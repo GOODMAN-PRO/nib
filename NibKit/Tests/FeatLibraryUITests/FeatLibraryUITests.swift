@@ -30,7 +30,6 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(problems, [])
     }
     func testLibraryChromeLayoutRegistersAndDrawsItsDropletBodies() async throws {
-        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Liquid Glass compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
         let root = LibraryRootView(model: model)
@@ -42,7 +41,9 @@ final class FeatLibraryUITests: XCTestCase {
                     let anchors = compact ? ["library.new"] : ["library.new", "library.sort"]
                     var registeredFrames: [String: CGRect] = [:]
                     var drawnIDs: Set<String> = []
-                    var registeredAnchors: Set<String> = []
+                    var registeredAnchors: [String: CGRect] = [:]
+                    var registeredStyles: [String: DropletStyle] = [:]
+                    var presentations: [String: DropletPresentation] = [:]
                     // Use the production controls and their custom layout, over the worst-case contrast backdrop.
                     let view = ZStack {
                         NibColor.label
@@ -56,26 +57,33 @@ final class FeatLibraryUITests: XCTestCase {
                                 }
                                 .padding(NibSpacing.l)
                                 LibraryChromeFieldProbe(ids: ids, anchors: anchors) { field in
-                                    // Copy the state while the live window is attached. hostedImage tears down
-                                    // the window on return, which unregisters droplets from their field.
+                                    // Inspect registrations from the production view, not hand-built test droplets.
+                                    let entries = Mirror(reflecting: field).children.first { $0.label == "entries" }?.value
+                                        as? [String: DropletField.Entry]
+                                    registeredStyles = entries?.mapValues(\.style) ?? [:]
                                     for id in ids {
+                                        presentations[id] = field.node(id).presentation
                                         registeredFrames[id] = field.visualFrame(id)
                                         if field.node(id).presentation.isDrawn { drawnIDs.insert(id) }
                                     }
-                                    registeredAnchors = Set(field.worldAnchors.keys)
+                                    registeredAnchors = field.worldAnchors
                                 }
+                                NibFloatingLayer(host: model.floating)
                             }
                         }
                     }
+                    .coordinateSpace(name: "library.chrome")
+                    .onPreferenceChange(LibraryChromeFrames.self) { model.updateMenuAnchors(from: $0) }
                     .nibLiquidMode(mode)
                     .environment(\.horizontalSizeClass, compact ? .compact : .regular)
-                    let rendered = try await NibSnapshot.hostedImage(view, size: size, variant: variant)
-                    let image = try XCTUnwrap(rendered)
+                    let image = try await hostlessLayoutImage(view, size: size, variant: variant)
                     let name = "library-chrome-\(compact ? "iphone" : "ipad")-\(variant.rawValue)-\(mode.rawValue)"
-                    let attachment = XCTAttachment(image: image)
-                    attachment.name = name
-                    attachment.lifetime = .keepAlways
-                    add(attachment)
+                    if mode == .off {
+                        let attachment = XCTAttachment(image: image)
+                        attachment.name = name
+                        attachment.lifetime = .keepAlways
+                        add(attachment)
+                    }
 
                     let clear = try XCTUnwrap(registeredFrames["library.controls"], "\(name): Clear needs a rest frame")
                     let tinted = try XCTUnwrap(registeredFrames["library.new.button"], "\(name): New needs a rest frame")
@@ -88,39 +96,159 @@ final class FeatLibraryUITests: XCTestCase {
                     XCTAssertEqual(tinted.minY, compact ? size.height - NibSpacing.l - 44 : NibSpacing.l,
                                    accuracy: 0.5, name)
 
-                    var accentPixels = 0
-                    let interior = tinted.insetBy(dx: 8, dy: 8)
-                    for y in Int(interior.minY)..<Int(interior.maxY) {
-                        for x in Int(interior.minX)..<Int(interior.maxX) {
-                            let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
-                            if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { accentPixels += 1 }
+                    let clearStyle = try XCTUnwrap(registeredStyles["library.controls"])
+                    let tintedStyle = try XCTUnwrap(registeredStyles["library.new.button"])
+                    XCTAssertEqual(clearStyle.material, .clear)
+                    XCTAssertEqual(tintedStyle.material, .tinted)
+                    XCTAssertTrue(tintedStyle.systemGlassSpec.tintsAccent)
+                    for id in ids {
+                        let style = try XCTUnwrap(registeredStyles[id])
+                        let presentation = try XCTUnwrap(presentations[id])
+                        XCTAssertTrue(DropletBodyModifier.drawsBody(style: style, presentation: presentation), id)
+                        XCTAssertEqual(presentation.bodySize, presentation.restSize, "Resting bodies must cover their controls")
+                    }
+                    let traits = UITraitCollection(userInterfaceStyle: variant == .dark ? .dark : .light)
+                    let accent = NibGlassBodyTint.resolvedColor(tintedStyle.glassKind, colorScheme: variant.colorScheme)
+                    XCTAssertEqual(accent, NibUIColor.accent.resolvedColor(with: traits))
+                    XCTAssertEqual(accent.cgColor.alpha, 1, accuracy: 0.001)
+                    let clearBody = NibGlassBodyTint.resolvedColor(clearStyle.glassKind, colorScheme: variant.colorScheme)
+                    XCTAssertEqual(clearBody, NibUIColor.clearBody.resolvedColor(with: traits))
+                    XCTAssertEqual(clearBody.cgColor.alpha, variant == .dark ? 0.62 : 0.46, accuracy: 0.001,
+                                   "Clear must retain its specified body opacity over ink/paper")
+                    // System glass requires a compositor; the off mode is ordinary hostless-renderable content.
+                    if mode == .off {
+                        var accentPixels = 0
+                        let interior = tinted.insetBy(dx: 8, dy: 8)
+                        for y in Int(interior.minY)..<Int(interior.maxY) {
+                            for x in Int(interior.minX)..<Int(interior.maxX) {
+                                let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                                if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { accentPixels += 1 }
+                            }
+                        }
+                        XCTAssertGreaterThan(Double(accentPixels) / Double(interior.width * interior.height), 0.55,
+                                             "\(name): onAccent must have a visible accent body")
+                        // Sample the core before the Search glyph, beyond the refractive rim band.
+                        let bodyPixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: clear.minX + 9, y: clear.midY)))
+                        if variant == .light {
+                            XCTAssertGreaterThan(bodyPixel.r, 30, "\(name): Clear must draw over black")
+                        } else {
+                            XCTAssertLessThan(bodyPixel.r, 225, "\(name): Clear must draw over white")
                         }
                     }
-                    XCTAssertGreaterThan(Double(accentPixels) / Double(interior.width * interior.height), 0.55,
-                                         "\(name): onAccent must have a visible accent body")
-                    // Sample the core before the Search glyph, beyond the refractive rim band.
-                    let bodyPixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: clear.minX + 9, y: clear.midY)))
-                    if variant == .light {
-                        XCTAssertGreaterThan(bodyPixel.r, 30, "\(name): Clear must draw over black")
-                    } else {
-                        XCTAssertLessThan(bodyPixel.r, 225, "\(name): Clear must draw over white")
+                    XCTAssertTrue(Set(registeredAnchors.keys).isSuperset(of: anchors), "\(name): bud anchors must follow placement")
+                    XCTAssertEqual(try XCTUnwrap(registeredAnchors["library.new"]), tinted,
+                                   "\(name): New must anchor to its actual button")
+                    if !compact {
+                        let sort = try XCTUnwrap(registeredAnchors["library.sort"])
+                        XCTAssertEqual(sort.midX, clear.midX, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.midY, clear.midY, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.width, NibMetrics.hitTarget, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.height, NibMetrics.hitTarget, accuracy: 0.5, name)
                     }
-                    XCTAssertTrue(registeredAnchors.isSuperset(of: anchors), "\(name): bud anchors must follow placement")
                 }
             }
         }
     }
+    func testLibraryRootMenusRestBesideTheirActualSources() async throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                for mode in [NibLiquidMode.full, .off] {
+                    for menu in ["new", "sort"] {
+                        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+                        model.sidebarVisible = false
+                        model.liquidMode = mode
+                        // Exercise a request before the first layout as well as the settled presentation.
+                        model.menu = menu
+                        let source = "library." + menu, popover = "library." + menu + ".menu"
+                        var capturedField: DropletField?
+                        var anchorFrames: [String: CGRect] = [:]
+                        var presentedFrames: [String: CGRect] = [:]
+                        var menuIsDrawn = false
+                        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+                            id: "test.menuGeometry", owner: "test", placement: .center, surface: .none,
+                            isInteractive: false) { _ in
+                                AnyView(LibraryChromeFieldProbe(
+                                    ids: ["library.controls", "library.new.button", popover],
+                                    anchors: ["library.new", "library.sort"]) { capturedField = $0 })
+                            })
+                        _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad), size: size,
+                                                          variant: variant, settlePasses: mode == .full ? 60 : 10) {
+                            guard let field = capturedField else { return }
+                            anchorFrames = field.worldAnchors
+                            for id in ["library.controls", "library.new.button", popover] {
+                                presentedFrames[id] = field.visualFrame(id)
+                            }
+                            menuIsDrawn = field.node(popover).presentation.isDrawn
+                        }
+                        let name = "\(menu)-\(size)-\(variant.rawValue)-\(mode.rawValue)"
+                        let anchor = try XCTUnwrap(anchorFrames[source], name)
+                        let controls = try XCTUnwrap(presentedFrames["library.controls"], name)
+                        let newButton = try XCTUnwrap(presentedFrames["library.new.button"], name)
+                        XCTAssertEqual(try XCTUnwrap(anchorFrames["library.new"]), newButton, name)
+                        let sort = try XCTUnwrap(anchorFrames["library.sort"], name)
+                        XCTAssertEqual(sort.midX, controls.midX, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.midY, controls.midY, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.size.width, NibMetrics.hitTarget, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.size.height, NibMetrics.hitTarget, accuracy: 0.5, name)
+                        XCTAssertGreaterThan(anchor.minX, size.width / 2, name)
+                        XCTAssertLessThan(anchor.maxY, size.height / 2, name)
+
+                        let frame = try XCTUnwrap(presentedFrames[popover], name)
+                        XCTAssertTrue(menuIsDrawn, name)
+                        XCTAssertEqual(frame.width, NibMetrics.popoverWidth, accuracy: 0.5, name)
+                        XCTAssertGreaterThan(frame.height, 0, name)
+                        XCTAssertEqual(frame.minY - anchor.maxY, NibMetrics.popoverGap, accuracy: 0.5, name)
+                        let inset = NibMetrics.chromeInset
+                        let expectedX = min(anchor.midX, size.width - inset - frame.width / 2)
+                        XCTAssertEqual(frame.midX, expectedX, accuracy: 0.5, name)
+                        XCTAssertGreaterThanOrEqual(frame.minX, inset - 0.5, name)
+                        XCTAssertLessThanOrEqual(frame.maxX, size.width - inset + 0.5, name)
+                        XCTAssertGreaterThanOrEqual(frame.minY, inset - 0.5, name)
+                        XCTAssertLessThanOrEqual(frame.maxY, size.height - inset + 0.5, name)
+                    }
+                }
+            }
+        }
+    }
+
+    func testLibraryMenuWaitsForUsableSourceGeometry() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.menu = "new"
+        model.updateMenuAnchors(from: ["anchor.library.new": .zero])
+        var capturedField: DropletField?
+        let view = NibDropletContainer {
+            LibraryBuds(model: model)
+            LibraryChromeFieldProbe(ids: [], anchors: []) { capturedField = $0 }
+            NibFloatingLayer(host: model.floating)
+        }.nibLiquidMode(.off)
+        _ = try await hostlessLayoutImage(view, size: CGSize(width: 834, height: 1194), variant: .light)
+        let field = try XCTUnwrap(capturedField)
+        XCTAssertFalse(field.node("library.new.menu").presentation.isDrawn)
+        XCTAssertNil(model.menuAnchors["library.new"])
+        XCTAssertNil(model.floating.anchors["library.new"])
+        XCTAssertEqual(model.menu, "new", "Keep the request pending until layout publishes its source")
+
+        model.updateMenuAnchors(from: ["anchor.library.new": CGRect(x: 700, y: 16, width: 96, height: 44)])
+        XCTAssertNotNil(model.menuAnchors["library.new"])
+        XCTAssertNotNil(model.floating.anchors["library.new"])
+        model.updateMenuAnchors(from: [:])
+        XCTAssertTrue(model.menuAnchors.isEmpty)
+        XCTAssertNil(model.floating.anchors["library.new"], "A removed control must not retain a stale source")
+    }
+
     func testLibraryRootChromeSnapshots() async throws {
-        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Library compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
-        model.setView(["sidebar": false])
+        model.sidebarVisible = false
+        model.liquidMode = .off
         for compact in [false, true] {
             for variant in [NibSnapshot.Variant.light, .dark] {
-                let rendered = try await NibSnapshot.hostedImage(
-                    LibraryRootView(model: model), size: CGSize(width: compact ? 390 : 1024, height: compact ? 844 : 768),
-                    variant: variant)
-                let image = try XCTUnwrap(rendered)
+                let size = CGSize(width: compact ? 390 : 1024, height: compact ? 844 : 768)
+                let image = try await hostlessLayoutImage(
+                    LibraryRootView(model: model, idiom: compact ? .phone : .pad), size: size, variant: variant)
+                XCTAssertEqual(image.size, size)
+                let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 2, y: size.height / 2)))
+                XCTAssertGreaterThan(background.a, 250, "The root must render an opaque library surface")
                 let attachment = XCTAttachment(image: image)
                 attachment.name = "library-root-\(compact ? "iphone" : "ipad")-\(variant.rawValue)"
                 attachment.lifetime = .keepAlways
@@ -128,6 +256,67 @@ final class FeatLibraryUITests: XCTestCase {
             }
         }
     }
+    func testFolderTitlesFitTheirMeasuredGridCellsWithoutTruncation() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let rows = ["Research", "Reference notes", "Reading"].enumerated().map { index, title in
+            LibraryRow(ref: "folder:TITLETEST0\(index)", kind: "folder", title: title)
+        }
+        model.rows = rows
+        model.applySort()
+        for compact in [false, true] {
+            let width: CGFloat = compact ? 358 : 960
+            for variant in NibSnapshot.Variant.allCases {
+                var frames: [String: CGRect] = [:]
+                let view = LibraryGridView(model: model)
+                    .environment(\.horizontalSizeClass, compact ? .compact : .regular)
+                    .onPreferenceChange(LibraryFrames.self) { frames = $0 }
+                _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 768), variant: variant)
+                var font = NibUIFont.button
+                UITraitCollection(preferredContentSizeCategory: variant == .largeText ? .accessibilityExtraLarge : .large)
+                    .performAsCurrent { font = NibUIFont.button }
+                for row in rows {
+                    let frame = try XCTUnwrap(frames[row.ref], "Every folder must be laid out")
+                    let textWidth = (row.name as NSString).size(withAttributes: [.font: font]).width
+                    let required = ceil(textWidth) + NibMetrics.hitTarget + NibSpacing.m + 2 * NibSpacing.l
+                    XCTAssertGreaterThanOrEqual(frame.width, required,
+                                                "\(row.name) must fit without an ellipsis (\(variant), compact: \(compact))")
+                    XCTAssertGreaterThan(frame.height, 0)
+                    XCTAssertGreaterThanOrEqual(frame.minX, -0.5)
+                    XCTAssertLessThanOrEqual(frame.maxX, width + 0.5)
+                }
+            }
+        }
+    }
+
+    /// No app-supplied UIWindowScene is needed (UIKit may attach an internal legacy scene).
+    /// Native glass is checked structurally; off-mode pixels and UIKit navigation/scroll views
+    /// can be captured directly from their laid-out layers.
+    private func hostlessLayoutImage<V: View>(_ view: V, size: CGSize,
+                                             variant: NibSnapshot.Variant, settlePasses: Int = 5,
+                                             inspect: () -> Void = {}) async throws -> UIImage {
+        let host = UIHostingController(rootView: view.ignoresSafeArea()
+            .environment(\.colorScheme, variant.colorScheme)
+            .environment(\.dynamicTypeSize, variant.dynamicTypeSize))
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.backgroundColor = .clear
+        for _ in 0..<settlePasses {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        inspect()
+        host.view.layer.displayIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            host.view.layer.render(in: context.cgContext)
+        }
+    }
+
     func testTintedButtonHasAccentBeforeDropletRegistration() throws {
         let field = DropletField()
         let image = try XCTUnwrap(NibSnapshot.image(
@@ -146,6 +335,155 @@ final class FeatLibraryUITests: XCTestCase {
         }
         XCTAssertGreaterThan(accentPixels, 800, "The button needs an accent body beneath its white glyphs.")
     }
+    func testPhonePresentationSurvivesRotationAndShortWindowsStayCompact() {
+        for size in [CGSize(width: 390, height: 844), CGSize(width: 844, height: 390), CGSize(width: 932, height: 430)] {
+            XCTAssertTrue(LibraryPresentation.isCompact(size: size, idiom: .phone))
+            XCTAssertTrue(LibraryPresentation.isCompact(size: size, idiom: .pad))
+        }
+        XCTAssertFalse(LibraryPresentation.isCompact(size: CGSize(width: 768, height: 1024), idiom: .pad))
+        XCTAssertFalse(LibraryPresentation.isCompact(size: CGSize(width: 1194, height: 834), idiom: .pad))
+    }
+
+    func testBridgeStatusSharesControlRowAndMovesToBottomOnPhone() throws {
+        for size in [CGSize(width: 390, height: 844), CGSize(width: 844, height: 390), CGSize(width: 768, height: 1024)] {
+            let compact = size.height < 600 || size.width < 600
+            let controlsWidth: CGFloat = compact ? 104 : 252
+            let view = LibraryChromeOverlayLayout(inlineSidebar: false, compact: compact, titleBottom: 180) {
+                NibInk.cobalt.color.frame(width: controlsWidth, height: 44)
+                    .layoutValue(key: LibraryChromeOverlaySlot.self,
+                                 value: .init(placement: compact ? .bottomTrailing : .topTrailing, isControls: true))
+                NibInk.vermilion.color.frame(width: 60, height: 40)
+                    .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topTrailing))
+                NibInk.moss.color.frame(width: 44, height: 32)
+                    .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topTrailing))
+            }.padding(NibSpacing.l).background(NibPaper.white.color)
+            let image = try XCTUnwrap(NibSnapshot.image(view, size: size))
+            let midY: CGFloat = compact ? size.height - 16 - 22 : 16 + 22
+            let status = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 16 - 44 - 16 - 30, y: midY)))
+            let secondStatus = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 16 - 22, y: midY)))
+            let controls = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 16 - 44 - 16 - 60 - 16 - controlsWidth / 2, y: midY)))
+            XCTAssertGreaterThan(Int(status.r) - Int(status.b), 80, "Status must align with the measured control row")
+            XCTAssertGreaterThan(Int(secondStatus.g) - Int(secondStatus.b), 20, "Contributions must sit beside one another")
+            XCTAssertGreaterThan(Int(controls.b) - Int(controls.r), 80)
+            if compact {
+                let searchRegion = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 46, y: 202)))
+                XCTAssertGreaterThan(searchRegion.r, 240, "Status must leave navigation and pull-down search clear")
+            }
+        }
+    }
+
+    func testFolderColumnsPreserveOrdinaryNamesBeforeAddingColumns() {
+        let minimum = LibraryFolderLayout.minimumWidth(names: ["Semester 1", "Physics 9702"], font: NibUIFont.button)
+        let width: CGFloat = 656
+        let count = LibraryFolderLayout.columnCount(width: width, minimum: minimum, gutter: NibMetrics.libraryGutter)
+        XCTAssertLessThan(count, 4)
+        XCTAssertGreaterThanOrEqual((width - CGFloat(count - 1) * NibMetrics.libraryGutter) / CGFloat(count), minimum)
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 180, minimum: minimum, gutter: 16), 1)
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 1400, minimum: minimum, gutter: 24), 4)
+        var largeFont = NibUIFont.button
+        UITraitCollection(preferredContentSizeCategory: .accessibilityExtraLarge).performAsCurrent { largeFont = NibUIFont.button }
+        let largeMinimum = LibraryFolderLayout.minimumWidth(names: ["Semester 1", "Physikvorlesungen"], font: largeFont)
+        XCTAssertGreaterThan(largeMinimum, minimum)
+        XCTAssertLessThanOrEqual(LibraryFolderLayout.columnCount(width: width, minimum: largeMinimum, gutter: 24), count)
+    }
+
+    func testMissingAndLockedCoverGlyphsContrastWithWhitePaperInBothThemes() throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var row = try XCTUnwrap(h.library.node(Fixtures.docID)).mapRow
+        row.sync = nil
+        for locked in [false, true] {
+            row.locked = locked
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                for size in [NibMetrics.coverSize, CGSize(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)] {
+                    let image = try XCTUnwrap(NibSnapshot.image(LibraryCover(row: row, model: model, loadsThumbnail: false), size: size, variant: variant))
+                    let paper = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 2, y: size.height - 2)))
+                    XCTAssertGreaterThan(paper.r, 250)
+                    XCTAssertGreaterThan(paper.g, 250)
+                    XCTAssertGreaterThan(paper.b, 250)
+                    var darkest = 255
+                    for y in stride(from: Int(size.height / 2) - 16, through: Int(size.height / 2) + 16, by: 2) {
+                        for x in stride(from: max(2, Int(size.width / 2) - 16), through: min(Int(size.width) - 2, Int(size.width / 2) + 16), by: 2) {
+                            let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                            darkest = min(darkest, max(Int(pixel.r), max(Int(pixel.g), Int(pixel.b))))
+                        }
+                    }
+                    XCTAssertLessThan(darkest, 120, "Missing and locked covers need opaque dark ink on white paper in \(variant)")
+                }
+            }
+        }
+    }
+
+    func testRenderedThumbnailKeepsItsPaperColourInDarkMode() throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var row = try XCTUnwrap(h.library.node(Fixtures.docID)).mapRow
+        row.locked = false
+        row.sync = nil
+        let thumbnail = UIGraphicsImageRenderer(size: NibMetrics.coverSize).image { context in
+            NibPaper.ivory.uiColor.setFill()
+            context.fill(CGRect(origin: .zero, size: NibMetrics.coverSize))
+        }
+        model.coverCache.images.setObject(thumbnail, forKey: (row.ref + String(row.modified ?? 0)) as NSString)
+        var pixels: [RGBA] = []
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            let image = try XCTUnwrap(NibSnapshot.image(LibraryCover(row: row, model: model, loadsThumbnail: false),
+                                                      size: NibMetrics.coverSize, variant: variant))
+            pixels.append(try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 70, y: 91))))
+        }
+        XCTAssertEqual(pixels[0], pixels[1])
+        XCTAssertGreaterThan(pixels[1].r, 240)
+        XCTAssertLessThan(pixels[1].b, 250, "The rendered ivory paper must not become the white placeholder")
+    }
+
+    func testReflowMeasuresOnlyCoverAndHidesSourceUntilLanding() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var row = try XCTUnwrap(h.library.node(Fixtures.docID)).mapRow
+        row.title = "A notebook with a title that wraps onto two lines"
+        model.rows = [row]
+        for list in [false, true] {
+            for compact in [false, true] {
+                let expected = list ? CGSize(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                    : compact ? NibMetrics.coverSizeCompact : NibMetrics.coverSize
+                model.reflow.frames.removeAll()
+                let view = LibraryCell(row: row, model: model, list: list)
+                    .frame(width: list ? 320 : expected.width)
+                    .nibReflowSpace(model.reflow)
+                    .environment(\.horizontalSizeClass, compact ? .compact : .regular)
+                let host = UIHostingController(rootView: view)
+                let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 360, height: 300))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                for _ in 0..<20 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    if model.reflow.frames[row.ref] != nil { break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let cover = try XCTUnwrap(model.reflow.frames[row.ref])
+                XCTAssertEqual(cover.width, expected.width, accuracy: 0.5)
+                XCTAssertEqual(cover.height, expected.height, accuracy: 0.5, "Labels must not enlarge the drag envelope")
+                model.reflow.begin(row.ref, order: [row.ref], at: CGPoint(x: cover.midX, y: cover.midY))
+                XCTAssertEqual(try XCTUnwrap(model.reflow.carrierFrame).size, cover.size)
+                XCTAssertTrue(LibraryCarrierVisibility.hides(row.ref, in: model.reflow))
+                XCTAssertFalse(LibraryCarrierVisibility.hides("doc:OTHERDOC01", in: model.reflow))
+                _ = model.reflow.end()
+                XCTAssertTrue(LibraryCarrierVisibility.hides(row.ref, in: model.reflow), "Keep the source hidden while the carrier lands")
+                model.reflow.landed()
+                XCTAssertFalse(LibraryCarrierVisibility.hides(row.ref, in: model.reflow))
+
+                let image = try XCTUnwrap(NibSnapshot.image(LibraryStackedCarrier(ref: row.ref, model: model), size: expected))
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "library-carrier-\(list ? "list" : "grid")-\(compact ? "compact" : "regular")"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+                let bottomPaper = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: expected.width / 2, y: expected.height - 10)))
+                XCTAssertGreaterThan(bottomPaper.r, 240, "The bottom of the carrier must contain cover paper, not an empty label region")
+                XCTAssertEqual(DropletStyle.card.envelope, 3)
+            }
+        }
+    }
+
     func testPerFolderViewsAndWindowIsolation() async throws {
         let h = harness()
         let other = EditorSession(); h.app.services.sessions.add(other)

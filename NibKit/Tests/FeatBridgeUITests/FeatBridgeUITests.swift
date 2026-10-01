@@ -1078,6 +1078,31 @@ final class FeatBridgeUITests: XCTestCase {
 
     // MARK: Rendering
 
+    func testCompactDocumentStatusVisiblyIdentifiesTheClientInEveryVariant() async throws {
+        let (h, fake, monitor) = makeHarness()
+        let bridge = try XCTUnwrap(fake)
+        try await h.run(CommandIDs.bridgeSetEnabled, ["enabled": true])
+        let context = ChromeContext(app: h.app, session: h.session, kind: .notebook, isCompact: true)
+        let status = try XCTUnwrap(h.app.ui.toolbar.get(BridgeUIIDs.statusItem)?.compactStatus)
+        var imagesByClient: [[NibSnapshot.Variant: UIImage]] = []
+
+        for name in ["Claude Code", "Cursor"] {
+            bridge.clients = [["name": .string(name), "sessions": 1]]
+            await monitor.refresh()
+            XCTAssertEqual(monitor.snapshot?.clients.first?.name, name)
+            let pill = try XCTUnwrap(status(context))
+            imagesByClient.append(NibSnapshot.images(pill, size: CGSize(width: 120, height: 44)))
+        }
+
+        for variant in NibSnapshot.Variant.allCases {
+            let first = try XCTUnwrap(imagesByClient[0][variant]?.pngData())
+            let second = try XCTUnwrap(imagesByClient[1][variant]?.pngData())
+            // Both clients have the same connection dot. Only visible text can distinguish these renders;
+            // checking the presentation or VoiceOver label alone would miss the compact dot-only regression.
+            XCTAssertNotEqual(first, second, "\(variant): the compact bar must visibly identify its client")
+        }
+    }
+
     func testSettingsPageAndPillRenderInEveryVariant() async throws {
         let (h, fake, monitor) = makeHarness()
         fake?.clients = [["name": "claude-code", "version": "2.0", "lastSeen": .number(Date().timeIntervalSince1970),

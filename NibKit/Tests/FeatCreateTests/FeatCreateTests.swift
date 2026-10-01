@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatCreate
 
 /// Records the calls stand-in commands receive.
@@ -1408,7 +1409,6 @@ final class FeatCreateTests: XCTestCase {
     // MARK: - Screens render (Light, Dark, AX3)
 
     func testNewNotebookWithCoverColoursFitsA402PointPhone() async throws {
-        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Live sheet geometry requires an app-hosted window scene; validate it in simulator captures.")
         let h = harness()
         h.app.content.templates.register(Self.ruled())
         h.app.content.templates.register(Self.solidCover())
@@ -1420,25 +1420,59 @@ final class FeatCreateTests: XCTestCase {
             let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook, session: h.session,
                                          navigator: nil, onDone: {})
                 .environment(\.horizontalSizeClass, .compact)
-            // Live hosting lets the sheet measure its width and settle into the compact layout.
-            let captured = try await NibSnapshot.hostedImage(sheet, size: phone, variant: variant)
-            let image = try XCTUnwrap(captured)
+            // A standalone window supplies the real width to the sheet's window reader. Layer rendering
+            // includes the UIKit scroll content without requiring an app-hosted compositor.
+            let host = UIHostingController(rootView: sheet.ignoresSafeArea()
+                .environment(\.colorScheme, variant.colorScheme)
+                .environment(\.dynamicTypeSize, variant.dynamicTypeSize))
+            let window = UIWindow(frame: CGRect(origin: .zero, size: phone))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<5 {
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let fitting = host.sizeThatFits(in: phone)
+            XCTAssertEqual(fitting.width, phone.width, accuracy: 0.5,
+                           "Cover swatches must not widen the sheet (\(variant.rawValue))")
+            host.view.layer.displayIfNeeded()
+            let image = UIGraphicsImageRenderer(size: phone).image { context in
+                host.view.layer.render(in: context.cgContext)
+            }
             XCTAssertEqual(image.size, phone)
             let attachment = XCTAttachment(image: image)
             attachment.name = "NewNotebook-cover-colours-iPhone-402-\(variant.rawValue)"
             attachment.lifetime = .keepAlways
             add(attachment)
 
+            // Measure the header at the same Dynamic Type size: AX3 moves Cancel below the 16...44 band.
+            let headerHeight = Int(ceil(NibSnapshot.fittingSize(
+                NibSheetHeader(NewDocumentKind.notebook.sheetTitle, onCancel: {})
+                    .padding(.horizontal, NibSpacing.l - NibSpacing.xl),
+                width: phone.width, variant: variant).height))
+            XCTAssertGreaterThanOrEqual(headerHeight, 60)
             // A nine-column swatch grid widens the whole sheet and pushes Cancel into this 16 pt margin.
             let background = try XCTUnwrap(NibSnapshot.pixel(image, at: .zero))
             var occupiedMarginPixels = 0
-            for y in 16..<44 {
+            for y in 0..<headerHeight {
                 for x in 0..<16 {
                     let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
                     if pixel != background { occupiedMarginPixels += 1 }
                 }
             }
             XCTAssertEqual(occupiedMarginPixels, 0, "Cancel must stay inside the sheet padding (\(variant.rawValue))")
+            // A blank layer capture must not accidentally satisfy the empty-margin assertion.
+            var cancelPixels = 0
+            for y in 0..<headerHeight {
+                for x in 16..<100 {
+                    let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                    if pixel != background { cancelPixels += 1 }
+                }
+            }
+            XCTAssertGreaterThan(cancelPixels, 20, "Cancel must actually render inside the padding")
         }
     }
 

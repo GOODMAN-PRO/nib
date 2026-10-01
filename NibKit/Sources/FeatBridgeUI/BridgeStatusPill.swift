@@ -115,7 +115,7 @@ final class BridgePillState: ObservableObject {
 struct BridgeStatusPill: View {
     @ObservedObject var monitor: BridgeMonitor
     let context: ChromeContext
-    /// The document's after-title control uses caption1 and folds to its dot on compact width.
+    /// The document's after-title control keeps its caption1 client name beside the dot at every width.
     var isNavStatus = false
     @StateObject private var state = BridgePillState()
 
@@ -133,11 +133,9 @@ struct BridgeStatusPill: View {
                         .frame(width: NibMetrics.statusDot, height: NibMetrics.statusDot)
                         .accessibilityHidden(true)
                 }
-                if !isNavStatus || !context.isCompact {
-                    Text(presentation?.primary ?? String(localized: "Bridge"))
-                    if !isNavStatus, let secondary = presentation?.secondary {
-                        Text(secondary)
-                    }
+                Text(presentation?.primary ?? String(localized: "Bridge"))
+                if !isNavStatus, let secondary = presentation?.secondary {
+                    Text(secondary)
                 }
             }
             .font(isNavStatus ? NibFont.caption1 : NibFont.caption1Emphasis)

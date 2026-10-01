@@ -5,15 +5,16 @@ import NibContracts
 import NibTesting
 @testable import NibDesign
 
-/// Live compositor regressions: ImageRenderer alone cannot detect glass refracting its own sibling foreground.
+/// Structural and contrast regressions always run hostless. A live scene additionally exercises native optics.
 @MainActor
 final class GlassForegroundSnapshotTests: XCTestCase {
     private let size = CGSize(width: 360, height: 240)
 
     func testBarPaletteAndDeepGlyphsStayCrispAndReadable() async throws {
-        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Liquid Glass compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
+        try assertHostlessForegroundGuarantees()
+        guard NibSnapshot.supportsHostedImages else { return }
         for variant in [NibSnapshot.Variant.light, .dark] {
-            for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep] {
+            for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep, .hud, .standaloneHUD] {
                 let reference = try await capture(surface, glass: false, variant: variant)
                 let rendered = try await capture(surface, variant: variant)
                 let empty = try await capture(surface, showsContent: false, variant: variant)
@@ -64,7 +65,8 @@ final class GlassForegroundSnapshotTests: XCTestCase {
     }
 
     func testLibraryNewHasAccentBehindItsLabelInBothAppearances() async throws {
-        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Liquid Glass compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
+        try assertHostlessAccentGuarantees()
+        guard NibSnapshot.supportsHostedImages else { return }
         for variant in [NibSnapshot.Variant.light, .dark] {
             let image = try await capture(.library, variant: variant)
             attach(image, name: "library-new-\(variant.rawValue)")
@@ -104,6 +106,136 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         XCTAssertEqual(fullPaper.cgColor.alpha, 0.8, accuracy: 0.001)
         XCTAssertEqual(partialPaper.cgColor.alpha, 0.62 + 0.18 * 0.7, accuracy: 0.001)
         XCTAssertEqual(NibUIColor.deepBody.resolvedColor(with: dark).cgColor.alpha, 0.86, accuracy: 0.001)
+    }
+
+    func testChromeColoursKeepAppAppearanceWhenGlassAdaptsToTheOppositeBackdrop() {
+        for scheme in [ColorScheme.light, .dark] {
+            var app = EnvironmentValues()
+            app.colorScheme = scheme
+            var glass = EnvironmentValues()
+            glass.colorScheme = scheme == .dark ? .light : .dark
+            glass.nibChromeAppearance = NibChromeAppearance(app)
+            for token in [NibColor.label, NibColor.labelSecondary, NibColor.accent, NibColor.warning,
+                          NibColor.onAccent, NibInk.cobalt.color] {
+                XCTAssertEqual(NibChromeColor(token).resolve(in: glass), token.resolve(in: app))
+            }
+            // Ordinary components still follow their local appearance when they are outside a glass host.
+            glass.nibChromeAppearance = nil
+            XCTAssertEqual(NibChromeColor(NibColor.label).resolve(in: glass), NibColor.label.resolve(in: glass))
+        }
+    }
+
+    func testSharedChromeComponentsKeepTheirGlyphsWhenGlassChangesLocalAppearance() throws {
+        let components: [(String, AnyView)] = [
+            ("title", AnyView(NibBarTitle(title: "Physics", subtitle: "Page 1 of 4"))),
+            ("toolbar", AnyView(NibToolbarItem(.search, label: "Search") {})),
+            ("tool", AnyView(NibToolButton(tool: NibTool(id: "pen", label: "Pen", symbol: .pen),
+                                            isSelected: true) {})),
+            ("hud", AnyView(NibHUDText("125%", secondary: "3 of 12"))),
+            ("search", AnyView(NibSearchField(text: .constant(""), prompt: "Find", style: .onDroplet)
+                .frame(width: 240)))
+        ]
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            var app = EnvironmentValues()
+            app.colorScheme = variant.colorScheme
+            let opposite: ColorScheme = variant == .dark ? .light : .dark
+            for (name, component) in components {
+                let reference = try XCTUnwrap(NibSnapshot.image(component, size: size, variant: variant))
+                let adapted = try XCTUnwrap(NibSnapshot.image(
+                    component.environment(\.colorScheme, opposite)
+                        .environment(\.nibChromeAppearance, NibChromeAppearance(app)),
+                    size: size, variant: variant))
+                var cores = 0
+                for y in 100..<140 {
+                    for x in 40..<320 {
+                        let point = CGPoint(x: CGFloat(x), y: CGFloat(y))
+                        let ref = try XCTUnwrap(NibSnapshot.pixel(reference, at: point))
+                        let isCore = variant == .dark ? min(ref.r, ref.g, ref.b) > 252 : max(ref.r, ref.g, ref.b) < 3
+                        guard ref.a > 252, isCore else { continue }
+                        cores += 1
+                        let actual = try XCTUnwrap(NibSnapshot.pixel(adapted, at: point))
+                        XCTAssertEqual(actual, ref, "\(name), \(variant): glass must not recolour the glyph core")
+                    }
+                }
+                XCTAssertGreaterThan(cores, 10, "\(name): sample real full-strength glyphs")
+            }
+        }
+    }
+
+    private func assertHostlessForegroundGuarantees() throws {
+        if #available(iOS 26.0, *) {
+            let host = NibNativeGlass(effect: NibSystemGlass.of(.clear, interactive: true).glass,
+                                      shape: NibDropletShape()) { Text("Foreground") }
+            let structure = String(reflecting: type(of: host.body))
+            XCTAssertTrue(structure.contains("Text"), structure)
+            XCTAssertTrue(structure.localizedCaseInsensitiveContains("glass"), structure)
+            for forbidden in ["ZStack", "Overlay", "Background", "TupleView"] {
+                XCTAssertFalse(structure.contains(forbidden), "Glass must wrap its foreground directly: \(structure)")
+            }
+        }
+        for dark in [false, true] {
+            let scheme: ColorScheme = dark ? .dark : .light
+            let traits = UITraitCollection(userInterfaceStyle: dark ? .dark : .light)
+            let ink = UIColor.black, paper = UIColor.white
+            for style in [DropletStyle.bar, .palette, .popover, .hud] {
+                let field = DropletField()
+                field.usesSystemGlass = true
+                field.setRest("foreground", CGRect(x: 40, y: 100, width: 280, height: 44), style: style)
+                defer { field.unregister("foreground") }
+                let presentation = field.node("foreground").presentation
+                XCTAssertTrue(presentation.isDrawn, "The first measured frame must draw without a display-link tick")
+                XCTAssertTrue(DropletBodyModifier.drawsBody(style: style, presentation: presentation))
+                XCTAssertEqual(style.systemGlassSpec.tintsAccent, false)
+                let body = NibGlassBodyTint.resolvedColor(style.glassKind, paperShare: dark ? 1 : 0,
+                                                         colorScheme: scheme)
+                let background = composite(body, over: dark ? paper : ink)
+                let glyph = NibUIColor.label.resolvedColor(with: traits)
+                XCTAssertGreaterThanOrEqual(contrast(rgba(glyph), rgba(background)), 4.5,
+                                            "\(style.glassKind), \(scheme): full-strength glyphs over ink/paper")
+            }
+        }
+    }
+
+    private func assertHostlessAccentGuarantees() throws {
+        let button = NibDropletButton(id: "library.new.button", title: "New", symbol: .plus, kind: .tinted) {}
+        let modifier = try XCTUnwrap(findDroplet(in: button.body), "New must use the shared droplet modifier")
+        XCTAssertEqual(modifier.style.material, .tinted)
+        XCTAssertTrue(modifier.style.systemGlassSpec.tintsAccent)
+        XCTAssertTrue(modifier.style.systemGlassSpec.isInteractive)
+        XCTAssertTrue(DropletBodyModifier.drawsBody(style: modifier.style, presentation: DropletPresentation()))
+        for scheme in [ColorScheme.light, .dark] {
+            let traits = UITraitCollection(userInterfaceStyle: scheme == .dark ? .dark : .light)
+            let body = NibGlassBodyTint.resolvedColor(modifier.style.glassKind, colorScheme: scheme)
+            XCTAssertEqual(body, NibUIColor.accent.resolvedColor(with: traits))
+            XCTAssertEqual(body.cgColor.alpha, 1, accuracy: 0.001)
+            let foreground = NibUIColor.onAccent.resolvedColor(with: traits)
+            XCTAssertGreaterThanOrEqual(contrast(rgba(foreground), rgba(body)), scheme == .light ? 4.5 : 3)
+        }
+    }
+
+    private func findDroplet(in value: Any, depth: Int = 0) -> DropletModifier? {
+        if let modifier = value as? DropletModifier { return modifier }
+        guard depth < 24 else { return nil }
+        for child in Mirror(reflecting: value).children {
+            if let modifier = findDroplet(in: child.value, depth: depth + 1) { return modifier }
+        }
+        return nil
+    }
+
+    private func rgba(_ color: UIColor) -> RGBA {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        XCTAssertTrue(color.getRed(&r, green: &g, blue: &b, alpha: &a))
+        return RGBA(UInt8((r * 255).rounded()), UInt8((g * 255).rounded()),
+                    UInt8((b * 255).rounded()), UInt8((a * 255).rounded()))
+    }
+
+    private func composite(_ color: UIColor, over backdrop: UIColor) -> UIColor {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+        XCTAssertTrue(color.getRed(&r, green: &g, blue: &b, alpha: &a))
+        XCTAssertTrue(backdrop.getRed(&br, green: &bg, blue: &bb, alpha: &ba))
+        return UIColor(red: r * a + br * (1 - a), green: g * a + bg * (1 - a),
+                       blue: b * a + bb * (1 - a), alpha: 1)
     }
 
     private func capture(_ surface: NibGlassForegroundGallery.Surface, glass: Bool = true,

@@ -151,7 +151,7 @@ enum ObjectMenuKeys {
 // MARK: - Placement
 
 /// Where the capsule rests (pure, container coordinates): centred above the selection, clear of the rotation handle;
-/// below it when the top chrome is in the way; pinned under the top chrome over a selection taller than the window.
+/// below it when the top chrome is in the way; pinned to the roomier edge for a selection taller than the window.
 /// Clamped 16 pt inside the sides. nil when the selection is off screen.
 enum ObjectMenuPlacement {
     struct Result: Equatable {
@@ -166,21 +166,26 @@ enum ObjectMenuPlacement {
 
     /// `top` / `bottom`: what the chrome and safe area keep clear at the container's top and bottom.
     static func place(bar: CGSize, selection: CGRect, in bounds: CGRect, top: CGFloat, bottom: CGFloat) -> Result? {
-        guard !selection.isNull, !selection.isInfinite, selection.intersects(bounds) || bounds.contains(selection) else {
+        guard !selection.isNull, !selection.isInfinite, !bounds.isEmpty,
+              selection.intersects(bounds) || bounds.contains(selection) else {
             return nil
         }
+        let visible = selection.intersection(bounds)
         let halfW = bar.width / 2, halfH = bar.height / 2
         let minX = bounds.minX + NibMetrics.chromeInset + halfW
         let maxX = max(minX, bounds.maxX - NibMetrics.chromeInset - halfW)
-        let x = min(max(selection.midX, minX), maxX)
+        let x = min(max(visible.midX, minX), maxX)
         let lo = bounds.minY + top + halfH
         let hi = max(lo, bounds.maxY - bottom - halfH)
-        let aboveY = selection.minY - gapAbove - halfH
+        let aboveY = visible.minY - gapAbove - halfH
         if aboveY >= lo && aboveY <= hi { return Result(centre: CGPoint(x: x, y: aboveY), above: true) }
-        let belowY = selection.maxY + gapBelow + halfH
+        let belowY = visible.maxY + gapBelow + halfH
         if belowY >= lo && belowY <= hi { return Result(centre: CGPoint(x: x, y: belowY), above: false) }
-        let pinned = min(max(selection.minY + halfH + NibSpacing.s, lo), hi)
-        return Result(centre: CGPoint(x: x, y: pinned), above: true)
+        // Neither side has the full handle clearance (a large or partially clipped selection). Keep actions
+        // reachable inside the visible chrome bounds, on whichever side has more space.
+        let above = visible.minY - (bounds.minY + top) >= bounds.maxY - bottom - visible.maxY
+        let pinned = min(max(above ? aboveY : belowY, lo), hi)
+        return Result(centre: CGPoint(x: x, y: pinned), above: above)
     }
 
     /// Top chrome and safe area the capsule stays below.
@@ -462,13 +467,16 @@ final class ObjectMenuModel: ObservableObject {
 /// NibDesign offers a non-modal bud; the canvas stays live around it: drag the selection, tap away to deselect.
 struct ObjectMenuOverlay: View {
     @ObservedObject var model: ObjectMenuModel
+    var layoutChanged: () -> Void = {}
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var barSize = CGSize(width: NibMetrics.hitTarget * 4, height: NibMetrics.barHeight)
 
     var body: some View {
         GeometryReader { proxy in
-            let origin = proxy.frame(in: NibLiquid.space).origin
-            let bounds = CGRect(origin: origin, size: proxy.size)
+            // The attachment converts model.anchor through FloatingHosting.containerRect into this same space.
+            // Only the final position is translated back to the overlay's local coordinates.
+            let bounds = proxy.frame(in: NibLiquid.space)
+            let origin = bounds.origin
             let top = ObjectMenuPlacement.topReserve(safeTop: proxy.safeAreaInsets.top)
             let placement = ObjectMenuPlacement.place(bar: barSize, selection: model.anchor, in: bounds, top: top,
                                                       bottom: proxy.safeAreaInsets.bottom + NibMetrics.chromeInset)
@@ -485,6 +493,7 @@ struct ObjectMenuOverlay: View {
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
             .animation(model.isShown ? NibMotion.enter : NibMotion.exit, value: model.isShown)
+            .onChange(of: bounds, initial: true) { _, _ in layoutChanged() }
             .onChange(of: placement, initial: true) { _, p in
                 guard let p else { return }
                 let room = p.centre.y - barSize.height / 2 - ObjectMenuPlacement.colourPopoverHeight - NibMetrics.popoverGap

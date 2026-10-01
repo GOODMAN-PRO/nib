@@ -14,6 +14,7 @@ public struct NibDropletContainer<Content: View>: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.nibLiquidMode) private var mode
     @Environment(\.nibBackdrop) private var backdrop
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.horizontalSizeClass) private var sizeClass
     private let inking: NibInkingState?
     private let content: Content
@@ -59,6 +60,7 @@ public struct NibDropletContainer<Content: View>: View {
         }
         .onChange(of: inking?.isInking ?? false, initial: true) { _, value in field.setInking(value) }
         .onChange(of: inking?.strokeBounds ?? .null) { _, rect in field.setStroke(rect) }
+        .onChange(of: colorScheme) { _, _ in field.wake() }
         .onChange(of: backdrop, initial: true) { _, pages in field.setBackdrop(pages) }
         .onChange(of: sizeClass, initial: true) { _, value in
             field.metrics = value == .compact ? .compact : .regular

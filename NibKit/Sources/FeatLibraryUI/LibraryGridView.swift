@@ -7,11 +7,43 @@ struct LibraryFrames: PreferenceKey {
     static var defaultValue: [String: CGRect] = [:]
     static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) { value.merge(nextValue(), uniquingKeysWith: { _, b in b }) }
 }
+struct LibraryCoverFrames: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, frame in frame })
+    }
+}
+
+enum LibraryCarrierVisibility {
+    static func hides(_ ref: String, in reflow: NibReflow<String>) -> Bool {
+        reflow.isCarried(ref) || reflow.armed == ref
+    }
+}
+
+@MainActor
+enum LibraryFolderLayout {
+    static func minimumWidth(names: [String], font: UIFont) -> CGFloat {
+        let textWidth = names.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        // Reserve a full hit target for the folder glyph plus the tile's gap and horizontal insets.
+        return max(NibMetrics.folderTileMinWidth, ceil(textWidth) + NibMetrics.hitTarget + NibSpacing.m + 2 * NibSpacing.l)
+    }
+
+    static func columnCount(width: CGFloat, minimum: CGFloat, gutter: CGFloat) -> Int {
+        min(4, max(1, Int((max(0, width) + gutter) / (minimum + gutter))))
+    }
+}
+
 struct LibraryTargets: PreferenceKey {
     static var defaultValue: [String: CGRect] = [:]
     static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) { value.merge(nextValue(), uniquingKeysWith: { _, b in b }) }
 }
 extension View {
+    func libraryCoverFrame(_ ref: String) -> some View {
+        background { GeometryReader { geometry in
+            Color.clear.preference(key: LibraryCoverFrames.self,
+                                   value: [ref: geometry.frame(in: .named("library.cell." + ref))])
+        } }
+    }
     func libraryDropTarget(_ ref: String?) -> some View {
         background { GeometryReader { geometry in
             if let ref { Color.clear.preference(key: LibraryTargets.self, value: [ref: geometry.frame(in: .global)]) }
@@ -27,7 +59,7 @@ struct LibraryGridView: View {
     @State private var dragSelection = LibrarySelection()
     @State private var selecting = false
     @State private var marquee: CGRect?
-    @State private var searchText = ""
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {
         Group {
             if model.isLoading && model.rows.isEmpty { ProgressView(String(localized: "Loading library")) }
@@ -36,7 +68,7 @@ struct LibraryGridView: View {
                     primary: NibAction(String(localized: "New Notebook")) { model.setView(["menu": "new"]) },
                     secondary: NibAction(String(localized: "Import")) { model.perform(CommandIDs.importPick, model.folder == nil ? [:] : ["folder": model.folderRef]) })
             } else {
-                ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: NibMetrics.libraryGutter) {
                         if model.layout == .list { list }
                         else { grid }
@@ -68,8 +100,6 @@ struct LibraryGridView: View {
                     .simultaneousGesture(selectionGesture, including: model.selection.isSelecting ? .all : .subviews)
                     .padding(.bottom, NibMetrics.canvasBottomInsetCompact)
                 }
-                .scrollDisabled(model.selection.isSelecting && selecting)
-                .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: String(localized: "Search this folder"))
                 .overlay {
                     if model.visibleRows.isEmpty {
                         NibEmptyState(symbol: .search, title: String(localized: "No matching items"),
@@ -79,14 +109,6 @@ struct LibraryGridView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onAppear { searchText = model.search }
-        .onChange(of: model.search) { _, value in if value != searchText { searchText = value } }
-        .task(id: searchText) {
-            guard searchText != model.search else { return }
-            do { try await Task.sleep(for: .milliseconds(180)); try Task.checkCancellation() }
-            catch { return }
-            model.setView(["search": .string(searchText)])
-        }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
     }
     private var folders: [LibraryRow] { model.folderRows }
@@ -99,11 +121,12 @@ struct LibraryGridView: View {
         return Array(repeating: GridItem(.fixed(coverWidth), spacing: gutter, alignment: .top), count: count)
     }
     private var folderColumns: [GridItem] {
-        if sizeClass != .compact {
-            let width = max(0, (contentWidth - 3 * NibMetrics.libraryGutter) / 4)
-            return Array(repeating: GridItem(.fixed(width), spacing: NibMetrics.libraryGutter, alignment: .top), count: 4)
+        var font = NibUIFont.button
+        UITraitCollection(preferredContentSizeCategory: dynamicTypeSize.uiContentSizeCategory).performAsCurrent {
+            font = NibUIFont.button
         }
-        let count = max(1, Int((contentWidth + gutter) / (NibMetrics.folderTileMinWidth + gutter)))
+        let minimum = LibraryFolderLayout.minimumWidth(names: folders.map(\.name), font: font)
+        let count = LibraryFolderLayout.columnCount(width: contentWidth, minimum: minimum, gutter: gutter)
         let width = max(0, (contentWidth - CGFloat(count - 1) * gutter) / CGFloat(count))
         return Array(repeating: GridItem(.fixed(width), spacing: gutter, alignment: .top), count: count)
     }
@@ -113,7 +136,6 @@ struct LibraryGridView: View {
             LazyVGrid(columns: folderColumns, alignment: .leading, spacing: gutter) {
                 ForEach(folders) { row in
                     cell(row)
-                        .nibReflowItem(row.ref, in: model.folderReflow)
                         .nibReflowDraggable(row.ref, in: model.folderReflow, order: model.folderRefs) { model.drop($0) }
                 }
             }
@@ -124,7 +146,6 @@ struct LibraryGridView: View {
             LazyVGrid(columns: coverColumns, alignment: .leading, spacing: gutter) {
                 ForEach(documents) { row in
                     cell(row)
-                        .nibReflowItem(row.ref, in: model.reflow)
                         .nibReflowDraggable(row.ref, in: model.reflow, order: model.documentRefs) { model.drop($0) }
                 }
             }
@@ -134,7 +155,6 @@ struct LibraryGridView: View {
         LazyVStack(spacing: NibSpacing.xs) {
             ForEach(model.visibleRows) { row in
                 cell(row, list: true)
-                    .nibReflowItem(row.ref, in: row.isFolder ? model.folderReflow : model.reflow)
                     .nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow, order: row.isFolder ? model.folderRefs : model.documentRefs) { model.drop($0) }
             }
         }
@@ -169,12 +189,14 @@ struct LibraryGridView: View {
 }
 
 /// Loads document counts only for cells the lazy grid/list actually presents.
-private struct LibraryCell: View {
+struct LibraryCell: View {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
     @ObservedObject private var cache: LibraryCoverCache
     let list: Bool
     @State private var subtitle: String?
+    @State private var coverFrame: CGRect = .zero
+    private var reflow: NibReflow<String> { row.isFolder ? model.folderReflow : model.reflow }
     init(row: LibraryRow, model: LibraryViewModel, list: Bool) {
         self.row = row; self.model = model; self.cache = model.coverCache; self.list = list
     }
@@ -205,6 +227,22 @@ private struct LibraryCell: View {
             if model.renaming == row.ref { LibraryRenameField(row: row, model: model) }
         }
         .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+        .coordinateSpace(name: "library.cell." + row.ref)
+        .onPreferenceChange(LibraryCoverFrames.self) { coverFrame = $0[row.ref] ?? .zero }
+        .opacity(LibraryCarrierVisibility.hides(row.ref, in: reflow) ? 0 : 1)
+        .offset(reflow.offset(for: row.ref))
+        .animation(reflow.animatesOffsets ? NibMotion.reflow.animation : nil, value: reflow.offset(for: row.ref))
+        // This non-drawing sibling measures only the cover, before the visible cell's reflow offset.
+        // Labels retain their grid space but never enlarge the carrier or its combine hit region.
+        .background(alignment: .topLeading) {
+            if row.isFolder {
+                Color.clear.nibReflowItem(row.ref, in: reflow)
+            } else if !coverFrame.isEmpty {
+                Color.clear.frame(width: coverFrame.width, height: coverFrame.height)
+                    .nibReflowItem(row.ref, in: reflow)
+                    .offset(x: coverFrame.minX, y: coverFrame.minY)
+            }
+        }
         .background { GeometryReader { geometry in
             Color.clear.preference(key: LibraryFrames.self, value: [row.ref: geometry.frame(in: .named("library.selection"))])
         } }
@@ -235,6 +273,7 @@ struct LibraryCard: View {
                     isFavorite: row.favorite == true, typeBadge: row.typeBadge,
                     isSelected: model.selection.isSelecting ? model.selection.refs.contains(row.ref) : nil, absorbOffset: model.absorbing[row.ref]) {
                         LibraryCover(row: row, model: model, loadsThumbnail: thumbnail)
+                            .libraryCoverFrame(row.ref)
                     }
             }
         }
@@ -251,10 +290,24 @@ struct LibraryCover: View {
         self.row = row; self.model = model; self.loadsThumbnail = loadsThumbnail; self.cache = model.coverCache
     }
     var body: some View {
-        ZStack {
-            NibPaper.white.color
-            if !isLocked, let rendered = image ?? model.coverCache.images.object(forKey: cacheKey as NSString) { Image(uiImage: rendered).resizable().scaledToFit() }
-            else { Image(nib: isLocked ? .lock : row.typeBadge ?? .notebook).font(NibFont.display).foregroundStyle(NibColor.labelTertiary) }
+        Group {
+            if !isLocked, let rendered = image ?? model.coverCache.images.object(forKey: cacheKey as NSString) {
+                ZStack {
+                    NibPaper.white.color
+                    Image(uiImage: rendered).resizable().scaledToFit()
+                }
+            } else {
+                // Paper does not invert with chrome. Its missing/locked glyph uses opaque paper ink too.
+                ZStack {
+                    NibPaper.white.color
+                    GeometryReader { proxy in
+                        Image(nib: isLocked ? .lock : row.typeBadge ?? .notebook)
+                            .font(proxy.size.width <= NibMetrics.rowThumbnailWidth ? NibFont.title3 : NibFont.display)
+                            .foregroundStyle(NibInk.graphite.color)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+            }
         }
         .overlay(alignment: .topLeading) {
             HStack(spacing: NibSpacing.xs) {
@@ -284,7 +337,8 @@ struct LibraryListRow: View {
     var body: some View {
         HStack(spacing: NibSpacing.l) {
             if row.isFolder { Image(nib: .folderFill).foregroundStyle(NibColor.labelSecondary) }
-            else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax) }
+            else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                .libraryCoverFrame(row.ref) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label)
                 if !row.isFolder { Text(subtitle ?? row.subtitle()).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
@@ -357,6 +411,26 @@ private struct LibraryPointerMarquee: UIViewRepresentable {
                 start = CGPoint(x: point.x - translation.x, y: point.y - translation.y)
             }
             changed(start, point, pan.state == .ended || pan.state == .cancelled || pan.state == .failed)
+        }
+    }
+}
+
+private extension DynamicTypeSize {
+    var uiContentSizeCategory: UIContentSizeCategory {
+        switch self {
+        case .xSmall: .extraSmall
+        case .small: .small
+        case .medium: .medium
+        case .large: .large
+        case .xLarge: .extraLarge
+        case .xxLarge: .extraExtraLarge
+        case .xxxLarge: .extraExtraExtraLarge
+        case .accessibility1: .accessibilityMedium
+        case .accessibility2: .accessibilityLarge
+        case .accessibility3: .accessibilityExtraLarge
+        case .accessibility4: .accessibilityExtraExtraLarge
+        case .accessibility5: .accessibilityExtraExtraExtraLarge
+        @unknown default: .large
         }
     }
 }

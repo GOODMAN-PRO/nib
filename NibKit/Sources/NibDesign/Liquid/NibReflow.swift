@@ -296,6 +296,8 @@ public final class NibReflow<ID: Hashable> {
     public let combines: Bool
 
     @ObservationIgnored var frames: [ID: CGRect] = [:]
+    @ObservationIgnored var coverFrames: [ID: CGRect] = [:]
+    @ObservationIgnored private var carrierHosts: Set<UUID> = []
     @ObservationIgnored var spaceOrigin: CGPoint = .zero
     @ObservationIgnored private var order: [ID] = []
     @ObservationIgnored private var hover: ID?
@@ -314,7 +316,26 @@ public final class NibReflow<ID: Hashable> {
 
     public func offset(for id: ID) -> CGSize { model?.offset(of: id) ?? .zero }
 
-    public func isCarried(_ id: ID) -> Bool { carried == id }
+    public func isCarried(_ id: ID) -> Bool { carried == id || lift?.id == id }
+
+    func hidesSource(_ id: ID) -> Bool { hasCarrier && (isCarried(id) || armed == id) }
+
+    func attachCarrier(_ token: UUID) {
+        carrierHosts.insert(token)
+        hasCarrier = true
+    }
+
+    func detachCarrier(_ token: UUID) {
+        carrierHosts.remove(token)
+        hasCarrier = !carrierHosts.isEmpty
+    }
+
+    /// Keep the layout's pitch, but use the measured cover rectangle for drag and combine geometry.
+    func dragFrame(_ id: ID, in slot: CGRect) -> CGRect {
+        guard let cover = coverFrames[id], let cell = frames[id] else { return slot }
+        return CGRect(x: slot.minX + cover.minX - cell.minX, y: slot.minY + cover.minY - cell.minY,
+                      width: cover.width, height: cover.height)
+    }
 
     /// The frame an item is shown at now, in global coordinates (nil when no drag is on).
     public func globalFrame(of id: ID) -> CGRect? {
@@ -332,10 +353,10 @@ public final class NibReflow<ID: Hashable> {
         for (i, x) in order.enumerated() {
             if let layout {
                 ids.append(x)
-                slots.append(layout.slot(i))
+                slots.append(dragFrame(x, in: layout.slot(i)))
             } else if let f = frames[x], NibGeometry.isUsable(f) {
                 ids.append(x)
-                slots.append(f)
+                slots.append(dragFrame(x, in: f))
             }
         }
         guard let m = NibReflowModel(ids: ids, slots: slots, dragged: id, combines: combines) else { return }
@@ -520,11 +541,16 @@ struct NibReflowItemModifier<ID: Hashable>: ViewModifier {
     func body(content: Content) -> some View {
         let offset = reflow.offset(for: id)
         let armed = reflow.armed == id
-        let drawnByCarrier = reflow.hasCarrier && (reflow.isCarried(id) || armed)
+        let drawnByCarrier = reflow.hidesSource(id)
         content
+            .environment(\.nibReflowMeasureCover, { frame in
+                if NibGeometry.isUsable(frame) { reflow.coverFrames[id] = frame }
+            })
             .scaleEffect(armed ? NibReflowMetrics.armedScale : 1)
             .animation(NibMotion.lift.animation, value: armed)
             .opacity(drawnByCarrier ? 0 : 1)
+            .animation(nil, value: drawnByCarrier)
+            .accessibilityHidden(drawnByCarrier)
             .offset(offset)
             .animation(reflow.animatesOffsets ? NibMotion.reflow.animation : nil, value: offset)
             .onGeometryChange(for: CGRect.self) { proxy in
@@ -598,6 +624,7 @@ public struct NibReflowCarrier<ID: Hashable, Content: View>: View {
     let reflow: NibReflow<ID>
     let id: String
     let content: (ID) -> Content
+    @State private var hostToken = UUID()
     @Environment(DropletField.self) private var field: DropletField?
 
     public init(_ reflow: NibReflow<ID>, id: String = "reflow.carrier", @ViewBuilder content: @escaping (ID) -> Content) {
@@ -633,8 +660,9 @@ public struct NibReflowCarrier<ID: Hashable, Content: View>: View {
             .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
         }
         .allowsHitTesting(false)
-        .onAppear { reflow.hasCarrier = true }
-        .onDisappear { reflow.hasCarrier = false }
+        .environment(\.nibReflowCoverOnly, true)
+        .onAppear { reflow.attachCarrier(hostToken) }
+        .onDisappear { reflow.detachCarrier(hostToken) }
     }
 }
 
@@ -668,11 +696,12 @@ struct CarrierDriver<ID: Hashable>: View {
 
     var body: some View {
         Color.clear
-            .onChange(of: reflow.lift) { _, lift in drive(lift) }
+            .onChange(of: reflow.lift, initial: true) { _, lift in drive(lift) }
             .onChange(of: field?.node(id).presentation) { _, p in
                 // The droplet registers a frame after it appears: catch up with the finger, then watch for the landing.
                 drive(reflow.lift)
-                guard let p, let lift = reflow.lift, case .released = lift.phase, !p.isLifted, !p.isSettling else {
+                guard let p, p.restSize != .zero, let lift = reflow.lift, case .released = lift.phase,
+                      !p.isLifted, !p.isSettling else {
                     return
                 }
                 reflow.landed()

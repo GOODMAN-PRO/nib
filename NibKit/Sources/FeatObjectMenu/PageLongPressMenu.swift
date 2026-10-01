@@ -186,7 +186,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     private var subscriptions: [EventSubscription] = []
     private var commits = 0
     private var builtFor: BuildKey?
-    private var lastViewRect: CGRect?
+    private var lastContainerRect: CGRect?
     private var reshow: Task<Void, Never>?
     private var editMenuShownFor: Selection?
     private var pendingMenu: UIMenu?
@@ -319,8 +319,13 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     }
 
     private func reposition(contentChanged: Bool) {
-        guard let host, let facts = model.facts, model.hasEntries, host.pageFrame(facts.page) != nil else {
+        guard let host, let facts = model.facts, model.hasEntries else {
             model.isShown = false
+            return
+        }
+        guard host.pageFrame(facts.page) != nil else {
+            model.isShown = false
+            scheduleReshow()
             return
         }
         let viewRect = ScreenshotSharing.viewRect(facts.bounds, page: facts.page, host: host)
@@ -343,10 +348,19 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
                          in: host.canvasView)
         guard let rect = target.containerRect(viewRect, from: host.canvasView) else {
             model.isShown = false
+            // Rotation can temporarily detach the floating reference view. There may be no further canvas event
+            // once it rejoins the window, so keep a retry alive until conversion succeeds or selection clears.
+            scheduleReshow()
             return
         }
-        let moved = !contentChanged && lastViewRect != nil && lastViewRect != viewRect
-        lastViewRect = viewRect
+        // Both this comparison and the overlay's bounds use NibLiquid.space. Canvas coordinates alone miss a
+        // sidebar / safe-area change, while exact equality can keep postponing reshow for subpixel layout noise.
+        let tolerance = 1 / max(host.canvasView.traitCollection.displayScale, 1)
+        let moved = !contentChanged && lastContainerRect.map {
+            abs($0.minX - rect.minX) > tolerance || abs($0.minY - rect.minY) > tolerance
+                || abs($0.width - rect.width) > tolerance || abs($0.height - rect.height) > tolerance
+        } == true
+        if contentChanged || moved || lastContainerRect == nil { lastContainerRect = rect }
         model.setAnchor(rect)
         if contentChanged {
             reshow?.cancel()
@@ -357,7 +371,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             model.isShown = false
             model.colourOpen = false
             model.styleOpen = false
-            scheduleReshow()
+            scheduleReshow(restart: true)
         } else if reshow == nil {
             show()
         }
@@ -371,17 +385,22 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     private func hide() {
         model.clear()
-        lastViewRect = nil
+        lastContainerRect = nil
         editMenuShownFor = nil
         reshow?.cancel()
         reshow = nil
     }
 
-    private func scheduleReshow() {
+    private func scheduleReshow(restart: Bool = false) {
+        guard restart || reshow == nil else { return }
         reshow?.cancel()
         reshow = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
+            // Finish pending UIKit geometry before sampling the anchor again. Clear the task only afterwards:
+            // layout callbacks may ask for another retry while this one is still completing.
+            self.host?.canvasView.window?.layoutIfNeeded()
+            guard !Task.isCancelled else { return }
             self.reshow = nil
             self.refresh()
         }
@@ -390,7 +409,11 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     private func present(on target: FloatingHosting) {
         guard floating !== target else { return }
         dismissFloating()
-        target.present(ObjectMenuIDs.overlay, content: AnyView(ObjectMenuOverlay(model: model)))
+        lastContainerRect = nil
+        target.present(ObjectMenuIDs.overlay, content: AnyView(ObjectMenuOverlay(model: model) { [weak self] in
+            // SwiftUI's floating layer can finish laying out after the canvas's last layout callback.
+            self?.scheduleReshow()
+        }))
         target.present(ObjectMenuIDs.colourPopover, content: AnyView(ObjectMenuColourPopover(model: model)))
         target.present(ObjectMenuIDs.stylePopover, content: AnyView(ObjectMenuStylePopover(model: model)))
         floating = target

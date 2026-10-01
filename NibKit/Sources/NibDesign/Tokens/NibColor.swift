@@ -119,6 +119,40 @@ public enum NibColor {
     public static let swatchRing = Color(uiColor: NibUIColor.swatchRing)
 }
 
+/// Appearance captured before entering native glass, shared by its default foreground and explicit component
+/// colours. Keep the public Color tokens unchanged for callers that also use them on ordinary opaque surfaces.
+struct NibChromeAppearance {
+    let environment: EnvironmentValues
+    var colorScheme: ColorScheme { environment.colorScheme }
+
+    init(_ environment: EnvironmentValues) {
+        self.environment = environment
+    }
+}
+
+private struct NibChromeAppearanceKey: EnvironmentKey {
+    static let defaultValue: NibChromeAppearance? = nil
+}
+
+extension EnvironmentValues {
+    var nibChromeAppearance: NibChromeAppearance? {
+        get { self[NibChromeAppearanceKey.self] }
+        set { self[NibChromeAppearanceKey.self] = newValue }
+    }
+}
+
+/// Resolve semantic chrome colours against the enclosing app, not the appearance inferred from white paper by
+/// native glass. Outside glass this uses the ordinary environment. Explicit ink/accent colours retain their hue.
+struct NibChromeColor: ShapeStyle {
+    let color: Color
+
+    init(_ color: Color) { self.color = color }
+
+    func resolve(in environment: EnvironmentValues) -> Color.Resolved {
+        color.resolve(in: environment.nibChromeAppearance?.environment ?? environment)
+    }
+}
+
 // The colour tables live in NibContracts (§1, item 6) so core modules share them; UI gets colours and names here.
 
 public extension NibHexColour {

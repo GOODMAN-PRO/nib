@@ -250,6 +250,24 @@ final class ToolbarCustomizationModel: ObservableObject {
     }
 }
 
+/// A fitted sheet must measure the form, not the List's minimal intrinsic height. Use the standard iPad form
+/// size as the ideal, capped by the presentation's proposal for iPhone, rotation, Split View and the keyboard.
+/// Propose the allocated size back to the stack so the list scrolls in the space below its natural-height header.
+private struct ToolbarCustomizationSheetLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let ideal = NibMetrics.newDocumentSheetSize
+        return CGSize(width: min(proposal.width ?? ideal.width, ideal.width),
+                      height: min(proposal.height ?? ideal.height, ideal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for subview in subviews {
+            subview.place(at: bounds.origin, anchor: .topLeading,
+                          proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
+        }
+    }
+}
+
 /// Toolbar customisation (T-086, P-031): an opaque grouped list, never glass (DESIGN.md §14.3). Reorder with the
 /// handles, hide with −, show with +, save and apply named layouts, reset a part. Plugin items appear here like
 /// native ones. Presented as a sheet panel (More › Customise Toolbar) and as Settings › Editing › Toolbar.
@@ -269,13 +287,7 @@ struct ToolbarCustomizationView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let onDone {
-                NibSheetHeader(String(localized: "Customise Toolbar"), cancelTitle: String(localized: "Done"),
-                               onCancel: { onDone() })
-            }
-            list
-        }
+        content
         .background(NibColor.groupedBackground)
         .navigationTitle(String(localized: "Toolbar"))
         .alert(String(localized: "Save Layout"), isPresented: $naming) {
@@ -294,6 +306,22 @@ struct ToolbarCustomizationView: View {
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "Saved layouts are kept."))
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if let onDone {
+            ToolbarCustomizationSheetLayout {
+                VStack(spacing: 0) {
+                    NibSheetHeader(String(localized: "Customise Toolbar"), cancelTitle: String(localized: "Done"),
+                                   onCancel: { onDone() })
+                        .fixedSize(horizontal: false, vertical: true)
+                    list
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        } else {
+            list
         }
     }
 

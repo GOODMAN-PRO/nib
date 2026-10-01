@@ -2,10 +2,9 @@ import SwiftUI
 import NibContracts
 import NibDesign
 
-/// One sidebar side (D-065, D-117, D-136): the selected panel with a tab strip for every panel placed on that side,
-/// a Sidebar / Window switch, the panel's position menu and Close. The caller makes it a Deep `panel` droplet (docked,
-/// over the page or full-window) or puts it in a sheet (compact windows). A panel that draws its own header
-/// (contracts-v2 `providesHeader`) gets the tab strip only.
+/// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
+/// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
+/// Panels providing their own header keep it; the assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
     let side: SidebarSide
@@ -18,8 +17,17 @@ struct SidebarPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if chrome.drawsHeader(selected) { header }
-            tabStrip
+            if chrome.drawsHeader(selected) {
+                header
+            } else if selected.id != PanelIDs.assistant {
+                HStack {
+                    Spacer(minLength: 0)
+                    PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
+                                       mode: showsModeToggle ? mode : nil,
+                                       additionalPanels: SidebarNavigation.additional(tabs))
+                }
+            }
+            if selected.id != PanelIDs.assistant { tabStrip }
             Rectangle()
                 .fill(NibColor.separatorSoft)
                 .frame(height: NibStroke.hairline)
@@ -34,39 +42,33 @@ struct SidebarPanelView: View {
     private var header: some View {
         NibPanelHeader(title: selected.title, symbol: NibSymbol(systemName: selected.icon) ?? .puzzle,
                        onClose: { chrome.closePanel(selected.id) }) {
-            if showsModeToggle {
-                let next: SidebarMode = mode == .window ? .sidebar : .window
-                NibIconButton(next == .sidebar ? NibSymbol.sidebar : NibSymbol.pages,
-                              label: next == .sidebar ? String(localized: "Show as Sidebar") : String(localized: "Show as Window"),
-                              size: .panel) {
-                    chrome.tap("sidebar.toggle", ["mode": .string(next.rawValue)])
-                }
-            }
-            PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot)
+            PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
+                               mode: showsModeToggle ? mode : nil,
+                               additionalPanels: SidebarNavigation.additional(tabs))
         }
     }
 
-    /// Up to three tabs as a segmented control (Pages · Outline · Search); more as a strip of glyphs.
+    /// Pages, Outline and Bookmarks remain labelled; secondary panels live in the header's single menu.
     @ViewBuilder
     private var tabStrip: some View {
-        if tabs.count > 1 && tabs.count <= 3 {
-            NibSegmentedControl(selection: selection, options: tabs.map { $0.id }) { id in
-                tabs.first(where: { $0.id == id })?.title ?? id
-            }
-            .padding(.horizontal, NibSpacing.m)
-            .padding(.bottom, NibSpacing.xs)
-        } else if tabs.count > 3 {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(tabs, id: \.id) { tab in
-                        NibIconButton(NibSymbol(systemName: tab.icon) ?? .puzzle, label: tab.title, size: .panel,
-                                      isOn: tab.id == selected.id) {
-                            chrome.tap("panel.open", ["id": .string(tab.id)])
+        let primary = SidebarNavigation.primary(tabs)
+        if primary.count > 1 {
+            ViewThatFits(in: .horizontal) {
+                NibSegmentedControl(selection: selection, options: primary.map { $0.id }) { id in
+                    primary.first(where: { $0.id == id })?.title ?? id
+                }
+                .fixedSize(horizontal: true, vertical: false)
+                VStack(spacing: 0) {
+                    ForEach(primary, id: \.id) { tab in
+                        NibButton(tab.title, kind: tab.id == selected.id ? .secondary : .plain, expands: true) {
+                            selection.wrappedValue = tab.id
                         }
+                        .accessibilityAddTraits(tab.id == selected.id ? .isSelected : [])
                     }
                 }
-                .padding(.horizontal, NibSpacing.xs)
             }
+            .padding(.horizontal, NibSpacing.xs)
+            .padding(.bottom, NibSpacing.xs)
         }
     }
 
@@ -84,9 +86,23 @@ struct PanelPlacementMenu: View {
     let chrome: ChromeWindow
     let panel: PanelDescriptor
     let current: PanelSpot
+    var mode: SidebarMode? = nil
+    var additionalPanels: [PanelDescriptor] = []
 
     var body: some View {
         Menu {
+            if !additionalPanels.isEmpty {
+                Section(String(localized: "Panels")) {
+                    ForEach(additionalPanels, id: \.id) { tab in
+                        Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
+                    }
+                }
+            }
+            if let mode {
+                Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
+                    chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
+                }
+            }
             option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
             option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)
             option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay)
@@ -101,7 +117,7 @@ struct PanelPlacementMenu: View {
                 .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                 .contentShape(Rectangle())
         }
-        .accessibilityLabel(String(localized: "Panel Position"))
+        .accessibilityLabel(String(localized: "Panel Options"))
     }
 
     private var hasOverride: Bool {
@@ -120,5 +136,60 @@ struct PanelPlacementMenu: View {
     private func set(_ value: String?) {
         let json: JSONValue = value.map { JSONValue.string($0) } ?? .null
         chrome.tap("settings.set", ["name": .string(ChromeSettings.placementName(panel.id)), "value": json])
+    }
+}
+
+/// Stable navigation hierarchy independent of how many features register sidebar panels.
+enum SidebarNavigation {
+    static let primaryIDs = ["sidebar.pages", "outline.tab", "outline.bookmarks"]
+
+    static func primary(_ tabs: [PanelDescriptor]) -> [PanelDescriptor] {
+        let navigation = primaryIDs.compactMap { id in tabs.first { $0.id == id } }
+        return navigation.isEmpty ? Array(tabs.prefix(3)) : navigation
+    }
+
+    static func additional(_ tabs: [PanelDescriptor]) -> [PanelDescriptor] {
+        let ids = Set(primary(tabs).map(\.id))
+        return tabs.filter { !ids.contains($0.id) }
+    }
+}
+
+/// The portrait dock keeps its detent when rotated to landscape and back (§14.9).
+enum AssistantDetent: CaseIterable {
+    case medium, expanded
+
+    var fraction: CGFloat { self == .medium ? 0.45 : 0.90 }
+
+    func released(translation: CGFloat) -> AssistantDetent {
+        guard abs(translation) >= NibSpacing.xxl else { return self }
+        return translation < 0 ? .expanded : .medium
+    }
+}
+
+struct AssistantDockView: View {
+    let chrome: ChromeWindow
+    let panel: PanelDescriptor
+    @Binding var detent: AssistantDetent
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // The whole 44 pt row is a drag target; the button is the equivalent for VoiceOver and keyboard users.
+            NibButton(detent == .medium ? String(localized: "Expand Assistant") : String(localized: "Reduce Assistant"),
+                      kind: .plain, size: .compact, expands: true) {
+                chrome.state.noteTap()
+                detent = detent == .medium ? .expanded : .medium
+            }
+            .simultaneousGesture(DragGesture().onEnded { value in
+                chrome.state.noteTap()
+                detent = detent.released(translation: value.translation.height)
+            })
+            if chrome.drawsHeader(panel) {
+                NibPanelHeader(title: panel.title, symbol: .assistant, onClose: { chrome.closePanel(panel.id) }) {
+                    PanelPlacementMenu(chrome: chrome, panel: panel, current: .right)
+                }
+            }
+            panel.makeView(chrome.panelContext(panel.id, presentation: .sidebar))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 }

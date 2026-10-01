@@ -84,6 +84,7 @@ final class ChromeState: ObservableObject {
     @Published private(set) var sheet: String? = nil
     @Published private(set) var cover: String? = nil
     @Published var mode: SidebarMode = .sidebar
+    @Published var assistantDetent: AssistantDetent = .medium
     /// `panel.open {id, params}`: what each open panel was opened with (`PanelContext.params`).
     @Published private(set) var params: [String: JSONValue] = [:]
     /// The tab a side showed when it was hidden, so the sidebar comes back where it was.
@@ -300,6 +301,8 @@ enum PanelResolver {
             if let raw = override, let chosen = PanelSpot(rawValue: raw), PanelSpot.overrides.contains(chosen) {
                 return chosen
             }
+            // The assistant uses an adaptive trailing dock; floating is an explicit choice (§14.9).
+            if panel.id == PanelIDs.assistant { return .right }
             if panel.placement == .floating { return .floating }
             return sidebarOnRight ? .right : .left
         case .sheet:

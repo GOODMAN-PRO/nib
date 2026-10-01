@@ -74,12 +74,12 @@ public struct NibBarTitle: View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
                 .font(NibFont.barTitle)
-                .foregroundStyle(NibColor.label)
+                .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(1)
             if let subtitle {
                 Text(subtitle)
                     .font(NibFont.caption1Emphasis)
-                    .foregroundStyle(subtitleIsWarning ? NibColor.warning : NibColor.label)
+                    .foregroundStyle(NibChromeColor(subtitleIsWarning ? NibColor.warning : NibColor.label))
                     .lineLimit(1)
             }
         }
@@ -121,7 +121,7 @@ public struct NibHUD: View {
                 }
             }
             .font(NibFont.hud)
-            .foregroundStyle(NibColor.label)
+            .foregroundStyle(NibChromeColor(NibColor.label))
         }
         .padding(.leading, symbol == nil ? 12 : 0)
         .padding(.trailing, 12)
@@ -168,7 +168,7 @@ public struct NibToast: View {
         HStack(spacing: NibSpacing.m) {
             Text(message)
                 .font(NibFont.callout)
-                .foregroundStyle(NibColor.label)
+                .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(2)
             if let action {
                 Button(action.title, action: action.handler)

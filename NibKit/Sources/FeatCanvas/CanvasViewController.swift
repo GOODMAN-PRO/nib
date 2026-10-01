@@ -49,6 +49,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var fitZoom: Double = 1
     private(set) var zoomLimits: ClosedRange<Double> = ZoomRules.notebookRange
     private var isAtFit = true
+    /// A pan at fit width is a reading position, not a request to keep the page's top fitted.
+    private var hasManualPan = false
     private(set) var didInitialLayout = false
     private var lastViewport: CGSize = .zero
 
@@ -151,8 +153,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.addGestureRecognizer(tap)
 
         // iPad ↔ iPhone layout (Split View, Slide Over): the chrome's room and the fit width change.
-        registerForTraitChanges([UITraitHorizontalSizeClass.self]) { (vc: CanvasViewController, _: UITraitCollection) in
-            vc.updateChromeInsets()
+        registerForTraitChanges([UITraitHorizontalSizeClass.self, UITraitPreferredContentSizeCategory.self]) {
+            (vc: CanvasViewController, _: UITraitCollection) in
             vc.view.setNeedsLayout()
         }
 
@@ -180,11 +182,14 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         super.viewDidLayoutSubviews()
         let size = scrollView.bounds.size
         guard size.width > 0, size.height > 0, !isClosed else { return }
+        // Capture the reading position before UIKit adjusts the content inset.
+        let anchor = didInitialLayout ? centreAnchor() : nil
+        let fittedPage = isAtFit && !hasManualPan ? currentPage : nil
+        let previousInsets = scrollView.chromeInsets
         updateChromeInsets()
-        if size != lastViewport || !didInitialLayout {
-            let anchor = didInitialLayout ? centreAnchor() : nil
+        if size != lastViewport || previousInsets != scrollView.chromeInsets || !didInitialLayout {
             lastViewport = size
-            relayout(anchor: anchor, initial: !didInitialLayout)
+            relayout(anchor: anchor, initial: !didInitialLayout, fittedPage: fittedPage)
             didInitialLayout = true
             applyPendingNavigation()
         }
@@ -193,7 +198,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     override func viewSafeAreaInsetsDidChange() {
         super.viewSafeAreaInsetsDidChange()
-        updateChromeInsets()
+        view.setNeedsLayout()
     }
 
     /// Opens (or re-opens) the canvas: observers, tool, attachments, the input half.
@@ -264,6 +269,11 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         session.$page.dropFirst().receive(on: main).sink { [weak self] _ in self?.sessionPageChanged() }
             .store(in: &subscriptions)
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .filter { $0.userInfo?["name"] as? String == CommandIDs.toolbarDock }
+            .receive(on: main)
+            .sink { [weak self] _ in self?.view.setNeedsLayout() }
+            .store(in: &subscriptions)
+        NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
             .compactMap { $0.userInfo?["name"] as? String }
             .filter { $0 == NibSettings.stylusMode.name }
             .receive(on: main)
@@ -321,17 +331,34 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// starts below the bars and its last line scrolls above the palette.
     private func updateChromeInsets() {
         let safe = view.safeAreaInsets
-        let top = safe.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
+        var top = safe.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
+        if app.ui.screens.toolbarView != nil, !session.readOnly {
+            let savedName = app.settings.json(CommandIDs.toolbarDock)?["edge"]?.stringValue
+            let savedEdge = savedName.flatMap { NibDock(commandValue: $0) }
+            let defaultEdge: NibDock = isCompact ? .bottom : (view.bounds.width > view.bounds.height ? .leading : .top)
+            if (savedEdge ?? defaultEdge) == .top {
+                let region = DropletDockModel.region(
+                    size: view.bounds.size,
+                    safeArea: EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right),
+                    compact: isCompact)
+                let thickness = min(NibMetrics.paletteThicknessMax, max(NibMetrics.paletteThickness,
+                    UIFontMetrics(forTextStyle: .body)
+                        .scaledValue(for: NibMetrics.paletteThickness, compatibleWith: traitCollection)))
+                // Reserve the fused options bar too, even while scrolling temporarily folds it away.
+                top = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+            }
+        }
         let bottom = isCompact ? safe.bottom + NibMetrics.canvasBottomInsetCompact : safe.bottom + NibSpacing.l
         scrollView.chromeInsets = UIEdgeInsets(top: top, left: safe.left, bottom: bottom, right: safe.right)
     }
 
     /// Lays the pages out for the current mode and window, then zooms and scrolls: to the current page at fit the first
-    /// time (`initial`), else keeping `anchor` (a page point) where it was.
-    private func relayout(anchor: (page: PageID, point: Point, window: CGPoint)?, initial: Bool) {
+    /// time (`initial`) or when fitted chrome changes, else keeping the manual reading anchor where it was.
+    private func relayout(anchor: (page: PageID, point: Point, window: CGPoint)?, initial: Bool,
+                          fittedPage: PageID? = nil) {
         let size = scrollView.bounds.size
         guard size.width > 0, size.height > 0 else { return }
-        let target = pendingPage ?? currentPage
+        let target = pendingPage ?? fittedPage ?? currentPage
         let newMode = mode(for: target)
         let modeChanged = newMode != mode
         mode = newMode
@@ -372,7 +399,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         configureScrolling()
         refreshConfiguredPages()
 
-        if initial || modeChanged || anchor == nil {
+        if initial || modeChanged || anchor == nil || (fittedPage != nil && !mode.isWorld) {
             positionAtStart(page: target)
         } else {
             applyZoom(isAtFit ? fitZoom : ZoomRules.clamp(scrollView.zoom, zoomLimits))
@@ -407,6 +434,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         case .stack:
             applyZoom(fitZoom)
             isAtFit = true
+            hasManualPan = false
             if let p = page { scrollToPage(p, animated: false) } else { setOffset(minimumOffset) }
         case .world(let id):
             let z = boardContent == nil ? 1 : min(1, fitZoom)
@@ -530,21 +558,27 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     /// Zooms to `z` (clamped) keeping `anchor` (a page point) where it is, else the middle of the window. `centreFit`:
-    /// a board's fit also centres its content.
+    /// explicit fit places a notebook's current page below the chrome, or centres a board's content.
     func setZoom(_ z: Double, anchor pageAnchor: (PageID, Point)?, centreFit: Bool) {
         guard isViewLoaded, didInitialLayout else {
             pendingZoom = z
             return
         }
         var keepAnchor = centreAnchor()
+        let targetPage = currentPage
         if let pa = pageAnchor, scrollView.index(of: pa.0) != nil {
             let v = host.viewPoint(pa.1, page: pa.0)
             keepAnchor = (pa.0, pa.1, CGPoint(x: v.x - scrollView.bounds.minX, y: v.y - scrollView.bounds.minY))
         }
         applyZoom(z)
         isAtFit = abs(scrollView.zoom - fitZoom) <= fitZoom * 0.001
-        if centreFit, case .world(let id) = mode {
-            centre(on: boardContent?.center ?? .zero, page: id)
+        if centreFit {
+            hasManualPan = false
+            if case .world(let id) = mode {
+                centre(on: boardContent?.center ?? .zero, page: id)
+            } else if let page = targetPage {
+                scrollToPage(page, animated: false)
+            }
         } else if let a = keepAnchor {
             keep(a)
         }
@@ -690,6 +724,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// Pans by page points (or fractions of the window). A paged window turns the page for a window-sized step.
     func scrollBy(dx: Double, dy: Double, windowFractions: Bool, animated: Bool) {
         guard isViewLoaded, didInitialLayout, !isClosed else { return }
+        if dx != 0 || dy != 0 { hasManualPan = true }
         if windowFractions, case .stack(.horizontal) = mode, abs(dx) >= 0.5,
            let current = session.page, let i = scrollView.index(of: current) {
             let j = min(max(i + (dx > 0 ? 1 : -1), 0), scrollView.pages.count - 1)
@@ -902,6 +937,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     private func readOnlyChanged() {
+        view.setNeedsLayout()
         applyStylusMode()
         host.inputController?.canvasReadOnlyDidChange(host)
         updateAddPageIndicator()
@@ -1013,6 +1049,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        hasManualPan = true
         // The user takes over: the page at the middle of the window is the current page again.
         requestedPage = nil
         isAnimatingScroll = false

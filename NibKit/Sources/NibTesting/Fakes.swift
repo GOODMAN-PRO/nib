@@ -28,26 +28,45 @@ public final class InMemorySecretStore: SecretStore {
 
 /// Renders blank images of the requested size; `marks` is returned verbatim when requested.
 public final class FakeRenderer: PageRenderer {
-    public var marks: [String: String] = [:]
-    public private(set) var requests: [RenderRequest] = []
-    public private(set) var invalidations: [(DocumentID, PageID, Rect?)] = []
-    public var pageSize = PageSize.a4
+    // PageRenderer's async methods run on the generic executor. SwiftUI thumbnails can call the same fake
+    // concurrently, so recording requests must be synchronised just like the real renderer's cache.
+    private let lock = NSLock()
+    private var storedMarks: [String: String] = [:]
+    private var storedRequests: [RenderRequest] = []
+    private var storedInvalidations: [(DocumentID, PageID, Rect?)] = []
+    private var storedPageSize = PageSize.a4
+
+    public var marks: [String: String] {
+        get { lock.withLock { storedMarks } }
+        set { lock.withLock { storedMarks = newValue } }
+    }
+    public var requests: [RenderRequest] { lock.withLock { storedRequests } }
+    public var invalidations: [(DocumentID, PageID, Rect?)] { lock.withLock { storedInvalidations } }
+    public var pageSize: PageSize {
+        get { lock.withLock { storedPageSize } }
+        set { lock.withLock { storedPageSize = newValue } }
+    }
 
     public init() {}
 
     public func render(_ request: RenderRequest) async throws -> RenderResult {
-        requests.append(request)
-        let region = request.region ?? Rect(x: 0, y: 0, width: pageSize.width, height: pageSize.height)
+        let (region, resultMarks) = lock.withLock {
+            storedRequests.append(request)
+            return (request.region ?? Rect(x: 0, y: 0, width: storedPageSize.width, height: storedPageSize.height),
+                    request.marks ? storedMarks : [:])
+        }
         let size = CGSize(width: max(1, region.width * request.scale), height: max(1, region.height * request.scale))
         return RenderResult(image: FakeRenderer.blank(size), region: region, scale: request.scale,
-                            marks: request.marks ? marks : [:])
+                            marks: resultMarks)
     }
 
     public func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
         FakeRenderer.blank(CGSize(width: maxPixelSize, height: maxPixelSize))
     }
 
-    public func invalidate(doc: DocumentID, page: PageID, rect: Rect?) { invalidations.append((doc, page, rect)) }
+    public func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {
+        lock.withLock { storedInvalidations.append((doc, page, rect)) }
+    }
     public func purgeCaches() {}
 
     public static func blank(_ size: CGSize) -> CGImage {

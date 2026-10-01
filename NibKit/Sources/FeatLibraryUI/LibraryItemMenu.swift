@@ -138,7 +138,8 @@ struct LibraryBuds: View {
         }
     }
     private func binding(_ menu: String) -> Binding<Bool> {
-        Binding(get: { model.menu == menu }, set: { model.setView(["menu": $0 ? .string(menu) : "none"]) })
+        Binding(get: { model.menu == menu && model.menuAnchors["library." + menu] != nil },
+                set: { model.setView(["menu": $0 ? .string(menu) : "none"]) })
     }
 }
 
@@ -153,7 +154,7 @@ struct LibraryNewButton: View {
                 NibDropletButton(id: "library.new.button", title: String(localized: "New"), symbol: .plus, kind: .tinted) { model.setView(["menu": "new"]) }
             }
         }
-        .nibBudAnchor("library.new")
+        .libraryChromeFrame("anchor.library.new")
         .overlay {
             LibraryNewTapTarget(single: { model.setView(["menu": "new"]) }, double: {
                 model.setView(["menu": "none"])

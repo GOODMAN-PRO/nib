@@ -13,14 +13,16 @@ public enum FeatSearchUIFeature: NibFeature {
         app.settings.declarePrefix(SearchRuntime.recentPrefix, synced: false,
             summary: "Last document-open time for the twenty most recently opened documents.", owner: id,
             schema: .num(min: 0))
-        app.ui.panels.register(PanelDescriptor(id: SearchOpen.documentPanel, title: String(localized: "Search"),
-            icon: NibSymbol.search.name, placement: .sidebarTab, order: 40, owner: id) { context in
+        var document = PanelDescriptor(id: SearchOpen.documentPanel, title: String(localized: "Search"),
+            icon: NibSymbol.search.name, placement: .fullScreen, order: 40, owner: id) { context in
                 if let session = context.session {
-                    return AnyView(DocumentSearchPanel(app: context.app, session: session,
+                    return AnyView(DocumentSearchSheet(app: context.app, session: session,
                         state: SearchRuntime.from(context.app).state(session)))
                 }
                 return AnyView(NibEmptyState(symbol: .search, title: String(localized: "Open a document to search it")))
-            })
+            }
+        document.providesHeader = true
+        app.ui.panels.register(document)
         var library = PanelDescriptor(id: SearchOpen.libraryPanel, title: String(localized: "Search"),
             icon: NibSymbol.search.name, placement: .fullScreen, order: 40, owner: id) { context in
                 if let session = context.session ?? context.navigator?.session {
@@ -35,7 +37,11 @@ public enum FeatSearchUIFeature: NibFeature {
             icon: NibSymbol.search.name, group: .navLeading, order: 200, owner: id,
             command: CommandIDs.searchOpen, params: ["scope": "document"],
             shortcut: KeyShortcut("f", [.command]), docKinds: Set(DocumentKind.allCases))
-        toolbar.isOn = { $0.openPanels.contains(SearchOpen.documentPanel) }
+        toolbar.isOn = { [weak app] in
+            guard let app else { return false }
+            let state = SearchRuntime.from(app).state($0)
+            return state.isPresented && !state.isLibraryScope && state.document == $0.document
+        }
         app.ui.toolbar.register(toolbar)
         app.ui.menus.register(MenuItemDescriptor(id: "searchui.libraryFind", title: String(localized: "Search library"),
             icon: NibSymbol.search.name, location: .appMenu, order: 40, owner: id,
@@ -55,12 +61,12 @@ public enum FeatSearchUIFeature: NibFeature {
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "searchui.highlights", owner: id) { host in
             SearchHighlights(state: SearchRuntime.from(host.app).state(host.session))
         })
-        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.field", owner: id, placement: .top,
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.document", owner: id, placement: .top,
             surface: .none, isVisible: { context in
                 let state = SearchRuntime.from(context.app).state(context.session)
-                return !context.isCompact && !state.isLibraryScope && state.isPresented && state.document == context.session.document
+                return !SearchOpen.usesDocumentSheet && !state.isLibraryScope && state.isPresented && state.document == context.session.document
             }, makeView: { context in
-                AnyView(DocumentSearchField(app: context.app, session: context.session,
+                AnyView(DocumentSearchPanel(app: context.app, session: context.session,
                     state: SearchRuntime.from(context.app).state(context.session)))
             }))
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.counter", owner: id, placement: .bottom, surface: .none,
@@ -79,6 +85,9 @@ struct SearchOpen: NibCommand {
     static let libraryPanel = "searchui.library"
     static let documentPanel = "searchui.document"
     static let libraryOverlay = "searchui.libraryOverlay"
+    // A narrow iPad Split View still uses the full-width field/results overlay (§14.5).
+    // Only iPhone uses a full-screen system search field.
+    static var usesDocumentSheet: Bool { UIDevice.current.userInterfaceIdiom == .phone }
     struct Params: Codable {
         var scope: String
         var query: String?
@@ -152,7 +161,7 @@ struct SearchOpen: NibCommand {
                 if !host.isPresenting(libraryOverlay) {
                     host.present(libraryOverlay) { LibrarySearchOverlay(app: app, session: session, state: state) }
                 }
-            } else {
+            } else if state.isLibraryScope || usesDocumentSheet {
                 let panel = state.isLibraryScope ? libraryPanel : documentPanel
                 if !session.openPanels.contains(panel) {
                     _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(panel), "instant": .bool(state.instant)])

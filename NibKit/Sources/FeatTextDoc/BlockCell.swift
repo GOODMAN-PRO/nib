@@ -244,7 +244,9 @@ final class BlockTextView: UITextView {
         allowsEditingTextAttributes = true
         adjustsFontForContentSizeCategory = false
         linkTextAttributes = [.foregroundColor: NibUIColor.accent, .underlineStyle: NSUnderlineStyle.single.rawValue]
-        placeholderLabel.textColor = NibUIColor.labelTertiary
+        // Placeholders must remain readable on both editor backgrounds, including small captions.
+        // Wording and italic styling distinguish them from content without relying on low opacity.
+        placeholderLabel.textColor = NibUIColor.labelSecondary.withAlphaComponent(1)
         placeholderLabel.isAccessibilityElement = false
         placeholderLabel.isUserInteractionEnabled = false
         addSubview(placeholderLabel)
@@ -270,7 +272,11 @@ final class BlockTextView: UITextView {
     func updatePlaceholder() {
         let empty = textStorage.length == 0
         placeholderLabel.isHidden = !(empty && placeholder != nil && (alwaysShowsPlaceholder || isFirstResponder))
-        if let style = style { placeholderLabel.font = style.baseFont }
+        if let style = style {
+            let descriptor = style.baseFont.fontDescriptor
+            let italic = descriptor.withSymbolicTraits(descriptor.symbolicTraits.union(.traitItalic)) ?? descriptor
+            placeholderLabel.font = UIFont(descriptor: italic, size: style.baseFont.pointSize)
+        }
         setNeedsLayout()
     }
 

@@ -157,8 +157,9 @@ struct PanelSheetView: View {
 /// Where chrome overlays rest. Pure, so it is unit-tested. Each placement stacks its overlays away from its edge in
 /// z-order (the lowest `order` nearest the edge), 16 pt apart (the resting gap, DESIGN.md §10.4): top ones hang
 /// below the bars, bottom ones stand on the region's bottom edge, leading, trailing and centre ones are centred
-/// vertically. An anchored overlay sits below its anchor, above it when there is no room below, clamped inside the
-/// region either way.
+/// vertically. Bottom groups also clear one another, keeping the trailing HUD nearest the keyboard and lifting
+/// the centred counter when needed. An anchored overlay sits below its anchor, above it when there is no room
+/// below, clamped inside the region either way.
 enum ChromeOverlayGeometry {
     struct Item: Equatable {
         var id: String
@@ -194,15 +195,8 @@ enum ChromeOverlayGeometry {
                     y += entry.size.height + gap
                 }
             case .bottomLeading, .bottom, .bottomTrailing:
-                // Keyboard clearance belongs to bottom HUDs, never to the top field or the bars.
-                let bottomRegion = ChromeRegion.avoidingKeyboard(keyboardFrame, in: region)
-                var y = bottomRegion.maxY
-                for entry in stack {
-                    y -= entry.size.height
-                    frames[entry.id] = CGRect(origin: CGPoint(x: x(placement, width: entry.size.width, in: region), y: y),
-                                              size: entry.size)
-                    y -= gap
-                }
+                // Resolve all three bottom placements together below, independent of dictionary iteration order.
+                break
             case .leading, .trailing, .center:
                 let total = stack.reduce(CGFloat(0)) { $0 + $1.size.height } + gap * CGFloat(max(0, stack.count - 1))
                 var y = max(region.minY, region.midY - total / 2)
@@ -213,6 +207,27 @@ enum ChromeOverlayGeometry {
                 }
             case .anchored:
                 break
+            }
+        }
+        // Keep the page HUD at the trailing edge. Other corner HUDs, then the centred search counter, move up
+        // only when their measured frames cannot share a row with the 16 pt resting gap (DESIGN.md §10.4).
+        // Moving upwards preserves keyboard clearance and the controls' measured sizes / 44 pt hit targets.
+        let bottomRegion = ChromeRegion.avoidingKeyboard(keyboardFrame, in: region)
+        var bottomFrames: [CGRect] = []
+        for placement in [ChromePlacement.bottomTrailing, .bottomLeading, .bottom] {
+            var bottom = bottomRegion.maxY
+            for entry in stacks[placement] ?? [] {
+                var frame = CGRect(x: x(placement, width: entry.size.width, in: region),
+                                   y: bottom - entry.size.height, width: entry.size.width, height: entry.size.height)
+                while let ceiling = bottomFrames.filter({ other in
+                    frame.minX < other.maxX + gap && frame.maxX + gap > other.minX
+                        && frame.minY < other.maxY + gap && frame.maxY + gap > other.minY
+                }).map(\.minY).min() {
+                    frame.origin.y = ceiling - gap - frame.height
+                }
+                frames[entry.id] = frame
+                bottomFrames.append(frame)
+                bottom = frame.minY - gap
             }
         }
         return frames

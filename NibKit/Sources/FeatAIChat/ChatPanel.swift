@@ -30,12 +30,8 @@ struct ChatPanel: View {
                 .accessibilityLabel(String(localized: "Assistant options"))
             }
             if model.showsConversations { conversationList }
-            else {
-                contextRow
-                Rectangle().fill(NibColor.separatorSoft).frame(height: NibStroke.hairline)
-                thread
-                composer
-            }
+            else if !model.isConfigured { connectionBody }
+            else { configuredBody }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .contain)
@@ -129,45 +125,62 @@ struct ChatPanel: View {
         .padding(.bottom, NibSpacing.s)
     }
 
-    private var thread: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: NibSpacing.xl) {
-                    if !model.isConfigured {
-                        NibEmptyState(symbol: .assistant, title: String(localized: "Connect a model"),
-                                      message: String(localized: "Connect a model to use the assistant."))
-                        ForEach(["Anthropic", "OpenAI-compatible", "Ollama", "LM Studio", "Custom"], id: \.self) { provider in
-                            NibButton(provider, symbol: .settings, kind: .plain) { model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)]) }
-                        }
-                    } else if model.entries.isEmpty {
-                        Text(String(localized: "Ask about your notes, or switch to Edit to change them."))
-                            .font(NibFont.chat).foregroundStyle(NibColor.labelSecondary)
+    // Setup owns the whole body. Inactive context and composer controls must never squeeze it out of a sheet.
+    private var connectionBody: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: NibSpacing.l) {
+                Label { Text(String(localized: "Connect a model")) } icon: { Image(nib: .assistant) }
+                    .font(NibFont.headline).foregroundStyle(NibColor.label)
+                    .accessibilityAddTraits(.isHeader)
+                Text(String(localized: "Connect a model to use the assistant."))
+                    .font(NibFont.callout).foregroundStyle(NibColor.label)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(["Anthropic", "OpenAI-compatible", "Ollama", "LM Studio", "Custom"], id: \.self) { provider in
+                    NibButton(provider, symbol: .settings, kind: .plain) {
+                        model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)])
                     }
-                    ForEach(model.entries) { entry in ChatMessageView(model: model, entry: entry).id(entry.id) }
-                    if model.isStreaming, model.entries.last?.text.isEmpty == true {
-                        NibTraceRow(String(localized: "Reading your context…"), phase: .running)
-                    }
-                    if model.isGeneratingImage {
-                        NibTraceRow(String(localized: "Generating image…"), phase: .running)
-                    }
-                    if model.isLoadingChat {
-                        NibTraceRow(String(localized: "Loading conversation…"), phase: .running)
-                    }
-                    if !model.proposals.isEmpty { ChatProposalsView(model: model) }
-                    if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
-                    if let error = model.error {
-                        NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
-                                  action: model.retryPrompt != nil && !model.isStreaming ? NibAction(String(localized: "Retry")) {
-                            model.perform(ChatCommand.send, ["retry": true])
-                        } : nil)
-                    }
-                    Color.clear.frame(height: NibSpacing.xxs).id("aichat.bottom")
                 }
-                .padding(NibSpacing.l)
             }
-            .scrollBounceBehavior(.basedOnSize)
-            .onChange(of: model.entries.last?.id) { _, _ in proxy.scrollTo("aichat.bottom", anchor: .bottom) }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(NibSpacing.l)
         }
+        .scrollBounceBehavior(.basedOnSize)
+    }
+
+    private var configuredBody: some View {
+        ScrollViewReader { proxy in
+            ChatThreadLayout(context: contextRow, thread: threadContent, composer: composer)
+                .onChange(of: model.entries.last?.id) { _, _ in proxy.scrollTo("aichat.bottom", anchor: .bottom) }
+        }
+    }
+
+    private var threadContent: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xl) {
+            if model.entries.isEmpty {
+                Text(String(localized: "Ask about your notes, or switch to Edit to change them."))
+                    .font(NibFont.chat).foregroundStyle(NibColor.labelSecondary)
+            }
+            ForEach(model.entries) { entry in ChatMessageView(model: model, entry: entry).id(entry.id) }
+            if model.isStreaming, model.entries.last?.text.isEmpty == true {
+                NibTraceRow(String(localized: "Reading your context…"), phase: .running)
+            }
+            if model.isGeneratingImage {
+                NibTraceRow(String(localized: "Generating image…"), phase: .running)
+            }
+            if model.isLoadingChat {
+                NibTraceRow(String(localized: "Loading conversation…"), phase: .running)
+            }
+            if !model.proposals.isEmpty { ChatProposalsView(model: model) }
+            if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
+            if let error = model.error {
+                NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
+                          action: model.retryPrompt != nil && !model.isStreaming ? NibAction(String(localized: "Retry")) {
+                    model.perform(ChatCommand.send, ["retry": true])
+                } : nil)
+            }
+            Color.clear.frame(height: NibSpacing.xxs).id("aichat.bottom")
+        }
+        .padding(NibSpacing.l)
     }
 
     private var composer: some View {
@@ -202,7 +215,7 @@ struct ChatPanel: View {
                 Spacer(minLength: 0)
             }
             Text(String(localized: "\(model.tokenCount.formatted()) tokens this chat · sent only to your provider"))
-                .font(NibFont.caption2).foregroundStyle(NibColor.labelSecondary)
+                .font(NibFont.caption2).foregroundStyle(NibColor.label)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(NibSpacing.l)
@@ -255,6 +268,38 @@ struct ChatPanel: View {
         case .sidebar: return String(localized: "Sidebar")
         case .window: return String(localized: "Window")
         default: return String(localized: "Floating")
+        }
+    }
+}
+
+/// Keep a readable thread between fixed controls when they fit. At short detents or large text sizes, scroll
+/// the entire body instead, so neither the thread nor the composer is compressed or clipped offscreen.
+struct ChatThreadLayout<Context: View, Thread: View, Composer: View>: View {
+    let context: Context
+    let thread: Thread
+    let composer: Composer
+    static var minimumThreadHeight: CGFloat { NibMetrics.hitTarget * 3 }
+
+    var body: some View {
+        ViewThatFits(in: .vertical) {
+            VStack(spacing: 0) {
+                context.fixedSize(horizontal: false, vertical: true)
+                Rectangle().fill(NibColor.separatorSoft).frame(height: NibStroke.hairline)
+                ScrollView { thread }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(minHeight: Self.minimumThreadHeight)
+                composer.fixedSize(horizontal: false, vertical: true)
+            }
+            ScrollView {
+                VStack(spacing: 0) {
+                    context
+                    Rectangle().fill(NibColor.separatorSoft).frame(height: NibStroke.hairline)
+                    thread.frame(minHeight: Self.minimumThreadHeight, alignment: .top)
+                    composer
+                }
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .scrollBounceBehavior(.basedOnSize)
         }
     }
 }

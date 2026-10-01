@@ -3,6 +3,7 @@ import UIKit
 import SwiftUI
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatCanvas
 
 /// The canvas (F006) end to end on the fixture documents: registration, the view.* and canvas.* commands on a live
@@ -214,6 +215,82 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(vc.hud.primaryText, "1")
         XCTAssertEqual(vc.hud.secondaryText, "/ 3")
         XCTAssertEqual(vc.hud.zoomPercent, ZoomRules.percent(vc.zoom))
+    }
+
+    func testTopDockKeepsFittedPageBelowOptionsInPhoneLandscape() async throws {
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            // Stand in for the toolbar screen without importing another feature's implementation.
+            h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+            let vc = try makeCanvas(h, page: Fixtures.page2, size: CGSize(width: 844, height: 390))
+            defer { vc.closeCanvas() }
+            vc.traitOverrides.horizontalSizeClass = .compact
+            vc.overrideUserInterfaceStyle = appearance
+            vc.view.setNeedsLayout()
+            vc.view.layoutIfNeeded()
+            _ = try await h.run("view.zoom", ["fit": true])
+            let originalTop = vc.scrollView.chromeInsets.top
+
+            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "top", "along": 0.5])
+            await waitUntil("top dock clearance") {
+                vc.view.layoutIfNeeded()
+                return vc.scrollView.chromeInsets.top > originalTop
+            }
+            let safe = vc.view.safeAreaInsets
+            let paletteRegion = DropletDockModel.region(
+                size: vc.view.bounds.size,
+                safeArea: EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right),
+                compact: true)
+            let pageTop = windowPoint(vc, .zero, Fixtures.page2).y
+            XCTAssertGreaterThanOrEqual(pageTop, paletteRegion.minY + NibMetrics.paletteThickness
+                                        + NibMetrics.barHeight + NibSpacing.m - 0.5)
+            XCTAssertEqual(pageTop, vc.scrollView.chromeInsets.top, accuracy: 0.5)
+            XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
+            XCTAssertEqual(h.session.page, Fixtures.page2)
+
+            // Docking back releases the clearance without changing pages or leaving the old top gap.
+            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+            await waitUntil("bottom dock clearance") {
+                vc.view.layoutIfNeeded()
+                return vc.scrollView.chromeInsets.top == originalTop
+            }
+            XCTAssertEqual(windowPoint(vc, .zero, Fixtures.page2).y, originalTop, accuracy: 0.5)
+            XCTAssertEqual(h.session.page, Fixtures.page2)
+        }
+    }
+
+    func testDockChangePreservesManualZoomAndPanIncludingPanAtFitWidth() async throws {
+        for zoomIn in [false, true] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+            let vc = try makeCanvas(h, size: CGSize(width: 844, height: 390))
+            defer { vc.closeCanvas() }
+            vc.traitOverrides.horizontalSizeClass = .compact
+            vc.view.setNeedsLayout()
+            vc.view.layoutIfNeeded()
+            if zoomIn { vc.setZoom(vc.fitZoom * 2, anchor: nil, centreFit: false) }
+            vc.scrollBy(dx: zoomIn ? 40 : 0, dy: 160, windowFractions: false, animated: false)
+            let point = Point(200, 200)
+            let before = windowPoint(vc, point, Fixtures.page1)
+            let zoom = vc.zoom
+            let top = vc.scrollView.chromeInsets.top
+
+            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "top", "along": 0.5])
+            await waitUntil("manual view's new chrome inset") {
+                vc.view.layoutIfNeeded()
+                return vc.scrollView.chromeInsets.top > top
+            }
+            let after = windowPoint(vc, point, Fixtures.page1)
+            XCTAssertEqual(after.x, before.x, accuracy: 0.5)
+            XCTAssertEqual(after.y, before.y, accuracy: 0.5)
+            XCTAssertEqual(vc.zoom, zoom, accuracy: 1e-9)
+
+            // Explicit fit restores the page-first position after manual navigation.
+            _ = try await h.run("view.zoom", ["fit": true])
+            XCTAssertEqual(windowPoint(vc, .zero, Fixtures.page1).y, vc.scrollView.chromeInsets.top, accuracy: 0.5)
+        }
     }
 
     func testGeometryRoundTripsThroughPageTransformAndConvert() throws {

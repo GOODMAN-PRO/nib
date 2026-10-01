@@ -95,7 +95,8 @@ struct AttachedDroplet<Content: View>: View {
             }
             .opacity(p.contentOpacity)
             .transformEffect(contentTransform(p))
-            .modifier(DropletBodyModifier(id: id, style: style, presentation: p, namespace: namespace, field: field))
+            .modifier(DropletBodyModifier(id: id, style: style, presentation: p, namespace: namespace, field: field,
+                                          isBud: bud != nil, requestedHidden: requestedHidden))
             .overlay {
                 if !style.drawsBody && p.isDrawn {
                     FrameRim(style: style, presentation: p)
@@ -191,40 +192,54 @@ struct DropletBodyModifier: ViewModifier {
     let presentation: DropletPresentation
     let namespace: Namespace.ID?
     let field: DropletField
+    var isBud = false
+    var requestedHidden = false
     @Environment(\.colorScheme) private var colorScheme
+
+    var drawsNativeBody: Bool {
+        Self.drawsBody(style: style, presentation: presentation, isBud: isBud, requestedHidden: requestedHidden)
+    }
+
+    static func drawsBody(style: DropletStyle, presentation: DropletPresentation,
+                          isBud: Bool = false, requestedHidden: Bool = false) -> Bool {
+        guard style.drawsBody, !presentation.hidden, !(requestedHidden && !presentation.hasBud) else { return false }
+        // Resting controls already have a SwiftUI layout before the field receives its first measurement.
+        // Use that layout immediately; buds and dry covers still require an explicit visible presentation.
+        return presentation.isDrawn || (!isBud && !presentation.hasBud && !style.restsDry)
+    }
 
     func body(content: Content) -> some View {
         // Disabled glass and frame-only droplets must remain ordinary SwiftUI content. Even identity glass
         // creates a system compositor host, which offscreen ImageRenderer cannot draw.
-        if #available(iOS 26.0, *), field.usesSystemGlass, style.drawsBody {
-            let enabled = field.usesSystemGlass && style.drawsBody
-            let drawn = enabled && presentation.isDrawn && !presentation.hidden
-            let shape = NibDropletShape(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius)
-            let dx = enabled ? (presentation.bodySize.width - presentation.restSize.width) / 2 : 0
-            let dy = enabled ? (presentation.bodySize.height - presentation.restSize.height) / 2 : 0
-            content
-                .padding(.horizontal, dx)
-                .padding(.vertical, dy)
-                .background {
-                    if drawn {
-                        if field.isFrozen {
-                            shape.fill(NibGlassBodyTint.color(style.glassKind, paperShare: presentation.paperShare))
-                        } else {
-                            shape.fill(NibGlassBodyTint.systemUnderlay(style.glassKind, colorScheme: colorScheme,
-                                                                       paperShare: presentation.paperShare))
-                        }
-                    }
+        if #available(iOS 26.0, *), field.usesSystemGlass, drawsNativeBody {
+            let radius = presentation.restSize == .zero ? style.cornerRadius : presentation.cornerRadius
+            let shape = NibDropletShape(cornerRadius: style.cornerRadius == nil ? nil : radius)
+            let dx = (presentation.bodySize.width - presentation.restSize.width) / 2
+            let dy = (presentation.bodySize.height - presentation.restSize.height) / 2
+            NibNativeGlass(effect: field.isFrozen ? .identity : style.systemGlass, shape: shape) {
+                content
+                    .padding(.horizontal, dx)
+                    .padding(.vertical, dy)
+            }
+            .modifier(GlassIDModifier(id: id, namespace: namespace))
+            .background {
+                // The fill must be a backdrop of the returned glass host, never part of its foreground.
+                if field.isFrozen {
+                    shape.fill(NibGlassBodyTint.color(style.glassKind, paperShare: presentation.paperShare,
+                                                     colorScheme: colorScheme))
+                } else {
+                    shape.fill(NibGlassBodyTint.systemUnderlay(style.glassKind, colorScheme: colorScheme,
+                                                              paperShare: presentation.paperShare))
                 }
-                .glassEffect(drawn && !field.isFrozen ? style.systemGlass : .identity, in: shape)
-                .modifier(GlassIDModifier(id: id, namespace: namespace))
-                .overlay {
-                    if drawn && presentation.rim > 1.001 {
-                        NibLiftRim(cornerRadius: shape.cornerRadius, boost: presentation.rim - 1)
-                    }
+            }
+            .overlay {
+                if presentation.rim > 1.001 {
+                    NibLiftRim(cornerRadius: shape.cornerRadius, boost: presentation.rim - 1)
                 }
-                .offset(x: enabled ? presentation.bodyOffset.x : 0, y: enabled ? presentation.bodyOffset.y : 0)
-                .padding(.vertical, -dy)
-                .padding(.horizontal, -dx)
+            }
+            .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
+            .padding(.vertical, -dy)
+            .padding(.horizontal, -dx)
         } else {
             content
         }
@@ -274,5 +289,6 @@ struct BudAnchorReader: View {
             } action: { frame in
                 field?.setWorldAnchor(id, frame)
             }
+            .onDisappear { field?.removeWorldAnchor(id) }
     }
 }

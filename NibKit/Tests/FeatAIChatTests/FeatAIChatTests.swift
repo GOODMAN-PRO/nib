@@ -12,7 +12,9 @@ final class FeatAIChatTests: XCTestCase {
         let h = Harness(features: [FeatAIChatFeature.self])
         let panel = try XCTUnwrap(h.app.ui.panels.get(PanelIDs.assistant))
         XCTAssertTrue(panel.providesHeader)
+        // The host's full-width panel kind can dock or float; the stored placement determines its default.
         XCTAssertEqual(panel.placement, .floating)
+        XCTAssertEqual(h.app.settings.json("chrome.panelPlacement." + PanelIDs.assistant), "right")
         let item = try XCTUnwrap(h.app.ui.menus.all.first { $0.location == .block })
         let context = MenuContext(app: h.app, session: h.session, ref: "block:FIXTUREDOC02/FIXTUREBLK01")
         XCTAssertEqual(item.params(context)["scope"]?.stringValue, "block")
@@ -25,6 +27,20 @@ final class FeatAIChatTests: XCTestCase {
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatAIChatFeature.self], owners: [FeatAIChatFeature.id])
         XCTAssertEqual(problems, [])
+    }
+
+    func testRegistrationPreservesExplicitPanelPlacement() {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let name = "chrome.panelPlacement." + PanelIDs.assistant
+        XCTAssertFalse(h.app.settings.get(NibSettings.sidebarOnRight), "The notebook sidebar is independent.")
+        for choice in ["floating", "left", "right"] {
+            h.app.settings.setJSON(name, .string(choice))
+            FeatAIChatFeature.register(h.app)
+            XCTAssertEqual(h.app.settings.json(name)?.stringValue, choice)
+        }
+        h.app.settings.setJSON(name, nil)
+        FeatAIChatFeature.register(h.app)
+        XCTAssertEqual(h.app.settings.json(name), "right")
     }
 
     func testPresenterRetainsFallbackAndIsOnlyInstalledForAI() async throws {
@@ -315,7 +331,7 @@ final class FeatAIChatTests: XCTestCase {
         h.app.settings.set(NibSettings.sidebarOnRight, true)
         _ = try await h.run(ChatCommand.open, ["mode": "sidebar"])
         _ = try await h.run(ChatCommand.open, ["mode": "floating"])
-        XCTAssertEqual(placements, ["floating", "left", "right", "floating"])
+        XCTAssertEqual(placements, ["right", "left", "right", "floating"])
         XCTAssertEqual(closes, 3)
         XCTAssertTrue(received.allSatisfy { $0["scope"] == "block" && $0["refs"] == ["block:FIXTUREDOC02/FIXTUREBLK01"] })
         XCTAssertEqual(model.entries.last?.text, "Still here")
@@ -329,6 +345,9 @@ final class FeatAIChatTests: XCTestCase {
         model.entries = [ChatEntry(id: "LAYOUTMSG", role: "assistant", text: "Review this paragraph before accepting a change.")]
         let descriptor = try XCTUnwrap(h.app.ui.panels.get(PanelIDs.assistant))
         for (placement, size) in [(PanelPresentation.sheet, CGSize(width: 390, height: 844)),
+                                  (.sheet, CGSize(width: 390, height: 422)),
+                                  (.sheet, CGSize(width: 844, height: 240)),
+                                  (.sheet, CGSize(width: 844, height: 390)),
                                   (.sidebar, CGSize(width: 344, height: 900)), (.floating, CGSize(width: 344, height: 560)),
                                   (.window, CGSize(width: 1024, height: 900))] {
             var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
@@ -336,6 +355,103 @@ final class FeatAIChatTests: XCTestCase {
             for variant in NibSnapshot.Variant.allCases {
                 let image = try XCTUnwrap(NibSnapshot.image(descriptor.makeView(context), size: size, variant: variant, scale: 1))
                 XCTAssertEqual(image.size, size)
+            }
+        }
+    }
+
+    func testShortBodyKeepsThreadReadableAndTallBodyPinsComposer() async throws {
+        // Distinct solid regions exercise the real layout without depending on text rasterisation. A compressed
+        // thread or an overflowing fixed stack cannot leave green at both sample points in the short body.
+        // ImageRenderer omits the UIKit-backed scrolling viewport; capture the live view's layers instead.
+        let layout = ChatThreadLayout(context: Color.red.frame(height: 88),
+                                      thread: Color.green.frame(height: 132),
+                                      composer: Color.blue.frame(height: 176))
+        for width: CGFloat in [344, 390, 844] {
+            let short = try await layoutImage(layout, size: CGSize(width: width, height: 220))
+            let attachment = XCTAttachment(image: short)
+            attachment.name = "assistant-short-body-\(Int(width))"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            for y: CGFloat in [112, 200] {
+                let pixel = try XCTUnwrap(NibSnapshot.pixel(short, at: CGPoint(x: width / 2, y: y)))
+                XCTAssertGreaterThan(pixel.g, pixel.r)
+                XCTAssertGreaterThan(pixel.g, pixel.b)
+            }
+            let tall = try await layoutImage(layout, size: CGSize(width: width, height: 640))
+            let bottom = try XCTUnwrap(NibSnapshot.pixel(tall, at: CGPoint(x: width / 2, y: 620)))
+            XCTAssertGreaterThan(bottom.b, bottom.r)
+            XCTAssertGreaterThan(bottom.b, bottom.g)
+        }
+    }
+
+    private func layoutImage<V: View>(_ view: V, size: CGSize) async throws -> UIImage {
+        let host = UIHostingController(rootView: view.ignoresSafeArea()
+            .environment(\.colorScheme, .light).environment(\.dynamicTypeSize, .large))
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.backgroundColor = .clear
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        // Allow SwiftUI to mount and lay out the selected ViewThatFits branch and its scroll content.
+        try await Task.sleep(for: .milliseconds(100))
+        host.view.layoutIfNeeded()
+        host.view.layer.displayIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            host.view.layer.render(in: context.cgContext)
+        }
+    }
+
+    func testConnectionScreenDoesNotRenderInactiveComposerAtEitherDetent() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let ai = FakeAIService()
+        ai.isConfigured = false
+        h.app.services.ai = ai
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let descriptor = try XCTUnwrap(h.app.ui.panels.get(PanelIDs.assistant))
+        var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        context.presentation = .sheet
+        for size in [CGSize(width: 390, height: 422), CGSize(width: 390, height: 844),
+                     CGSize(width: 844, height: 240), CGSize(width: 844, height: 390)] {
+            for variant in NibSnapshot.Variant.allCases {
+                model.composer = ""
+                let empty = try XCTUnwrap(NibSnapshot.image(descriptor.makeView(context), size: size, variant: variant, scale: 1))
+                model.composer = "A retained draft\nwith multiple lines\nmust not consume setup space."
+                let draft = try XCTUnwrap(NibSnapshot.image(descriptor.makeView(context), size: size, variant: variant, scale: 1))
+                XCTAssertEqual(empty.pngData(), draft.pngData(), "An inactive composer must not alter setup: \(size), \(variant)")
+                let attachment = XCTAttachment(image: empty)
+                attachment.name = "Assistant connection \(Int(size.width))x\(Int(size.height)) \(variant.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+        }
+    }
+
+    func testPrivacyFooterLabelMeetsSmallTextContrastOnPanelSurfaces() {
+        func components(_ color: UIColor, traits: UITraitCollection) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            XCTAssertTrue(color.resolvedColor(with: traits).getRed(&r, green: &g, blue: &b, alpha: &a))
+            return (r, g, b, a)
+        }
+        func luminance(_ rgb: [CGFloat]) -> CGFloat {
+            let linear = rgb.map { $0 <= 0.04045 ? $0 / 12.92 : pow(($0 + 0.055) / 1.055, 2.4) }
+            return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
+        }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let traits = UITraitCollection(userInterfaceStyle: style)
+            let text = components(NibUIColor.label, traits: traits)
+            for surface in [NibUIColor.backgroundSecondary, NibUIColor.chromeOpaque, NibUIColor.deepBody] {
+                let body = components(surface, traits: traits)
+                // Black ink beneath light glass, white paper beneath dark glass.
+                let backdrop: CGFloat = style == .dark ? 1 : 0
+                let bg = [body.0, body.1, body.2].map { $0 * body.3 + backdrop * (1 - body.3) }
+                let fg = zip([text.0, text.1, text.2], bg).map { $0 * text.3 + $1 * (1 - text.3) }
+                let a = luminance(fg), b = luminance(bg)
+                XCTAssertGreaterThanOrEqual((max(a, b) + 0.05) / (min(a, b) + 0.05), 4.5)
             }
         }
     }

@@ -64,6 +64,16 @@ final class TokenContrastTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testEmptyStateExplanationIsReadableInstructionalText() {
+        let message = UIColor(NibEmptyState.messageForeground)
+        for dark in [false, true] {
+            for surface in [NibUIColor.background, NibUIColor.backgroundSecondary] {
+                XCTAssertGreaterThanOrEqual(contrast(message, on: surface, over: whitePaper, dark: dark), 4.5)
+            }
+        }
+    }
+
     func testAccentTextPassesOnLibraryAndSheetBackgrounds() {
         // DESIGN.md §3.2: Pool is 5.3:1 on white and 6.3:1 on black, so 15 pt links pass AA.
         XCTAssertEqual(contrast(NibUIColor.accent, on: NibUIColor.background, over: whitePaper, dark: false), 5.3, accuracy: 0.1)
