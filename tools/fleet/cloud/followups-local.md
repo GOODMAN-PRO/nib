@@ -9,3 +9,12 @@
 - F054 ↔ F089: F054's embedded Summary subtab shows F089's summary JSON as plain text; it must render it the way F089's Summary sidebar does (fix in F054's files).
 - F085 COMPLETION PASS (before integration): Codex left out (in F085's own scope) the inline per-block AI button; selective proposal toggles + on-page proofreader previews; historical attachment/tool-trace/cross-device token restoration; end-to-end nav/sidebar/floating verification with F017's host. The review didn't flag them. Run resume implement for F085 with these as the note, then CI + review.
 - F002/F070 ↔ F111 (BUG): library.repair returns catalogRebuilt=false — repair does not recreate a deleted catalogue (doc.create -> FolderLibrary.changed -> scheduleCacheSave debounce race). F111's IntegrationTests repairCatalog scenario now asserts it and fails until F002/F070 fix the rebuild path.
+
+## Design pass 2 (after the integration RC ships)
+- Library chrome: Search/Sort/Select and "Cloud & Backup" still have no Clear glass capsule body (bare glyphs) — light + dark (after/001, 031).
+- Library folder card truncates the name to "Seme…" — card too narrow for titles; size to content/grid like document cards.
+- Stray blue "Documents" breadcrumb link under the "6 items · Name, A to Z" subtitle (duplicate of the title).
+- Dark mode: document cards without a thumbnail render bright white with near-invisible placeholder icons — use paper-aware placeholder colours.
+- Library "mcp" bridge pill floats alone below the top-right group — place inside/next to the floating group per §14.9.
+- NibDesign GlassForegroundSnapshotTests: replace the XCTSkipUnless(NibSnapshot.supportsHostedImages) guards with hostless structural assertions (glass applied to content, accent body present) so nothing is skipped.
+- Re-run the 3 design lenses on the after/ captures and fix remaining blockers/majors.
