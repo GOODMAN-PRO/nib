@@ -15,24 +15,25 @@ public enum FeatReplayFeature: NibFeature {
         app.content.tapHandlers.register(TapHandlerDescriptor(
             id: "replay.handwriting", owner: id, gesture: .tap, command: CommandIDs.replayTapAt,
             order: 50, itemKinds: [.stroke], worksInReadOnly: true))
-        for mode in ReplayMode.allCases {
+        for (index, mode) in ReplayMode.allCases.enumerated() {
             var menu = MenuItemDescriptor(
                 id: "replay.mode." + mode.rawValue, title: ReplayLabels.title(mode), icon: NibSymbol.history.name,
                 location: .documentMore, order: 410 + (ReplayMode.allCases.firstIndex(of: mode) ?? 0), owner: id,
                 command: CommandIDs.replaySetMode, params: { _ in ["mode": .string(mode.rawValue), "enabled": true] },
                 isVisible: { $0.session?.replay != nil }, submenu: String(localized: "Note Replay"))
+            menu.shortcut = KeyShortcut(String(index + 1), [.command, .option, .shift])
             menu.isChecked = { $0.session?.replay?.mode == mode }
             app.ui.menus.register(menu)
         }
         app.ui.menus.register(MenuItemDescriptor(
             id: "replay.options", title: String(localized: "Replay Options"), icon: NibSymbol.history.name,
             location: .documentMore, order: 415, owner: id, command: CommandIDs.panelOpen,
-            params: { _ in ["id": "replay.options"] }, isVisible: { $0.session?.document != nil }))
+            params: { _ in ["id": "replay.options"] }, isVisible: { ReplayMenuVisibility.hasAudio($0) }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "replay.item", title: String(localized: "Replay Handwriting"), icon: NibSymbol.play.name,
             location: .objectMenu, order: 450, owner: id, command: CommandIDs.replaySeekToItem,
             params: { ctx in ["ref": .string(ctx.ref ?? ctx.selection.refs.first ?? "")] },
-            isVisible: { $0.itemKinds == [.stroke] && ($0.ref != nil || $0.selection.items.count == 1) }))
+            isVisible: { ReplayMenuVisibility.linkedStroke($0) }))
         app.ui.panels.register(PanelDescriptor(
             id: "replay.options", title: String(localized: "Note Replay"), icon: NibSymbol.history.name,
             placement: .sheet, order: 450, owner: id, docKinds: [.notebook, .whiteboard]) { context in
@@ -55,6 +56,26 @@ public enum FeatReplayFeature: NibFeature {
     }
 
     public static func start(_ app: NibApp) async { ReplayController.of(app.services)?.start() }
+}
+
+@MainActor
+private enum ReplayMenuVisibility {
+    static func hasAudio(_ ctx: MenuContext) -> Bool {
+        guard let doc = ctx.doc ?? ctx.session?.document, ctx.app.services.lock?.isLocked(doc) != true,
+              let content = try? ctx.app.workspace.content(doc),
+              content.meta.kind == .notebook || content.meta.kind == .whiteboard else { return false }
+        return !content.liveAudio.isEmpty
+    }
+
+    static func linkedStroke(_ ctx: MenuContext) -> Bool {
+        guard ctx.itemKinds == [.stroke], hasAudio(ctx),
+              let ref = ctx.ref ?? ctx.selection.refs.first,
+              case let .item(doc, page, id)? = NodeRef(ref),
+              let item = try? ctx.app.workspace.item(doc, page: page, id: id), !item.deleted,
+              let stroke = item.stroke, stroke.style.tool != .tape,
+              let clips = try? ctx.app.workspace.content(doc).liveAudio else { return false }
+        return ReplayLink.clip(for: stroke.t0, in: clips, preferred: nil, doc: doc) != nil
+    }
 }
 
 @MainActor
@@ -89,7 +110,7 @@ struct ReplayOptionsView: View {
                     ForEach(ReplayMode.allCases, id: \.self) { mode in
                         NibButton(ReplayLabels.title(mode), symbol: options.mode == mode ? .checkCircle : .circle,
                                   kind: .plain, expands: true) { set(["mode": .string(mode.rawValue), "enabled": true]) }
-                            .accessibilityValue(options.mode == mode ? String(localized: "Selected") : "")
+                            .accessibilityAddTraits(options.mode == mode ? .isSelected : [])
                             .accessibilityHint(ReplayLabels.detail(mode))
                     }
                 }
@@ -127,7 +148,7 @@ final class ReplayFullScreenController: UIViewController {
     private let canvas: UIViewController
     private let replaySession: EditorSession
     private let source: EditorSession
-    private let app: NibApp
+    private weak var app: NibApp?
     private let options: ReplayOptions
     private var onClose: (() -> Void)?
 
@@ -143,12 +164,13 @@ final class ReplayFullScreenController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        guard let app, let controller = ReplayController.of(app.services) else { return }
         view.backgroundColor = NibUIColor.background
         addChild(canvas)
         view.addSubview(canvas.view)
         canvas.view.translatesAutoresizingMaskIntoConstraints = false
         canvas.didMove(toParent: self)
-        let dock = UIHostingController(rootView: ReplayFullScreenDock(app: app, source: source, options: options))
+        let dock = UIHostingController(rootView: ReplayFullScreenDock(app: app, source: source, options: options, controller: controller))
         dock.sizingOptions = [.intrinsicContentSize]
         addChild(dock); view.addSubview(dock.view); dock.view.translatesAutoresizingMaskIntoConstraints = false
         dock.didMove(toParent: self)
@@ -164,6 +186,13 @@ final class ReplayFullScreenController: UIViewController {
         replaySession.editor = canvas as? DocumentEditing
     }
 
+    func closeSource() {
+        app?.services.sessions.remove(replaySession)
+        options.fullScreen = false
+        onClose?(); onClose = nil
+        dismiss(animated: false)
+    }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         if isBeingDismissed || presentingViewController == nil {
@@ -174,9 +203,10 @@ final class ReplayFullScreenController: UIViewController {
 
 @MainActor
 private struct ReplayFullScreenDock: View {
-    let app: NibApp
+    weak var app: NibApp?
     let source: EditorSession
     @ObservedObject var options: ReplayOptions
+    @ObservedObject var controller: ReplayController
     var body: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: NibSpacing.m) { controls }
@@ -187,15 +217,16 @@ private struct ReplayFullScreenDock: View {
         .background(NibColor.background)
     }
     @ViewBuilder private var controls: some View {
-        NibButton(String(localized: "Play or Pause"), symbol: .play, kind: .plain) {
-            app.perform(CommandIDs.audioPlay, ["toggle": true], session: source)
+        NibButton(controller.playing ? String(localized: "Pause Audio") : String(localized: "Play Audio"),
+                  symbol: controller.playing ? .pause : .play, kind: .plain) {
+            app?.perform(CommandIDs.audioPlay, ["toggle": true], session: source)
         }
         NibToggle(String(localized: "Follow pages"), isOn: Binding(get: { options.followAlong }, set: {
-            app.perform(CommandIDs.replaySetMode, ["mode": .string(options.mode.rawValue), "followAlong": .bool($0)], session: source)
+            app?.perform(CommandIDs.replaySetMode, ["mode": .string(options.mode.rawValue), "followAlong": .bool($0)], session: source)
         }))
         NibButton(String(localized: "Exit Full Screen"), symbol: .xmark, kind: .plain,
                   shortcut: KeyboardShortcut(.escape, modifiers: [])) {
-            app.perform(CommandIDs.replaySetMode, ["mode": .string(options.mode.rawValue), "fullScreen": false], session: source)
+            app?.perform(CommandIDs.replaySetMode, ["mode": .string(options.mode.rawValue), "fullScreen": false], session: source)
         }
     }
 }

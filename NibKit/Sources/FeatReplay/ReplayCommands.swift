@@ -26,7 +26,7 @@ struct ReplaySetMode: NibCommand {
         if !ctx.dryRun {
             if let fullScreen = p.fullScreen { try await controller.setFullScreen(fullScreen, for: session, query: { try await ctx.execute($0, $1) }) }
             controller.configure(session, mode: p.mode, enabled: p.enabled, followAlong: p.followAlong)
-            controller.start()
+            controller.start(resync: false)
             await controller.refresh()
             ctx.ui?.setNeedsChromeUpdate(session)
         }
@@ -62,7 +62,7 @@ struct ReplaySeekToItem: NibCommand {
         let t = ReplayLink.seekTime(ink.t0, clip: clip)
         if !ctx.dryRun {
             _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(ref), "t": .number(t)])
-            ReplayController.of(ctx.services)?.start()
+            ReplayController.of(ctx.services)?.start(resync: false)
             await ReplayController.of(ctx.services)?.refresh()
         }
         return Output(clip: ref, t: t)
@@ -74,7 +74,7 @@ struct ReplayTapAt: NibCommand {
     struct Output: Codable { var handled: Bool }
     static let descriptor = CommandDescriptor(
         id: CommandIDs.replayTapAt, title: "Seek Replay at Handwriting",
-        summary: "Handle a handwriting tap only while note replay is active, seeking one second before the stroke in the currently loaded clip.",
+        summary: "Handle a handwriting tap only while note replay is active, seeking one second before the stroke in its linked recording.",
         params: .obj(["page": .ref, "point": .point, "ref": .ref,
                       "gesture": .str(choices: CanvasGesture.allCases.map(\.rawValue))], required: ["page", "point"]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [80, 122],
@@ -89,7 +89,6 @@ struct ReplayTapAt: NibCommand {
         let query: ReplayReader.Query = { try await ctx.execute($0, $1) }
         let status = try await ctx.execute(CommandIDs.audioSetPlayback, [:]).decode(ReplayPlayback.self)
         guard let clipRef = status.clip, NodeRef(clipRef)?.documentID == doc else { return Output(handled: false) }
-        let clip = try await ReplayReader.clip(clipRef, app: app, query: query)
         let ink: ReplayInk?
         if let ref = p.ref {
             guard case let .item(d, pg, _)? = NodeRef(ref), d == doc, pg == page else { return Output(handled: false) }
@@ -97,12 +96,20 @@ struct ReplayTapAt: NibCommand {
         } else {
             // Canvas normally supplies its exact topmost hit. Direct API callers may omit ref.
             let point = Point(p.point[0], p.point[1])
-            ink = try await ReplayReader.inks(doc, app: app, query: query)
-                .last { $0.page == page && $0.bounds.contains(point) }
+            ink = try await ReplayReader.hit(doc, page: page, point: point, app: app, query: query)
         }
-        guard let ink, ReplayLink.contains(ink.t0, clip: clip) else { return Output(handled: false) }
+        guard let ink, !ink.isTape else { return Output(handled: false) }
+        let clips = try await ReplayReader.clips(doc, app: app, query: query)
+        guard let clip = ReplayLink.clip(for: ink.t0, in: clips, preferred: status.clip, doc: doc) else { return Output(handled: false) }
+        let target = NodeRef.audio(doc, clip.id).description
+        let t = ReplayLink.seekTime(ink.t0, clip: clip)
         if !ctx.dryRun {
-            _ = try await ctx.execute(CommandIDs.audioSeek, ["t": .number(ReplayLink.seekTime(ink.t0, clip: clip))])
+            if target == clipRef {
+                _ = try await ctx.execute(CommandIDs.audioSeek, ["t": .number(t)])
+            } else {
+                _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(target), "t": .number(t)])
+                if !status.playing { _ = try await ctx.execute(CommandIDs.audioPause, [:]) }
+            }
             await ReplayController.of(ctx.services)?.refresh()
         }
         return Output(handled: true)
