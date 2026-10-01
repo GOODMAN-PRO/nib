@@ -1,0 +1,77 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPen/PenTool.swift:47 (strokeFinished) and :113-115 (longPress)",
+      "problem": "Circle to Lasso's longPress sets consumedPress = true, and the next strokeFinished swallows whatever stroke arrives: it does not commit it and does not cancel the wet ink. In .pencilKit mode touchesBegan/touchesEnded never run for ordinary strokes (Canvas.swift CanvasInputMode docs), so nothing resets the flag when the long press produces no dot stroke. That happens with a finger long-press in pencilOnly mode (ARCHITECTURE: 'A touch held still for 0.5 s calls longPress') or when the input half cancels the press. The user's next real pen stroke stays on screen as wet ink but is never written: silent data loss.",
+      "fix": "Scope the swallow to the press itself. In longPress, record the press (location, ProcessInfo.systemUptime, sample.isPencil) instead of a bare Bool. In strokeFinished, swallow only a stroke that is LoopDetector.isDot(stroke.polyline, scale:) within ~16 screen pt of the press and finished within ~1.5 s, and call host.cancelWetStroke() when you do. Clear the record in every other case and commit normally. Add a test: longPress inside a pending loop, then strokeFinished with a normal (non-dot) stroke, must commit it (canvas.committed.count == 1)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPen/PenTool.swift:52-63 (Scribble to Erase branch)",
+      "problem": "Every stroke that passes ScribbleDetector is cancelled and dropped, even when ink.scribbleErase erased nothing. The command returns EraseCounts with removed == 0 when no pen/pencil stroke on the active layer is covered (EraseCommands.swift InkScribbleErase.run returns .zero). Back-and-forth hatching or shading on empty paper, or over highlighter or shapes, matches the detector (≥4 reversals, swing ≥45 %, density ≥3) and vanishes without feedback: user ink is lost. In Goodnotes the scribble only erases when it covers writing.",
+      "fix": "Decode the result (`try result.decode(EraseCounts.self)` or `result[\"removed\"]?.doubleValue`). When removed == 0, keep the ink with `host?.commitStroke(stroke, page: page)`, exactly as the catch branch already does. Add a PenGestureTests case whose stub ink.scribbleErase returns {removed: 0, created: 0} and assert canvas.committed.count == 1."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPen/InkCommands.swift:122-137 (ptsB64 path), :161-167, :203-220 (sanitised/check)",
+      "problem": "There is no range validation at the AI/plugin trust boundary for anything except x/y. The flat `pts` path caps every field at 1e7 only, so force, width, height and t up to 1e7 are accepted. The ptsB64 path checks only isFinite, so width, height and force can be up to Float.greatestFiniteMagnitude. With zero widths and force ≈ 3e38, InkModel.fillSizes computes w·(1+(force−0.5)·ps·1.2), which overflows Float to +inf, and the stroke is stored with infinite nib sizes. Stroke.encode's non-compact form then throws on Double.infinity (JSONEncoder), so query.get, AI reads and export of that page fail. The renderer and PencilKit also receive inf/1e7-pt sizes. ptsB64 is also fully base64-decoded and unpacked into StrokePoints before maxPointsPerStroke is checked.",
+      "fix": "In InkParse.sanitised, clamp to physical ranges: force 0…8 (UITouch max ≈ 4.17), width/height 0…InkLimits.maxWidth, opacity 0…1, altitude 0…π/2, azimuth/roll to −2π…2π, t ≥ 0 and ≤ 86_400. Apply the same clamps to the ptsB64 path. Before Data(base64Encoded:), reject strings longer than (maxPointsPerStroke·40·4/3 + 4). Before unpackCompact, reject data.count/40 > maxPointsPerStroke. After InkParse.prepare, assert that every width/height is finite (throw invalidParams otherwise). Add tests with ptsB64 force = Float.greatestFiniteMagnitude and with fmt full width = 1e7: either rejected, or stored with finite sizes ≤ maxWidth."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/PenGestures.swift:262-273 (LoopDetector.crossesStart), called from analyse on every finished stroke",
+      "problem": "crossesStart tests every tail-third segment against every head-third segment on the raw outline, which can be up to 20,000 points. That is O(n²) on the main actor for each stroke when Circle to Lasso is on (the default): a 2,400-point stroke (10 s at 240 Hz) runs about 640k segment tests, over the 2 ms finalize budget (§20); 20k points is about 44M.",
+      "fix": "In isClosedLoop, evaluate crossesStart only when both gap tests fail, and run it on PenGeometry.resampled(points, spacing: side/24), which is already capped at 256 points. Add an XCTAssertLessThan(elapsed, budget×4) test on a 20k-point stroke."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/FeatPenFeature.swift:43-57 (start observer)",
+      "problem": "Any 'pen.*' change re-registers both canvas tool descriptors. That includes pen.stabilization and pen.reduceLatency, which do not affect the ink, and synced remote changes or AI/plugin settings.set calls arriving mid-stroke. The canvas responds with syncActiveTool(force: true), which deactivates the PenTool: an in-progress dashed/dotted (samples) stroke is discarded by resetSamples, the overlay is cleared, and a pending Circle-to-Lasso loop is lost. The observation for each app is also never removed.",
+      "fix": "Filter to keys that change inkStyle/inputMode: pen.style, pen.tipSharpness, pen.pressure, pen.tipFlatness, pen.reactToRoll, presets.pen and presets.pencil. Defer the re-register while the session is inking (EditorSession.inking, G12) and flush it on the next idle. Remove the entry from `observations` when the app stops."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/PenTool.swift:161-171, 295-304 (hold fallback)",
+      "problem": "While recognition is pending or found no shape, touchesMoved keeps only the last non-predicted sample of each batch. appendFallback also copies the previous width/height. The continuation of a held stroke that is kept as ink therefore loses the coalesced samples (2 to 4× sparser) and its pressure-driven width.",
+      "fix": "Append every non-predicted sample of the batch in order. Set width/height to 0 on the appended points, so InkModel.prepare/PenDynamics derive them from force, or derive them from sample.force through InkModel.fillSizes on that segment."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/PenTool.swift:206-211",
+      "problem": "When item.delete of mergeWith fails after shape.create succeeded, both the new merged shape and the original neighbours remain, so the merge geometry is duplicated on the page.",
+      "fix": "On item.delete failure, roll the group back: run CommandIDs.undo for the doc when the top undo entry is `group`, or call item.delete on the created ref (shape.create returns {ref}). Then commit the original stroke with preserve()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/PenTool.swift:283-287 (vector preview dash)",
+      "problem": "The dashed/dotted preview uses dashes of [4w, 3w] with round caps. The dry renderer (NibRender/PageCompositor.swift:184-185) uses [3w, 2w] butt-capped dashes and [0.01, 2.5w] dots. The pattern visibly jumps when the dry tile replaces the preview.",
+      "fix": "Use the renderer's lengths, [max(3w,3), max(2w,2.5)] with .butt caps for dashed and [0.01, max(2.5w,2.5)] with .round caps for dotted, scaled by zoomScale. Better still, file a contract request to expose the pattern on StrokePattern so both sides share it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/PenSettingsView.swift:17-28 (PenOptions init, also used by PenOptionsBar)",
+      "problem": "PenOptionsBar is the active-tool menu and is visible while the pen draws. It creates a PenOptions that subscribes to every `committed` event in the app and runs loadWritingAids, a query.get bus round trip with plugin hooks and logging, after every stroke, even though the bar never shows Writing Aids.",
+      "fix": "Move the committed-event subscription and loadWritingAids into PenSettingsView only, for example with an `observesWritingAids` init flag that defaults to false for the bar. Filter events to the session's document."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/PenTool.swift:68-70 (loop path processor drop)",
+      "problem": "When a stroke processor drops a loop stroke (returns false), strokeFinished returns before host.cancelWetStroke(). The wet ink stays on screen but is never written. CanvasHostImpl.commitStroke completes .success(nil) in that case, so the canvas can clean up, but this path bypasses it.",
+      "fix": "Call host.cancelWetStroke() before returning, or route the loop through host.commitStroke(_:page:completion:) and take the id from the completion."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPen/InkCommands.swift:569-588 (InkSetStyle.run)",
+      "problem": "When refs is omitted (a user call that uses the selection), one shape, text box or image in a mixed selection makes the whole ink.setStyle fail with invalidParams.",
+      "fix": "When p.refs == nil, filter the selection to stroke items, skipping locked or non-stroke items, and throw only when none remain. Keep the strict per-ref error for explicit refs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPenTests/PenGestureTests.swift:110-139, 76-92",
+      "problem": "The shape.create, item.delete and ink.scribbleErase stubs do not mutate the document or return real outputs. So the tests do not prove that the pen's createParams are accepted by the real F031 shape.create (whose style patch rejects unknown fields), that the merge deletion and undo round trip work, or the zero-removal and long-press reset cases. Each test also builds an unused second Harness/FakeCanvasHost.",
+      "fix": "In one test, register FeatShapesFeature and FeatShapeRecognitionFeature (dependencies already on this branch) with FeatPenFeature in the Harness. Run hold → snap → lift, then assert that a shape item with drawnWith == pen exists, the merged neighbour is gone, and undo restores snapshotAll(). Add the regression tests listed in the major findings, and drop the unused hosts."
+    }
+  ]
+}

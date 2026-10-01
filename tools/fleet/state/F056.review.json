@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSearchUI/Recents.swift SearchRuntime.receive (L218-231) and SearchRuntime.load recents branch (L257-273)",
+      "problem": "Recents are built from doc.opened, which Workspace.content emits the first time ANY reader loads a document head, not when a window shows it. F056 then loads each recent row with query.get, and F003's documentJSON calls ctx.workspace.content(doc). Each recent that is not yet loaded emits doc.opened, which re-records it at 'now' and queues a refresh. The refresh bumps the generation, aborts the running load and starts over. At launch, opening library search with recents [A,B,C] makes about n^2/2 query.get calls, keeps all 20 documents in workspace memory, and persists the order reversed as [C,B,A]. Every launch flips the order again. Documents only read by AI, plugins, export or backup (query.get, nib_get) also show up as 'recently opened'. Reopening a document whose head is still cached never emits doc.opened, so it is never moved up. The trashed filter reads node[\"trashedAt\"], but query.get document JSON has no trashedAt (it lives on LibraryNode), so that check is a no-op.",
+      "fix": "Record recents from NibEventType.sessionDocument events (event.doc != nil: a window now shows that document). Keep doc.opened only when app.services.sessions.sessions.contains { $0.document == doc }. Build RecentRow from app.services.library?.node(doc): skip it when nil, kind != .document or trashedAt != nil, use title and documentKind, and skip services.lock?.isLocked(doc). Never call query.get or workspace.content here. Add tests: (1) a query.get fake that emits doc.opened leaves the recents order unchanged; (2) a session switching back to an already-loaded document moves it to the top."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSearchUI/Recents.swift SearchRuntime.receive (L237-243) and SearchRuntime.load pagination loop (L283-293)",
+      "problem": "Each tx.committed event, in any document, makes every window with search open send search.open {refresh:true}. Each refresh drains every search.text cursor at limit 500, which can be about 14 calls, and each call re-runs the whole FTS query. In document scope, search.text first awaits indexer.flush(doc), so with the in-document panel open every pen stroke triggers Vision handwriting recognition of the dirty page plus the full query. This bypasses F055's 5 s debounce and competes with inking. Superseded refreshes are never cancelled; the generation check only throws their results away. Keystrokes have the same cost because they are not debounced and every cursor page is fetched up front.",
+      "fix": "Remove NibEventType.committed from the refresh triggers. index.progress {running:false} and library.changed already mean the index content changed. If live refresh is wanted, coalesce to one debounced (at least 1 s), cancellable Task per session, skip it while session.inking.isInking, and refresh only states whose scope contains event.doc. Fetch a first page (e.g. limit 100) and load further cursors only when the list scrolls to the end or search.step passes the last loaded match. Debounce search.text calls from typing by about 150 ms in SearchRuntime. Add a test: N committed events produce at most one search.text call."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSearchUI/Recents.swift SearchRuntime.state (L179-197); FeatSearchUIFeature.swift SearchStep.run (L215-222)",
+      "problem": "Document-scoped search state is never rebound when the window switches documents (tab switch, doc.open, library to another notebook). EditorSession.openPanels is not reset by the shell, so in document B the panel, the 'n of m' counter HUD (isVisible does not check the document) and the results still belong to document A. Pressing ⌘G in B calls SearchOpen.navigate, which sees session.document != hit doc and runs doc.open(A), pulling the user back to A. The doc.opened refresh also re-queries A inside B's window.",
+      "fix": "In state(_:) also subscribe to session.$document. When a presented state's scope is doc:X or page:X/… and the new document differs, set scope to NodeRef.document(newDoc), keep the query, clear matches and selectedID, and send search.open {scope:'document', refresh:true}. Close the state instead when the new document is nil. In SearchStep, only step through hits whose doc is session.document. In the counter's isVisible, require NodeRef(state.scope)?.documentID == context.session.document. Add a test: switch session.document, then search.step must not change the document."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSearchUI/FeatSearchUIFeature.swift SearchOpen.navigate (L180-183)",
+      "problem": "navigate assumes doc.open switches the document synchronously. In the shell, ShellViewController.openDocument wraps the open in Task { if await gate(doc) … } whenever ui.openGate is set, and F071 (Password Lock) sets it for every document. After doc.open returns, session.document is therefore still the old document, and `guard session.document == doc else throw NibError(.unavailable, \"The document could not be opened.\")` fires. Every library result in another document shows that error and never calls reveal(page:rect:). It never sets flashID or flashUntil and never dismisses the library overlay, so isPresented stays true, yet the document opens a moment later. The tests hide this because their doc.open fake is synchronous.",
+      "fix": "Set selectedID and a pending reveal (hit) before doc.open. After doc.open, if session.document != doc, await the switch: observe session.$document or a sessionDocument event with a bounded timeout, and return quietly without an error if the gate refuses. Then call session.editor?.reveal(page:rect:animated:false), set flashID and flashUntil, and dismiss the library overlay. Add a test with a doc.open fake that changes session.document from a later Task."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSearchUI/FeatSearchUIFeature.swift SearchOpen.run (L148-156)",
+      "problem": "The load is skipped whenever `match` is present. A single call such as search.open {scope:'doc:FIXTUREDOC01', query:'new', match:0}, which the schema allows and an AI or plugin will send, sets state.query = 'new' and then navigates to result 0 of the PREVIOUS query's matches. With no earlier matches it throws 'The search result no longer exists.' The match index silently refers to stale results.",
+      "fix": "Run `try await runtime.load(state, context: ctx)` when `changed || state.matches.isEmpty` (and after a scope reset) even if p.match is set, then validate and apply the match. Add a test that sends query and match in one call after a different query."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/FeatSearchUIFeature.swift toolbar registration (L33-38)",
+      "problem": "The find button is registered in ToolbarGroup.navTrailing, but the contract's group documentation puts search in navLeading ('library, sidebar, search, AI, read-only'), which is also where F017 places its default search item (order 200). Because F056 registers a search.open item, F017's taken(\"search.open\") check drops its leading button, so the magnifier moves to the trailing side next to Share.",
+      "fix": "Use group: .navLeading, order: 200."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/FeatSearchUIFeature.swift SearchOpen.run (L134)",
+      "problem": "`state.isPresented = true` runs for refresh calls too. A refresh queued by receive() or the 'Try search again' banner that runs after the user closed search brings back the page washes, the top field overlay and the counter HUD, while the panel stays closed.",
+      "fix": "At the top of run: `if p.refresh == true && !state.isPresented { return output(state) }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/Recents.swift SearchMatch.id (L22) and dedupe (L294-295)",
+      "problem": "id is ref|kind|snippet|time. Two distinct matches with the same block ref, kind and snippet but different rects (repeated scan or PDF lines, repeated words on one page) get the same id. The dedupe drops one, so ⌘G can never reach the second occurrence.",
+      "fix": "Add rect (x,y,w,h), pageIndex and itemIDs to id. Dedupe only exact duplicates (SearchMatch is Equatable)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/Recents.swift SearchRuntime.receive (L216-217)",
+      "problem": "The rolling `event.seq > lastEvent` watermark drops an event that arrives after a higher seq. That can happen with emitters off the main actor, because EventBus yields after releasing its lock, and it can lose a doc.opened or the final index.progress {running:false}.",
+      "fix": "Remove only the replay overlap: remember replay.last?.seq and skip stream events with seq <= that value, with no rolling watermark."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/FeatSearchUIFeature.swift SearchOpen.navigate (L185-193)",
+      "problem": "Transcript hits (kind 'transcript', ref audio:D/A, time in seconds) only open the document. Tapping a transcript result neither seeks nor plays at the matched line.",
+      "fix": "For kind == \"transcript\" with a time, also run `audio.play {clip: hit.ref, t: hit.time}` (catalogue: audio.play clip, t?)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/LibrarySearchView.swift SearchResultRow.loadSnippet (L242-256) and snippet overlay (L209-218)",
+      "problem": "The handwriting snippet renders at scale 1, which is blurry on 2x and 3x screens. The region is the tight word bbox, so a 210x30 match shows as a thin strip inside the 120x60 frame, and the Lemon overlay fills the whole frame including the letterbox. A row that LazyVStack recycles renders again (a new tmp asset) every time it reappears.",
+      "fix": "Pass `scale` from @Environment(\\.displayScale). Expand the region to the 2:1 aspect of NibMetrics.searchSnippetSize around the match and wash only the match rect. Cache rendered images per hit.id in SearchState."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSearchUI/LibrarySearchView.swift SearchResults (L124-160)",
+      "problem": "Copy and accessibility gaps. The 'Recently opened' heading is not marked as a header. The recent rows' clock icon is not hidden from VoiceOver. 'Indexing \\(n) pages…' and '\\(n) matches' have no plural variants ('1 pages', '1 matches'), and the banner reads 'Indexing 0 pages…' while running with pending 0. A folder scope with an empty query shows 'Find in this document'.",
+      "fix": "Add .accessibilityAddTraits(.isHeader) to the heading and .accessibilityHidden(true) to the row icon. Use inflected or plural localized strings. Show the banner only when remainingPages > 0. Give folder scope its own empty-state copy."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatSearchUITests/FeatSearchUITests.swift",
+      "problem": "The riskiest paths are untested because the fakes are idealized. doc.open switches synchronously. query.get never emits doc.opened. Nothing tests a document switch while search is open, commit-driven refreshes, or a call that sends query and match together.",
+      "fix": "Add the tests named in the majors above: asynchronous doc.open, recents stable under a doc.opened-emitting query.get, rescoping on a session.document change, refresh coalescing under committed events, and query plus match in one call."
+    }
+  ]
+}
