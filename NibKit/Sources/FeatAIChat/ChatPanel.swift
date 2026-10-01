@@ -1,1 +1,351 @@
-// Scaffold placeholder, owned by F085 (AI chat panel). Replace this file.
+import Foundation
+import SwiftUI
+import UniformTypeIdentifiers
+import NibContracts
+import NibDesign
+
+struct ChatPanel: View {
+    @ObservedObject var model: ChatViewModel
+    let context: PanelContext
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    var body: some View {
+        VStack(spacing: 0) {
+            NibPanelHeader(title: String(localized: "Assistant"), subtitle: model.providerLabel, symbol: .assistant,
+                           onClose: { model.perform(ChatCommand.close) }) {
+                Menu {
+                    Button(String(localized: "New conversation")) { model.perform(ChatCommand.new) }
+                    Button(String(localized: "Conversations")) { model.perform(ChatCommand.inspect, ["section": "conversations"]) }
+                    ForEach(sizeClass == .compact ? [PanelPresentation.floating, .sidebar] : [.floating, .sidebar, .window], id: \.self) { mode in
+                        Button(modeTitle(mode)) { model.perform(ChatCommand.open, ["mode": .string(mode.rawValue)]) }
+                    }
+                    Button(String(localized: "AI settings")) { model.perform(CommandIDs.settingsOpen, ["page": "ai"]) }
+                } label: {
+                    Image(nib: .more).font(NibFont.glyph(.panel))
+                        .foregroundStyle(NibColor.labelSecondary)
+                        .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+                }
+                .accessibilityLabel(String(localized: "Assistant options"))
+            }
+            if model.showsConversations { conversationList }
+            else {
+                contextRow
+                Rectangle().fill(NibColor.separatorSoft).frame(height: NibStroke.hairline)
+                thread
+                composer
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(String(localized: "Assistant"))
+        .nibSheet(isPresented: Binding(get: { model.confirmation != nil }, set: { presented in
+            if !presented, let pending = model.confirmation {
+                model.perform(ChatCommand.confirm, ["request": .string(pending.id), "decision": "deny"])
+            }
+        })) {
+            if let pending = model.confirmation { ConfirmationSheet(model: model, pending: pending) }
+        }
+        .fileImporter(isPresented: $model.needsImagePicker, allowedContentTypes: [.image]) { result in
+            switch result {
+            case .success(let url):
+                Task {
+                    do {
+                        let encoded = try await Task.detached { () throws -> String in
+                            let scoped = url.startAccessingSecurityScopedResource()
+                            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                            let attributes = try url.resourceValues(forKeys: [.fileSizeKey])
+                            guard (attributes.fileSize ?? 0) <= 20_000_000 else { throw NibError.invalid("choose an image smaller than 20 MB", path: "$.image") }
+                            return try Data(contentsOf: url).base64EncodedString()
+                        }.value
+                        model.perform(ChatCommand.attach, ["source": "image", "base64": .string(encoded)])
+                    } catch { model.error = NibError.wrap(error) }
+                }
+            case .failure(let error): model.error = NibError.wrap(error)
+            }
+        }
+        .onDisappear { model.perform(ChatCommand.inspect, ["section": "visibility", "visible": false]) }
+        .task {
+            model.perform(ChatCommand.inspect, ["section": "visibility", "visible": true])
+            if let scope = context.params["scope"]?.stringValue {
+                model.perform(ChatCommand.configure, ["scope": .string(scope), "refs": context.params["refs"] ?? []])
+            } else { model.perform(ChatCommand.inspect, ["section": "context"]) }
+        }
+    }
+
+    private var contextRow: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.s) {
+            NibSegmentedControl(selection: Binding(get: { model.mode }, set: { mode in
+                model.perform(ChatCommand.configure, ["mode": .string(mode.rawValue)])
+            }), options: AIMode.allCases) { $0 == .ask ? String(localized: "Ask") : String(localized: "Edit") }
+            .accessibilityLabel(String(localized: "Create mode"))
+            .accessibilityHint(String(localized: "Ask reads notes. Edit can change notes."))
+            .disabled(model.isStreaming)
+            ScrollView(.horizontal) {
+                HStack(spacing: NibSpacing.s) {
+                    Menu {
+                        ForEach(AIScopeKind.allCases, id: \.self) { scope in
+                            Button(scopeTitle(scope)) { model.perform(ChatCommand.configure, ["scope": .string(scope.rawValue)]) }
+                        }
+                    } label: {
+                        Label { Text(model.contextLabel) } icon: { Image(nib: .citation) }
+                            .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+                            .frame(minHeight: NibMetrics.hitTarget)
+                    }
+                    .accessibilityLabel(String(localized: "Context: \(model.contextLabel)"))
+                    .disabled(model.isStreaming)
+                    ForEach(model.attachments, id: \.self) { ref in
+                        NibChip(String(localized: "Page image"), symbol: .image, onRemove: {
+                            model.perform(ChatCommand.attach, ["source": "remove", "asset": .string(ref.name)])
+                        })
+                    }
+                    Menu {
+                        Button(String(localized: "Attach screenshot")) { model.perform(ChatCommand.attach, ["source": "screenshot"]) }
+                        Button(String(localized: "Attach image")) { model.perform(ChatCommand.pickImage) }
+                    } label: {
+                        Image(nib: .plus).font(NibFont.glyph(.panel))
+                            .foregroundStyle(NibColor.labelSecondary)
+                            .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+                    }
+                    .accessibilityLabel(String(localized: "Add image context"))
+                    .disabled(model.isStreaming)
+                }
+            }
+        }
+        .padding(.horizontal, NibSpacing.l)
+        .padding(.bottom, NibSpacing.s)
+    }
+
+    private var thread: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: NibSpacing.xl) {
+                    if !model.isConfigured {
+                        NibEmptyState(symbol: .assistant, title: String(localized: "Connect a model"),
+                                      message: String(localized: "Connect a model to use the assistant."))
+                        ForEach(["Anthropic", "OpenAI-compatible", "Ollama", "LM Studio", "Custom"], id: \.self) { provider in
+                            NibButton(provider, symbol: .settings, kind: .plain) { model.perform(CommandIDs.settingsOpen, ["page": "ai"]) }
+                        }
+                    } else if model.entries.isEmpty {
+                        Text(String(localized: "Ask about your notes, or switch to Edit to change them."))
+                            .font(NibFont.chat).foregroundStyle(NibColor.labelSecondary)
+                    }
+                    ForEach(model.entries) { entry in ChatMessageView(model: model, entry: entry).id(entry.id) }
+                    if model.isStreaming, model.entries.last?.text.isEmpty == true {
+                        HStack(spacing: NibSpacing.s) {
+                            ProgressView()
+                            Text(String(localized: "Reading your context…")).font(NibFont.caption1)
+                        }
+                        .foregroundStyle(NibColor.labelSecondary)
+                    }
+                    if model.isGeneratingImage {
+                        HStack(spacing: NibSpacing.s) {
+                            ProgressView()
+                            Text(String(localized: "Generating image…")).font(NibFont.caption1)
+                        }
+                    }
+                    if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
+                    if let error = model.error {
+                        VStack(alignment: .leading, spacing: NibSpacing.s) {
+                            Label { Text(error.message).font(NibFont.footnote).foregroundStyle(NibColor.label) } icon: {
+                                Image(nib: .warningTriangle).foregroundStyle(NibColor.warning)
+                            }
+                            if let hint = error.hint { Text(hint).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
+                            if model.retryPrompt != nil {
+                                NibButton(String(localized: "Retry"), symbol: .retry, kind: .plain) { model.perform(ChatCommand.send, ["retry": true]) }
+                                    .disabled(model.isStreaming)
+                            }
+                        }
+                    }
+                    Color.clear.frame(height: NibSpacing.xxs).id("aichat.bottom")
+                }
+                .padding(NibSpacing.l)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .onChange(of: model.entries.last?.id) { _, _ in proxy.scrollTo("aichat.bottom", anchor: .bottom) }
+        }
+    }
+
+    private var composer: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.s) {
+            if !model.quickActions.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack(spacing: NibSpacing.s) {
+                        ForEach(model.quickActions, id: \.id) { action in
+                            NibChip(action.title, action: { model.perform(ChatCommand.send, ["action": .string(action.id)]) })
+                        }
+                    }
+                    .padding(.vertical, NibSpacing.s)
+                }
+                .disabled(model.isStreaming || model.isGeneratingImage)
+            }
+            HStack(alignment: .bottom, spacing: NibSpacing.s) {
+                NibField(text: $model.composer, prompt: String(localized: "Tell Nib what to change…"), lines: 1...5)
+                    .accessibilityLabel(String(localized: "Question or instruction"))
+                if model.isStreaming || model.isGeneratingImage {
+                    NibIconButton(.stopGenerating, label: String(localized: "Stop generating"), size: .send) { model.perform(ChatCommand.stop) }
+                } else if !model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    NibIconButton(.send, label: String(localized: "Send to assistant"), size: .send) { model.perform(ChatCommand.send, ["prompt": .string(model.composer)]) }
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .disabled(!model.isConfigured)
+                }
+            }
+            HStack(spacing: NibSpacing.s) {
+                NibButton(String(localized: "Generate image"), symbol: .image, kind: .plain, size: .compact) {
+                    model.perform(ChatCommand.draft, ["action": "image", "prompt": .string(model.composer)])
+                }
+                .disabled(!model.isConfigured || model.composer.isEmpty || model.isStreaming || model.isGeneratingImage)
+                Spacer(minLength: 0)
+            }
+            Text(String(localized: "\(model.tokenCount.formatted()) tokens this chat · sent only to your provider"))
+                .font(NibFont.caption2).foregroundStyle(NibColor.labelSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(NibSpacing.l)
+    }
+
+    private var conversationList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: NibSpacing.m) {
+                NibButton(String(localized: "New conversation"), symbol: .plus) { model.perform(ChatCommand.new) }
+                    .disabled(model.isStreaming)
+                if model.conversations.isEmpty {
+                    Text(String(localized: "No conversations yet")).font(NibFont.body).foregroundStyle(NibColor.labelSecondary)
+                }
+                ForEach(model.conversations) { chat in
+                    VStack(alignment: .leading, spacing: NibSpacing.s) {
+                        NibButton(chat.title, kind: .plain) { model.perform(ChatCommand.select, ["chat": .string(chat.id)]) }
+                        if model.renamingChat == chat.id {
+                            NibField(text: $model.renameTitle, prompt: String(localized: "Conversation title"))
+                            NibButton(String(localized: "Save name"), kind: .secondary) {
+                                model.perform(CommandIDs.aiChatRename, ["chat": .string(chat.id), "title": .string(model.renameTitle)])
+                            }
+                        }
+                        HStack(spacing: NibSpacing.s) {
+                            NibButton(String(localized: "Rename"), kind: .plain, size: .compact) {
+                                model.perform(ChatCommand.inspect, ["section": "rename", "chat": .string(chat.id)])
+                            }
+                            NibButton(String(localized: "Delete"), kind: .destructivePlain, size: .compact) {
+                                model.perform(CommandIDs.aiChatDelete, ["chat": .string(chat.id)])
+                            }
+                        }
+                    }
+                }
+                NibButton(String(localized: "Back to thread"), kind: .plain) { model.perform(ChatCommand.inspect, ["section": "conversations"]) }
+            }
+            .padding(NibSpacing.l)
+        }
+    }
+
+    private func scopeTitle(_ scope: AIScopeKind) -> String {
+        switch scope {
+        case .selection: return String(localized: "Selection")
+        case .page: return String(localized: "Page")
+        case .document: return String(localized: "Document")
+        case .library: return String(localized: "Library")
+        case .block: return String(localized: "Block")
+        }
+    }
+    private func modeTitle(_ mode: PanelPresentation) -> String {
+        switch mode {
+        case .sidebar: return String(localized: "Sidebar")
+        case .window: return String(localized: "Window")
+        default: return String(localized: "Floating")
+        }
+    }
+}
+
+
+/// The shared scene hook has no panel-scene factory. Compose it for assistant windows and delegate all other scenes.
+@MainActor
+final class ChatWindowScenes: SceneHooks {
+    static let activityType = "app.nib.aiChat"
+    unowned let app: NibApp
+    let wrapped: SceneHooks?
+    private var windows: [String: ChatWindowScene] = [:]
+
+    init(app: NibApp, wrapped: SceneHooks?) { self.app = app; self.wrapped = wrapped }
+
+    func open(_ model: ChatViewModel) throws {
+        guard !NibApp.isHostlessTest else { throw NibError.unavailable("assistant windows require the app") }
+        guard UIApplication.shared.supportsMultipleScenes else {
+            throw NibError(.unsupported, "use the assistant sheet on this device")
+        }
+        let activity = activity(for: model)
+        let request = UISceneSessionActivationRequest(role: .windowApplication, userActivity: activity, options: nil)
+        UIApplication.shared.activateSceneSession(for: request) { error in
+            Task { @MainActor in model.error = NibError.wrap(error) }
+        }
+    }
+
+    func close(_ session: EditorSession) -> Bool {
+        guard let scene = windows[session.id.raw]?.scene else { return false }
+        UIApplication.shared.requestSceneSessionDestruction(scene.session, options: nil) { [weak self] error in
+            Task { @MainActor in
+                guard let self else { return }
+                ChatRuntime.get(self.app).model(for: session).error = NibError.wrap(error)
+            }
+        }
+        return true
+    }
+
+    func sceneDidConnect(_ scene: UIWindowScene, options: UIScene.ConnectionOptions, navigator: SceneNavigator) {
+        let activities = Array(options.userActivities) + (scene.session.stateRestorationActivity.map { [$0] } ?? [])
+        guard let activity = activities.first(where: { $0.activityType == Self.activityType }) else {
+            wrapped?.sceneDidConnect(scene, options: options, navigator: navigator)
+            return
+        }
+        let model = ChatRuntime.get(app).model(for: navigator.session)
+        model.presentation = .window
+        let savedScope: AIScope
+        if let raw = activity.userInfo?["scope"] as? String, let json = try? JSONValue.parse(raw), let scope = try? json.decode(AIScope.self) {
+            savedScope = scope
+            navigator.session.document = scope.doc
+            navigator.session.page = scope.page
+        } else { savedScope = AIScope(kind: .library) }
+        let chat = activity.userInfo?["chat"] as? String
+        windows[navigator.session.id.raw] = ChatWindowScene(scene)
+        Task { @MainActor [weak navigator] in
+            guard let navigator else { return }
+            if let chat, !chat.isEmpty {
+                do { try await model.selectChat(chat) }
+                catch { model.error = NibError.wrap(error) }
+            }
+            do { try model.setScope(savedScope.kind, refs: savedScope.refs) }
+            catch { model.error = NibError.wrap(error) }
+            var context = PanelContext(app: app, session: navigator.session, navigator: navigator, dismiss: { [weak self] in
+                _ = self?.close(navigator.session)
+            })
+            context.presentation = .window
+            let controller = UIHostingController(rootView: ChatPanel(model: model, context: context)
+                .frame(maxWidth: NibMetrics.textColumnWidth, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(NibColor.backgroundSecondary))
+            controller.modalPresentationStyle = .fullScreen
+            controller.isModalInPresentation = true
+            navigator.presentModal(controller)
+        }
+    }
+
+    func restorationActivity(_ navigator: SceneNavigator) -> NSUserActivity? {
+        if windows[navigator.session.id.raw]?.scene != nil {
+            return activity(for: ChatRuntime.get(app).model(for: navigator.session))
+        }
+        return wrapped?.restorationActivity(navigator)
+    }
+
+    func makeTabBar(_ navigator: SceneNavigator) -> UIView? {
+        windows[navigator.session.id.raw]?.scene == nil ? wrapped?.makeTabBar(navigator) : nil
+    }
+
+    private func activity(for model: ChatViewModel) -> NSUserActivity {
+        let activity = NSUserActivity(activityType: Self.activityType)
+        activity.title = String(localized: "Assistant")
+        activity.userInfo = ["chat": model.chatID ?? "", "scope": (try? JSONValue.from(model.scope).jsonString()) ?? "{}"]
+        return activity
+    }
+}
+
+private final class ChatWindowScene {
+    weak var scene: UIWindowScene?
+    init(_ scene: UIWindowScene) { self.scene = scene }
+}
