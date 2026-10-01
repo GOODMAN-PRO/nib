@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatConvertText/FeatConvertTextFeature.swift L40-45 (KeyCommandDescriptor convert.preview, KeyShortcut(\"t\", [.command, .shift]))",
+      "problem": "The spec reserves Shift-Cmd-T for New Text Document: F047 registers it in start() only when no other key uses that shortcut, and F073 maps it globally. F057 adds an unrequested Shift-Cmd-T. With F057 registered, F047 sees the shortcut as taken and never registers its key, so New Text Document loses its shortcut in the library. In notebooks and whiteboards, F057's .canvas key with docKinds also outranks F073's mapping under KeyCommandRouting, so the key converts handwriting instead of creating a text document. F057's spec asks for no shortcut.",
+      "fix": "Delete the KeyCommandDescriptor block (L40-45). If a shortcut is still wanted, pick one that is not in the forge-spec keyboard map or F073's GlobalShortcuts table, and add a test asserting that F057 registers no shortcut that F047 or F073 reserve."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatConvertText/ConvertCommands.swift HandwritingToTextPages.run L177-206",
+      "problem": "Data-loss risk. handwriting.toTextPages collects every pen and pencil stroke on a page (L177). As soon as recognition returns any text, it deletes all of them and writes one text box over the union of all ink (Conversion.write with replace: true). Sketches, diagrams, arrows, underlines and crossed-out strokes that recognition matched to no line are deleted with no text replacing them, and the page layout collapses into one page-sized box. This runs with no preview, including for AI and plugin callers. recognize.items already returns per-line attribution (lines[].refs and lines[].bbox, SearchCommands.swift RecognizeItems.Line), but the command ignores it.",
+      "fix": "Decode recognize.items' lines. Create one text box per recognised line, or per run of adjacent lines, at that line's bbox, coloured from its first ref. Delete only the strokes listed in the recognised lines' refs, and leave every other stroke on the page. Return skipped strokes or pages in the output. Add a test whose fake recognize.items returns a line covering FIXTURESTK01 only, plus a second pen stroke that no line covers. Assert that the second stroke survives and the undo round trip still holds."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatConvertText/ConvertPreviewSheet.swift RecognitionLanguageModel.load L225-236, row .disabled L294",
+      "problem": "The Recognition Language sheet (D-110, P-035) depends on query.get, which F003 owns. F003 is not a declared dependency (dependsOn is F055 only) and is still a scaffold stub on origin/main. When query.get is missing, it throws unavailable, selected stays nil, and every language row is disabled (L294), so the per-document language cannot be changed from the UI at all. ARCHITECTURE section 6.2 says callers should treat a missing command as an optional dependency, and the preview model in the same file does exactly that (it checks app.commands.entry(queryGet)). No test exercises RecognitionLanguageModel.",
+      "fix": "In load(), read the language directly: selected = try app.workspace.content(doc).meta.language. Alternatively, use query.get only when app.commands.entry(CommandIDs.queryGet) != nil and fall back to the workspace read otherwise. Add Harness tests (no F003 registered) for load() setting selected and enabling rows, for choose() success updating selected and receipt, and for the indexed:false path setting retryLanguage."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatConvertText/ConvertPreviewSheet.swift ConvertPreviewModel.convert L101-116, receipt and Undo Conversion L176-185, announcement L195-197",
+      "problem": "After Convert, the sheet stays open with a hand-built receipt: inline Text plus a manual UIAccessibility.post announcement. This is the 'announce results to VoiceOver instead of toasting' workaround that contracts-v2 G12 replaces with FloatingHosting.postToast(_:actionTitle:action:). Separately, 'Undo Conversion' runs generic edit.undo on the document. That undoes whatever step is latest, which can be an edit made in another window, by the AI or by a plugin after the conversion. The command group is cleared in the defer at L107, so the conversion itself cannot be targeted.",
+      "fix": "Keep the conversion group after success. On success, dismiss the sheet and call context.session?.floatingHost?.postToast(String(localized: \"Handwriting converted to text.\"), actionTitle: String(localized: \"Undo\"), action: { app.perform(CommandIDs.revertGroup, [\"doc\": docRef, \"group\": .string(group)], session:) }). Show the in-sheet receipt only when floatingHost is nil, and drop the manual UIAccessibility.post when the toast is used. The Undo button must call history.revertGroup {doc, group}, not edit.undo. Add a model test that makes another edit after converting, then asserts that undoing the conversion leaves that edit in place."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/ConvertCommands.swift Conversion.box L98-107",
+      "problem": "The stored font size uses NibUIFont.body.pointSize as its cap. That value is scaled by UIFontMetrics, so the persisted document depends on the converting device's Dynamic Type setting: about 17 pt by default and about 53 pt at AX5, for the same command and params. There is no lower bound, so a short or flat stroke (height around 3 pt) produces text of about 2 pt. The box also ignores the user's NibSettings.defaultTextStyle (font, background, border) that new text boxes are meant to use.",
+      "fix": "Start from ctx.app?.settings.get(NibSettings.defaultTextStyle) ?? TextBoxStyle(). Override padding, size and colour. Use a fixed document constant for the cap (style.defaults.size ?? 17), never a UIFont, and clamp the size with a floor of about 9 pt. Add a unit test for the size computation: tall single line, many lines, flat stroke."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/ConvertCommands.swift Conversion.source L37-60, validateUnchanged L81-85, checkedID L92",
+      "problem": "Each ref is resolved with ctx.workspace.item(...), and so is each check in validateUnchanged. That call scans the page's whole item array (Workspace.item uses first(where:)), so converting a page of N strokes costs O(N^2) comparisons, twice, on the main actor. A dense page of a few thousand strokes, multiplied over several pages, goes far past the 16 ms command budget (ARCHITECTURE section 14).",
+      "fix": "Load ctx.workspace.allItems(doc, page:) once per page and build a [ElementID: Item] dictionary. Use it in source(), validateUnchanged() and checkedID(). In HandwritingToTextPages, build the Source directly from the already loaded ink array instead of turning items back into refs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/ConvertCommands.swift HandwritingToTextPages.run L177-179",
+      "problem": "Page conversion passes every pen and pencil stroke to Conversion.source, which throws permission_denied for a locked stroke and invalid_params for an empty or degenerate stroke. A single locked stroke on one page therefore aborts the whole multi-page conversion.",
+      "fix": "In the page path, filter the ink to strokes that are unlocked, non-empty and have finite, positive bounds before building the Source. List the excluded refs in the output, for example skippedItems. Add a test with one locked stroke on the page."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/ConvertCommands.swift HandwritingToTextPages L159, L189-191",
+      "problem": "ids must equal the number of text boxes actually created, but that number is only known after recognition, because blank and unreadable pages are skipped. An AI or plugin passing one id per requested page gets invalid_params whenever any page is skipped, after all the OCR work. This defeats the caller-chosen-ids rule (ARCHITECTURE section 6.1).",
+      "fix": "Define ids as one id per deduplicated entry of pages, in pages order. Validate the count and NibID.isValid before any recognition. A skipped page leaves its id unused. Update the summary and test accordingly."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/ConvertCommands.swift DocumentSetLanguage.run L241, L250-256; RecognitionLanguages.supported L211-216",
+      "problem": "doc.setLanguage awaits index.rebuild {doc}. F055 implements that by removing the document's index rows and then re-recognising every page with pausable: false. On a large notebook the edit command and the sheet's 'Rebuilding search…' spinner last minutes, and search for that document is empty the whole time. The Indexer already re-indexes the whole document on a meta.language change (Indexer.swift L1006-1007). Separately, VNRecognizeTextRequest.supportedRecognitionLanguages() runs on the main actor on every call; F027 runs it detached.",
+      "fix": "Commit the language, then start the rebuild without blocking the result: return indexed: false with scheduled: true and run index.rebuild in a Task that reports failure through IndexProgressPayload or a toast. Or call index.rebuild from the sheet after doc.setLanguage returns, as the spec's 'doc.setLanguage then index.rebuild' reads. Cache the supported-language list in a static, computed once off the main actor."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/FeatConvertTextFeature.swift L47-52; ConvertPreviewSheet.swift RecognitionLanguageSettings L318-330",
+      "problem": "This adds a second 'Recognition Language' settings page. F027 already owns the settings half of P-035 (Settings › General › Language, the default recognition language). F057's page is only a button that opens a per-document sheet, and it fails ('Open a document…') when settings are opened from the library. The two pages with the same name and different meanings both match settings search for 'recognition'. The spec for F057 asks only for the document title menu.",
+      "fix": "Remove the SettingsPageDescriptor and RecognitionLanguageSettings. The per-document language stays in the document title menu, and F027 keeps the default language."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/ConvertPreviewSheet.swift close() L200-203 and L312-315",
+      "problem": "Both sheets call app.perform(panel.close) (an async bus call that F017 handles by dismissing the panel) and context.dismiss() synchronously. The sheet is dismissed twice in an undefined order, and the second dismissal can close the presenting controller. Other panels (for example F022's GoToPageDialog) call only context.dismiss().",
+      "fix": "Call only context.dismiss() in both close() functions."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatConvertText/FeatConvertTextFeature.swift menu isVisible L29-31",
+      "problem": "Convert › Text appears for any selection whose items are all .stroke, which includes highlighter-only and tape-only selections. The user then opens the preview and hits 'Only pen and pencil strokes can be converted.' on Convert.",
+      "fix": "In isVisible, resolve the selection refs through context.app.workspace (it is a cheap lookup for a selection) and require at least one pen or pencil stroke. Alternatively, make handwriting.toText ignore non-handwriting strokes in refs instead of throwing, and say so in its summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatConvertTextTests/FeatConvertTextTests.swift",
+      "problem": "Several risky paths have no tests: the revisions success path (matching revisions must convert; only the mismatch is tested), RecognitionLanguageModel, the box font-size computation, and page conversion with locked strokes or strokes recognition does not attribute. The recognize.items fake always returns lines: [], so the line and ref data the page conversion should use is never exercised.",
+      "fix": "Add tests: handwriting.toText with revisions equal to the current item.rev.description succeeds; RecognitionLanguageModel load, choose and retry without F003; Conversion.box sizing cases; toTextPages with a fake that returns lines with refs, plus a locked stroke."
+    }
+  ]
+}
