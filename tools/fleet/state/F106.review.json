@@ -1,0 +1,101 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistOverlay.swift:45-54, 56-57, 95",
+      "problem": "The overlay takes over host.canvasView.accessibilityElements. canvasView is the canvas scroll view (contracts G14), and F101 adds the PageTileViews to it as subviews, each one supplying its own VoiceOver elements. canvasDidChange always calls removeAccessibility first, before the opt-in guard, and that sets canvasView.accessibilityElements = (nil ?? []).filter{...} = []. A non-nil array replaces UIKit's subview discovery, so once this attachment attaches (it is registered for every notebook and whiteboard), VoiceOver no longer reaches the pages, their items, comment pins, links or typed text. This happens even with Math Assist turned off. When glows exist, the array holds only the Math Assist elements. The test (line 220) asserts the empty array, which locks the bug in.",
+      "fix": "Do not touch canvasView.accessibilityElements. Give the attachment its own container: a transparent UIView added to host.canvasView with isUserInteractionEnabled = false, whose accessibilityElements are the glow elements. F104's SpellcheckOverlay and F032's kit.view already work this way. Remove that view in detach. Change the test to assert that the canvas's own accessibilityElements stays nil and that the overlay view holds one element."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:208-253; NibKit/Tests/FeatMathAssistTests/MathAssistWatcherTests.swift:12-24",
+      "problem": "In production the recognition cache never hits. The page rows from the real query.get (F003 QueryShapes.summary, ARCHITECTURE §7.2) carry no \"rev\", so every AssistInk.revision is \"\". The cache check requires group.allSatisfy { !$0.revision.isEmpty }, and the cache stores `group` (empty revisions) instead of recognizedInk. So every scan re-runs math.recognize (render.page plus Vision OCR, or a vision AI request when a provider is configured) for every handwriting line on the page. Scans run on every commit, every pencil-up (overlay inking observer), every finger tap (tapAt) and inside every math.assist / updateAnswers call. On a page with 30 lines, one stroke means about 30 renders and OCR or AI calls, and with an AI provider that means a stream of paid network requests carrying the user's handwriting. The tests miss this because the fake query.get returns \"rev\" and \"latex\" fields that the real command does not.",
+      "fix": "Ask for the revision explicitly: query.get {ref, cursor, fields: [\"bbox\",\"layer\",\"tool\",\"rev\",\"math\"]}. Shapes.pick merges summary and full-record fields, and \"limit\" is not a query.get param, so drop it. Store recognizedInk in the cache and compare by ref+revision. Skip the whole rescan when workspace.contentRevision(doc, page:) (contracts G9) has not changed. Make the test fake return exactly the §7.2 row shape (no rev unless asked through fields, math text under \"text\"/\"math\") and add a test that a second scan of an unchanged page calls the fake math.recognize zero times."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistCommands.swift:160-161; FeatMathAssistOverlayFeature.swift:14-15",
+      "problem": "The tap handler has no itemKinds filter, so every finger tap on an opted-in page reaches mathassist.tapAt. F101's GestureRouter awaits each tap handler in turn before the active tool gets the tap. tapAt calls runtime.scan(page), a full query.get walk, O(n^2) grouping, math.recognize per line (uncached, see above) and math.evaluate per question, so lasso, text tool and other taps wait for a whole page re-recognition, which can take seconds with an AI provider. The fresh scan's line indices can also differ from the cached runtime.pages that the overlay used to name its anchors (\"mathassist.anchor.<page>.<index>\"), so the popover can attach to the wrong glow.",
+      "fix": "Hit-test in tapAt against the watcher's cached runtime.pages[page] (the lines the glow is drawn from) and return handled:false at once when there are no cached question lines. Scan only when no cache exists yet, and never on the tap path when Math Assist is off. Pass the matched line's refs to the popover so the anchor and the write use the same line identity."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistCommands.swift:163-164 vs MathAssistOverlay.swift:69-73",
+      "problem": "The tap target does not match the glow's position. tapAt accepts a square of half-size hitTarget/zoom/2 centred on (bounds.maxX, bounds.midY), but the glow is drawn at bounds.maxY + NibSpacing.xs. The distance from midY to the glow is h/2 + 4 pt, so a tap on the glow misses for any line taller than 36 pt at zoom 1, and taller than 14 pt at zoom 2. That covers most handwriting while zoomed in, and any stacked fraction. The glow then does nothing and the tap falls through to the tool. The test taps at zoom 1 on an 18 pt line, so it passes.",
+      "fix": "Add one helper, e.g. `static func glowRect(_ line: AssistLine, zoom: Double) -> Rect` (page space), and use it for the CAShapeLayer path, the floating anchor/accessibility rect and the tapAt hit-test. Pad it to a 44 pt view-space target. Add tests at zoom 2 and with a 60 pt-tall line."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistOverlay.swift:158-167, 182-184",
+      "problem": "The 'Strategies' section is broken (spec: tap -> formats/strategies/Edit LaTeX). solve() calls math.solve with \"latex\" as an array, but F088's SolveMath.Params.latex is a String. User principals skip schema validation, so Codable decoding fails and the user gets an error toast. Even with the right type, math.solve is a `read` command that returns a MathSession, and app.perform throws the result away, so no steps or hints UI can ever appear.",
+      "fix": "Open F088's panel instead, the same way its own menus do: app.perform(CommandIDs.panelOpen, [\"id\": \"aimath.panel\", \"mode\": .string(mode), \"refs\": .array(line.refs.map(JSONValue.string))], session:), and pass the corrected latex as a string param if the panel reads it. Gate the buttons on app.ui.panels.get(\"aimath.panel\") != nil rather than on the command entry."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:308-325; MathAssistCommands.swift:37-43",
+      "problem": "Automatic answer updates address the line only by its position. updateAnswers calls math.assist with {page, line: index, format} and no refs/latex guard. math.assist then runs a fresh scan whose line list can differ: recognition is non-deterministic or AI-backed, and lines whose math.recognize fails are dropped with `continue`, which shifts every later index. lines[index] can then be a different equation, and math.assist writes an unrequested answer next to it, or replaces that line's linked answer with a value computed for another line.",
+      "fix": "Pass \"refs\": line.refs (and \"latex\": line.latex when the link is corrected) in the updateAnswers invocation, so that a shifted index throws .conflict. The command already supports the guard. Better still, let math.assist resolve the line by refs when refs is given. Add a test where a line before the question fails recognition on the second scan."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:20, 257-258, 309; MathAssistCommands.swift:53",
+      "problem": "When the source equation's strokes change, answers go stale or get duplicated. Links are keyed by the lexicographically smallest source ref and need link.source == line.refs exactly. If the user corrects the equation (erases the '3' in '2+3=' and writes '4', or adds a term), the refs change, so updateAnswers skips the link forever and the old answer ink stays, now wrong. If the key changed, a new math.assist finds no `old` link and writes a second answer next to the first. Links whose sources are gone are never pruned from PageRecord.ext either.",
+      "fix": "Reconcile links against the current lines. Match a link to the question line that shares the most of its source refs, or whose bounds contain its answer anchor. When a matched line's refs differ, re-key the link and treat its unchanged answer ink as `old`, so it is replaced rather than duplicated. When a line is no longer a question or no longer evaluates, leave the ink but drop the link. Prune links whose source refs no longer exist on each successful math.assist write."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:285-289; MathAssistCommands.swift:113",
+      "problem": "Every answer stroke's 'signature' is its full Item JSON encoded with the default encoder: all points in the decimal 'full' format, 10 floats per point. That string is stored, escaped, in AssistAnswerLink.signatures inside PageRecord.ext. PageRecords live in the uncompressed doc.<dev>.json (ARCHITECTURE §5), so each written answer adds roughly 10-70 KB to the document file. That file is loaded on open, rewritten on every doc-level save and synced. A homework notebook with hundreds of answers grows its doc JSON by megabytes.",
+      "fix": "Store a fixed-size digest, e.g. SHA256 (CryptoKit) of the canonical JSON with rev zeroed, encoded with JSONEncoder .sortedKeys, and compare digests in matches(). Keep the revision fallback."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:274-283",
+      "problem": "definitions() runs MathStack.run, which blocks the calling thread on a DispatchSemaphore. scan runs on the main actor, so parsing and defining every page line (up to 8192 chars each, and possibly evaluating sums or matrix inverses) freezes the UI.",
+      "fix": "Make definitions async and use `try await MathStack.perform { ... }` (F061 provides it to free the main actor)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:163-180",
+      "problem": "group() rebuilds each candidate group's union bounds from every member for every input stroke, which is O(n^2) on the main actor (up to 10,000 strokes allowed). A stroke that bridges two existing groups joins only one, and groups never merge, so a stacked fraction or a long bar can split one expression into fragments.",
+      "fix": "Keep a running bounds per group, sweep by minY with an active set, and merge every compatible group a new stroke touches (union-find)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:215-217",
+      "problem": "Typed math definitions read item[\"latex\"], but query.get page rows give math items their LaTeX as \"text\" (lines joined by newlines), not \"latex\". This path is dead in production and only works against the test fake.",
+      "fix": "Read item[\"text\"] split by newlines (or request fields: [\"math\"] and read math.latex), and test against the real row shape."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistWatcher.swift:86, 298-301; MathAssistCommands.swift:87-89",
+      "problem": "While an answer is being written, the commit observer drops every commit on that page (`!self.writing.contains(page)`), and didWrite reschedules with update=false. A definition edit committed during the asynchronous ink.writeText therefore leaves the newly written answer stale until some later edit.",
+      "fix": "Record dropped commits as pending (pending[page] = (true, group)) instead of skipping them, so didWrite's schedule carries update=true. Alternatively, capture the definition lines' revisions before writing and re-check them in the final transaction."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistOverlay.swift:22, 93",
+      "problem": "NibUIColor.accent.cgColor is resolved without the canvas trait collection, so the glow can show the light-mode accent in dark mode (or the reverse) until the next canvasDidChange. F101 resolves it with resolvedColor(with: traitCollection).",
+      "fix": "Use NibUIColor.accent.resolvedColor(with: host.canvasView.traitCollection).cgColor, and refresh on trait changes (registerForTraitChanges on the overlay view)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistOverlay.swift:56-96 (S-022 parity)",
+      "problem": "The glow is a short accent underline only. The computed answer is never shown inline (only in the popover and in the VoiceOver value), and the Pencil cannot open the options: only finger taps enter the tap-handler chain, and the attachment does not claim Pencil taps through hitTest(_:isPencil:host:) or gesture(_:at:host:). S-022 (inline handwritten calculation) expects a visible suggested answer next to the '=' that can be accepted with Pencil or finger.",
+      "fix": "Draw the suggested answer as a ghost preview at the ink-writing position, using the assistant ghost-ink opacity token (DESIGN §5.2, 42 %), hidden while inking. Claim Pencil taps inside the glow rect with hitTest(_:isPencil:host:) and route them through gesture(_:at:host:) to mathassist.tapAt."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathAssistCommands.swift (no read command)",
+      "problem": "math.assist takes a positional `line` index, but no query exposes the detected lines, their refs, LaTeX, current answers or links. AI and plugins cannot find which equations glow or which index to pass, except by repeated dry runs.",
+      "fix": "Add a read command (e.g. mathassist.lines {page} -> [{line, refs, latex, answer?, failure?, linked}]) built from the watcher's scan, and refer to it in math.assist's summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatMathAssistTests/MathAssistWatcherTests.swift",
+      "problem": "No tests cover the risky paths: recognition caching against the real query.get shape, tap geometry at zoom != 1 or on tall lines, index shift between scans, source-equation edits (stale or duplicate answers), and accessibility-container preservation.",
+      "fix": "Add the tests named in the issues above, and make the fake query.get follow ARCHITECTURE §7.2 exactly."
+    }
+  ]
+}
