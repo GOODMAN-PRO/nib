@@ -7,7 +7,23 @@ import NibTesting
 
 @MainActor
 final class LessonManagerTests: XCTestCase {
-    private func harness() -> Harness { Harness(features: [FeatTeacherFeature.self, FeatTeacherLessonsFeature.self]) }
+    private func harness() -> Harness {
+        let h = Harness(features: [FeatTeacherFeature.self, FeatTeacherLessonsFeature.self])
+        // F002 is an independent feature; use its catalogue command contract in this feature harness.
+        for command in [CommandIDs.libraryTrash, CommandIDs.trashRecover] {
+            h.app.commands.register(CommandDescriptor(id: command, title: "Library action", summary: "Harness library action",
+                                                      params: .obj(["refs": .arr(.ref)], required: ["refs"]), effect: .library, target: .library)) { params, ctx in
+                for value in params["refs"]?.arrayValue ?? [] {
+                    let doc = try LessonManager.document(try XCTUnwrap(value.stringValue))
+                    if command == CommandIDs.libraryTrash { try ctx.services.library?.trash(doc) }
+                    else { try ctx.services.library?.restore(doc, to: nil) }
+                }
+                ctx.events.emit(NibEventType.libraryChanged)
+                return [:]
+            }
+        }
+        return h
+    }
 
     private func source(_ h: Harness, id: DocumentID = "LESSONSOURCE01") throws -> (DocumentID, PageID, ElementID, AssetRef) {
         let image = try h.assets.put(Fixtures.pngData, ext: "png", doc: id)
@@ -90,9 +106,9 @@ final class LessonManagerTests: XCTestCase {
         let new = Item(id: "STUDENTWORK01", kind: .text, text: TextBoxItem(frame: Frame(x: 40, y: 160, w: 300, h: 50), text: RichText(plain: "6 m/s")))
         try await h.insert([new], page: page, doc: "SAMCOPY01")
         XCTAssertFalse(try h.app.workspace.items("LEECOPY01", page: page).contains { $0.id == new.id })
-        try await h.run(CommandIDs.lessonCreate, ["action": "trash", "ids": ["SAMCOPY01", "LEECOPY01"]])
+        try await h.run(CommandIDs.libraryTrash, ["refs": ["doc:SAMCOPY01", "doc:LEECOPY01"]])
         XCTAssertNotNil(h.library.node("SAMCOPY01")?.trashedAt)
-        try await h.run(CommandIDs.lessonCreate, ["action": "restore", "ids": ["SAMCOPY01", "LEECOPY01"]])
+        try await h.run(CommandIDs.trashRecover, ["refs": ["doc:SAMCOPY01", "doc:LEECOPY01"]])
         XCTAssertNil(h.library.node("SAMCOPY01")?.trashedAt)
         XCTAssertTrue(try h.app.workspace.items("SAMCOPY01", page: page).contains { $0.id == new.id })
     }
@@ -175,6 +191,8 @@ final class LessonManagerTests: XCTestCase {
         let secret = Item(id: "PRIVATENOTE01", kind: .text, layer: LessonManager.presentLayer,
                           text: TextBoxItem(frame: Frame(x: 40, y: 180, w: 300, h: 40), text: RichText(plain: "Teacher reminder")))
         try await h.insert([secret], page: page, doc: privateDoc)
+        let otherLayer = Item(id: "PRIVATELAYERZERO01", kind: .text, layer: 0,
+                              text: TextBoxItem(frame: Frame(x: 40, y: 220, w: 300, h: 40), text: RichText(plain: "Other private notes")))
         h.app.workspace.close(privateDoc)
         let store = try XCTUnwrap(h.app.workspace.persistence as? PrivateLessonPersistence)
         h.app.workspace.persistence = PrivateLessonPersistence(base: h.persistence, root: store.root)
@@ -182,6 +200,7 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertTrue(h.app.bus.undo(privateDoc))
         XCTAssertFalse(try h.app.workspace.items(privateDoc, page: page).contains { $0.id == secret.id })
         XCTAssertTrue(h.app.bus.redo(privateDoc))
+        try await h.insert([otherLayer], page: page, doc: privateDoc)
         XCTAssertEqual(try LessonManager.capture(doc, workspace: h.app.workspace), initial)
         // A registered dependency is guarded before its handler runs, including typed and JSON calls.
         h.app.commands.register(CommandDescriptor(id: CommandIDs.collabHost, title: "Host", summary: "Test live host", effect: .library)) { _, _ in
@@ -200,12 +219,13 @@ final class LessonManagerTests: XCTestCase {
         let refreshed = try h.app.workspace.items(privateDoc, page: page)
         XCTAssertTrue(refreshed.contains { $0.id == shared.id })
         XCTAssertTrue(refreshed.contains { $0.id == secret.id })
+        XCTAssertTrue(refreshed.contains { $0.id == otherLayer.id && $0.layer == 0 })
         let copy = try await h.run(CommandIDs.lessonCreate, ["doc": .string(doc.raw), "folder": "folder:FIXTUREFLD01", "students": ["Sam"]])
         let copyID = NodeRef.documentID(from: try XCTUnwrap(copy["refs"]?[0]?.stringValue))
         XCTAssertFalse(try h.app.workspace.items(copyID, page: page).contains { $0.id == secret.id })
     }
 
-    func testLibraryWindowUndoRedoForCopiesAndRosterReplacement() async throws {
+    func testLibraryWindowUndoRedoForCopiesAndSingleHistoryForRosterReplacement() async throws {
         let h = harness()
         let (doc, _, _, _) = try source(h)
         let runtime = try XCTUnwrap(h.app.services.get(LessonRuntime.key, as: LessonRuntime.self))
@@ -225,9 +245,9 @@ final class LessonManagerTests: XCTestCase {
         try await h.run(CommandIDs.lessonImportRoster, ["csv": "id,name\nlee,Lee", "folder": "folder:FIXTUREFLD01"])
         undo.endUndoGrouping()
         let roster = LessonManager.rosterID(Fixtures.folderID)
-        await windowAction(h, action: { undo.undo() })
+        XCTAssertTrue(h.app.bus.undo(roster))
         XCTAssertEqual(try h.app.workspace.content(roster).meta.ext?[LessonManager.rosterKey]?.decode(LessonRoster.self).students.first?.id, "sam")
-        await windowAction(h, action: { undo.redo() })
+        XCTAssertTrue(h.app.bus.redo(roster))
         XCTAssertEqual(try h.app.workspace.content(roster).meta.ext?[LessonManager.rosterKey]?.decode(LessonRoster.self).students.first?.id, "lee")
     }
 
@@ -272,6 +292,221 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertTrue(items.contains { $0.text?.text.plainText.contains("120 metres") == true })
     }
 
+    func testCSVCommonExportEncodingsDelimitersAndQuoteWhitespace() throws {
+        for delimiter in [",", ";", "\t"] {
+            let csv = "id" + delimiter + "name\nsam" + delimiter + " \"O'Brien, J\"  \n"
+            XCTAssertEqual(try RosterImport.parse(csv).first?.name, "O'Brien, J")
+        }
+        let csv = "id;name\nsam;José"
+        let windows = try XCTUnwrap(csv.data(using: .windowsCP1252))
+        XCTAssertEqual(try RosterImport.parse(RosterImport.text(windows)).first?.name, "José")
+        for (bom, encoding) in [(Data([0xFF, 0xFE]), String.Encoding.utf16LittleEndian),
+                                (Data([0xFE, 0xFF]), String.Encoding.utf16BigEndian)] {
+            let bytes = bom + (try XCTUnwrap(csv.data(using: encoding)))
+            XCTAssertEqual(try RosterImport.parse(RosterImport.text(bytes)).first?.name, "José")
+        }
+    }
+
+    func testTeachingModesRejectTextAndStudySetsWithoutLosingRecords() async throws {
+        let h = harness()
+        for kind in [DocumentKind.textDocument, .studySet] {
+            let id = NibID.make()
+            let original = DocumentContent(meta: DocumentMeta(id: id, kind: kind))
+            _ = try h.library.createDocument(original, title: "Other kind", in: Fixtures.folderID)
+            for mode in ["prep", "present", "feedback"] {
+                do {
+                    try await h.run(CommandIDs.lessonSetState, ["doc": .string(id.raw), "state": .string(mode)])
+                    XCTFail("teaching mode accepted a non-canvas document")
+                } catch { XCTAssertEqual((error as? NibError)?.code, .unsupported) }
+                XCTAssertEqual(try h.app.workspace.content(id), original)
+            }
+            let menu = MenuContext(app: h.app, session: h.session, doc: id)
+            XCTAssertFalse(h.app.ui.menus.all.filter { $0.id.hasPrefix("teacherlessons.mode.") }.contains { $0.isVisible(menu) })
+        }
+    }
+
+    func testFeedbackUsesEmptyLayerAndRetainsSourceLayerNames() async throws {
+        let h = harness()
+        let (doc, page, _, _) = try source(h)
+        h.app.commands.register(CommandDescriptor(id: "test.layer", title: "Layer", summary: "Set source layers", effect: .edit)) { _, ctx in
+            var meta = try ctx.workspace.content(doc).meta
+            meta.layers[1].name = "Examples"
+            meta.layers[2].name = "Teacher annotations"
+            try ctx.mutate { tx in try tx.putMeta(meta) }
+            return [:]
+        }
+        try await h.run("test.layer")
+        try await h.insert([Item(kind: .text, layer: 1, text: TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "Example")))], page: page, doc: doc)
+        try await h.run(CommandIDs.lessonCreate, ["doc": .string(doc.raw), "students": ["Sam"], "folder": "folder:FIXTUREFLD01", "ids": ["FEEDBACKCOPY01"]])
+        try await h.run(CommandIDs.lessonSetState, ["doc": "doc:FEEDBACKCOPY01", "state": "feedback"])
+        XCTAssertEqual(h.session.document, "FEEDBACKCOPY01")
+        XCTAssertEqual(h.session.activeLayer, 2)
+        let meta = try h.app.workspace.content("FEEDBACKCOPY01").meta
+        XCTAssertEqual(meta.layers[1].name, "Examples")
+        XCTAssertEqual(meta.layers[2].name, "Teacher annotations")
+        let note = Item(kind: .text, layer: h.session.activeLayer, text: TextBoxItem(frame: Frame(x: 0, y: 40, w: 100, h: 30), text: RichText(plain: "Feedback")))
+        try await h.insert([note], page: page, doc: "FEEDBACKCOPY01")
+        XCTAssertFalse(try h.app.workspace.items(doc, page: page).contains { $0.id == note.id })
+        let result = try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"])
+        let privateDoc = NodeRef.documentID(from: try XCTUnwrap(result["ref"]?.stringValue))
+        XCTAssertTrue(try h.app.workspace.items(privateDoc, page: page).contains { $0.layer == 1 })
+        XCTAssertEqual(try h.app.workspace.content(privateDoc).meta.layers[1].name, "Examples")
+    }
+
+    func testQuickLessonBatchParamsAndPresentConflictsWhileLeading() async throws {
+        let h = harness()
+        let (doc, _, _, _) = try source(h)
+        let context = MenuContext(app: h.app, session: h.session, doc: doc)
+        let menu = try XCTUnwrap(h.app.ui.menus.get("teacherlessons.quickLesson"))
+        let calls = try XCTUnwrap(menu.params(context)["calls"]?.arrayValue)
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0]["command"]?.stringValue, CommandIDs.collabHost)
+        XCTAssertEqual(calls[0]["params"]?["doc"]?.stringValue, NodeRef.document(doc).description)
+        XCTAssertEqual(calls[1]["command"]?.stringValue, CommandIDs.panelOpen)
+        XCTAssertEqual(calls[1]["params"]?["id"]?.stringValue, "collab.share")
+        var follow = MenuItemDescriptor(id: "test.follow", title: "Follow Me", location: .documentTitle, order: 1, owner: "test", command: CommandIDs.collabFollowMe)
+        follow.isChecked = { _ in true }
+        h.app.ui.menus.register(follow)
+        do {
+            try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"])
+            XCTFail("leading presentation must stay on the shared document")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .conflict) }
+        XCTAssertEqual(h.session.document, Fixtures.docID)
+    }
+
+    func testRosterEmailsAreNotSavedAndTrashedRosterIsIgnored() async throws {
+        let h = harness()
+        let (doc, _, _, _) = try source(h)
+        let result = try await h.run(CommandIDs.lessonImportRoster, ["csv": "id,name,email\nsam,Sam,sam@example.org", "folder": "folder:FIXTUREFLD01"])
+        let rosterID = NodeRef.documentID(from: try XCTUnwrap(result["ref"]?.stringValue))
+        let roster = try XCTUnwrap(try h.app.workspace.content(rosterID).meta.ext?[LessonManager.rosterKey]?.decode(LessonRoster.self))
+        XCTAssertNil(roster.students.first?.email)
+        try h.library.trash(rosterID)
+        do {
+            try await h.run(CommandIDs.lessonCreate, ["doc": .string(doc.raw), "folder": "folder:FIXTUREFLD01"])
+            XCTFail("roster in Trash was trusted")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .invalidParams) }
+    }
+
+    func testInterruptedTransferJournalIsRolledBackOnFeatureStart() async throws {
+        let h = harness()
+        let doc: DocumentID = "INTERRUPTEDCOPY01"
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook)), title: "Interrupted", in: Fixtures.folderID)
+        let directory = h.library.metadataURL.appendingPathComponent("teacherlessons-pending")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let journal = directory.appendingPathComponent(h.app.workspace.clock.deviceHex + ".json")
+        try JSONEncoder().encode([doc]).write(to: journal)
+        await FeatTeacherLessonsFeature.start(h.app)
+        XCTAssertNil(h.library.node(doc))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+    }
+
+    func testReturnKeepsConcurrentMetadataAndRejectsChangedAssignment() async throws {
+        for changeAssignment in [false, true] {
+            let h = harness()
+            let (doc, _, _, _) = try source(h)
+            let copy: DocumentID = "CONCURRENTCOPY01"
+            try await h.run(CommandIDs.lessonCreate, ["doc": .string(doc.raw), "students": ["Sam"], "folder": "folder:FIXTUREFLD01", "ids": [.string(copy.raw)]])
+            try await h.run(CommandIDs.lessonSetState, ["doc": .string(copy.raw), "state": "submitted"])
+            let started = expectation(description: "snapshot write reached its await")
+            let gate = BlockingLessonAssets(base: h.assets, started: started)
+            h.app.services.assets = gate
+            let returning = Task { try await h.run(CommandIDs.lessonSetState, ["doc": .string(copy.raw), "state": "returned"]) }
+            await fulfillment(of: [started], timeout: 5)
+            h.app.commands.register(CommandDescriptor(id: "test.remoteMeta", title: "Remote metadata", summary: "Concurrent metadata", effect: .edit)) { _, ctx in
+                var meta = try ctx.workspace.content(copy).meta
+                meta.layers[0].name = "Renamed remotely"
+                meta.ext?["test.remote"] = "preserved"
+                if changeAssignment {
+                    var record = try XCTUnwrap(LessonManager.assignment(meta))
+                    record.attempt += 1
+                    meta.ext?[LessonManager.assignmentKey] = try JSONValue.from(record)
+                }
+                try ctx.mutate(undoable: false) { tx in try tx.putMeta(meta) }
+                return [:]
+            }
+            do { try await h.run("test.remoteMeta") } catch { gate.release(); throw error }
+            gate.release()
+            do {
+                _ = try await returning.value
+                XCTAssertFalse(changeAssignment)
+            } catch { XCTAssertTrue(changeAssignment); XCTAssertEqual((error as? NibError)?.code, .conflict) }
+            let meta = try h.app.workspace.content(copy).meta
+            XCTAssertEqual(meta.layers[0].name, "Renamed remotely")
+            XCTAssertEqual(meta.ext?["test.remote"]?.stringValue, "preserved")
+            XCTAssertEqual(try LessonManager.assignment(meta)?.state, changeAssignment ? .submitted : .returned)
+        }
+    }
+
+    func testReturnedVersionIncludesImmutableRecordingAndTranscriptAndOpensReadOnly() async throws {
+        let h = harness()
+        let (doc, page, _, _) = try source(h)
+        let copy: DocumentID = "AUDIOCOPY01"
+        try await h.run(CommandIDs.lessonCreate, ["doc": .string(doc.raw), "students": ["Sam"], "folder": "folder:FIXTUREFLD01", "ids": [.string(copy.raw)]])
+        var clip = AudioClip(id: "LESSONAUDIO01", name: "Working", file: "audio/working.m4a", start: 0, duration: 1, page: page)
+        clip.transcriptFile = "audio/working.transcript"
+        let capturedClip = clip
+        h.app.commands.register(CommandDescriptor(id: "test.audio", title: "Audio", summary: "Record test audio", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.put(capturedClip, doc: copy) }
+            return [:]
+        }
+        try await h.run("test.audio")
+        let audio = try h.persistence.fileURL(copy, relativePath: clip.file)
+        let transcript = try h.persistence.fileURL(copy, relativePath: "audio/working.transcript.device.json")
+        let originalAudio = Data("original audio".utf8), originalTranscript = Data("original transcript".utf8)
+        try originalAudio.write(to: audio); try originalTranscript.write(to: transcript)
+        try await h.run(CommandIDs.lessonSetState, ["doc": .string(copy.raw), "state": "submitted"])
+        let result = try await h.run(CommandIDs.lessonSetState, ["doc": .string(copy.raw), "state": "returned"])
+        let ref = AssetRef(try XCTUnwrap(result["snapshot"]?.stringValue))
+        let saved = try JSONDecoder().decode(LessonSnapshot.self, from: h.assets.data(ref, doc: copy))
+        let savedClip = try XCTUnwrap(saved.content.liveAudio.first)
+        XCTAssertTrue(savedClip.file.hasPrefix("returns/"))
+        try Data("edited audio".utf8).write(to: audio)
+        try Data("edited transcript".utf8).write(to: transcript)
+        XCTAssertEqual(try Data(contentsOf: h.persistence.fileURL(copy, relativePath: savedClip.file)), originalAudio)
+        let opened = try await h.run(CommandIDs.lessonSetState, ["doc": .string(copy.raw), "state": "openReturn"])
+        let version = NodeRef.documentID(from: try XCTUnwrap(opened["ref"]?.stringValue))
+        XCTAssertEqual(h.session.document, version)
+        XCTAssertTrue(h.session.readOnly)
+        XCTAssertTrue(h.app.isReadOnly(version))
+        XCTAssertEqual(try Data(contentsOf: h.app.workspace.persistence.fileURL(version, relativePath: savedClip.file)), originalAudio)
+        let savedTranscript = try XCTUnwrap(savedClip.transcriptFile) + ".device.json"
+        XCTAssertEqual(try Data(contentsOf: h.app.workspace.persistence.fileURL(version, relativePath: savedTranscript)), originalTranscript)
+        do {
+            try await h.run(CommandIDs.lessonSetState, ["doc": .string(version.raw), "state": "published"])
+            XCTFail("returned version was writable")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .permissionDenied) }
+    }
+
+    func testFailedWindowUndoDoesNotOfferRedoAndCanBeRetried() async throws {
+        let h = harness()
+        let (doc, _, _, _) = try source(h)
+        let runtime = try XCTUnwrap(h.app.services.get(LessonRuntime.key, as: LessonRuntime.self))
+        let undo = runtime.fallbackUndo
+        undo.groupsByEvent = false
+        undo.beginUndoGrouping()
+        try await h.run(CommandIDs.lessonCreate, ["doc": .string(doc.raw), "students": ["Sam"], "folder": "folder:FIXTUREFLD01", "ids": ["UNDOFAILCOPY01"]])
+        undo.endUndoGrouping()
+        var refuse = true
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "test.rejectUndo", owner: "test", commands: [CommandIDs.libraryTrash]) { _, _, _ in
+            if refuse { throw NibError(.conflict, "Test replay failure") }
+            return nil
+        })
+        let failed = expectation(description: "failed replay was reported")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { _ in failed.fulfill() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        undo.undo()
+        await fulfillment(of: [failed], timeout: 5)
+        XCTAssertNil(h.library.node("UNDOFAILCOPY01")?.trashedAt)
+        XCTAssertFalse(undo.canRedo)
+        XCTAssertTrue(undo.canUndo)
+        refuse = false
+        await windowAction(h, action: { undo.undo() })
+        XCTAssertNotNil(h.library.node("UNDOFAILCOPY01")?.trashedAt)
+        await windowAction(h, action: { undo.redo() })
+        XCTAssertNil(h.library.node("UNDOFAILCOPY01")?.trashedAt)
+    }
+
     func testCommandsConformAndPanelRendersAtPhoneAndIPadSizes() async throws {
         let issues = await CommandConformance.check(features: [FeatTeacherFeature.self, FeatTeacherLessonsFeature.self], owners: [FeatTeacherLessonsFeature.id])
         XCTAssertEqual(issues, [])
@@ -301,6 +536,22 @@ private final class FailingLessonAssets: AssetStore {
     init(base: AssetStore, refused: DocumentID) { self.base = base; self.refused = refused }
     func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
         if doc == refused { throw NibError.unavailable("test asset destination") }
+        return try base.put(data, ext: ext, doc: doc)
+    }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
+private final class BlockingLessonAssets: AssetStore {
+    let base: AssetStore
+    let started: XCTestExpectation
+    private let semaphore = DispatchSemaphore(value: 0)
+    init(base: AssetStore, started: XCTestExpectation) { self.base = base; self.started = started }
+    func release() { semaphore.signal() }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        if ext == "json" { started.fulfill(); semaphore.wait() }
         return try base.put(data, ext: ext, doc: doc)
     }
     func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }

@@ -19,7 +19,11 @@ enum RosterImport {
         guard csv.utf8.count <= maxBytes else { throw invalid("The roster is too large.") }
         var text = csv
         if text.first == "\u{FEFF}" { text.removeFirst() }
-        let rows = try records(text)
+        let headerLine = String(text.prefix { $0 != "\n" && $0 != "\r" && $0 != "\r\n" })
+        let delimiter = [Character(","), ";", "\t"].max { lhs, rhs in
+            headerLine.filter { $0 == lhs }.count < headerLine.filter { $0 == rhs }.count
+        } ?? ","
+        let rows = try records(text, delimiter: delimiter)
         guard let header = rows.first else { throw invalid("The roster is empty.") }
         let keys = header.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: " ", with: "_") }
         guard Set(keys).count == keys.count else { throw invalid("The roster has duplicate column headings.") }
@@ -68,7 +72,18 @@ enum RosterImport {
         NibError(.invalidParams, message, path: "$.csv", hint: "use CSV headed id,name,email; quote names containing commas")
     }
 
-    private static func records(_ text: String) throws -> [[String]] {
+    static func text(_ bytes: Data) throws -> String {
+        guard bytes.count <= maxBytes else { throw invalid("Choose a CSV file no larger than 2 MB.") }
+        let encoding: String.Encoding
+        if bytes.starts(with: [0xFF, 0xFE]) { encoding = .utf16LittleEndian }
+        else if bytes.starts(with: [0xFE, 0xFF]) { encoding = .utf16BigEndian }
+        else if let value = String(data: bytes, encoding: .utf8) { return value }
+        else { encoding = .windowsCP1252 }
+        guard let value = String(data: bytes, encoding: encoding) else { throw invalid("The roster encoding could not be read.") }
+        return value
+    }
+
+    private static func records(_ text: String, delimiter: Character) throws -> [[String]] {
         enum State { case field, quoted, closed }
         var state = State.field, field = "", row: [String] = [], rows: [[String]] = []
         let chars = Array(text)
@@ -88,14 +103,16 @@ enum RosterImport {
                     else { state = .closed }
                 } else { field.append(c) }
             case .closed:
-                if c == "," { endField() }
+                if c == delimiter { endField() }
                 else if c == "\n" || c == "\r" || c == "\r\n" { endRow() }
+                else if c == " " || c == "\t" { }
                 else { throw invalid("There is text after a closing quote.") }
             case .field:
                 if c == "\"" {
-                    guard field.isEmpty else { throw invalid("A quote must start a field; double quotes inside quoted names.") }
+                    guard field.trimmingCharacters(in: .whitespaces).isEmpty else { throw invalid("A quote must start a field; double quotes inside quoted names.") }
+                    field = ""
                     state = .quoted
-                } else if c == "," { endField() }
+                } else if c == delimiter { endField() }
                 else if c == "\n" || c == "\r" || c == "\r\n" { endRow() }
                 else { field.append(c) }
             }

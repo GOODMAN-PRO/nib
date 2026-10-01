@@ -34,7 +34,11 @@ public enum FeatTeacherLessonsFeature: NibFeature {
                 params: { context in
                     guard let doc = context.doc else { return [:] }
                     return ["doc": .string(NodeRef.document(doc).description), "state": .string(mode)]
-                }, isVisible: { $0.doc != nil && $0.session?.readOnly != true }, submenu: String(localized: "Teaching Mode")))
+                }, isVisible: { context in
+                    guard let doc = context.doc, context.session?.readOnly != true,
+                          let meta = try? context.app.workspace.content(doc).meta else { return false }
+                    return meta.kind == .notebook || meta.kind == .whiteboard
+                }, submenu: String(localized: "Teaching Mode")))
         }
         app.ui.menus.register(MenuItemDescriptor(
             id: "teacherlessons.quickLesson", title: String(localized: "Start Quick Lesson"), icon: NibSymbol.share.name,
@@ -45,17 +49,30 @@ public enum FeatTeacherLessonsFeature: NibFeature {
                                   ["command": .string(CommandIDs.panelOpen), "params": ["id": "collab.share"]]]]
             },
             isVisible: { $0.doc.map { !LessonManager.isPrivate($0) } ?? false }))
-        app.ui.menus.register(MenuItemDescriptor(
-            id: "teacherlessons.followMe", title: String(localized: "Start Follow Me"), icon: NibSymbol.profile.name,
-            location: .documentMore, order: 730, owner: id, command: CommandIDs.collabFollowMe, params: { _ in ["on": true] }))
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: panelID + ".key", title: String(localized: "Open Teacher Toolkit"), shortcut: KeyShortcut("l", [.command, .shift]),
-            command: CommandIDs.panelOpen, params: ["id": .string(panelID), "instant": true], scope: .global, owner: id))
+        for location in [MenuLocation.documentMore, .documentTitle] {
+            for (state, title) in [("submitted", String(localized: "Submit Assignment")),
+                                   ("returned", String(localized: "Return Assignment")),
+                                   ("resubmit", String(localized: "Request Resubmission"))] {
+                app.ui.menus.register(MenuItemDescriptor(
+                    id: "teacherlessons.assignment." + state + "." + location.rawValue, title: title,
+                    icon: NibSymbol.documentWrite.name, location: location, order: 730, owner: id,
+                    command: CommandIDs.lessonSetState,
+                    params: { context in
+                        guard let doc = context.doc else { return [:] }
+                        return ["doc": .string(NodeRef.document(doc).description), "state": .string(state)]
+                    }, isVisible: { context in
+                        guard let doc = context.doc, !LessonManager.isPrivate(doc), context.session?.readOnly != true,
+                              let meta = try? context.app.workspace.content(doc).meta,
+                              let record = try? LessonManager.assignment(meta), let next = LessonState(rawValue: state) else { return false }
+                        return record.state != next && record.state.accepts(next)
+                    }))
+            }
+        }
         // Private presentation documents cannot be exported to the class or broadcast to a live session. The user
         // can return to Prep to share, and can still project the local presentation through present.start.
         app.bus.hooks.register(CommandHookDescriptor.guarding(
             id: "teacherlessons.privateSharing", owner: id,
-            commands: ["collab.host", "export.*", "library.duplicate", "doc.duplicate", "library.move"]) { _, params, ctx in
+            commands: [CommandIDs.collabHost, CommandIDs.exportRun, CommandIDs.exportPresent, CommandIDs.libraryDuplicate, CommandIDs.libraryMove]) { _, params, ctx in
                 func containsPrivate(_ value: JSONValue) -> Bool {
                     if let text = value.stringValue {
                         let doc = NodeRef(text)?.documentID ?? NibID(text)
@@ -65,7 +82,7 @@ public enum FeatTeacherLessonsFeature: NibFeature {
                     if let values = value.objectValue { return values.values.contains(where: containsPrivate) }
                     return false
                 }
-                let implicitPrivate = params["doc"] == nil && params["ref"] == nil && params["refs"] == nil
+                let implicitPrivate = params["doc"] == nil && params["ref"] == nil && params["refs"] == nil && params["docs"] == nil
                     && ctx.activeSession?.document.map { LessonManager.isPrivate($0) } == true
                 if containsPrivate(params) || implicitPrivate {
                     throw NibError(.permissionDenied, "Present notes stay on this device. Switch to Prep to share the lesson.", hint: "call lesson.setState {state: prep}")
@@ -75,6 +92,18 @@ public enum FeatTeacherLessonsFeature: NibFeature {
     }
 
     public static func start(_ app: NibApp) async {
+        // A durable creation journal repairs transfers interrupted by process termination.
+        if let library = app.services.library {
+            let journal = library.metadataURL.appendingPathComponent("teacherlessons-pending")
+                .appendingPathComponent(app.workspace.clock.deviceHex + ".json")
+            if let bytes = try? Data(contentsOf: journal), let ids = try? JSONDecoder().decode([DocumentID].self, from: bytes) {
+                for doc in ids where library.node(doc) != nil {
+                    app.workspace.close(doc)
+                    try? library.deletePermanently(doc)
+                }
+                if ids.allSatisfy({ library.node($0) == nil }) { try? FileManager.default.removeItem(at: journal) }
+            }
+        }
         // Install before restored private tabs load. Public document calls are forwarded unchanged.
         guard !(app.workspace.persistence is PrivateLessonPersistence), let assets = app.services.assets else { return }
         let root: URL
@@ -100,6 +129,7 @@ private struct LessonPanelEntry: Identifiable {
     var state: LessonState?
     var student: String?
     var returns: Int
+    var unreadable = false
 }
 
 /// Opaque sheet content: the host owns the floating droplet container. Lists and fields never draw glass over ink.
@@ -120,9 +150,12 @@ private struct LessonPanel: View {
     @State private var error: String?
     @State private var receipt: String?
     @State private var loading = false
+    @State private var liveHosted = false
     @State private var liveCode: String?
     @State private var liveURL: String?
     @Environment(\.horizontalSizeClass) private var widthClass
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var liveSubscription: EventSubscription?
 
     var body: some View {
         ScrollView {
@@ -149,14 +182,11 @@ private struct LessonPanel: View {
                         run(CommandIDs.librarySetView, ["folder": .string(folder)])
                     }.disabled(folder.isEmpty || loading)
                 }
-                if let error {
-                    Text(error).font(NibFont.callout).foregroundStyle(NibColor.warning)
-                        .accessibilityLabel(String(localized: "Teacher toolkit error: \(error)"))
-                }
-                if let receipt { Text(receipt).font(NibFont.callout).foregroundStyle(NibColor.labelSecondary).accessibilityAddTraits(.updatesFrequently) }
+                if let error { NibBanner(error, style: .warning) }
+                if let receipt { NibBanner(receipt, style: .info) }
                 if loading { ProgressView().accessibilityLabel(String(localized: "Saving lesson changes")) }
                 section(String(localized: "Roster")) {
-                    Text(String(localized: "CSV headings: id,name,email. Use different ids for students with the same name. Import again to replace the roster."))
+                    Text(String(localized: "CSV headings: id,name,email. Use different ids for students with the same name. Only ids and names are saved. The roster is visible to everyone with folder access. Import again to replace it."))
                         .font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
                     NibField(text: $csv, prompt: String(localized: "Paste roster CSV"), lines: 3...8)
                         .accessibilityLabel(String(localized: "Roster CSV"))
@@ -167,8 +197,11 @@ private struct LessonPanel: View {
                         run(CommandIDs.lessonImportRoster, ["folder": .string(folder)], completion: importedRoster)
                     }.disabled(folder.isEmpty || loading)
                     if !roster.isEmpty {
-                        Text(String(localized: "\(roster.count) students")).font(NibFont.bodyEmphasis)
-                        ForEach(roster) { student in NibRow(student.name, subtitle: student.email) { EmptyView() } }
+                        DisclosureGroup(String(localized: "\(roster.count) students")) {
+                            LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
+                                ForEach(roster) { student in NibRow(student.name) { EmptyView() } }
+                            }
+                        }.font(NibFont.body)
                     }
                 }
                 section(String(localized: "Lesson")) {
@@ -176,12 +209,11 @@ private struct LessonPanel: View {
                         Text(String(localized: "Choose a document")).tag("")
                         ForEach(documents) { Text($0.title).tag($0.id) }
                     }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
-                    Text(String(localized: "Prep edits the shared lesson. Present keeps teaching notes on this device. Feedback writes on the selected student copy."))
+                    Text(String(localized: "Prep prepares the source before publishing. Published student copies are independent. Present keeps teaching notes on this device. Feedback writes on the selected student copy."))
                         .font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: NibSpacing.s) { modeButtons }
+                    if widthClass == .compact || typeSize.isAccessibilitySize {
                         VStack(alignment: .leading, spacing: NibSpacing.s) { modeButtons }
-                    }
+                    } else { HStack(spacing: NibSpacing.s) { modeButtons } }
                     NibButton(String(localized: "Create Lesson"), symbol: .duplicate, kind: .primary) {
                         run(CommandIDs.lessonCreate, ["doc": .string(doc), "folder": .string(folder)]) { value in
                             let count = value["refs"]?.arrayValue?.count ?? 0
@@ -196,10 +228,9 @@ private struct LessonPanel: View {
                             Task { await loadFolders(); await loadClass() }
                         }
                     }.disabled(folder.isEmpty || loading)
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: NibSpacing.s) { liveButtons }
+                    if widthClass == .compact || typeSize.isAccessibilitySize {
                         VStack(alignment: .leading, spacing: NibSpacing.s) { liveButtons }
-                    }
+                    } else { HStack(spacing: NibSpacing.s) { liveButtons } }
                     if let liveCode {
                         Text(String(localized: "Join code: \(liveCode)")).font(NibFont.title2).textSelection(.enabled)
                         if let liveURL { NibQRCode(liveURL, label: String(localized: "Join this Quick Lesson")) }
@@ -212,16 +243,17 @@ private struct LessonPanel: View {
                     Picker(String(localized: "Filter assignments"), selection: $filter) {
                         Text(String(localized: "All assignments")).tag("all")
                         ForEach(LessonState.allCases, id: \.rawValue) { Text($0.title).tag($0.rawValue) }
-                    }.font(NibFont.body)
-                    Picker(String(localized: "Sort assignments"), selection: $sort) {
-                        Text(String(localized: "Student name")).tag("name")
-                        Text(String(localized: "Assignment state")).tag("state")
-                    }.font(NibFont.body)
+                    }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
+                    NibSegmentedControl(selection: $sort, options: ["name", "state"]) {
+                        $0 == "name" ? String(localized: "Student name") : String(localized: "Assignment state")
+                    }.accessibilityLabel(String(localized: "Sort assignments"))
                     if visibleEntries.isEmpty {
                         NibEmptyState(symbol: .documentWrite, title: String(localized: "No assignments here"),
                                       message: String(localized: "Import a roster and publish a lesson to create student copies."))
                     } else {
-                        ForEach(visibleEntries) { entry in assignmentRow(entry) }
+                        LazyVStack(alignment: .leading, spacing: NibSpacing.m) {
+                            ForEach(visibleEntries) { entry in assignmentRow(entry) }
+                        }
                     }
                 }
                 section(String(localized: "Archive class")) {
@@ -243,10 +275,22 @@ private struct LessonPanel: View {
             .frame(maxWidth: .infinity)
         }
         .background(NibColor.backgroundSecondary)
+        .onChange(of: error) { _, value in
+            if let value { AccessibilityNotification.Announcement(value).post() }
+        }
+        .onChange(of: receipt) { _, value in
+            if let value { AccessibilityNotification.Announcement(value).post() }
+        }
+        .onDisappear { liveSubscription?.cancel(); liveSubscription = nil }
         .task {
+            liveSubscription?.cancel()
+            liveSubscription = context.app.events.subscribe { event in
+                if event.type == "collab.session" { Task { @MainActor in await loadLiveSession() } }
+            }
             folder = context.params["folder"]?.stringValue ?? ""
             doc = context.params["doc"]?.stringValue ?? context.session?.document.map { NodeRef.document($0).description } ?? ""
             await loadFolders()
+            await loadLiveSession()
             if let selected = try? LessonManager.document(doc), LessonManager.isPrivate(selected) {
                 if let detail = try? await context.app.bus.execute(CommandIDs.queryGet, ["ref": .string(doc), "fields": ["meta", "ext"]], session: context.session),
                    let source = (detail["meta"]?["ext"] ?? detail["ext"])?[LessonManager.privateSourceKey]?.stringValue {
@@ -258,56 +302,63 @@ private struct LessonPanel: View {
     }
 
     private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: NibSpacing.m) {
-            Text(title).font(NibFont.title3).foregroundStyle(NibColor.label).accessibilityAddTraits(.isHeader)
-            content()
-        }
+        NibInspectorSection(title) { content() }
     }
     private var modeButtons: some View {
         Group {
             NibButton(String(localized: "Use Prep"), symbol: .layers) { state("prep", ref: doc) }
             NibButton(String(localized: "Use Present"), symbol: .layers) { state("present", ref: doc) }
             NibButton(String(localized: "Write Feedback"), symbol: .documentWrite) { state("feedback", ref: doc) }
-        }.disabled(doc.isEmpty || loading)
+        }.disabled(doc.isEmpty || loading || !supportsModes)
+    }
+    private var supportsModes: Bool {
+        guard let id = try? LessonManager.document(doc), let kind = try? context.app.workspace.content(id).meta.kind else { return false }
+        return kind == .notebook || kind == .whiteboard
     }
     private var liveButtons: some View {
         Group {
             NibButton(String(localized: "Start Quick Lesson"), symbol: .share) {
                 run(CommandIDs.collabHost, ["doc": .string(doc)]) { value in
+                    Task { await loadLiveSession() }
                     liveCode = value["code"]?.stringValue
                     liveURL = value["url"]?.stringValue
                     receipt = String(localized: "Quick Lesson started. Approve students in Manage Participants.")
                 }
             }
                 .disabled(doc.isEmpty || loading)
-            NibButton(String(localized: "Start Follow Me"), symbol: .profile) { run(CommandIDs.collabFollowMe, ["on": true]) }
-                .disabled(loading)
-            NibButton(String(localized: "Stop Follow Me"), kind: .plain) { run(CommandIDs.collabFollowMe, ["on": false]) }
-                .disabled(loading)
+            NibButton(String(localized: "Start Follow Me"), symbol: .present) { run(CommandIDs.collabFollowMe, ["on": true]) }
+                .disabled(loading || !liveHosted)
+            NibButton(String(localized: "Stop Follow Me"), symbol: .present, kind: .plain) { run(CommandIDs.collabFollowMe, ["on": false]) }
+                .disabled(loading || !liveHosted)
         }
     }
+    private func loadLiveSession() async {
+        let value = try? await context.app.bus.execute(CommandIDs.collabParticipants, [:], session: context.session)
+        liveHosted = value?["active"]?.boolValue == true && value?["side"]?.stringValue == "host"
+    }
     private var visibleEntries: [LessonPanelEntry] {
-        entries.filter { $0.state != nil && (filter == "all" || $0.state?.rawValue == filter) }.sorted {
+        entries.filter { ($0.state != nil || $0.unreadable) && (filter == "all" || $0.state?.rawValue == filter) }.sorted {
             if sort == "state", $0.state != $1.state { return ($0.state?.rawValue ?? "") < ($1.state?.rawValue ?? "") }
             return ($0.student ?? $0.title).localizedStandardCompare($1.student ?? $1.title) == .orderedAscending
         }
     }
     private func assignmentRow(_ entry: LessonPanelEntry) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
-            NibRow(entry.student ?? entry.title, subtitle: entry.state?.title) {
+            NibRow(entry.student ?? entry.title, subtitle: entry.unreadable ? String(localized: "Unreadable assignment") : entry.state?.title) {
                 NibButton(String(localized: "Open Copy"), kind: .plain) { run(CommandIDs.docOpen, ["doc": .string(entry.id)]) }
             }
-            if entry.returns > 0 { Text(String(localized: "\(entry.returns) saved return snapshots")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: NibSpacing.s) { assignmentActions(entry) }
-                VStack(alignment: .leading, spacing: NibSpacing.s) { assignmentActions(entry) }
+            if entry.returns > 0 {
+                NibButton(String(localized: "Open Returned Version"), symbol: .history, kind: .plain) { state("openReturn", ref: entry.id) }
             }
+            if widthClass == .compact || typeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: NibSpacing.s) { assignmentActions(entry) }
+            } else { HStack(spacing: NibSpacing.s) { assignmentActions(entry) } }
             Divider()
         }
     }
     private func assignmentActions(_ entry: LessonPanelEntry) -> some View {
         Group {
-            NibButton(String(localized: "Write Feedback"), kind: .plain) { state("feedback", ref: entry.id) }
+            if !entry.unreadable { NibButton(String(localized: "Write Feedback"), kind: .plain) { state("feedback", ref: entry.id) } }
             if entry.state == .published || entry.state == .resubmit {
                 NibButton(String(localized: "Submit Copy")) { state("submitted", ref: entry.id) }
             }
@@ -332,7 +383,7 @@ private struct LessonPanel: View {
     }
     private func run(_ command: String, _ params: JSONValue, completion: @escaping (JSONValue) -> Void = { _ in }) {
         guard !loading else { return }
-        loading = true; error = nil
+        loading = true; error = nil; receipt = nil
         Task {
             do {
                 let value = try await context.app.bus.execute(command, params, session: context.session)
@@ -346,8 +397,7 @@ private struct LessonPanel: View {
     }
     private func loadFolders() async {
         do {
-            let value = try await context.app.bus.execute(CommandIDs.queryTree, ["root": "lib", "depth": 8], session: context.session)
-            let nodes = flattened(value)
+            let nodes = try await pagedNodes(CommandIDs.queryTree, ["root": "lib", "depth": 8])
             documents = nodes.filter { $0["kind"]?.stringValue == "document" || $0["ref"]?.stringValue?.hasPrefix("doc:") == true }.compactMap { node in
                 guard let ref = node["ref"]?.stringValue ?? node["id"]?.stringValue.map({ "doc:" + $0 }) else { return nil }
                 return LessonPanelEntry(id: ref, title: node["title"]?.stringValue ?? ref, returns: 0)
@@ -363,21 +413,47 @@ private struct LessonPanel: View {
         loading = true; error = nil
         defer { loading = false }
         do {
-            let value = try await context.app.bus.execute(CommandIDs.libraryList, ["folder": .string(folder), "sort": "title"], session: context.session)
             var results: [LessonPanelEntry] = []
-            let nodes = flattened(value).filter { $0["kind"]?.stringValue == "document" || $0["ref"]?.stringValue?.hasPrefix("doc:") == true }
+            let nodes = try await pagedNodes(CommandIDs.libraryList, ["folder": .string(folder), "sort": "title"]).filter { $0["kind"]?.stringValue == "document" || $0["ref"]?.stringValue?.hasPrefix("doc:") == true }
             roster = []
-            for node in nodes {
-                guard let ref = node["ref"]?.stringValue ?? node["id"]?.stringValue.map({ "doc:" + $0 }) else { continue }
-                let detail = try await context.app.bus.execute(CommandIDs.queryGet, ["ref": .string(ref), "fields": ["meta", "ext"]], session: context.session)
-                let ext = detail["meta"]?["ext"] ?? detail["ext"] ?? detail["document"]?["meta"]?["ext"]
-                if let json = ext?[LessonManager.rosterKey], let record = try? json.decode(LessonRoster.self) { roster = record.students }
-                let assignment = try ext?[LessonManager.assignmentKey]?.decode(LessonAssignment.self)
-                results.append(LessonPanelEntry(id: ref, title: node["title"]?.stringValue ?? ref,
-                                               state: assignment?.state, student: assignment?.student?.name, returns: assignment?.returns.count ?? 0))
+            // Bound concurrent reads so large classes do not create a task per document at once.
+            for start in stride(from: 0, to: nodes.count, by: 8) {
+                let batch = Array(nodes[start..<min(start + 8, nodes.count)])
+                let details = await withTaskGroup(of: (JSONValue, JSONValue?).self) { group in
+                    for node in batch {
+                        group.addTask { @MainActor in
+                            guard let ref = node["ref"]?.stringValue ?? node["id"]?.stringValue.map({ "doc:" + $0 }) else { return (node, nil) }
+                            let detail = try? await context.app.bus.execute(CommandIDs.queryGet, ["ref": .string(ref), "fields": ["meta", "ext"]], session: context.session)
+                            return (node, detail)
+                        }
+                    }
+                    var values: [(JSONValue, JSONValue?)] = []
+                    for await value in group { values.append(value) }
+                    return values
+                }
+                for (node, detail) in details {
+                    guard let ref = node["ref"]?.stringValue ?? node["id"]?.stringValue.map({ "doc:" + $0 }) else { continue }
+                    let ext = detail?["meta"]?["ext"] ?? detail?["ext"] ?? detail?["document"]?["meta"]?["ext"]
+                    if let json = ext?[LessonManager.rosterKey], let record = try? json.decode(LessonRoster.self) { roster = record.students }
+                    let assignment = try? ext?[LessonManager.assignmentKey]?.decode(LessonAssignment.self)
+                    results.append(LessonPanelEntry(id: ref, title: node["title"]?.stringValue ?? ref,
+                                                   state: assignment?.state, student: assignment?.student?.name, returns: assignment?.returns.count ?? 0,
+                                                   unreadable: detail == nil || (ext?[LessonManager.assignmentKey] != nil && assignment == nil)))
+                }
             }
             entries = results
         } catch { self.error = NibError.wrap(error).message }
+    }
+    private func pagedNodes(_ command: String, _ params: JSONValue) async throws -> [JSONValue] {
+        var params = params.objectValue ?? [:], nodes: [JSONValue] = [], cursors = Set<String>()
+        repeat {
+            let value = try await context.app.bus.execute(command, .object(params), session: context.session)
+            nodes += flattened(value)
+            guard let cursor = value["cursor"]?.stringValue, !cursor.isEmpty else { break }
+            guard cursors.insert(cursor).inserted else { throw NibError(.conflict, "The library pagination cursor repeated.") }
+            params["cursor"] = .string(cursor)
+        } while true
+        return nodes
     }
     private func flattened(_ value: JSONValue) -> [JSONValue] {
         if let values = value.arrayValue { return values.flatMap(flattened) }

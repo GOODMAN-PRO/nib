@@ -56,11 +56,20 @@ enum LessonManager {
     static let assignmentKey = "nib.lesson"
     static let rosterKey = "nib.roster"
     static let privateSourceKey = "nib.lesson.privateSource"
+    static let returnReadOnlyKey = "nib.lesson.returnReadOnly"
     static let managedKey = "nib.lesson.managed"
     nonisolated static let privatePrefix = "PRESENT_"
+    /// S-095: Prep prepares the source before publication; student copies are independent after publishing.
     static let prepLayer = 0
     static let presentLayer = NibLimits.layerCount - 1
     static let feedbackLayer = 1
+    static let feedbackLayerKey = "nib.lesson.feedbackLayer"
+
+    static func feedbackLayer(in snapshot: LessonSnapshot) -> Int? {
+        guard snapshot.content.meta.kind == .notebook || snapshot.content.meta.kind == .whiteboard else { return nil }
+        let occupied = Set(snapshot.items.values.joined().map(\.layer))
+        return (1..<presentLayer).first { !occupied.contains($0) }
+    }
 
     static func assignment(_ meta: DocumentMeta) throws -> LessonAssignment? {
         guard let value = meta.ext?[assignmentKey] else { return nil }
@@ -231,7 +240,10 @@ final class PrivateLessonPersistence: DocumentPersistence {
         return url
     }
     func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { LessonManager.isPrivate(doc) ? nil : try base.remoteChanges(doc) }
-    func isReadOnly(_ doc: DocumentID) -> Bool { LessonManager.isPrivate(doc) ? false : base.isReadOnly(doc) }
+    func isReadOnly(_ doc: DocumentID) -> Bool {
+        if LessonManager.isPrivate(doc) { return (try? snapshot(doc).content.meta.ext?[LessonManager.returnReadOnlyKey]?.boolValue) == true }
+        return base.isReadOnly(doc)
+    }
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
         if LessonManager.isPrivate(doc) { return (try? snapshot(doc).items[page]?.map(\.rev).max()) ?? nil }
         return base.contentRevision(doc, page: page)

@@ -33,29 +33,23 @@ final class LessonRuntime {
         return store
     }
 
-    /// UndoManager registers its inverse synchronously. The actual disk changes still run through lesson.create,
-    /// retaining schema validation, permission checks and normal command error presentation.
     func recordCopies(_ ids: [DocumentID], ctx: CommandContext) {
-        guard !ids.isEmpty, let app = ctx.app else { return }
-        let refs = JSONValue.array(ids.map { .string($0.raw) })
-        record(command: CommandIDs.lessonCreate, undo: ["action": "trash", "ids": refs],
-               redo: ["action": "restore", "ids": refs], title: String(localized: "Create Lesson"), ctx: ctx, app: app)
+        guard ctx.principal.isUser, !ids.isEmpty, let app = ctx.app else { return }
+        let refs = JSONValue.array(ids.map { .string(NodeRef.document($0).description) })
+        record(command: CommandIDs.libraryTrash, redoCommand: CommandIDs.trashRecover,
+               undo: ["refs": refs], redo: ["refs": refs], title: String(localized: "Create Lesson"), ctx: ctx, app: app)
     }
 
-    func recordRoster(previous: [LessonStudent], next: [LessonStudent], folder: FolderID, ctx: CommandContext) {
-        guard let app = ctx.app else { return }
-        let undo: JSONValue = ["csv": .string(RosterImport.csv(previous)), "folder": .string(NodeRef.folder(folder).description), "recordUndo": false]
-        let redo: JSONValue = ["csv": .string(RosterImport.csv(next)), "folder": .string(NodeRef.folder(folder).description), "recordUndo": false]
-        record(command: CommandIDs.lessonImportRoster, undo: undo, redo: redo,
-               title: String(localized: "Import Roster"), ctx: ctx, app: app)
-    }
-
-    private func record(command: String, undo: JSONValue, redo: JSONValue, title: String, ctx: CommandContext, app: NibApp) {
+    private func record(command: String, redoCommand: String, undo: JSONValue, redo: JSONValue, title: String, ctx: CommandContext, app: NibApp) {
         let manager = ctx.navigator?.rootViewController?.undoManager ?? fallbackUndo
-        let step = LessonCommandUndo(app: app, session: ctx.session, manager: manager, command: command,
+        let step = LessonCommandUndo(app: app, session: ctx.session, manager: manager, command: command, redoCommand: redoCommand,
                                      undo: undo, redo: redo, title: title)
         // UndoManager targets are not relied on for ownership; the feature keeps the steps for its lifetime.
         undoSteps.append(step)
+        if undoSteps.count > 50 {
+            let removed = undoSteps.removeFirst()
+            manager.removeAllActions(withTarget: removed)
+        }
         step.register(undo: true)
     }
 }
@@ -66,20 +60,53 @@ final class LessonCommandUndo {
     weak var manager: UndoManager?
     weak var session: EditorSession?
     let command: String
+    let redoCommand: String
     let undoParams: JSONValue
     let redoParams: JSONValue
     let title: String
-    init(app: NibApp, session: EditorSession?, manager: UndoManager, command: String, undo: JSONValue, redo: JSONValue, title: String) {
+    private var pending: [Bool] = []
+    private var replaying = false
+    init(app: NibApp, session: EditorSession?, manager: UndoManager, command: String, redoCommand: String, undo: JSONValue, redo: JSONValue, title: String) {
         self.app = app; self.session = session; self.manager = manager; self.command = command
+        self.redoCommand = redoCommand
         self.undoParams = undo; self.redoParams = redo; self.title = title
     }
     func register(undo: Bool) {
-        manager?.registerUndo(withTarget: self) { step in
+        guard let manager else { return }
+        // Retrying after an awaited failure is outside UndoManager's synchronous undo group.
+        let needsGroup = manager.groupingLevel == 0 && !manager.isUndoing && !manager.isRedoing
+        if needsGroup { manager.beginUndoGrouping() }
+        manager.registerUndo(withTarget: self) { step in
             step.register(undo: !undo)
-            step.app?.perform(step.command, undo ? step.undoParams : step.redoParams, session: step.session)
+            step.pending.append(undo)
+            guard !step.replaying else { return }
+            step.replaying = true
+            Task { @MainActor in await step.replayPending() }
         }
-        manager?.setActionName(title)
+        manager.setActionName(title)
+        if needsGroup { manager.endUndoGrouping() }
     }
+
+    private func replayPending() async {
+        defer { replaying = false }
+        guard let app else { pending.removeAll(); return }
+        while !pending.isEmpty {
+            let undo = pending.removeFirst()
+            do {
+                _ = try await app.bus.execute(undo ? command : redoCommand,
+                                              undo ? undoParams : redoParams, session: session)
+            } catch {
+                // A failed replay offers retry, and queued inverses cannot act on unchanged state.
+                pending.removeAll()
+                manager?.removeAllActions(withTarget: self)
+                register(undo: undo)
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": undo ? command : redoCommand, "error": NibError.wrap(error)])
+                return
+            }
+        }
+    }
+
 }
 
 struct LessonCreate: NibCommand {
@@ -88,18 +115,15 @@ struct LessonCreate: NibCommand {
         var students: JSONValue?
         var folder: String?
         var ids: [String]?
-        /// Additive library undo operation; only documents tagged as created by this feature can be acted on.
-        var action: String?
     }
     struct Output: Codable { var refs: [String]; var source: String? }
 
     static let descriptor = CommandDescriptor(
         id: "lesson.create", title: String(localized: "Create Lesson"),
-        summary: "Publish one independent copy per student in a shared class folder; students accepts roster objects or names; doc=sample creates a sample; ids fixes copy ids; action trash/restore supports undo.",
+        summary: "Publish one independent copy per student in a shared class folder; students accepts roster objects or names; doc=sample creates a sample; ids fixes copy ids.",
         params: .obj(["doc": .str("source doc ref, or sample for the built-in lesson"),
                       "students": .arr(.anything("name string or {id,name,email?}; omit to use the imported roster")),
-                      "folder": .ref, "ids": .arr(.str("caller-chosen document ids, one per copy")),
-                      "action": .str("default create; undo operations only affect lesson-managed documents", choices: ["create", "trash", "restore"]) ]),
+                      "folder": .ref, "ids": .arr(.str("caller-chosen document ids, one per copy")) ], required: ["doc", "folder"]),
         examples: [["doc": "doc:FIXTUREDOC01", "students": ["Sam"], "folder": "folder:FIXTUREFLD01"],
                    ["doc": "sample", "students": [], "folder": "folder:FIXTUREFLD01", "ids": ["SAMPLELESSON01"]]],
         effect: .library, target: .library, extraScopes: [.documentRead])
@@ -110,37 +134,6 @@ struct LessonCreate: NibCommand {
         guard !runtime.busy else { throw NibError(.conflict, "Another lesson operation is still saving.", hint: "try again when it finishes") }
         runtime.busy = true
         defer { runtime.busy = false }
-        let action = p.action ?? "create"
-        if action != "create" {
-            guard ["trash", "restore"].contains(action), let ids = p.ids, !ids.isEmpty else {
-                throw LessonManager.invalid("Choose lesson document ids and a valid action.", path: "$.action")
-            }
-            let docs = try ids.map { try LessonManager.document($0, path: "$.ids") }
-            for doc in docs {
-                try LessonManager.writable(doc, ctx)
-                guard library.node(doc) != nil, try ctx.workspace.content(doc).meta.ext?[LessonManager.managedKey]?.boolValue == true else {
-                    throw NibError(.permissionDenied, "Library undo can only change documents created by the lesson toolkit.")
-                }
-            }
-            if !ctx.dryRun {
-                var changed: [DocumentID] = []
-                do {
-                    for doc in docs {
-                        if action == "trash" { try library.trash(doc) }
-                        else { try library.restore(doc, to: nil) }
-                        changed.append(doc)
-                    }
-                } catch {
-                    for doc in changed.reversed() {
-                        if action == "trash" { try? library.restore(doc, to: nil) }
-                        else { try? library.trash(doc) }
-                    }
-                    throw NibError.wrap(error)
-                }
-                ctx.events.emit(NibEventType.libraryChanged)
-            }
-            return Output(refs: docs.map { NodeRef.document($0).description }, source: nil)
-        }
         guard let folderString = p.folder, let sourceString = p.doc else {
             throw LessonManager.invalid("Choose a source document and a class folder.", path: "$.doc")
         }
@@ -175,7 +168,9 @@ struct LessonCreate: NibCommand {
         snapshot.content.meta.ext?[LessonManager.rosterKey] = nil
         // Dry runs are a true preview: no package creation, file copy, state or undo changes.
         if ctx.dryRun { return Output(refs: ids.map { NodeRef.document($0).description }, source: isSample ? nil : NodeRef.document(source).description) }
-        let blobs = try await copyInputs(snapshot, source: isSample ? nil : source, ctx: ctx)
+        let inputs = try copyInputs(snapshot, source: isSample ? nil : source, ctx: ctx)
+        let journal = try pendingURL(ctx)
+        try JSONEncoder().encode(ids).write(to: journal, options: .atomic)
         var created: [DocumentID] = []
         do {
             var copies: [(DocumentID, LessonSnapshot)] = []
@@ -191,13 +186,23 @@ struct LessonCreate: NibCommand {
                     copy.content.meta.ext?[LessonManager.assignmentKey] = try JSONValue.from(
                         LessonAssignment(source: source, folder: folder, student: student, state: .published, attempt: 1, returns: []))
                 }
-                copy.content.meta.layers[LessonManager.feedbackLayer].name = String(localized: "Feedback")
+                if let layer = LessonManager.feedbackLayer(in: snapshot) {
+                    copy.content.meta.ext?[LessonManager.feedbackLayerKey] = .number(Double(layer))
+                    if copy.content.meta.layers[layer].name == "Layer \(layer + 1)" {
+                        copy.content.meta.layers[layer].name = String(localized: "Feedback")
+                    }
+                }
                 let blank = DocumentContent(meta: DocumentMeta(id: id, kind: copy.content.meta.kind))
                 let actual = try library.createDocument(blank, title: student.map { title + " · " + $0.name } ?? title, in: folder)
                 created.append(actual)
                 guard actual == id else { throw NibError(.unsupported, "The library did not honour the supplied document id.") }
-                copy = try await transfer(copy, to: id, blobs: blobs, ctx: ctx)
                 copies.append((id, copy))
+            }
+            let mapped = try await transfer(snapshot, to: ids, inputs: inputs, ctx: ctx)
+            for index in copies.indices {
+                let meta = copies[index].1.content.meta
+                copies[index].1 = mapped
+                copies[index].1.content.meta = meta
             }
             try ctx.mutate(undoable: false) { tx in
                 for (id, copy) in copies {
@@ -211,11 +216,13 @@ struct LessonCreate: NibCommand {
                 }
             }
             for id in created { ctx.workspace.persistence.flush(id) }
+            try FileManager.default.removeItem(at: journal)
             runtime.recordCopies(created, ctx: ctx)
             ctx.events.emit(NibEventType.libraryChanged)
             return Output(refs: created.map { NodeRef.document($0).description }, source: isSample ? nil : NodeRef.document(source).description)
         } catch {
             for id in created { ctx.workspace.close(id); try? library.deletePermanently(id) }
+            if created.allSatisfy({ library.node($0) == nil }) { try? FileManager.default.removeItem(at: journal) }
             throw NibError.wrap(error)
         }
     }
@@ -223,9 +230,9 @@ struct LessonCreate: NibCommand {
     static func studentList(_ value: JSONValue?, folder: FolderID, ctx: CommandContext) throws -> [LessonStudent] {
         guard let value, value != .null else {
             let id = LessonManager.rosterID(folder)
-            guard ctx.services.library?.node(id) != nil,
+            guard let node = ctx.services.library?.node(id), node.trashedAt == nil,
                   let json = try ctx.workspace.content(id).meta.ext?[LessonManager.rosterKey] else { return [] }
-            return try json.decode(LessonRoster.self).students
+            return try json.decode(LessonRoster.self).students.map { LessonStudent(id: $0.id, name: $0.name, email: nil) }
         }
         guard let values = value.arrayValue, values.count <= RosterImport.maxStudents else {
             throw LessonManager.invalid("Choose at most 1,000 students.", path: "$.students")
@@ -243,54 +250,73 @@ struct LessonCreate: NibCommand {
         return out
     }
 
-    struct CopyInputs { var assets: [String: Data]; var files: [String: Data] }
-    static func copyInputs(_ snapshot: LessonSnapshot, source: DocumentID?, ctx: CommandContext) async throws -> CopyInputs {
+    /// Written before package creation. A process termination cannot bypass next-launch rollback.
+    static func pendingURL(_ ctx: CommandContext) throws -> URL {
+        let library = try ctx.services.require(ctx.services.library, "library")
+        let directory = library.metadataURL.appendingPathComponent("teacherlessons-pending", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent(ctx.workspace.clock.deviceHex + ".json")
+    }
+
+    struct CopyInputs { var refs: Set<AssetRef>; var source: DocumentID?; var files: [String: URL] }
+    static func copyInputs(_ snapshot: LessonSnapshot, source: DocumentID?, ctx: CommandContext) throws -> CopyInputs {
         let refs = LessonManager.assets(in: try JSONValue.from(snapshot))
-        let assets = ctx.services.assets
         var files: [String: URL] = [:]
         if let source {
             for clip in snapshot.content.liveAudio {
                 files[clip.file] = try ctx.workspace.persistence.fileURL(source, relativePath: clip.file)
                 if let transcript = clip.transcriptFile {
-                    // Persisted transcripts have per-device suffixes; preserve every file belonging to this base.
                     let base = try ctx.workspace.persistence.fileURL(source, relativePath: transcript)
+                    if FileManager.default.fileExists(atPath: base.path) { files[transcript] = base }
                     for file in try FileManager.default.contentsOfDirectory(at: base.deletingLastPathComponent(), includingPropertiesForKeys: nil)
                     where file.lastPathComponent.hasPrefix(base.lastPathComponent + ".") && file.pathExtension == "json" {
                         let relative = (transcript as NSString).deletingLastPathComponent
-                        files[relative + "/" + file.lastPathComponent] = file
+                        files[relative.isEmpty ? file.lastPathComponent : relative + "/" + file.lastPathComponent] = file
                     }
                 }
             }
         }
+        return CopyInputs(refs: refs, source: source, files: files)
+    }
+
+    /// One asset is loaded at a time and released after every destination receives it. Names are mapped once.
+    static func transfer(_ snapshot: LessonSnapshot, to docs: [DocumentID], inputs: CopyInputs, ctx: CommandContext) async throws -> LessonSnapshot {
+        let assets = try ctx.services.require(ctx.services.assets, "asset store")
+        var paths: [DocumentID: [String: URL]] = [:]
+        for doc in docs {
+            for path in inputs.files.keys { paths[doc, default: [:]][path] = try ctx.workspace.persistence.fileURL(doc, relativePath: path) }
+        }
         return try await Task.detached {
-            var bytes: [String: Data] = [:], fileBytes: [String: Data] = [:]
-            for ref in refs {
-                guard let source, let assets else { throw NibError.unavailable("lesson assets") }
-                bytes[ref.name] = try assets.data(ref, doc: source)
+            var map: [String: AssetRef] = [:]
+            for ref in inputs.refs {
+                guard let source = inputs.source else { throw NibError.unavailable("lesson assets") }
+                try autoreleasepool {
+                    let bytes = try assets.data(ref, doc: source)
+                    let ext = (ref.name as NSString).pathExtension
+                    for doc in docs {
+                        let copied = try assets.put(bytes, ext: ext.isEmpty ? "bin" : ext, doc: doc)
+                        if let previous = map[ref.name], previous != copied { throw NibError(.unsupported, "Asset names must be content-addressed.") }
+                        map[ref.name] = copied
+                    }
+                }
             }
-            for (path, url) in files { fileBytes[path] = try Data(contentsOf: url) }
-            return CopyInputs(assets: bytes, files: fileBytes)
+            for doc in docs {
+                for (path, source) in inputs.files {
+                    guard let destination = paths[doc]?[path], source != destination else { continue }
+                    // Replace atomically, leaving the previous Present recording intact on copy failure.
+                    let temporary = destination.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+                    defer { try? FileManager.default.removeItem(at: temporary) }
+                    try FileManager.default.copyItem(at: source, to: temporary)
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+                    } else { try FileManager.default.moveItem(at: temporary, to: destination) }
+                }
+            }
+            guard map.contains(where: { $0.key != $0.value.name }) else { return snapshot }
+            return try LessonManager.remappedAssets(JSONValue.from(snapshot), map).decode(LessonSnapshot.self)
         }.value
     }
 
-    static func transfer(_ snapshot: LessonSnapshot, to doc: DocumentID, blobs: CopyInputs, ctx: CommandContext) async throws -> LessonSnapshot {
-        let assets = try ctx.services.require(ctx.services.assets, "asset store")
-        var paths: [String: URL] = [:]
-        for path in blobs.files.keys { paths[path] = try ctx.workspace.persistence.fileURL(doc, relativePath: path) }
-        return try await Task.detached {
-            var map: [String: AssetRef] = [:]
-            for (name, bytes) in blobs.assets {
-                let ext = (name as NSString).pathExtension
-                map[name] = try assets.put(bytes, ext: ext.isEmpty ? "bin" : ext, doc: doc)
-            }
-            for (path, bytes) in blobs.files {
-                guard let url = paths[path] else { continue }
-                try bytes.write(to: url, options: .atomic)
-            }
-            let json = try JSONValue.from(snapshot)
-            return try LessonManager.remappedAssets(json, map).decode(LessonSnapshot.self)
-        }.value
-    }
 }
 
 struct LessonSetState: NibCommand {
@@ -298,8 +324,8 @@ struct LessonSetState: NibCommand {
     struct Output: Codable { var ref: String; var state: String; var snapshot: AssetRef? }
     static let descriptor = CommandDescriptor(
         id: "lesson.setState", title: String(localized: "Change Assignment State"),
-        summary: "Set published, submitted, returned or resubmit on a student copy; return saves an immutable snapshot. Prep, present and feedback select teaching modes; present uses a device-private workspace.",
-        params: .obj(["doc": .ref, "state": .str(choices: ["published", "submitted", "returned", "resubmit", "prep", "present", "feedback"])], required: ["doc", "state"]),
+        summary: "Change assignment state; return saves an immutable version, openReturn views it read-only. Prep, private Present and Feedback select notebook teaching modes.",
+        params: .obj(["doc": .ref, "state": .str(choices: ["published", "submitted", "returned", "resubmit", "prep", "present", "feedback", "openReturn"])], required: ["doc", "state"]),
         examples: [["doc": "doc:FIXTUREDOC01", "state": "published"]], effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
@@ -312,6 +338,7 @@ struct LessonSetState: NibCommand {
             let source = try LessonManager.document(raw)
             if p.state != "present" { doc = source }
         }
+        if p.state == "openReturn" { return try await openReturn(doc: doc, ctx: ctx) }
         try LessonManager.writable(doc, ctx)
         if ["prep", "present", "feedback"].contains(p.state) { return try await mode(p.state, doc: doc, ctx: ctx) }
         guard !LessonManager.isPrivate(doc), let state = LessonState(rawValue: p.state) else {
@@ -332,9 +359,25 @@ struct LessonSetState: NibCommand {
                                                   student: nil, state: .published, attempt: 1, returns: [])
         var snapshotRef: AssetRef?
         if state == .returned {
-            let snapshot = try LessonManager.capture(doc, workspace: ctx.workspace)
+            var snapshot = try LessonManager.capture(doc, workspace: ctx.workspace)
             let assets = try ctx.services.require(ctx.services.assets, "asset store")
-            let bytes = try await Task.detached { try JSONEncoder().encode(snapshot) }.value
+            if !ctx.dryRun {
+                let inputs = try LessonCreate.copyInputs(snapshot, source: doc, ctx: ctx)
+                let prefix = "returns/" + UUID().uuidString + "/"
+                var destinations: [String: URL] = [:]
+                for path in inputs.files.keys { destinations[path] = try ctx.workspace.persistence.fileURL(doc, relativePath: prefix + path) }
+                try await Task.detached {
+                    for (path, source) in inputs.files {
+                        if let destination = destinations[path] { try FileManager.default.copyItem(at: source, to: destination) }
+                    }
+                }.value
+                for index in snapshot.content.audio.indices {
+                    snapshot.content.audio[index].file = prefix + snapshot.content.audio[index].file
+                    if let transcript = snapshot.content.audio[index].transcriptFile { snapshot.content.audio[index].transcriptFile = prefix + transcript }
+                }
+            }
+            let captured = snapshot
+            let bytes = try await Task.detached { try JSONEncoder().encode(captured) }.value
             if !ctx.dryRun {
                 let destination = doc
                 let ref = try await Task.detached { try assets.put(bytes, ext: "json", doc: destination) }.value
@@ -344,13 +387,59 @@ struct LessonSetState: NibCommand {
         }
         if state == .resubmit { record.attempt += 1 }
         record.state = state
+        meta = try ctx.workspace.content(doc).meta
+        guard try LessonManager.assignment(meta) == existing else {
+            throw NibError(.conflict, "The assignment changed while its snapshot was saving. Try again.")
+        }
+        try LessonManager.writable(doc, ctx)
         meta.ext = meta.ext ?? [:]
         meta.ext?[LessonManager.assignmentKey] = try JSONValue.from(record)
         try ctx.mutate { tx in try tx.putMeta(meta) }
         return Output(ref: NodeRef.document(doc).description, state: state.rawValue, snapshot: snapshotRef)
     }
 
+    private static func openReturn(doc: DocumentID, ctx: CommandContext) async throws -> Output {
+        guard ctx.services.lock?.isLocked(doc) != true else { throw NibError(.locked, "Unlock the assignment before opening its returned version.") }
+        guard let record = try LessonManager.assignment(ctx.workspace.content(doc).meta), let saved = record.returns.last else {
+            throw NibError(.notFound, "This assignment has no returned version.")
+        }
+        let target = NibID(LessonManager.privatePrefix + "RETURN_" + LessonManager.digest(doc.raw + saved.asset.name))
+        if !ctx.dryRun {
+            let assets = try ctx.services.require(ctx.services.assets, "asset store")
+            var snapshot = try await Task.detached { try JSONDecoder().decode(LessonSnapshot.self, from: assets.data(saved.asset, doc: doc)) }.value
+            let store = try LessonRuntime.privateStore(ctx)
+            let inputs = try LessonCreate.copyInputs(snapshot, source: doc, ctx: ctx)
+            snapshot = try await LessonCreate.transfer(snapshot, to: [target], inputs: inputs, ctx: ctx)
+            snapshot.content.meta.id = target
+            snapshot.content.meta.sourceBookmark = nil
+            snapshot.content.meta.ext = snapshot.content.meta.ext ?? [:]
+            snapshot.content.meta.ext?[LessonManager.returnReadOnlyKey] = true
+            ctx.workspace.close(target)
+            try store.seed(snapshot)
+            ctx.services.packages.set(store.package(target), for: target)
+            if ctx.navigator != nil { _ = try await ctx.execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(target).description)]) }
+            ctx.activeSession?.document = target
+            ctx.activeSession?.page = snapshot.content.livePages.first?.id
+            ctx.activeSession?.readOnly = true
+        }
+        return Output(ref: NodeRef.document(target).description, state: "openReturn", snapshot: saved.asset)
+    }
+
     private static func mode(_ mode: String, doc: DocumentID, ctx: CommandContext) async throws -> Output {
+        let meta = try ctx.workspace.content(doc).meta
+        guard meta.kind == .notebook || meta.kind == .whiteboard else {
+            throw NibError(.unsupported, "Teaching modes require a notebook or whiteboard.")
+        }
+        if mode == "present", let app = ctx.app {
+            let menu = MenuContext(app: app, session: ctx.activeSession, doc: doc)
+            if app.ui.menus.all.contains(where: { $0.command == CommandIDs.collabFollowMe && $0.isChecked?(menu) == true }) {
+                throw NibError(.conflict, "Stop Follow Me before entering private Present mode.", hint: "call collab.followMe {on: false}")
+            }
+        }
+        let feedback = meta.ext?[LessonManager.feedbackLayerKey]?.intValue
+        if mode == "feedback", feedback == nil {
+            throw NibError(.unsupported, "This copy has no empty feedback layer. Publish a notebook with an unused layer.")
+        }
         let target: DocumentID
         if mode == "present", !LessonManager.isPrivate(doc) {
             target = LessonManager.privateID(doc, device: ctx.workspace.clock.deviceHex)
@@ -362,27 +451,35 @@ struct LessonSetState: NibCommand {
                 old = try LessonManager.capture(target, workspace: ctx.workspace)
             } else { old = nil }
             var value = try LessonManager.capture(doc, workspace: ctx.workspace)
+            guard !value.items.values.joined().contains(where: { $0.layer == LessonManager.presentLayer }) else {
+                throw NibError(.unsupported, "The source uses the private Present layer. Move its contents to another layer first.")
+            }
             value.content.meta.id = target
             value.content.meta.locked = false
             value.content.meta.sourceBookmark = nil
             value.content.meta.ext = value.content.meta.ext ?? [:]
             value.content.meta.ext?[LessonManager.privateSourceKey] = .string(doc.raw)
             value.content.meta.layers[LessonManager.presentLayer].name = String(localized: "Present, private")
-            for page in Array(value.items.keys) {
-                value.items[page] = value.items[page]?.map { item in var item = item; item.layer = LessonManager.prepLayer; return item }
-            }
-            let blobs = try await LessonCreate.copyInputs(value, source: doc, ctx: ctx)
-            // Asset writes need only the directory, so no previous private note is overwritten if a copy fails.
+            let inputs = try LessonCreate.copyInputs(value, source: doc, ctx: ctx)
             try FileManager.default.createDirectory(at: store.package(target), withIntermediateDirectories: true)
-            value = try await LessonCreate.transfer(value, to: target, blobs: blobs, ctx: ctx)
+            value = try await LessonCreate.transfer(value, to: [target], inputs: inputs, ctx: ctx)
             if let old {
-                for page in old.content.livePages {
-                    let notes = old.items[page.id]?.filter { $0.layer == LessonManager.presentLayer } ?? []
-                    if !notes.isEmpty {
-                        if value.content.page(page.id) == nil { value.content.pages.append(page) }
-                        value.items[page.id, default: []] += notes
+                let sourceItems = Set(value.items.values.joined().map(\.id))
+                let sourcePages = Set(value.content.livePages.map(\.id))
+                for page in old.content.pages {
+                    if !sourcePages.contains(page.id) {
+                        value.content.pages.removeAll { $0.id == page.id }
+                        value.content.pages.append(page)
                     }
+                    value.items[page.id, default: []] += (old.items[page.id] ?? []).filter { !sourceItems.contains($0.id) }
                 }
+                // Legacy private copies could contain blocks/cards; never drop their independent records.
+                let blocks = Set(value.content.blocks.map(\.id)), cards = Set(value.content.cards.map(\.id))
+                value.content.blocks += old.content.blocks.filter { !blocks.contains($0.id) }
+                value.content.cards += old.content.cards.filter { !cards.contains($0.id) }
+                let audio = Set(value.content.audio.map(\.id)), outline = Set(value.content.outline.map(\.id))
+                value.content.audio += old.content.audio.filter { !audio.contains($0.id) }
+                value.content.outline += old.content.outline.filter { !outline.contains($0.id) }
             }
             ctx.workspace.close(target)
             try store.seed(value)
@@ -394,8 +491,8 @@ struct LessonSetState: NibCommand {
             if let session = ctx.activeSession {
                 session.document = target
                 session.page = try ctx.workspace.content(target).livePages.first?.id
-                session.activeLayer = mode == "present" ? LessonManager.presentLayer : (mode == "feedback" ? LessonManager.feedbackLayer : LessonManager.prepLayer)
-                session.hiddenLayers = []
+                session.activeLayer = mode == "present" ? LessonManager.presentLayer : (mode == "feedback" ? feedback! : LessonManager.prepLayer)
+                // Retain the teacher's layer visibility choices.
             }
         }
         return Output(ref: NodeRef.document(target).description, state: mode, snapshot: nil)
@@ -440,20 +537,15 @@ struct LessonImportRoster: NibCommand {
                 let handle = try FileHandle(forReadingFrom: url)
                 defer { try? handle.close() }
                 let bytes = try handle.read(upToCount: RosterImport.maxBytes + 1) ?? Data()
-                guard bytes.count <= RosterImport.maxBytes, let text = String(data: bytes, encoding: .utf8) else {
-                    throw RosterImport.invalid("Choose a UTF-8 CSV file no larger than 2 MB.")
-                }
-                return text
+                return try RosterImport.text(bytes)
             }.value
         }
-        let students = try await Task.detached { try RosterImport.parse(text) }.value
+        let students = try await Task.detached { try RosterImport.parse(text).map { LessonStudent(id: $0.id, name: $0.name, email: nil) } }.value
         let doc = LessonManager.rosterID(folder)
         let created = library.node(doc) == nil
-        var previous: [LessonStudent]?
         if !created {
             try LessonManager.writable(doc, ctx)
             let existing = try ctx.workspace.content(doc).meta.ext?[LessonManager.rosterKey]?.decode(LessonRoster.self)
-            previous = existing?.students
             guard existing?.folder == folder, library.node(doc)?.trashedAt == nil else {
                 throw NibError(.conflict, "The roster id is already used or the roster is in Trash.", hint: "restore the roster before importing it again")
             }
@@ -474,7 +566,7 @@ struct LessonImportRoster: NibCommand {
             ctx.workspace.persistence.flush(doc)
             if p.recordUndo != false {
                 if created { runtime.recordCopies([doc], ctx: ctx) }
-                else if let previous { runtime.recordRoster(previous: previous, next: students, folder: folder, ctx: ctx) }
+
             }
             ctx.events.emit(NibEventType.libraryChanged)
         } catch {
