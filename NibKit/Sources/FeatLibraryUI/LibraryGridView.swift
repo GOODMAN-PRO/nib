@@ -300,8 +300,12 @@ struct LibraryCover: View {
                 // Paper does not invert with chrome. Its missing/locked glyph uses opaque paper ink too.
                 ZStack {
                     NibPaper.white.color
-                    Image(nib: isLocked ? .lock : row.typeBadge ?? .notebook)
-                        .font(NibFont.display).foregroundStyle(NibInk.graphite.color)
+                    GeometryReader { proxy in
+                        Image(nib: isLocked ? .lock : row.typeBadge ?? .notebook)
+                            .font(proxy.size.width <= NibMetrics.rowThumbnailWidth ? NibFont.title3 : NibFont.display)
+                            .foregroundStyle(NibInk.graphite.color)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
             }
         }

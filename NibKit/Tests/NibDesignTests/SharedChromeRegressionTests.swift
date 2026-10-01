@@ -8,6 +8,21 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testInitialMeasurementsDoNotAnimateButSubsequentMovesDo() {
+        let field = DropletField()
+        let provisional = CGRect(x: -48, y: -22, width: 96, height: 44)
+        let placed = CGRect(x: 0, y: 0, width: 96, height: 44)
+        field.setRest("new", provisional, style: .primary)
+        field.setRest("new", placed, style: .primary)
+        XCTAssertEqual(field.node("new").presentation.contentTransform, .identity)
+        XCTAssertEqual(field.visualFrame("new"), placed)
+
+        _ = field.tick(1.0 / 120)
+        field.setRest("new", placed.offsetBy(dx: 100, dy: 0), style: .primary)
+        XCTAssertEqual(field.node("new").presentation.contentTransform.tx, -100, accuracy: 0.01)
+        XCTAssertEqual(field.visualFrame("new"), placed)
+    }
+
     func testRestingControlsPublishGeometryWithoutAFrameTickEvenWhileInking() {
         for frozen in [false, true] {
             let field = DropletField()

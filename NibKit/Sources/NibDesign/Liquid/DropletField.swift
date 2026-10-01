@@ -54,6 +54,9 @@ final class DropletField {
         var style: DropletStyle
         var rest: CGRect = .zero
         var hasRest = false
+        // SwiftUI can report provisional positions while measuring its first layout. There is no previous
+        // on-screen position to preserve until a display-link turn has presented this entry.
+        var hasPresented = false
         var dyn = DropletDynamics()
         var isDragging = false
         var grabOffset: CGPoint = .zero
@@ -304,7 +307,7 @@ final class DropletField {
     func setRest(_ id: String, _ rect: CGRect, style: DropletStyle) {
         register(id, style: style)
         guard var e = entries[id], NibGeometry.isUsable(rect) else { return }
-        if !e.hasRest {
+        if !e.hasRest || (!e.hasPresented && !e.isDragging && e.bud == nil) {
             e.rest = rect
             e.hasRest = true
             e.dyn.size.snap(to: CGPoint(x: rect.width, y: rect.height))
@@ -1063,6 +1066,7 @@ final class DropletField {
         var busy = false
         for id in order {
             guard var e = entries[id], e.hasRest else { continue }
+            e.hasPresented = true
             stepBud(&e, now: now)
             let moving = e.dyn.step(step, style: e.style, reduceMotion: physicsOff, calm: mode == .calm)
             stepReshape(&e)

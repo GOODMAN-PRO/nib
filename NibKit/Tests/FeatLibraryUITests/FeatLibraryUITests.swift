@@ -284,6 +284,10 @@ final class FeatLibraryUITests: XCTestCase {
                 XCTAssertFalse(LibraryCarrierVisibility.hides(row.ref, in: model.reflow))
 
                 let image = try XCTUnwrap(NibSnapshot.image(LibraryStackedCarrier(ref: row.ref, model: model), size: expected))
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "library-carrier-\(list ? "list" : "grid")-\(compact ? "compact" : "regular")"
+                attachment.lifetime = .keepAlways
+                add(attachment)
                 let bottomPaper = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: expected.width / 2, y: expected.height - 10)))
                 XCTAssertGreaterThan(bottomPaper.r, 240, "The bottom of the carrier must contain cover paper, not an empty label region")
                 XCTAssertEqual(DropletStyle.card.envelope, 3)

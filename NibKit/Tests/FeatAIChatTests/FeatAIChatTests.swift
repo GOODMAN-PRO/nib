@@ -359,23 +359,50 @@ final class FeatAIChatTests: XCTestCase {
         }
     }
 
-    func testShortBodyKeepsThreadReadableAndTallBodyPinsComposer() throws {
+    func testShortBodyKeepsThreadReadableAndTallBodyPinsComposer() async throws {
         // Distinct solid regions exercise the real layout without depending on text rasterisation. A compressed
         // thread or an overflowing fixed stack cannot leave green at both sample points in the short body.
+        // ImageRenderer omits the UIKit-backed scrolling viewport; capture the live view's layers instead.
         let layout = ChatThreadLayout(context: Color.red.frame(height: 88),
                                       thread: Color.green.frame(height: 132),
                                       composer: Color.blue.frame(height: 176))
         for width: CGFloat in [344, 390, 844] {
-            let short = try XCTUnwrap(NibSnapshot.image(layout, size: CGSize(width: width, height: 220), scale: 1))
+            let short = try await layoutImage(layout, size: CGSize(width: width, height: 220))
+            let attachment = XCTAttachment(image: short)
+            attachment.name = "assistant-short-body-\(Int(width))"
+            attachment.lifetime = .keepAlways
+            add(attachment)
             for y: CGFloat in [112, 200] {
                 let pixel = try XCTUnwrap(NibSnapshot.pixel(short, at: CGPoint(x: width / 2, y: y)))
                 XCTAssertGreaterThan(pixel.g, pixel.r)
                 XCTAssertGreaterThan(pixel.g, pixel.b)
             }
-            let tall = try XCTUnwrap(NibSnapshot.image(layout, size: CGSize(width: width, height: 640), scale: 1))
+            let tall = try await layoutImage(layout, size: CGSize(width: width, height: 640))
             let bottom = try XCTUnwrap(NibSnapshot.pixel(tall, at: CGPoint(x: width / 2, y: 620)))
             XCTAssertGreaterThan(bottom.b, bottom.r)
             XCTAssertGreaterThan(bottom.b, bottom.g)
+        }
+    }
+
+    private func layoutImage<V: View>(_ view: V, size: CGSize) async throws -> UIImage {
+        let host = UIHostingController(rootView: view.ignoresSafeArea()
+            .environment(\.colorScheme, .light).environment(\.dynamicTypeSize, .large))
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        host.view.backgroundColor = .clear
+        host.view.setNeedsLayout()
+        host.view.layoutIfNeeded()
+        // Allow SwiftUI to mount and lay out the selected ViewThatFits branch and its scroll content.
+        try await Task.sleep(for: .milliseconds(100))
+        host.view.layoutIfNeeded()
+        host.view.layer.displayIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            host.view.layer.render(in: context.cgContext)
         }
     }
 
