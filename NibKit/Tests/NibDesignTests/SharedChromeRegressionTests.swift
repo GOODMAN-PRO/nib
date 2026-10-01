@@ -8,6 +8,30 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testReducedMotionBudsStayAtTheirFinalMeasuredPosition() {
+        for mode in [NibLiquidMode.full, .off] {
+            let field = DropletField()
+            field.mode = mode
+            field.reduceMotion = mode == .full
+            field.setWorldAnchor("source", CGRect(x: 700, y: 16, width: 96, height: 44))
+            field.setRest("menu", CGRect(x: 0, y: 0, width: 312, height: 200), style: .popover)
+            field.setBud("menu", source: "source", presented: true, instant: false, dismiss: {})
+            _ = field.tick(1.0 / 120)
+
+            // Content height and the source frame arrive in separate layout passes after opening.
+            for frame in [CGRect(x: 506, y: 80, width: 312, height: 200),
+                          CGRect(x: 506, y: 80, width: 312, height: 460)] {
+                field.setRest("menu", frame, style: .popover)
+                XCTAssertEqual(field.visualFrame("menu"), frame, "\(mode)")
+                XCTAssertEqual(field.node("menu").presentation.contentTransform, .identity)
+                XCTAssertTrue(field.node("menu").presentation.isDrawn)
+                _ = field.tick(1.0 / 120)
+                XCTAssertEqual(field.visualFrame("menu"), frame, "A fade must not move the popover")
+            }
+            field.unregister("menu")
+        }
+    }
+
     func testInitialMeasurementsDoNotAnimateButSubsequentMovesDo() {
         let field = DropletField()
         let provisional = CGRect(x: -48, y: -22, width: 96, height: 44)

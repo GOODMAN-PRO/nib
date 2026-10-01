@@ -330,6 +330,13 @@ final class DropletField {
         if e.reshape != .gathering { e.dyn.size.target = CGPoint(x: rect.width, y: rect.height) }
         e.dyn.corner.target = cornerTarget(e.style, rect.size)
         e.rest = rect
+        // Reduced-motion buds fade at their final position (§12). Their source and content
+        // measurements can settle after presentation; those corrections must not add a flight.
+        if physicsOff && e.bud?.presented == true && !e.isDragging {
+            e.dyn.offset.snap(to: .zero)
+            e.dyn.size.snap(to: CGPoint(x: rect.width, y: rect.height))
+            e.dyn.corner.snap(to: cornerTarget(e.style, rect.size))
+        }
         entries[id] = e
         wake()
     }
