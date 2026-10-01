@@ -13,17 +13,17 @@ public enum FeatMeetingAIFeature: NibFeature {
         app.services.set(LiveSummarizer(app: app), for: LiveSummarizer.serviceKey)
         app.settings.declare(MeetingSettings.live, summary: "Summarize new transcript speech about once per minute while recording.", owner: id, schema: .bool())
         app.settings.declare(MeetingSettings.language, summary: "Language for translated meeting summaries and generated notes.", owner: id, schema: .str())
-        app.ui.panels.register(PanelDescriptor(id: panelID, title: String(localized: "Summary"), icon: NibSymbol.transcript.name,
+        app.ui.panels.register(PanelDescriptor(id: panelID, title: String(localized: "Summary"), icon: NibSymbol.listBulleted.name,
             placement: .sidebarTab, order: 360, owner: id, docKinds: [.notebook, .whiteboard, .textDocument]) { AnyView(SummaryPanel(context: $0)) })
-        var settings = SettingsPageDescriptor(id: settingsID, title: String(localized: "Recording Settings"),
+        var settings = SettingsPageDescriptor(id: settingsID, title: String(localized: "Meeting AI"),
             icon: NibSymbol.microphone.name, section: .ai, order: 360, owner: id) { AnyView(MeetingRecordingSettings(app: $0)) }
-        settings.keywords = ["meeting", "summary", "cloud", "transcription", "language"]
+        settings.keywords = ["recording", "meeting", "summary", "cloud", "transcription", "language"]
         app.ui.settingsPages.register(settings)
         app.ui.menus.register(MenuItemDescriptor(id: "meetingai.summary", title: String(localized: "Summary"),
-            icon: NibSymbol.transcript.name, location: .documentMore, order: 425, owner: id, command: CommandIDs.panelOpen,
+            icon: NibSymbol.listBulleted.name, location: .documentMore, order: 425, owner: id, command: CommandIDs.panelOpen,
             params: { _ in ["id": .string(panelID)] }))
         app.ui.menus.register(MenuItemDescriptor(id: "meetingai.clip.summary", title: String(localized: "Summary"),
-            icon: NibSymbol.transcript.name, location: .audioClip, order: 330, owner: id, command: CommandIDs.panelOpen,
+            icon: NibSymbol.listBulleted.name, location: .audioClip, order: 330, owner: id, command: CommandIDs.panelOpen,
             params: { ["id": .string(panelID), "clip": .string($0.ref ?? "")] }, isVisible: { $0.ref != nil }))
         for (mode, title, order) in [("generate", String(localized: "Generate Notes"), 340), ("enhance", String(localized: "Enhance Notes"), 350)] {
             app.ui.menus.register(MenuItemDescriptor(id: "meetingai.clip." + mode, title: title, icon: NibSymbol.text.name,
@@ -31,7 +31,7 @@ public enum FeatMeetingAIFeature: NibFeature {
                 params: { ["clip": .string($0.ref ?? ""), "mode": .string(mode)] },
                 isVisible: { context in
                     guard let ref = context.ref, let runtime = context.app.services.get(LiveSummarizer.serviceKey, as: LiveSummarizer.self) else { return false }
-                    return runtime.recordings[ref]?.state != "recording" && runtime.recordings[ref]?.state != "paused"
+                    return runtime.recordings[ref]?.state != "recording" && runtime.recordings[ref]?.state != "paused" && runtime.transcribing[ref] == false
                 }))
         }
         var key = KeyCommandDescriptor(id: panelID, title: String(localized: "Show Summary"),

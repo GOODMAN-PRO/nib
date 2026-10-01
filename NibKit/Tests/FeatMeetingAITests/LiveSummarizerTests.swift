@@ -38,7 +38,7 @@ final class LiveSummarizerTests: XCTestCase {
         let second = try await summarize(corrected, previous: first, ai: ai)
         XCTAssertEqual(ai.requests.count, 5)
         XCTAssertEqual(second.windows[0], first.windows[0])
-        XCTAssertEqual(second.windows[1].source[0].text, corrected[1].text)
+        XCTAssertEqual(second.windows[1].sources[0], MeetingSource(corrected[1]))
     }
     func testLateSpeechAfterPauseIsNeverSkipped() async throws {
         let ai = FakeAIService(responses: (0..<4).map { _ in .init(text: Self.answer) })
@@ -92,6 +92,50 @@ final class LiveSummarizerTests: XCTestCase {
         XCTAssertEqual(summary.windows.count, 1)
         XCTAssertTrue(summary.windows[0].content.isEmpty)
         XCTAssertEqual(summary.windows[0].flags, [.lowConfidence, .noisy])
+    }
+
+    func testEmptyWindowCoversSourceAndDoesNotBlockLaterSpeech() async throws {
+        let empty = #"{"content":{"keyPoints":[],"decisions":[],"actionItems":[]},"translation":null,"flags":[]}"#
+        let ai = FakeAIService(responses: [.init(text: empty), .init(text: Self.answer)])
+        let speech = [line(0, start: 0), line(1, start: 61)]
+        let summary = try await summarize(speech, ai: ai)
+        XCTAssertEqual(summary.windows.count, 2)
+        XCTAssertTrue(summary.windows[0].content.isEmpty)
+        _ = try await summarize(speech, previous: summary, ai: ai)
+        XCTAssertEqual(ai.requests.count, 2)
+    }
+    func testChineseBaseLanguageDoesNotRequireTranslation() async throws {
+        let ai = FakeAIService(responses: [.init(text: #"{"content":{"keyPoints":["下周发布新版本"],"decisions":[],"actionItems":[]},"translation":null,"flags":[]}"#)])
+        let speech = [TranscriptSegment(index: 0, start: 0, duration: 20, text: "我们今天讨论项目的进度，并且决定下周发布新版本。大家需要在周五之前完成所有测试工作。")]
+        let summary = try await MeetingModel.summarize(lines: speech, previous: nil, target: "zh", incremental: true,
+            fallback: "zh", ai: ai, doc: doc, principal: .user)
+        XCTAssertEqual(summary.windows.count, 1)
+        XCTAssertNil(summary.windows[0].translation)
+        XCTAssertEqual(MeetingWindows.base("en-GB"), "en")
+        XCTAssertEqual(MeetingWindows.base("zh-Hant"), "zh")
+    }
+    func testModelCannotInventNoiseOrGapsAndEmptyTranslationFallsBack() async throws {
+        let ai = FakeAIService(responses: [.init(text: #"{"content":{"keyPoints":["Review the project plan."],"decisions":[],"actionItems":[]},"translation":{"keyPoints":[],"decisions":[],"actionItems":[]},"flags":["noisy","gaps"]}"#)])
+        let summary = try await summarize([line(0, start: 0)], ai: ai)
+        XCTAssertEqual(summary.windows[0].flags, [])
+        XCTAssertEqual(summary.windows[0].translatedContent, summary.windows[0].content)
+        XCTAssertTrue(MeetingGenerateNotes.makeNotes(summary, name: "Meeting").contains { $0.text == "Review the project plan." })
+    }
+    func testCatchUpUsesFiveMinuteWindows() {
+        let speech = (0..<120).map { line($0, start: Double($0) * 60) }
+        let plan = MeetingWindows.plan(lines: speech, previous: nil, target: "en", incremental: false, interval: 300)
+        XCTAssertEqual(plan.pending.count, 24)
+        XCTAssertEqual(plan.pending.flatMap { $0 }, speech)
+    }
+    func testRichNotebookNotesKeepHeadingsListsAndTodos() throws {
+        let notes = [MeetingNote(kind: .heading1, text: "Meeting"), MeetingNote(kind: .bullet, text: "A key point"),
+            MeetingNote(kind: .todo, text: "Prepare the release")]
+        let rich = MeetingGenerateNotes.richText(notes)
+        let pages = try MeetingGenerateNotes.paginateRich(rich, width: 450, height: 700)
+        XCTAssertEqual(pages.flatMap { $0.paragraphs }, rich.paragraphs)
+        XCTAssertEqual(rich.paragraphs[0].style, "title")
+        XCTAssertEqual(rich.paragraphs[1].list, .bullet)
+        XCTAssertEqual(rich.paragraphs[2].list, .todo)
     }
 
 }
