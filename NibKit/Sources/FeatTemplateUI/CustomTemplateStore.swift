@@ -2,6 +2,7 @@ import Foundation
 import UIKit
 import PDFKit
 import CryptoKit
+import os
 import NibContracts
 
 struct CustomTemplate: Codable, Equatable, Identifiable {
@@ -25,18 +26,18 @@ struct TemplateGroup: Codable, Equatable, Identifiable {
 
 /// A device writes only its own group file. Blobs are immutable, content addressed and retained with tombstones
 /// so a slow device can still merge a deletion, and an already applied document never depends on this library.
-@MainActor
-final class CustomTemplateStore {
-    let root: URL
+actor CustomTemplateStore {
+    private static let logger = Logger(subsystem: "app.nib", category: "templateui")
+    nonisolated let root: URL
     let clock: HLCClock
     init(root: URL, clock: HLCClock) { self.root = root; self.clock = clock }
 
-    static func validID(_ id: String, field: String = "id") throws -> String {
+    nonisolated static func validID(_ id: String, field: String = "id") throws -> String {
         guard NibID.isValid(id) else { throw NibError.invalid("Use 1–64 letters, digits, underscores or hyphens.", path: "$." + field) }
         return id
     }
 
-    static func title(_ value: String) throws -> String {
+    nonisolated static func title(_ value: String) throws -> String {
         let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.count <= 200 else { throw NibError.invalid("Enter a title of 1–200 characters.", path: "$.title") }
         return value
@@ -46,34 +47,64 @@ final class CustomTemplateStore {
         let fm = FileManager.default
         guard fm.fileExists(atPath: root.path) else { return [] }
         var merged: [TemplateGroup] = []
-        for directory in try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey]).sorted(by: { $0.path < $1.path }) {
-            guard (try directory.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true,
+        let directories: [URL]
+        do { directories = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey]) }
+        catch {
+            Self.logger.warning("Cannot scan template library: \(error.localizedDescription, privacy: .public)")
+            return []
+        }
+        for directory in directories.sorted(by: { $0.path < $1.path }) {
+            guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
                   NibID.isValid(directory.lastPathComponent) else { continue }
             var winner: TemplateGroup?
+            var deleted = false
             var templates: [String: CustomTemplate] = [:]
-            for file in try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).sorted(by: { $0.path < $1.path })
+            let files: [URL]
+            do { files = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
+            catch {
+                Self.logger.warning("Cannot scan template group: \(directory.path, privacy: .public)")
+                continue
+            }
+            for file in files.sorted(by: { $0.path < $1.path })
                 where file.lastPathComponent.hasPrefix("group.") && file.pathExtension == "json" {
-                let group: TemplateGroup
-                do { group = try JSONDecoder().decode(TemplateGroup.self, from: Data(contentsOf: file)) }
-                catch { throw NibError(.invalidParams, "Cannot read template group \(directory.lastPathComponent): \(error.localizedDescription)") }
-                guard group.id == directory.lastPathComponent else { throw NibError(.invalidParams, "Template group ID does not match its folder.") }
-                clock.observe(group.rev)
-                if winner == nil || winner!.rev.effective() < group.rev.effective() { winner = group }
-                for entry in group.templates {
-                    guard NibID.isValid(entry.id), Self.isBlobName(entry.file), entry.kind == "paper" || entry.kind == "cover",
-                          entry.size.width.isFinite, entry.size.height.isFinite, entry.size.width > 0, entry.size.height > 0 else {
-                        throw NibError(.invalidParams, "Invalid custom template metadata.")
+                do {
+                    // Decode entries separately so one future-version entry does not hide its valid siblings.
+                    let data = try Data(contentsOf: file)
+                    var object = try JSONDecoder().decode(JSONValue.self, from: data)
+                    let entries = object["templates"]?.arrayValue ?? []
+                    guard case var .object(fields) = object else { throw NibError.invalid("Invalid group record") }
+                    fields["templates"] = []
+                    object = .object(fields)
+                    let group = try object.decode(TemplateGroup.self)
+                    guard group.id == directory.lastPathComponent else { throw NibError.invalid("Mismatched group ID") }
+                    clock.observe(group.rev)
+                    deleted = deleted || group.deleted
+                    if winner == nil || winner!.rev.effective() < group.rev.effective() { winner = group }
+                    for value in entries {
+                        guard let entry = try? value.decode(CustomTemplate.self), NibID.isValid(entry.id),
+                              Self.isBlobName(entry.file), entry.kind == "paper" || entry.kind == "cover",
+                              entry.size.width.isFinite, entry.size.height.isFinite, entry.size.width > 0, entry.size.height > 0 else {
+                            Self.logger.warning("Skipping invalid template entry in \(file.path, privacy: .public)")
+                            continue
+                        }
+                        clock.observe(entry.rev)
+                        if templates[entry.id] == nil || templates[entry.id]!.rev.effective() < entry.rev.effective() { templates[entry.id] = entry }
                     }
-                    clock.observe(entry.rev)
-                    if templates[entry.id] == nil || templates[entry.id]!.rev.effective() < entry.rev.effective() { templates[entry.id] = entry }
+                } catch {
+                    Self.logger.warning("Skipping invalid template group file \(file.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
             }
             if var group = winner {
-                group.templates = templates.values.sorted { $0.id < $1.id }
+                group.deleted = deleted
+                group.templates = templates.values.sorted { $0.id < $1.id }.map { entry in
+                    var entry = entry
+                    if deleted { entry.deleted = true }
+                    return entry
+                }
                 if includeDeleted || !group.deleted { merged.append(group) }
             }
         }
-        return merged.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        return merged.sorted { $0.title == $1.title ? $0.id < $1.id : $0.title.localizedStandardCompare($1.title) == .orderedAscending }
     }
 
     private static func isBlobName(_ name: String) -> Bool {
@@ -117,6 +148,7 @@ final class CustomTemplateStore {
     func deleteGroup(_ id: String) throws {
         var group = try group(id)
         group.deleted = true; group.rev = clock.tick()
+        for index in group.templates.indices { group.templates[index].deleted = true; group.templates[index].rev = clock.tick() }
         try write(group)
     }
 
@@ -135,29 +167,37 @@ final class CustomTemplateStore {
         try write(group)
     }
 
-    func importFile(_ url: URL, group requested: String?, kind: String, id: String?, title: String? = nil) async throws -> CustomTemplate {
+    // Actor isolation serialises each import, including preparation and persistence, away from MainActor.
+    // There is no suspension between reading the merged snapshot and writing our device record.
+    func importFile(_ url: URL, group requested: String?, kind: String, id: String?, title: String? = nil) throws -> CustomTemplate {
         guard kind == "paper" || kind == "cover" else { throw NibError.invalid("Choose paper or cover.", path: "$.kind") }
         let id = try Self.validID(id ?? NibID.make().raw)
-        guard try !groups(includeDeleted: true).contains(where: { $0.templates.contains { $0.id == id } }) else {
+        let snapshot = try groups(includeDeleted: true)
+        guard !snapshot.contains(where: { $0.templates.contains { $0.id == id } }) else {
             throw NibError.invalid("That template ID is already in use.", path: "$.id")
         }
         let title = try Self.title(title ?? url.deletingPathExtension().lastPathComponent)
+        var group: TemplateGroup
+        if let requested {
+            _ = try Self.validID(requested, field: "group")
+            guard let existing = snapshot.first(where: { $0.id == requested && !$0.deleted }) else { throw NibError.notFound("Template group \(requested)") }
+            group = existing
+        } else if let custom = snapshot.first(where: { $0.id == "custom" && !$0.deleted }) { group = custom }
+        else if let fallback = snapshot.first(where: { !$0.deleted && $0.title == String(localized: "Custom") }) { group = fallback }
+        else {
+            let defaultID = snapshot.contains { $0.id == "custom" } ? NibID.make().raw : "custom"
+            group = TemplateGroup(id: defaultID, title: String(localized: "Custom"), rev: clock.tick())
+        }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let prepared = try await Task.detached(priority: .userInitiated) { try Self.prepare(url) }.value
-        // Re-read after the suspension; another import may have used the same ID or removed the group.
-        guard try !groups(includeDeleted: true).contains(where: { $0.templates.contains { $0.id == id } }) else {
-            throw NibError.invalid("That template ID is already in use.", path: "$.id")
-        }
-        var group: TemplateGroup
-        if let requested { group = try self.group(requested) }
-        else if let custom = try groups().first(where: { $0.id == "custom" }) { group = custom }
-        else if try groups(includeDeleted: true).contains(where: { $0.id == "custom" }) {
-            group = try create(title: String(localized: "Custom"), id: nil)
-        } else { group = try create(title: String(localized: "Custom"), id: "custom") }
+        let prepared = try Self.prepare(url)
         let hash = SHA256.hash(data: prepared.data).map { String(format: "%02x", $0) }.joined()
         let name = hash + "." + prepared.ext
         let directory = root.appendingPathComponent(group.id, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard directory.resolvingSymlinksInPath().deletingLastPathComponent() == root.resolvingSymlinksInPath() else {
+            throw NibError(.permissionDenied, "Template group folders must stay inside the library.")
+        }
         try prepared.data.write(to: directory.appendingPathComponent(name), options: .atomic)
         let entry = CustomTemplate(id: id, title: title, kind: kind, file: name, size: prepared.size, rev: clock.tick())
         group.templates.append(entry)
@@ -188,20 +228,23 @@ final class CustomTemplateStore {
         return (png, "png", PageSize(Double(image.size.width), Double(image.size.height)))
     }
 
-    func url(group: TemplateGroup, template: CustomTemplate) -> URL {
+    nonisolated func url(group: TemplateGroup, template: CustomTemplate) -> URL {
         root.appendingPathComponent(group.id, isDirectory: true).appendingPathComponent(template.file)
     }
 
-    func background(_ id: String, doc: DocumentID?, assets: AssetStore) throws -> Background {
+    func background(_ id: String, doc: DocumentID?, assets: AssetStore) async throws -> Background {
         let (group, entry) = try locate(id)
-        let data = try Data(contentsOf: url(group: group, template: entry))
-        let ext = (entry.file as NSString).pathExtension
-        let asset = try doc.map { try assets.put(data, ext: ext, doc: $0) } ?? assets.putTemporary(data, ext: ext)
-        let ref = doc == nil ? AssetRef("tmp:" + asset.name) : asset
-        var background: Background = ext == "pdf" ? .ofPDF(ref, page: 0) : .ofImage(ref)
-        // The Background wire format has no ext field. Its unused template field carries the cover marker
-        // for callers creating a notebook from template.choose; the PDF/image asset keeps its ordinary meaning.
-        if entry.kind == "cover" { background.template = TemplateRef(TemplateApply.customCoverKey, params: ["id": .string(entry.id)]) }
-        return background
+        return try await background(group: group, entry: entry, doc: doc, assets: assets)
+    }
+
+    func background(group: TemplateGroup, entry: CustomTemplate, doc: DocumentID?, assets: AssetStore) async throws -> Background {
+        let url = url(group: group, template: entry)
+        return try await Task.detached(priority: .userInitiated) {
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            let ext = (entry.file as NSString).pathExtension
+            let asset = try doc.map { try assets.put(data, ext: ext, doc: $0) } ?? assets.putTemporary(data, ext: ext)
+            let ref = doc == nil ? AssetRef("tmp:" + asset.name) : asset
+            return ext == "pdf" ? .ofPDF(ref, page: 0) : .ofImage(ref)
+        }.value
     }
 }

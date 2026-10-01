@@ -78,20 +78,23 @@ final class TemplateBrowserModel: ObservableObject {
     }
     func load() async {
         do {
-            let custom = try await run("template.listCustom")
-            if useDefaultSize, let value = custom["defaultSize"] { size = try value.decode(PageSize.self); useDefaultSize = false }
-            groups = try (custom["groups"] ?? []).decode([TemplateGroup].self)
-            hidden = Set(custom["hidden"]?.arrayValue?.compactMap(\.stringValue) ?? [])
-            if let paper = custom["defaultPaper"] { defaultPaper = try paper.decode(TemplateRef.self) }
-            if let cover = custom["defaultCover"], cover != .null { defaultCover = try cover.decode(TemplateRef.self) }
-            else { defaultCover = nil }
-            if custom["coverByDefault"]?.boolValue == false { defaultCover = nil }
             let builtin = try await run(CommandIDs.templateList)
             templates = try (builtin["templates"] ?? []).decode([TemplateInfo].self)
             namedColours = [:]
             for item in (builtin["paperColors"]?.arrayValue ?? []) + (builtin["coverColors"]?.arrayValue ?? []) {
                 if let name = item["name"]?.stringValue, let hex = item["hex"]?.stringValue { namedColours[name.lowercased()] = hex }
             }
+            var libraryError: String?
+            do {
+                let custom = try await run(CommandIDs.templateListCustom)
+                if useDefaultSize, let value = custom["defaultSize"] { size = try value.decode(PageSize.self); useDefaultSize = false }
+                groups = try (custom["groups"] ?? []).decode([TemplateGroup].self)
+                hidden = Set(custom["hidden"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+                if let paper = custom["defaultPaper"] { defaultPaper = try paper.decode(TemplateRef.self) }
+                if let cover = custom["defaultCover"], cover != .null { defaultCover = try cover.decode(TemplateRef.self) }
+                else { defaultCover = nil }
+                if custom["coverByDefault"]?.boolValue == false { defaultCover = nil }
+            } catch { libraryError = error.localizedDescription }
             if let selected = selection, !(kind == "cover" && selected == TemplateIDs.blank),
                !(templates.contains { $0.id == selected && $0.isCover == (kind == "cover") && (showHidden || !hidden.contains(selected)) } || groups.flatMap(\.liveTemplates).contains { $0.id == selected && $0.kind == kind }) { selection = nil }
             if selection == nil {
@@ -104,7 +107,7 @@ final class TemplateBrowserModel: ObservableObject {
                 seededColour = true
             }
             if !categories.contains(where: { $0.id == category }) { category = "" }
-            error = nil
+            error = libraryError
         } catch { self.error = error.localizedDescription }
     }
     func normalisedColour(_ value: String?) -> String? {
@@ -170,7 +173,7 @@ struct TemplateBrowser: View {
                         categoryPicker
                         gridContent
                     }
-                }.scrollBounceBehavior(.basedOnSize)
+                }.scrollBounceBehavior(.basedOnSize).nibFadeBottomEdge()
             } else {
                 VStack(spacing: NibSpacing.l) {
                     options
@@ -183,8 +186,8 @@ struct TemplateBrowser: View {
                                     }.buttonStyle(.plain).frame(minHeight: NibMetrics.hitTarget)
                                 }
                             }
-                        }.frame(width: NibMetrics.settingsSectionListWidth - NibMetrics.rowThumbnailWidth - NibSpacing.xl)
-                        ScrollView { gridContent }.scrollBounceBehavior(.basedOnSize)
+                        }.frame(width: NibMetrics.settingsSectionListWidth)
+                        ScrollView { gridContent }.scrollBounceBehavior(.basedOnSize).nibFadeBottomEdge()
                     }
                 }
             }
@@ -196,7 +199,7 @@ struct TemplateBrowser: View {
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
         .confirmationDialog(String(localized: "Delete this custom template?"), isPresented: Binding(get: { deletingTemplate != nil }, set: { if !$0 { deletingTemplate = nil } }), titleVisibility: .visible) {
             Button(String(localized: "Delete Template"), role: .destructive) {
-                if let id = deletingTemplate { model.action("template.delete", ["id": .string(id)]); deletingTemplate = nil }
+                if let id = deletingTemplate { model.action(CommandIDs.templateDelete, ["id": .string(id)]); deletingTemplate = nil }
             }
         }
     }
@@ -252,7 +255,7 @@ struct TemplateBrowser: View {
         Picker(String(localized: "Orientation"), selection: Binding(get: { model.size.isLandscape }, set: { model.size = TemplateSizing.oriented(model.size, landscape: $0) })) {
             Text(String(localized: "Portrait")).tag(false)
             Text(String(localized: "Landscape")).tag(true)
-        }.pickerStyle(.menu).frame(minHeight: NibMetrics.hitTarget)
+        }.pickerStyle(.segmented).frame(minHeight: NibMetrics.hitTarget)
     }
     private func setCustomSize() {
         do {
@@ -270,10 +273,14 @@ struct TemplateBrowser: View {
                                  action: { model.select(TemplateIDs.blank) }) { NibPaper.white.color }
                 }
                 ForEach(model.builtins) { template in
-                    tile(template.id, title: template.title, custom: false)
+                    VStack(spacing: NibSpacing.xs) {
+                        tile(template.id, title: template.title, custom: false)
+                            .opacity(model.hidden.contains(template.id) ? NibOpacity.recede : 1)
+                        if model.hidden.contains(template.id) { Text(String(localized: "Hidden")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
+                    }
                         .contextMenu {
                             Button(model.hidden.contains(template.id) ? String(localized: "Restore Template") : String(localized: "Hide Template")) {
-                                model.action("template.setHidden", ["id": .string(template.id), "hidden": .bool(!model.hidden.contains(template.id))])
+                                model.action(CommandIDs.templateSetHidden, ["id": .string(template.id), "hidden": .bool(!model.hidden.contains(template.id))])
                             }
                         }
                 }
@@ -340,14 +347,15 @@ struct TemplatePreview: View {
                 if !Task.isCancelled { image = rendered }
             } else if let definition = app.content.templates.get(id), let params = try? TemplateSizing.params(definition, color: color) {
                 let assets = app.services.assets
+                let renderSize = size
                 let rendered = await Task.detached(priority: .utility) { () -> UIImage? in
-                    let factor = min(Double(NibMetrics.paperTileSize.width) / size.width, Double(NibMetrics.paperTileSize.height) / size.height)
-                    let result = definition.renderOps(params, size: size, scale: factor, region: Rect(x: 0, y: 0, width: size.width, height: size.height))
+                    let factor = min(Double(NibMetrics.paperTileSize.width) / renderSize.width, Double(NibMetrics.paperTileSize.height) / renderSize.height)
+                    let result = definition.renderOps(params, size: renderSize, scale: factor, region: Rect(x: 0, y: 0, width: renderSize.width, height: renderSize.height))
                     let format = UIGraphicsImageRendererFormat(); format.scale = 2
-                    return UIGraphicsImageRenderer(size: CGSize(width: size.width * factor, height: size.height * factor), format: format).image { context in
+                    return UIGraphicsImageRenderer(size: CGSize(width: renderSize.width * factor, height: renderSize.height * factor), format: format).image { context in
                         let cg = context.cgContext
                         cg.scaleBy(x: factor, y: factor)
-                        cg.setFillColor(result.paper.cgColor); cg.fill(CGRect(x: 0, y: 0, width: size.width, height: size.height))
+                        cg.setFillColor(result.paper.cgColor); cg.fill(CGRect(x: 0, y: 0, width: renderSize.width, height: renderSize.height))
                         result.display.draw(in: cg, assets: assets)
                     }
                 }.value
@@ -389,12 +397,12 @@ struct TemplateLibraryView: View {
             if let page = context.params["fromPage"]?.stringValue {
                 HStack(spacing: NibSpacing.s) {
                     NibField(text: $pageTitle, prompt: String(localized: "Template title"))
-                    NibButton(String(localized: "Create Template")) { model.action("template.fromPage", ["page": .string(page), "title": .string(pageTitle)]) }
+                    NibButton(String(localized: "Create Template")) { model.action(CommandIDs.templateFromPage, ["page": .string(page), "title": .string(pageTitle)]) }
                         .disabled(pageTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }.padding(.horizontal, NibSpacing.xl)
             }
             if let error = model.error {
-                HStack { Text(error).font(NibFont.footnote).foregroundStyle(NibColor.destructive); NibButton(String(localized: "Retry"), kind: .plain) { Task { await model.load() } } }
+                NibBanner(error, style: .warning, action: NibAction(String(localized: "Retry")) { Task { await model.load() } })
                     .padding(.horizontal, NibSpacing.xl)
             }
             if model.busy { ProgressView().accessibilityLabel(String(localized: "Updating templates")) }
@@ -405,20 +413,37 @@ struct TemplateLibraryView: View {
         .task { await model.load() }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.pdf, .image]) { result in
             switch result {
-            case .success(let url): model.action("template.import", ["url": .string(url.absoluteString), "group": importingGroup.map(JSONValue.string) ?? .null, "kind": .string(model.kind)])
+            case .success(let url):
+                let group = importingGroup
+                let kind = model.kind
+                Task {
+                    do {
+                        guard let assets = context.app.services.assets else { throw NibError.unavailable("Asset store") }
+                        // Keep the exact URL object that carries the file picker's sandbox extension.
+                        let scoped = url.startAccessingSecurityScopedResource()
+                        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                        let ref = try await Task.detached(priority: .userInitiated) {
+                            let bytes = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                            guard bytes > 0, bytes <= NibLimits.maxDownloadBytes else { throw NibError.invalid("Template files must be between 1 byte and 200 MB.") }
+                            return try assets.putTemporary(Data(contentsOf: url, options: .mappedIfSafe), ext: url.pathExtension)
+                        }.value
+                        model.action(CommandIDs.templateImport, ["url": .string("tmp:" + ref.name), "group": group.map(JSONValue.string) ?? .null,
+                            "kind": .string(kind), "title": .string(url.deletingPathExtension().lastPathComponent)])
+                    } catch { model.error = error.localizedDescription }
+                }
             case .failure(let error): model.error = error.localizedDescription
             }
         }
         .confirmationDialog(String(localized: "Delete this group and its templates?"), isPresented: Binding(get: { confirmingGroup != nil }, set: { if !$0 { confirmingGroup = nil } }), titleVisibility: .visible) {
             Button(String(localized: "Delete Group"), role: .destructive) {
-                if let group = confirmingGroup { model.action("template.group.delete", ["group": .string(group)]); editingGroup = nil; importingGroup = nil; confirmingGroup = nil }
+                if let group = confirmingGroup { model.action(CommandIDs.templateGroupDelete, ["group": .string(group)]); editingGroup = nil; importingGroup = nil; confirmingGroup = nil }
             }
         }
     }
     private var kindControl: some View {
         Picker(String(localized: "Template kind"), selection: Binding(get: { model.kind }, set: { model.changeKind($0) })) {
             Text(String(localized: "Paper")).tag("paper"); Text(String(localized: "Covers")).tag("cover")
-        }.pickerStyle(.menu).frame(minHeight: NibMetrics.hitTarget)
+        }.pickerStyle(.segmented).frame(minHeight: NibMetrics.hitTarget)
     }
     private var groupControls: some View {
         VStack(spacing: NibSpacing.s) {
@@ -436,13 +461,13 @@ struct TemplateLibraryView: View {
     private var groupButtons: some View {
         HStack(spacing: NibSpacing.s) {
             NibButton(String(localized: "New Group"), kind: .plain) {
-                model.action("template.group.create", ["title": .string(groupTitle)]) { result in
+                model.action(CommandIDs.templateGroupCreate, ["title": .string(groupTitle)]) { result in
                     if let id = result["id"]?.stringValue { importingGroup = id; editingGroup = id; model.category = "group:" + id }
                 }
             }
                 .disabled(groupTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if let group = editingGroup {
-                NibButton(String(localized: "Rename Group"), kind: .plain) { model.action("template.group.rename", ["group": .string(group), "title": .string(groupTitle)]) }
+                NibButton(String(localized: "Rename Group"), kind: .plain) { model.action(CommandIDs.templateGroupRename, ["group": .string(group), "title": .string(groupTitle)]) }
                 NibButton(String(localized: "Delete Group"), kind: .destructivePlain) { confirmingGroup = group }
             }
         }
@@ -464,7 +489,7 @@ struct TemplatePickerView: View {
             NibSheetHeader(request.kind == "cover" ? String(localized: "Choose Cover") : String(localized: "Choose Paper"), primaryTitle: String(localized: "Choose Template"),
                 isPrimaryEnabled: model.choice != nil, onCancel: { finish(.failure(NibError(.userDenied, "Template selection cancelled."))) },
                 onPrimary: { if let choice = model.choice { finish(.success(choice)) } })
-            if let error = model.error { Text(error).font(NibFont.footnote).foregroundStyle(NibColor.destructive) }
+            if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Retry")) { Task { await model.load() } }) }
             TemplateBrowser(model: model)
         }.background(NibColor.backgroundSecondary).task { await model.load() }
     }

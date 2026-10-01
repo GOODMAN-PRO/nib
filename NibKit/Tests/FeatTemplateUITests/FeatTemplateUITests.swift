@@ -42,11 +42,55 @@ final class FeatTemplateUITests: XCTestCase {
             try ctx.mutate { tx in
                 for value in p["pages"]?.arrayValue ?? [] {
                     guard case let .page(doc, id)? = NodeRef(value.stringValue ?? ""), var page = try tx.content(doc).page(id) else { throw NibError.invalid("Invalid test page") }
-                    page.background = .ofTemplate(p["template"]?.stringValue ?? TemplateIDs.blank); try tx.put(page, doc: doc)
+                    page.background = .ofTemplate(p["template"]?.stringValue ?? TemplateIDs.blank)
+                    if let size = p["size"]?.arrayValue?.compactMap(\.doubleValue) { page.size = try TemplateSizing.parse(size) }
+                    try tx.put(page, doc: doc)
                 }
             }
             return [:]
         }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Read Node", summary: "Test query stand-in.", effect: .read)) { p, ctx in
+            let doc = try XCTUnwrap(NodeRef(p["ref"]?.stringValue ?? "")?.documentID)
+            let content = try ctx.workspace.content(doc)
+            return ["meta": try JSONValue.from(content.meta), "pages": .array(content.livePages.map { ["ref": .string(NodeRef.page(doc, $0.id).description)] })]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.assetPut, title: "Store Asset", summary: "Test asset stand-in.", effect: .edit, undoable: false)) { p, ctx in
+            let doc = try XCTUnwrap(NodeRef(p["doc"]?.stringValue ?? "")?.documentID)
+            let url = try await ctx.inputFile(XCTUnwrap(p["url"]?.stringValue))
+            let ref = try h.assets.put(Data(contentsOf: url), ext: p["ext"]?.stringValue ?? "png", doc: doc)
+            return try JSONValue.from(ref)
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.nodeSet, title: "Set Node", summary: "Test node stand-in.", effect: .edit)) { p, ctx in
+            let node = try XCTUnwrap(NodeRef(p["ref"]?.stringValue ?? ""))
+            let doc = try XCTUnwrap(node.documentID)
+            let fields = p["fields"] ?? [:]
+            try ctx.mutate { tx in
+                let content = try tx.content(doc)
+                if let id = node.pageID, var page = content.page(id) {
+                    var ext = page.ext ?? [:]
+                    let marker = fields["ext"]?[TemplateChange.customCoverKey]
+                    ext[TemplateChange.customCoverKey] = marker == .null ? nil : marker
+                    page.ext = ext.isEmpty ? nil : ext
+                    try tx.put(page, doc: doc)
+                } else {
+                    var meta = content.meta
+                    meta.coverEnabled = fields["meta"]?["coverEnabled"]?.boolValue ?? meta.coverEnabled
+                    try tx.putMeta(meta)
+                }
+            }
+            return [:]
+        }
+    }
+
+    private func apply(_ h: Harness, _ params: JSONValue) async throws -> JSONValue {
+        let id = try XCTUnwrap(params["template"]?.stringValue)
+        let custom = params["custom"]?.boolValue ?? false
+        let kind = custom ? try await store(h).locate(id).1.kind : "paper"
+        let model = TemplateBrowserModel(app: h.app, session: h.session, kind: kind)
+        let size = try TemplateSizing.parse(params["size"]?.arrayValue?.compactMap(\.doubleValue)) ?? .letter
+        let pages = params["pages"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        try await TemplateChange.apply(TemplateSelection(id: id, custom: custom, size: size), kind: kind, pages: pages, doc: Fixtures.docID, model: model)
+        return ["count": .number(Double(Set(pages).count))]
     }
 
     func testImportGroupRenameDeleteAndDeviceMerge() async throws {
@@ -55,16 +99,84 @@ final class FeatTemplateUITests: XCTestCase {
         let second = CustomTemplateStore(root: root, clock: HLCClock(device: 8))
         _ = try await h.run("template.group.create", ["title": "Papers", "id": "groupA"])
         _ = try await h.run("template.import", ["url": .string(try image(h)), "group": "groupA", "kind": "paper", "id": "paperA"])
-        _ = try second.rename("groupA", title: "Work")
+        _ = try await second.rename("groupA", title: "Work")
         _ = try await second.importFile(XCTUnwrap(h.assets.temporaryURL(AssetRef(String(try image(h).dropFirst(4))))), group: "groupA", kind: "cover", id: "coverB")
         _ = try await h.run("template.delete", ["id": "paperA"])
-        let merged = try second.group("groupA")
+        let merged = try await second.group("groupA")
         XCTAssertEqual(merged.title, "Work")
         XCTAssertEqual(merged.liveTemplates.map(\.id), ["coverB"])
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("groupA").path).filter { $0.hasPrefix("group.") }.count, 2)
         _ = try await h.run("template.group.delete", ["group": "groupA"])
-        XCTAssertTrue(try second.groups().isEmpty)
-        XCTAssertTrue(try second.groups(includeDeleted: true).first?.deleted == true)
+        let live = try await second.groups()
+        let all = try await second.groups(includeDeleted: true)
+        XCTAssertTrue(live.isEmpty)
+        XCTAssertTrue(all.first?.deleted == true)
+        XCTAssertTrue(all.first?.templates.allSatisfy(\.deleted) == true)
+    }
+
+    func testCorruptAndFutureMetadataKeepValidEntriesAndBuiltinsAvailable() async throws {
+        let h = harness(); registerPaper(h)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.templateList, title: "List Templates", summary: "Test catalogue.", effect: .read)) { _, _ in
+            ["templates": [["id": .string(TemplateIDs.blank), "title": "Blank", "category": "Essentials", "isCover": false, "owner": "templates"]]]
+        }
+        _ = try await h.run(CommandIDs.templateImport, ["url": .string(try image(h)), "kind": "paper", "id": "valid"])
+        let customStore = store(h)
+        let directory = customStore.root.appendingPathComponent("custom")
+        try Data("broken JSON".utf8).write(to: directory.appendingPathComponent("group.corrupt.json"))
+        var group = try await customStore.group("custom")
+        var unknown = try XCTUnwrap(group.templates.first)
+        unknown.id = "future"; unknown.kind = "future-kind"
+        group.templates.append(unknown)
+        try JSONEncoder().encode(group).write(to: directory.appendingPathComponent("group.future.json"))
+        let listed = try await h.run(CommandIDs.templateListCustom)
+        XCTAssertEqual(listed["templates"]?.arrayValue?.compactMap { $0["id"]?.stringValue }, ["valid"])
+        let builtinList = try await h.run(CommandIDs.templateList)
+        XCTAssertNotNil(builtinList["templates"])
+        let model = TemplateBrowserModel(app: h.app, session: h.session)
+        await model.load()
+        XCTAssertEqual(model.builtins.map(\.id), [TemplateIDs.blank])
+        XCTAssertNotNil(model.choice)
+    }
+
+    func testDefaultGroupDeletionReusesOneLiveFallback() async throws {
+        let h = harness()
+        _ = try await h.run(CommandIDs.templateImport, ["url": .string(try image(h)), "kind": "paper", "id": "old"])
+        _ = try await h.run(CommandIDs.templateGroupDelete, ["group": "custom"])
+        for id in ["newA", "newB"] {
+            _ = try await h.run(CommandIDs.templateImport, ["url": .string(try image(h)), "kind": "paper", "id": .string(id)])
+        }
+        let groups = try await store(h).groups()
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups.first?.title, String(localized: "Custom"))
+        XCTAssertEqual(Set(groups.first?.liveTemplates.map(\.id) ?? []), ["newA", "newB"])
+    }
+
+    func testConcurrentSnapshotsDeleteWinsAndMergeIsOrderIndependent() async throws {
+        let h = harness()
+        let customStore = store(h)
+        let directory = customStore.root.appendingPathComponent("conflict")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let baseRev = Rev(wallMs: 100, counter: 0, device: 1)
+        let baseEntry = CustomTemplate(id: "entry", title: "Base", kind: "paper", file: String(repeating: "a", count: 64) + ".png", size: .letter, rev: baseRev)
+        let base = TemplateGroup(id: "conflict", title: "Base", rev: baseRev, templates: [baseEntry])
+        var renamed = base; renamed.title = "Renamed"; renamed.rev = Rev(wallMs: 300, counter: 0, device: 2)
+        renamed.templates[0].title = "New entry"; renamed.templates[0].rev = renamed.rev
+        var deleted = base; deleted.deleted = true; deleted.rev = Rev(wallMs: 200, counter: 0, device: 1)
+        deleted.templates[0].deleted = true; deleted.templates[0].rev = deleted.rev
+        func write(_ first: TemplateGroup, _ second: TemplateGroup) throws {
+            try JSONEncoder().encode(first).write(to: directory.appendingPathComponent("group.a.json"))
+            try JSONEncoder().encode(second).write(to: directory.appendingPathComponent("group.b.json"))
+        }
+        try write(renamed, deleted)
+        let forward = try await customStore.groups(includeDeleted: true)
+        try write(deleted, renamed)
+        let reverse = try await customStore.groups(includeDeleted: true)
+        XCTAssertEqual(forward, reverse)
+        XCTAssertTrue(forward.first?.deleted == true)
+        XCTAssertTrue(forward.first?.templates.first?.deleted == true)
+        XCTAssertEqual(forward.first?.templates.first?.title, "New entry")
+        let live = try await customStore.groups()
+        XCTAssertTrue(live.isEmpty)
     }
 
     func testPDFFirstPageAndAssetCopySurviveLibraryDeletion() async throws {
@@ -74,9 +186,9 @@ final class FeatTemplateUITests: XCTestCase {
         }
         let ref = try h.assets.putTemporary(data, ext: "pdf")
         _ = try await h.run("template.import", ["url": .string("tmp:" + ref.name), "kind": "paper", "id": "pdf01"])
-        let (group, entry) = try store(h).locate("pdf01")
+        let (group, entry) = try await store(h).locate("pdf01")
         XCTAssertEqual(PDFDocument(url: store(h).url(group: group, template: entry))?.pageCount, 1)
-        let background = try store(h).background("pdf01", doc: Fixtures.docID, assets: h.assets)
+        let background = try await store(h).background("pdf01", doc: Fixtures.docID, assets: h.assets)
         XCTAssertEqual(background.kind, .pdf)
         XCTAssertEqual(background.pdfPage, 0)
         let asset = try XCTUnwrap(background.asset)
@@ -107,12 +219,34 @@ final class FeatTemplateUITests: XCTestCase {
         h.app.services.set(picker, for: TemplatePickerPresenter.serviceKey)
         let temporary = try await h.run("template.choose", ["kind": "cover"])
         XCTAssertTrue(temporary["background"]?["asset"]?.stringValue?.hasPrefix("tmp:") == true)
-        XCTAssertEqual(temporary["background"]?["template"]?["id"], .string(TemplateApply.customCoverKey))
-        XCTAssertEqual(temporary["background"]?["template"]?["params"]?["id"], "cover01")
+        XCTAssertNil(temporary["background"]?["template"])
         let stored = try await h.run("template.choose", ["kind": "cover", "doc": .string(NodeRef.document(Fixtures.docID).description)])
         let name = try XCTUnwrap(stored["background"]?["asset"]?.stringValue)
         XCTAssertFalse(name.hasPrefix("tmp:"))
         XCTAssertFalse(try h.assets.data(AssetRef(name), doc: Fixtures.docID).isEmpty)
+    }
+
+    func testCustomPickerDryRunOnlyUsesTemporaryAssets() async throws {
+        let h = harness()
+        _ = try await h.run(CommandIDs.templateImport, ["url": .string(try image(h)), "kind": "cover", "id": "dryCover"])
+        let picker = PickerStandIn()
+        picker.result = .success(TemplateSelection(id: "dryCover", custom: true, size: .letter))
+        h.app.services.set(picker, for: TemplatePickerPresenter.serviceKey)
+        let result = try await h.app.bus.execute(Invocation(command: CommandIDs.templateChoose,
+            params: ["kind": "cover", "doc": .string(NodeRef.document(Fixtures.docID).description)], session: h.session, dryRun: true)).value
+        let temporary = try XCTUnwrap(result["background"]?["asset"]?.stringValue)
+        XCTAssertTrue(temporary.hasPrefix("tmp:"))
+        XCTAssertThrowsError(try h.assets.data(AssetRef(String(temporary.dropFirst(4))), doc: Fixtures.docID))
+    }
+
+    func testNoCoverChoiceReturnsUserDenied() async throws {
+        let h = harness(); registerPaper(h)
+        let picker = PickerStandIn()
+        h.app.services.set(picker, for: TemplatePickerPresenter.serviceKey)
+        picker.result = .success(TemplateSelection(id: TemplateIDs.blank, size: .letter, color: RGBA.paperYellow.hex))
+        do { _ = try await h.run(CommandIDs.templateChoose, ["kind": "cover"]); XCTFail("Expected no cover") }
+        catch let error as NibError { XCTAssertEqual(error.code, .userDenied) }
+        XCTAssertNil(h.app.commands.descriptor("template.apply"))
     }
 
     func testFromPageCallsFlattenedExportAndImportsChosenID() async throws {
@@ -128,7 +262,8 @@ final class FeatTemplateUITests: XCTestCase {
         XCTAssertEqual(output["id"], "lecture")
         XCTAssertEqual(exported?["options"]?["mode"], "flattened")
         XCTAssertEqual(exported?["pages"], ["page:FIXTUREDOC01/FIXTUREPG002"])
-        XCTAssertEqual(try store(h).locate("lecture").1.title, "Lecture")
+        let lecture = try await store(h).locate("lecture").1
+        XCTAssertEqual(lecture.title, "Lecture")
     }
 
     func testApplyCustomCoverThenPaperAndUndoRedo() async throws {
@@ -136,16 +271,16 @@ final class FeatTemplateUITests: XCTestCase {
         _ = try await h.run("template.import", ["url": .string(try image(h)), "kind": "cover", "id": "cover01"])
         let before = try h.snapshot()
         let depth = h.undoDepth(Fixtures.docID)
-        _ = try await h.run("template.apply", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "cover01", "custom": true, "size": [612, 792]])
+        _ = try await apply(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "cover01", "custom": true, "size": [612, 792]])
         let covered = try h.snapshot()
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
         XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
-        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.ext?[TemplateApply.customCoverKey], true)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.ext?[TemplateChange.customCoverKey], "cover01")
         h.app.bus.undo(Fixtures.docID); XCTAssertEqual(try h.snapshot(), before)
         h.app.bus.redo(Fixtures.docID); XCTAssertEqual(try h.snapshot(), covered)
-        _ = try await h.run("template.apply", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": .string(TemplateIDs.blank)])
+        _ = try await apply(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": .string(TemplateIDs.blank)])
         XCTAssertFalse(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
-        XCTAssertNil(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.ext?[TemplateApply.customCoverKey])
+        XCTAssertNil(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.ext?[TemplateChange.customCoverKey])
         h.app.bus.undo(Fixtures.docID); XCTAssertEqual(try h.snapshot(), covered)
     }
 
@@ -154,12 +289,12 @@ final class FeatTemplateUITests: XCTestCase {
         _ = try await h.run("template.import", ["url": .string(try image(h)), "kind": "paper", "id": "paper01"])
         let before = try h.snapshot()
         do {
-            _ = try await h.run("template.apply", ["pages": ["doc:FIXTUREDOC01"], "template": "paper01", "custom": true, "size": [0, 792]])
+            _ = try await apply(h, ["pages": ["doc:FIXTUREDOC01"], "template": "paper01", "custom": true, "size": [0, 792]])
             XCTFail("Expected invalid size")
         } catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
         XCTAssertEqual(try h.snapshot(), before)
         let first = try h.app.workspace.content(Fixtures.docID).livePages.first
-        _ = try await h.run("template.apply", ["pages": ["doc:FIXTUREDOC01"], "template": "paper01", "custom": true])
+        _ = try await apply(h, ["pages": ["doc:FIXTUREDOC01"], "template": "paper01", "custom": true])
         let content = try h.app.workspace.content(Fixtures.docID)
         if content.meta.coverEnabled { XCTAssertEqual(content.livePages.first?.background, first?.background) }
         XCTAssertTrue(content.livePages.dropFirst().allSatisfy { $0.background.kind == .image })
@@ -218,11 +353,11 @@ final class FeatTemplateUITests: XCTestCase {
         _ = try await h.run("template.import", ["url": .string(try image(h)), "kind": "cover", "id": "cover01"])
         let before = try h.snapshot()
         do {
-            _ = try await h.run("template.apply", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "cover01", "custom": true])
+            _ = try await apply(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "cover01", "custom": true])
             XCTFail("A cover must only change page 1")
         } catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
         XCTAssertEqual(try h.snapshot(), before)
-        let output = try await h.run("template.apply", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002", "page:FIXTUREDOC01/FIXTUREPG002"], "template": .string(TemplateIDs.blank), "size": [612, 792]])
+        let output = try await apply(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG002", "page:FIXTUREDOC01/FIXTUREPG002"], "template": .string(TemplateIDs.blank), "size": [612, 792]])
         XCTAssertEqual(output["count"], 1)
         XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).page(NibID("FIXTUREPG002"))?.size, .letter)
         h.app.bus.undo(Fixtures.docID); XCTAssertEqual(try h.snapshot(), before)
@@ -257,6 +392,10 @@ final class FeatTemplateUITests: XCTestCase {
             for variant in NibSnapshot.Variant.allCases {
                 let image = try XCTUnwrap(NibSnapshot.image(screen, size: NibMetrics.newDocumentSheetSize, variant: variant, scale: 1))
                 XCTAssertEqual(image.size, NibMetrics.newDocumentSheetSize)
+                let cg = try XCTUnwrap(image.cgImage)
+                let data = try XCTUnwrap(cg.dataProvider?.data) as Data
+                let colors = Set(stride(from: 0, to: data.count - 4, by: max(4, (cg.bytesPerRow / 16 / 4) * 4)).map { Array(data[$0..<$0 + 3]) })
+                XCTAssertGreaterThan(colors.count, 8, "\(name) / \(variant.rawValue) must render content, not a blank surface")
                 let attachment = XCTAttachment(image: image); attachment.name = name + "-" + variant.rawValue; attachment.lifetime = .keepAlways; add(attachment)
             }
             let reduced = try XCTUnwrap(NibSnapshot.image(screen.nibLiquidMode(.off), size: NibMetrics.newDocumentSheetSize, scale: 1))

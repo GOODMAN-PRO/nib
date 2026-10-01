@@ -25,7 +25,10 @@ struct ChangeTemplateSheet: View {
             Picker(String(localized: "Template kind"), selection: Binding(get: { model.kind }, set: { model.changeKind($0) })) {
                 Text(String(localized: "Paper")).tag("paper")
                 Text(String(localized: "Cover")).tag("cover")
-            }.pickerStyle(.menu).frame(minHeight: NibMetrics.hitTarget)
+            }.pickerStyle(.segmented).frame(minHeight: NibMetrics.hitTarget)
+            if model.selectedCustom != nil {
+                Text(String(localized: "Custom backgrounds keep the existing page size.")).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+            }
             if !cover {
                 Picker(String(localized: "Apply to"), selection: $scope) {
                     Text(String(localized: "This page")).tag("this")
@@ -35,7 +38,7 @@ struct ChangeTemplateSheet: View {
                 Text(String(localized: "Content stays in place when the page size changes."))
                     .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
             }
-            if let error = model.error { Text(error).font(NibFont.footnote).foregroundStyle(NibColor.destructive).padding(.horizontal, NibSpacing.l) }
+            if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Retry")) { Task { await load() } }).padding(.horizontal, NibSpacing.l) }
             if applying { ProgressView().accessibilityLabel(String(localized: "Applying template")) }
             TemplateBrowser(model: model)
         }
@@ -59,10 +62,9 @@ struct ChangeTemplateSheet: View {
             if let size = value["size"]?.arrayValue?.compactMap(\.doubleValue), let parsed = try TemplateSizing.parse(size) { model.size = parsed }
             if let background = value["background"], let ref = background["template"], let id = ref["id"]?.stringValue {
                 if model.templates.contains(where: { $0.id == id && $0.isCover == cover }) { model.selection = id }
-                if let customID = ref["params"]?["id"]?.stringValue, model.groups.flatMap(\.liveTemplates).contains(where: { $0.id == customID && $0.kind == model.kind }) { model.selection = customID }
                 model.color = model.normalisedColour(ref["params"]?[cover ? TemplateParamNames.color : TemplateParamNames.paper]?.stringValue)
             }
-            if ["pdf", "image"].contains(value["background"]?["kind"]?.stringValue ?? ""), let id = value["ext"]?[TemplateApply.customTemplateKey]?.stringValue, model.groups.flatMap(\.liveTemplates).contains(where: { $0.id == id && $0.kind == model.kind }) { model.selection = id }
+            if ["pdf", "image"].contains(value["background"]?["kind"]?.stringValue ?? ""), let id = value["ext"]?[TemplateChange.customCoverKey]?.stringValue, model.groups.flatMap(\.liveTemplates).contains(where: { $0.id == id && $0.kind == model.kind }) { model.selection = id }
         } catch { model.error = error.localizedDescription }
     }
     private func apply() {
@@ -76,10 +78,63 @@ struct ChangeTemplateSheet: View {
         Task {
             defer { applying = false }
             do {
-                _ = try await model.run("template.apply", ["pages": .array(pages.map(JSONValue.string)), "template": .string(choice.id),
-                    "custom": .bool(choice.custom), "size": [ .number(choice.size.width), .number(choice.size.height) ], "color": choice.color.map(JSONValue.string) ?? .null])
-                context.dismiss()
+                try await TemplateChange.apply(choice, kind: model.kind, pages: pages, doc: doc, model: model)
+                if model.error == nil { context.dismiss() }
             } catch { model.error = error.localizedDescription }
+        }
+    }
+}
+
+/// F005 follow-up: isCover/coverFlag must consume and clear this page-1 ext marker when
+/// catalogue commands replace a custom cover outside this sheet. Never put it in Background.template.
+@MainActor
+enum TemplateChange {
+    static let customCoverKey = "templateui.customCover"
+
+    static func apply(_ choice: TemplateSelection, kind: String, pages: [String], doc: DocumentID, model: TemplateBrowserModel) async throws {
+        model.error = nil
+        _ = try TemplateSizing.parse([choice.size.width, choice.size.height])
+        let docRef = NodeRef.document(doc).description
+        let document = try await model.run(CommandIDs.queryGet, ["ref": .string(docRef)])
+        let records = document["pages"]?.arrayValue ?? []
+        let pageRefs = records.compactMap { record -> String? in
+            record["ref"]?.stringValue ?? record["id"]?.stringValue.map { NodeRef.page(doc, NibID($0)).description }
+        }
+        guard let first = pageRefs.first else { throw NibError.unavailable("Notebook page 1") }
+        let cover = kind == "cover" && choice.id != TemplateIDs.blank
+        let all = pages.contains(docRef)
+        let coverEnabled = document["meta"]?["coverEnabled"]?.boolValue ?? document["coverEnabled"]?.boolValue ?? false
+        let targets = Array(Set(all ? pageRefs.filter { cover || !coverEnabled || $0 != first } : pages)).sorted()
+        guard !targets.isEmpty, targets.allSatisfy({ NodeRef($0)?.documentID == doc && NodeRef($0)?.pageID != nil }) else {
+            throw NibError.invalid("Choose notebook pages.")
+        }
+        if cover && targets != [first] { throw NibError.invalid("A cover must be page 1.") }
+        var calls: [JSONValue] = []
+        if choice.custom {
+            guard let library = model.app.services.library, let assets = model.app.services.assets else { throw NibError.unavailable("Template library") }
+            let store = CustomTemplateStore(root: library.metadataURL.appendingPathComponent("templates"), clock: model.app.clock)
+            let (group, entry) = try await store.locate(choice.id)
+            guard entry.kind == kind else { throw NibError.invalid("The chosen template has the wrong kind.") }
+            var background = try await store.background(group: group, entry: entry, doc: nil, assets: assets)
+            guard let temporary = background.asset else { throw NibError.unavailable("Template asset") }
+            let stored = try await model.run(CommandIDs.assetPut, ["doc": .string(docRef), "url": .string(temporary.name), "ext": .string(temporary.ext)])
+            // asset.put's catalogue result is an AssetRef (a JSON string).
+            background.asset = try stored.decode(AssetRef.self)
+            calls.append(["command": .string(CommandIDs.pageSetBackground), "params": ["pages": .array(targets.map(JSONValue.string)), "background": try JSONValue.from(background)]])
+        } else {
+            guard let definition = model.app.content.templates.get(choice.id) else { throw NibError.notFound("Template \(choice.id)") }
+            let params = try TemplateSizing.params(definition, color: kind == "cover" && !cover ? nil : choice.color)
+            calls.append(["command": .string(CommandIDs.pageSetTemplate), "params": ["pages": .array((all ? pages : targets).map(JSONValue.string)),
+                "template": .string(choice.id), "params": .object(params), "size": [.number(choice.size.width), .number(choice.size.height)], "landscape": .bool(choice.size.isLandscape)]])
+        }
+        if targets.contains(first) {
+            // Marker is the custom template ID for a cover, null removes it when this sheet selects paper.
+            calls.append(["command": .string(CommandIDs.nodeSet), "params": ["ref": .string(first), "fields": ["ext": [customCoverKey: choice.custom && cover ? .string(choice.id) : .null]]]])
+            calls.append(["command": .string(CommandIDs.nodeSet), "params": ["ref": .string(docRef), "fields": ["meta": ["coverEnabled": .bool(cover)]]]])
+        }
+        let result = try await model.run(CommandIDs.batch, ["calls": .array(calls)])
+        if let warning = result["results"]?.arrayValue?.compactMap({ $0["value"]?["warning"]?.stringValue }).first {
+            model.error = warning
         }
     }
 }

@@ -84,8 +84,8 @@ private final class TemplatePickerHost: UIHostingController<AnyView>, UIAdaptive
 struct TemplateChoose: NibCommand {
     struct Params: Codable { var kind: String; var size: [Double]?; var color: String?; var doc: String? }
     struct Output: Codable { var background: Background; var size: [Double] }
-    static let descriptor = CommandDescriptor(id: "template.choose", title: "Choose Template",
-        summary: "Show the paper or cover picker and return {background, size}; custom assets are stored in doc, or returned with a tmp: prefix.",
+    static let descriptor = CommandDescriptor(id: CommandIDs.templateChoose, title: "Choose Template",
+        summary: "Show the paper or cover picker and return {background, size}; custom assets are stored in doc, or returned with a tmp: prefix (also for dry runs). No cover throws user_denied.",
         params: .obj(["kind": .str(choices: ["paper", "cover"]), "size": .arr(.num(), "[width, height] in page points"),
                       "color": .color, "doc": .ref], required: ["kind"]), examples: [["kind": "paper"]],
         effect: .read, target: .library, userPresence: true)
@@ -108,7 +108,7 @@ struct TemplateChoose: NibCommand {
         let background: Background
         if choice.custom {
             let store = try TemplateUICommands.store(ctx)
-            let (_, entry) = try store.locate(choice.id)
+            let (group, entry) = try await store.locate(choice.id)
             guard entry.kind == p.kind else { throw NibError.invalid("The chosen template has the wrong kind.") }
             guard let assets = ctx.services.assets else { throw NibError.unavailable("Asset store") }
             // A document can become locked or read-only while the picker is open.
@@ -116,9 +116,12 @@ struct TemplateChoose: NibCommand {
                 if ctx.services.lock?.isLocked(doc) == true { throw NibError(.locked, "The document was locked while choosing a template.") }
                 if ctx.isReadOnly(doc) { throw NibError(.permissionDenied, "The document is read-only.") }
             }
-            background = try store.background(choice.id, doc: doc, assets: assets)
+            background = try await store.background(group: group, entry: entry, doc: ctx.dryRun ? nil : doc, assets: assets)
         } else {
-            guard let definition = ctx.content.templates.get(choice.id), definition.isCover == (p.kind == "cover") || choice.id == TemplateIDs.blank else {
+            if p.kind == "cover", choice.id == TemplateIDs.blank {
+                throw NibError(.userDenied, "No cover selected.")
+            }
+            guard let definition = ctx.content.templates.get(choice.id), definition.isCover == (p.kind == "cover") else {
                 throw NibError.notFound("Chosen template \(choice.id)")
             }
             background = .ofTemplate(definition.id, params: try TemplateSizing.params(definition, color: choice.color))
@@ -145,88 +148,5 @@ enum TemplateSizing {
         guard let rgba = RGBA(hex: color) else { throw NibError.invalid("Supply an RGBA hex colour.", path: "$.color") }
         let key = definition.isCover ? TemplateParamNames.color : TemplateParamNames.paper
         return definition.params.contains { $0.name == key } ? [key: .string(rgba.hex)] : [:]
-    }
-}
-
-/// Additive F045 command: the shared page commands cannot mark PDF/image covers or combine their resize with apply.
-/// Marker: PDF/image Background.template.id == "templateui.customCover"; page 1 also stores that boolean ext key.
-/// Document meta carries the existing coverEnabled flag consumed by F022.
-struct TemplateApply: NibCommand {
-    static let customCoverKey = "templateui.customCover"
-    static let customTemplateKey = "templateui.customID"
-    struct Params: Codable { var pages: [String]; var template: String; var custom: Bool?; var size: [Double]?; var color: String? }
-    struct Output: Codable { var pages: [String]; var count: Int }
-    static let descriptor = CommandDescriptor(id: "template.apply", title: "Apply Template",
-        summary: "Apply built-in or custom paper/cover to page refs or all pages (doc:D), including size and the custom-cover marker; one undo step.",
-        params: .obj(["pages": .arr(.ref), "template": .str(), "custom": .bool(), "size": .arr(.num()), "color": .color], required: ["pages", "template"]),
-        examples: [["pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": .string(TemplateIDs.blank)]], effect: .edit)
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let size = try TemplateSizing.parse(p.size)
-        guard !p.pages.isEmpty else { throw NibError.invalid("Choose at least one page.", path: "$.pages") }
-        let custom = p.custom ?? false
-        let definition = ctx.content.templates.get(p.template)
-        let store = custom ? try TemplateUICommands.store(ctx) : nil
-        let entry = try store?.locate(p.template).1
-        if !custom && definition == nil { throw NibError.unavailable("Template \(p.template)") }
-        let cover = custom ? entry?.kind == "cover" : definition?.isCover == true
-        let params = try definition.map { try TemplateSizing.params($0, color: p.color) } ?? [:]
-        var targets: [DocumentID: [PageID]] = [:]
-        var seen = Set<String>()
-        for ref in p.pages {
-            guard let node = NodeRef(ref), let doc = node.documentID else { throw NibError.invalid("Supply page or document refs.", path: "$.pages") }
-            if ctx.services.lock?.isLocked(doc) == true { throw NibError(.locked, "Unlock the document before changing its template.") }
-            if ctx.isReadOnly(doc) { throw NibError(.permissionDenied, "The document is read-only.") }
-            let content = try ctx.workspace.content(doc)
-            guard content.meta.kind == .notebook else { throw NibError.unsupported("Changing notebook templates on this document kind") }
-            let pages: [PageRecord]
-            switch node {
-            case .document:
-                pages = cover ? Array(content.livePages.prefix(1)) : content.livePages.filter { !(content.meta.coverEnabled && $0.id == content.livePages.first?.id) }
-            case .page(_, let page):
-                guard let page = content.page(page), !page.deleted else { throw NibError.notFound(ref) }
-                if cover && page.id != content.livePages.first?.id { throw NibError.invalid("A cover must be page 1.", path: "$.pages") }
-                pages = [page]
-            default: throw NibError.invalid("Supply page or document refs.", path: "$.pages")
-            }
-            for page in pages where seen.insert(NodeRef.page(doc, page.id).description).inserted { targets[doc, default: []].append(page.id) }
-        }
-        guard !targets.isEmpty else { throw NibError.invalid("There are no paper pages to change.", path: "$.pages") }
-        var backgrounds: [DocumentID: Background] = [:]
-        if custom {
-            guard let store, let assets = ctx.services.assets else { throw NibError.unavailable("Asset store") }
-            for doc in targets.keys { backgrounds[doc] = try store.background(p.template, doc: doc, assets: assets) }
-        }
-        ctx.linkUndoAcrossDocuments()
-        for doc in targets.keys.sorted() {
-            let refs = (targets[doc] ?? []).map { JSONValue.string(NodeRef.page(doc, $0).description) }
-            if let background = backgrounds[doc] {
-                _ = try await ctx.execute(CommandIDs.pageSetBackground, ["pages": .array(refs), "background": try JSONValue.from(background)])
-            } else {
-                _ = try await ctx.execute(CommandIDs.pageSetTemplate, ["pages": .array(refs), "template": .string(p.template),
-                    "params": .object(params), "size": p.size.map { .array($0.map(JSONValue.number)) } ?? .null])
-            }
-        }
-        try ctx.mutate { tx in
-            for doc in targets.keys.sorted() {
-                let content = try tx.content(doc)
-                let ids = Set(targets[doc] ?? [])
-                var pages = content.livePages.filter { ids.contains($0.id) }
-                for index in pages.indices {
-                    if let size { pages[index].size = size }
-                    if custom { pages[index].background.template = backgrounds[doc]?.template }
-                    var ext = pages[index].ext ?? [:]
-                    ext[customCoverKey] = custom && cover ? true : nil
-                    ext[customTemplateKey] = custom ? .string(p.template) : nil
-                    pages[index].ext = ext.isEmpty ? nil : ext
-                }
-                try tx.put(pages, doc: doc)
-                var meta = content.meta
-                if let first = content.livePages.first, ids.contains(first.id) { meta.coverEnabled = cover }
-                if !custom, !cover, p.pages.contains(NodeRef.document(doc).description), let template = pages.last?.background.template { meta.defaultTemplate = template }
-                if meta != content.meta { try tx.putMeta(meta) }
-            }
-        }
-        let refs = targets.keys.sorted().flatMap { doc in (targets[doc] ?? []).map { NodeRef.page(doc, $0).description } }
-        return Output(pages: Array(refs.prefix(200)), count: refs.count)
     }
 }
