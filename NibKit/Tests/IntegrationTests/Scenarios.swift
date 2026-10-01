@@ -3,7 +3,6 @@ import UIKit
 import PDFKit
 import NibContracts
 import NibTesting
-import FeatQuery
 import FeatPen
 import NibStore
 import NibSync
@@ -39,9 +38,8 @@ enum Scenarios {
         ["page": page, "strokes": .array([try JSONValue.from(stroke(y: y))]), "ids": [.string(id)]]
     }
 
-    static func items(_ h: Harness, on target: JSONValue = page) async throws -> [JSONValue] {
-        let value = try await h.run(CommandIDs.queryFind, ["in": target, "limit": 500])
-        return try XCTUnwrap(value["items"]?.arrayValue)
+    static func items(_ h: Harness, on page: PageID = Fixtures.page2) throws -> [Item] {
+        try h.app.workspace.items(Fixtures.docID, page: page)
     }
 
     /// A bounded condition wait reports failure by throwing, so dependent assertions never run on a timed-out state.
@@ -70,7 +68,7 @@ enum Scenarios {
     static func canvasToInk() async throws {
         let savedInput = CanvasInputHooks.install
         defer { CanvasInputHooks.install = savedInput }
-        let h = Harness(features: [FeatQueryFeature.self, FeatCanvasFeature.self, FeatCanvasInputFeature.self,
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self,
                                    FeatPenFeature.self, FeatUndoUIFeature.self])
         h.app.services.renderer = SerializedCanvasRenderer()
         defer { try? FileManager.default.removeItem(at: h.persistence.root) }
@@ -84,12 +82,10 @@ enum Scenarios {
         wet.deliver(PKBridge.pkStroke(stroke()), style: .defaultPen, page: Fixtures.page2,
                     tool: tool, host: vc.host) { retired = true }
         try await wait("canvas → ink.addStrokes commit") { h.undoDepth(Fixtures.docID) == 1 }
-        let rows = try await items(h)
+        let rows = try items(h)
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows.first?["tool"], "pen")
-        let ref = try XCTUnwrap(rows.first?["ref"]?.stringValue)
-        let written = try await h.run(CommandIDs.queryGet, ["ref": .string(ref), "points": true])
-        XCTAssertNotNil(written["createdBy"])
+        XCTAssertEqual(rows.first?.stroke?.style.tool, .pen)
+        XCTAssertEqual(rows.first?.createdBy, "user")
         let committed = try h.snapshot()
         try await h.run(CommandIDs.undo, ["doc": doc])
         XCTAssertEqual(try h.snapshot(), before)
@@ -104,7 +100,7 @@ enum Scenarios {
     static func canvasReadOnly() async throws {
         let savedInput = CanvasInputHooks.install
         defer { CanvasInputHooks.install = savedInput }
-        let h = Harness(features: [FeatQueryFeature.self, FeatCanvasFeature.self, FeatCanvasInputFeature.self, FeatPenFeature.self])
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self, FeatPenFeature.self])
         h.app.services.renderer = SerializedCanvasRenderer()
         defer { try? FileManager.default.removeItem(at: h.persistence.root) }
         let vc = try canvas(h)
@@ -117,13 +113,13 @@ enum Scenarios {
         case .failure(let error): XCTAssertEqual(error.code, .permissionDenied)
         case .success: XCTFail("Read-only canvas accepted a stroke")
         }
-        let rows = try await items(h)
+        let rows = try items(h)
         XCTAssertTrue(rows.isEmpty)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
     static func aiHarness() -> Harness {
-        Harness(features: [FeatQueryFeature.self, FeatPenFeature.self, NibAIAgentFeature.self, FeatUndoUIFeature.self])
+        Harness(features: [FeatPenFeature.self, NibAIAgentFeature.self, FeatUndoUIFeature.self])
     }
 
     static func aiTurnAndHistory() async throws {
@@ -135,11 +131,19 @@ enum Scenarios {
             (CommandIDs.inkAddStrokes, try inkParams(id: "AITURNLINE02", y: 140))
         ])], bus: h.app.bus)
         h.app.services.ai = ai
-        let response = try await h.run(CommandIDs.aiAsk, ["prompt": "Draw two lines", "scope": page, "mode": "edit"], as: .ai("integration"))
+        let group = "INTEGRATIONAITURN"
+        let response = try await h.app.bus.execute(Invocation(command: CommandIDs.aiAsk,
+            params: ["prompt": "Draw two lines", "scope": page, "mode": "edit"],
+            principal: .ai("integration"), session: h.session, group: group)).value
         XCTAssertEqual(ai.requests.count, 1)
+        XCTAssertNotNil(ai.requests.first?.group)
+        XCTAssertEqual(ai.requests.first?.group, group)
+        XCTAssertEqual(ai.requests.first?.principal, .ai("integration"))
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
-        let group = try XCTUnwrap(response["group"]?.stringValue)
-        XCTAssertEqual(h.app.bus.history.entries(Fixtures.docID).first?.group, group)
+        XCTAssertEqual(response["group"]?.stringValue, group)
+        let entries = h.app.bus.history.entries(Fixtures.docID).filter { $0.group == group }
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?.mutations.count, 2)
         let turn = try h.snapshot()
         try await h.run(CommandIDs.undo, ["doc": doc])
         XCTAssertEqual(try h.snapshot(), before)
@@ -155,10 +159,11 @@ enum Scenarios {
         XCTAssertEqual(row.changes, 2)
         await history.revert(row)
         XCTAssertEqual(history.receipt, .reverted(count: 2, kept: 0))
-        let remaining = try await items(h)
-        XCTAssertEqual(remaining.compactMap { $0["ref"]?.stringValue }, ["item:FIXTUREDOC01/FIXTUREPG002/USERLATER01"])
+        let remaining = try items(h)
+        XCTAssertEqual(remaining.map { NodeRef.item(Fixtures.docID, Fixtures.page2, $0.id).description },
+                       ["item:FIXTUREDOC01/FIXTUREPG002/USERLATER01"])
         try await h.run(CommandIDs.undo, ["doc": doc])
-        let restored = try await items(h)
+        let restored = try items(h)
         XCTAssertEqual(restored.count, 3, "The History revert itself is undoable")
     }
 
@@ -178,7 +183,7 @@ enum Scenarios {
     }
 
     static func scanToSearch() async throws {
-        let h = Harness(features: [FeatQueryFeature.self, NibIndexFeature.self, FeatScanFeature.self])
+        let h = Harness(features: [NibIndexFeature.self, FeatScanFeature.self])
         defer { try? FileManager.default.removeItem(at: h.persistence.root) }
         let camera = ScenarioScanDevice()
         let savedCamera = ScanDevices.current
@@ -192,8 +197,9 @@ enum Scenarios {
         let scanned = try XCTUnwrap(result["refs"]?[0]?.stringValue)
         XCTAssertEqual(camera.captures, 1)
         XCTAssertEqual(recognizer.imageCalls, 1)
-        let pageJSON = try await h.run(CommandIDs.queryGet, ["ref": .string(scanned)])
-        XCTAssertNotNil(pageJSON["ext"]?[PageRecord.scanTextExtKey])
+        let scannedPage = try XCTUnwrap(NodeRef(scanned)?.pageID)
+        let record = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).pages.first { $0.id == scannedPage })
+        XCTAssertNotNil(record.ext?[PageRecord.scanTextExtKey])
         let text = try await h.run(CommandIDs.recognizePageText, ["page": .string(scanned)])
         XCTAssertTrue(text["blocks"]?.arrayValue?.contains { $0["text"] == "Photosynthesis chlorophyll" && $0["source"] == "scan" } == true)
         let hits = try await h.run(CommandIDs.searchText, ["query": "chlorophyll", "scope": doc])
@@ -209,7 +215,7 @@ enum Scenarios {
 
     static func repairCatalog() async throws {
         let h = Harness(features: [NibStoreFeature.self, NibLibraryFeature.self, NibSyncFeature.self,
-                                   FeatSyncUIFeature.self, FeatQueryFeature.self], fixtures: false, keepFeatureServices: true)
+                                   FeatSyncUIFeature.self], fixtures: false, keepFeatureServices: true)
         let library = try XCTUnwrap(h.app.services.library as? FolderLibrary)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-integration-library-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -225,14 +231,20 @@ enum Scenarios {
         let id = NodeRef.documentID(from: ref)
         h.app.workspace.persistence.flush(id)
         let before = try h.snapshot(id)
-        library.saveCacheNow()
+        try await wait("creation's catalog write") {
+            CatalogCache.load(library.cacheURL, root: root.standardizedFileURL.path) != nil
+        }
+        try await Task.sleep(nanoseconds: 1_200_000_000)
         library.waitForIO()
         XCTAssertTrue(FileManager.default.fileExists(atPath: library.cacheURL.path))
         try FileManager.default.removeItem(at: library.cacheURL)
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        library.waitForIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: library.cacheURL.path),
+                       "No pending creation save may mask a repair that does not rebuild the catalog")
         let repaired = try await h.run(CommandIDs.libraryRepair)
-        // refresh() debounces the derived cache save; do not force a save from the test, which would mask
-        // a repair that never scheduled one. Wait for the actual F002 write instead.
-        try await wait("repair's debounced catalog write") {
+        XCTAssertEqual(repaired["catalogRebuilt"], true)
+        try await wait("repair's catalog write") {
             CatalogCache.load(library.cacheURL, root: root.standardizedFileURL.path) != nil
         }
         library.waitForIO()
@@ -244,12 +256,11 @@ enum Scenarios {
         XCTAssertEqual(try h.snapshot(id), before)
         XCTAssertEqual(h.undoDepth(id), 0)
         h.app.workspace.close(id)
-        let reopened = try await h.run(CommandIDs.queryGet, ["ref": .string(ref)])
-        XCTAssertEqual(reopened["ref"]?.stringValue, ref, "The original package remains readable after rebuilding")
+        XCTAssertEqual(try h.snapshot(id), before, "The original package remains readable after rebuilding")
     }
 
     static func pageToTemplate() async throws {
-        let h = Harness(features: [FeatQueryFeature.self, NibRenderFeature.self, NibExportFeature.self, FeatTemplateUIFeature.self])
+        let h = Harness(features: [NibRenderFeature.self, NibExportFeature.self, FeatTemplateUIFeature.self])
         defer { try? FileManager.default.removeItem(at: h.persistence.root) }
         h.app.services.pdf = FakePDFService()
         let before = try h.snapshot()
@@ -275,7 +286,7 @@ enum Scenarios {
     }
 
     static func renderMarks() async throws {
-        let h = Harness(features: [FeatQueryFeature.self, NibRenderFeature.self])
+        let h = Harness(features: [NibRenderFeature.self])
         defer { try? FileManager.default.removeItem(at: h.persistence.root) }
         h.app.services.pdf = FakePDFService()
         let before = try h.snapshot()
@@ -285,14 +296,12 @@ enum Scenarios {
         XCTAssertEqual(invocation.command, CommandIDs.renderPage)
         let output = try await h.app.bus.execute(invocation).value
         let marks = try XCTUnwrap(output["marks"]?.objectValue)
-        let query = try await items(h, on: .string(NodeRef.page(Fixtures.docID, Fixtures.page1).description))
-        let refs = Set(query.compactMap { $0["ref"]?.stringValue })
+        let rows = try XCTUnwrap(before["items"]?[Fixtures.page1.raw]?.arrayValue)
+        let refs = Set(try rows.map { row in
+            NodeRef.item(Fixtures.docID, Fixtures.page1, NibID(try XCTUnwrap(row["id"]?.stringValue))).description
+        })
         XCTAssertFalse(marks.isEmpty)
         XCTAssertEqual(Set(marks.values.compactMap(\.stringValue)), refs)
-        for ref in marks.values {
-            let node = try await h.run(CommandIDs.queryGet, ["ref": ref])
-            XCTAssertEqual(node["ref"], ref)
-        }
         let name = try XCTUnwrap(output["asset"]?.stringValue)
         XCTAssertTrue(name.hasPrefix("tmp:"))
         let url = try XCTUnwrap(h.assets.temporaryURL(AssetRef(String(name.dropFirst(4)))))

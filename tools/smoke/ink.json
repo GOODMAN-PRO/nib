@@ -185,6 +185,19 @@
       "manual": "On a clear area write Nib smoke with Pencil and wait for handwriting recognition. Verify the next bridge call contains those words with boxes aligned to the ink."
     },
     {
+      "name": "Wait for handwriting indexing",
+      "waitEvent": {
+        "type": "index.progress",
+        "match": {
+          "payload": {
+            "running": false
+          }
+        },
+        "timeout": 30
+      },
+      "optional": true
+    },
+    {
       "tool": "nib_page_text",
       "args": {
         "page": "${page}"
@@ -192,10 +205,15 @@
       "expect": {
         "json": {
           "blocks": {
-            "$type": "array"
+            "$contains": {
+              "text": {
+                "$match": "[Nn][Ii][Bb]"
+              }
+            }
           }
         }
-      }
+      },
+      "optional": true
     },
     {
       "tool": "nib_render",

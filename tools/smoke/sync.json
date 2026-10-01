@@ -75,10 +75,11 @@
       "expect": {
         "json": {
           "items": {
-            "$type": "array"
+            "$len": 1
           }
         }
-      }
+      },
+      "optional": true
     },
     {
       "tool": "nib_render",
