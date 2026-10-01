@@ -74,7 +74,13 @@ enum TemplatePalette {
     }
 
     /// Darker by `amount` (0.16 = the cover spine's −16 % luminance).
-    static func shade(_ c: RGBA, _ amount: Double) -> RGBA { mix(c, RGBA(0, 0, 0, c.a), amount) }
+    static func shade(_ c: RGBA, _ amount: Double) -> RGBA {
+        let factor = 1 - amount
+        func channel(_ value: UInt8) -> UInt8 {
+            UInt8(max(0, min(255, (Double(value) * factor).rounded())))
+        }
+        return RGBA(channel(c.r), channel(c.g), channel(c.b), c.a)
+    }
 
     /// Rule colour for any paper: blue-grey on light paper, a lifted tone on dark paper.
     static func ruleColor(for paper: RGBA) -> RGBA {

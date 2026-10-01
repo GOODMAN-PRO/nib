@@ -51,8 +51,9 @@ struct HandleLayout {
     static let rotationLift = NibMetrics.rotationHandleOffset
     /// Every handle answers within a 44 pt target.
     static let reach = NibMetrics.hitTarget / 2
-    /// Sides shorter than this on screen keep only their corners.
-    static let edgeMinimum = NibSpacing.x6
+    /// Keep edge handles whenever the side fits a hit target. Overlaps with corner targets
+    /// use the nearest visual centre, just like the rotation and top-edge targets.
+    static let edgeMinimum = NibMetrics.hitTarget
 
     let corners: [CGPoint]
     /// Side midpoints: 0 top, 1 right, 2 bottom, 3 left.
