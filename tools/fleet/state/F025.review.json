@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibSync/SyncCommands.swift:468-539 (LibraryRelocate.run)",
+      "problem": "Move Library (copy:false) can permanently lose edits. Open documents are only flushed at line 468. The download, copy and verify steps then run detached for up to minutes while the UI stays live. Strokes drawn in an open document during that time are debounced into the OLD package. library.setRoot (F002) then calls workspace.close, which flushes the last pending writes to the old package while the locator still points there, and the WAL is truncated. Finally LibraryCopier.remove(items) deletes the old library. Anything written after that package was verified, including the last <=1.5 s debounce window flushed by close, never reaches the new library. Documents created or renamed during the copy are also lost or left behind. Size-only verify does not catch a same-size rewrite. carryPrefs failures are only logged before the originals are deleted.",
+      "fix": "Right after validate(), close every loaded document (ctx.workspace.close, which flushes) and set a `relocating` flag. While it is set, register a guarding hook that refuses doc.open/window.open and every effect:.library command with NibError(.unavailable, \"the library is being moved\"). Capture an inventory with sizes and mtimes when verify succeeds. Before LibraryCopier.remove(items), re-inventory the source: if anything changed or appeared, or if carryPrefs threw, keep the old folder (removedOriginal:false, save `leaving` as a known location) and report it. Let carryPrefs throw instead of logging. Clear the flag in a defer."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibSync/FolderWatcher.swift:429-431 (Walker) + 492 (SyncDiff.needsRefresh)",
+      "problem": "Opening or closing any document that holds another device's head runs a spurious synchronous library.refresh() (a full incremental rescan on the main actor). Other devices' heads of loaded packages are left out of LibraryScan.meta, and heads of unloaded packages are put in. docOpened schedules a check 0.4 s later, and at that point the package's heads leave `meta`, so `old.meta != new.meta` returns true and the library refreshes. The next poll after docClosed puts them back and refreshes again. In a multi-device library (the feature's target case) this happens on every open and close: a main-thread hitch that grows with library size, although nothing changed.",
+      "fix": "Keep the loaded set in LibraryScan (`var loaded: Set<String>`). In needsRefresh, compare meta only over keys whose package prefix is unloaded in both scans. For example, drop keys under `old.loaded ∪ new.loaded` from both dictionaries before comparing. Alternatively, always record every package's heads in a separate `packageHeads` map and diff only the unloaded ones. Add a NibSyncTests case: seed a package with doc.00000008.json, run check() as the baseline, open the doc (workspace.items), run check() again and assert library.refreshes == 0. Repeat after close."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/SyncCommands.swift:500, 513, 519-529",
+      "problem": "Relocate does heavy synchronous file work on the main actor. library.refresh() runs right after setRoot, and the new root has no catalog cache yet, so F002 does a full rebuild that reads every head on main. F002's setRoot already started refreshInBackground. LibraryCopier.remove(items) is a coordinated recursive delete of the whole old library, and it runs on main, as do remove(created) and carryPrefs. With a 5,000-document library this freezes the UI for seconds.",
+      "fix": "Remove the explicit library.refresh(): setRoot already rescans off-main, and it reloads prefs in finishBackgroundScan. If carried prefs must be reloaded, call carryPrefs before setRoot, into the destination's .nib-library. Run LibraryCopier.remove(...) inside `await Task.detached(priority: .utility) { ... }.value`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/LibraryLocationPicker.swift:280-348 (LibraryCopier.copy/verify/inventory)",
+      "problem": "verify() treats an unreadable source item as an empty inventory. When inventory(source) returns [:], no path is compared and the copy counts as verified. Enumeration errors are ignored because the enumerator has no errorHandler. When copyItem fails partway, the partially copied target is not in `created`, so it stays behind (possibly with a .nib-library marker). copy() also deletes a same-name destination item that appeared after validation.",
+      "fix": "In verify, report `name` as a problem when from[\"\"] is nil. Give both enumerators an errorHandler that records a failure and makes verify fail. On a copy error, also remove `target`. Throw instead of calling removeItem when `to` already exists."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/NibSyncFeature.swift:39-44",
+      "problem": "The doc.open/window.open guard ignores ensureDownloaded's false result. After the 30 s timeout the open proceeds with evicted heads or pages. The store's coordinated read then blocks the main actor until iCloud delivers them, possibly for a long time when offline.",
+      "fix": "`if !(await watcher.ensureDownloaded(doc)) { throw NibError(.unavailable, \"this document is still downloading from iCloud\", hint: \"try again once it has downloaded\") }`, or return the refusal value that guarding hooks use to block. Add a test with a stubbed scanner that reports evicted items."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/FolderWatcher.swift:903-918, 981-991",
+      "problem": "A detached scan that started before a root switch finishes afterwards and is applied to the new library. It overwrites packageCache and libraryBaseline, which rootChanged() reset, with the old root's scan. It can also set a library 'downloading' status that belongs to the old folder, and it forces a spurious refresh on the next check.",
+      "fix": "Keep a `rootGeneration` counter that rootChanged() increments. Capture it before the scan and skip the library section when it changed, or when `library.rootURL.standardizedFileURL != root`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/FolderWatcher.swift:985-991 (first scan only sets the baseline)",
+      "problem": "A document another device adds between the Library Store's launch or switch background scan and the watcher's first scan goes straight into the baseline. The catalog never lists it until Sync Now or the next foreground refresh, because later scans see an unchanged tree.",
+      "fix": "When libraryBaseline == nil and the library is not loading, compare catalogTree()/catalogTrash() with the scan as the reconcile branch does, and refresh on a mismatch."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/SyncCommands.swift:566 (LibraryRelocate.validate)",
+      "problem": "Moving the library back into the app's own folder is refused as 'not empty' whenever iOS has created Documents/Inbox. visibleEntries counts Inbox, even though topLevelItems and the watcher both treat it as outside the library.",
+      "fix": "Filter out SyncFiles.inboxName from visibleEntries(picked) when LibraryFolder.isAppDocuments(picked)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibSync/SyncCommands.swift:242-256 (library.locations)",
+      "problem": "library.locations resolves every remembered bookmark and reads resource values on the main actor. On third-party File Provider or iCloud folders, resolution can block for seconds. The Switch Library menu closures also call KnownLocations.listed (JSON decode plus file-system checks) for each of the 8 slots, 3-4 times per menu build.",
+      "fix": "Probe availability in Task.detached: resolve, check isDirectory/isLibrary/provider, then end access. Build the sorted list once per menu validation, or cache it until a sync.locations.* setting changes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibSyncTests/NibSyncTests.swift, FolderWatcherTests.swift:284-321",
+      "problem": "The riskiest paths have no tests. The relocate orchestration (flush → copy → verify → setRoot → remove originals) is never exercised because the picker has no seam: the copier helpers are tested one by one and the originals are deleted by hand. No test covers edits made during a relocation, the refresh behaviour on document open/close, or ensureDownloaded with evicted items.",
+      "fix": "Add a test-only picker override (for example `static var FolderPicker.testOutcome: FolderPicker.Outcome?` checked in PickerHost.pickFolder). Test library.relocate copy:false end to end: an edit committed while the copy is in flight must end up in the new library, and the original must be kept if the source changed. Add the open/close no-refresh test described above."
+    }
+  ]
+}
