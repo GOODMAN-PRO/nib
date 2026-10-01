@@ -781,7 +781,8 @@ final class FeatSearchUITests: XCTestCase {
         let host = UIHostingController(rootView: content)
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
         window.rootViewController = host
-        defer { window.rootViewController = nil }
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
 
         func descendants<T: UIView>(_ type: T.Type, in view: UIView) -> [T] {
             ((view as? T).map { [$0] } ?? [])
