@@ -1,1 +1,524 @@
-// Scaffold placeholder, owned by F004 (Page renderer (tiles, ink compositing, thumbnails)). Replace this file.
+import Foundation
+import CoreGraphics
+import UIKit
+import PencilKit
+import NibContracts
+
+// MARK: - Snapshot
+
+/// A value snapshot of one page for off-main compositing (taken by `NibPageRenderer.snapshot` on the main actor).
+/// Holds only values plus thread-safe objects: the asset store, the content registries and the background sources.
+struct RenderJob {
+    /// A visible item with its bounds (`Stroke.bounds` scans every point) and its paint bounds (contracts-v2
+    /// `ContentRegistries.paintBounds(for:)`: what its drawer can touch, used for culling).
+    struct Visible {
+        let item: Item
+        let bounds: Rect
+        let paint: Rect
+    }
+
+    let doc: DocumentID
+    let page: PageID
+    /// nil = infinite whiteboard board.
+    let size: PageSize?
+    let rotation: Int
+    let background: Background
+    let drawBackground: Bool
+    let template: TemplateSource?
+    let pdfURL: URL?
+    /// Every item of the page in z order, tombstones included (the workspace's array, shared copy-on-write).
+    let allItems: [Item]
+    let layers: Set<Int>
+    let hidden: Set<ElementID>
+    /// `DrawContext.annotations`: false leaves comment pins and link marks out (their drawers honour it).
+    let annotations: Bool
+    let replay: ReplayState?
+    let purpose: DrawPurpose
+    let requestedRegion: Rect?
+    let assets: AssetStore?
+    let registries: ContentRegistries
+    let pdf: PDFRenderPool
+    let rasters: RasterBackgroundCache
+    let inks: PKStrokeCache
+    /// Tile-cache variant (layers, background, annotations, purpose); nil = not cacheable (hidden items, replay).
+    let variant: String?
+    /// Tile-cache generation of the page when the snapshot was taken.
+    let generation: TileCache.Generation
+    /// Visible items, computed once per job by the first worker that needs them.
+    let culled = Lazy<[Visible]>()
+    /// `PageLooks` keys of the page, computed at most once per job.
+    let dependencies = Lazy<Set<String>>()
+
+    var pageKey: String { TileCache.pageKey(doc, page) }
+    var pageRect: Rect? { size.map { Rect(x: 0, y: 0, width: $0.width, height: $0.height) } }
+
+    /// Live items on the requested layers, minus hidden ones, in z order.
+    var visibleItems: [Item] {
+        allItems.filter { !$0.deleted && layers.contains($0.layer) && !hidden.contains($0.id) }
+    }
+
+    /// `visibleItems` with their bounds and paint bounds, shared by all tiles of the job.
+    var visible: [Visible] {
+        culled.get {
+            visibleItems.map { Visible(item: $0, bounds: $0.bounds, paint: registries.paintBounds(for: $0)) }
+        }
+    }
+
+    /// The registry entries this page's look depends on: its background template and the drawers (by draw key and
+    /// by kind, the two lookups of `ContentRegistries.drawer(for:)`) of every live item the renderer does not draw
+    /// itself, on any layer.
+    var looks: Set<String> {
+        dependencies.get {
+            var keys: Set<String> = []
+            if background.kind == .template, let id = background.template?.id { keys.insert(PageLooks.template(id)) }
+            for item in allItems where !item.deleted && InkBands.kind(of: item) == .item {
+                keys.insert(PageLooks.drawer(item.drawKey))
+                keys.insert(PageLooks.drawer(item.kind.rawValue))
+            }
+            return keys
+        }
+    }
+
+    /// False when the render lacks a template or an item drawer that may be registered later (plugins, content
+    /// packs): such a render is shown but never persisted as a thumbnail.
+    var isComplete: Bool {
+        if background.kind == .template && template == nil { return false }
+        return visibleItems.allSatisfy { InkBands.kind(of: $0) != .item || registries.drawer(for: $0) != nil }
+    }
+}
+
+/// A lazily computed, lock-protected value of one `RenderJob` (workers render its tiles concurrently).
+final class Lazy<Value> {
+    private let lock = NSLock()
+    private var value: Value?
+
+    func get(_ make: () -> Value) -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        if let v = value { return v }
+        let v = make()
+        value = v
+        return v
+    }
+}
+
+// MARK: - Ink bands
+
+/// A run of consecutive items drawn in one pass. Pen/pencil strokes become one PencilKit image, highlighters one
+/// image composited with multiply (normal at 55 % on dark paper), dashed/dotted strokes one filled-outline image;
+/// every other item goes to its `ItemDrawer`.
+struct InkBand {
+    enum Kind: Equatable { case ink, highlighter, patternInk, patternHighlighter, item }
+
+    var kind: Kind
+    /// Note Replay spotlight: ink written after the playhead is drawn at 25 %.
+    var faded = false
+    /// Highlighter bands: the colour alpha their strokes share (the band is composited once at that opacity).
+    var alpha: UInt8 = 255
+    var strokes: [Stroke] = []
+    /// `PKStrokeCache` keys of `strokes`, index for index.
+    var keys: [String] = []
+    var items: [Item] = []
+}
+
+enum InkBands {
+    static func kind(of item: Item) -> InkBand.Kind {
+        guard item.kind == .stroke, let s = item.stroke else { return .item }
+        switch (s.style.tool, s.style.pattern) {
+        case (.pen, .solid), (.pencil, .solid): return .ink
+        case (.highlighter, .solid): return .highlighter
+        case (.highlighter, _): return .patternHighlighter
+        case (.pen, _), (.pencil, _): return .patternInk
+        case (.tape, _): return .item
+        }
+    }
+
+    static func isHighlighter(_ k: InkBand.Kind) -> Bool { k == .highlighter || k == .patternHighlighter }
+
+    /// Note Replay for one stroke: spotlight fades ink written after the playhead, reveal draws only the points
+    /// written so far (nil = not written yet), static draws everything.
+    static func replayed(_ s: Stroke, _ replay: ReplayState?) -> (stroke: Stroke, faded: Bool)? {
+        guard let r = replay else { return (s, false) }
+        switch r.mode {
+        case .showAll:
+            return (s, false)
+        case .spotlight:
+            return (s, s.t0 > r.time)
+        case .reveal:
+            guard s.t0 <= r.time else { return nil }
+            let elapsed = Float(r.time - s.t0)
+            guard let last = s.points.last, last.t > elapsed else { return (s, false) }
+            var partial = s
+            partial.points = Array(s.points.prefix(while: { $0.t <= elapsed }))
+            guard !partial.points.isEmpty else { return nil }
+            return (partial, false)
+        }
+    }
+
+    /// Bands in drawing order. Within a run of consecutive strokes, highlighter strokes are drawn first so they sit
+    /// beneath pen and pencil ink (T-092); items of other kinds keep their z order and end a run.
+    static func make(_ items: [Item], replay: ReplayState?) -> [InkBand] {
+        struct Entry {
+            var kind: InkBand.Kind
+            var faded: Bool
+            var stroke: Stroke?
+            var key = ""
+            var item: Item
+        }
+        var ordered: [Entry] = []
+        var run: [Entry] = []
+        func flush() {
+            ordered += run.filter { isHighlighter($0.kind) } + run.filter { !isHighlighter($0.kind) }
+            run.removeAll()
+        }
+        for item in items {
+            let k = kind(of: item)
+            guard k != .item, let s = item.stroke else {
+                flush()
+                ordered.append(Entry(kind: .item, faded: false, stroke: nil, item: item))
+                continue
+            }
+            guard let r = replayed(s, replay) else { continue }
+            run.append(Entry(kind: k, faded: r.faded, stroke: r.stroke, key: PKStrokeCache.key(item, points: r.stroke.points.count),
+                             item: item))
+        }
+        flush()
+
+        var bands: [InkBand] = []
+        for e in ordered {
+            guard let stroke = e.stroke else {
+                bands.append(InkBand(kind: .item, items: [e.item]))
+                continue
+            }
+            let alpha = isHighlighter(e.kind) ? stroke.style.color.a : 255
+            if let last = bands.last, last.kind == e.kind, last.faded == e.faded, last.alpha == alpha {
+                bands[bands.count - 1].strokes.append(stroke)
+                bands[bands.count - 1].keys.append(e.key)
+            } else {
+                bands.append(InkBand(kind: e.kind, faded: e.faded, alpha: alpha, strokes: [stroke], keys: [e.key]))
+            }
+        }
+        return bands
+    }
+}
+
+// MARK: - PencilKit strokes
+
+/// Model strokes converted to `PKStroke`s, shared by every job and tile of the renderer. PencilKit keeps a stroke's
+/// render data on the `PKStroke` itself, so a tile drawn again (after an edit nearby, a zoom bucket change or an
+/// eviction) converts and prepares only the strokes it has not drawn at their current revision: roughly a third of
+/// a 150-stroke tile's composite. Keyed by document, item id, revision and point count (Note Replay's reveal draws a
+/// prefix of the points); an edit gives the item a new revision, so entries never go stale, they just age out.
+final class PKStrokeCache {
+    private final class Entry {
+        let stroke: PKStroke
+        init(_ stroke: PKStroke) { self.stroke = stroke }
+    }
+
+    /// Rough bytes one stroke point costs PencilKit (control point, interpolated path, render data).
+    static let bytesPerPoint = 160
+    private let cache = NSCache<NSString, Entry>()
+
+    init(costLimit: Int = 48 << 20) {
+        cache.totalCostLimit = costLimit
+    }
+
+    static func key(_ item: Item, points: Int) -> String {
+        "\(item.id.raw)|\(item.rev.wallMs).\(item.rev.counter).\(item.rev.device)|\(points)"
+    }
+
+    /// The PencilKit stroke for `stroke`; `key` (from `key(_:points:)`, plus the document and any colour change) names
+    /// its content, and nil skips the cache.
+    func stroke(_ stroke: Stroke, key: String?) -> PKStroke {
+        guard let key = key else { return PKBridge.pkStroke(stroke) }
+        if let hit = cache.object(forKey: key as NSString) { return hit.stroke }
+        let pk = PKBridge.pkStroke(stroke)
+        cache.setObject(Entry(pk), forKey: key as NSString, cost: max(1, stroke.points.count) * PKStrokeCache.bytesPerPoint)
+        return pk
+    }
+
+    func purge() {
+        cache.removeAllObjects()
+    }
+}
+
+// MARK: - Dashed and dotted strokes
+
+/// Dashed/dotted strokes (T-009): the variable-width `InkOutline` filled through a clip made from the centre line
+/// dashed with the pattern — butt-capped dashes, or round dots one nib wide.
+enum PatternInk {
+    static func lengths(for style: InkStyle) -> [CGFloat] {
+        let w = CGFloat(max(style.width, 0.5))
+        switch style.pattern {
+        case .solid: return []
+        case .dashed: return [max(w * 3, 3), max(w * 2, 2.5)]
+        case .dotted: return [0.01, max(w * 2.5, 2.5)]
+        }
+    }
+
+    static func maskPath(_ stroke: Stroke) -> CGPath? {
+        var s = stroke
+        InkModel.prepare(&s)
+        let pattern = lengths(for: s.style)
+        guard !pattern.isEmpty, s.points.count >= 2 else { return nil }
+        let centre = CGMutablePath()
+        centre.addLines(between: s.points.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) })
+        let w = CGFloat(max(s.style.width, 0.5))
+        let dashed = centre.copy(dashingWithPhase: 0, lengths: pattern)
+        if s.style.pattern == .dotted {
+            return dashed.copy(strokingWithWidth: w, lineCap: .round, lineJoin: .round, miterLimit: 10)
+        }
+        let widest = CGFloat(s.points.map { max($0.width, $0.height) }.max() ?? 0)
+        return dashed.copy(strokingWithWidth: max(widest, w) * 2 + 2, lineCap: .butt, lineJoin: .round, miterLimit: 10)
+    }
+
+    static func fill(_ stroke: Stroke, color: RGBA, cg: CGContext) {
+        let outline = InkOutline.path(stroke)
+        cg.saveGState()
+        defer { cg.restoreGState() }
+        if let mask = maskPath(stroke) {
+            cg.addPath(mask)
+            cg.clip()
+        }
+        cg.addPath(outline)
+        cg.setFillColor(color.cgColor)
+        cg.fillPath()
+    }
+}
+
+// MARK: - Set-of-Mark
+
+/// Numbered boxes over items for vision models; numbers follow reading order (top to bottom, then left to right).
+enum SetOfMarks {
+    struct Mark {
+        var number: Int
+        var ref: String
+        var box: Rect
+    }
+
+    static let colour = RGBA(0xFF, 0x2D, 0x55)
+    /// Label text height in output pixels.
+    static let labelPixels = 13.0
+
+    static func number(_ items: [RenderJob.Visible], doc: DocumentID, page: PageID, region: Rect) -> [Mark] {
+        let boxed = items.filter { $0.bounds.intersects(region) }
+        let sorted = boxed.sorted { ($0.bounds.minY, $0.bounds.minX) < ($1.bounds.minY, $1.bounds.minX) }
+        return sorted.enumerated().map { i, e in
+            Mark(number: i + 1, ref: NodeRef.item(doc, page, e.item.id).description, box: e.bounds)
+        }
+    }
+
+    /// `cg` is in page coordinates (y down); line widths and labels are sized in output pixels.
+    static func draw(_ marks: [Mark], region: Rect, scale: Double, cg: CGContext) {
+        guard !marks.isEmpty, scale > 0 else { return }
+        let px = CGFloat(1 / scale)
+        let font = UIFont.boldSystemFont(ofSize: CGFloat(labelPixels) * px)
+        cg.saveGState()
+        UIGraphicsPushContext(cg)
+        defer {
+            UIGraphicsPopContext()
+            cg.restoreGState()
+        }
+        let area = region.cg
+        for m in marks {
+            cg.setStrokeColor(colour.cgColor)
+            cg.setLineWidth(2 * px)
+            cg.stroke(m.box.cg)
+            let text = NSAttributedString(string: String(m.number), attributes: [.font: font, .foregroundColor: UIColor.white])
+            let size = text.size()
+            var label = CGRect(x: m.box.cg.minX, y: m.box.cg.minY, width: size.width + 6 * px, height: size.height + 2 * px)
+            label.origin.x = max(area.minX, min(label.minX, area.maxX - label.width))
+            label.origin.y = max(area.minY, min(label.minY, area.maxY - label.height))
+            cg.setFillColor(colour.cgColor)
+            cg.fill(label)
+            text.draw(at: CGPoint(x: label.minX + 3 * px, y: label.minY + px))
+        }
+    }
+}
+
+// MARK: - Compositing
+
+/// The paper under the items: its colour when known (template paper or background colour; nil under a PDF or image
+/// background) and whether it is dark (D-078).
+struct Paper {
+    var colour: RGBA?
+    var isDark: Bool { RenderGeometry.isDark(colour ?? .white) }
+}
+
+/// Draws one region of a page: background (template DisplayList, PDF page, image or colour), then the items in z
+/// order as `InkBand`s, then optional Set-of-Mark boxes. Pure and thread-safe; always under a light trait collection
+/// so PencilKit and dynamic colours never invert ink in dark mode (paper is never inverted, D-078).
+enum PageCompositor {
+    static func image(_ job: RenderJob, region: Rect, scale: Double, width: Int, height: Int,
+                      marks: [SetOfMarks.Mark]) -> CGImage? {
+        guard let cg = makeContext(width: width, height: height) else { return nil }
+        applyPageTransform(cg, region: region, width: width, height: height)
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            draw(job, region: region, scale: scale, width: width, height: height, cg: cg)
+            SetOfMarks.draw(marks, region: region, scale: scale, cg: cg)
+        }
+        return cg.makeImage()
+    }
+
+    /// Assembles cached tiles (page rects) into a region at any scale. Antialiasing is off for the tile images so
+    /// neighbouring tiles meet on pixel centres without seams.
+    static func assemble(_ tiles: [(rect: Rect, image: CGImage)], region: Rect, scale: Double, width: Int, height: Int,
+                         marks: [SetOfMarks.Mark]) -> CGImage? {
+        guard let cg = makeContext(width: width, height: height) else { return nil }
+        applyPageTransform(cg, region: region, width: width, height: height)
+        cg.saveGState()
+        cg.setShouldAntialias(false)
+        for t in tiles { drawImage(t.image, in: t.rect.cg, cg: cg) }
+        cg.restoreGState()
+        SetOfMarks.draw(marks, region: region, scale: scale, cg: cg)
+        return cg.makeImage()
+    }
+
+    static func draw(_ job: RenderJob, region: Rect, scale: Double, width: Int, height: Int, cg: CGContext) {
+        cg.saveGState()
+        defer { cg.restoreGState() }
+        if let page = job.pageRect { cg.clip(to: page.cg) }
+        let paper = drawBackground(job, region: region, scale: scale, cg: cg)
+        let items = job.visible.compactMap { $0.paint.intersects(region) ? $0.item : nil }
+        for band in InkBands.make(items, replay: job.replay) {
+            drawBand(band, job: job, region: region, scale: scale, width: width, height: height, paper: paper, cg: cg)
+        }
+    }
+
+    /// Draws the page background (when requested) and returns the paper, which decides dark-paper blending.
+    static func drawBackground(_ job: RenderJob, region: Rect, scale: Double, cg: CGContext) -> Paper {
+        let bg = job.background
+        let area = (job.pageRect ?? region).cg
+        switch bg.kind {
+        case .template:
+            guard let t = job.template else {
+                if job.drawBackground { fill(area, .white, cg) }
+                return Paper(colour: .white)
+            }
+            return Paper(colour: DisplayListRenderer.drawTemplate(t, size: job.size, region: region, scale: scale,
+                                                                  draw: job.drawBackground, cg: cg, assets: job.assets,
+                                                                  doc: job.doc))
+        case .color:
+            let colour = bg.color ?? .white
+            if job.drawBackground { fill(area, colour, cg) }
+            return Paper(colour: colour)
+        case .pdf:
+            guard job.drawBackground else { return Paper() }
+            fill(area, .white, cg)
+            if let url = job.pdfURL {
+                job.pdf.draw(url: url, pageIndex: bg.pdfPage ?? 0, rotation: job.rotation, pageSize: job.size, cg: cg)
+            }
+            return Paper()
+        case .image:
+            guard job.drawBackground else { return Paper() }
+            fill(area, .white, cg)
+            if let ref = bg.asset, let raster = job.rasters.image(ref, doc: job.doc, assets: job.assets) {
+                raster.draw(rotation: job.rotation, pageSize: job.size, cg: cg)
+            }
+            return Paper()
+        }
+    }
+
+    static func drawBand(_ band: InkBand, job: RenderJob, region: Rect, scale: Double, width: Int, height: Int,
+                         paper: Paper, cg: CGContext) {
+        let fade: CGFloat = band.faded ? 0.25 : 1
+        switch band.kind {
+        case .ink:
+            composite(inkImage(band, opaque: false, job: job, region: region, scale: scale), region: region, alpha: fade,
+                      blend: .normal, cg: cg)
+        case .highlighter:
+            let (alpha, blend) = highlighterBlend(band.alpha, dark: paper.isDark)
+            composite(inkImage(band, opaque: true, job: job, region: region, scale: scale), region: region,
+                      alpha: alpha * fade, blend: blend, cg: cg)
+        case .patternInk:
+            let image = patternImage(band.strokes, opaque: false, region: region, width: width, height: height)
+            composite(image, region: region, alpha: fade, blend: .normal, cg: cg)
+        case .patternHighlighter:
+            let (alpha, blend) = highlighterBlend(band.alpha, dark: paper.isDark)
+            let image = patternImage(band.strokes, opaque: true, region: region, width: width, height: height)
+            composite(image, region: region, alpha: alpha * fade, blend: blend, cg: cg)
+        case .item:
+            for item in band.items {
+                guard let drawer = job.registries.drawer(for: item) else { continue }
+                cg.saveGState()
+                drawer.draw(item, in: DrawContext(cg: cg, scale: scale, doc: job.doc, page: job.page, darkPaper: paper.isDark,
+                                                  assets: job.assets, replay: job.replay, purpose: job.purpose,
+                                                  annotations: job.annotations, paper: paper.colour))
+                cg.restoreGState()
+            }
+        }
+    }
+
+    /// Light paper: multiply at the colour's own opacity, so ink and text beneath stay dark and crisp (T-016, T-092).
+    /// Dark paper: multiply would vanish, so a normal blend at 55 % (D-078).
+    static func highlighterBlend(_ colourAlpha: UInt8, dark: Bool) -> (CGFloat, CGBlendMode) {
+        if dark { return (0.55, CGBlendMode.normal) }
+        return (CGFloat(colourAlpha) / 255, CGBlendMode.multiply)
+    }
+
+    /// One PencilKit image of a band's solid pen/pencil (or highlighter) strokes: PencilKit's own ink look, so dry
+    /// tiles match the wet ink the canvas captured. `opaque` draws the colours at full opacity (highlighter bands are
+    /// composited once at the band's alpha). Strokes come from the renderer's `PKStrokeCache`.
+    static func inkImage(_ band: InkBand, opaque: Bool, job: RenderJob, region: Rect, scale: Double) -> CGImage? {
+        guard !band.strokes.isEmpty else { return nil }
+        let prefix = job.doc.raw + (opaque ? "|o|" : "|")
+        var strokes: [PKStroke] = []
+        strokes.reserveCapacity(band.strokes.count)
+        for (i, stroke) in band.strokes.enumerated() {
+            var s = stroke
+            if opaque { s.style.color = s.style.color.withAlpha(1) }
+            strokes.append(job.inks.stroke(s, key: i < band.keys.count ? prefix + band.keys[i] : nil))
+        }
+        return PKDrawing(strokes: strokes).image(from: region.cg, scale: CGFloat(scale)).cgImage
+    }
+
+    static func patternImage(_ strokes: [Stroke], opaque: Bool, region: Rect, width: Int, height: Int) -> CGImage? {
+        guard !strokes.isEmpty, let band = makeContext(width: width, height: height) else { return nil }
+        applyPageTransform(band, region: region, width: width, height: height)
+        for s in strokes { PatternInk.fill(s, color: opaque ? s.style.color.withAlpha(1) : s.style.color, cg: band) }
+        return band.makeImage()
+    }
+
+    static func composite(_ image: CGImage?, region: Rect, alpha: CGFloat, blend: CGBlendMode, cg: CGContext) {
+        guard let image = image else { return }
+        cg.saveGState()
+        cg.setAlpha(alpha)
+        cg.setBlendMode(blend)
+        drawImage(image, in: region.cg, cg: cg)
+        cg.restoreGState()
+    }
+
+    // MARK: Helpers
+
+    static func makeContext(width: Int, height: Int) -> CGContext? {
+        guard width > 0, height > 0, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let cg = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        cg?.interpolationQuality = .high
+        return cg
+    }
+
+    /// Makes 1 unit = 1 page point with the origin at the page's top-left and y down, mapping `region` exactly onto
+    /// the `width` × `height` bitmap (what `DrawContext.cg` promises drawers).
+    static func applyPageTransform(_ cg: CGContext, region: Rect, width: Int, height: Int) {
+        cg.translateBy(x: 0, y: CGFloat(height))
+        cg.scaleBy(x: CGFloat(Double(width) / region.width), y: -CGFloat(Double(height) / region.height))
+        cg.translateBy(x: CGFloat(-region.x), y: CGFloat(-region.y))
+    }
+
+    /// Draws a CGImage upright into a y-down context.
+    static func drawImage(_ image: CGImage, in rect: CGRect, cg: CGContext) {
+        cg.saveGState()
+        cg.translateBy(x: rect.minX, y: rect.maxY)
+        cg.scaleBy(x: 1, y: -1)
+        cg.draw(image, in: CGRect(origin: .zero, size: rect.size))
+        cg.restoreGState()
+    }
+
+    static func fill(_ rect: CGRect, _ colour: RGBA, _ cg: CGContext) {
+        cg.saveGState()
+        cg.setFillColor(colour.cgColor)
+        cg.fill(rect)
+        cg.restoreGState()
+    }
+}
