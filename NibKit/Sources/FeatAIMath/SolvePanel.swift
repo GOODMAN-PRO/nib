@@ -30,6 +30,7 @@ final class SolvePanelModel: ObservableObject {
         var params: [String: JSONValue] = ["mode": .string(state.mode.rawValue), "action": .string(action.rawValue),
                                           "state": try JSONValue.from(state), "refs": .array(refs.map(JSONValue.string))]
         if !latex.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { params["latex"] = .string(latex) }
+        for key in ["textRange", "bbox"] { params[key] = context.params[key] }
         if let index { params["index"] = .number(Double(index)) }
         if let approach { params["approach"] = .string(approach) }
         if action == .check { params["attempt"] = .string(attempt) }
@@ -44,21 +45,33 @@ final class SolvePanelModel: ObservableObject {
         lastAction = action
         lastIndex = index
         lastApproach = approach
-        busy = true
         error = nil
-        task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.busy = false }
+        // These transitions use the model's already-checked state and do no service work.
+        if [.approach, .hint, .skip, .reveal, .expand, .edit].contains(action) {
             do {
-                let params = try self.parameters(action, index: index, approach: approach)
-                let result = try await self.context.app.bus.execute(Invocation(command: CommandIDs.mathSolve, params: params,
-                                                                              session: self.context.session))
+                state = try MathTutor.transition(action, state: state, index: index, approach: approach)
+                isEditing = action == .edit || state.equations.isEmpty
+            } catch { self.error = NibError.wrap(error).message }
+            return
+        }
+        let params: JSONValue
+        do { params = try parameters(action, index: index, approach: approach) }
+        catch { self.error = NibError.wrap(error).message; return }
+        let context = self.context
+        busy = true
+        task = Task { @MainActor [weak self] in
+            do {
+                let result = try await context.app.bus.execute(Invocation(command: CommandIDs.mathSolve, params: params,
+                                                                          session: context.session))
                 try Task.checkCancellation()
-                self.state = try result.value.decode(MathSession.self)
-                self.latex = self.state.equations.joined(separator: "\n")
-                self.isEditing = action == .edit || self.state.equations.isEmpty
-            } catch is CancellationError { }
-            catch { self.error = NibError.wrap(error).message }
+                let state = try result.value.decode(MathSession.self)
+                guard let self else { return }
+                self.state = state
+                self.latex = state.equations.joined(separator: "\n")
+                self.isEditing = state.equations.isEmpty
+                self.busy = false
+            } catch is CancellationError { self?.busy = false }
+            catch { self?.error = NibError.wrap(error).message; self?.busy = false }
         }
     }
 
@@ -66,21 +79,24 @@ final class SolvePanelModel: ObservableObject {
 
     func revealTeacherHint() {
         guard !busy, let ref = state.teacherRef else { return }
+        let params: JSONValue
+        do { params = try parameters(.recognize) }
+        catch { self.error = NibError.wrap(error).message; return }
+        let context = self.context
         busy = true
         error = nil
         task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.busy = false }
             do {
-                _ = try await self.context.app.bus.execute(Invocation(command: CommandIDs.answerZoneRevealHint,
-                                                                      params: ["ref": .string(ref)], session: self.context.session))
+                _ = try await context.app.bus.execute(Invocation(command: CommandIDs.answerZoneRevealHint,
+                                                                  params: ["ref": .string(ref)], session: context.session))
                 try Task.checkCancellation()
-                let params = try self.parameters(.recognize)
-                let result = try await self.context.app.bus.execute(Invocation(command: CommandIDs.mathSolve,
-                    params: params, session: self.context.session))
-                self.state = try result.value.decode(MathSession.self)
-            } catch is CancellationError { }
-            catch { self.error = NibError.wrap(error).message }
+                let result = try await context.app.bus.execute(Invocation(command: CommandIDs.mathSolve,
+                                                                          params: params, session: context.session))
+                try Task.checkCancellation()
+                self?.state = try result.value.decode(MathSession.self)
+                self?.busy = false
+            } catch is CancellationError { self?.busy = false }
+            catch { self?.error = NibError.wrap(error).message; self?.busy = false }
         }
     }
 
@@ -97,17 +113,33 @@ final class SolvePanelModel: ObservableObject {
 
 struct SolvePanel: View {
     let context: PanelContext
+    var initialState: MathSession? = nil
+    var initialError: String? = nil
+
+    static func contentID(_ context: PanelContext) -> String { context.params.jsonString() }
+
+    var body: some View {
+        SolvePanelContent(context: context, initialState: initialState, initialError: initialError)
+            .id(Self.contentID(context))
+    }
+}
+
+private struct SolvePanelContent: View {
+    let context: PanelContext
+    private let loadOnAppear: Bool
     @StateObject private var model: SolvePanelModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.dynamicTypeSize) private var typeSize
 
-    init(context: PanelContext, initialState: MathSession? = nil) {
+    init(context: PanelContext, initialState: MathSession? = nil, initialError: String? = nil) {
         self.context = context
+        loadOnAppear = initialState == nil
         let model = SolvePanelModel(context)
         if let initialState {
             model.state = initialState
             model.latex = initialState.equations.joined(separator: "\n")
         }
+        model.error = initialError
         _model = StateObject(wrappedValue: model)
     }
 
@@ -127,6 +159,7 @@ struct SolvePanel: View {
                         })
                     }
                     if model.busy { NibTraceRow(String(localized: "Checking the maths…"), phase: .running) }
+                    if let warning = model.state.recognitionWarning { NibBanner(warning, style: .warning) }
                     if model.state.plan == nil { review }
                     else { explanation }
                     Text(String(localized: "Arithmetic, algebra, systems, matrices and numeric calculus can be checked on-device when supported. Symbolic calculus and limits use your AI provider."))
@@ -139,16 +172,20 @@ struct SolvePanel: View {
         }
         .foregroundStyle(NibColor.label)
         .frame(maxWidth: sizeClass == .compact ? .infinity : NibMetrics.panelWidth(typeSize))
-        .task { model.run(.recognize) }
+        .task { if loadOnAppear { model.run(.recognize) } }
         .onDisappear { model.cancel() }
     }
 
     private var contextSummary: some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
-            Text(model.refs.isEmpty ? String(localized: "Typed LaTeX") : String(localized: "Selected problem · \(model.refs.count) sources"))
-                .font(NibFont.chat)
+            NibChip(model.refs.isEmpty ? String(localized: "Typed LaTeX") :
+                    (model.refs.count == 1 ? String(localized: "Selected problem · 1 source") :
+                        String(localized: "Selected problem · \(model.refs.count) sources")), style: .context)
+            if let source = model.state.recognitionSource, !source.isEmpty {
+                NibChip(source, style: .context)
+            }
             Text(model.state.plan == nil
-                 ? String(localized: "Recognition may use your provider. Continue sends the reviewed problem and app context.")
+                 ? String(localized: "Recognition may use your provider. Solving sends the reviewed problem and app context.")
                  : String(localized: "Read: reviewed problem and app context."))
                 .font(NibFont.caption1)
                 .foregroundStyle(NibColor.labelSecondary)
@@ -165,7 +202,7 @@ struct SolvePanel: View {
                     .accessibilityLabel(String(localized: "Problem in LaTeX"))
             } else {
                 ForEach(Array(model.state.equations.enumerated()), id: \.offset) { _, equation in
-                    Text(verbatim: equation).font(NibFont.body).textSelection(.enabled)
+                    formula(equation)
                 }
                 NibButton(String(localized: "Edit LaTeX"), kind: .plain) { model.run(.edit) }
             }
@@ -179,7 +216,7 @@ struct SolvePanel: View {
                 }
             }
             if model.state.teacherRef != nil { teacherHints }
-            NibButton(String(localized: "Continue"), symbol: .forward, kind: .primary, expands: true,
+            NibButton(model.state.mode == .solve ? String(localized: "Solve Problem") : String(localized: "Start Lesson"), symbol: .forward, kind: .primary, expands: true,
                       shortcut: KeyboardShortcut(.return, modifiers: .command)) { model.run(.solve) }
                 .disabled(model.busy || model.latex.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                           (model.state.mode == .teach && model.state.approach.isEmpty))
@@ -193,8 +230,9 @@ struct SolvePanel: View {
 
     private var explanation: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
+            if model.state.teacherRef != nil { teacherHints }
             if let plan = model.state.plan {
-                Text(verbatim: model.latex).font(NibFont.body).textSelection(.enabled)
+                formula(model.latex)
                 if model.state.mode == .solve {
                     ForEach(Array(plan.steps.enumerated()), id: \.offset) { index, step in
                         VStack(alignment: .leading, spacing: NibSpacing.s) {
@@ -202,33 +240,33 @@ struct SolvePanel: View {
                                       kind: .plain) { model.run(.expand, index: index) }
                                 .accessibilityValue(model.state.expanded.contains(index) ? String(localized: "Expanded") : String(localized: "Collapsed"))
                             if model.state.expanded.contains(index) {
-                                Text(verbatim: step.detail).font(NibFont.body).textSelection(.enabled)
+                                formula(step.detail)
                             }
                         }
                     }
                 } else {
                     ForEach(Array(plan.hints.prefix(model.state.hintCount).enumerated()), id: \.offset) { _, hint in
-                        Text(verbatim: hint).font(NibFont.body).textSelection(.enabled)
+                        Text(verbatim: hint).font(NibFont.body).textSelection(.enabled).accessibilityLabel(MathTutor.spoken(hint))
                     }
                     NibField(text: $model.attempt, prompt: String(localized: "Your answer"), lines: 1...3)
                         .accessibilityLabel(String(localized: "Your answer to the problem"))
                     NibButton(String(localized: "Check Answer"), kind: .primary, expands: true) { model.run(.check) }
                         .disabled(model.attempt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     if let feedback = model.state.feedback { NibBanner(feedback, style: .info) }
-                    NibButton(String(localized: "Next Hint"), expands: true) { model.run(.hint) }
+                    NibButton(String(localized: "Show Next Hint"), expands: true) { model.run(.hint) }
                         .disabled(model.state.hintCount >= plan.hints.count)
-                    NibButton(String(localized: "Better Explanation"), kind: .plain) { model.run(.explain) }
+                    NibButton(String(localized: "Explain Differently"), kind: .plain) { model.run(.explain) }
                     NibButton(String(localized: "Skip This Hint"), kind: .plain) { model.run(.skip) }
                         .disabled(model.state.hintCount >= plan.hints.count)
                 }
                 if model.state.revealed {
                     Text(String(localized: "Answer")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
-                    Text(verbatim: plan.answer).font(NibFont.body).textSelection(.enabled)
+                    formula(plan.answer)
                     NibBanner(verificationLabel, style: model.state.verification == .mismatch ? .warning : .info)
                 } else {
                     NibButton(String(localized: "Reveal Answer"), symbol: .eye, expands: true) { model.run(.reveal) }
                 }
-                NibButton(String(localized: "Alternative Method"), kind: .plain) { model.run(.alternative) }
+                NibButton(String(localized: "Try Another Method"), kind: .plain) { model.run(.alternative) }
                 NibButton(String(localized: "Edit LaTeX"), kind: .plain) { model.run(.edit) }
             }
         }.disabled(model.busy)
@@ -236,13 +274,18 @@ struct SolvePanel: View {
 
     private var teacherHints: some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
-            Text(String(localized: "Teacher-approved hints")).font(NibFont.headline)
-            ForEach(Array(model.state.teacherHints.prefix(model.state.hintCount).enumerated()), id: \.offset) { _, hint in
-                Text(verbatim: hint).font(NibFont.body)
+            Text(String(localized: "Teacher-approved hints")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
+            ForEach(Array(model.state.teacherHints.prefix(model.state.teacherHintCount ?? model.state.hintCount).enumerated()), id: \.offset) { _, hint in
+                Text(verbatim: hint).font(NibFont.body).accessibilityLabel(MathTutor.spoken(hint))
             }
             NibButton(String(localized: "Reveal Teacher Hint"), kind: .secondary, expands: true) { model.revealTeacherHint() }
-                .disabled(model.busy || model.state.hintCount >= model.state.teacherHints.count)
+                .disabled(model.busy || (model.state.teacherHintCount ?? model.state.hintCount) >= model.state.teacherHints.count)
         }
+    }
+
+    private func formula(_ text: String) -> some View {
+        Text(verbatim: text).font(NibFont.math).textSelection(.enabled)
+            .accessibilityLabel(MathTutor.spoken(text))
     }
 
     private var verificationLabel: String {

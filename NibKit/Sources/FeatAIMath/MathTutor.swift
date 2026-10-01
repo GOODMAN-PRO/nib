@@ -70,20 +70,23 @@ struct MathSession: Codable, Equatable {
     var teacherRef: String?
     var teacherHints: [String] = []
     var skipped: Int = 0
+    var teacherHintCount: Int?
+    var recognitionSource: String?
+    var recognitionWarning: String?
 }
 
 enum MathTutor {
     static let approaches = ["Understand the idea", "Work step by step", "Try it yourself"]
 
-    /// Until F099 publishes a typed answer-zone query, accept only custom items owned by that feature.
+    /// F099 stores its AnswerZone record in CustomItem.data.
     static func teacherHints(_ node: JSONValue) throws -> (hints: [String], revealed: Int) {
         let item = node["custom"] ?? node
-        guard item["owner"]?.stringValue == "teacher", item["type"]?.stringValue == "answerZone",
+        guard item["owner"]?.stringValue == "nib.answerZone", item["type"]?.stringValue == "zone",
               let data = item["data"], let rows = data["hints"]?.arrayValue,
               rows.count <= 40, rows.allSatisfy({ $0.stringValue.map(MathPlan.validText) == true }) else {
             throw NibError.unsupported("This item does not expose teacher-owned answer-zone hints through query.get")
         }
-        let count = data["revealedHintCount"]?.intValue ?? data["hintsRevealed"]?.intValue ?? 0
+        let count = data["revealed"]?.intValue ?? 0
         return (rows.compactMap(\.stringValue), min(rows.count, max(0, count)))
     }
 
@@ -120,12 +123,13 @@ enum MathTutor {
             next.hintCount = 0
             next.expanded = []
             next.feedback = nil
+            next.verification = .unverified
         default: throw NibError.invalid("This action needs the maths service.", path: "$.action")
         }
         return next
     }
 
-    /// Accept a complete scalar or a single assignment only. Prose, units, vectors and multiple roots stay unverified.
+    /// Parse one numeric term; lists of roots are parsed by numericTerms.
     static func numericAnswer(_ answer: String) -> (variable: String?, value: Double)? {
         var text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasPrefix("\\("), text.hasSuffix("\\)") { text = String(text.dropFirst(2).dropLast(2)) }
@@ -181,13 +185,77 @@ enum MathTutor {
         return rows.allSatisfy { isNumeric($0, depth: depth + 1) }
     }
 
-    static func equalValues(_ a: JSONValue, _ b: JSONValue) -> Bool {
-        if let x = a.doubleValue, let y = b.doubleValue { return close(x, y) }
-        guard let xs = a.arrayValue, let ys = b.arrayValue, xs.count == ys.count else { return false }
-        return zip(xs, ys).allSatisfy { equalValues($0, $1) }
+    struct NumericTerm {
+        var variable: String?
+        var value: Double
+        var tolerance: Double
     }
 
-    static func close(_ a: Double, _ b: Double) -> Bool {
-        abs(a - b) <= 1e-9 * max(1, abs(a), abs(b))
+    /// Integers and fractions are exact; decimals specify rounding to their last written place.
+    static func precision(_ text: String) -> Double {
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.contains("/"), !raw.contains("\\frac"),
+              let number = Double(raw), number.isFinite else { return 0 }
+        let parts = raw.lowercased().components(separatedBy: "e")
+        let exponent = parts.count == 2 ? (Int(parts[1]) ?? 0) : 0
+        guard let dot = parts[0].firstIndex(of: ".") else { return 0 }
+        let places = parts[0].distance(from: parts[0].index(after: dot), to: parts[0].endIndex)
+        let tolerance = 0.5 * pow(10, Double(exponent - places))
+        return tolerance.isFinite ? tolerance : 0
+    }
+
+    static func numericTerms(_ answer: String) -> [NumericTerm]? {
+        var text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("\\("), text.hasSuffix("\\)") { text = String(text.dropFirst(2).dropLast(2)) }
+        if text.hasPrefix("$"), text.hasSuffix("$") { text = String(text.dropFirst().dropLast()) }
+        text = text.replacingOccurrences(of: #"\s+or\s+"#, with: ",", options: .regularExpression)
+        let parts = text.components(separatedBy: ",")
+        guard parts.count <= 100 else { return nil }
+        var terms: [NumericTerm] = []
+        for part in parts {
+            guard let parsed = numericAnswer(part) else { return nil }
+            let digits = part.components(separatedBy: "=").last ?? part
+            terms.append(NumericTerm(variable: parsed.variable, value: parsed.value, tolerance: precision(digits)))
+        }
+        return terms.isEmpty ? nil : terms
+    }
+
+    static func equalValues(_ a: JSONValue, _ b: JSONValue, candidateText: String = "", exact: Bool = true) -> Bool {
+        let regex = try? NSRegularExpression(pattern: #"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"#)
+        let range = NSRange(candidateText.startIndex..., in: candidateText)
+        var tolerances = regex?.matches(in: candidateText, range: range).compactMap { match in
+            Range(match.range, in: candidateText).map { precision(String(candidateText[$0])) }
+        } ?? []
+        // Fractions are exact, including decimal numerators and denominators.
+        if candidateText.contains("/") || candidateText.contains("\\frac") { tolerances = [] }
+        var index = 0
+        func compare(_ x: JSONValue, _ y: JSONValue) -> Bool {
+            if let lhs = x.doubleValue, let rhs = y.doubleValue {
+                defer { index += 1 }
+                let tolerance = index < tolerances.count ? tolerances[index] : 0
+                return close(lhs, rhs, tolerance: tolerance, exact: exact)
+            }
+            guard let xs = x.arrayValue, let ys = y.arrayValue, xs.count == ys.count else { return false }
+            return zip(xs, ys).allSatisfy { compare($0, $1) }
+        }
+        return compare(a, b)
+    }
+
+    static func close(_ a: Double, _ b: Double, tolerance: Double = 0, exact: Bool = true) -> Bool {
+        abs(a - b) <= tolerance + (exact ? 1e-9 : 1e-6) * max(1, abs(a), abs(b))
+    }
+
+    static func spoken(_ latex: String) -> String {
+        var text = latex
+        let replacements = [(#"\frac"#, " fraction "), (#"\sqrt"#, " square root "),
+                            (#"\times"#, " times "), (#"\cdot"#, " times "), (#"\div"#, " divided by "),
+                            (#"\int"#, " integral "), (#"\pi"#, " pi "), (#"\infty"#, " infinity "),
+                            (#"\approx"#, " approximately equals "), ("=", " equals "),
+                            ("^", " to the power of "), ("+", " plus "), ("-", " minus ")]
+        for (command, phrase) in replacements { text = text.replacingOccurrences(of: command, with: phrase) }
+        text = text.replacingOccurrences(of: #"\\[a-zA-Z]+"#, with: " ", options: .regularExpression)
+        for delimiter in ["{", "}", "$", #"\("#, #"\)"#] { text = text.replacingOccurrences(of: delimiter, with: " ") }
+        return text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
