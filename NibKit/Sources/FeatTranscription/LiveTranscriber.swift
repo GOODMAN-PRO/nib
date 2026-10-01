@@ -14,14 +14,28 @@ struct TranscriptLanguage: Codable, Identifiable, Equatable {
 @MainActor
 protocol TranscriptSpeechSession: AnyObject {
     var isComplete: Bool { get }
-    func append(_ buffer: AVAudioPCMBuffer)
-    func finish() async throws -> [TranscriptSegment]
+    @discardableResult func append(_ buffer: AVAudioPCMBuffer) -> Bool
+    func finish(windowSeconds: Double) async throws -> SpeechWindowResult
     func cancel()
+}
+
+struct SpeechWindowResult {
+    var lines: [TranscriptSegment]
+    var complete: Bool
+    var error: NibError?
+
+    static func isNoSpeech(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return (ns.domain == "kAFAssistantErrorDomain" && ns.code == 1110)
+            || error.localizedDescription.localizedCaseInsensitiveContains("no speech detected")
+            || (error as? NibError)?.message.localizedCaseInsensitiveContains("no speech detected") == true
+    }
 }
 
 /// Speech stays behind this boundary; hostless tests inject it without touching Apple's singleton.
 @MainActor
 protocol TranscriptSpeechBackend: AnyObject {
+    var authorised: Bool { get }
     func authorise() async throws
     func languages() throws -> [TranscriptLanguage]
     func session(language: String, update: @escaping ([TranscriptSegment]) -> Void) throws -> TranscriptSpeechSession
@@ -56,6 +70,7 @@ enum SpeechParagraphs {
 
 @MainActor
 final class AppleTranscriptSpeech: TranscriptSpeechBackend {
+    var authorised: Bool { !NibApp.isHostlessTest && SFSpeechRecognizer.authorizationStatus() == .authorized }
     func authorise() async throws {
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("Speech in hostless tests") }
         let status = SFSpeechRecognizer.authorizationStatus()
@@ -89,10 +104,6 @@ final class AppleTranscriptSpeech: TranscriptSpeechBackend {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: language)), recognizer.isAvailable else {
             throw NibError.unavailable("Speech for this language")
         }
-        guard recognizer.supportsOnDeviceRecognition else {
-            throw NibError(.unavailable, "The on-device model is not available for this language",
-                hint: "add this language under iOS Settings › General › Keyboard › Dictation Languages, connect to Wi-Fi, then try again; or choose Cloud")
-        }
         return AppleTranscriptSession(recognizer: recognizer, update: update)
     }
 }
@@ -115,28 +126,34 @@ private final class AppleTranscriptSession: TranscriptSpeechSession {
                 SpeechWord(text: $0.substring, start: $0.timestamp, duration: $0.duration)
             }
             let final = result?.isFinal ?? false
-            let failure = error.map { NibError(.unavailable, $0.localizedDescription, hint: "try regenerating the transcript") }
+            let ended = error != nil
+            let noSpeech = error.map { SpeechWindowResult.isNoSpeech($0) } ?? false
+            let failure = error.flatMap { SpeechWindowResult.isNoSpeech($0) ? nil : NibError(.unavailable, $0.localizedDescription, hint: "try regenerating the transcript") }
             Task { @MainActor [weak self] in
                 guard let self, !self.completed else { return }
                 if let words { self.lines = SpeechParagraphs.assemble(words); update(self.lines) }
-                if final || failure != nil { self.completed = true; self.failure = failure }
+                if noSpeech { self.lines = [] }
+                if final || ended { self.completed = true; self.failure = failure }
             }
         }
     }
 
-    func append(_ buffer: AVAudioPCMBuffer) { if !completed { request.append(buffer) } }
+    @discardableResult func append(_ buffer: AVAudioPCMBuffer) -> Bool {
+        guard !completed else { return false }
+        request.append(buffer)
+        return true
+    }
 
-    func finish() async throws -> [TranscriptSegment] {
+    func finish(windowSeconds: Double) async throws -> SpeechWindowResult {
         request.endAudio()
-        let deadline = Date().addingTimeInterval(6)
+        let deadline = Date().addingTimeInterval(max(6, windowSeconds * 0.5))
         while !completed && Date() < deadline {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         task?.cancel()
-        if let failure, lines.isEmpty { throw failure }
-        if !completed && lines.isEmpty { throw NibError(.timeout, "Speech did not finish this recording window") }
-        return lines
+        return SpeechWindowResult(lines: lines, complete: completed,
+            error: failure ?? (completed ? nil : NibError(.timeout, "Speech did not finish this recording window")))
     }
 
     func cancel() { completed = true; request.endAudio(); task?.cancel(); task = nil }
@@ -176,30 +193,69 @@ enum TranscriptAudioReader {
         }.value
     }
 
-    static func snapshot(url: URL) async throws -> URL {
+    /// Three minutes of 16 kHz mono PCM is under 6 MB, independent of the input hardware rate.
+    static let uploadWindow = 180.0
+
+    static func snapshot(url: URL, from start: Double, through end: Double) async throws -> URL {
         try await Task.detached(priority: .utility) {
             let source = FileManager.default.fileExists(atPath: url.path) ? url : url.deletingPathExtension().appendingPathExtension("aac")
             let input = try AVAudioFile(forReading: source)
+            let rate = input.processingFormat.sampleRate
+            let last = min(input.length, AVAudioFramePosition((end * rate).rounded()))
+            input.framePosition = min(last, AVAudioFramePosition((start * rate).rounded()))
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1),
+                  let converter = AVAudioConverter(from: input.processingFormat, to: format) else {
+                throw NibError.unavailable("audio conversion")
+            }
             let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
             do {
                 let output = try AVAudioFile(forWriting: outputURL, settings: [AVFormatIDKey: kAudioFormatLinearPCM,
-                    AVSampleRateKey: input.processingFormat.sampleRate, AVNumberOfChannelsKey: input.processingFormat.channelCount,
-                    AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false],
+                    AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false],
                     commonFormat: .pcmFormatFloat32, interleaved: false)
-                let length = input.length
-                while input.framePosition < length {
+                var readError: Error?
+                while true {
                     try Task.checkCancellation()
-                    let count = AVAudioFrameCount(min(16_384, length - input.framePosition))
-                    guard let buffer = AVAudioPCMBuffer(pcmFormat: input.processingFormat, frameCapacity: count) else {
+                    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8_192) else {
                         throw NibError.unavailable("audio decoding memory")
                     }
-                    try input.read(into: buffer, frameCount: count)
-                    guard buffer.frameLength > 0 else { break }
-                    try output.write(from: buffer)
+                    var conversionError: NSError?
+                    let status = converter.convert(to: buffer, error: &conversionError) { count, status in
+                        guard input.framePosition < last else { status.pointee = .endOfStream; return nil }
+                        let capacity = AVAudioFrameCount(min(Int64(count), last - input.framePosition))
+                        guard let sourceBuffer = AVAudioPCMBuffer(pcmFormat: input.processingFormat, frameCapacity: capacity) else {
+                            readError = NibError.unavailable("audio decoding memory"); status.pointee = .endOfStream; return nil
+                        }
+                        do { try input.read(into: sourceBuffer, frameCount: capacity) }
+                        catch { readError = error; status.pointee = .endOfStream; return nil }
+                        status.pointee = sourceBuffer.frameLength > 0 ? .haveData : .endOfStream
+                        return sourceBuffer.frameLength > 0 ? sourceBuffer : nil
+                    }
+                    if let readError { throw readError }
+                    if let conversionError { throw conversionError }
+                    if status == .error { throw NibError.unavailable("audio conversion") }
+                    if buffer.frameLength > 0 { try output.write(from: buffer) }
+                    if status == .endOfStream { break }
                 }
                 return outputURL
             } catch { try? FileManager.default.removeItem(at: outputURL); throw error }
         }.value
+    }
+
+    @MainActor
+    static func cloud(url: URL, from start: Double, through end: Double, ai: AIService, language: String) async throws -> [TranscriptSegment] {
+        var cursor = start
+        var lines: [TranscriptSegment] = []
+        while cursor < end {
+            let limit = min(end, cursor + uploadWindow)
+            let upload = try await snapshot(url: url, from: cursor, through: limit)
+            defer { try? FileManager.default.removeItem(at: upload) }
+            let result = try await ai.transcribe(audio: upload, language: Locale(identifier: language).language.languageCode?.identifier)
+            try TranscriptFiles.validate(result)
+            lines += LiveTranscriber.offset(result, start: cursor, index: lines.count)
+            cursor = limit
+        }
+        return lines
     }
 
     static func duration(url: URL) async throws -> Double {
@@ -218,12 +274,14 @@ final class LiveTranscriber {
     weak var app: NibApp?
     var speech: TranscriptSpeechBackend
     private var subscription: EventSubscription?
-    private var jobs: [String: Task<Void, Never>] = [:]
+    private(set) var jobs: [String: Task<Void, Never>] = [:]
     private var states: [String: AudioRecordingPayload] = [:]
     private let logger = Logger(subsystem: "app.nib", category: "transcription")
     private(set) var previews: [String: [TranscriptSegment]] = [:]
     private(set) var errors: [String: NibError] = [:]
     var regenerating = Set<String>()
+    private var cursors: [String: Double] = [:]
+    private var previewDates: [String: Date] = [:]
 
     init(app: NibApp, speech: TranscriptSpeechBackend) { self.app = app; self.speech = speech }
 
@@ -260,18 +318,28 @@ final class LiveTranscriber {
 
     private func cloudRecording(_ ref: String) async throws {
         guard let app else { return }
+        let store = try TranscriptStore.of(app.services)
         let clip = try await recordingClip(ref)
-        var last = 0.0
+        let committed = try await store.read(clip)
+        var last = max(cursors[ref] ?? 0, committed.map { $0.start + $0.duration }.max() ?? 0)
+        let language = clip.record.language ?? app.settings.get(TranscriptSettings.language)
         while let state = states[ref] {
             try Task.checkCancellation()
-            guard app.settings.get(TranscriptSettings.live) else { return }
-            let elapsed = state.state == "recording" ? max(state.duration, Date().timeIntervalSince1970 - clip.record.start) : state.duration
-            if state.state == "stopped" || elapsed - last >= 60 {
-                // Sensitive command preserves gateway confirmation for AI/plugin-origin recordings.
-                _ = try await app.bus.execute(CommandIDs.transcriptRegenerate, ["clip": .string(ref), "engine": "cloud"])
-                last = elapsed
-            }
-            if state.state == "stopped" { return }
+            guard app.settings.get(TranscriptSettings.live), app.settings.get(TranscriptSettings.cloud) else { return }
+            do {
+                let elapsed = try await TranscriptAudioReader.duration(url: clip.audio)
+                if elapsed > last && (state.state == "stopped" || state.state == "paused" || elapsed - last >= 60) {
+                    let end = min(elapsed, last + 60)
+                    let ai = try app.services.require(app.services.ai, "AI transcription")
+                    guard ai.isConfigured else { throw NibError.unavailable("an AI provider with an audio endpoint") }
+                    let lines = try await TranscriptAudioReader.cloud(url: clip.audio, from: last, through: end, ai: ai, language: language)
+                    try await append(Self.offset(lines, start: 0, index: try await nextIndex(clip, store: store)), ref: ref)
+                    last = end; cursors[ref] = last
+                    if state.state == "stopped" || state.state == "paused" { continue }
+                }
+                if state.state == "stopped" { return }
+            } catch is CancellationError { throw CancellationError() }
+            catch { report(error, clip: ref) } // Keep the cursor: retry exactly this range on the next tick.
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }
@@ -282,92 +350,84 @@ final class LiveTranscriber {
         let clip = try await recordingClip(ref)
         let language = clip.record.language ?? app.settings.get(TranscriptSettings.language)
         var committed = try await store.read(clip)
-        var cursor = 0.0
-        var windowStart = 0.0
+        var cursor = max(cursors[ref] ?? 0, committed.map { $0.start + $0.duration }.max() ?? 0)
+        var windowStart = cursor
         var windowIndex = try await nextIndex(clip, store: store)
-        var paused = false
         var sessionStarted = Date()
-        var session = try speech.session(language: language) { [weak self] lines in
+        var session: TranscriptSpeechSession? = try speech.session(language: language) { [weak self] lines in
             self?.preview(ref, committed: committed, lines: lines, offset: windowStart, index: windowIndex)
         }
-        defer { session.cancel() }
+        defer { session?.cancel() }
         while let state = states[ref] {
             try Task.checkCancellation()
-            if !app.settings.get(TranscriptSettings.live) {
-                if cursor > windowStart && !paused {
-                    let lines = Self.offset(try await session.finish(), start: windowStart, index: windowIndex)
-                    if !lines.isEmpty { try await append(lines, ref: ref) }
-                }
-                return
+            let enabled = app.settings.get(TranscriptSettings.live)
+            // Finish before reading: Speech may have completed while the disk read was suspended.
+            if let current = session, current.isComplete || !enabled {
+                let lines = try await finish(current, seconds: cursor - windowStart, ref: ref)
+                if !lines.isEmpty { try await append(Self.offset(lines, start: windowStart, index: windowIndex), ref: ref) }
+                current.cancel(); session = nil; cursors[ref] = cursor
+                windowStart = cursor
             }
-            if state.state == "paused" {
-                if !paused {
-                    let chunk = try await TranscriptAudioReader.read(url: clip.audio, from: cursor, through: windowStart + 60)
-                    for buffer in chunk.buffers { session.append(buffer) }
-                    cursor = chunk.end
-                    if cursor > windowStart {
-                        let lines = Self.offset(try await session.finish(), start: windowStart, index: windowIndex)
-                        if !lines.isEmpty { try await append(lines, ref: ref) }
-                    }
-                    committed = try await store.read(clip)
-                    windowStart = cursor
-                    windowIndex = try await nextIndex(clip, store: store)
-                    session.cancel()
-                    let end = try await TranscriptAudioReader.duration(url: clip.audio)
-                    if cursor < end - 0.02 {
-                        session = try speech.session(language: language) { [weak self] lines in
-                            self?.preview(ref, committed: committed, lines: lines, offset: windowStart, index: windowIndex)
-                        }
-                        sessionStarted = Date()
-                    } else { paused = true }
-                }
+            if !enabled { return }
+            let end: Double
+            do { end = try await TranscriptAudioReader.duration(url: clip.audio) }
+            catch {
+                report(error, clip: ref)
                 try await Task.sleep(nanoseconds: 1_000_000_000)
                 continue
             }
-            if paused {
-                if state.state == "stopped" {
-                    let end = try await TranscriptAudioReader.duration(url: clip.audio)
-                    if cursor >= end - 0.02 { return }
+            if session == nil {
+                if cursor >= end - 0.02 {
+                    if state.state == "stopped" { return }
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    continue
                 }
-                session = try speech.session(language: language) { [weak self] lines in
-                    self?.preview(ref, committed: committed, lines: lines, offset: windowStart, index: windowIndex)
-                }
-                sessionStarted = Date()
-                paused = false
-            }
-            let limit = windowStart + 60
-            do {
-                let chunk = try await TranscriptAudioReader.read(url: clip.audio, from: cursor, through: limit)
-                for buffer in chunk.buffers { session.append(buffer) }
-                cursor = chunk.end
-            } catch {
-                if state.state == "stopped" { throw error }
-                // ADTS can have an incomplete trailing packet while F052 writes it. Retry on the next tick.
-            }
-            let stopped = state.state == "stopped"
-            let finalDuration = stopped ? try await TranscriptAudioReader.duration(url: clip.audio) : nil
-            let drained = finalDuration.map { cursor >= $0 - 0.02 } ?? false
-            if drained && cursor <= windowStart { return }
-            if cursor >= limit - 0.02 || drained || Date().timeIntervalSince(sessionStarted) >= 60 || (session.isComplete && cursor > windowStart) {
-                let result = try await session.finish()
-                let lines = Self.offset(result, start: windowStart, index: windowIndex)
-                if !lines.isEmpty {
-                    try await append(lines, ref: ref)
-                    committed = try await store.read(clip)
-                }
-                if drained { return }
-                windowStart = cursor
+                committed = try await store.read(clip)
                 windowIndex = try await nextIndex(clip, store: store)
-                session.cancel()
                 session = try speech.session(language: language) { [weak self] lines in
                     self?.preview(ref, committed: committed, lines: lines, offset: windowStart, index: windowIndex)
                 }
                 sessionStarted = Date()
             }
-            // A stopped file is complete: drain the next window immediately rather than
-            // waiting for the polling interval used while audio is still being recorded.
-            if stopped { continue }
+            guard let current = session else { continue }
+            do {
+                let chunk = try await TranscriptAudioReader.read(url: clip.audio, from: cursor, through: min(end, windowStart + 60))
+                for buffer in chunk.buffers {
+                    guard current.append(buffer) else { break }
+                    cursor += Double(buffer.frameLength) / buffer.format.sampleRate
+                }
+                cursor = min(cursor, chunk.end)
+            } catch is CancellationError { throw CancellationError() }
+            catch { report(error, clip: ref) }
+            let drained = cursor >= end - 0.02
+            if current.isComplete || cursor >= windowStart + 60 - 0.02
+                || ((state.state == "stopped" || state.state == "paused") && drained)
+                || Date().timeIntervalSince(sessionStarted) >= 60 {
+                let lines = try await finish(current, seconds: cursor - windowStart, ref: ref)
+                if !lines.isEmpty { try await append(Self.offset(lines, start: windowStart, index: windowIndex), ref: ref) }
+                current.cancel(); session = nil; cursors[ref] = cursor
+                windowStart = cursor
+                if state.state == "stopped" && drained { return }
+                continue
+            }
             try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
+    private func finish(_ session: TranscriptSpeechSession, seconds: Double, ref: String) async throws -> [TranscriptSegment] {
+        guard seconds > 0 else { session.cancel(); return [] }
+        do {
+            let result = try await session.finish(windowSeconds: seconds)
+            if let error = result.error {
+                if SpeechWindowResult.isNoSpeech(error) { return [] }
+                report(error, clip: ref); return []
+            }
+            guard result.complete else { report(NibError(.timeout, "Speech did not finish this recording window"), clip: ref); return [] }
+            return result.lines
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            if !SpeechWindowResult.isNoSpeech(error) { report(error, clip: ref) }
+            return []
         }
     }
 
@@ -385,7 +445,7 @@ final class LiveTranscriber {
     }
 
     private func nextIndex(_ clip: TranscriptStore.Clip, store: TranscriptStore) async throws -> Int {
-        let allocated = try await store.files.read(base: clip.base, includingRetired: true)
+        let allocated = try await store.files.read(base: clip.base, includingRetired: true, device: store.device)
         return (allocated.map(\.index).max() ?? -1) + 1
     }
 
@@ -397,7 +457,9 @@ final class LiveTranscriber {
 
     private func preview(_ ref: String, committed: [TranscriptSegment], lines: [TranscriptSegment], offset: Double, index: Int) {
         previews[ref] = committed + Self.offset(lines, start: offset, index: index)
-        app?.events.emit(TranscriptStore.changed, payload: ["clip": .string(ref)])
+        guard Date().timeIntervalSince(previewDates[ref] ?? .distantPast) >= 1 else { return }
+        previewDates[ref] = Date()
+        app?.events.emit(TranscriptStore.changed, doc: NodeRef(ref)?.documentID, payload: ["clip": .string(ref)])
     }
 
     static func offset(_ lines: [TranscriptSegment], start: Double, index: Int) -> [TranscriptSegment] {
@@ -407,20 +469,24 @@ final class LiveTranscriber {
     }
 
     func transcribe(_ clip: TranscriptStore.Clip, language: String) async throws -> [TranscriptSegment] {
-        var session = try speech.session(language: language) { _ in }
-        defer { session.cancel() }
         let duration = try await TranscriptAudioReader.duration(url: clip.audio)
+        let ref = NodeRef.audio(clip.doc, clip.record.id).description
         var result: [TranscriptSegment] = []
         var cursor = 0.0
         while cursor < duration {
             try Task.checkCancellation()
+            let session = try speech.session(language: language) { _ in }
+            defer { session.cancel() }
+            let start = cursor
             let chunk = try await TranscriptAudioReader.read(url: clip.audio, from: cursor, through: min(cursor + 60, duration))
-            for buffer in chunk.buffers { session.append(buffer) }
-            result += Self.offset(try await session.finish(), start: cursor, index: result.count)
-            session.cancel()
-            guard chunk.end > cursor else { break }
-            cursor = chunk.end
-            if cursor < duration { session = try speech.session(language: language) { _ in } }
+            for buffer in chunk.buffers {
+                guard session.append(buffer) else { break }
+                cursor += Double(buffer.frameLength) / buffer.format.sampleRate
+            }
+            cursor = min(cursor, chunk.end)
+            result += Self.offset(try await finish(session, seconds: cursor - start, ref: ref), start: start, index: result.count)
+            // A recognizer that refuses all audio must not spin forever.
+            guard cursor > start else { throw NibError.unavailable("Speech did not accept recorded audio") }
         }
         return result
     }

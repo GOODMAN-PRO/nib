@@ -7,7 +7,7 @@ public enum FeatTranscriptionFeature: NibFeature {
     static let panelID = "transcription"
 
     public static func register(_ app: NibApp) {
-        app.services.set(TranscriptStore(), for: TranscriptStore.serviceKey)
+        app.services.set(TranscriptStore(device: app.deviceHex), for: TranscriptStore.serviceKey)
         app.services.set(LiveTranscriber(app: app, speech: AppleTranscriptSpeech()), for: LiveTranscriber.serviceKey)
         app.services.set(SystemTranscriptClipboard(), for: "transcription.clipboard")
         app.commands.register(TranscriptGet.self)
@@ -72,6 +72,6 @@ public enum FeatTranscriptionFeature: NibFeature {
 
 enum TranscriptSettings {
     static let live = SettingKey<Bool>("transcription.live", default: false, synced: true)
-    static let cloud = SettingKey<Bool>("transcription.cloud", default: false, synced: true)
+    static let cloud = SettingKey<Bool>("security.transcription.cloud", default: false, synced: true)
     static let language = SettingKey<String>("transcription.language", default: Locale.current.identifier, synced: true)
 }

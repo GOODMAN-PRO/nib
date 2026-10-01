@@ -25,8 +25,9 @@ struct TranscriptGet: NibCommand {
         let preview = live?.previews[p.clip] ?? []
         // A user's correction wins over the uncommitted Speech hypothesis for the same index.
         let merged = TranscriptFiles.merge([preview, lines])
+        let warning = await store.files.warning(base: clip.base)
         return Output(clip: p.clip, name: clip.record.name, segments: merged, summary: clip.record.summary,
-                      error: live?.errors[p.clip])
+                      error: live?.errors[p.clip] ?? warning)
     }
 }
 
@@ -58,7 +59,7 @@ struct TranscriptRegenerate: NibCommand {
         summary: "Replace a transcript using onDevice Speech or cloud AI, according to Recording Settings; not undoable.",
         params: .obj(["clip": .ref, "engine": .str(choices: ["onDevice", "cloud"])], required: ["clip"]),
         examples: [["clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "engine": "onDevice"]],
-        effect: .edit, undoable: false, sensitive: true)
+        effect: .edit, destructive: true, undoable: false, sensitive: true)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> TranscriptGet.Output {
         let store = try TranscriptStore.of(ctx.services)
         let clip = try store.clip(p.clip, workspace: ctx.workspace)
@@ -67,15 +68,17 @@ struct TranscriptRegenerate: NibCommand {
             throw NibError.unavailable("transcription engine")
         }
         guard !live.regenerating.contains(p.clip) else { throw NibError(.conflict, "This transcript is already being regenerated") }
+        guard live.jobs[p.clip] == nil else { throw NibError(.conflict, "Stop live transcription before replacing this transcript") }
+        live.regenerating.insert(p.clip)
+        defer { live.regenerating.remove(p.clip) }
         let engine = p.engine ?? (ctx.services.settings.get(TranscriptSettings.cloud) ? "cloud" : "onDevice")
         guard ["cloud", "onDevice"].contains(engine) else {
             throw NibError(.invalidParams, "Choose onDevice or cloud", path: "$.engine", hint: "call commands.describe for transcript.regenerate")
         }
-        let allocated = try await store.files.read(base: clip.base, includingRetired: true)
+        let allocated = try await store.files.read(base: clip.base, includingRetired: true, device: store.device)
         let before = allocated.filter { !TranscriptFiles.isRetired($0) }
         if ctx.dryRun { return try await TranscriptGet.run(.init(clip: p.clip), ctx) }
-        live.regenerating.insert(p.clip)
-        defer { live.regenerating.remove(p.clip) }
+        live.clearError(for: p.clip)
         let language = clip.record.language ?? ctx.services.settings.get(TranscriptSettings.language)
         var lines: [TranscriptSegment]
         if engine == "cloud" {
@@ -84,18 +87,13 @@ struct TranscriptRegenerate: NibCommand {
             }
             let ai = try ctx.services.require(ctx.services.ai, "AI transcription")
             guard ai.isConfigured else { throw NibError.unavailable("an AI provider with an audio endpoint") }
-            let snapshot = try await TranscriptAudioReader.snapshot(url: clip.audio)
-            defer { try? FileManager.default.removeItem(at: snapshot) }
-            lines = try await ai.transcribe(audio: snapshot, language: Locale(identifier: language).language.languageCode?.identifier)
+            let duration = try await TranscriptAudioReader.duration(url: clip.audio)
+            lines = try await TranscriptAudioReader.cloud(url: clip.audio, from: 0, through: duration, ai: ai, language: language)
         } else {
             lines = try await live.transcribe(clip, language: language)
         }
         try TranscriptFiles.validate(lines)
         try Task.checkCancellation()
-        guard try await store.files.read(base: clip.base, includingRetired: true) == allocated else {
-            throw NibError(.conflict, "The transcript was edited while transcription was running",
-                           hint: "read transcript.get and regenerate again to replace those edits")
-        }
         for line in allocated { if let rev = line.rev { ctx.workspace.clock.observe(rev) } }
         lines = lines.enumerated().map { index, line in
             var line = line; line.index = index; line.rev = ctx.workspace.clock.tick(); return line
@@ -105,8 +103,7 @@ struct TranscriptRegenerate: NibCommand {
         for old in before where !indices.contains(old.index) {
             lines.append(TranscriptSegment(index: old.index, start: old.start, duration: 0, text: "", rev: ctx.workspace.clock.tick()))
         }
-        try await store.persist(lines, clip: clip, ctx: ctx)
-        live.clearError(for: p.clip)
+        try await store.persist(lines, clip: clip, ctx: ctx, expected: allocated)
         return try await TranscriptGet.run(.init(clip: p.clip), ctx)
     }
 }
@@ -124,7 +121,7 @@ struct TranscriptAppend: NibCommand {
         try TranscriptFiles.validate(p.lines)
         let store = try TranscriptStore.of(ctx.services)
         let clip = try store.clip(p.clip, workspace: ctx.workspace)
-        let current = try await store.files.read(base: clip.base, includingRetired: true)
+        let current = try await store.files.read(base: clip.base, includingRetired: true, device: store.device)
         let existing = Set(current.map(\.index))
         let lines = p.lines.filter { !existing.contains($0.index) }.map { line -> TranscriptSegment in
             var line = line; line.rev = ctx.workspace.clock.tick(); return line
@@ -163,11 +160,16 @@ struct TranscriptInsert: NibCommand {
             throw NibError(.invalidParams, "Invalid text box id", path: "$.id", hint: "use 1–64 letters, digits, hyphens or underscores")
         }
         let id = p.id.map { NibID($0) } ?? NibID.make()
-        if try ctx.workspace.page(ofItem: id, in: doc) != nil { throw NibError(.conflict, "An item already uses this id") }
-        let point = p.at ?? Point(Double(NibSpacing.xxl), Double(NibSpacing.xxl))
+        if p.id != nil, try ctx.workspace.allItems(doc, page: page).contains(where: { $0.id == id }) {
+            throw NibError(.conflict, "An item already uses this id on this page")
+        }
+        var point = p.at ?? Point(36, 36)
         guard point.x.isFinite, point.y.isFinite else { throw NibError.invalid("Drop point must be finite", path: "$.at") }
-        let width = min(Double(NibMetrics.panelWidth), max(Double(NibMetrics.hitTarget), (record.size ?? .a4).width - point.x))
-        let box = TextBoxItem(frame: Frame(x: point.x, y: point.y, w: width, h: Double(NibMetrics.hitTarget)),
+        let size = record.size ?? .a4
+        let width = size.width * 0.6
+        point.x = min(max(0, point.x), size.width - width)
+        point.y = min(max(0, point.y), max(0, size.height - 72))
+        let box = TextBoxItem(frame: Frame(x: point.x, y: point.y, w: width, h: 72),
                               text: RichText(plain: selected.map(\.text).joined(separator: "\n\n")))
         try ctx.mutate { tx in _ = try tx.put(Item(id: id, kind: .text, layer: ctx.activeSession?.activeLayer ?? 0, text: box), doc: doc, page: page) }
         return Output(ref: NodeRef.item(doc, page, id).description)
@@ -195,10 +197,16 @@ struct TranscriptSeek: NibCommand {
         } else {
             throw NibError(.invalidParams, "Pass a transcript index or a timestamp in seconds", path: "$.t", hint: "call transcript.get")
         }
-        let pages = try ctx.workspace.content(clip.doc).livePages.map { page in
-            (page.id, try ctx.workspace.items(clip.doc, page: page.id))
+        let cached = ctx.workspace.cachedPages(clip.doc)
+        var keeping = cached
+        defer { ctx.workspace.evictPages(clip.doc, keeping: keeping) }
+        let lowerMs = (clip.record.start + line.start) * 1000
+        let pages = try ctx.workspace.content(clip.doc).livePages.compactMap { page -> (PageID, [Item])? in
+            if let revision = ctx.workspace.contentRevision(clip.doc, page: page.id), Double(revision.wallMs) < lowerMs { return nil }
+            return (page.id, try ctx.workspace.items(clip.doc, page: page.id))
         }
         let page = TranscriptPageLink.mostEditedPage(clip: clip.record, segment: line, pages: pages)
+        if let page { keeping.insert(page) }
         if !ctx.dryRun {
             _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(p.clip), "t": .number(line.start)])
             if let page {
@@ -243,13 +251,13 @@ struct TranscriptCopy: NibCommand {
 
 @MainActor
 struct TranscriptLanguages: NibCommand {
-    struct Output: Codable { var languages: [TranscriptLanguage] }
+    struct Output: Codable { var languages: [TranscriptLanguage]; var authorised: Bool }
     static let descriptor = CommandDescriptor(id: "transcript.languages", title: "Transcription Languages",
         summary: "Read Apple Speech language availability and whether each model works on this device.",
         params: .empty, examples: [[:]], effect: .read, target: .app)
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
         guard let live = ctx.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self) else { throw NibError.unavailable("Speech") }
-        return Output(languages: try live.speech.languages())
+        return Output(languages: try live.speech.languages(), authorised: live.speech.authorised)
     }
 }
 

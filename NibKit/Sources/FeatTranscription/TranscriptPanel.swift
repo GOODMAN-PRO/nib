@@ -10,28 +10,46 @@ final class TranscriptPanelModel: ObservableObject {
     let app: NibApp
     let session: EditorSession?
     @Published var clips: [TranscriptList.Row] = []
-    @Published var selectedClip = ""
+    @Published var selectedClip = "" {
+        didSet {
+            if selectedClip != oldValue { transcript = nil; editIndex = nil; editText = ""; editClip = nil }
+        }
+    }
     @Published var transcript: TranscriptGet.Output?
     @Published var error: String?
     @Published var busy = false
     @Published var playback: AudioPlaybackPayload?
     @Published var editIndex: Int?
     @Published var editText = ""
+    private(set) var editClip: String?
+    private var recordingClip: String?
     private var subscription: EventSubscription?
-    private var refreshing = false
+    private var refreshing = Set<String>()
 
     init(context: PanelContext) {
         app = context.app; session = context.session
         selectedClip = context.params["clip"]?.stringValue ?? ""
         editIndex = context.params["index"]?.intValue
+        if editIndex != nil { editClip = selectedClip }
+        let document = session?.document
         subscription = app.events.subscribe { [weak self] event in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let playback = event.decode(AudioPlaybackPayload.self) { self.playback = playback }
-                if event.type == TranscriptStore.changed || event.type == LiveTranscriber.statusEvent || event.type == NibEventType.committed {
-                    await self.refresh()
-                }
-            }
+            guard [NibEventType.audioPlayback, NibEventType.audioRecording, NibEventType.committed,
+                   TranscriptStore.changed, LiveTranscriber.statusEvent].contains(event.type) else { return }
+            if event.type == NibEventType.committed && event.doc != document { return }
+            Task { @MainActor [weak self] in await self?.receive(event) }
+        }
+    }
+
+    func receive(_ event: NibEvent) async {
+        if let playback = event.decode(AudioPlaybackPayload.self) { self.playback = playback; return }
+        if let recording = event.decode(AudioRecordingPayload.self), NodeRef(recording.clip)?.documentID == session?.document {
+            if recording.state == "recording" { recordingClip = recording.clip }
+            await reload()
+        } else if event.type == NibEventType.committed, event.doc == session?.document {
+            await reload()
+        } else if (event.type == TranscriptStore.changed || event.type == LiveTranscriber.statusEvent),
+                  event.payload?["clip"]?.stringValue == selectedClip {
+            await refresh()
         }
     }
 
@@ -41,22 +59,38 @@ final class TranscriptPanelModel: ObservableObject {
             let result = try await app.bus.execute(TranscriptList.descriptor.id,
                 ["doc": .string(NodeRef.document(doc).description)], session: session)
             clips = try result.decode(TranscriptList.Output.self).clips
-            if !clips.contains(where: { $0.id == selectedClip }) { selectedClip = clips.first?.id ?? "" }
+            if let recordingClip, clips.contains(where: { $0.id == recordingClip }) {
+                selectedClip = recordingClip; self.recordingClip = nil
+            } else if !clips.contains(where: { $0.id == selectedClip }) { selectedClip = clips.first?.id ?? "" }
             await refresh()
         } catch { self.error = NibError.wrap(error).message }
     }
 
     func refresh() async {
-        guard !refreshing, !selectedClip.isEmpty else { return }
-        refreshing = true
-        defer { refreshing = false }
         let ref = selectedClip
+        guard !ref.isEmpty else { transcript = nil; error = nil; return }
+        guard !refreshing.contains(ref) else { return }
+        refreshing.insert(ref)
+        defer { refreshing.remove(ref) }
         do {
             let result = try await app.bus.execute(CommandIDs.transcriptGet, ["clip": .string(ref)], session: session)
             guard ref == selectedClip else { return }
             transcript = try result.decode(TranscriptGet.Output.self)
+            error = nil
             if let editIndex, editText.isEmpty { editText = transcript?.segments.first { $0.index == editIndex }?.text ?? "" }
-        } catch { self.error = NibError.wrap(error).message }
+        } catch {
+            guard ref == selectedClip else { return }
+            transcript = nil; self.error = NibError.wrap(error).message
+        }
+    }
+
+    func saveEdit() {
+        guard let editClip, let editIndex, editClip == selectedClip else { return }
+        run(CommandIDs.transcriptEditSegment, ["clip": .string(editClip), "index": .number(Double(editIndex)), "text": .string(editText)])
+    }
+
+    func beginEdit(_ line: TranscriptSegment) {
+        editClip = selectedClip; editIndex = line.index; editText = line.text
     }
 
     func run(_ command: String, _ params: JSONValue) {
@@ -79,7 +113,7 @@ final class TranscriptPanelModel: ObservableObject {
         if menu.id == "transcription.line.edit" {
             // Selecting an editor is session UI; its eventual write uses transcript.editSegment.
             app.perform(menu.command, menu.params(menuContext(line)), session: session)
-            editIndex = line.index; editText = line.text
+            beginEdit(line)
         } else { run(menu.command, menu.params(menuContext(line))) }
     }
 
@@ -94,6 +128,7 @@ struct TranscriptPanel: View {
     @State private var tab = TranscriptTab.transcript
     @State private var settings = false
     @State private var follow = true
+    @State private var confirmRegenerate = false
     @FocusState private var searchFocused: Bool
 
     init(context: PanelContext) {
@@ -111,7 +146,7 @@ struct TranscriptPanel: View {
                 onClose: { context.app.perform(CommandIDs.panelClose, ["id": .string(FeatTranscriptionFeature.panelID)], session: context.session) }) {
                 NibIconButton(.settings, label: String(localized: "Recording Settings"), size: .panel) { settings.toggle() }
             }
-            if model.clips.count > 1 {
+            if model.clips.count > 1 && model.editIndex == nil {
                 Picker(String(localized: "Recording"), selection: $model.selectedClip) {
                     ForEach(model.clips) { clip in Text(clip.name).tag(clip.id) }
                 }
@@ -124,11 +159,12 @@ struct TranscriptPanel: View {
                 .padding(.bottom, NibSpacing.s)
             NibSearchField(text: $search, prompt: tab == .transcript ? String(localized: "Search transcript") : String(localized: "Search summary"))
                 .focused($searchFocused)
+                .nibShortcutHint(KeyboardShortcut("f", modifiers: [.command, .option]))
                 .padding(.horizontal, NibSpacing.l)
                 .padding(.bottom, NibSpacing.s)
             if let error = model.error ?? model.transcript?.error?.message {
-                Text(error).font(NibFont.footnote).foregroundStyle(NibColor.destructive)
-                    .padding(NibSpacing.l).accessibilityLabel(String(localized: "Transcription error: \(error)"))
+                NibBanner(error, action: NibAction(String(localized: "Retry")) { Task { await model.reload() } })
+                    .padding(NibSpacing.l)
             }
             if settings {
                 ScrollView { TranscriptRecordingSettings(app: context.app) }
@@ -151,12 +187,13 @@ struct TranscriptPanel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // The sidebar host owns the Deep surface and the window's single droplet container.
         .task(id: context.session?.document) { await model.reload() }
+        .onChange(of: model.selectedClip) { _, _ in confirmRegenerate = false }
         .task(id: model.selectedClip) {
             await model.refresh()
             // File-provider edits from another device need no local event to become visible.
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
-                await model.refresh()
+                await model.reload()
             }
         }
         .background {
@@ -166,25 +203,33 @@ struct TranscriptPanel: View {
     }
 
     private var transcriptLines: some View {
-        ScrollViewReader { proxy in
-            TimelineView(.periodic(from: .now, by: 0.25)) { timeline in
-                let active = activeIndex(at: timeline.date)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
-                        if lines.isEmpty {
-                            NibEmptyState(symbol: .transcript,
-                                title: search.isEmpty ? String(localized: "No transcript yet") : String(localized: "No matching lines"),
-                                message: search.isEmpty ? String(localized: "Generate a transcript, or enable live transcription in Recording Settings.") : nil)
-                        }
-                        ForEach(lines, id: \.index) { line in
-                            transcriptRow(line, active: line.index == active).id(line.index)
-                        }
-                    }.padding(NibSpacing.l)
+        let filtered = lines
+        return ScrollViewReader { proxy in
+            if model.playback?.playing == true {
+                TimelineView(.periodic(from: .now, by: 0.25)) { timeline in
+                    transcriptList(filtered, active: activeIndex(at: timeline.date), proxy: proxy)
                 }
-                .onChange(of: active) { _, index in
-                    if follow, search.isEmpty, let index { proxy.scrollTo(index, anchor: .center) }
-                }
+            } else {
+                transcriptList(filtered, active: activeIndex(at: Date()), proxy: proxy)
             }
+        }
+    }
+
+    private func transcriptList(_ filtered: [TranscriptSegment], active: Int?, proxy: ScrollViewProxy) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
+                if filtered.isEmpty {
+                    NibEmptyState(symbol: .transcript,
+                        title: search.isEmpty ? String(localized: "No transcript yet") : String(localized: "No matching lines"),
+                        message: search.isEmpty ? String(localized: "Generate a transcript, or enable live transcription in Recording Settings.") : nil)
+                }
+                ForEach(filtered, id: \.index) { line in
+                    transcriptRow(line, active: line.index == active).id(line.index)
+                }
+            }.padding(NibSpacing.l)
+        }
+        .onChange(of: active) { _, index in
+            if follow, search.isEmpty, let index { proxy.scrollTo(index, anchor: .center) }
         }
     }
 
@@ -203,7 +248,7 @@ struct TranscriptPanel: View {
         }
         .padding(NibSpacing.m)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(active ? NibColor.accentWash : NibColor.fill3.opacity(0), in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow))
+        .background(active ? NibColor.accentWash : Color.clear, in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow))
         .accessibilityElement(children: .contain)
         .accessibilityValue(active ? String(localized: "Current transcript line") : "")
         .contextMenu {
@@ -238,7 +283,7 @@ struct TranscriptPanel: View {
     @ViewBuilder private func editButtons(_ index: Int) -> some View {
         NibButton(String(localized: "Cancel"), shortcut: KeyboardShortcut(.escape, modifiers: [])) { model.editIndex = nil; model.editText = "" }
         NibButton(String(localized: "Save"), kind: .primary, shortcut: KeyboardShortcut(.return, modifiers: .command)) {
-            model.run(CommandIDs.transcriptEditSegment, ["clip": .string(model.selectedClip), "index": .number(Double(index)), "text": .string(model.editText)])
+            model.saveEdit()
         }.disabled(model.busy)
     }
 
@@ -272,9 +317,18 @@ struct TranscriptPanel: View {
         VStack(spacing: NibSpacing.s) {
             if tab == .transcript {
                 NibToggle(String(localized: "Follow playback"), isOn: $follow)
-                NibButton(String(localized: "Regenerate Transcript"), symbol: .replace, expands: true) {
-                    model.run(CommandIDs.transcriptRegenerate, ["clip": .string(model.selectedClip)])
-                }.disabled(model.busy)
+                if confirmRegenerate {
+                    NibBanner(String(localized: "Regenerating replaces all transcript corrections and cannot be undone."),
+                        action: NibAction(String(localized: "Replace Transcript")) {
+                            confirmRegenerate = false
+                            model.run(CommandIDs.transcriptRegenerate, ["clip": .string(model.selectedClip)])
+                        })
+                    NibButton(String(localized: "Cancel")) { confirmRegenerate = false }
+                } else {
+                    NibButton(String(localized: "Regenerate Transcript"), symbol: .replace, expands: true) {
+                        confirmRegenerate = true
+                    }.disabled(model.busy)
+                }
             }
             if context.app.services.ai?.isConfigured == true && context.app.commands.descriptor(CommandIDs.meetingSummarize) != nil {
                 NibButton(tab == .summary ? String(localized: "Regenerate Summary") : String(localized: "Summarise"), symbol: .assistant, expands: true) {
@@ -304,6 +358,7 @@ struct TranscriptRecordingSettings: View {
     @State private var live = false
     @State private var cloud = false
     @State private var language = Locale.current.identifier
+    @State private var authorised = false
     @State private var languages: [TranscriptLanguage] = []
     @State private var search = ""
     @State private var error: String?
@@ -314,10 +369,12 @@ struct TranscriptRecordingSettings: View {
             NibToggle(String(localized: "Live transcription"), isOn: binding(TranscriptSettings.live, value: $live))
             NibToggle(String(localized: "Cloud transcription"), isOn: binding(TranscriptSettings.cloud, value: $cloud))
             Text(cloud ? String(localized: "Audio is sent to your configured AI provider. Long recordings update every minute and when recording stops.")
-                       : String(localized: "On-device transcription keeps audio on this iPad or iPhone."))
+                       : String(localized: "Apple Speech uses on-device recognition when supported. Other languages may send audio to Apple."))
                 .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
-            NibButton(String(localized: "Enable Speech Recognition"), symbol: .microphone, expands: true) {
-                Task { await authorise() }
+            if !authorised {
+                NibButton(String(localized: "Enable Speech Recognition"), symbol: .microphone, expands: true) {
+                    Task { await authorise() }
+                }
             }
             NibSearchField(text: $search, prompt: String(localized: "Search languages"))
             Text(String(localized: "Language")).font(NibFont.headline)
@@ -331,11 +388,11 @@ struct TranscriptRecordingSettings: View {
                             } catch { self.error = NibError.wrap(error).message }
                         }
                     } label: {
-                        NibRow(item.name, subtitle: item.onDevice ? String(localized: "Available on device") : String(localized: "On-device model unavailable"), icon: .language) {
+                        NibRow(item.name, subtitle: availability(item), icon: .language) {
                             if language == item.id { Image(nib: .checkmark).foregroundStyle(NibColor.accent) }
                         }
                     }.buttonStyle(.plain).hoverEffect(.highlight).accessibilityLabel(item.name)
-                    .accessibilityValue(item.onDevice ? String(localized: "Available on device") : String(localized: "On-device model unavailable"))
+                    .accessibilityValue(availability(item))
                     .accessibilityAddTraits(language == item.id ? [.isSelected] : [])
                 }
             }
@@ -345,6 +402,11 @@ struct TranscriptRecordingSettings: View {
         }
         .font(NibFont.body).foregroundStyle(NibColor.label).padding(NibSpacing.l)
         .task { await load() }
+    }
+
+    private func availability(_ item: TranscriptLanguage) -> String {
+        if !authorised { return String(localized: "Enable Speech Recognition to check availability") }
+        return item.onDevice ? String(localized: "Available on device") : String(localized: "Apple server recognition")
     }
 
     private func binding(_ key: SettingKey<Bool>, value: Binding<Bool>) -> Binding<Bool> {
@@ -364,7 +426,8 @@ struct TranscriptRecordingSettings: View {
             cloud = try await setting(TranscriptSettings.cloud)
             language = try await setting(TranscriptSettings.language)
             let result = try await app.bus.execute(TranscriptLanguages.descriptor.id)
-            languages = try result.decode(TranscriptLanguages.Output.self).languages
+            let output = try result.decode(TranscriptLanguages.Output.self)
+            languages = output.languages; authorised = output.authorised
         } catch { self.error = NibError.wrap(error).message }
     }
 

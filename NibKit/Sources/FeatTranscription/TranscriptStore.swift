@@ -1,5 +1,6 @@
 import Foundation
 import NibContracts
+import os
 
 /// Disk layout shared with NibIndex: one array per device, merged by stable line index.
 actor TranscriptFiles {
@@ -9,13 +10,29 @@ actor TranscriptFiles {
         let after: Data
     }
 
-    func read(base: URL, includingRetired: Bool = false) throws -> [TranscriptSegment] {
+    private var warnings: [URL: [String]] = [:]
+
+    func warning(base: URL) -> NibError? {
+        guard let names = warnings[base], !names.isEmpty else { return nil }
+        return NibError(.conflict, "Skipped unreadable transcript files: \(names.joined(separator: ", "))", hint: "wait for these device files to finish syncing")
+    }
+
+    func read(base: URL, includingRetired: Bool = false, device: String? = nil) throws -> [TranscriptSegment] {
         let directory = base.deletingLastPathComponent()
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
         let stem = base.lastPathComponent
         let urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { Self.matches($0.lastPathComponent, stem: stem) }.sorted { $0.path < $1.path }
-        let arrays = try urls.map { try decode($0) }
+        warnings[base] = []
+        var arrays: [[TranscriptSegment]] = []
+        for url in urls {
+            do { arrays.append(try decode(url)) }
+            catch {
+                guard let device, url != base.appendingPathExtension(device).appendingPathExtension("json") else { throw error }
+                warnings[base, default: []].append(url.lastPathComponent)
+                Logger(subsystem: "app.nib", category: "transcription").error("Skipping unreadable transcript: \(url.lastPathComponent, privacy: .public)")
+            }
+        }
         let merged = Self.merge(arrays)
         return includingRetired ? merged : merged.filter { !Self.isRetired($0) }
     }
@@ -30,10 +47,11 @@ actor TranscriptFiles {
     static func isRetired(_ line: TranscriptSegment) -> Bool { line.text.isEmpty && line.duration == 0 }
 
     static func merge(_ arrays: [[TranscriptSegment]]) -> [TranscriptSegment] {
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
         var byIndex: [Int: TranscriptSegment] = [:]
         for lines in arrays {
             for line in lines {
-                if let old = byIndex[line.index], (old.rev ?? .zero) > (line.rev ?? .zero) { continue }
+                if let old = byIndex[line.index], (old.rev ?? .zero).effective(now: now) > (line.rev ?? .zero).effective(now: now) { continue }
                 byIndex[line.index] = line
             }
         }
@@ -53,6 +71,15 @@ actor TranscriptFiles {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try after.write(to: url, options: .atomic)
         return Write(url: url, before: before, after: after)
+    }
+
+    /// Compare and write without an actor suspension between the two operations.
+    func replace(base: URL, device: String, expected: [TranscriptSegment], lines: [TranscriptSegment]) throws -> Write {
+        guard try read(base: base, includingRetired: true, device: device) == expected else {
+            throw NibError(.conflict, "The transcript was edited while transcription was running",
+                hint: "read transcript.get before replacing those edits")
+        }
+        return try write(base: base, device: device, lines: lines)
     }
 
     func rollback(_ write: Write) throws {
@@ -86,6 +113,8 @@ final class TranscriptStore {
     static let serviceKey = "transcription.store"
     static let changed = "transcript.changed"
     let files = TranscriptFiles()
+    let device: String
+    init(device: String) { self.device = device }
 
     struct Clip {
         let doc: DocumentID
@@ -124,22 +153,26 @@ final class TranscriptStore {
         }
     }
 
-    func read(_ clip: Clip) async throws -> [TranscriptSegment] { try await files.read(base: clip.base) }
+    func read(_ clip: Clip) async throws -> [TranscriptSegment] { try await files.read(base: clip.base, device: device) }
 
-    func persist(_ lines: [TranscriptSegment], clip: Clip, ctx: CommandContext) async throws {
+    func persist(_ lines: [TranscriptSegment], clip: Clip, ctx: CommandContext, expected: [TranscriptSegment]? = nil) async throws {
         try Self.canWrite(clip.doc, ctx: ctx)
         guard !ctx.dryRun else { return }
         let write: TranscriptFiles.Write
-        do { write = try await files.write(base: clip.base, device: ctx.workspace.clock.deviceHex, lines: lines) }
+        do {
+            if let expected { write = try await files.replace(base: clip.base, device: device, expected: expected, lines: lines) }
+            else { write = try await files.write(base: clip.base, device: device, lines: lines) }
+        }
         catch { throw NibError.wrap(error) }
         do {
             try Self.canWrite(clip.doc, ctx: ctx)
             guard var current = try ctx.workspace.content(clip.doc).liveAudio.first(where: { $0.id == clip.record.id }) else {
                 throw NibError.notFound("audio clip")
             }
-            current.transcriptFile = clip.record.transcriptFile ?? "audio/\(clip.record.id.raw).transcript"
-            // A real transaction advertises the sidecar change to sync, indexing and document observers.
-            try ctx.mutate(undoable: false) { tx in _ = try tx.put(current, doc: clip.doc) }
+            if current.transcriptFile == nil {
+                current.transcriptFile = "audio/\(clip.record.id.raw).transcript"
+                try ctx.mutate(undoable: false) { tx in _ = try tx.put(current, doc: clip.doc) }
+            }
         } catch {
             try await files.rollback(write)
             throw error
