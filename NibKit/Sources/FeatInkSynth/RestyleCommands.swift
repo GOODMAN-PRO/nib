@@ -122,13 +122,28 @@ struct HandwritingRestyle: NibCommand {
             guard ids.count <= count else {
                 throw NibError.invalid("There are more ids than generated strokes.", path: "$.ids")
             }
+            let live = try tx.items(doc, page: page)
+            guard !live.contains(where: { item in
+                [item.attachedTo, item.connector?.from.item, item.connector?.to.item]
+                    .compactMap { $0 }.contains { replacing.contains($0) }
+            }) else {
+                throw NibError(.conflict, "Other items are attached to the selected handwriting.",
+                               hint: "Use Neaten Handwriting to keep comments, connectors and attachments intact.")
+            }
             try tx.delete(items: Array(replacing), doc: doc, page: page)
             var output: [Item] = []
             for replacement in replacements {
                 let offset = output.count
                 let chosen = offset < ids.count ? Array(ids[offset..<min(ids.count, offset + replacement.strokes.count)]) : []
-                output.append(contentsOf: try InkSynthParams.write(replacement.strokes, ids: chosen,
-                                  layer: replacement.originals[0].layer, doc: doc, page: page, tx: tx))
+                let first = replacement.originals[0]
+                let nextZ = live.filter { $0.z > first.z }.map { $0.z }.min()
+                let keys = FractionalIndex.balanced(count: replacement.strokes.count, after: first.z, before: nextZ)
+                let items = replacement.strokes.enumerated().map { index, stroke -> Item in
+                    Item(id: index < chosen.count ? chosen[index] : NibID.make(), kind: .stroke,
+                         z: keys[index], layer: first.layer, attachedTo: first.attachedTo,
+                         ext: first.ext, stroke: stroke)
+                }
+                output.append(contentsOf: try tx.put(items, doc: doc, page: page))
             }
             return output
         }

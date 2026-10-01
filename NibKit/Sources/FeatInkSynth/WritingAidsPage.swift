@@ -10,6 +10,7 @@ struct WritingAidsPage: View {
     @StateObject private var model: WritingAidsModel
     @State private var word = ""
     @State private var prefix = ""
+    @State private var hasStarted = false
 
     init(app: NibApp) {
         _model = StateObject(wrappedValue: WritingAidsModel(app: app))
@@ -20,13 +21,17 @@ struct WritingAidsPage: View {
             Section {
                 NibRow(String(localized: "Handwriting Spellcheck"), icon: .recognisedText) {
                     NibToggle("", isOn: Binding(get: { model.spellcheck }, set: {
-                        model.change(CommandIDs.settingsSet, ["name": .string(NibSettings.spellcheckNewDocuments.name), "value": .bool($0)])
+                        model.setSpellcheck($0)
                     }))
                     .accessibilityLabel(String(localized: "Handwriting Spellcheck for New Documents"))
                 }
+                NibRow(String(localized: "Math Assist"), icon: .math) {
+                    NibToggle("", isOn: Binding(get: { model.mathAssist }, set: { model.setMathAssist($0) }))
+                        .accessibilityLabel(String(localized: "Math Assist"))
+                }
                 NibRow(String(localized: "Synthesis Font"), icon: .text) {
                     Picker(String(localized: "Synthesis Font"), selection: Binding(get: { model.font }, set: {
-                        model.change(CommandIDs.settingsSet, ["name": .string(InkSynthSettings.font.name), "value": .string($0.rawValue)])
+                        model.setFont($0)
                     })) {
                         ForEach(InkSynthFont.allCases, id: \.self) { font in
                             Text(verbatim: font.rawValue).font(NibFont.body).tag(font)
@@ -38,7 +43,7 @@ struct WritingAidsPage: View {
                     .hoverEffect(.highlight)
                 }
             } footer: {
-                Text(String(localized: "Spellcheck applies to new documents. Change an existing document in its Writing Aids menu. The synthesis font is used for spelling corrections and font restyling on this device."))
+                Text(String(localized: "Spellcheck and Math Assist apply to new documents. Change an existing document in its Writing Aids menu. The synthesis font is used for spelling corrections and font restyling on this device."))
                     .font(NibFont.footnote)
                     .foregroundStyle(NibColor.labelSecondary)
             }
@@ -82,18 +87,17 @@ struct WritingAidsPage: View {
                           shortcut: KeyboardShortcut(.return, modifiers: .command), action: addWord)
                     .disabled(word.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy)
             } header: {
-                Text(String(localized: "Personal Dictionary")).font(NibFont.footnote)
+                Text(String(localized: "Personal Dictionary")).font(NibFont.footnote).textCase(nil)
             } footer: {
                 Text(String(localized: "Custom words ignore case and sync with your library."))
                     .font(NibFont.footnote)
                     .foregroundStyle(NibColor.labelSecondary)
             }
-            if model.busy { ProgressView().accessibilityLabel(String(localized: "Updating Writing Aids")) }
             if let error = model.error {
                 Section {
                     Text(verbatim: error).font(NibFont.body).foregroundStyle(NibColor.destructive)
                         .accessibilityLabel(String(localized: "Writing Aids: \(error)"))
-                    NibButton(String(localized: "Try Again"), symbol: .retry) { model.refresh() }
+                    NibButton(String(localized: "Reload Writing Aids"), symbol: .retry) { model.refresh() }
                 }
             }
         }
@@ -102,16 +106,24 @@ struct WritingAidsPage: View {
         .scrollContentBackground(.hidden)
         .background(NibColor.groupedBackground)
         .navigationTitle(String(localized: "Writing Aids"))
-        .task { await model.reload() }
+        .overlay(alignment: .topTrailing) {
+            if model.busy {
+                ProgressView().padding(NibSpacing.m)
+                    .accessibilityLabel(String(localized: "Updating Writing Aids"))
+            }
+        }
         .task(id: prefix) {
             do {
-                try await Task.sleep(for: .milliseconds(200))
+                if hasStarted { try await Task.sleep(for: .milliseconds(200)) }
+                hasStarted = true
                 guard !Task.isCancelled else { return }
                 model.prefix = prefix
                 await model.reload()
             } catch { /* A newer filter replaces this request. */ }
         }
-        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: model.app.settings)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: model.app.settings)
+            .filter { WritingAidsModel.isRelevantSetting($0.userInfo?["name"] as? String) }
+            .debounce(for: .milliseconds(150), scheduler: RunLoop.main)) { _ in
             model.refresh()
         }
     }
@@ -128,6 +140,7 @@ struct WritingAidsPage: View {
 final class WritingAidsModel: ObservableObject {
     let app: NibApp
     @Published var spellcheck = NibSettings.spellcheckNewDocuments.defaultValue
+    @Published var mathAssist = NibSettings.mathAssistSuggestions.defaultValue
     @Published var font: InkSynthFont = .noteworthy
     @Published var words: [String] = []
     @Published var cursor: String?
@@ -139,6 +152,36 @@ final class WritingAidsModel: ObservableObject {
 
     init(app: NibApp) { self.app = app }
 
+    nonisolated static func isRelevantSetting(_ name: String?) -> Bool {
+        guard let name else { return false }
+        return name == NibSettings.spellcheckNewDocuments.name || name == NibSettings.mathAssistSuggestions.name
+            || name == InkSynthSettings.font.name || name.hasPrefix(NibSettings.dictionaryPrefix)
+    }
+
+    func setSpellcheck(_ value: Bool) {
+        guard !busy else { return }
+        let old = spellcheck
+        spellcheck = value
+        change(CommandIDs.settingsSet, ["name": .string(NibSettings.spellcheckNewDocuments.name), "value": .bool(value)],
+               failure: { self.spellcheck = old })
+    }
+
+    func setMathAssist(_ value: Bool) {
+        guard !busy else { return }
+        let old = mathAssist
+        mathAssist = value
+        change(CommandIDs.settingsSet, ["name": .string(NibSettings.mathAssistSuggestions.name), "value": .bool(value)],
+               failure: { self.mathAssist = old })
+    }
+
+    func setFont(_ value: InkSynthFont) {
+        guard !busy else { return }
+        let old = font
+        font = value
+        change(CommandIDs.settingsSet, ["name": .string(InkSynthSettings.font.name), "value": .string(value.rawValue)],
+               failure: { self.font = old })
+    }
+
     func refresh() { Task { await reload() } }
 
     func reload() async {
@@ -146,10 +189,12 @@ final class WritingAidsModel: ObservableObject {
         let request = generation
         do {
             let spell = try await read(CommandIDs.settingsGet, ["name": .string(NibSettings.spellcheckNewDocuments.name)])
+            let math = try await read(CommandIDs.settingsGet, ["name": .string(NibSettings.mathAssistSuggestions.name)])
             let synthesis = try await read(CommandIDs.settingsGet, ["name": .string(InkSynthSettings.font.name)])
             let dictionary = try await read(CommandIDs.dictionaryList, ["prefix": .string(prefix), "limit": 100])
             guard request == generation, !Task.isCancelled else { return }
             spellcheck = spell["value"]?.boolValue ?? NibSettings.spellcheckNewDocuments.defaultValue
+            mathAssist = math["value"]?.boolValue ?? NibSettings.mathAssistSuggestions.defaultValue
             font = synthesis["value"]?.stringValue.flatMap { InkSynthFont(name: $0) } ?? .noteworthy
             words = dictionary["words"]?.arrayValue?.compactMap { $0.stringValue } ?? []
             cursor = dictionary["cursor"]?.stringValue
@@ -160,8 +205,9 @@ final class WritingAidsModel: ObservableObject {
         }
     }
 
-    func change(_ command: String, _ params: JSONValue, success: @escaping () -> Void = {}) {
+    func change(_ command: String, _ params: JSONValue, failure: @escaping () -> Void = {}, success: @escaping () -> Void = {}) {
         guard !busy else { return }
+        generation += 1 // Invalidate reads started before an optimistic control change.
         busy = true
         error = nil
         Task {
@@ -170,7 +216,10 @@ final class WritingAidsModel: ObservableObject {
                 _ = try await read(command, params)
                 success()
                 await reload()
-            } catch { self.error = error.localizedDescription }
+            } catch {
+                failure()
+                self.error = error.localizedDescription
+            }
         }
     }
 

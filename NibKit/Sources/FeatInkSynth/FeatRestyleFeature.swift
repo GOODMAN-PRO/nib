@@ -12,11 +12,13 @@ public enum FeatRestyleFeature: NibFeature {
             icon: NibSymbol.editHandwriting.name, section: .writing, order: 300, owner: id) {
                 AnyView(WritingAidsPage(app: $0))
             }
-        page.keywords = ["spellcheck", "spelling", "dictionary", "handwriting", "font", "restyle"]
+        page.keywords = ["spellcheck", "spelling", "dictionary", "handwriting", "font", "restyle", "math"]
         app.ui.settingsPages.register(page)
 
         let visible: @MainActor (MenuContext) -> Bool = { context in
-            !context.selection.isEmpty && context.itemKinds == [.stroke] && context.session?.readOnly != true
+            guard !context.selection.isEmpty, context.itemKinds == [.stroke], context.session?.readOnly != true,
+                  let doc = context.session?.document ?? context.doc else { return false }
+            return !app.isReadOnly(doc)
         }
         var neaten = MenuItemDescriptor(
             id: "restyle.neaten", title: String(localized: "Neaten Handwriting"),

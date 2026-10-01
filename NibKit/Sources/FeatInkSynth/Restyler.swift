@@ -11,6 +11,8 @@ enum Restyler {
     struct Line: Codable {
         var words: [Word]
         var angle: Double?
+        var baseline: [Point]? = nil
+        var xHeight: Double? = nil
     }
     struct Words: Codable {
         var lines: [Line]
@@ -40,6 +42,12 @@ enum Restyler {
             guard angle.isFinite else { throw NibError.invalid("Invalid handwriting line angle.", path: "$.refs") }
             let toLocal = Affine.rotation(-angle)
             let toPage = Affine.rotation(angle)
+            let baselinePoints = (line.baseline ?? []).map { toLocal.apply($0) }.sorted { $0.x < $1.x }
+            func fittedBaseline(at x: Double) -> Double? {
+                guard let first = baselinePoints.first, let last = baselinePoints.last else { return nil }
+                let dx = last.x - first.x
+                return first.y + (abs(dx) > 0.001 ? (x - first.x) * (last.y - first.y) / dx : 0)
+            }
             struct Measured {
                 var refs: [String]
                 var strokes: [Stroke]
@@ -65,26 +73,49 @@ enum Restyler {
                 }
                 let profile = word.text.flatMap { InkTypesetter.verticalExtent(of: $0, font: .noteworthy) }
                 let extent = profile.map { max($0.above + $0.below, 0.1) } ?? 1
-                let size = box.height / extent
-                let below = profile.map { max($0.below, 0) * size } ?? 0
+                let emSize = box.height / extent
+                let size = profile == nil ? 0 : emSize
+                let below = profile.map { max($0.below, 0) * emSize } ?? 0
                 let lean = InkTypesetter.lean(of: strokes.map { $0.polyline },
                                               step: InkTypesetter.leanStep(forHeight: box.height)) ?? 0
+                let bottoms = strokes.compactMap { Rect.bounding($0.polyline) }.filter { strokeBox in
+                    guard let expected = fittedBaseline(at: strokeBox.midX) else { return true }
+                    return abs(strokeBox.maxY - expected) <= 0.3 * (line.xHeight ?? box.height)
+                }.map { $0.maxY }
+                let wordBaseline = profile != nil ? box.maxY - below
+                    : (bottoms.isEmpty ? fittedBaseline(at: box.midX) ?? box.maxY : median(bottoms))
                 measured.append(Measured(refs: selected, strokes: strokes, box: box,
-                                         baseline: box.maxY - below, size: size, lean: lean))
+                                         baseline: wordBaseline, size: size, lean: lean))
             }
             let baseline = median(measured.map { $0.baseline })
             let size = median(measured.map { $0.size }.filter { $0 > 0 })
-            let lean = median(measured.filter { $0.size > 0 }.map { $0.lean })
+            let lean = median(measured.map { $0.lean })
+            measured.sort { $0.box.minX < $1.box.minX }
+            var previousBox: Rect?
+            var previousNewMaxX: Double?
+            var offset = 0.0
             for word in measured {
                 try checkCancellation()
                 let scale = word.size > 0 ? min(max(size / word.size, 0.75), 4.0 / 3.0) : 1
                 let shear = (word.lean - lean) * scale
-                let transform = Affine(a: scale, b: 0, c: shear, d: scale,
+                var transform = Affine(a: scale, b: 0, c: shear, d: scale,
                                        tx: word.box.minX * (1 - scale) - shear * word.baseline,
                                        ty: baseline - scale * word.baseline)
+                let originalBox = bounds(word.strokes) ?? word.box
+                let localStrokes = word.strokes.map { preservingNib($0.transformed(by: transform), from: $0) }
+                if let newBox = bounds(localStrokes) {
+                    if let previousBox, let previousNewMaxX {
+                        let gap = max(0, originalBox.minX - previousBox.maxX)
+                        offset = max(offset, previousNewMaxX + gap - newBox.minX)
+                    }
+                    transform.tx += offset
+                    previousNewMaxX = newBox.maxX + offset
+                }
+                previousBox = originalBox
                 for (ref, stroke) in zip(word.refs, word.strokes) {
-                    guard var item = items[ref] else { continue }
-                    item.stroke = stroke.transformed(by: transform).transformed(by: toPage)
+                    guard var item = items[ref], let original = item.stroke else { continue }
+                    item.stroke = preservingNib(stroke.transformed(by: transform).transformed(by: toPage),
+                                                from: original)
                     result.append(item)
                 }
             }
@@ -97,7 +128,7 @@ enum Restyler {
     }
 
     /// Font restyling runs per recognised word: position, layer, pen and colour come from that word's original ink.
-    /// The entire visual extent, including the nib, is fitted to its old box, avoiding overflow into nearby notes.
+    /// Fit the visual extent to the old box while limiting aspect-ratio distortion and preserving the pen weight.
     static func font(_ items: [String: Item], lines: [Line], font: InkSynthFont) throws -> [Replacement] {
         var result: [Replacement] = []
         var used = Set<String>()
@@ -117,6 +148,15 @@ enum Restyler {
                 let originals = refs.compactMap { items[$0] }.sorted { ($0.z, $0.id.raw) < ($1.z, $1.id.raw) }
                 guard let first = originals.first, let style = first.stroke?.style,
                       let box = bounds(originals.compactMap { $0.stroke }) else { continue }
+                guard originals.allSatisfy({ $0.stroke?.style.color == style.color }) else {
+                    throw NibError(.unsupported, "Font restyle cannot preserve a mixed-colour word.",
+                                   hint: "Use Neaten Handwriting to preserve every ink colour.")
+                }
+                // Per-stroke extension data has no unambiguous mapping onto synthesised letter strokes.
+                guard originals.allSatisfy({ $0.ext == first.ext && $0.attachedTo == first.attachedTo }) else {
+                    throw NibError(.unsupported, "This word has different attachments or extension data.",
+                                   hint: "Use Neaten Handwriting to keep the original strokes.")
+                }
                 let options = InkTypesetter.Options(font: font, size: max(box.height, 4), style: style,
                                                     t0: originals.compactMap { $0.stroke?.t0 }.min() ?? 0)
                 let layout = InkTypesetter.layout(text, at: box.center, options: options).prepared()
@@ -162,19 +202,25 @@ enum Restyler {
         }
     }
 
+    /// Fit height while limiting letterform distortion to 20–25 percent horizontally.
     static func fit(_ strokes: [Stroke], to target: Rect) -> [Stroke] {
-        var fitted = strokes
-        // Nib extents scale with sqrt(determinant), while bounds have a fixed 1 pt antialias margin.
-        // Refinement accounts for both, including very wide or narrow words.
-        for _ in 0..<8 {
-            guard let box = bounds(fitted), box.width > 0, box.height > 0 else { break }
-            let sx = max(target.width - 2, 0.1) / max(box.width - 2, 0.1)
-            let sy = max(target.height - 2, 0.1) / max(box.height - 2, 0.1)
-            let transform = Affine(a: sx, b: 0, c: 0, d: sy,
-                                   tx: target.midX - sx * box.midX, ty: target.midY - sy * box.midY)
-            fitted = fitted.map { $0.transformed(by: transform) }
+        guard let box = bounds(strokes), box.height > 0, box.width > 0 else { return strokes }
+        let sy = max(target.height - 2, 0.1) / max(box.height - 2, 0.1)
+        let desiredX = max(target.width - 2, 0.1) / max(box.width - 2, 0.1)
+        let sx = min(max(desiredX, sy * 0.8), sy * 1.25)
+        let transform = Affine(a: sx, b: 0, c: 0, d: sy,
+                               tx: target.midX - sx * box.midX, ty: target.midY - sy * box.midY)
+        return strokes.map { preservingNib($0.transformed(by: transform), from: $0) }
+    }
+
+    static func preservingNib(_ transformed: Stroke, from original: Stroke) -> Stroke {
+        var result = transformed
+        result.style.width = original.style.width
+        for index in result.points.indices {
+            result.points[index].width = original.points[index].width
+            result.points[index].height = original.points[index].height
         }
-        return fitted
+        return result
     }
 
     static func bounds(_ strokes: [Stroke]) -> Rect? {

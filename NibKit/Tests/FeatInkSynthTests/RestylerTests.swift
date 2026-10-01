@@ -22,8 +22,8 @@ final class RestylerTests: XCTestCase {
             for part in 0..<2 {
                 let left = 80.0 + Double(word) * 60 + Double(part) * 14
                 let stroke = Stroke(style: InkStyle(color: RGBA(0x1F, 0x5F, 0xD1), width: 1), points: [
-                    StrokePoint(x: Float(left + lean * height), y: Float(bottom - height), t: 0),
-                    StrokePoint(x: Float(left), y: Float(bottom), t: 0.2)
+                    StrokePoint(x: Float(left + lean * height), y: Float(bottom - height), t: 0, width: 1.1, height: 0.8),
+                    StrokePoint(x: Float(left), y: Float(bottom), t: 0.2, width: 1.4, height: 1.0)
                 ], t0: 1000 + Double(word))
                 items.append(Item(id: NibID("WORD\(word)PART\(part)"), kind: .stroke, layer: word, stroke: stroke))
             }
@@ -56,7 +56,7 @@ final class RestylerTests: XCTestCase {
     func testNeatenReducesBaselineSizeAndSlantVarianceKeepsInkAndUndoRedo() async throws {
         let h = Harness(features: [FeatRestyleFeature.self])
         let old = try await seed(h)
-        query(h, CommandIDs.handwritingWords, value: try geometry(old))
+        query(h, CommandIDs.handwritingWords, value: try geometry(old, text: true))
         let before = try h.snapshot()
         let depth = h.undoDepth(Fixtures.docID)
         h.session.page = Fixtures.page2
@@ -78,6 +78,9 @@ final class RestylerTests: XCTestCase {
             XCTAssertEqual(item.stroke?.points.map { $0.t }, original.stroke?.points.map { $0.t })
             XCTAssertEqual(item.stroke?.t0, original.stroke?.t0)
             XCTAssertEqual(item.stroke?.style.color, original.stroke?.style.color)
+            XCTAssertEqual(item.stroke?.style.width, original.stroke?.style.width)
+            XCTAssertEqual(item.stroke?.points.map { $0.width }, original.stroke?.points.map { $0.width })
+            XCTAssertEqual(item.stroke?.points.map { $0.height }, original.stroke?.points.map { $0.height })
             XCTAssertEqual(item.layer, original.layer)
         }
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
@@ -90,8 +93,20 @@ final class RestylerTests: XCTestCase {
 
     func testFontFitsEachOriginalBoxPreservesColourAndLayerAndUndo() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self, FeatRestyleFeature.self])
-        let old = try await seed(h)
-        query(h, CommandIDs.recognizeItems, value: try geometry(old, text: true))
+        var source: [Item] = []
+        for layer in 0..<3 {
+            let options = InkTypesetter.Options(font: .noteworthy, size: [18.0, 22.0, 26.0][layer],
+                                               style: InkStyle(color: RGBA(0x1F, 0x5F, 0xD1), width: 1))
+            source += InkTypesetter.layout("hello", at: Point(80 + Double(layer) * 90, 120), options: options)
+                .prepared().strokes.map { Item.makeStroke($0, layer: layer) }
+        }
+        let old = try await h.insert(source, page: Fixtures.page2)
+        let words = (0..<3).map { layer -> Restyler.Word in
+            let group = old.filter { $0.layer == layer }
+            return .init(refs: group.map(ref), bbox: InkSynthParams.bounds(group)!, text: "hello")
+        }
+        query(h, CommandIDs.recognizeItems, value: try JSONValue.from(
+            Restyler.Words(lines: [.init(words: words, angle: 0)], truncated: false)))
         let before = try h.snapshot()
         let depth = h.undoDepth(Fixtures.docID)
         let output = try await h.run(CommandIDs.handwritingRestyle,
@@ -102,10 +117,11 @@ final class RestylerTests: XCTestCase {
         for layer in 0..<3 {
             let expected = try XCTUnwrap(InkSynthParams.bounds(old.filter { $0.layer == layer }))
             let actual = try XCTUnwrap(InkSynthParams.bounds(written.filter { $0.layer == layer }))
-            XCTAssertEqual(actual.midX, expected.midX, accuracy: expected.width * 0.2)
-            XCTAssertEqual(actual.midY, expected.midY, accuracy: expected.height * 0.2)
-            XCTAssertEqual(actual.width, expected.width, accuracy: expected.width * 0.2)
-            XCTAssertEqual(actual.height, expected.height, accuracy: expected.height * 0.2)
+            XCTAssertEqual(actual.minX, expected.minX, accuracy: expected.width * 0.2)
+            XCTAssertEqual(actual.maxX, expected.maxX, accuracy: expected.width * 0.2)
+            XCTAssertEqual(actual.minY, expected.minY, accuracy: expected.height * 0.2)
+            XCTAssertEqual(actual.maxY, expected.maxY, accuracy: expected.height * 0.2)
+            XCTAssertTrue(written.filter { $0.layer == layer }.allSatisfy { $0.stroke?.style.width == 1 })
             XCTAssertTrue(written.filter { $0.layer == layer }.allSatisfy { $0.stroke?.style.color == RGBA(0x1F, 0x5F, 0xD1) })
         }
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
@@ -169,11 +185,17 @@ final class RestylerTests: XCTestCase {
         await model.reload()
         XCTAssertTrue(model.loaded)
         XCTAssertEqual(model.font, .noteworthy)
+        XCTAssertFalse(model.mathAssist)
         try await h.run(CommandIDs.settingsSet, ["name": "writing.spellcheckNewDocuments", "value": true])
         try await h.run(CommandIDs.settingsSet, ["name": "inksynth.font", "value": "Marker Felt"])
+        model.setMathAssist(true)
+        XCTAssertTrue(model.mathAssist, "The switch updates immediately")
+        while model.busy { await Task.yield() }
+        XCTAssertTrue(h.app.settings.get(NibSettings.mathAssistSuggestions))
         try await h.run(CommandIDs.dictionaryAdd, ["word": "Nibnote"])
         await model.reload()
         XCTAssertTrue(model.spellcheck)
+        XCTAssertTrue(model.mathAssist)
         XCTAssertEqual(model.font, .markerFelt)
         XCTAssertEqual(model.words, ["nibnote"])
         try await h.run(CommandIDs.dictionaryRemove, ["word": "nibnote"])
@@ -213,23 +235,232 @@ final class RestylerTests: XCTestCase {
 
     func testNeatenPagesThroughAllLinesBeforeItsOneCommit() async throws {
         let h = Harness(features: [FeatRestyleFeature.self])
-        let old = try await seed(h)
+        let firstLine = try await seed(h)
+        let secondLine = try await h.insert(firstLine.map { item in
+            var next = item
+            next.id = NibID(item.id.raw + "SECOND")
+            next.z = ""
+            next.stroke = item.stroke?.transformed(by: .translation(0, 100))
+            return next
+        }, page: Fixtures.page2)
+        let old = firstLine + secondLine
         var cursors: [String?] = []
-        let all = try geometry(old).decode(Restyler.Words.self).lines[0].words
+        let all = try [geometry(firstLine, text: true), geometry(secondLine, text: true)]
+            .map { try $0.decode(Restyler.Words.self).lines[0] }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.handwritingWords, title: "Paged Words", summary: "Test query.",
             params: .obj(["refs": .arr(.ref), "cursor": .str()], required: ["refs"]), effect: .read)) { params, _ in
                 let cursor = params["cursor"]?.stringValue
                 cursors.append(cursor)
                 let index = Int(cursor ?? "0") ?? 0
-                return try JSONValue.from(Restyler.Words(lines: [.init(words: [all[index]], angle: 0)],
-                    truncated: index < 2, cursor: index < 2 ? String(index + 1) : nil))
+                return try JSONValue.from(Restyler.Words(lines: [all[index]],
+                    truncated: index < 1, cursor: index < 1 ? String(index + 1) : nil))
             }
         let before = try h.snapshot()
         try await h.run(CommandIDs.handwritingRestyle, ["refs": .array(old.map { .string(ref($0)) }), "style": "neaten"])
-        XCTAssertEqual(cursors, [nil, "1", "2"])
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), 2)
+        XCTAssertEqual(cursors, [nil, "1"])
+        let written = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        for line in [firstLine, secondLine] {
+            let changed = written.filter { item in line.contains { $0.id == item.id } }
+            let previous = line.map { Rect.bounding($0.stroke!.polyline)!.maxY }
+            XCTAssertLessThanOrEqual(variance(changed.map { Rect.bounding($0.stroke!.polyline)!.maxY }),
+                                     variance(previous) * 0.5)
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 3)
         try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
         XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testNeatenKeepsCloseWordsSeparateAndOrdered() async throws {
+        let h = Harness(features: [FeatRestyleFeature.self])
+        let old = try await seed(h)
+        var left = 80.0
+        let adjacent = stride(from: 0, to: old.count, by: 2).flatMap { start -> [Item] in
+            let pair = Array(old[start..<start + 2])
+            let box = Restyler.bounds(pair.compactMap { $0.stroke })!
+            let shifted = pair.map { item -> Item in
+                var result = item
+                result.stroke = item.stroke?.transformed(by: .translation(left - box.minX, 0))
+                return result
+            }
+            left += box.width + [4.0, 6.0, 5.0][start / 2]
+            return shifted
+        }
+        let words = try geometry(adjacent, text: true).decode(Restyler.Words.self).lines
+        let result = try Restyler.neaten(Dictionary(uniqueKeysWithValues: adjacent.map { (ref($0), $0) }), lines: words)
+        let boxes = stride(from: 0, to: result.count, by: 2).map {
+            Restyler.bounds(result[$0..<$0 + 2].compactMap { $0.stroke })!
+        }
+        for index in 1..<boxes.count {
+            XCTAssertGreaterThan(boxes[index].minX, boxes[index - 1].maxX)
+            XCTAssertGreaterThan(boxes[index].midX, boxes[index - 1].midX)
+        }
+    }
+
+    func testNeatenRotatedRecognisedProfilesReducesLocalBaselineVariance() throws {
+        let angle = 8.0 * Double.pi / 180
+        let toPage = Affine.rotation(angle)
+        let toLocal = Affine.rotation(-angle)
+        let texts = ["big", "ace", "jog"]
+        let baselines = [120.0, 128.0, 115.0]
+        var originals: [String: Item] = [:]
+        var words: [Restyler.Word] = []
+        for index in 0..<3 {
+            let profile = InkTypesetter.verticalExtent(of: texts[index], font: .noteworthy)!
+            let size = [18.0, 22.0, 26.0][index]
+            let x = 80 + Double(index) * 60
+            let stroke = Stroke(style: InkStyle(width: 1.7), points: [
+                StrokePoint(x: Float(x), y: Float(baselines[index] - profile.above * size), width: 1.2, height: 0.9),
+                StrokePoint(x: Float(x + 14), y: Float(baselines[index] + profile.below * size), width: 1.4, height: 1.1)
+            ]).transformed(by: toPage)
+            let item = Item(id: NibID("ROTATED\(index)"), kind: .stroke, stroke: stroke)
+            originals[ref(item)] = item
+            words.append(.init(refs: [ref(item)], bbox: item.bounds, text: texts[index]))
+        }
+        let line = Restyler.Line(words: words, angle: 8)
+        let result = try Restyler.neaten(originals, lines: [line])
+        let localBaselines = result.enumerated().map { index, item -> Double in
+            let box = Rect.bounding(item.stroke!.transformed(by: toLocal).polyline)!
+            let profile = InkTypesetter.verticalExtent(of: texts[index], font: .noteworthy)!
+            let size = box.height / (profile.above + profile.below)
+            return box.maxY - profile.below * size
+        }
+        XCTAssertLessThanOrEqual(variance(localBaselines), variance(baselines) * 0.5)
+        for item in result {
+            XCTAssertEqual(item.stroke?.style.width, originals[ref(item)]?.stroke?.style.width)
+        }
+    }
+
+    func testTextlessDescenderUsesLineBaselineWithoutScaling() throws {
+        func stroke(_ id: String, _ x: Double, _ top: Double, _ bottom: Double) -> Item {
+            Item(id: NibID(id), kind: .stroke, stroke: Stroke(style: InkStyle(), points: [
+                StrokePoint(x: Float(x), y: Float(top)), StrokePoint(x: Float(x), y: Float(bottom))
+            ]))
+        }
+        let old = [stroke("BODY", 80, 100, 120), stroke("DESCENDER", 94, 104, 130),
+                   stroke("NEXT", 130, 100, 120)]
+        let line = Restyler.Line(words: [
+            .init(refs: old.prefix(2).map(ref), bbox: Restyler.bounds(old.prefix(2).compactMap { $0.stroke })!, text: nil),
+            .init(refs: [ref(old[2])], bbox: old[2].bounds, text: nil)
+        ], angle: 0, baseline: [Point(70, 120), Point(150, 120)], xHeight: 20)
+        let result = try Restyler.neaten(Dictionary(uniqueKeysWithValues: old.map { (ref($0), $0) }), lines: [line])
+        for item in result {
+            let original = old.first { $0.id == item.id }!
+            XCTAssertEqual(item.stroke?.points.map { $0.y }, original.stroke?.points.map { $0.y })
+        }
+        XCTAssertEqual(result.first { $0.id.raw == "DESCENDER" }?.stroke?.points.last?.y, 130)
+    }
+
+    func testFontPreservesSharedAttachmentExtensionAndStacking() async throws {
+        let h = Harness(features: [FeatRestyleFeature.self])
+        let container = try await h.insert([Item(id: NibID("CONTAINER"), kind: .stroke,
+            stroke: Stroke(style: InkStyle(), points: [StrokePoint(x: 10, y: 10), StrokePoint(x: 20, y: 20)]))], page: Fixtures.page2)[0]
+        let old = try await seed(h)
+        let selected = try await h.insert(old.prefix(2).map { item in
+            var item = item
+            item.attachedTo = container.id
+            item.ext = ["plugin": ["value": true]]
+            return item
+        }, page: Fixtures.page2)
+        query(h, CommandIDs.recognizeItems, value: try geometry(selected, text: true))
+        let before = try h.snapshot()
+        let nextZ = old.filter { $0.z > selected[0].z }.map { $0.z }.min()!
+        let output = try await h.run(CommandIDs.handwritingRestyle,
+            ["refs": .array(selected.map { .string(ref($0)) }), "style": "font"])
+        let newRefs = Set(output["refs"]!.arrayValue!.compactMap { $0.stringValue })
+        let written = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).filter { newRefs.contains(ref($0)) }
+        XCTAssertFalse(written.isEmpty)
+        XCTAssertTrue(written.allSatisfy { $0.attachedTo == container.id && $0.ext == selected[0].ext })
+        XCTAssertTrue(written.allSatisfy { $0.z > selected[0].z && $0.z < nextZ })
+        try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testFontRefusesMixedColourAndLiveDependants() async throws {
+        let h = Harness(features: [FeatRestyleFeature.self])
+        let old = try await seed(h)
+        var selected = Array(old.prefix(2))
+        query(h, CommandIDs.recognizeItems, value: try geometry(selected, text: true))
+        selected[1].stroke!.style.color = .black
+        selected = try await h.insert(selected, page: Fixtures.page2)
+        let params: JSONValue = ["refs": .array(selected.map { .string(ref($0)) }), "style": "font"]
+        var before = try h.snapshot()
+        do { try await h.run(CommandIDs.handwritingRestyle, params); XCTFail("Expected mixed-colour refusal") }
+        catch let error as NibError { XCTAssertEqual(error.code, .unsupported) }
+        XCTAssertEqual(try h.snapshot(), before)
+        _ = try await h.insert(Array(old.prefix(2)), page: Fixtures.page2)
+        let dependants = [
+            Item(id: NibID("ATTACHED"), kind: .stroke, attachedTo: old[0].id, stroke: old[2].stroke),
+            Item(id: NibID("CONNECTOR"), kind: .connector,
+                 connector: ConnectorItem(from: ConnectorEnd(point: .zero, item: old[0].id),
+                                          to: ConnectorEnd(point: Point(10, 10))))
+        ]
+        for dependant in dependants {
+            _ = try await h.insert([dependant], page: Fixtures.page2)
+            before = try h.snapshot()
+            do { try await h.run(CommandIDs.handwritingRestyle, params); XCTFail("Expected attachment conflict") }
+            catch let error as NibError {
+                XCTAssertEqual(error.code, .conflict)
+                XCTAssertTrue(error.hint?.contains("Neaten Handwriting") == true)
+            }
+            XCTAssertEqual(try h.snapshot(), before)
+            try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        }
+    }
+
+    func testFontFitCapsAnisotropyAndKeepsNib() throws {
+        let stroke = Stroke(style: InkStyle(width: 2), points: [
+            StrokePoint(x: 0, y: 0, width: 2, height: 1), StrokePoint(x: 10, y: 10, width: 3, height: 2)
+        ])
+        let fitted = Restyler.fit([stroke], to: Rect(x: 0, y: 0, width: 200, height: 30))[0]
+        let dx = Double(fitted.points[1].x - fitted.points[0].x)
+        let dy = Double(fitted.points[1].y - fitted.points[0].y)
+        XCTAssertLessThanOrEqual(dx / dy, 1.25001)
+        XCTAssertEqual(fitted.style.width, stroke.style.width)
+        XCTAssertEqual(fitted.points.map { $0.width }, stroke.points.map { $0.width })
+        XCTAssertEqual(fitted.points.map { $0.height }, stroke.points.map { $0.height })
+    }
+
+    func testCancellationAfterQueryWhileFontWorkerRunsDoesNotCommit() async throws {
+        let h = Harness(features: [FeatRestyleFeature.self])
+        let old = try await seed(h)
+        let before = try h.snapshot()
+        var lines = try geometry(old, text: true).decode(Restyler.Words.self).lines
+        for index in lines[0].words.indices {
+            lines[0].words[index].text = String(repeating: "handwriting ", count: 160)
+        }
+        query(h, CommandIDs.recognizeItems, value: try JSONValue.from(Restyler.Words(lines: lines))) {
+            let running = withUnsafeCurrentTask { $0 }
+            Task {
+                try await Task.sleep(for: .milliseconds(5))
+                running?.cancel()
+            }
+        }
+        let task = Task { try await h.run(CommandIDs.handwritingRestyle,
+            ["refs": .array(old.map { .string(ref($0)) }), "style": "font"]) }
+        do { _ = try await task.value; XCTFail("Expected worker cancellation") }
+        catch let error as NibError { XCTAssertEqual(error.code, .userDenied) }
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testWritingAidsSettingFilterAndOptimisticRollback() async throws {
+        XCTAssertFalse(WritingAidsModel.isRelevantSetting("unrelated.setting"))
+        XCTAssertFalse(WritingAidsModel.isRelevantSetting(nil))
+        for name in [NibSettings.spellcheckNewDocuments.name, NibSettings.mathAssistSuggestions.name,
+                     InkSynthSettings.font.name, NibSettings.dictionaryPrefix + "nib"] {
+            XCTAssertTrue(WritingAidsModel.isRelevantSetting(name))
+        }
+        let h = Harness(features: [FeatInkSynthFeature.self, FeatRestyleFeature.self])
+        let model = WritingAidsModel(app: h.app)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.settingsSet, title: "Fail Settings", summary: "Test failure.",
+            params: .obj(["name": .str(), "value": .anything()]), effect: .edit, target: .app, undoable: false)) { _, _ in
+                throw NibError(.unavailable, "Test setting failure")
+            }
+        model.setSpellcheck(true)
+        XCTAssertTrue(model.spellcheck)
+        while model.busy { await Task.yield() }
+        XCTAssertEqual(model.spellcheck, NibSettings.spellcheckNewDocuments.defaultValue)
+        XCTAssertNotNil(model.error)
     }
 
     func testWritingAidsSnapshotsInPhoneAndTabletVariants() {
