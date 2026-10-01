@@ -236,10 +236,10 @@ public struct NibWidthPresetButton: View {
         let shape = RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
         Button(action: action) {
             Circle()
-                .fill(NibColor.label)
+                .fill(NibChromeColor(NibColor.label))
                 .frame(width: diameter, height: diameter)
                 .frame(width: NibMetrics.hitTarget, height: 40)
-                .background(isSelected ? NibColor.fill3 : Color.clear, in: shape)
+                .background(NibChromeColor(isSelected ? NibColor.fill3 : Color.clear), in: shape)
                 .opacity(isEnabled ? 1 : NibOpacity.disabled)
                 .frame(minHeight: NibMetrics.hitTarget)
                 .contentShape(Rectangle())

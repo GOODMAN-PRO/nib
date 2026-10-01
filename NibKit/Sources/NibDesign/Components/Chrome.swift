@@ -138,19 +138,45 @@ public struct NibHUD: View {
 public struct NibToolOptionsBar<Content: View>: View {
     let id: String
     let content: Content
+    let availableWidth: CGFloat?
+    @State private var contentWidth: CGFloat?
 
-    public init(id: String, @ViewBuilder content: () -> Content) {
+    /// `availableWidth` is the viewport after the caller removes its safe-area/chrome margins.
+    /// Omit it to retain the intrinsic sizing used by existing callers and measurement hosts.
+    public init(id: String, availableWidth: CGFloat? = nil, @ViewBuilder content: () -> Content) {
         self.id = id
+        self.availableWidth = availableWidth.map { NibGeometry.dimension($0) }
         self.content = content()
     }
 
     public var body: some View {
-        HStack(spacing: 0) { content }
-            .padding(.horizontal, NibSpacing.xs)
+        viewport
             .frame(height: NibMetrics.barHeight)
+            .clipShape(NibDropletShape())
             .nibChromeTypeCap()
             .droplet(id, style: .bar)
             .accessibilityElement(children: .contain)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 0) { content }
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, NibSpacing.xs)
+    }
+
+    @ViewBuilder private var viewport: some View {
+        if let availableWidth {
+            ScrollView(.horizontal) {
+                controls
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+            }
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            // Bound the first layout too: measurement must never expose an oversized capsule.
+            .frame(width: min(contentWidth ?? availableWidth, availableWidth))
+        } else {
+            controls
+        }
     }
 }
 

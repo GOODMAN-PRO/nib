@@ -8,6 +8,7 @@ struct LibrarySearchView: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
+    @State private var searchPresented = true
     var body: some View {
         NavigationStack {
             SearchResults(app: app, session: session, state: state)
@@ -15,10 +16,12 @@ struct LibrarySearchView: View {
                 .navigationTitle(String(localized: "Search"))
                 .navigationBarTitleDisplayMode(.inline)
                 .searchable(text: searchBinding(app: app, session: session, state: state),
+                    isPresented: $searchPresented,
                     placement: .navigationBarDrawer(displayMode: .always), prompt: String(localized: "Search your notes"))
+                .onChange(of: state.focusGeneration) { _, _ in searchPresented = true }
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        NibButton(String(localized: "Close search"), kind: .plain) {
+                        Button(String(localized: "Close search")) {
                             app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
                         }
                     }
@@ -33,36 +36,65 @@ struct LibrarySearchOverlay: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
-    @Environment(\.horizontalSizeClass) private var sizeClass
     var body: some View {
-        if sizeClass == .compact {
+        if SearchOpen.usesDocumentSheet {
             LibrarySearchView(app: app, session: session, state: state)
         } else {
-            GeometryReader { geometry in
-                let width = min(NibMetrics.searchWidth, geometry.size.width - NibSpacing.x3)
-                ZStack(alignment: .top) {
-                    NibColor.scrim.opacity(0)
-                        .contentShape(Rectangle())
-                        .onTapGesture { close() }
-                        .accessibilityHidden(true)
-                    VStack(spacing: NibSpacing.l) {
-                        HStack(spacing: NibSpacing.s) {
-                            SearchInput(app: app, session: session, state: state, style: .onDroplet)
-                            NibIconButton(.xmark, label: String(localized: "Close search"), action: close)
-                        }
-                        .padding(.trailing, NibSpacing.xs)
-                        .frame(width: width)
-                        .droplet("searchui.libraryField", style: .bar)
-                        .budsFrom("library.search", isPresented: presentationBinding, instant: state.instant)
-                        SearchResults(app: app, session: session, state: state)
-                            .frame(width: width)
-                            .frame(maxHeight: min(NibMetrics.searchResultsMaxHeight,
-                                max(NibMetrics.hitTarget, geometry.size.height - NibMetrics.barHeight - NibSpacing.x6)))
-                            .droplet("searchui.libraryResults", style: .panel)
-                            .budsFrom("searchui.libraryField", isPresented: presentationBinding, instant: state.instant)
+            LibrarySearchFloatingContent(app: app, session: session, state: state)
+        }
+    }
+}
+
+@MainActor
+struct LibrarySearchFloatingContent: View {
+    let app: NibApp
+    let session: EditorSession
+    @ObservedObject var state: SearchState
+    @State private var viewport: SearchViewport?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let bounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
+            let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
+                windowSize: viewport?.windowSize ?? geometry.size)
+            let top = NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
+            let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,
+                (viewport?.availableHeight ?? geometry.size.height) - bounds.minY) - top, reservesNavigation: false)
+            ZStack(alignment: .top) {
+                NibColor.scrim.opacity(0)
+                    .contentShape(Rectangle())
+                    .onTapGesture { close() }
+                    .accessibilityHidden(true)
+                VStack(spacing: NibSpacing.l) {
+                    HStack(spacing: NibSpacing.s) {
+                        SearchInput(app: app, session: session, state: state, style: .onDroplet)
+                            .frame(minWidth: 0, maxWidth: .infinity)
+                        NibIconButton(.xmark, label: String(localized: "Close search"), action: close)
                     }
-                    .padding(.top, NibSpacing.l)
+                    .padding(.trailing, NibSpacing.xs)
+                    .frame(width: width)
+                    .nibChromeTypeCap()
+                    .droplet("searchui.libraryField", style: .bar)
+                    .budsFrom("library.search", isPresented: presentationBinding, instant: state.instant)
+                    SearchResults(app: app, session: session, state: state)
+                        .frame(width: width)
+                        .frame(height: height)
+                        .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
+                        .droplet("searchui.libraryResults", style: .panel)
+                        .budsFrom("searchui.libraryField", isPresented: presentationBinding, instant: state.instant)
                 }
+                .frame(width: width)
+                .padding(.top, top)
+            }
+            // Fix the root proposal as well as the surfaces: intrinsic content must not
+            // expand the ZStack and move its centre outside the floating host's viewport.
+            .frame(width: bounds.width, height: bounds.height, alignment: .top)
+            .position(x: bounds.midX, y: bounds.midY)
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+            .background {
+                SearchViewportReader { viewport = $0 }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
         }
     }

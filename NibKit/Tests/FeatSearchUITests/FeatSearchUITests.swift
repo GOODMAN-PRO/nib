@@ -111,6 +111,199 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertEqual(state.countLabel, "0 matches")
     }
 
+    func testDocumentCounterStartsAtFirstMatchAndTracksNavigationFilterAndRefresh() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let first = hit(text: "First")
+        let ink = hit(Fixtures.page2, kind: "ink")
+        let last = hit(Fixtures.page2, text: "Last")
+        installDependencies(h, hits: [first, ink, last])
+        let editor = SearchTestEditor(h)
+        h.session.editor = editor
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+        let state = SearchRuntime.from(h.app).state(h.session)
+        XCTAssertEqual(state.selectedID, first.id)
+        XCTAssertEqual(state.countLabel, "1 of 3")
+        try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(state.selectedID, ink.id)
+        XCTAssertEqual(state.countLabel, "2 of 3")
+        XCTAssertEqual(editor.lastPage, Fixtures.page2)
+        try await h.run(CommandIDs.searchStep, ["direction": "previous"])
+        XCTAssertEqual(state.countLabel, "1 of 3")
+        try await h.run(CommandIDs.searchStep, ["direction": "previous"])
+        XCTAssertEqual(state.selectedID, last.id)
+        XCTAssertEqual(state.countLabel, "3 of 3")
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "refresh": true])
+        XCTAssertEqual(state.selectedID, last.id, "Index refresh must preserve the active hit")
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "filter": "handwriting"])
+        XCTAssertEqual(state.selectedID, ink.id, "Filtering out the current hit activates the first visible hit")
+        XCTAssertEqual(state.countLabel, "1 of 1")
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "filter": "pdf"])
+        XCTAssertNil(state.selectedID)
+        XCTAssertEqual(state.countLabel, "0 matches")
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "filter": "all"])
+        XCTAssertEqual(state.countLabel, "1 of 3")
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Hello"])
+        XCTAssertNil(state.selectedID, "Library results must not open or select a document automatically")
+        XCTAssertEqual(state.countLabel, "3 matches")
+    }
+
+    func testSearchViewportUsesWindowOrientationAndSpecifiedWidths() {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366),
+                     CGSize(width: 390, height: 834), CGSize(width: 600, height: 834)] {
+            let width = size.width - 2 * NibMetrics.chromeInset
+            XCTAssertEqual(SearchViewport.panelWidth(availableWidth: width, windowSize: size), width)
+        }
+        for size in [CGSize(width: 1194, height: 834), CGSize(width: 1366, height: 1024)] {
+            XCTAssertEqual(SearchViewport.panelWidth(availableWidth: size.width - 32, windowSize: size), 560)
+            XCTAssertEqual(SearchViewport.panelWidth(availableWidth: 500, windowSize: size), 500)
+        }
+        // Keyboard visibility must not turn an iPad portrait window into a landscape search layout.
+        let portrait = SearchViewport.measure(windowBounds: CGRect(x: 0, y: 0, width: 834, height: 1194),
+            safeArea: .zero, frame: CGRect(x: 16, y: 100, width: 802, height: 1094),
+            keyboard: CGRect(x: 0, y: 600, width: 834, height: 594))
+        XCTAssertEqual(SearchViewport.panelWidth(availableWidth: 802, windowSize: portrait.windowSize), 802)
+    }
+
+    func testResultsEndAboveKeyboardAndSeparateNavigationRows() {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834),
+                     CGSize(width: 390, height: 834)] {
+            let bounds = CGRect(origin: .zero, size: size)
+            let top: CGFloat = 100
+            let keyboard = CGRect(x: 0, y: size.height - 350, width: size.width, height: 350)
+            let column = CGRect(x: 16, y: top, width: size.width - 32, height: size.height - top)
+            let viewport = SearchViewport.measure(windowBounds: bounds, safeArea: .zero,
+                frame: column, keyboard: keyboard)
+            let height = SearchViewport.resultsHeight(availableHeight: viewport.availableHeight, reservesNavigation: true)
+            let resultsBottom = top + NibMetrics.barHeight + NibMetrics.minimumRestingGap + height
+            XCTAssertGreaterThan(height, 0, "Results remain scrollable while the keyboard is shown")
+            XCTAssertLessThanOrEqual(height, 600)
+            XCTAssertLessThanOrEqual(resultsBottom + 2 * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap),
+                keyboard.minY - NibMetrics.minimumRestingGap,
+                "Neither the match HUD nor the page HUD may overlap the results panel")
+            let dryHeight = SearchViewport.resultsHeight(availableHeight: viewport.availableHeight, reservesNavigation: false)
+            XCTAssertGreaterThan(dryHeight, height, "Library search does not reserve document HUD rows")
+        }
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 100, reservesNavigation: true), 0)
+        XCTAssertEqual(SearchViewport.resultsHeight(availableHeight: 2000, reservesNavigation: true), 600)
+    }
+
+    func testSearchWidthClampsOversizedProposalsToWindowMargins() {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 600, height: 834),
+                     CGSize(width: 390, height: 834), CGSize(width: 500, height: 400)] {
+            let expected = size.width - 2 * NibMetrics.chromeInset
+            for proposal in [size.width, size.width * 2, CGFloat.greatestFiniteMagnitude] {
+                XCTAssertEqual(SearchViewport.panelWidth(availableWidth: proposal, windowSize: size), expected)
+            }
+            XCTAssertEqual(SearchViewport.panelWidth(availableWidth: 280, windowSize: size), 280,
+                "A narrower host must remain authoritative")
+        }
+        XCTAssertEqual(SearchViewport.panelWidth(availableWidth: 2000,
+            windowSize: CGSize(width: 1194, height: 834)), 560)
+        XCTAssertEqual(SearchViewport.panelWidth(availableWidth: -10, windowSize: nil), 0)
+        XCTAssertEqual(SearchViewport.panelWidth(availableWidth: 500, windowSize: .zero), 0)
+    }
+
+    func testLibrarySearchCentresInsideVisibleHostIntersection() {
+        let window = CGRect(x: 0, y: 0, width: 834, height: 1194)
+        for host in [window, CGRect(x: -200, y: 0, width: 1400, height: 1194),
+                     CGRect(x: 100, y: 24, width: 600, height: 1100),
+                     CGRect(x: 100, y: 24, width: 1000, height: 1100)] {
+            let viewport = SearchViewport.measure(windowBounds: window, safeArea: .zero, frame: host, keyboard: nil)
+            let bounds = SearchViewport.hostBounds(proposedSize: host.size, viewport: viewport)
+            let visible = host.intersection(window)
+            XCTAssertEqual(bounds.offsetBy(dx: host.minX, dy: host.minY), visible)
+            let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
+                windowSize: viewport.windowSize)
+            let left = host.minX + bounds.midX - width / 2
+            XCTAssertEqual(left, visible.minX + NibMetrics.chromeInset)
+            XCTAssertEqual(left + width, visible.maxX - NibMetrics.chromeInset)
+        }
+        XCTAssertEqual(SearchViewport.hostBounds(proposedSize: window.size, viewport: nil), window)
+        let outside = SearchViewport.measure(windowBounds: window, safeArea: .zero,
+            frame: window.offsetBy(dx: window.width, dy: 0), keyboard: nil)
+        XCTAssertEqual(SearchViewport.hostBounds(proposedSize: window.size, viewport: outside), .zero)
+    }
+
+    func testLibrarySearchKeepsPortraitWidthWhenKeyboardChangesVisibleHeight() {
+        let window = CGRect(x: 0, y: 0, width: 834, height: 1194)
+        let keyboard = CGRect(x: 0, y: 600, width: 834, height: 594)
+        let top = NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
+        for keyboardFrame: CGRect? in [nil, keyboard, nil] {
+            let viewport = SearchViewport.measure(windowBounds: window, safeArea: .zero,
+                frame: window, keyboard: keyboardFrame)
+            let bounds = SearchViewport.hostBounds(proposedSize: CGSize(width: 834, height: 700), viewport: viewport)
+            XCTAssertEqual(bounds.midX, 417)
+            XCTAssertEqual(SearchViewport.panelWidth(availableWidth: bounds.width - 32,
+                windowSize: viewport.windowSize), 802)
+            let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height, viewport.availableHeight) - top,
+                reservesNavigation: false)
+            let bottom = top + NibMetrics.barHeight + NibMetrics.minimumRestingGap + height
+            XCTAssertLessThanOrEqual(bottom, keyboardFrame.map { $0.minY - NibMetrics.minimumRestingGap } ?? bounds.maxY)
+        }
+    }
+
+    func testSearchViewportIgnoresKeyboardOutsideItsWindowColumn() {
+        let bounds = CGRect(x: 0, y: 0, width: 1194, height: 834)
+        let column = CGRect(x: 317, y: 100, width: 560, height: 734)
+        let safe = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
+        let clear = SearchViewport.measure(windowBounds: bounds, safeArea: safe, frame: column, keyboard: nil)
+        XCTAssertEqual(clear.availableHeight, 698)
+        for keyboard in [CGRect(x: 0, y: 834, width: 1194, height: 350),
+                         CGRect(x: 0, y: 400, width: 300, height: 300)] {
+            XCTAssertEqual(SearchViewport.measure(windowBounds: bounds, safeArea: safe,
+                frame: column, keyboard: keyboard), clear)
+        }
+        let floating = SearchViewport.measure(windowBounds: bounds, safeArea: safe, frame: column,
+            keyboard: CGRect(x: 500, y: 400, width: 300, height: 300))
+        XCTAssertEqual(floating.availableHeight, 284)
+    }
+
+    func testViewportReaderRespondsToKeyboardFrameAndDismissal() async throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1194, height: 834))
+        var measured: SearchViewport?
+        let sensor = SearchViewportReader.Sensor { measured = $0 }
+        sensor.frame = CGRect(x: 16, y: 100, width: 1162, height: 700)
+        window.addSubview(sensor)
+        sensor.layoutIfNeeded()
+        for _ in 0..<10 { await Task.yield() }
+        let initial = try XCTUnwrap(measured)
+        let keyboard = window.convert(CGRect(x: 0, y: 484, width: 1194, height: 350),
+            to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillChangeFrameNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: keyboard)])
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(try XCTUnwrap(measured).availableHeight, 368)
+        let hidden = window.convert(CGRect(x: 0, y: 834, width: 1194, height: 350),
+            to: window.screen.coordinateSpace)
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil,
+            userInfo: [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: hidden)])
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(measured, initial)
+        sensor.removeFromSuperview()
+    }
+
+    func testViewportReaderRecalculatesVisibleBoundsAfterHostAndWindowResize() async throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        var measured: SearchViewport?
+        let sensor = SearchViewportReader.Sensor { measured = $0 }
+        window.addSubview(sensor)
+        defer { sensor.removeFromSuperview() }
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834),
+                     CGSize(width: 600, height: 834), CGSize(width: 834, height: 1194)] {
+            window.frame = CGRect(origin: .zero, size: size)
+            // An oversized, offset host must still centre in this window after rotation or Split View resizing.
+            sensor.frame = CGRect(x: -100, y: 0, width: size.width + 200, height: size.height)
+            sensor.setNeedsLayout()
+            sensor.layoutIfNeeded()
+            for _ in 0..<10 { await Task.yield() }
+            let viewport = try XCTUnwrap(measured)
+            XCTAssertEqual(viewport.windowSize, size)
+            XCTAssertEqual(viewport.visibleBounds, CGRect(x: 100, y: 0, width: size.width, height: size.height))
+            XCTAssertEqual(SearchViewport.panelWidth(availableWidth: sensor.bounds.width, windowSize: viewport.windowSize),
+                size.width > size.height ? 560 : size.width - 32)
+        }
+    }
+
     func testResultNavigatesExactPageRectAndDoesNotCreateUndoSteps() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let hits = [hit(), hit(Fixtures.page2)]
@@ -223,7 +416,7 @@ final class FeatSearchUITests: XCTestCase {
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertEqual(calls, 1)
         XCTAssertEqual(state.matches.count, 1)
-        try await h.run(CommandIDs.searchOpen, ["scope": "document", "match": 0])
+        XCTAssertEqual(state.selectedID, first.id)
         try await h.run(CommandIDs.searchStep, ["direction": "next"])
         XCTAssertEqual(calls, 2)
         XCTAssertEqual(state.matches.count, 2)
@@ -419,8 +612,12 @@ final class FeatSearchUITests: XCTestCase {
         try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertEqual(state.matches, [first, second])
+        XCTAssertEqual(state.selectedID, first.id)
         try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(state.selectedID, second.id)
         try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(state.selectedID, first.id)
+        try await h.run(CommandIDs.searchStep, ["direction": "previous"])
         XCTAssertEqual(state.selectedID, second.id)
     }
 
@@ -492,6 +689,9 @@ final class FeatSearchUITests: XCTestCase {
         let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get("searchui.document"))
         XCTAssertEqual(overlay.placement, .top)
         XCTAssertEqual(overlay.surface, .none)
+        let counter = try XCTUnwrap(h.app.ui.chromeOverlays.get("searchui.counter"))
+        XCTAssertEqual(counter.placement, .bottom, "Navigation lives outside the top results panel")
+        XCTAssertEqual(counter.surface, .none, "The counter supplies its own HUD droplet")
         XCTAssertNil(h.app.ui.chromeOverlays.get("searchui.field"), "The field must not be hosted separately from results")
         let toolbar = try XCTUnwrap(h.app.ui.toolbar.get("searchui.find"))
         XCTAssertEqual(toolbar.isOn?(h.session), false)
@@ -503,6 +703,8 @@ final class FeatSearchUITests: XCTestCase {
         for compact in [false, true] {
             let context = ChromeContext(app: h.app, session: h.session, kind: .notebook, isCompact: compact)
             XCTAssertEqual(overlay.isVisible(context), !SearchOpen.usesDocumentSheet)
+            XCTAssertEqual(counter.isVisible(context), !SearchOpen.usesDocumentSheet,
+                "iPhone system search must not retain a floating match HUD")
         }
 
         try await h.run(CommandIDs.searchOpen, ["scope": "document", "close": true])
@@ -513,6 +715,22 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertFalse(h.session.openPanels.contains(SearchOpen.documentPanel))
         XCTAssertEqual(toolbar.isOn?(h.session), false)
         XCTAssertFalse(overlay.isVisible(ChromeContext(app: h.app, session: h.session)))
+    }
+
+    func testLibrarySearchUsesNativePhonePanelEvenWhenFloatingHostExists() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [hit()])
+        let host = SearchTestFloatingHost()
+        h.session.floatingHost = host
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Hello"])
+        XCTAssertEqual(h.session.openPanels.contains(SearchOpen.libraryPanel), SearchOpen.usesDocumentSheet)
+        XCTAssertEqual(host.isPresenting(SearchOpen.libraryOverlay), !SearchOpen.usesDocumentSheet)
+        let panel = try XCTUnwrap(h.app.ui.panels.get(SearchOpen.libraryPanel))
+        XCTAssertEqual(panel.placement, .fullScreen)
+        XCTAssertTrue(panel.providesHeader, "Search owns the native navigation/search field and dismissal")
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "close": true])
+        XCTAssertFalse(host.isPresenting(SearchOpen.libraryOverlay))
+        XCTAssertFalse(h.session.openPanels.contains(SearchOpen.libraryPanel))
     }
 
     func testDocumentSearchFieldAndResultsFillPortraitAndSplitViewWidth() {
@@ -542,6 +760,72 @@ final class FeatSearchUITests: XCTestCase {
                 attachment.lifetime = .keepAlways
                 add(attachment)
             } else { XCTFail("Portrait document search did not render") }
+        }
+    }
+
+    func testLibrarySearchForegroundFitsFloatingHostAfterResize() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.scope = "lib"
+        state.query = "Hello notes"
+        state.matches = [hit()]
+        state.isPresented = true
+        state.instant = true
+        let floating = NibFloatingHost()
+        floating.present("searchui.library") {
+            LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+        }
+        let content = NibDropletContainer { NibFloatingLayer(host: floating) }
+            .environment(\.colorScheme, .dark)
+            .ignoresSafeArea(.container)
+        let host = UIHostingController(rootView: content)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+
+        func descendants<T: UIView>(_ type: T.Type, in view: UIView) -> [T] {
+            ((view as? T).map { [$0] } ?? [])
+                + view.subviews.flatMap { descendants(type, in: $0) }
+        }
+
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 600, height: 834),
+                     CGSize(width: 1194, height: 834), CGSize(width: 834, height: 1194)] {
+            window.frame = CGRect(origin: .zero, size: size)
+            host.view.frame = window.bounds
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            // The viewport and droplet rest frames publish on later main-loop turns.
+            try await Task.sleep(nanoseconds: 500_000_000)
+            host.view.layoutIfNeeded()
+            let input = try XCTUnwrap(descendants(UITextField.self, in: host.view).first { $0.text == state.query })
+            let results = try XCTUnwrap(descendants(UIScrollView.self, in: host.view)
+                .filter { $0.bounds.height > NibMetrics.barHeight }
+                .max { $0.bounds.height < $1.bounds.height })
+            // Resizing reflows live droplets. Measure their resting geometry after the real
+            // display-link springs settle, rather than assuming a loaded simulator finishes in 0.5 s.
+            var previousFrames: [CGRect] = []
+            var stableSamples = 0
+            for _ in 0..<30 {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                host.view.layoutIfNeeded()
+                let frames = [input.convert(input.bounds, to: window), results.convert(results.bounds, to: window)]
+                stableSamples = frames == previousFrames ? stableSamples + 1 : 0
+                previousFrames = frames
+                if stableSamples >= 3 { break }
+            }
+            XCTAssertGreaterThanOrEqual(stableSamples, 3, "Search geometry must settle after resizing")
+            let inputFrame = input.convert(input.bounds, to: window)
+            XCTAssertGreaterThan(inputFrame.width, 0)
+            XCTAssertGreaterThanOrEqual(inputFrame.minX, NibMetrics.chromeInset)
+            XCTAssertLessThanOrEqual(inputFrame.maxX, size.width - NibMetrics.chromeInset - NibMetrics.hitTarget,
+                "The query must leave room for the Close search control inside the window")
+            let resultsFrame = results.convert(results.bounds, to: window)
+            let expectedWidth = size.width > size.height ? NibMetrics.searchWidth : size.width - 2 * NibMetrics.chromeInset
+            XCTAssertEqual(resultsFrame.width, expectedWidth, accuracy: 1)
+            XCTAssertEqual(resultsFrame.midX, size.width / 2, accuracy: 1)
+            XCTAssertGreaterThanOrEqual(resultsFrame.minX, NibMetrics.chromeInset - 1)
+            XCTAssertLessThanOrEqual(resultsFrame.maxX, size.width - NibMetrics.chromeInset + 1)
         }
     }
 
@@ -612,4 +896,16 @@ private final class SearchTestEditor: DocumentEditing {
     init(_ h: Harness) { session = h.session }
     func reveal(page: PageID, rect: Rect?, animated: Bool) { lastPage = page; lastRect = rect; self.animated = animated }
     func reloadAll() {}
+}
+
+@MainActor
+private final class SearchTestFloatingHost: FloatingHosting {
+    private var presented = Set<String>()
+    func present(_ id: String, content: AnyView) { presented.insert(id) }
+    func dismiss(_ id: String) { presented.remove(id) }
+    func isPresenting(_ id: String) -> Bool { presented.contains(id) }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { nil }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
 }

@@ -6,15 +6,13 @@ import NibDesign
 
 // MARK: - Layout
 
-/// The tab strip above the document chrome: one Clear droplet, centred, holding the Library button and
-/// up to five 32 pt tab capsules (DESIGN.md §14.2); tabs that do not fit go into a "N more" menu, and the current tab
-/// is always among the visible ones. Pure, so it is unit-tested.
+/// The tab strip between the document bars: one Clear droplet holding up to five 32 pt capsules (§14.2).
+/// The current tab stays visible whenever a capsule fits; the Tabs menu always reaches every document.
+/// The library's standalone strip includes its own Library button and overflow. Pure, so it is unit-tested.
 enum TabStripLayout {
     static let dropletID = "windows.tabs"
     /// Visual height; the legacy library host also receives this height from the shell.
-    static let stripHeight: CGFloat = 36
-    /// Until chrome exposes a centre slot, its bars sit a full droplet gap below the tabs.
-    static let documentTopInset = stripHeight + NibSpacing.l
+    static let stripHeight = NibMetrics.tabCapsuleHeight + 2 * NibSpacing.xxs
     static let tabHeight = NibMetrics.tabCapsuleHeight
     /// Tab capsules sit concentric inside the droplet.
     static let inset: CGFloat = (stripHeight - tabHeight) / 2
@@ -42,6 +40,39 @@ enum TabStripLayout {
     /// (`editing.openAsTabs`) is separate: restored tabs never force chrome on, and one document needs no strip.
     static func showsStrip(tabCount: Int, enabled: Bool) -> Bool {
         enabled && tabCount > 1
+    }
+
+    /// The after-title Tabs menu measures the actual end of the leading bar, including title/status width.
+    /// Reserve the complete §14.2 trailing group (six 44 pt controls, separator, padding, assistant and gap),
+    /// even when some actions are unavailable. Compact chrome has three controls and no separate assistant.
+    /// This conservative envelope avoids coupling F018 to another feature's live action model.
+    static func documentSlot(control: CGRect, bounds: CGRect, compact: Bool, rightToLeft: Bool) -> CGRect {
+        let trailingWidth = compact
+            ? 3 * NibMetrics.hitTarget + 2 * NibSpacing.xs
+            : 7 * NibMetrics.hitTarget + separatorWidth + 2 * NibSpacing.xs + NibSpacing.l
+        let controlEdge = rightToLeft ? control.minX : control.maxX
+        let start = rightToLeft
+            ? bounds.minX + NibMetrics.chromeInset + trailingWidth + NibSpacing.l
+            : controlEdge + NibSpacing.xs + NibSpacing.l
+        let end = rightToLeft
+            ? controlEdge - NibSpacing.xs - NibSpacing.l
+            : bounds.maxX - NibMetrics.chromeInset - trailingWidth - NibSpacing.l
+        return CGRect(x: start, y: control.midY - stripHeight / 2,
+                      width: max(0, end - start), height: stripHeight)
+    }
+
+    /// Document chrome already supplies Library and the Tabs menu. Spend only the measured gap on capsules;
+    /// when none fit, every document stays reachable through that menu, without squeezing a tab below its minimum.
+    static func documentPlan(count: Int, active: Int?, width: CGFloat, compact: Bool) -> Plan {
+        let widths = tabWidths(compact: compact)
+        let available = max(0, width - 2 * inset)
+        let slots = min(max(0, count), maxTabs, Int(available / widths.lowerBound))
+        var shown = Array(0..<slots)
+        if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }
+        let hidden = (0..<max(0, count)).filter { !shown.contains($0) }
+        let tabWidth = slots == 0 ? 0 : min(widths.upperBound, available / CGFloat(slots))
+        return Plan(shown: shown, hidden: hidden, tabWidth: tabWidth,
+                    dropletWidth: slots == 0 ? 0 : 2 * inset + CGFloat(slots) * tabWidth)
     }
 
     static func plan(count: Int, active: Int?, width: CGFloat) -> Plan {
@@ -209,11 +240,13 @@ final class TabStripModel: ObservableObject {
 
 struct TabStripView: View {
     @ObservedObject var model: TabStripModel
+    var documentPlan: TabStripLayout.Plan? = nil
 
     var body: some View {
         GeometryReader { proxy in
             if model.isVisible {
-                let plan = TabStripLayout.plan(count: model.tabs.count, active: model.activeIndex, width: proxy.size.width)
+                let plan = documentPlan ?? TabStripLayout.plan(count: model.tabs.count, active: model.activeIndex,
+                                                               width: proxy.size.width)
                 strip(plan)
                     .frame(width: proxy.size.width, height: proxy.size.height)
             }
@@ -223,15 +256,17 @@ struct TabStripView: View {
 
     private func strip(_ plan: TabStripLayout.Plan) -> some View {
         HStack(spacing: 0) {
-            NibIconButton(.library, label: String(localized: "Library"), size: .bar, isOn: model.showsLibrary) {
-                model.showLibrary()
+            if documentPlan == nil {
+                NibIconButton(.library, label: String(localized: "Library"), size: .bar, isOn: model.showsLibrary) {
+                    model.showLibrary()
+                }
+                NibBarSeparator()
             }
-            NibBarSeparator()
             ForEach(plan.shown, id: \.self) { index in
                 TabCapsule(tab: model.tabs[index], count: model.tabs.count, isSelected: model.selectedIndex == index,
                            width: plan.tabWidth, model: model)
             }
-            if !plan.hidden.isEmpty {
+            if documentPlan == nil, !plan.hidden.isEmpty {
                 overflowMenu(plan.hidden)
             }
         }
@@ -376,14 +411,18 @@ struct TabDrag: ViewModifier {
 
 // MARK: - Document floating host
 
-/// Uses the contracts-v2 floating host, so tabs share the bars' container, backdrop and Pencil recede behaviour.
-/// The extra safe area moves chrome, not the full-bleed document frame. Only this feature's contribution is removed.
+/// Uses the existing floating host for the third droplet. The after-title menu is both the overflow fallback
+/// and the measurement anchor; document safe areas and the bars' vertical positions never change.
 @MainActor
 final class TabStripDocumentPresentation: ObservableObject {
     private(set) weak var controller: UIViewController?
     private(set) weak var host: FloatingHosting?
-    @Published private(set) var top: CGFloat = 0
-    private var reservedTop: CGFloat = 0
+    private var anchorFrame: CGRect?
+    private var containerFrame: CGRect?
+    private var rightToLeft = false
+    private(set) var model: TabStripModel?
+    @Published private(set) var slot: CGRect = .zero
+    @Published private(set) var compact = false
 
     init(controller: UIViewController, host: FloatingHosting) {
         self.controller = controller
@@ -391,26 +430,49 @@ final class TabStripDocumentPresentation: ObservableObject {
     }
 
     func present(_ model: TabStripModel) {
-        guard let controller, let host else { return }
-        let required = TabStripLayout.documentTopInset
-        controller.additionalSafeAreaInsets.top += required - reservedTop
-        reservedTop = required
-        updateGeometry()
+        guard controller != nil, let host else { return }
+        self.model = model
         host.present(TabStripLayout.dropletID, content: AnyView(TabStripDocumentView(model: model, placement: self)))
     }
 
     func dismiss() {
-        if let controller {
-            controller.additionalSafeAreaInsets.top -= reservedTop
-        }
-        reservedTop = 0
+        model = nil
+        anchorFrame = nil
+        containerFrame = nil
+        slot = .zero
         host?.dismiss(TabStripLayout.dropletID)
     }
 
-    func updateGeometry() {
-        guard let controller, let view = controller.viewIfLoaded else { return }
-        let value = max(0, view.safeAreaInsets.top - reservedTop)
-        if top != value { top = value }
+    /// Both measurements come from final SwiftUI layout in NibLiquid.space, the floating host's coordinates.
+    /// A UIViewRepresentable background can still have zero/ideal bounds when the menu is already laid out;
+    /// reading those bounds (or waiting for UIKit conversion to attach) must not suppress valid capsules.
+    func updateAnchor(_ frame: CGRect, compact: Bool, rightToLeft: Bool) {
+        anchorFrame = usable(frame) ? frame : nil
+        self.rightToLeft = rightToLeft
+        if self.compact != compact { self.compact = compact }
+        refreshGeometry()
+    }
+
+    func updateContainer(_ frame: CGRect) {
+        containerFrame = usable(frame) ? frame : nil
+        refreshGeometry()
+    }
+
+    func refreshGeometry() {
+        guard let anchor = anchorFrame, let container = containerFrame,
+              let view = controller?.viewIfLoaded else {
+            if slot != .zero { slot = .zero }
+            return
+        }
+        let bounds = container.inset(by: view.safeAreaInsets)
+        let value = TabStripLayout.documentSlot(control: anchor, bounds: bounds, compact: compact,
+                                               rightToLeft: rightToLeft)
+        if slot != value { slot = value }
+    }
+
+    private func usable(_ frame: CGRect) -> Bool {
+        !frame.isNull && !frame.isInfinite && frame.origin.x.isFinite && frame.origin.y.isFinite
+            && frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
     }
 }
 
@@ -419,36 +481,106 @@ private struct TabStripDocumentView: View {
     @ObservedObject var placement: TabStripDocumentPresentation
 
     var body: some View {
-        GeometryReader { proxy in
-            TabStripView(model: model)
-                .frame(width: proxy.size.width, height: TabStripLayout.stripHeight)
-                .position(x: proxy.size.width / 2,
-                          y: placement.top + NibMetrics.barTopGap + TabStripLayout.stripHeight / 2)
+        let slot = placement.slot
+        let plan = TabStripLayout.documentPlan(count: model.tabs.count, active: model.activeIndex,
+                                               width: slot.width, compact: placement.compact)
+        // Keep the measurement surface mounted even while the first layout has no slot. Otherwise the
+        // menu-only state cannot recover when the floating layer attaches or the window gains enough room.
+        ZStack(alignment: .topLeading) {
+            TabStripLayoutReader(placement: placement)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            if !plan.shown.isEmpty {
+                TabStripView(model: model, documentPlan: plan)
+                    .frame(width: slot.width, height: TabStripLayout.stripHeight)
+                    .position(x: slot.midX, y: slot.midY)
+            }
         }
-        .background(TabStripSafeAreaReader(placement: placement).allowsHitTesting(false))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: NibLiquid.space)
+        } action: { frame in
+            placement.updateContainer(frame)
+        }
     }
 }
 
-/// SwiftUI's floating layer ignores the safe area. Read UIKit's actual document safe area instead, and follow
-/// status-bar changes, rotation and Stage Manager resizing without creating another hosting controller/container.
-private struct TabStripSafeAreaReader: UIViewRepresentable {
+/// The existing after-title extension point provides a surface-free 44 pt menu. It remains available even when
+/// a long title, Dynamic Type, Split View or Stage Manager leaves no room for a separate tab capsule.
+struct DocumentTabsMenu: View {
+    @ObservedObject var model: TabStripModel
+    let placement: TabStripDocumentPresentation
+    let compact: Bool
+    @Environment(\.layoutDirection) private var layoutDirection
+
+    var body: some View {
+        Menu {
+            Button(String(localized: "Library")) { model.showLibrary() }
+            ForEach(model.tabs) { tab in
+                Button { model.select(tab.index) } label: {
+                    if tab.index == model.selectedIndex {
+                        Label { Text(tab.title) } icon: { Image(nib: .checkmark) }
+                    } else {
+                        Text(tab.title)
+                    }
+                }
+            }
+            if let active = model.tabs.first(where: { $0.index == model.selectedIndex }) {
+                Divider()
+                TabMenu(items: model.menuItems(active)) { model.run($0, on: active) }
+            }
+        } label: {
+            Image(nib: .templates)
+                .font(NibFont.glyph(.bar))
+                .foregroundStyle(NibColor.label)
+                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+                .contentShape(Rectangle())
+        }
+        .menuIndicator(.hidden)
+        .menuStyle(.button)
+        .buttonStyle(NibPressStyle(shape: Capsule()))
+        .accessibilityLabel(String(localized: "Tabs"))
+        .accessibilityValue(String(localized: "\(model.tabs.count) open documents"))
+        .background {
+            GeometryReader { proxy in
+                let frame = proxy.frame(in: NibLiquid.space)
+                Color.clear
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { frame in
+                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                    }
+                    .onChange(of: compact) { _, compact in
+                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                    }
+                    .onChange(of: layoutDirection) { _, direction in
+                        placement.updateAnchor(frame, compact: compact, rightToLeft: direction == .rightToLeft)
+                    }
+            }
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+/// Final UIKit attachment/layout can follow SwiftUI's geometry callbacks. Refresh the safe-area-dependent
+/// bounds then as well, without using this representable's proposed size as the menu's measured frame.
+private struct TabStripLayoutReader: UIViewRepresentable {
     let placement: TabStripDocumentPresentation
 
-    func makeUIView(context: Context) -> TabStripSafeAreaView {
-        let view = TabStripSafeAreaView()
+    func makeUIView(context: Context) -> TabStripLayoutView {
+        let view = TabStripLayoutView()
         view.placement = placement
         view.isUserInteractionEnabled = false
         return view
     }
 
-    func updateUIView(_ view: TabStripSafeAreaView, context: Context) {
+    func updateUIView(_ view: TabStripLayoutView, context: Context) {
         view.placement = placement
         view.scheduleUpdate()
     }
 }
 
-private final class TabStripSafeAreaView: UIView {
+private final class TabStripLayoutView: UIView {
     weak var placement: TabStripDocumentPresentation?
+    private var updateScheduled = false
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -466,7 +598,13 @@ private final class TabStripSafeAreaView: UIView {
     }
 
     func scheduleUpdate() {
-        Task { @MainActor [weak placement] in placement?.updateGeometry() }
+        guard !updateScheduled else { return }
+        updateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            updateScheduled = false
+            placement?.refreshGeometry()
+        }
     }
 }
 

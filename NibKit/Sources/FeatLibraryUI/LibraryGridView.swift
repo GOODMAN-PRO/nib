@@ -24,8 +24,8 @@ enum LibraryCarrierVisibility {
 enum LibraryFolderLayout {
     static func minimumWidth(names: [String], font: UIFont) -> CGFloat {
         let textWidth = names.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
-        // Reserve a full hit target for the folder glyph plus the tile's gap and horizontal insets.
-        return max(NibMetrics.folderTileMinWidth, ceil(textWidth) + NibMetrics.hitTarget + NibSpacing.m + 2 * NibSpacing.l)
+        // Budget for wide custom glyphs and text rounding before adding another folder column.
+        return max(NibMetrics.folderTileMinWidth, ceil(textWidth) + NibMetrics.barHeightMax + NibSpacing.m + 2 * NibSpacing.l + NibSpacing.s)
     }
 
     static func columnCount(width: CGFloat, minimum: CGFloat, gutter: CGFloat) -> Int {
@@ -53,6 +53,7 @@ extension View {
 
 struct LibraryGridView: View {
     @ObservedObject var model: LibraryViewModel
+    var compactHeight = false
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var contentWidth: CGFloat = 0
     @State private var frames: [String: CGRect] = [:]
@@ -69,7 +70,7 @@ struct LibraryGridView: View {
                     secondary: NibAction(String(localized: "Import")) { model.perform(CommandIDs.importPick, model.folder == nil ? [:] : ["folder": model.folderRef]) })
             } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    VStack(alignment: .leading, spacing: NibMetrics.libraryGutter) {
+                    VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : NibMetrics.libraryGutter) {
                         if model.layout == .list { list }
                         else { grid }
                     }
@@ -98,7 +99,7 @@ struct LibraryGridView: View {
                     })
                     .onPreferenceChange(LibraryFrames.self) { frames = $0 }
                     .simultaneousGesture(selectionGesture, including: model.selection.isSelecting ? .all : .subviews)
-                    .padding(.bottom, NibMetrics.canvasBottomInsetCompact)
+                    .padding(.bottom, NibSpacing.l)
                 }
                 .overlay {
                     if model.visibleRows.isEmpty {
@@ -131,19 +132,34 @@ struct LibraryGridView: View {
         return Array(repeating: GridItem(.fixed(width), spacing: gutter, alignment: .top), count: count)
     }
     @ViewBuilder private var grid: some View {
+        if compactHeight && !folders.isEmpty && !documents.isEmpty && !dynamicTypeSize.isAccessibilitySize {
+            HStack(alignment: .top, spacing: gutter) {
+                VStack(alignment: .leading, spacing: NibSpacing.s) { folderSection }
+                    .frame(width: min(contentWidth / 2, NibMetrics.folderTileMinWidth * 2))
+                VStack(alignment: .leading, spacing: NibSpacing.s) { documentSection }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else {
+            folderSection
+            documentSection
+        }
+    }
+    @ViewBuilder private var folderSection: some View {
         if !folders.isEmpty {
-            Text(String(localized: "Folders")).font(NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: folderColumns, alignment: .leading, spacing: gutter) {
+            Text(String(localized: "Folders")).font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
+            LazyVGrid(columns: compactHeight ? [GridItem(.flexible())] : folderColumns, alignment: .leading, spacing: gutter) {
                 ForEach(folders) { row in
                     cell(row)
                         .nibReflowDraggable(row.ref, in: model.folderReflow, order: model.folderRefs) { model.drop($0) }
                 }
             }
         }
+    }
+    @ViewBuilder private var documentSection: some View {
         if !documents.isEmpty {
             Text(documents.allSatisfy { $0.kind == "notebook" } ? String(localized: "Notebooks") : String(localized: "Documents"))
-                .font(NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: coverColumns, alignment: .leading, spacing: gutter) {
+                .font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
+            LazyVGrid(columns: compactHeight ? [GridItem(.adaptive(minimum: coverWidth), spacing: gutter, alignment: .top)] : coverColumns, alignment: .leading, spacing: gutter) {
                 ForEach(documents) { row in
                     cell(row)
                         .nibReflowDraggable(row.ref, in: model.reflow, order: model.documentRefs) { model.drop($0) }
@@ -262,8 +278,8 @@ struct LibraryCard: View {
         if let row {
             if row.isFolder {
                 NibFolderTile(name: row.name, count: row.items.map(LibraryRow.itemCount) ?? String(localized: "Folder"),
-                    color: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) } ?? NibColor.labelSecondary,
-                    glyph: row.icon.flatMap { NibSymbol(systemName: $0).map(NibFolderGlyph.symbol) } ?? row.icon.map(NibFolderGlyph.emoji) ?? .symbol(.folderFill),
+                    color: row.folderColor,
+                    glyph: row.folderGlyph,
                     isTargeted: model.hasLibraryDrag, isFused: model.dropTarget == row.ref)
                     .overlay(alignment: .topTrailing) {
                         if model.selection.isSelecting { NibBadge(.type(model.selection.refs.contains(row.ref) ? .checkCircleFill : .circle)).padding(NibSpacing.xs) }
@@ -336,7 +352,10 @@ struct LibraryListRow: View {
     var subtitle: String? = nil
     var body: some View {
         HStack(spacing: NibSpacing.l) {
-            if row.isFolder { Image(nib: .folderFill).foregroundStyle(NibColor.labelSecondary) }
+            if row.isFolder {
+                NibFolderGlyphView(glyph: row.folderGlyph, color: row.folderColor, size: NibMetrics.rowThumbnailWidth)
+                    .frame(width: NibMetrics.rowThumbnailWidth)
+            }
             else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
                 .libraryCoverFrame(row.ref) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
@@ -432,5 +451,16 @@ private extension DynamicTypeSize {
         case .accessibility5: .accessibilityExtraExtraExtraLarge
         @unknown default: .large
         }
+    }
+}
+
+// Tiles and rows resolve exactly the same persisted style, including user emoji.
+extension LibraryRow {
+    var folderGlyph: NibFolderGlyph {
+        icon.flatMap { NibSymbol(systemName: $0).map(NibFolderGlyph.symbol) }
+            ?? icon.map(NibFolderGlyph.emoji) ?? .symbol(.folderFill)
+    }
+    var folderColor: Color {
+        color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) } ?? NibColor.labelSecondary
     }
 }

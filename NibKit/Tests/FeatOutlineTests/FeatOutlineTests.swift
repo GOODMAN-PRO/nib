@@ -1,6 +1,8 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatOutline
 
@@ -61,6 +63,8 @@ final class FeatOutlineTests: XCTestCase {
         // DESIGN.md §14.4: Pages · Outline · Bookmarks, ahead of Audio (300) and the other sidebar tabs.
         XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.outline)?.order, 200)
         XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.bookmarks)?.order, 210)
+        XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.outline)?.providesHeader, true,
+                       "Outline owns its adaptive heading so chrome accessories cannot compress its title")
 
         // The nav-bar bookmark button, in notebooks only (the chrome drops its own button for page.setBookmarked).
         let nav = h.app.ui.toolbar.get(OutlinePanels.bookmarkNavItem)
@@ -526,6 +530,68 @@ final class FeatOutlineTests: XCTestCase {
         let indent = try XCTUnwrap(h.app.ui.menuItems(.outlineEntry, entry).first { $0.id == "outline.entry.indent" })
         try await h.run(indent.command, indent.params(entry))
         XCTAssertEqual(try tree(h).parent(of: id), Fixtures.outlineID)
+    }
+
+    // MARK: Panel layout
+
+    func testNavigatorHeadingKeepsItsTitleReadableAndReflowsAccessories() {
+        let h = harness()
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        for title in ["Outline", "Gliederung"] {
+            for typeSize in [DynamicTypeSize.large, .accessibility3] {
+                let text = UIHostingController(rootView: Text(title).font(NibFont.headline)
+                    .fixedSize().environment(\.dynamicTypeSize, typeSize))
+                let idealTitle = text.sizeThatFits(in: CGSize(width: 1_000, height: 1_000))
+                for width in [NibMetrics.navigatorWidth, NibMetrics.panelWidthAccessibility] {
+                    let header = UIHostingController(rootView: OutlinePanelHeader(model: model, dismiss: {}, title: title)
+                        .environment(\.dynamicTypeSize, typeSize))
+                    let fitted = header.sizeThatFits(in: CGSize(width: width, height: 1_000))
+                    let fitsInline = idealTitle.width + NibSpacing.s + 2 * NibMetrics.hitTarget
+                        + 2 * NibSpacing.m <= width
+                    let expectedHeight = fitsInline
+                        ? max(idealTitle.height, NibMetrics.hitTarget) + 2 * NibSpacing.s
+                        : idealTitle.height + NibSpacing.xs + NibMetrics.hitTarget + 2 * NibSpacing.s
+                    XCTAssertLessThanOrEqual(fitted.width, width + 1, "\(title), \(typeSize)")
+                    XCTAssertEqual(fitted.height, expectedHeight, accuracy: 1,
+                                   "Keep the full heading on one line; put accessories below when needed")
+                }
+            }
+        }
+    }
+
+    /// Capture both Add entry placements at the actual navigator width for the design review, including AX3.
+    func testOutlinePanelNarrowLayoutReviewImages() async throws {
+        let h = harness()
+        for empty in [false, true] {
+            if empty { try await h.run("outline.delete", ["entry": entryRef(Fixtures.outlineID)]) }
+            for typeSize in [DynamicTypeSize.large, .accessibility3] {
+                for scheme in [ColorScheme.light, .dark] {
+                    let context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+                    let host = UIHostingController(rootView: OutlinePanel(context: context)
+                        .environment(\.dynamicTypeSize, typeSize)
+                        .environment(\.colorScheme, scheme)
+                        .background(NibColor.backgroundSecondary)
+                        .ignoresSafeArea())
+                    let size = CGSize(width: NibMetrics.navigatorWidth, height: 640)
+                    let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                    window.rootViewController = host
+                    window.isHidden = false
+                    defer { window.isHidden = true; window.rootViewController = nil }
+                    host.view.frame = window.bounds
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(100))
+                    host.view.layoutIfNeeded()
+                    let image = UIGraphicsImageRenderer(size: size).image { renderer in
+                        host.view.layer.render(in: renderer.cgContext)
+                    }
+                    let attachment = XCTAttachment(image: image)
+                    attachment.name = "Outline-\(empty ? "empty" : "entries")-\(typeSize)-\(scheme)"
+                    attachment.lifetime = .keepAlways
+                    add(attachment)
+                    XCTAssertEqual(host.view.bounds.width, NibMetrics.navigatorWidth)
+                }
+            }
+        }
     }
 
     // MARK: Panel model

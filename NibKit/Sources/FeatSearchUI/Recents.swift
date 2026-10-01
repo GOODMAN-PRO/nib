@@ -158,6 +158,12 @@ final class SearchState: ObservableObject {
     var isLibraryScope: Bool { scope == "lib" || scope.hasPrefix("folder:") }
     var remainingPages: Int { max(0, progress?.pending ?? 0) }
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
+    /// Document navigation always has an active hit as soon as results arrive. Library search
+    /// keeps its unselected count until a row is opened. Preserve selection across refreshes.
+    func reconcileSelection() {
+        guard selectedIndex == nil else { return }
+        selectedID = isLibraryScope ? nil : visibleMatches.first?.id
+    }
     var countLabel: String {
         if let selectedIndex { return String(localized: "\(selectedIndex + 1) of \(visibleMatches.count)") }
         return String(AttributedString(localized: "^[\(visibleMatches.count) match](inflect: true)").characters)
@@ -375,7 +381,7 @@ final class SearchRuntime {
                 state.cursor = response.truncated ? response.cursor : nil
                 state.recentRows = []
                 state.snippetImages = state.snippetImages.filter { key, _ in state.matches.contains { $0.id == key } }
-                if !state.visibleMatches.contains(where: { $0.id == state.selectedID }) { state.selectedID = nil }
+                state.reconcileSelection()
             }
         } catch {
             guard generation == state.generation else { return }
@@ -400,6 +406,7 @@ final class SearchRuntime {
                  "scope": .string(state.scope), "limit": 100, "cursor": .string(cursor)]).decode(SearchResponse.self)
             guard generation == state.generation, !Task.isCancelled else { return }
             state.matches = exactUnique(state.matches + response.results)
+            state.reconcileSelection()
             state.cursor = response.truncated ? response.cursor : nil
         } catch {
             guard generation == state.generation, !Task.isCancelled else { return }

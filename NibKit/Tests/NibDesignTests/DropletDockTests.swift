@@ -28,6 +28,26 @@ final class DropletDockTests: XCTestCase {
         XCTAssertEqual(reserved.maxX, 1194 - 16 - 344, accuracy: 1e-9)   // the right dock moves to the panel's edge
     }
 
+    func testCompactHeightPhoneDockLeavesRoomForFusedOptionsAndPage() {
+        let size = CGSize(width: 844, height: 390)
+        let region = DropletDockModel.region(size: size, safeArea: EdgeInsets(), compact: true)
+        let dock = DropletDockModel(region: region, length: 349, thickness: NibMetrics.paletteThickness,
+                                   compact: true)
+        let palette = dock.frame(for: NibPaletteDock(edge: .top, along: 0.5))
+        let pageTop = palette.maxY + NibMetrics.barHeight + NibSpacing.m
+        XCTAssertGreaterThanOrEqual(size.height - pageTop - NibSpacing.l, 196)
+        XCTAssertEqual(region.minY, 60)
+        XCTAssertEqual(region.maxY, 382)
+
+        // Regular-width windows and taller compact windows retain their existing geometry.
+        let regular = DropletDockModel.region(size: size, safeArea: EdgeInsets(), compact: false)
+        XCTAssertEqual(regular.minY, 68)
+        let tall = DropletDockModel.region(size: CGSize(width: 1194, height: 834),
+                                          safeArea: EdgeInsets(), compact: true)
+        XCTAssertEqual(tall.minY, 68)
+        XCTAssertEqual(iPhone.region.minY, 127)
+    }
+
     func testFramesSlideAlongTheirEdge() {
         XCTAssertEqual(iPad.frame(for: NibPaletteDock(edge: .leading, along: 0.5)),
                        CGRect(x: 16, y: 210.5, width: 56, height: 469))

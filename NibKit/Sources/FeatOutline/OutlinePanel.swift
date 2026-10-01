@@ -503,6 +503,50 @@ final class OutlinePanelModel: ObservableObject {
 
 // MARK: - Outline tab
 
+/// The navigator is only 240 pt wide. Preserve the title's ideal width in the inline arrangement and move
+/// accessories below it when they cannot fit, rather than splitting a word to make room (DESIGN.md §§13.6, 16).
+/// The host still supplies placement controls and the panel's Deep surface; this header adds no nested glass.
+struct OutlinePanelHeader: View {
+    @ObservedObject var model: OutlinePanelModel
+    let dismiss: @MainActor () -> Void
+    var title = String(localized: "Outline")
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: NibSpacing.s) {
+                heading.fixedSize(horizontal: true, vertical: true)
+                Spacer(minLength: 0)
+                accessories
+            }
+            VStack(alignment: .leading, spacing: NibSpacing.xs) {
+                heading.fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer(minLength: 0)
+                    accessories
+                }
+            }
+        }
+        .padding(.horizontal, NibSpacing.m)
+        .padding(.vertical, NibSpacing.s)
+    }
+
+    private var heading: some View {
+        Text(title)
+            .font(NibFont.headline)
+            .foregroundStyle(NibColor.label)
+            .layoutPriority(1)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private var accessories: some View {
+        HStack(spacing: 0) {
+            OutlineOptionsMenu(model: model)
+            NibIconButton(.xmark, label: String(localized: "Close Outline"), size: .round, action: dismiss)
+        }
+        .fixedSize()
+    }
+}
+
 struct OutlinePanel: View {
     @StateObject private var model: OutlinePanelModel
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -516,7 +560,10 @@ struct OutlinePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            OutlinePanelHeader(model: model, dismiss: dismiss)
+            if !model.sections.isEmpty {
+                addEntryButton
+            }
             if model.sections.isEmpty {
                 ScrollView {
                     NibEmptyState(symbol: .outline, title: String(localized: "No outline yet"), message: emptyMessage,
@@ -534,24 +581,19 @@ struct OutlinePanel: View {
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 0) {
-            if !model.sections.isEmpty {
-                NibButton(String(localized: "Add entry for this page"), symbol: .plus, kind: .plain, size: .compact) {
-                    model.beginAdd()
-                }
-                .disabled(!model.canAdd)
-            }
-            Spacer(minLength: NibSpacing.xs)
-            OutlineOptionsMenu(model: model)
+    private var addEntryButton: some View {
+        NibButton(String(localized: "Add entry"), symbol: .plus, kind: .plain, size: .compact, expands: true) {
+            model.beginAdd()
         }
+        .disabled(!model.canAdd)
+        .accessibilityHint(String(localized: "Adds an outline entry for the current page."))
         .padding(.horizontal, NibSpacing.xs)
     }
 
     private var emptyAction: NibAction? {
         guard model.canAdd else { return nil }
         let model = self.model
-        return NibAction(String(localized: "Add entry for this page"), handler: { model.beginAdd() })
+        return NibAction(String(localized: "Add entry"), handler: { model.beginAdd() })
     }
 
     private var emptyMessage: String? {

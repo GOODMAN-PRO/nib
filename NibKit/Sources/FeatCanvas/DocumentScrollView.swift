@@ -21,6 +21,21 @@ enum CanvasMode: Equatable {
     }
 }
 
+/// EditorHost supplies clearance from actual chrome bounds, minus the canvas's baseline. Reconstitute that
+/// clearance once: the safe area already includes the host's additional insets (including document tabs).
+enum CanvasChromeInsets {
+    static func resolve(safeArea: UIEdgeInsets, additional: UIEdgeInsets, compact: Bool,
+                        topDocked: Bool, fallbackTop: CGFloat?) -> UIEdgeInsets {
+        var top = safeArea.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
+        if additional.top == 0, let fallbackTop { top = max(top, fallbackTop) }
+        // EditorHost subtracts this baseline when forwarding occupied bounds. Keep it when there is a
+        // measured bottom obstruction, but release the phone's empty bottom rail when its palette is on top.
+        let bottomBaseline = compact ? NibMetrics.canvasBottomInsetCompact : NibSpacing.l
+        let bottom = safeArea.bottom + (topDocked && additional.bottom == 0 ? NibSpacing.l : bottomBaseline)
+        return UIEdgeInsets(top: top, left: safeArea.left, bottom: bottom, right: safeArea.right)
+    }
+}
+
 // MARK: - Page layout (pure)
 
 /// Single-page layout (D-076: no two-page spread) in layout space, which is page points: every page sits in a slot

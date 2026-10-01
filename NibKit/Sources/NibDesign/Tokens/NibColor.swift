@@ -46,6 +46,8 @@ public enum NibUIColor {
     public static let accent = UIColor.nib(0x0066E0, dark: 0x3D8BFF)
     public static let accentWash = UIColor.nib(0x0066E0, 0.10, dark: 0x3D8BFF, 0.16)
     public static let onAccent = UIColor.white
+    /// An unselected marker sits on user covers (including white paper), independent of the app appearance.
+    public static let coverSelectionOutline = UIColor.systemGray
     public static let destructive = UIColor.systemRed
     public static let success = UIColor.systemGreen
     public static let warning = UIColor.systemOrange
@@ -100,6 +102,7 @@ public enum NibColor {
     public static let accent = Color(uiColor: NibUIColor.accent)
     public static let accentWash = Color(uiColor: NibUIColor.accentWash)
     public static let onAccent = Color(uiColor: NibUIColor.onAccent)
+    public static let coverSelectionOutline = Color(uiColor: NibUIColor.coverSelectionOutline)
     public static let destructive = Color(uiColor: NibUIColor.destructive)
     public static let success = Color(uiColor: NibUIColor.success)
     public static let warning = Color(uiColor: NibUIColor.warning)

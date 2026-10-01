@@ -41,9 +41,9 @@ enum TemplatePalette {
 
     static let kraft = RGBA(0xC4, 0xA2, 0x7A)
 
-    /// Cover cloths (DESIGN.md §3.6) plus kraft.
+    /// The eight cover cloths shared with NibDesign (DESIGN.md §3.6).
     static let cloths: [(name: String, color: RGBA)] =
-        NibCoverCloth.allCases.map { (name: $0.rawValue, color: TemplatePalette.rgba($0.hex)) } + [(name: "kraft", color: kraft)]
+        NibCoverCloth.allCases.map { (name: $0.rawValue, color: TemplatePalette.rgba($0.hex)) }
 
     /// "#RRGGBB[AA]" or a preset name ("white", "yellow", "dark", "ivory", …, cloth names such as "navy").
     static func parse(_ value: JSONValue?) -> RGBA? {
@@ -51,6 +51,8 @@ enum TemplatePalette {
         let s = raw.trimmingCharacters(in: .whitespaces).lowercased()
         if let p = papers.first(where: { $0.name == s }) { return p.paper }
         if let c = cloths.first(where: { $0.name == s }) { return c.color }
+        // Preserve saved custom colours without offering kraft as a ninth default cloth.
+        if s == "kraft" { return kraft }
         return RGBA(hex: s)
     }
 
@@ -72,7 +74,13 @@ enum TemplatePalette {
     }
 
     /// Darker by `amount` (0.16 = the cover spine's −16 % luminance).
-    static func shade(_ c: RGBA, _ amount: Double) -> RGBA { mix(c, RGBA(0, 0, 0, c.a), amount) }
+    static func shade(_ c: RGBA, _ amount: Double) -> RGBA {
+        let factor = 1 - amount
+        func channel(_ value: UInt8) -> UInt8 {
+            UInt8(max(0, min(255, (Double(value) * factor).rounded())))
+        }
+        return RGBA(channel(c.r), channel(c.g), channel(c.b), c.a)
+    }
 
     /// Rule colour for any paper: blue-grey on light paper, a lifted tone on dark paper.
     static func ruleColor(for paper: RGBA) -> RGBA {

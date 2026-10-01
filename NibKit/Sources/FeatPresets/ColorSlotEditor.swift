@@ -105,12 +105,30 @@ enum ColourTarget: Equatable {
 /// in-document loupe) and, for an existing slot, Remove.
 struct ColourEditor: View {
     let model: PresetMenuModel
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var inks: [PaletteInk] { PresetColour.palette(for: model.tool) }
 
     var body: some View {
         let slot = model.colourSlot
         VStack(alignment: .leading, spacing: NibSpacing.m) {
+            if sizeClass == .compact {
+                NibInspectorSection(String(localized: "Saved Colours")) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.hitTarget), spacing: 0)],
+                              alignment: .leading, spacing: NibSpacing.s) {
+                        ForEach(Array(model.presets.swatches.enumerated()), id: \.offset) { index, swatch in
+                            SwatchSlot(tool: model.tool, swatch: swatch, name: PresetColour.name(swatch.color),
+                                       isSelected: index == model.presets.selectedSwatch,
+                                       registry: model.app?.content.tapePatterns) {
+                                model.tapSwatch(index)
+                            }
+                        }
+                        if model.presets.swatches.count < ToolPresets.maxSwatches {
+                            NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
+                        }
+                    }
+                }
+            }
             if model.tool == "tape", let registry = model.app?.content.tapePatterns {
                 NibInspectorSection(String(localized: "Pattern")) {
                     TapePatternGrid(model: model, registry: registry)

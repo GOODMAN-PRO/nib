@@ -824,6 +824,29 @@ extension NewNotebookSheet {
 
 // MARK: - Sheet
 
+/// Keep preview, cover choices and paper in one continuous form (DESIGN.md §14.6).
+/// A separate, height-limited upper scroller hides the cover strip behind the preview. The whole form
+/// scrolls instead, with the paper continuation fade at the visible edge rather than below the sheet.
+struct NewNotebookFormViewport<Form: View, Paper: View>: View {
+    let contentInset: CGFloat
+    @ViewBuilder var form: Form
+    @ViewBuilder var paper: Paper
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: NibSpacing.xl) {
+                form
+                paper
+            }
+            .padding(.top, NibSpacing.xl)
+            .padding(.bottom, NibSpacing.l)
+        }
+        .contentMargins(.horizontal, contentInset, for: .scrollContent)
+        .scrollDismissesKeyboard(.interactively)
+        .nibFadeBottomEdge()
+    }
+}
+
 /// New Notebook (DESIGN.md §14.6): an opaque sheet, Cancel · title · Create (the one Tinted action). Type, title with
 /// the live cover preview, the cover strip, the paper grid with its groups, then size, orientation and paper colour.
 /// iPhone stacks the same order and pins Create at the bottom.
@@ -870,28 +893,29 @@ struct NewNotebookSheet: View {
                            isPrimaryEnabled: !model.isWorking, onCancel: onDone, onPrimary: create)
                 // The shared header supplies 20 pt; align its phone content to the scroll view's 16 pt margin.
                 .padding(.horizontal, contentInset - NibSpacing.xl)
-            ScrollView {
-                VStack(alignment: .leading, spacing: NibSpacing.xl) {
-                    if let message = model.message {
-                        NibBanner(message, style: .warning)
-                    }
-                    kindPicker
-                    titleRow
-                    switch draft.kind {
-                    case .notebook:
+            if draft.kind == .notebook {
+                NewNotebookFormViewport(contentInset: contentInset) {
+                    VStack(alignment: .leading, spacing: NibSpacing.xl) {
+                        formHeading
                         coverSection
+                    }
+                } paper: {
+                    VStack(alignment: .leading, spacing: NibSpacing.xl) {
                         paperSection
                         optionsSection
-                    case .whiteboard:
-                        boardSection
-                    case .textDocument, .studySet:
-                        EmptyView()
                     }
                 }
-                .padding(.vertical, NibSpacing.xl)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: NibSpacing.xl) {
+                        formHeading
+                        if draft.kind == .whiteboard { boardSection }
+                    }
+                    .padding(.vertical, NibSpacing.xl)
+                }
+                .contentMargins(.horizontal, contentInset, for: .scrollContent)
+                .scrollDismissesKeyboard(.interactively)
             }
-            .contentMargins(.horizontal, contentInset, for: .scrollContent)
-            .scrollDismissesKeyboard(.interactively)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if compact {
@@ -921,6 +945,15 @@ struct NewNotebookSheet: View {
     }
 
     // MARK: Type and title
+
+    @ViewBuilder
+    private var formHeading: some View {
+        if let message = model.message {
+            NibBanner(message, style: .warning)
+        }
+        kindPicker
+        titleRow
+    }
 
     private var kindPicker: some View {
         ViewThatFits(in: .horizontal) {
@@ -1001,16 +1034,12 @@ struct NewNotebookSheet: View {
             if compact {
                 VStack(alignment: .leading, spacing: NibSpacing.m) {
                     groupChips
-                    paperGrid
+                    paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
                 }
             } else {
                 HStack(alignment: .top, spacing: NibSpacing.l) {
                     groupList
-                    ScrollView {
-                        paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
-                    }
-                    .frame(height: NewNotebookSheet.gridHeight)
-                    .nibFadeBottomEdge()
+                    paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
                 }
             }
         }
@@ -1020,8 +1049,6 @@ struct NewNotebookSheet: View {
         NibAction(String(localized: "More Templates…"), handler: { Task { @MainActor in await model.chooseMore() } })
     }
 
-    /// Two and a half rows of paper tiles with their names, so the cut-off row reads as "more below".
-    static let gridHeight = NibMetrics.paperTileSize.height * 2.5 + NibSpacing.xxl * 2
     /// The group list beside the grid (DESIGN.md §14.6 asks for about 150 pt; kept on the 4 pt grid).
     static let groupListWidth = NibMetrics.paperTileSize.width + NibSpacing.x5
 

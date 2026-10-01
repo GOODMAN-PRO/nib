@@ -51,6 +51,7 @@ struct LibraryMenuEntries: View {
     let location: MenuLocation
     var rows: [LibraryRow] = []
     var compact = false
+    var rowHeight: CGFloat?
     var body: some View {
         let context = LibraryMenus.context(model, location: location, rows: rows)
         let entries = model.app.ui.menuItems(location, context)
@@ -70,7 +71,7 @@ struct LibraryMenuEntries: View {
                 ForEach(Array(Set(entries.compactMap(\.submenu))).sorted(), id: \.self) { title in
                     Menu(title) {
                         ForEach(entries.filter { $0.submenu == title }, id: \.id) { entry in menuButton(entry, context) }
-                    }
+                    }.frame(minHeight: NibMetrics.hitTarget).frame(height: rowHeight)
                 }
             }
         }
@@ -85,7 +86,7 @@ struct LibraryMenuEntries: View {
                 if entry.isChecked?(context) == true { Image(nib: .checkmark) }
                 if let key = entry.shortcut { Text(LibraryShortcut.label(key)).font(NibFont.caption1) }
             }
-        }.frame(minHeight: NibMetrics.hitTarget)
+        }.frame(minHeight: NibMetrics.hitTarget).frame(height: rowHeight)
     }
     private func activate(_ entry: MenuItemDescriptor, _ context: MenuContext) {
         if entry.destructive {
@@ -114,17 +115,16 @@ struct LibraryBuds: View {
     @ObservedObject var model: LibraryViewModel
     var body: some View {
         ZStack {
-            NibBudPopover(id: "library.new.menu", source: "library.new", isPresented: binding("new"), title: String(localized: "New")) {
-                LibraryMenuEntries(model: model, location: .libraryNew)
-            }
+            LibraryNewMenuPopover(model: model, isPresented: binding("new"))
             NibBudPopover(id: "library.app.menu", source: "library.app", isPresented: binding("app"), title: String(localized: "Nib")) {
                 LibraryMenuEntries(model: model, location: .appMenu)
             }
             NibBudPopover(id: "library.sort.menu", source: "library.sort", isPresented: binding("sort"), title: String(localized: "Sort and View")) {
                 VStack(alignment: .leading, spacing: NibSpacing.s) {
-                    HStack {
-                        NibButton(String(localized: "Grid"), symbol: .pages, kind: .plain) { model.setView(["layout": "grid"]) }
-                        NibButton(String(localized: "List"), symbol: .listView, kind: .plain) { model.setView(["layout": "list"]) }
+                    NibSegmentedControl(selection: Binding(get: { model.layout }, set: {
+                        model.setView(["layout": .string($0.rawValue)])
+                    }), options: LibraryLayout.allCases) {
+                        $0 == .grid ? String(localized: "Grid") : String(localized: "List")
                     }
                     ForEach(LibrarySort.allCases, id: \.self) { sort in
                         NibButton(sort.title, symbol: model.sort == sort ? .checkmark : nil, kind: .plain) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
@@ -140,6 +140,93 @@ struct LibraryBuds: View {
     private func binding(_ menu: String) -> Binding<Bool> {
         Binding(get: { model.menu == menu && model.menuAnchors["library." + menu] != nil },
                 set: { model.setView(["menu": $0 ? .string(menu) : "none"]) })
+    }
+}
+
+/// The scroll viewport ends between complete menu rows; the fixed footer signals continuation.
+/// The shared droplet and bud modifiers retain the same material and presentation physics.
+struct LibraryNewMenuPopover: View {
+    @ObservedObject var model: LibraryViewModel
+    @Binding var isPresented: Bool
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @ScaledMetric(relativeTo: .body) private var rowHeight = NibMetrics.hitTarget
+    @ScaledMetric(relativeTo: .headline) private var titleHeight: CGFloat = 22
+    @State private var reachedBottom = false
+    @Namespace private var scrollSpace
+
+    var body: some View {
+        GeometryReader { proxy in
+            let anchor = model.menuAnchors["library.new"] ?? .zero
+            let inset = NibMetrics.chromeInset
+            let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
+            let top = proxy.safeAreaInsets.top + inset
+            let bottom = proxy.size.height - proxy.safeAreaInsets.bottom - inset
+            let below = max(0, bottom - anchor.maxY - gap)
+            let above = max(0, anchor.minY - gap - top)
+            let context = LibraryMenus.context(model, location: .libraryNew, rows: [])
+            let entries = model.app.ui.menuItems(.libraryNew, context)
+            let count = entries.filter { $0.submenu == nil }.count + Set(entries.compactMap(\.submenu)).count
+            let header = titleHeight + NibSpacing.m + 2 * NibSpacing.l
+            let layout = LibraryMenuViewport(available: max(above, below), count: count,
+                                             rowHeight: rowHeight, header: header)
+            let width = min(NibMetrics.popoverWidth, max(0, proxy.size.width - 2 * inset))
+            let y = layout.height <= below ? anchor.maxY + gap : max(top, anchor.minY - gap - layout.height)
+            VStack(alignment: .leading, spacing: NibSpacing.m) {
+                Text(String(localized: "New")).font(NibFont.headline).foregroundStyle(NibColor.label)
+                    .frame(height: titleHeight, alignment: .leading)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        LibraryMenuEntries(model: model, location: .libraryNew, rowHeight: rowHeight)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .scrollTargetLayout()
+                    .background {
+                        GeometryReader { content in
+                            Color.clear.preference(key: LibraryMenuAtBottomKey.self,
+                                value: content.frame(in: .named(scrollSpace)).maxY <= layout.viewportHeight + NibSpacing.xxs)
+                        }
+                    }
+                }
+                .coordinateSpace(name: scrollSpace)
+                .scrollTargetBehavior(.viewAligned)
+                .scrollBounceBehavior(.basedOnSize)
+                .onPreferenceChange(LibraryMenuAtBottomKey.self) { reachedBottom = $0 }
+                .frame(height: layout.viewportHeight)
+                if layout.scrolls {
+                    HStack(spacing: NibSpacing.xs) {
+                        Image(nib: .chevronDown).rotationEffect(.degrees(reachedBottom ? 180 : 0))
+                        Text(reachedBottom ? String(localized: "More actions above") : String(localized: "More actions below"))
+                    }
+                        .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                        .frame(maxWidth: .infinity, minHeight: NibSpacing.l)
+                }
+            }
+            .padding(NibSpacing.l)
+            .frame(width: width)
+            .droplet("library.new.menu", style: .popover)
+            .budsFrom("library.new", isPresented: $isPresented)
+            .position(x: min(max(anchor.midX, inset + width / 2), proxy.size.width - inset - width / 2),
+                      y: y + layout.height / 2)
+        }
+    }
+}
+
+private struct LibraryMenuAtBottomKey: PreferenceKey {
+    static let defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = nextValue() }
+}
+
+struct LibraryMenuViewport {
+    let viewportHeight: CGFloat
+    let scrolls: Bool
+    let height: CGFloat
+    init(available: CGFloat, count: Int, rowHeight: CGFloat, header: CGFloat) {
+        let limit = min(available, NibMetrics.popoverMaxHeight)
+        let footer = NibSpacing.l + NibSpacing.m
+        scrolls = header + CGFloat(count) * rowHeight > limit
+        let capacity = max(1, Int(max(0, limit - header - (scrolls ? footer : 0)) / rowHeight))
+        viewportHeight = CGFloat(min(count, capacity)) * rowHeight
+        height = header + viewportHeight + (scrolls ? footer : 0)
     }
 }
 

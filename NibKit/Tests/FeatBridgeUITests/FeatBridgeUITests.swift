@@ -2,6 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatBridgeUI
 
@@ -1077,6 +1078,55 @@ final class FeatBridgeUITests: XCTestCase {
     }
 
     // MARK: Rendering
+
+    func testEnabledBridgeSwitchIsGreenDespiteInheritedAccent() async throws {
+        let (h, _, monitor) = makeHarness()
+        for width: CGFloat in [390, 834] {
+            for variant in NibSnapshot.Variant.allCases {
+                var greenSamples: [Int] = []
+                for enabled in [false, true] {
+                    try await h.run(CommandIDs.bridgeSetEnabled, ["enabled": .bool(enabled)])
+                    await monitor.refresh()
+                    let page = BridgeSettingsPage(app: h.app, monitor: monitor)
+                        .tint(NibColor.accent)
+                        .environment(\.colorScheme, variant.colorScheme)
+                        .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+                        .ignoresSafeArea()
+                    let host = UIHostingController(rootView: page)
+                    let window = UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: 600))
+                    window.rootViewController = host
+                    window.isHidden = false
+                    defer { window.isHidden = true; window.rootViewController = nil }
+                    host.overrideUserInterfaceStyle = variant == .dark ? .dark : .light
+                    host.view.frame = window.bounds
+                    host.view.layoutIfNeeded()
+                    // Mount the List's first section and the UIKit-backed switch on iOS 26.
+                    try await Task.sleep(for: .milliseconds(100))
+                    host.view.layoutIfNeeded()
+                    host.view.layer.displayIfNeeded()
+                    let format = UIGraphicsImageRendererFormat()
+                    format.scale = 1
+                    let image = UIGraphicsImageRenderer(size: window.bounds.size, format: format).image { context in
+                        host.view.layer.render(in: context.cgContext)
+                    }
+                    var green = 0
+                    for y in stride(from: 0, to: 140, by: 4) {
+                        for x in stride(from: 0, to: Int(width), by: 4) {
+                            let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: y)))
+                            if Int(pixel.g) > Int(pixel.r) + 30 && Int(pixel.g) > Int(pixel.b) + 30 {
+                                green += 1
+                            }
+                        }
+                    }
+                    greenSamples.append(green)
+                }
+                // The tiny status dot cannot satisfy this: the enabled switch must contribute green track pixels.
+                // Covers the native iOS 26 switch and NibToggle's earlier-OS rendering without ImageRenderer's
+                // UIKit placeholders, and ensures the off state does not acquire the enabled green treatment.
+                XCTAssertGreaterThan(greenSamples[1], greenSamples[0] + 20, "\(width) pt, \(variant)")
+            }
+        }
+    }
 
     func testCompactDocumentStatusVisiblyIdentifiesTheClientInEveryVariant() async throws {
         let (h, fake, monitor) = makeHarness()

@@ -91,7 +91,9 @@ public enum Fixtures {
         clip.rev = base
         let content = DocumentContent(meta: meta, pages: [p1, p2, p3], outline: [outline], audio: [clip])
 
-        let z = FractionalIndex.sequence(after: nil, count: 10)
+        // Persist the fixture's original stacking keys just like a saved document. Tests insert
+        // between these keys, so changes to the key generator must not change their starting data.
+        let z = ["V", "k", "s", "w", "y", "z", "zV", "zk", "zs", "zw"]
         let pts: [StrokePoint] = (0..<20).map { (i: Int) -> StrokePoint in
             let x = Float(72 + i * 4), y = Float(120 + i % 5), t = Float(i) * 0.01
             return StrokePoint(x: x, y: y, t: t)

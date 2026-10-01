@@ -55,13 +55,16 @@ public struct DropletDockModel: Equatable, Sendable {
     /// The docks' region in a full-window view of `size`: below the bars (safe area + 8 + 44 + 16), 16 pt in from the
     /// sides, 16 pt above the bottom safe area (8 on iPhone, just above the home indicator), less `reservedTrailing` (a
     /// docked assistant panel moves the right dock to its leading edge).
+    /// Compact-height phones use the small gap below the bars to leave room for the palette's fused options.
     public static func region(size: CGSize, safeArea s: EdgeInsets, compact: Bool,
                               reservedTrailing: CGFloat = 0) -> CGRect {
         let size = NibGeometry.size(size)
         let s = EdgeInsets(top: NibGeometry.dimension(s.top), leading: NibGeometry.dimension(s.leading),
                            bottom: NibGeometry.dimension(s.bottom), trailing: NibGeometry.dimension(s.trailing))
         let reservedTrailing = NibGeometry.dimension(reservedTrailing)
-        let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
+        let compactHeight = compact && size.height < NibMetrics.compactBreakpoint && size.width > size.height
+        let topGap = compactHeight ? NibSpacing.s : NibSpacing.l
+        let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + topGap
         let bottom = s.bottom + (compact ? NibSpacing.s : NibSpacing.l)
         return NibGeometry.rect(CGRect(x: s.leading + NibSpacing.l, y: top,
                       width: max(0, size.width - s.leading - s.trailing - 2 * NibSpacing.l - reservedTrailing),

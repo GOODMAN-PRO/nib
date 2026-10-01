@@ -389,7 +389,7 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertNil(l.target(at: CGPoint(x: 400, y: 400)))
     }
 
-    func testRotationAndTopEdgeHitAreasStaySeparateAtEveryZoomAndAngle() {
+    func testRotationAndTopEdgeUseSpecifiedOffsetAndNearestHitAtEveryZoomAndAngle() {
         for zoom: CGFloat in [0.5, 1, 3] {
             for angle in [0.0, Double.pi / 6, Double.pi / 2, Double.pi] {
                 let frame = Frame(x: 100, y: 200, w: 160, h: 90, rotation: angle)
@@ -399,18 +399,83 @@ final class FeatTransformTests: XCTestCase {
                 XCTAssertTrue(l.showsTopBottom)
                 let top = l.edges[0]
                 let distance = HandleLayout.distance(top, l.rotation)
-                XCTAssertGreaterThan(distance, NibMetrics.hitTarget)
+                XCTAssertEqual(distance, NibMetrics.rotationHandleOffset, accuracy: 1e-9)
+                XCTAssertEqual(l.centre(of: .rotate), l.rotation)
+                XCTAssertEqual(l.target(at: l.rotation), .rotate)
+                XCTAssertEqual(l.target(at: top), .edge(0))
                 let unit = CGPoint(x: (l.rotation.x - top.x) / distance,
                                    y: (l.rotation.y - top.y) / distance)
-                // Each complete hit area still belongs to its own handle, including the side facing the other.
-                let edgeBoundary = CGPoint(x: top.x + unit.x * (HandleLayout.reach - 0.01),
-                                           y: top.y + unit.y * (HandleLayout.reach - 0.01))
-                let rotationBoundary = CGPoint(x: l.rotation.x - unit.x * (HandleLayout.reach - 0.01),
-                                               y: l.rotation.y - unit.y * (HandleLayout.reach - 0.01))
+                // The 44 pt targets overlap at the specified 24 pt offset. Their shared area belongs to the
+                // nearest visual centre; it must not force the rotation bead up into the object menu's glass.
+                let edgeBoundary = CGPoint(x: top.x + unit.x * (distance / 2 - 0.01),
+                                           y: top.y + unit.y * (distance / 2 - 0.01))
+                let rotationBoundary = CGPoint(x: l.rotation.x - unit.x * (distance / 2 - 0.01),
+                                               y: l.rotation.y - unit.y * (distance / 2 - 0.01))
                 XCTAssertEqual(l.target(at: edgeBoundary), .edge(0))
                 XCTAssertEqual(l.target(at: rotationBoundary), .rotate)
-                XCTAssertNil(l.target(at: HandleLayout.mid(top, l.rotation)), "the hit targets have a gap")
+                // The outside edges still reach the full 22 pt radius, with no oversized invisible target.
+                for (target, centre, direction) in [(HandleTarget.rotate, l.rotation, CGFloat(1)),
+                                                     (.edge(0), top, CGFloat(-1))] {
+                    let boundary = CGPoint(x: centre.x + unit.x * direction * (HandleLayout.reach - 0.01),
+                                           y: centre.y + unit.y * direction * (HandleLayout.reach - 0.01))
+                    XCTAssertEqual(l.target(at: boundary), target)
+                }
+                let outside = CGPoint(x: l.rotation.x + unit.x * (HandleLayout.reach + 0.01),
+                                      y: l.rotation.y + unit.y * (HandleLayout.reach + 0.01))
+                XCTAssertNil(l.target(at: outside))
+                XCTAssertNotNil(l.target(at: HandleLayout.mid(top, l.rotation)), "no dead zone along the stem")
                 XCTAssertTrue(l.bounds.contains(l.rotation), "overlay bounds include the lifted rotation handle")
+            }
+        }
+    }
+
+    func testSingleRigidRotationBeadAndStemStayCentredBelowObjectMenu() throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let host = FakeCanvasHost(h)
+        host.canvasView.overrideUserInterfaceStyle = .dark
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        let handles = try makeHandles(h, host)
+        defer { handles.detach(from: host) }
+        let overlay = try XCTUnwrap(host.canvasView.subviews.first {
+            $0.subviews.contains { $0 is NibHandleView }
+        })
+
+        for size in [CGSize(width: 1024, height: 1366), CGSize(width: 1366, height: 1024),
+                     CGSize(width: 390, height: 844)] {
+            host.canvasView.frame.size = size
+            for zoom in [0.5, 1.0, 3.0] {
+                host.zoomScale = zoom
+                handles.canvasDidChange(host)
+                let layout = try XCTUnwrap(handles.layout)
+                let beads = overlay.subviews.compactMap { $0 as? NibHandleView }.filter { !$0.isHidden }
+                XCTAssertEqual(beads.count, 9, "four corners, four edges and exactly one rotation bead")
+                let protruding = beads.filter { $0.center.y < layout.edges[0].y }
+                XCTAssertEqual(protruding.count, 1)
+                let bead = try XCTUnwrap(protruding.first)
+                bead.layoutIfNeeded()
+                XCTAssertEqual(bead.center, layout.rotation)
+                XCTAssertEqual(bead.bounds.size, CGSize(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget))
+                XCTAssertEqual(bead.transform, .identity)
+                XCTAssertTrue(bead.layer.animationKeys()?.isEmpty ?? true)
+                let body = try XCTUnwrap(bead.layer.sublayers?.first as? CAShapeLayer)
+                let visual = try XCTUnwrap(body.path).boundingBoxOfPath
+                XCTAssertEqual(visual.size, CGSize(width: NibMetrics.handleBead, height: NibMetrics.handleBead))
+                XCTAssertEqual(bead.convert(CGPoint(x: visual.midX, y: visual.midY), to: overlay), layout.rotation)
+                XCTAssertEqual(layout.target(at: bead.center), .rotate)
+
+                let stems = (overlay.layer.sublayers ?? []).compactMap { $0 as? CAShapeLayer }
+                    .filter { !$0.isHidden && $0.path != nil }
+                XCTAssertEqual(stems.count, 1, "one hairline, with no duplicate rotation decoration")
+                let stem = try XCTUnwrap(stems.first)
+                XCTAssertEqual(stem.lineWidth, NibStroke.hairline)
+                XCTAssertEqual(try XCTUnwrap(stem.path).boundingBoxOfPath,
+                               CGRect(x: layout.rotation.x, y: layout.rotation.y, width: 0,
+                                      height: NibMetrics.rotationHandleOffset))
+                // §14.3's object-menu placement reserves the rotation offset plus half its hit target.
+                let menuBottom = layout.edges[0].y - NibMetrics.rotationHandleOffset - NibMetrics.hitTarget / 2
+                XCTAssertGreaterThan(bead.frame.minY + visual.minY, menuBottom,
+                                     "the bead must stay outside the glass that could refract a second image")
+                XCTAssertEqual(bead.frame.minY, menuBottom, accuracy: 1e-9)
             }
         }
     }

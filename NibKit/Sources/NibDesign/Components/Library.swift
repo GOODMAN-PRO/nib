@@ -90,10 +90,19 @@ struct NibCheckBead: View {
     let isOn: Bool
 
     var body: some View {
-        Image(nib: isOn ? .checkCircleFill : .circle)
-            .font(.system(size: 22))
-            .foregroundStyle(isOn ? NibColor.accent : NibColor.labelTertiary)
-            .background { Circle().fill(NibColor.background).padding(2) }
+        Circle()
+            .fill(isOn ? NibColor.accent : NibColor.onAccent)
+            .overlay {
+                if isOn {
+                    Image(nib: .checkmark)
+                        .symbolRenderingMode(.monochrome)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(NibColor.onAccent)
+                } else {
+                    Circle().strokeBorder(NibColor.coverSelectionOutline, lineWidth: NibStroke.ring)
+                }
+            }
+            .frame(width: 22, height: 22)
             .accessibilityHidden(true)
     }
 }

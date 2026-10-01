@@ -269,7 +269,6 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var recent: [String] = []
     @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 412)
     @State private var moreSize = CGSize(width: NibMetrics.popoverWidth, height: 124)
-    @State private var optionsSize = CGSize(width: 200, height: NibMetrics.barHeight)
     /// A released drag on its way to its dock: the one plip plays when it arrives (DESIGN.md §10.11).
     @State private var landing: DockLanding?
     /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
@@ -487,10 +486,15 @@ public struct NibToolPalette<Settings: View>: View {
                     moreGrid(a.more, anchor: slotAt(along), placement: placement(d), bounds: bounds)
                 }
                 if let opts = resolvedOptions(selection), let along = map[selection] {
-                    NibToolOptionsBar(id: id + ".options") { opts.bar }
-                        .onGeometryChange(for: CGSize.self) { $0.size } action: { if NibGeometry.isFinite($0) { optionsSize = NibGeometry.size($0) } }
-                        .position(placement(d).centre(size: optionsSize, beside: slotAt(along), gap: -1, in: bounds,
-                                                      alignment: .centre))
+                    // Share the palette's safe horizontal region, including a reserved trailing panel.
+                    // Placement adds chromeInset itself, so expand that region by the inset first.
+                    let optionsBounds = CGRect(x: r.minX - NibMetrics.chromeInset, y: bounds.minY,
+                                               width: r.width + 2 * NibMetrics.chromeInset, height: bounds.height)
+                    let available = placement(d).availableSize(beside: slotAt(along), gap: 0, in: optionsBounds)
+                    NibToolOptionsPlacement(containerSize: bounds.size, bounds: optionsBounds,
+                                            anchor: slotAt(along), placement: placement(d)) {
+                        NibToolOptionsBar(id: id + ".options", availableWidth: available.width) { opts.bar }
+                    }
                     if let pop = opts.popover {
                         // NibBudPopover works in container coordinates; this layer starts at `origin` in them.
                         NibBudPopover(id: id + ".options.popover", source: pop.source, isPresented: pop.isPresented,
@@ -802,6 +806,30 @@ public struct NibToolPalette<Settings: View>: View {
                 released = moves ? OwnRelease(dock: next, velocity: release.velocity, landing: arrival) : nil
                 dock = next
             }
+    }
+}
+
+/// Measure and position the bounded viewport in the same layout pass. A cached size from the previous
+/// tool/orientation can otherwise place the new, wider viewport beyond the inset for its first frame.
+struct NibToolOptionsPlacement: Layout {
+    let containerSize: CGSize
+    let bounds: CGRect
+    let anchor: CGRect
+    let placement: NibBudPlacement
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        NibGeometry.size(containerSize)
+    }
+
+    func placeSubviews(in rect: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let available = placement.availableSize(beside: anchor, gap: 0, in: bounds)
+        let proposed = ProposedViewSize(width: available.width, height: NibMetrics.barHeight)
+        for subview in subviews {
+            let size = subview.sizeThatFits(proposed)
+            let centre = placement.centre(size: size, beside: anchor, gap: -1, in: bounds, alignment: .centre)
+            subview.place(at: CGPoint(x: rect.minX + centre.x, y: rect.minY + centre.y),
+                          anchor: .center, proposal: proposed)
+        }
     }
 }
 

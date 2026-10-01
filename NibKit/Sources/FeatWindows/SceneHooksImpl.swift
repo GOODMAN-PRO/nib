@@ -1,5 +1,6 @@
 import UIKit
 import Combine
+import SwiftUI
 import NibContracts
 
 /// `app.ui.sceneHooks`: what a window opens with (a requested document, its restored tabs, or on a cold launch the
@@ -42,6 +43,12 @@ final class SceneHooksImpl: SceneHooks {
     }
 
     // MARK: SceneHooks
+
+    func documentTabsMenu(_ context: ChromeContext) -> AnyView? {
+        guard let presentation = tabPresentations[context.session.id], let model = presentation.model,
+              model.isVisible else { return nil }
+        return AnyView(DocumentTabsMenu(model: model, placement: presentation, compact: context.isCompact))
+    }
 
     func sceneDidConnect(_ scene: UIWindowScene, options: UIScene.ConnectionOptions, navigator: SceneNavigator) {
         let type = WindowState.activityType
@@ -88,6 +95,7 @@ final class SceneHooksImpl: SceneHooks {
                 tabPresentations.removeValue(forKey: navigator.session.id)?.dismiss()
             }
             tabPresentations = tabPresentations.filter { $0.value.controller != nil && $0.value.host != nil }
+            app.ui.setNeedsChromeUpdate(navigator.session)
             return nil
         }
         tabPresentations.removeValue(forKey: navigator.session.id)?.dismiss()

@@ -51,12 +51,20 @@ struct NibNativeGlass<Foreground: View>: View {
     var body: some View {
         // Capture the app's appearance outside the glass host. Native glass can adapt its foreground to white
         // paper, but our dark contrast underlay still needs the app's light label/icon tokens (DESIGN.md §2.4).
-        let appearance = NibChromeAppearance(environment)
+        let appearance = environment.nibChromeAppearance ?? NibChromeAppearance(environment)
         foreground()
-            .foregroundStyle(Color(NibColor.label.resolve(in: environment)))
+            .foregroundStyle(Color(NibColor.label.resolve(in: appearance.environment)))
             .environment(\.nibChromeAppearance, appearance)
             .environment(\.colorScheme, appearance.colorScheme)
             .glassEffect(effect, in: shape)
+            // The material needs the same appearance as its foreground. An environment override only
+            // before glassEffect reaches the labels, leaving the native effect free to render light glass.
+            .environment(\.colorScheme, appearance.colorScheme)
+            .environment(\.nibChromeAppearance, appearance)
+            // The UIKit-backed effect captures traits when its native host is created. Updating only
+            // SwiftUI's environment can leave that host in its previous appearance. Recreate this
+            // effect/foreground pair together, without replacing the container's field or glass IDs.
+            .id(appearance.colorScheme)
     }
 }
 
@@ -146,7 +154,9 @@ struct NibGlassModifier: ViewModifier {
     /// While the Pencil is down nothing samples the backdrop (DESIGN.md §10.8).
     @Environment(\.nibIsInking) private var frozen
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.nibChromeAppearance) private var chromeAppearance
     @Environment(\.nibBackdrop) private var backdrop
+    @Environment(DropletField.self) private var field: DropletField?
     @State private var restFrame = CGRect.zero
 
     func body(content: Content) -> some View {
@@ -157,13 +167,18 @@ struct NibGlassModifier: ViewModifier {
             NibNativeGlass(effect: systemGlass, shape: shape) {
                 content
             }
-            .background { systemUnderlay }
             .background {
-                GeometryReader { proxy in
-                    Color.clear
-                        .onAppear { restFrame = proxy.frame(in: NibLiquid.space) }
-                        .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in restFrame = frame }
-                }
+                if !sharesNativeBackdrop { systemUnderlay }
+            }
+            .anchorPreference(key: NibStaticGlassBackdropKey.self, value: .bounds) { bounds in
+                sharesNativeBackdrop
+                    ? [NibStaticGlassBackdrop(bounds: bounds, shape: shape,
+                        tint: NibGlassBodyTint.systemUnderlay(kind, colorScheme: resolvedScheme, paperShare: paperShare))]
+                    : []
+            }
+            .background {
+                Color.clear
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { restFrame = $0 }
             }
         } else {
             content.background { fallback }
@@ -177,10 +192,18 @@ struct NibGlassModifier: ViewModifier {
     }
 
     private var tint: Color {
-        NibGlassBodyTint.color(kind, paperShare: paperShare, colorScheme: colorScheme)
+        NibGlassBodyTint.color(kind, paperShare: paperShare, colorScheme: resolvedScheme)
     }
 
+    private var resolvedScheme: ColorScheme { chromeAppearance?.colorScheme ?? colorScheme }
+
     private var paperShare: Double { DropletField.paperShare(restFrame, in: backdrop) }
+
+    /// Static nibGlass surfaces can also live inside a container. Hand their neutral body to its backdrop
+    /// layer; identity/opaque surfaces keep their local fallback since they have no native material to sample it.
+    private var sharesNativeBackdrop: Bool {
+        field != nil && renderer == .system && kind != .bead && !frozen
+    }
 
     /// The dark-paper contrast body is beneath glass, alongside the frozen, Liquid Off and bead fills.
     @available(iOS 26.0, *)
@@ -192,7 +215,7 @@ struct NibGlassModifier: ViewModifier {
         } else if frozen {
             shape.fill(tint)
         } else {
-            shape.fill(NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paperShare))
+            shape.fill(NibGlassBodyTint.systemUnderlay(kind, colorScheme: resolvedScheme, paperShare: paperShare))
         }
     }
 

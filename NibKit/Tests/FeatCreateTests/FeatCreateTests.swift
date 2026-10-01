@@ -1408,6 +1408,194 @@ final class FeatCreateTests: XCTestCase {
 
     // MARK: - Screens render (Light, Dark, AX3)
 
+    func testFormViewportShowsPreviewThenCoverChoicesBeforePaper() async throws {
+        for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),
+                     CGSize(width: 402, height: 720), CGSize(width: 320, height: 520)] {
+            for variant in NibSnapshot.Variant.allCases {
+                var previewFrame = CGRect.zero
+                var coverFrame = CGRect.zero
+                var paperFrame = CGRect.zero
+                let view = NewNotebookFormViewport(contentInset: NibSpacing.l) {
+                    VStack(alignment: .leading, spacing: NibSpacing.xl) {
+                        Text("Notebook").font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
+                        HStack(spacing: NibSpacing.l) {
+                            NibPaper.white.color
+                                .frame(width: NibMetrics.coverPreviewSize.width,
+                                       height: NibMetrics.coverPreviewSize.height)
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                                    previewFrame = $0
+                                }
+                            Text("Untitled").font(NibFont.body)
+                        }
+                        NibInspectorSection("Cover") {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: NibSpacing.l) {
+                                    NibPaperTile(name: "No cover", isSelected: true,
+                                                 size: NibMetrics.coverStripSize, action: {}) {
+                                        NibPaper.white.color
+                                    }
+                                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                                        coverFrame = $0
+                                    }
+                                    ForEach(0..<6) { index in
+                                        NibPaperTile(name: "Cover \(index)", isSelected: false,
+                                                     size: NibMetrics.coverStripSize, action: {}) {
+                                            NibPaper.white.color
+                                        }
+                                    }
+                                }
+                                .padding(NibStroke.ring + NibStroke.ringOutset)
+                            }
+                        }
+                    }
+                } paper: {
+                    NibInspectorSection("Paper") {
+                        NibPaperTile(name: "Blank", isSelected: true, action: {}) {
+                            NibPaper.white.color
+                        }
+                    }
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                        paperFrame = $0
+                    }
+                }
+                .background(NibColor.backgroundSecondary)
+                .ignoresSafeArea()
+                .environment(\.colorScheme, variant.colorScheme)
+                .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+                let host = UIHostingController(rootView: view)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                XCTAssertEqual(previewFrame.width, 104, accuracy: 0.5)
+                XCTAssertEqual(previewFrame.height, 136, accuracy: 0.5)
+                XCTAssertEqual(coverFrame.width, 88, accuracy: 0.5)
+                XCTAssertGreaterThanOrEqual(coverFrame.height, 116)
+                XCTAssertGreaterThanOrEqual(previewFrame.minY, 0)
+                XCTAssertGreaterThan(coverFrame.minY, previewFrame.maxY)
+                XCTAssertLessThan(coverFrame.maxY, size.height - NibSpacing.l,
+                                  "Cover choices and their names must be visible on opening, before the fade")
+                XCTAssertGreaterThan(paperFrame.minY, coverFrame.maxY,
+                                     "Paper must follow the cover strip in the same content flow")
+            }
+        }
+    }
+
+    func testPaperRemainsReachableAfterTallFormAndFadesAtTheSheetEdge() async throws {
+        // These are the available bodies below the header (and above Create on a phone).
+        // A deliberately tall form reproduces cover colours, custom fields and accessibility text.
+        for size in [CGSize(width: 720, height: 560), CGSize(width: 402, height: 720),
+                     CGSize(width: 320, height: 520)] {
+            for variant in NibSnapshot.Variant.allCases {
+                var categoryFrame = CGRect.zero
+                var tileFrame = CGRect.zero
+                var formFrame = CGRect.zero
+                let view = NewNotebookFormViewport(contentInset: NibSpacing.l) {
+                    Rectangle().fill(NibColor.fill3).frame(height: 1_200)
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                            formFrame = $0
+                        }
+                } paper: {
+                    VStack(alignment: .leading, spacing: NibSpacing.s) {
+                        Text("Basic")
+                            .font(NibFont.body)
+                            .frame(minHeight: NibMetrics.hitTarget)
+                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                                categoryFrame = $0
+                            }
+                        NibPaperTile(name: "Blank", isSelected: true, action: {}) {
+                            NibPaper.white.color
+                        }
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                            tileFrame = $0
+                        }
+                        // Continuous ink through the viewport boundary makes the fade measurable.
+                        Rectangle().fill(NibColor.label).frame(height: 1_200)
+                    }
+                }
+                .background(NibColor.backgroundSecondary)
+                .ignoresSafeArea()
+                .environment(\.colorScheme, variant.colorScheme)
+                .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+                let host = UIHostingController(rootView: view)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                func scrollViews(in view: UIView) -> [UIScrollView] {
+                    (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
+                }
+                let regions = scrollViews(in: host.view)
+                XCTAssertEqual(regions.count, 1, "Preview, covers and paper must share one vertical scroll")
+                for region in regions {
+                    XCTAssertGreaterThan(region.contentSize.height, region.bounds.height)
+                    XCTAssertLessThanOrEqual(region.contentSize.width, region.bounds.width + 1,
+                                             "Categories and selection rings must fit the viewport width")
+                }
+
+                XCTAssertGreaterThan(categoryFrame.minY, formFrame.maxY,
+                                     "Tall cover controls must remain before Paper, without a separate viewport")
+                let region = try XCTUnwrap(regions.first)
+                let initialFormY = formFrame.minY
+                let initialCategoryY = categoryFrame.minY
+                let offset = initialCategoryY - NibSpacing.m
+                // SwiftUI's horizontal content margin is represented by the resting x offset.
+                // Scroll only vertically, as a drag in this vertical scroll view would.
+                region.setContentOffset(CGPoint(x: region.contentOffset.x, y: offset), animated: false)
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                XCTAssertEqual(initialFormY - formFrame.minY, offset, accuracy: 1,
+                               "Scrolling to paper must also move the cover form")
+                XCTAssertEqual(initialCategoryY - categoryFrame.minY, offset, accuracy: 1)
+                XCTAssertGreaterThan(categoryFrame.height, 0)
+                XCTAssertEqual(categoryFrame.minY, NibSpacing.m, accuracy: 1)
+                XCTAssertGreaterThanOrEqual(tileFrame.minY, categoryFrame.maxY)
+                XCTAssertGreaterThanOrEqual(tileFrame.height, NibMetrics.paperTileSize.height)
+                XCTAssertLessThan(tileFrame.maxY, size.height - NibSpacing.l,
+                                  "The entire first tile and its name must be above the continuation fade")
+                XCTAssertGreaterThanOrEqual(categoryFrame.minX, NibSpacing.l)
+                XCTAssertLessThanOrEqual(categoryFrame.maxX, size.width - NibSpacing.l)
+
+                host.view.layer.displayIfNeeded()
+                let image = UIGraphicsImageRenderer(size: size).image { context in
+                    host.view.layer.render(in: context.cgContext)
+                }
+                let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 1, y: size.height - 1)))
+                func contrast(at distance: CGFloat) throws -> Int {
+                    let pixel = try XCTUnwrap(NibSnapshot.pixel(image,
+                        at: CGPoint(x: size.width / 2, y: size.height - distance)))
+                    return abs(Int(pixel.r) - Int(background.r))
+                        + abs(Int(pixel.g) - Int(background.g)) + abs(Int(pixel.b) - Int(background.b))
+                }
+                let solid = try contrast(at: 20)
+                let fadeStart = try contrast(at: 16)
+                let fadeMiddle = try contrast(at: 8)
+                let fadeEnd = try contrast(at: 1)
+                XCTAssertGreaterThan(solid, 100, "The scrolling content must actually render")
+                XCTAssertEqual(Double(fadeStart), Double(solid), accuracy: 20,
+                               "Only the final 16 pt should fade")
+                XCTAssertGreaterThan(fadeStart, fadeMiddle)
+                XCTAssertGreaterThan(fadeMiddle, fadeEnd)
+                XCTAssertLessThan(fadeEnd, solid / 4)
+            }
+        }
+    }
+
     func testNewNotebookWithCoverColoursFitsA402PointPhone() async throws {
         let h = harness()
         h.app.content.templates.register(Self.ruled())
