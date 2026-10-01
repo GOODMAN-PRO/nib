@@ -1,0 +1,6 @@
+{"type":"textDelta","text":"Adding a "}
+{"type":"textDelta","text":"page — then I’ll check."}
+{"type":"toolCall","id":"c2","name":"nib_run","arguments":{"command":"page.add","params":{"doc":"doc:FIXTUREDOC01","position":"end","id":"NEWPAGE00001"}}}
+{"type":"toolCall","id":"c3","name":"nib_context","arguments":{}}
+{"type":"usage","input":1200,"output":85}
+{"type":"stop","reason":"tool_use"}
