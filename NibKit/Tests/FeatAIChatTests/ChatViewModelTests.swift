@@ -520,6 +520,240 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(model.entries.last?.isPersisted == true)
     }
 
+    private func installProposalEdits(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(id: "test.proposedEdit", title: "Revise text", summary: "Revise a fixture record.",
+            params: .obj(["ref": .ref, "text": .str()], required: ["ref", "text"]), effect: .edit)) { p, ctx in
+            guard case let .item(d, page, id)? = NodeRef(p["ref"]?.stringValue ?? "") else { throw NibError.invalid("item ref") }
+            var item = try ctx.workspace.item(d, page: page, id: id)
+            item.ext = ["revision": p["text"] ?? ""]
+            try ctx.mutate { tx in try tx.put(item, doc: d, page: page) }
+            return [:]
+        }
+    }
+
+    func testSelectiveProposalsStayDryUntilAcceptedAndUndoTogether() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        installProposalEdits(h)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        let before = try h.snapshotAll()
+        let refs = ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"]
+        _ = try await h.run(ChatCommand.propose, ["changes": .array(refs.map {
+            ["command": "test.proposedEdit", "params": ["ref": .string($0), "text": "Reviewed"], "title": "Revise text"]
+        })])
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        let first = try XCTUnwrap(model.proposals.first)
+        let second = try XCTUnwrap(model.proposals.last)
+        _ = try await h.run(ChatCommand.proposal, ["action": "include", "included": [.string(first.id)]])
+        _ = try await h.run(ChatCommand.accept)
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).ext?["revision"], "Reviewed")
+        XCTAssertNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID).ext?["revision"])
+        XCTAssertEqual(model.proposals.map(\.id), [second.id])
+        _ = try await h.run(ChatCommand.accept, ["id": .string(second.id)])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "individual approvals stay one group")
+        let receipt = try XCTUnwrap(model.entries.last)
+        XCTAssertEqual(receipt.changes.count, 2)
+        _ = try await h.run(ChatCommand.undo, ["message": .string(receipt.id)])
+        XCTAssertEqual(try h.snapshotAll(), before)
+    }
+
+    func testProposalDiscardInclusionUndoAndStalePreviewProtection() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        installProposalEdits(h)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
+        _ = try await h.run(ChatCommand.propose, ["changes": [["command": "test.proposedEdit", "params": ["ref": .string(ref), "text": "AI"]]]])
+        let id = try XCTUnwrap(model.proposals.first?.id)
+        model.localUndo.removeAllActions()
+        model.localUndo.beginUndoGrouping()
+        _ = try await h.run(ChatCommand.proposal, ["action": "discard", "id": .string(id)])
+        model.localUndo.endUndoGrouping()
+        XCTAssertTrue(model.proposals.isEmpty)
+        model.localUndo.undo()
+        XCTAssertEqual(model.proposals.first?.id, id)
+        _ = try await h.run("test.proposedEdit", ["ref": .string(ref), "text": "Later user edit"])
+        do { _ = try await h.run(ChatCommand.accept); XCTFail("stale preview must not overwrite a later edit") }
+        catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).ext?["revision"], "Later user edit")
+        XCTAssertEqual(model.proposals.count, 1)
+    }
+
+    func testAIProposalToolStagesDuringStreamAndCannotSelfAccept() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        installProposalEdits(h)
+        let changes: JSONValue = ["changes": [["command": "test.proposedEdit", "params": ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "AI"]]]]
+        h.app.services.ai = FakeAIService(responses: [.init(text: "Review this change", toolCalls: [(ChatCommand.propose, changes)])], bus: h.app.bus)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        let before = try h.snapshotAll()
+        _ = try await model.send(prompt: "Proofread", principal: .user, group: "PROPOSALTURN")
+        XCTAssertEqual(model.proposals.count, 1)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        do { _ = try await h.run(ChatCommand.accept, as: .ai(try XCTUnwrap(model.chatID))); XCTFail("AI cannot approve") }
+        catch let error as NibError { XCTAssertEqual(error.code, .permissionDenied) }
+    }
+
+    func testAskModeCannotStageAndUnsafePreviewNeverRuns() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        installProposalEdits(h)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let params: JSONValue = ["changes": [["command": "test.proposedEdit", "params": ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "AI"]]]]
+        do { _ = try await h.run(ChatCommand.propose, params); XCTFail("Ask mode cannot stage edits") }
+        catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+        var calls = 0
+        h.app.commands.register(CommandDescriptor(id: "test.unsafeProposal", title: "Upload", summary: "Upload a record.", effect: .edit, sensitive: true)) { _, _ in calls += 1; return [:] }
+        model.mode = .edit
+        do { _ = try await h.run(ChatCommand.propose, ["changes": [["command": "test.unsafeProposal", "params": [:]]]]); XCTFail("must not preview") }
+        catch let error as NibError { XCTAssertEqual(error.code, .unsupported) }
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testConversationRestoresMergedUsageImagesDetailedAndLegacyTools() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let chat = "RESTORECHAT1"
+        let directory = h.library.metadataURL.appendingPathComponent("ai")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let user = ChatEntry(id: "RESTOREUSER1", role: "user", text: "Read this image", images: [try h.assets.putTemporary(Fixtures.pngData, ext: "png")])
+        var answer = ChatEntry(id: "RESTOREANS01", role: "assistant", text: "Answer", group: "RESTOREGROUP")
+        answer.usage = AIUsage(input: 11, output: 7)
+        answer.tools = [ChatToolActivity(id: "RESTORETOOL", name: "query.get", arguments: ["ref": "doc:FIXTUREDOC01"], succeeded: true)]
+        var raw = StoredChatEntry(answer)
+        raw.tools = nil
+        let firstRev = Rev(wallMs: 1000, counter: 0, device: 1)
+        let secondRev = Rev(wallMs: 2000, counter: 0, device: 2)
+        let original: JSONValue = try JSONValue.from(raw).merging(["type": "message", "rev": .string(firstRev.description), "tools": ["query.get"]])
+        var newer = original.merging(["rev": .string(secondRev.description), "usage": ["input": 23, "output": 9]])
+        newer = newer.merging(["rating": "up"])
+        try (original.jsonString() + "\n" + original.jsonString() + "\n{torn").write(to: directory.appendingPathComponent(chat + ".00000001.jsonl"), atomically: true, encoding: .utf8)
+        try (newer.jsonString() + "\n").write(to: directory.appendingPathComponent(chat + ".00000002.jsonl"), atomically: true, encoding: .utf8)
+        try await ChatArchive.save(chat: chat, device: "00000001", records: [
+            .init(message: StoredChatEntry(user), rev: firstRev), .init(message: StoredChatEntry(answer), rev: firstRev)
+        ], metadata: h.library.metadataURL, assets: h.assets, doc: Fixtures.docID)
+        let source = try XCTUnwrap(h.assets.temporaryURL(try XCTUnwrap(user.images.first)))
+        try FileManager.default.removeItem(at: source)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatList, title: "List", summary: "Merged canonical conversation.", effect: .read)) { _, _ in
+            ["chats": [["id": .string(chat), "title": "Restored", "doc": "doc:FIXTUREDOC01", "updated": 2000]],
+             "messages": [["id": .string(user.id), "role": "user", "text": .string(user.text)],
+                          ["id": .string(answer.id), "role": "assistant", "text": "Answer", "rating": "up", "group": "RESTOREGROUP"]]]
+        }
+        h.app.settings.set(ChatViewModel.tokenKey(chat), 999)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try await model.selectChat(chat)
+        XCTAssertEqual(model.tokenCount, 32, "usage merges by id, not device or local settings")
+        let restored = try XCTUnwrap(model.entries.last)
+        XCTAssertEqual(restored.rating, "up")
+        XCTAssertEqual(restored.tools.first?.arguments, ["ref": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(restored.tools.first?.succeeded, true)
+        let image = try XCTUnwrap(model.entries.first?.images.first)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(model.imageURL(image))), Fixtures.pngData)
+        try await model.selectChat(chat)
+        XCTAssertEqual(model.tokenCount, 32, "reopening never counts usage twice")
+        let legacy = try JSONDecoder().decode(StoredChatEntry.self, from: Data(original.jsonString().utf8)).entry
+        XCTAssertFalse(try XCTUnwrap(legacy.tools.first).hasArguments)
+        XCTAssertNil(legacy.tools.first?.succeeded)
+    }
+
+    func testDestructiveProposalNeedsExplicitApprovalAndCreationKeepsProvenance() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit; model.chatID = "APPROVALCHAT"
+        h.app.commands.register(CommandDescriptor(id: "test.proposedCreate", title: "Insert text", summary: "Insert a text item.",
+            params: .obj(["id": .str(), "page": .ref, "text": .str()], required: ["id", "page", "text"]), effect: .edit)) { p, ctx in
+            guard case .page(let doc, let page)? = NodeRef(p["page"]?.stringValue ?? "") else { throw NibError.invalid("page") }
+            let item = Item(id: NibID(p["id"]?.stringValue ?? ""), kind: .text,
+                text: TextBoxItem(frame: Frame(x: 72, y: 72, w: 300, h: 80), text: RichText(plain: p["text"]?.stringValue ?? "")))
+            try ctx.mutate { tx in try tx.put(item, doc: doc, page: page) }
+            return ["ref": .string(NodeRef.item(doc, page, item.id).description)]
+        }
+        h.app.commands.register(CommandDescriptor(id: "test.proposedDelete", title: "Delete item", summary: "Delete a fixture item.",
+            params: .obj(["ref": .ref], required: ["ref"]), effect: .edit, destructive: true)) { p, ctx in
+            guard case .item(let doc, let page, let id)? = NodeRef(p["ref"]?.stringValue ?? "") else { throw NibError.invalid("item") }
+            var item = try ctx.workspace.item(doc, page: page, id: id); item.deleted = true
+            try ctx.mutate { tx in try tx.put(item, doc: doc, page: page) }
+            return [:]
+        }
+        let before = try h.snapshotAll()
+        _ = try await h.run(ChatCommand.propose, ["changes": [
+            ["command": "test.proposedCreate", "params": ["text": "Inserted after approval"]],
+            ["command": "test.proposedDelete", "params": ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"]]
+        ]])
+        let createdID = try XCTUnwrap(model.proposals.first?.params["id"]?.stringValue)
+        let deletion = try XCTUnwrap(model.proposals.last?.id)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        _ = try await h.run(ChatCommand.accept)
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: NibID(createdID)).createdBy, "ai:APPROVALCHAT")
+        XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
+        XCTAssertEqual(model.proposals.map(\.id), [deletion])
+        _ = try await h.run(ChatCommand.accept, ["id": .string(deletion)])
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
+        _ = try await h.run(ChatCommand.undo, ["message": .string(try XCTUnwrap(model.entries.last?.id))])
+        XCTAssertEqual(try h.snapshotAll(), before)
+    }
+
+    func testMultiPageProposalReviewIsRequiredBeforeApplying() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        installProposalEdits(h)
+        let model = ChatRuntime.get(h.app).model(for: h.session); model.mode = .edit
+        _ = try await h.run(ChatCommand.propose, ["changes": [
+            ["command": "test.proposedEdit", "params": ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "One"]],
+            ["command": "test.proposedEdit", "params": ["ref": "item:FIXTUREDOC04/FIXTUREBRD01/FIXTUREBSH01", "text": "Two"]]
+        ]])
+        XCTAssertTrue(model.proposalNeedsReview)
+        let before = try h.snapshotAll()
+        do { _ = try await h.run(ChatCommand.accept); XCTFail("review required") }
+        catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+        let review = Task { try await h.run(ChatCommand.proposal, ["action": "review"]) }
+        while model.confirmation == nil { await Task.yield() }
+        XCTAssertEqual(try h.snapshotAll(), before)
+        _ = try await h.run(ChatCommand.confirm, ["request": .string(try XCTUnwrap(model.confirmation?.id)), "decision": "allow"])
+        _ = try await review.value
+        XCTAssertFalse(model.proposalNeedsReview)
+        let output = try await h.run(ChatCommand.accept)
+        let group = try XCTUnwrap(output["group"]?.stringValue)
+        XCTAssertTrue(h.app.bus.history.isLinked(group))
+        _ = try await h.run(ChatCommand.undo, ["message": .string(try XCTUnwrap(model.entries.last?.id))])
+        XCTAssertEqual(try h.snapshotAll(), before)
+    }
+
+    func testObsoletePanelDisappearanceCannotHideTheReplacementPlacement() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        _ = try await h.run(ChatCommand.inspect, ["section": "visibility", "visible": true, "lease": "floating"])
+        _ = try await h.run(ChatCommand.inspect, ["section": "visibility", "visible": true, "lease": "sidebar"])
+        _ = try await h.run(ChatCommand.inspect, ["section": "visibility", "visible": false, "lease": "floating"])
+        XCTAssertTrue(model.isVisible)
+        XCTAssertEqual(model.visibilityLease, "sidebar")
+        _ = try await h.run(ChatCommand.inspect, ["section": "visibility", "visible": false, "lease": "sidebar"])
+        XCTAssertFalse(model.isVisible)
+    }
+
+    func testContextAndOnPagePreviewCommandsSupportUndoAndRedo() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let original = model.scope
+        model.localUndo.beginUndoGrouping()
+        _ = try await h.run(ChatCommand.configure, ["scope": "page", "mode": "edit"])
+        model.localUndo.endUndoGrouping()
+        XCTAssertEqual(model.scope.kind, .page)
+        XCTAssertEqual(model.mode, .edit)
+        model.localUndo.undo()
+        XCTAssertEqual(model.scope, original)
+        XCTAssertEqual(model.mode, .ask)
+        model.localUndo.redo()
+        XCTAssertEqual(model.scope.kind, .page)
+        model.localUndo.removeAllActions()
+        model.localUndo.beginUndoGrouping()
+        _ = try await h.run(ChatCommand.proposal, ["action": "preview", "visible": false])
+        model.localUndo.endUndoGrouping()
+        XCTAssertFalse(model.showsProposalsOnPage)
+        model.localUndo.undo()
+        XCTAssertTrue(model.showsProposalsOnPage)
+        model.localUndo.redo()
+        XCTAssertFalse(model.showsProposalsOnPage)
+    }
+
 }
 
 @MainActor

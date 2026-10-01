@@ -41,13 +41,14 @@ struct ChatEntry: Identifiable {
     }
 }
 
-struct ChatToolActivity: Identifiable {
+struct ChatToolActivity: Identifiable, Codable {
     var id = UUID().uuidString
     var name: String
     var arguments: JSONValue
     var succeeded: Bool?
     var cancelled = false
     var changes: ChangeSummary?
+    var hasArguments = true
 }
 
 struct ChatConversation: Decodable, Identifiable {
@@ -57,7 +58,8 @@ struct ChatConversation: Decodable, Identifiable {
     var updated: Double
 }
 
-struct StoredChatEntry: Decodable {
+/// F084's list is intentionally small; the JSONL record has additional optional fields.
+struct StoredChatEntry: Codable {
     var id: String
     var role: String
     var text: String
@@ -65,6 +67,55 @@ struct StoredChatEntry: Decodable {
     var changes: ChangeSummary?
     var rating: String?
     var at: Double?
+    var images: [String]?
+    var usage: AIUsage?
+    var tools: [ChatToolActivity]?
+    var cancelled: Bool?
+    var reverted: Bool?
+    var revertNote: String?
+    var receipt: Bool?
+
+    init(_ entry: ChatEntry) {
+        id = entry.id; role = entry.role; text = entry.text; group = entry.group
+        changes = entry.changes; rating = entry.rating; at = entry.at.timeIntervalSince1970
+        images = entry.images.map(\.name); usage = entry.usage; tools = entry.tools
+        reverted = entry.reverted; revertNote = entry.revertNote; receipt = entry.isReceipt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, role, text, group, changes, rating, at, images, usage, tools, cancelled, reverted, revertNote, receipt
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        role = try c.decodeIfPresent(String.self, forKey: .role) ?? "user"
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        group = try c.decodeIfPresent(String.self, forKey: .group)
+        changes = try c.decodeIfPresent(ChangeSummary.self, forKey: .changes)
+        rating = try c.decodeIfPresent(String.self, forKey: .rating)
+        at = try c.decodeIfPresent(Double.self, forKey: .at)
+        images = try c.decodeIfPresent([String].self, forKey: .images)
+        usage = try c.decodeIfPresent(AIUsage.self, forKey: .usage)
+        cancelled = try c.decodeIfPresent(Bool.self, forKey: .cancelled)
+        reverted = try c.decodeIfPresent(Bool.self, forKey: .reverted)
+        revertNote = try c.decodeIfPresent(String.self, forKey: .revertNote)
+        receipt = try c.decodeIfPresent(Bool.self, forKey: .receipt)
+        if let detailed = try? c.decode([ChatToolActivity].self, forKey: .tools) { tools = detailed }
+        else if let names = try? c.decode([String].self, forKey: .tools) {
+            // Legacy records never stored arguments or individual outcomes. Do not invent either.
+            tools = names.enumerated().map { ChatToolActivity(id: id + ".tool.\($0.offset)", name: $0.element,
+                arguments: [:], succeeded: nil, cancelled: cancelled ?? false, hasArguments: false) }
+        }
+    }
+
+    var entry: ChatEntry {
+        var entry = ChatEntry(id: id, role: role, text: text, images: (images ?? []).map(AssetRef.init),
+            changes: changes ?? ChangeSummary(), group: group, rating: rating,
+            at: Date(timeIntervalSince1970: at ?? 0), isReceipt: receipt ?? false, isPersisted: true)
+        entry.usage = usage ?? AIUsage(); entry.tools = tools ?? []
+        entry.reverted = reverted ?? false; entry.revertNote = revertNote
+        return entry
+    }
 }
 
 struct ChatListResult: Decodable {
@@ -95,6 +146,8 @@ final class ChatViewModel: ObservableObject {
     @Published var attachments: [AssetRef] = []
     @Published var isStreaming = false
     var isVisible = false
+    var visibilityLease: String?
+    weak var windowUndoManager: UndoManager?
     @Published var isGeneratingImage = false
     @Published var error: NibError?
     @Published var showsConversations = false
@@ -102,6 +155,13 @@ final class ChatViewModel: ObservableObject {
     @Published var renameTitle = ""
     @Published var showsTools = false
     @Published var draft: ChatDraft?
+    @Published var proposals: [ChatProposal] = []
+    @Published var showsProposalsOnPage = true
+    @Published var proposalsReviewed = false
+    @Published private(set) var isApplyingProposals = false
+    private(set) var isStagingProposals = false
+    let localUndo = UndoManager()
+    var proposalApplyGroup: String?
     @Published var confirmation: ChatConfirmation?
     @Published var providerLabel = String(localized: "Your provider · your API key")
     @Published var contextLabel = String(localized: "Library")
@@ -210,7 +270,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func selectChat(_ id: String, principal: Principal = .user) async throws {
-        guard !isStreaming, !isGeneratingImage else { throw NibError(.conflict, "stop this turn before switching conversations") }
+        guard !isStreaming, !isGeneratingImage, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "stop this turn before switching conversations") }
         guard let app else { throw NibError.unavailable("assistant is closed") }
         let token = UUID()
         loadToken = token
@@ -219,13 +279,14 @@ final class ChatViewModel: ObservableObject {
         let result = try await app.bus.execute(CommandIDs.aiChatList, ["all": true, "chat": .string(id)], principal: principal, session: session)
         guard loadToken == token, !isStreaming, !isGeneratingImage else { throw CancellationError() }
         let list = try result.decode(ChatListResult.self)
+        let restored = try await ChatArchive.restore(chat: id, listed: list.messages ?? [], metadata: app.services.library?.metadataURL)
+        guard loadToken == token, !isStreaming, !isGeneratingImage else { throw CancellationError() }
         chatID = id
-        totalTokens = app.settings.get(Self.tokenKey(id))
         conversations = list.chats
-        entries = (list.messages ?? []).map {
-            ChatEntry(id: $0.id, role: $0.role, text: $0.text, changes: $0.changes ?? ChangeSummary(),
-                      group: $0.group, rating: $0.rating, at: Date(timeIntervalSince1970: $0.at ?? 0), isPersisted: true)
-        }
+        entries = restored.map(\.entry)
+        let usage = restored.compactMap(\.usage)
+        totalTokens = usage.isEmpty ? app.settings.get(Self.tokenKey(id)) : usage.reduce(0) { $0 + $1.input + $1.output }
+        proposals = []; proposalApplyGroup = nil; localUndo.removeAllActions()
         for i in entries.indices { resolveEntryCitations(i) }
         if let owner = list.chats.first(where: { $0.id == id })?.doc, let ref = NodeRef(owner), let doc = ref.documentID {
             scope = AIScope(kind: .document, doc: doc)
@@ -240,12 +301,15 @@ final class ChatViewModel: ObservableObject {
     }
 
     func newChat() throws {
-        guard !isStreaming, !isGeneratingImage else { throw NibError(.conflict, "stop this turn before starting a conversation") }
+        guard !isStreaming, !isGeneratingImage, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "stop this turn before starting a conversation") }
         loadToken = nil
         isLoadingChat = false
         chatID = nil
         totalTokens = 0
         entries = []
+        proposals = []
+        proposalApplyGroup = nil
+        localUndo.removeAllActions()
         attachments = []
         composer = ""
         draft = nil
@@ -260,13 +324,14 @@ final class ChatViewModel: ObservableObject {
         guard let app, let ai = app.services.ai, ai.isConfigured else {
             throw NibError(.unavailable, "Connect a model to use the assistant.", hint: "open Settings › AI")
         }
-        guard !isStreaming, !isGeneratingImage, !isLoadingChat else { throw NibError(.conflict, "a turn or conversation load is already running") }
+        guard !isStreaming, !isGeneratingImage, !isLoadingChat, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "a turn or conversation load is already running") }
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("enter a question or instruction", path: "$.prompt") }
         let images = retry ? retryImages : attachments
         guard images.isEmpty || ai.supportsVision else {
             throw NibError(.unsupported, "this model cannot read images", hint: "choose a model with vision in Settings › AI")
         }
+        guard proposals.isEmpty else { throw NibError(.conflict, "accept or discard the pending proposals first") }
         let id = chatID ?? NibID.make().raw
         chatID = id
         let prior = retry ? entries.first(where: { $0.id == retryEntry }) : nil
@@ -295,8 +360,11 @@ final class ChatViewModel: ObservableObject {
         retryImages = images
         retryEntry = answerID
         let effectivePrincipal = principal.isUser ? Principal.ai(id) : principal
-        let request = AIRequest(chatID: id, messages: [AIMessage(role: "user", text: text, images: images.isEmpty ? nil : images)],
+        var request = AIRequest(chatID: id, messages: [AIMessage(role: "user", text: text, images: images.isEmpty ? nil : images)],
                                 mode: mode, scope: scope, principal: effectivePrincipal, group: group)
+        if mode == .edit {
+            request.system = "For proposed note edits, call ai.chat.propose with changes [{command, params, title}]. Each row must be an independent command. Use commands.describe to read its schema. These edits remain previews until the user accepts individual rows. Do not claim they are applied."
+        }
         // Commit observers run synchronously on the bus's main actor. Keep the receipt accurate even if Stop wins
         // the race with a queued toolFinished stream event.
         let commits = app.bus.observeCommits { [weak self] changeset in
@@ -359,6 +427,7 @@ final class ChatViewModel: ObservableObject {
                             }
                         } catch { /* The streamed receipt remains usable when the catalogue is temporarily unavailable. */ }
                     }
+                    try await persistConversation()
                     return response
                 case .failed(let failure): throw failure
                 }
@@ -367,6 +436,7 @@ final class ChatViewModel: ObservableObject {
             throw NibError(.unavailable, "the provider closed the stream before completing the answer", hint: "retry this turn")
         } catch {
             if generation == token, !(error is CancellationError) { self.error = NibError.wrap(error) }
+            try? await persistConversation()
             throw error
         }
     }
@@ -421,6 +491,7 @@ final class ChatViewModel: ObservableObject {
         }
         if failed > 0 { error = NibError(.conflict, notes.joined(separator: "\n")) }
         else if skipped > 0 { error = NibError(.conflict, "\(skipped) later edits were kept. \(reverted) changes reverted.") }
+        try await persistConversation()
         return ["reverted": .number(Double(reverted)), "skipped": .number(Double(skipped))]
     }
 
@@ -455,7 +526,7 @@ final class ChatViewModel: ObservableObject {
         guard let app, let ai = app.services.ai, ai.isConfigured, let assets = app.services.assets else {
             throw NibError.unavailable("connect a model and an asset store first")
         }
-        guard !isStreaming, !isGeneratingImage, !isLoadingChat else { throw NibError(.conflict, "a turn or conversation load is already running") }
+        guard !isStreaming, !isGeneratingImage, !isLoadingChat, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "a turn or conversation load is already running") }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NibError.invalid("describe an image", path: "$.prompt") }
         let token = UUID()
         generation = token
@@ -479,6 +550,32 @@ final class ChatViewModel: ObservableObject {
             if generation == token, !(error is CancellationError) { self.error = NibError.wrap(error) }
             throw error
         }
+    }
+
+    func persistConversation() async throws {
+        guard let app, let chatID, let metadata = app.services.library?.metadataURL else { return }
+        // Reconcile the user message too, so attachments merge by F084's canonical message id.
+        if app.commands.entry(CommandIDs.aiChatList) != nil,
+           let value = try? await app.bus.execute(CommandIDs.aiChatList, ["chat": .string(chatID)], session: session),
+           let stored = try? value.decode(ChatListResult.self) {
+            var used = Set(entries.filter(\.isPersisted).map(\.id))
+            for i in entries.indices where !entries[i].isPersisted && !entries[i].isReceipt {
+                if let match = stored.messages?.first(where: { !used.contains($0.id) && $0.role == entries[i].role && $0.text == entries[i].text && ($0.group == nil || $0.group == entries[i].group) }) {
+                    entries[i].id = match.id; entries[i].isPersisted = true; used.insert(match.id)
+                }
+            }
+        }
+        let records = entries.filter { $0.isPersisted || $0.isReceipt }.map { ChatArchive.Record(message: StoredChatEntry($0), rev: app.clock.tick()) }
+        try await ChatArchive.save(chat: chatID, device: app.deviceHex, records: records, metadata: metadata,
+                                   assets: app.services.assets, doc: scope.doc)
+    }
+
+    func imageURL(_ asset: AssetRef) -> URL? {
+        if let metadata = app?.services.library?.metadataURL {
+            let url = ChatArchive.assetURL(asset.name, metadata: metadata)
+            if let url, FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return app?.services.assets?.temporaryURL(asset) ?? scope.doc.flatMap { app?.services.assets?.url(asset, doc: $0) }
     }
 
     private func resolveEntryCitations(_ index: Int) {
@@ -557,5 +654,288 @@ enum ChatImageBytes {
         if data.starts(with: [0xff, 0xd8, 0xff]) { return (data, "jpg") }
         guard let png = image.pngData() else { throw NibError.invalid("cannot convert image", path: "$.image") }
         return (png, "png")
+    }
+}
+
+/// Presentation metadata supplements, never rewrites, F084's chat records. The folder is inside the synced
+/// AI metadata tree; F084 scans only its top-level JSONL files. I/O is serialized off the main actor.
+actor ChatArchive {
+    static let io = ChatArchive()
+    struct Record: Codable {
+        var message: StoredChatEntry
+        var rev: Rev
+    }
+    private struct AgentRecord: Decodable {
+        var message: StoredChatEntry
+        var rev: Rev
+        var deleted: Bool
+        var type: String
+        enum CodingKeys: String, CodingKey { case rev, deleted, type }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            rev = try c.decodeIfPresent(Rev.self, forKey: .rev) ?? .zero
+            deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted) ?? false
+            type = try c.decodeIfPresent(String.self, forKey: .type) ?? "message"
+            message = try StoredChatEntry(from: decoder)
+        }
+    }
+
+    static func assetURL(_ name: String, metadata: URL) -> URL? {
+        guard !name.isEmpty, !name.hasPrefix("."), !name.contains("/"), !name.contains("\\"), !name.contains("\0") else { return nil }
+        return metadata.appendingPathComponent("ai/presentation/assets", isDirectory: true).appendingPathComponent(name)
+    }
+    static func restore(chat: String, listed: [StoredChatEntry], metadata: URL?) async throws -> [StoredChatEntry] {
+        guard NibID.isValid(chat), let metadata else { return listed }
+        return try await io.load(chat: chat, listed: listed, metadata: metadata)
+    }
+    static func save(chat: String, device: String, records: [Record], metadata: URL, assets: AssetStore?, doc: DocumentID?) async throws {
+        guard NibID.isValid(chat), device.count == 8, device.allSatisfy({ $0.isHexDigit }) else { throw NibError.invalid("invalid conversation archive id") }
+        try await io.write(chat: chat, device: device, records: records, metadata: metadata, assets: assets, doc: doc)
+    }
+
+    private func files(_ directory: URL, chat: String) throws -> [URL] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey])
+            .filter { $0.lastPathComponent.hasPrefix(chat + ".") && $0.pathExtension == "jsonl" && (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+    private func records<T: Decodable>(_ type: T.Type, url: URL) throws -> [T] {
+        // A torn line is skipped just as in F084. An unreadable file is surfaced to the caller.
+        try Data(contentsOf: url).split(separator: 0x0a).compactMap { try? JSONDecoder().decode(type, from: Data($0)) }
+    }
+    private func merged(chat: String, metadata: URL) throws -> [String: Record] {
+        var result: [String: Record] = [:]
+        for file in try files(metadata.appendingPathComponent("ai/presentation"), chat: chat) {
+            for record in try records(Record.self, url: file) {
+                if result[record.message.id].map({ $0.rev.effective() >= record.rev.effective() }) != true { result[record.message.id] = record }
+            }
+        }
+        return result
+    }
+    private func load(chat: String, listed: [StoredChatEntry], metadata: URL) throws -> [StoredChatEntry] {
+        var agent: [String: AgentRecord] = [:]
+        for file in try files(metadata.appendingPathComponent("ai"), chat: chat) {
+            for record in try records(AgentRecord.self, url: file) where record.type == "message" {
+                if agent[record.message.id].map({ $0.rev.effective() >= record.rev.effective() }) != true { agent[record.message.id] = record }
+            }
+        }
+        let presentation = try merged(chat: chat, metadata: metadata)
+        // List owns visibility, message order and feedback. Never resurrect a deleted or inaccessible message.
+        var restored = listed.compactMap { base -> StoredChatEntry? in
+            guard agent[base.id]?.deleted != true else { return nil }
+            var result = base
+            let disk = agent[base.id]?.message
+            let ui = presentation[base.id]?.message
+            result.images = ui?.images ?? disk?.images ?? base.images
+            result.usage = disk?.usage ?? ui?.usage ?? base.usage
+            result.tools = ui?.tools ?? disk?.tools ?? base.tools
+            result.cancelled = disk?.cancelled ?? ui?.cancelled ?? base.cancelled
+            result.reverted = ui?.reverted ?? base.reverted
+            result.revertNote = ui?.revertNote ?? base.revertNote
+            return result
+        }
+        let ids = Set(restored.map(\.id))
+        restored += presentation.values.map(\.message).filter { $0.receipt == true && !ids.contains($0.id) }
+            .sorted { ($0.at ?? 0, $0.id) < ($1.at ?? 0, $1.id) }
+        return restored
+    }
+    private func write(chat: String, device: String, records incoming: [Record], metadata: URL, assets: AssetStore?, doc: DocumentID?) throws {
+        let directory = metadata.appendingPathComponent("ai/presentation", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent(chat + "." + device + ".jsonl")
+        var own = Dictionary((FileManager.default.fileExists(atPath: file.path) ? try records(Record.self, url: file) : []).map { ($0.message.id, $0) }, uniquingKeysWith: { $0.rev > $1.rev ? $0 : $1 })
+        let existing = try merged(chat: chat, metadata: metadata)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        for record in incoming {
+            for name in record.message.images ?? [] {
+                guard let dest = Self.assetURL(name, metadata: metadata) else { throw NibError.invalid("invalid attachment name") }
+                if !FileManager.default.fileExists(atPath: dest.path), let assets,
+                   let source = assets.temporaryURL(AssetRef(name)) ?? doc.flatMap({ assets.url(AssetRef(name), doc: $0) }) {
+                    try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try Data(contentsOf: source).write(to: dest, options: .atomic)
+                }
+            }
+            if let prior = existing[record.message.id], try encoder.encode(prior.message) == encoder.encode(record.message) { continue }
+            own[record.message.id] = record
+        }
+        var data = Data()
+        for record in own.values.sorted(by: { $0.message.id < $1.message.id }) { data.append(try encoder.encode(record)); data.append(0x0a) }
+        try data.write(to: file, options: .atomic)
+    }
+}
+
+struct ChatProposal: Identifiable {
+    var id = NibID.make().raw
+    var number: Int
+    var command: String
+    var params: JSONValue
+    var title: String
+    var changes: ChangeSummary
+    var originals: [String: JSONValue]
+    var included = true
+    var destructive: Bool
+    var target: String?
+    var previewText: String
+    var group: String
+}
+
+@MainActor
+extension ChatViewModel {
+    var proposalNeedsReview: Bool {
+        !proposalsReviewed && (proposals.reduce(0) { $0 + $1.changes.count } > 10 || Set(proposals.flatMap { $0.changes.all }.compactMap {
+            guard let ref = NodeRef($0), let doc = ref.documentID else { return nil as String? }
+            return doc.raw + "/" + (ref.pageID?.raw ?? "blocks")
+        }).count > 1)
+    }
+
+    func proposalSnapshot(_ ref: String) throws -> JSONValue {
+        guard let app, let node = NodeRef(ref), let doc = node.documentID else { throw NibError.invalid("invalid proposal ref") }
+        switch node {
+        case .item(_, let page, let item):
+            return try JSONValue.from(app.workspace.allItems(doc, page: page).first { $0.id == item })
+        case .block(_, let block):
+            return try JSONValue.from(app.workspace.content(doc).blocks.first { $0.id == block })
+        case .page(_, let page):
+            return try JSONValue.from(app.workspace.content(doc).pages.first { $0.id == page })
+        default: return try JSONValue.from(app.workspace.content(doc))
+        }
+    }
+
+    func stageProposals(_ rows: [JSONValue], context: CommandContext) async throws -> JSONValue {
+        guard let app, mode == .edit, !isApplyingProposals, !isStagingProposals, !isLoadingChat else { throw NibError(.conflict, "switch to Edit before proposing changes") }
+        guard !rows.isEmpty, rows.count + proposals.count <= 100 else { throw NibError.invalid("propose between 1 and 100 independent changes") }
+        if !context.principal.isUser {
+            guard case .ai(let chat) = context.principal, chat == chatID, isStreaming else { throw NibError(.permissionDenied, "proposals belong to this window's active AI turn") }
+        }
+        let turn = turnToken
+        let chat = chatID
+        isStagingProposals = true
+        defer { isStagingProposals = false }
+        var staged: [ChatProposal] = []
+        for row in rows {
+            let command = try ChatCommands.string(row, "command")
+            guard let descriptor = app.commands.descriptor(command), descriptor.effect == .edit,
+                  descriptor.owner != FeatAIChatFeature.id, !descriptor.sensitive, !descriptor.userPresence,
+                  !descriptor.forwardsCalls, !descriptor.scopes.contains(.network),
+                  app.services.get(ServiceKeys.pluginHost, as: PluginHosting.self)?.installed.contains(where: { $0.id == descriptor.owner }) != true else {
+                throw NibError(.unsupported, "this command cannot be staged safely", hint: "propose independent local document edits")
+            }
+            var params = row["params"] ?? [:]
+            guard params.objectValue != nil else { throw NibError.invalid("proposal params must be an object") }
+            // Freeze caller-chosen ids and session defaults at preview time.
+            if descriptor.params.toJSON()["properties"]?["id"] != nil, params["id"] == nil { params = params.merging(["id": .string(NibID.make().raw)]) }
+            if descriptor.params.toJSON()["properties"]?["page"] != nil, params["page"] == nil, let doc = session?.document, let page = session?.page {
+                params = params.merging(["page": .string(NodeRef.page(doc, page).description)])
+            }
+            if descriptor.params.toJSON()["properties"]?["doc"] != nil, params["doc"] == nil, let doc = session?.document {
+                params = params.merging(["doc": .string(NodeRef.document(doc).description)])
+            }
+            if let issue = descriptor.params.validate(params).first { throw NibError.invalid(issue.message, path: issue.path) }
+            let preview = try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
+                session: session, group: context.group, dryRun: true))
+            guard !preview.changes.isEmpty else { throw NibError.invalid("the proposal has no document changes") }
+            let touched = Set(preview.changes.all)
+            guard !proposals.contains(where: { !Set($0.changes.all).isDisjoint(with: touched) }),
+                  !staged.contains(where: { !Set($0.changes.all).isDisjoint(with: touched) }) else {
+                throw NibError(.conflict, "each proposal must change independent records")
+            }
+            var originals: [String: JSONValue] = [:]
+            for ref in touched { originals[ref] = try proposalSnapshot(ref) }
+            staged.append(ChatProposal(number: proposals.count + staged.count + 1, command: command, params: params,
+                title: row["title"]?.stringValue ?? descriptor.title, changes: preview.changes, originals: originals,
+                destructive: descriptor.destructive || !preview.changes.removed.isEmpty,
+                target: preview.changes.all.first, previewText: (try? params["text"]?.decode(RichText.self).plainText) ?? row["title"]?.stringValue ?? descriptor.title,
+                group: context.group))
+        }
+        if !context.principal.isUser, turn != turnToken || chat != chatID || !isStreaming { throw CancellationError() }
+        if !context.dryRun {
+            let prior = proposals
+            registerProposalUndo(prior, title: String(localized: "Propose changes"))
+            if proposals.isEmpty { proposalApplyGroup = nil }
+            proposals += staged; proposalsReviewed = false
+        }
+        return ["proposed": .number(Double(staged.count)), "applied": false, "ids": .array(staged.map { .string($0.id) })]
+    }
+
+    func registerContextUndo() {
+        let previousScope = scope, previousMode = mode, previousLabel = contextLabel
+        let manager = windowUndoManager ?? (session?.editor as? UIViewController)?.undoManager ?? localUndo
+        manager.registerUndo(withTarget: self) { model in
+            MainActor.assumeIsolated {
+                model.registerContextUndo()
+                model.scope = previousScope; model.mode = previousMode; model.contextLabel = previousLabel
+            }
+        }
+        manager.setActionName(String(localized: "Change assistant context"))
+    }
+
+    func setPreviewVisibility(_ visible: Bool) {
+        let prior = showsProposalsOnPage
+        let manager = windowUndoManager ?? (session?.editor as? UIViewController)?.undoManager ?? localUndo
+        manager.registerUndo(withTarget: self) { model in
+            MainActor.assumeIsolated { model.setPreviewVisibility(prior) }
+        }
+        manager.setActionName(String(localized: "Preview proposals"))
+        showsProposalsOnPage = visible
+    }
+
+    func registerProposalUndo(_ previous: [ChatProposal], title: String) {
+        let manager = windowUndoManager ?? (session?.editor as? UIViewController)?.undoManager ?? localUndo
+        manager.registerUndo(withTarget: self) { model in
+            MainActor.assumeIsolated {
+                let current = model.proposals
+                model.registerProposalUndo(current, title: title)
+                model.proposals = previous; model.proposalsReviewed = false
+            }
+        }
+        manager.setActionName(title)
+    }
+
+    func changeProposal(_ action: String, id: String?, included: [String]?, visible: Bool?) throws {
+        guard !isStreaming, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "wait for the current turn") }
+        if action == "preview" {
+            setPreviewVisibility(visible ?? !showsProposalsOnPage)
+            return
+        }
+        if let id, !proposals.contains(where: { $0.id == id }) { throw NibError.notFound("proposal") }
+        if let included, !Set(included).isSubset(of: Set(proposals.map(\.id))) { throw NibError.notFound("proposal") }
+        registerProposalUndo(proposals, title: String(localized: "Choose proposed changes"))
+        if action == "discard" { proposals.removeAll { id == nil || $0.id == id } }
+        else if action == "include", let included {
+            for i in proposals.indices { proposals[i].included = included.contains(proposals[i].id) }
+        } else { throw NibError.invalid("unknown proposal action") }
+    }
+
+    func applyProposals(id: String?, context: CommandContext) async throws -> JSONValue {
+        guard context.principal.isUser else { throw NibError(.permissionDenied, "only the user may accept proposals") }
+        guard !isStreaming, !isGeneratingImage, !isLoadingChat, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "wait for the current turn") }
+        guard !proposalNeedsReview else { throw NibError(.conflict, "review these changes before accepting") }
+        let selected = proposals.filter { row in id.map { $0 == row.id } ?? (row.included && !row.destructive) }
+        guard !selected.isEmpty else { throw NibError(.unavailable, "include a proposal before accepting") }
+        // Preflight every selected row before writing any of them. Later edits are never silently overwritten.
+        for proposal in selected {
+            for (ref, original) in proposal.originals where try proposalSnapshot(ref) != original {
+                throw NibError(.conflict, "a proposed record changed after its preview", hint: "discard it and ask for a new proposal")
+            }
+        }
+        if context.dryRun { return ["count": .number(Double(selected.count))] }
+        proposalApplyGroup = context.group
+        isApplyingProposals = true
+        defer { isApplyingProposals = false }
+        var changes = ChangeSummary()
+        let chat = chatID ?? NibID.make().raw
+        for proposal in selected {
+            let result = try await ChatCommands.insertAIContent(proposal.command, proposal.params, context: context, chat: chat)
+            let applied = (try? result["changes"]?.decode(ChangeSummary.self)) ?? ChangeSummary()
+            changes.merge(applied)
+            proposals.removeAll { $0.id == proposal.id }
+            if let i = entries.lastIndex(where: { $0.group == context.group && $0.isReceipt }) { entries[i].changes.merge(applied) }
+            else { entries.append(ChatEntry(id: NibID.make().raw, role: "assistant", text: String(localized: "Applied proposed changes."),
+                changes: applied, group: context.group, isReceipt: true)) }
+        }
+        let turnChanges = entries.last(where: { $0.group == context.group && $0.isReceipt })?.changes ?? changes
+        if Set(turnChanges.all.compactMap { NodeRef($0)?.documentID }).count > 1 { context.linkUndoAcrossDocuments() }
+        try await persistConversation()
+        return ["changes": try JSONValue.from(changes), "group": .string(context.group)]
     }
 }

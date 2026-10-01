@@ -18,6 +18,9 @@ public enum FeatAIChatFeature: NibFeature {
         }
         panel.providesHeader = true
         app.ui.panels.register(panel)
+        app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "aichat.inlineAI", owner: id, order: 851) { _ in
+            ChatInlineAttachment()
+        })
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "aichat.answerDrop", owner: id, order: 850) { _ in
             ChatAnswerDropAttachment()
         })
@@ -43,6 +46,7 @@ public enum FeatAIChatFeature: NibFeature {
             runtime.windowScenes = scenes
             app.ui.sceneHooks = scenes
         }
+        runtime.installBlockAccessories()
         app.gateway.setPresenter(runtime, forPrincipalKind: "ai")
     }
 }
@@ -64,6 +68,10 @@ enum ChatCommand {
     static let undo = "ai.chat.undo"
     static let show = "ai.chat.show"
     static let confirm = "ai.chat.confirm"
+    static let askBlock = "ai.chat.askBlock"
+    static let propose = "ai.chat.propose"
+    static let proposal = "ai.chat.proposal"
+    static let accept = "ai.chat.acceptProposals"
 }
 
 @MainActor
@@ -73,6 +81,7 @@ final class ChatRuntime: ConfirmationPresenter {
     // Gateway deliberately holds presenters weakly. NibServices retains this runtime and its fallback.
     var fallback: ConfirmationPresenter?
     var windowScenes: ChatWindowScenes?
+    var blockAccessoriesInstalled = false
     private var models: [String: ChatViewModel] = [:]
 
     init(app: NibApp) { self.app = app }
@@ -139,7 +148,10 @@ enum ChatCommands {
             let descriptor = CommandDescriptor(id: id, title: title, summary: summary, params: schema, examples: examples,
                 effect: effect, target: .app, extraScopes: extraScopes.union(security ? [.security] : []), userPresence: userPresence, sensitive: sensitive, forwardsCalls: forwards)
             app.commands.register(descriptor) { params, ctx in
-                do { return try await handler(params, ctx) }
+                do {
+                    if let problem = descriptor.params.validate(params).first { throw NibError(problem.code, problem.message, path: problem.path) }
+                    return try await handler(params, ctx)
+                }
                 catch {
                     if !ctx.dryRun, !(error is CancellationError), let app = ctx.app {
                         ChatRuntime.get(app).model(for: ctx.activeSession).error = NibError.wrap(error)
@@ -148,13 +160,74 @@ enum ChatCommands {
                 }
             }
         }
+        register(ChatCommand.askBlock, "Ask About This Block", "Open the assistant with this text or handwriting block as its explicit context.",
+            schema: .obj(["ref": .ref], required: ["ref"]), examples: [["ref": "block:FIXTUREDOC02/FIXTUREBLK01"]], forwards: true) { p, ctx in
+                let raw = try string(p, "ref")
+                let scope: String
+                switch NodeRef(raw) {
+                case .block(let doc, let block):
+                    guard try ctx.workspace.content(doc).liveBlocks.contains(where: { $0.id == block }) else { throw NibError.notFound("block") }
+                    scope = "block"
+                case .item(let doc, let page, let item):
+                    let value = try ctx.workspace.item(doc, page: page, id: item)
+                    guard value.kind == .text || value.kind == .stroke else { throw NibError.invalid("choose a text or ink block") }
+                    scope = "selection"
+                default: throw NibError.invalid("choose a text or ink block", path: "$.ref")
+                }
+                if ctx.dryRun { return [:] }
+                return try await ctx.execute(ChatCommand.open, ["scope": .string(scope), "refs": [.string(raw)]])
+            }
+        register(ChatCommand.propose, "Propose Note Changes", "Stage independent local edits for per-row approval. Nothing is applied until the user accepts; preview uses dry-run.",
+            schema: .obj(["changes": .arr(.obj(["command": .str(), "params": .obj([:]), "title": .str()], required: ["command", "params"]))], required: ["changes"]),
+            examples: [["changes": [["command": "text.setText", "params": ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Revised"], "title": "Revise text"]]]],
+            forwards: true, extraScopes: [.ai]) { p, ctx in
+                guard let rows = p["changes"]?.arrayValue else { throw NibError.invalid("changes must be an array") }
+                return try await model(ctx).stageProposals(rows, context: ctx)
+            }
+        register(ChatCommand.proposal, "Review Proposed Changes", "Include or discard individual proposals, toggle on-page proofreader previews, or review a large set before accepting.",
+            schema: .obj(["action": .str(choices: ["include", "discard", "preview", "review"]), "id": .str(), "included": .arr(.str()), "visible": .bool()], required: ["action"]),
+            examples: [["action": "discard"]], forwards: true) { p, ctx in
+                guard ctx.principal.isUser else { throw NibError(.permissionDenied, "only the user reviews proposals") }
+                let model = try model(ctx)
+                if ctx.dryRun { return [:] }
+                let action = try string(p, "action")
+                if action == "review" {
+                    guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "wait for this turn") }
+                    let pending = ChatConfirmation(request: ConfirmationRequest(principal: .user,
+                        command: ctx.bus.registry.descriptor(ChatCommand.accept)!, params: ["count": .number(Double(model.proposals.count))]))
+                    var summary = ChangeSummary()
+                    for row in model.proposals { summary.merge(row.changes) }
+                    pending.summary = summary
+                    pending.previewText = String(localized: "Review each proposed change. Accept applies only included rows; deletions need their own approval.")
+                    for ref in summary.all { pending.labels[ref] = model.citationLabel(ref) }
+                    switch await model.requestConfirmation(pending) {
+                    case .allow, .allowRestOfGroup: model.proposalsReviewed = true
+                    case .deny: break
+                    }
+                } else {
+                    try model.changeProposal(action, id: p["id"]?.stringValue,
+                        included: p["included"]?.arrayValue?.compactMap(\.stringValue), visible: p["visible"]?.boolValue)
+                }
+                return [:]
+            }
+        register(ChatCommand.accept, "Accept Proposed Changes", "Apply included proposals in one undo group with AI provenance; id approves a single row, including a destructive row.",
+            schema: .obj(["id": .str()]), examples: [[:]], effect: .edit, forwards: true) { p, ctx in
+                let model = try model(ctx)
+                guard ctx.principal.isUser else { throw NibError(.permissionDenied, "only the user may accept proposals") }
+                if let group = model.proposalApplyGroup, group != ctx.group {
+                    return try await ctx.bus.execute(Invocation(command: ChatCommand.accept, params: p, principal: ctx.principal,
+                        session: ctx.session, group: group, dryRun: ctx.dryRun, depth: ctx.depth + 1, readOnly: ctx.readOnly)).value
+                }
+                return try await model.applyProposals(id: p["id"]?.stringValue, context: ctx)
+            }
         register(ChatCommand.open, "Assistant", "Open the assistant in floating, sidebar or window mode with an optional selection or block context.",
             schema: .obj(["scope": scopeSchema, "refs": .arr(.ref), "mode": .str(choices: ["floating", "sidebar", "window"])]),
             examples: [[:], ["scope": "block", "refs": ["block:FIXTUREDOC02/FIXTUREBLK01"]]]) { p, ctx in
                 let model = try model(ctx)
                 if ctx.dryRun { return [:] }
                 if let scope = p["scope"]?.stringValue {
-                    guard !model.isStreaming else { throw NibError(.conflict, "stop this turn before changing its context") }
+                    guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "stop this turn before changing its context") }
+                    if ctx.principal.isUser { model.registerContextUndo() }
                     try model.setScope(try kind(scope), refs: try refs(p))
                 }
                 let panelParams: JSONValue = ["scope": .string(model.scope.kind.rawValue), "refs": .array(model.scope.refs.map(JSONValue.string))]
@@ -162,7 +235,7 @@ enum ChatCommands {
                     return try await ctx.execute(CommandIDs.panelOpen, ["id": .string(PanelIDs.assistant), "params": panelParams])
                 }
                 guard ["floating", "sidebar", "window"].contains(mode) else { throw NibError.invalid("unknown panel mode", path: "$.mode") }
-                guard !model.isStreaming, !model.isGeneratingImage else { throw NibError(.conflict, "stop this turn before changing panel mode") }
+                guard !model.isStreaming, !model.isGeneratingImage, !model.isApplyingProposals else { throw NibError(.conflict, "stop this turn before changing panel mode") }
                 if mode == "window" {
                     guard let app = ctx.app, let scenes = ChatRuntime.get(app).windowScenes else { throw NibError.unavailable("assistant window routing") }
                     try scenes.open(model)
@@ -236,8 +309,9 @@ enum ChatCommands {
             schema: .obj(["mode": .str(choices: AIMode.allCases.map(\.rawValue)), "scope": scopeSchema, "refs": .arr(.ref)]),
             examples: [["mode": "ask", "scope": "document"]]) { p, ctx in
                 let model = try model(ctx)
-                guard !model.isStreaming else { throw NibError(.conflict, "stop this turn before changing its context") }
+                guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "stop this turn before changing its context") }
                 if ctx.dryRun { return [:] }
+                if ctx.principal.isUser { model.registerContextUndo() }
                 if let raw = p["mode"]?.stringValue {
                     guard let mode = AIMode(rawValue: raw) else { throw NibError.invalid("mode must be ask or edit", path: "$.mode") }
                     if let raw = p["scope"]?.stringValue { try model.setScope(try kind(raw), refs: try refs(p)) }
@@ -248,7 +322,7 @@ enum ChatCommands {
                 return [:]
             }
         register(ChatCommand.inspect, "Assistant Details", "Show conversations or raw tool calls, refresh context, or clear an inline error.",
-            schema: .obj(["section": .str(choices: ["conversations", "tools", "context", "error", "visibility", "rename"]), "visible": .bool(), "chat": .str()], required: ["section"]),
+            schema: .obj(["section": .str(choices: ["conversations", "tools", "context", "error", "visibility", "rename"]), "visible": .bool(), "chat": .str(), "lease": .str()], required: ["section"]),
             examples: [["section": "context"]]) { p, ctx in
                 let model = try model(ctx)
                 if ctx.dryRun { return [:] }
@@ -263,8 +337,12 @@ enum ChatCommands {
                     model.renamingChat = chat
                     model.renameTitle = conversation.title
                 case "visibility":
-                    model.isVisible = p["visible"]?.boolValue ?? false
-                    if !model.isVisible { model.stop() }
+                    let visible = p["visible"]?.boolValue ?? false
+                    let lease = p["lease"]?.stringValue
+                    if !visible, let lease, lease != model.visibilityLease { return [:] }
+                    model.visibilityLease = visible ? lease : nil
+                    model.isVisible = visible
+                    if !visible { model.stop() }
                 default: throw NibError.invalid("unknown section", path: "$.section")
                 }
                 return [:]
@@ -281,7 +359,7 @@ enum ChatCommands {
             schema: .obj(["source": .str(choices: ["screenshot", "image", "remove"]), "asset": .str(), "base64": .str()], required: ["source"]),
             examples: [["source": "image", "asset": "fixture-image.png"]]) { p, ctx in
                 let model = try model(ctx)
-                guard !model.isStreaming else { throw NibError(.conflict, "wait for this turn before adding context") }
+                guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "wait for this turn before adding context") }
                 if ctx.dryRun { return [:] }
                 let source = try string(p, "source")
                 if source == "remove" {

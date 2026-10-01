@@ -8,6 +8,7 @@ struct ChatPanel: View {
     @ObservedObject var model: ChatViewModel
     let context: PanelContext
     @State private var deletingChat: String?
+    @State private var visibilityLease = UUID().uuidString
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
@@ -75,9 +76,10 @@ struct ChatPanel: View {
             case .failure(let error): model.error = NibError.wrap(error)
             }
         }
-        .onDisappear { model.perform(ChatCommand.inspect, ["section": "visibility", "visible": false]) }
+        .onDisappear { model.perform(ChatCommand.inspect, ["section": "visibility", "visible": false, "lease": .string(visibilityLease)]) }
         .task {
-            model.perform(ChatCommand.inspect, ["section": "visibility", "visible": true])
+            model.windowUndoManager = context.navigator?.rootViewController?.undoManager
+            model.perform(ChatCommand.inspect, ["section": "visibility", "visible": true, "lease": .string(visibilityLease)])
             if let scope = context.params["scope"]?.stringValue {
                 model.perform(ChatCommand.configure, ["scope": .string(scope), "refs": context.params["refs"] ?? []])
             } else { model.perform(ChatCommand.inspect, ["section": "context"]) }
@@ -151,6 +153,7 @@ struct ChatPanel: View {
                     if model.isLoadingChat {
                         NibTraceRow(String(localized: "Loading conversation…"), phase: .running)
                     }
+                    if !model.proposals.isEmpty { ChatProposalsView(model: model) }
                     if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
                     if let error = model.error {
                         NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
