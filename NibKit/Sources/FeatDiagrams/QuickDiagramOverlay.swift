@@ -233,14 +233,17 @@ final class QuickDiagramOverlay: CanvasAttachment {
     /// omitted midpoint avoids stealing touches from the selection's body at small zoom scales.
     static func selectionHitRects(for item: Item, transform: CGAffineTransform) -> [CGRect] {
         let corners = (item.frame ?? Frame(item.bounds)).corners.map { $0.cg.applying(transform) }
-        let edges = (0..<4).map { i in
-            CGPoint(x: (corners[i].x + corners[(i + 1) % 4].x) / 2,
-                    y: (corners[i].y + corners[(i + 1) % 4].y) / 2)
+        let edges: [CGPoint] = (0..<4).map { i in
+            let start = corners[i]
+            let end = corners[(i + 1) % 4]
+            return CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
         }
         let dx = edges[0].x - edges[2].x, dy = edges[0].y - edges[2].y
         let length = hypot(dx, dy)
-        let rotation = CGPoint(x: edges[0].x + (length > 0 ? dx / length : 0) * NibMetrics.rotationHandleOffset,
-                               y: edges[0].y + (length > 0 ? dy / length : -1) * NibMetrics.rotationHandleOffset)
+        let normalX: CGFloat = length > 0 ? dx / length : 0
+        let normalY: CGFloat = length > 0 ? dy / length : -1
+        let rotation = CGPoint(x: edges[0].x + normalX * NibMetrics.rotationHandleOffset,
+                               y: edges[0].y + normalY * NibMetrics.rotationHandleOffset)
         return (corners + edges + [rotation]).map { hitRect(at: $0) }
     }
 
