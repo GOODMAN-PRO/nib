@@ -131,3 +131,7 @@ rejoin using the stored admission secret, and assert the guest's next patch is a
 Also cover a real 20 MiB snapshot/file on a slow transport and disabling the relay during host and guest sessions.
 F092 tests exercise the underlying roster transition, ordered retry/drain, and bus-driven session retirement without
 importing or modifying the F072-owned module/test target.
+
+The F092 review branch restores the previously imported F072 files to `origin/main` to honor feature ownership.
+On that base F072 is still scaffolded; its implementation must land through the F072 branch before the live
+session integration requests above can be verified end to end.
