@@ -8,9 +8,15 @@ import NibDesign
 @MainActor
 final class LibraryModels {
     static let serviceKey = "libraryui.models"
-    var models: [NibID: LibraryViewModel] = [:]
+    private final class WeakModel {
+        weak var value: LibraryViewModel?
+        init(_ value: LibraryViewModel) { self.value = value }
+    }
+    private var storage: [NibID: WeakModel] = [:]
+    var models: [NibID: LibraryViewModel] { storage.compactMapValues(\.value) }
+    let coverCache = LibraryCoverCache()
     unowned let app: NibApp
-    init(_ app: NibApp) { self.app = app }
+    init(_ app: NibApp) { self.app = app; coverCache.observe(app.events) }
     static func get(_ app: NibApp) -> LibraryModels {
         if let existing = app.services.get(serviceKey, as: LibraryModels.self) { return existing }
         let store = LibraryModels(app)
@@ -19,8 +25,9 @@ final class LibraryModels {
     }
     func model(_ session: EditorSession) -> LibraryViewModel {
         if let model = models[session.id] { return model }
-        let model = LibraryViewModel(app: app, session: session)
-        models[session.id] = model
+        let model = LibraryViewModel(app: app, session: session, coverCache: coverCache)
+        storage = storage.filter { $0.value.value != nil }
+        storage[session.id] = WeakModel(model)
         return model
     }
     static func folder(_ ref: String?) throws -> FolderID? {
@@ -61,7 +68,7 @@ final class LibraryViewModel: ObservableObject {
     @Published var absorbing: [String: CGSize] = [:]
     var dropFrame: CGRect?
     @Published var dropTarget: String?
-    let coverCache = NSCache<NSString, UIImage>()
+    let coverCache: LibraryCoverCache
     @Published var hasLibraryDrag = false
     @Published var menu: String?
     @Published var renaming: String?
@@ -72,27 +79,37 @@ final class LibraryViewModel: ObservableObject {
     @Published var syncText = String(localized: "Local library")
     @Published var liquidMode = NibLiquidMode.full
     @Published var registryRevision = 0
-    @Published var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
+    @Published var confirmation: LibraryConfirmation?
+    private(set) var folderRows: [LibraryRow] = []
+    private(set) var documentRows: [LibraryRow] = []
+    private(set) var folderRefs: [String] = []
+    private(set) var documentRefs: [String] = []
+    private(set) var visibleRefs: [String] = []
+    private(set) var sortPasses = 0
+    var isVisible = false
+    private(set) var isDirty = true
+    private var sortedRows: [LibraryRow] = []
+    private var sortInputs: SortInputs?
+    private struct SortInputs: Equatable {
+        var sort: LibrarySort; var filter: LibraryFilter; var manual: [String]; var search: String
+    }
     private var loadGeneration = 0
     private var eventSubscription: EventSubscription?
     private var observations = Set<AnyCancellable>()
 
-    init(app: NibApp, session: EditorSession) {
-        self.app = app; self.session = session
+    init(app: NibApp, session: EditorSession, coverCache: LibraryCoverCache) {
+        self.app = app; self.session = session; self.coverCache = coverCache
         floatingAdapter = LibraryFloatingAdapter(floating)
-        coverCache.countLimit = 96
-        coverCache.totalCostLimit = 64 * 1024 * 1024
         restoreView()
         liquidMode = NibLiquidMode(rawValue: app.settings.get(NibSettings.liquidMode)) ?? .full
         eventSubscription = app.events.subscribe { [weak self] event in
-            guard [NibEventType.libraryChanged, NibEventType.syncStatus, NibEventType.committed].contains(event.type) else { return }
+            guard [NibEventType.libraryChanged, NibEventType.syncStatus].contains(event.type) else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if event.type == NibEventType.syncStatus {
                     self.syncText = event.payload?["message"]?.stringValue ?? String(localized: "Syncing library")
                 } else {
-                    if event.doc != nil { self.coverCache.removeAllObjects() }
-                    await self.reload()
+                    await self.markDirty()
                 }
             }
         }
@@ -102,13 +119,15 @@ final class LibraryViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: .nibCommandFailed, object: app).sink { [weak self] notification in
             guard let command = notification.userInfo?["command"] as? String,
                   command.hasPrefix("library.") || command.hasPrefix("folder.") else { return }
-            Task { @MainActor in await self?.reload() }
+            Task { @MainActor in await self?.markDirty() }
         }.store(in: &observations)
-        NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings).sink { [weak self] _ in
+        NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings).sink { [weak self] note in
+            let name = note.userInfo?["name"] as? String
             Task { @MainActor in
                 guard let self else { return }
                 self.liquidMode = NibLiquidMode(rawValue: self.app.settings.get(NibSettings.liquidMode)) ?? .full
-                self.restoreView(); self.applySort()
+                if name == LibraryOrder.viewKey(self.folder) { self.restoreView() }
+                if name == LibraryOrder.viewKey(self.folder) || name == LibraryOrder.key(self.folder) { self.applySort() }
             }
         }.store(in: &observations)
     }
@@ -134,12 +153,30 @@ final class LibraryViewModel: ObservableObject {
     }
     func applySort() {
         let manual = app.settings.json(LibraryOrder.key(folder))?.arrayValue?.compactMap(\.stringValue) ?? []
+        let inputs = SortInputs(sort: sort, filter: filter, manual: manual, search: search)
+        guard sortedRows != rows || sortInputs != inputs else { return }
+        sortedRows = rows; sortInputs = inputs; sortPasses += 1
         visibleRows = LibrarySorting.rows(rows, sort: sort, filter: filter, manual: manual, search: search)
-        snapshot = LibrarySorting.snapshot(visibleRows)
+        splitSections()
         selection.retain(rows.map(\.ref))
     }
-    func queryRows(folder: FolderID?, recursive: Bool = false) async throws -> [LibraryRow] {
+    func splitSections() {
+        let sections = LibrarySorting.sections(visibleRows)
+        folderRows = sections.folders; documentRows = sections.documents
+        folderRefs = folderRows.map(\.ref); documentRefs = documentRows.map(\.ref)
+        visibleRefs = visibleRows.map(\.ref)
+    }
+    func markDirty() async {
+        isDirty = true
+        if isVisible { await reload() }
+    }
+    func appear() async {
+        isVisible = true
+        if isDirty { await reload() }
+    }
+    func queryRows(folder: FolderID?, recursive: Bool = false, foldersOnly: Bool = false) async throws -> [LibraryRow] {
         var params: JSONValue = ["limit": 1000, "recursive": .bool(recursive)]
+        if foldersOnly { params = params.merging(["kinds": ["folder"]]) }
         if let folder { params = params.merging(["folder": .string(NodeRef.folder(folder).description)]) }
         var result: [LibraryRow] = [], cursors = Set<String>()
         repeat {
@@ -158,9 +195,9 @@ final class LibraryViewModel: ObservableObject {
         isLoading = true
         do {
             let children = try await queryRows(folder: current)
-            let catalog = try await queryRows(folder: nil, recursive: true)
+            let catalog = try await queryRows(folder: nil, recursive: true, foldersOnly: true)
             guard generation == loadGeneration, current == folder else { return }
-            rows = children; allFolders = catalog.filter(\.isFolder)
+            rows = children; allFolders = catalog; isDirty = false
             error = nil; isLoading = false; applySort()
         } catch {
             guard generation == loadGeneration else { return }
@@ -194,15 +231,42 @@ final class LibraryViewModel: ObservableObject {
         context.params = panel.params; context.presentation = panel.presentation
         return context
     }
-    func registerUndo(order: [String], inverse: [String], folder: FolderID?) {
+    func registerUndo(undo: JSONValue, redo: JSONValue) {
         guard let manager = testUndoManager ?? controller?.viewIfLoaded?.window?.undoManager else { return }
         manager.registerUndo(withTarget: self) { model in
-            model.registerUndo(order: inverse, inverse: order, folder: folder)
-            model.perform(CommandIDs.libraryReorder, ["refs": .array(order.map(JSONValue.string)),
-                "folder": .string(folder.map { NodeRef.folder($0).description } ?? "lib"), "recordUndo": false])
+            model.registerUndo(undo: redo, redo: undo)
+            model.perform(CommandIDs.libraryReorder, undo)
         }
         manager.setActionName(String(localized: "Reorder"))
     }
+    func moveDrop(refs: [String], destination: String) {
+        let parents = Dictionary(grouping: rows.filter { refs.contains($0.ref) }, by: { $0.parent ?? "lib" })
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var params: JSONValue = ["refs": .array(refs.map(JSONValue.string))]
+            if destination != "lib" && destination != "trash" { params = params.merging(["folder": .string(destination)]) }
+            do {
+                _ = try await self.app.bus.execute(destination == "trash" ? CommandIDs.libraryTrash : CommandIDs.libraryMove, params, session: self.session)
+                let title = destination == "trash" ? String(localized: "Trash") : destination == "lib" ? String(localized: "Documents") : self.allFolders.first { $0.ref == destination }?.name ?? self.rows.first { $0.ref == destination }?.name ?? String(localized: "Folder")
+                // library.move's merge result has no inverse command; folder moves can replay their old parents.
+                let canUndo = !destination.hasPrefix("doc:") && !parents.isEmpty
+                var undoAction: (@MainActor () -> Void)?
+                if canUndo { undoAction = { [weak self] in
+                    guard let self else { return }
+                    for (parent, rows) in parents {
+                        var undo: JSONValue = ["refs": .array(rows.map { .string($0.ref) })]
+                        if parent != "lib" { undo = undo.merging(["folder": .string(parent)]) }
+                        self.perform(CommandIDs.libraryMove, undo)
+                    }
+                } }
+                self.floatingAdapter.postToast(String(localized: "Moved to \(title)"), actionTitle: canUndo ? String(localized: "Undo") : nil, action: undoAction)
+            } catch {
+                await self.markDirty()
+                self.floatingAdapter.postToast(NibError.wrap(error).message)
+            }
+        }
+    }
+
     func drop(_ drop: NibReflowDrop<String>) {
         if let destination = dropTarget, let carried = reflow.carried ?? folderReflow.carried {
             let refs = selection.refs.contains(carried) ? selection.refs.sorted() : [carried]
@@ -213,16 +277,15 @@ final class LibraryViewModel: ObservableObject {
                     self?.absorbing[carried] = nil
                 }
             }
-            let params: JSONValue = ["refs": .array(refs.map(JSONValue.string))]
-            perform(destination == "trash" ? CommandIDs.libraryTrash : CommandIDs.libraryMove,
-                    destination == "trash" || destination == "lib" ? params : params.merging(["folder": .string(destination)]))
-            dropTarget = nil
+            moveDrop(refs: refs, destination: destination)
+            dropTarget = nil; dropFrame = nil
             return
         }
         switch drop {
         case .none: break
         case .combine(let ref, into: let target):
-            perform(CommandIDs.libraryMove, ["refs": .array([.string(ref)]), "folder": .string(target)])
+            let refs = selection.refs.contains(ref) ? documentRefs.filter { selection.refs.contains($0) && $0 != target } : [ref]
+            moveDrop(refs: refs, destination: target)
         case .reorder(let move):
             // Apply immediately, in the same update that clears reflow's offsets.
             let isFolder = visibleRows.first { $0.ref == move.id }?.isFolder ?? false
@@ -231,15 +294,16 @@ final class LibraryViewModel: ObservableObject {
             let map = Dictionary(visibleRows.map { ($0.ref, $0) }, uniquingKeysWith: { a, _ in a })
             let untouched = visibleRows.filter { $0.isFolder != isFolder }
             visibleRows = isFolder ? next.compactMap { map[$0] } + untouched : untouched + next.compactMap { map[$0] }
-            snapshot = LibrarySorting.snapshot(visibleRows)
+            splitSections()
+            sortInputs = nil
             let params = LibraryOrder.moveParams(move, folder: folder)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
                     let result = try await self.app.bus.execute(CommandIDs.libraryReorder, params, session: self.session)
-                    if let undo = result["undo"] {
+                    if result["undo"] != nil {
                         self.floatingAdapter.postToast(String(localized: "Items reordered"), actionTitle: String(localized: "Undo")) { [weak self] in
-                            self?.perform(CommandIDs.libraryReorder, undo)
+                            (self?.testUndoManager ?? self?.controller?.viewIfLoaded?.window?.undoManager)?.undo()
                         }
                     }
                 } catch {
@@ -291,6 +355,7 @@ final class LibraryRootViewController: UIViewController {
     }
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        model.isVisible = false
         if model.session.floatingHost === model.floatingAdapter { model.session.floatingHost = nil }
     }
 }
@@ -302,7 +367,7 @@ struct LibraryRootView: View {
     var body: some View {
         GeometryReader { geometry in
             let compact = geometry.size.width < NibMetrics.compactBreakpoint
-            let inlineSidebar = geometry.size.width >= 900
+            let inlineSidebar = geometry.size.width >= NibMetrics.librarySidebarBreakpoint
             NibDropletContainer {
                 HStack(spacing: 0) {
                     if inlineSidebar || (compact && model.sidebarVisible) {
@@ -328,9 +393,10 @@ struct LibraryRootView: View {
                     }
                     Spacer()
                     HStack {
+                        Spacer(minLength: 0)
                         if model.selection.isSelecting { selectionBar }
                         Spacer(minLength: 0)
-                        if compact && !model.sidebarVisible { chrome(compact: true) }
+                        if compact && !model.sidebarVisible && !model.selection.isSelecting { chrome(compact: true) }
                     }
                 }
                 .padding(NibSpacing.l)
@@ -350,7 +416,16 @@ struct LibraryRootView: View {
             .nibLiquidMode(model.liquidMode)
             .sheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .fullScreenCover(item: fullScreenBinding) { panel in LibraryPanelView(panel: panel, model: model) }
-            .task { await model.reload() }
+            .confirmationDialog(model.confirmation?.title ?? "", isPresented: Binding(get: { model.confirmation != nil }, set: { if !$0 { model.confirmation = nil } }), titleVisibility: .visible) {
+                if let confirmation = model.confirmation {
+                    Button(confirmation.title, role: .destructive) {
+                        model.confirmation = nil
+                        model.perform(confirmation.command, confirmation.params)
+                    }
+                }
+            }
+            .task { await model.appear() }
+            .onDisappear { model.isVisible = false }
         }
     }
     private var sheetBinding: Binding<LibraryPanel?> {
@@ -372,10 +447,6 @@ struct LibraryRootView: View {
                             NibSidebarRow(panel.title, symbol: NibSymbol(systemName: panel.icon) ?? .library, isSelected: model.tab?.id == panel.id)
                         }
                         .libraryDropTarget(panel.id == PanelIDs.trash ? "trash" : "card:tab:" + panel.id)
-                        .onDrop(of: [.text], isTargeted: nil) { providers in
-                            guard panel.id == PanelIDs.trash else { return false }
-                            return LibraryDrop.accept(providers, model: model, destination: nil, trash: true)
-                        }
                     }
                     DisclosureGroup(String(localized: "Folders")) {
                         ForEach(model.allFolders) { row in
@@ -384,7 +455,6 @@ struct LibraryRootView: View {
                                               glyphTint: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) })
                             }
                             .libraryDropTarget("sidebarFolder:" + row.ref)
-                            .onDrop(of: [.text], isTargeted: nil) { LibraryDrop.accept($0, model: model, destination: row.ref) }
                         }
                     }.font(NibFont.body).foregroundStyle(NibColor.label).padding(NibSpacing.m)
                 }.buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
@@ -408,12 +478,12 @@ struct LibraryRootView: View {
                         NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
                     }
                 }
-                Text(String(localized: "\(model.visibleRows.count) items · \(model.sort.title)")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                Text(LibraryRow.itemCount(model.visibleRows.count) + " · " + model.sort.title).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                 ScrollView(.horizontal) {
                     HStack(spacing: NibSpacing.s) {
                         breadcrumb(String(localized: "Documents"), ref: "lib")
                         ForEach(model.breadcrumbs) { row in
-                            Image(nib: .forward).foregroundStyle(NibColor.labelTertiary)
+                            Image(nib: .forward).foregroundStyle(NibColor.labelTertiary).accessibilityHidden(true)
                             breadcrumb(row.name, ref: row.ref)
                         }
                     }
@@ -429,7 +499,6 @@ struct LibraryRootView: View {
     }
     private func breadcrumb(_ title: String, ref: String) -> some View {
         NibButton(title, kind: .plain) { model.setView(["folder": .string(ref)]) }.libraryDropTarget("breadcrumb:" + ref)
-            .onDrop(of: [.text], isTargeted: nil) { LibraryDrop.accept($0, model: model, destination: ref) }
     }
     private func chrome(compact: Bool) -> some View {
         HStack(spacing: NibSpacing.l) {
@@ -484,7 +553,11 @@ private struct LibraryDragMonitor: View {
     private func target(_ lift: NibReflow<String>.Lift?, reflow: NibReflow<String>) {
         let dragging = model.reflow.isDragging || model.folderReflow.isDragging
         if model.hasLibraryDrag != dragging { model.hasLibraryDrag = dragging }
-        guard let lift, lift.phase == .dragging else { return }
+        guard let lift, lift.phase == .dragging else {
+            if !dragging { model.dropTarget = nil; model.dropFrame = nil }
+            reflow.isPaused = false; reflow.isCondensed = false
+            return
+        }
         let match = targets.filter {
             $0.key != "sidebar" && !$0.key.hasPrefix("card:") && $0.key != lift.id &&
             $0.key != "sidebarFolder:" + lift.id && $0.value.insetBy(dx: -(NibSpacing.m + NibStroke.thin), dy: -(NibSpacing.m + NibStroke.thin)).contains(lift.location)
@@ -506,10 +579,65 @@ private struct LibraryStackedCarrier: View {
         ZStack {
             ForEach(Array(stack.enumerated().reversed()), id: \.element.ref) { index, row in
                 LibraryCard(row: row, model: model, thumbnail: false)
-                    .rotationEffect(.degrees(Double(index + 1) * 4))
+                    .rotationEffect(.degrees(Double(index + 1) * NibReflowMetrics.libraryStackFanDegrees))
                     .offset(x: CGFloat(index + 1) * NibSpacing.xs, y: CGFloat(index + 1) * NibSpacing.xs)
             }
             LibraryCard(row: model.rows.first { $0.ref == ref }, model: model, thumbnail: false)
         }.accessibilityHidden(true)
     }
+}
+
+struct LibraryConfirmation {
+    var title: String
+    var command: String
+    var params: JSONValue
+}
+
+/// One app-wide cache; commits evict only the affected document, without a catalog query.
+@MainActor
+final class LibraryCoverCache: ObservableObject {
+    let images = NSCache<NSString, UIImage>()
+    @Published private(set) var revisions: [DocumentID: Int] = [:]
+    private var keys: [DocumentID: Set<String>] = [:]
+    private var subscription: EventSubscription?
+    init() {
+        images.countLimit = NibMetrics.libraryCoverCacheCount
+        images.totalCostLimit = NibMetrics.libraryCoverCacheBytes
+    }
+    func observe(_ events: EventBus) {
+        subscription = events.subscribe { [weak self] event in
+            guard event.type == NibEventType.committed, let doc = event.doc else { return }
+            Task { @MainActor [weak self] in self?.invalidate(doc) }
+        }
+    }
+    deinit { subscription?.cancel() }
+    func invalidate(_ doc: DocumentID) {
+        for key in keys.removeValue(forKey: doc) ?? [] { images.removeObject(forKey: key as NSString) }
+        revisions[doc, default: 0] += 1
+    }
+    func thumbnail(_ row: LibraryRow, app: NibApp) async -> UIImage? {
+        guard row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }
+        let key = row.ref + String(row.modified ?? 0)
+        if let image = images.object(forKey: key as NSString) { return image }
+        guard let renderer = app.services.renderer,
+              let page = try? app.workspace.peekContent(row.nodeID).pages.first?.id else { return nil }
+        let revision = revisions[row.nodeID] ?? 0
+        let result = await renderer.thumbnail(doc: row.nodeID, page: page, maxPixelSize: NibMetrics.libraryThumbnailMaxPixels)
+        guard !Task.isCancelled, revision == revisions[row.nodeID] ?? 0, let result else { return nil }
+        let image = UIImage(cgImage: result)
+        keys[row.nodeID, default: []].insert(key)
+        images.setObject(image, forKey: key as NSString, cost: result.bytesPerRow * result.height)
+        return image
+    }
+}
+
+// Library-specific tokens stay in F019's ownership until NibDesign adopts them.
+extension NibMetrics {
+    static let librarySidebarBreakpoint = compactBreakpoint + sidebarWidth
+    static let libraryThumbnailMaxPixels = 512
+    static let libraryCoverCacheCount = 96
+    static let libraryCoverCacheBytes = 64 * 1024 * 1024
+}
+extension NibReflowMetrics {
+    static let libraryStackFanDegrees: Double = 4
 }

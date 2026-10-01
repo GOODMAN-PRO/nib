@@ -51,7 +51,6 @@ struct LibraryMenuEntries: View {
     let location: MenuLocation
     var rows: [LibraryRow] = []
     var compact = false
-    @State private var pending: MenuItemDescriptor?
     var body: some View {
         let context = LibraryMenus.context(model, location: location, rows: rows)
         let entries = model.app.ui.menuItems(location, context)
@@ -76,11 +75,7 @@ struct LibraryMenuEntries: View {
             }
         }
         .disabled(location == .librarySelection && rows.isEmpty)
-        .confirmationDialog(String(localized: "Move selected items to Trash?"), isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }), titleVisibility: .visible) {
-            if let entry = pending {
-                Button(entry.resolvedTitle(for: context), role: .destructive) { run(entry, context) }
-            }
-        }
+
     }
     private func menuButton(_ entry: MenuItemDescriptor, _ context: MenuContext) -> some View {
         Button(role: entry.destructive ? .destructive : nil) { activate(entry, context) } label: {
@@ -93,12 +88,14 @@ struct LibraryMenuEntries: View {
         }.frame(minHeight: NibMetrics.hitTarget)
     }
     private func activate(_ entry: MenuItemDescriptor, _ context: MenuContext) {
-        if entry.destructive { pending = entry } else { run(entry, context) }
+        if entry.destructive {
+            model.confirmation = LibraryConfirmation(title: entry.resolvedTitle(for: context), command: entry.command, params: entry.params(context))
+            model.setView(["menu": "none"])
+        } else { run(entry, context) }
     }
     private func run(_ entry: MenuItemDescriptor, _ context: MenuContext) {
         model.perform(entry.command, entry.params(context))
         model.setView(["menu": "none"])
-        pending = nil
     }
 }
 

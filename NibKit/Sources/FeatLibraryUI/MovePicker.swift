@@ -32,6 +32,8 @@ struct MovePicker: View {
     @State private var folders: [LibraryRow] = []
     @State private var busy = false
     @State private var error: String?
+    @State private var searchText = ""
+    @State private var newTitle = ""
     private var state: JSONValue { model.modal?.id == "libraryui.move" ? model.modal?.params ?? context.params : context.params }
     private var refs: [String] { state["refs"]?.arrayValue?.compactMap(\.stringValue) ?? [] }
     private var destination: String { state["destination"]?.stringValue ?? state["folder"]?.stringValue ?? "lib" }
@@ -45,7 +47,7 @@ struct MovePicker: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
-            NibSearchField(text: binding("search"), prompt: String(localized: "Find a folder"))
+            NibSearchField(text: $searchText, prompt: String(localized: "Find a folder"))
             HStack {
                 NibButton(String(localized: "Library Root"), symbol: .library, kind: .plain) { update(["destination": "lib"]) }
                 Menu {
@@ -68,10 +70,10 @@ struct MovePicker: View {
             }
             if let error { NibBanner(error) }
             HStack {
-                TextField(String(localized: "New folder name"), text: binding("newTitle")).font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
+                TextField(String(localized: "New folder name"), text: $newTitle).font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
                     .onSubmit { Task { await createFolder() } }
                 NibButton(String(localized: "Create Folder"), symbol: .plus) { Task { await createFolder() } }
-                    .disabled(busy || (state["newTitle"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(busy || newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             HStack {
                 NibButton(String(localized: "Cancel"), kind: .plain) { context.dismiss() }
@@ -79,32 +81,47 @@ struct MovePicker: View {
                 NibButton(String(localized: "Move Here"), kind: .primary) { Task { await move() } }.disabled(busy || refs.isEmpty)
             }
         }
-        .padding(NibSpacing.xxl).background(NibColor.background).task { await load() }
+        .padding(NibSpacing.xxl).background(NibColor.background).task { searchText = search; newTitle = state["newTitle"]?.stringValue ?? ""; await load() }
+        .onChange(of: search) { _, value in if value != searchText { searchText = value } }
+        .task(id: searchText) {
+            guard searchText != search else { return }
+            do { try await Task.sleep(for: .milliseconds(180)); try Task.checkCancellation() } catch { return }
+            update(["search": .string(searchText)])
+        }
     }
     private func update(_ patch: JSONValue) { model.setView(["panel": "libraryui.move", "params": state.merging(patch)]) }
-    private func binding(_ field: String) -> Binding<String> { Binding(get: { state[field]?.stringValue ?? "" }, set: { update(.object([field: .string($0)])) }) }
     private func load() async {
-        do { folders = try await model.queryRows(folder: nil, recursive: true).filter(\.isFolder) }
+        do { folders = try await model.queryRows(folder: nil, recursive: true, foldersOnly: true) }
         catch { self.error = NibError.wrap(error).message }
     }
     private func createFolder() async {
         busy = true; defer { busy = false }
         do {
-            var params: JSONValue = ["title": state["newTitle"] ?? ""]
-            if destination != "lib" { params = params.merging(["parent": .string(destination)]) }
-            let result = try await model.app.bus.execute(CommandIDs.folderCreate, params, session: model.session)
+            let result = try await MovePickerActions.createFolder(title: newTitle, destination: destination, model: model)
             await load()
             update(["destination": result["ref"] ?? "lib", "newTitle": ""])
-            error = nil
+            newTitle = ""; error = nil
         } catch { self.error = NibError.wrap(error).message }
     }
     private func move() async {
         busy = true; defer { busy = false }
         do {
-            var params: JSONValue = ["refs": .array(refs.map(JSONValue.string))]
-            if destination != "lib" { params = params.merging(["folder": .string(destination)]) }
-            _ = try await model.app.bus.execute(CommandIDs.libraryMove, params, session: model.session)
+            try await MovePickerActions.move(refs: refs, destination: destination, model: model)
             context.dismiss()
         } catch { self.error = NibError.wrap(error).message }
+    }
+}
+
+@MainActor
+enum MovePickerActions {
+    static func createFolder(title: String, destination: String, model: LibraryViewModel) async throws -> JSONValue {
+        var params: JSONValue = ["title": .string(title)]
+        if destination != "lib" { params = params.merging(["parent": .string(destination)]) }
+        return try await model.app.bus.execute(CommandIDs.folderCreate, params, session: model.session)
+    }
+    static func move(refs: [String], destination: String, model: LibraryViewModel) async throws {
+        var params: JSONValue = ["refs": .array(refs.map(JSONValue.string))]
+        if destination != "lib" { params = params.merging(["folder": .string(destination)]) }
+        _ = try await model.app.bus.execute(CommandIDs.libraryMove, params, session: model.session)
     }
 }

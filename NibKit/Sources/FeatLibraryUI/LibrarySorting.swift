@@ -24,6 +24,17 @@ struct LibraryRow: Codable, Identifiable, Hashable {
     var name: String { title ?? String(localized: "Locked document") }
     var nodeID: NibID { NibID(String(ref.split(separator: ":").last ?? "")) }
 
+    var accessibilityLabel: String { name }
+    var accessibilityValue: String {
+        [locked == true ? String(localized: "Locked") : "",
+         favorite == true ? String(localized: "Favourite") : "",
+         sync == SyncBadge.error.rawValue ? String(localized: "Sync error") : sync == SyncBadge.syncing.rawValue ? String(localized: "Syncing") : "",
+         isFolder ? items.map(Self.itemCount) ?? "" : pages.map(Self.pageCount) ?? ""]
+            .filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+    static func itemCount(_ count: Int) -> String { count == 1 ? String(localized: "1 item") : String(localized: "\(count) items") }
+    static func pageCount(_ count: Int) -> String { count == 1 ? String(localized: "1 page") : String(localized: "\(count) pages") }
+
     static func from(_ node: LibraryNode) -> LibraryRow {
         LibraryRow(ref: node.kind == .folder ? NodeRef.folder(node.id).description : NodeRef.document(node.id).description,
                    kind: node.kind == .folder ? "folder" : node.documentKind?.rawValue ?? "document",
@@ -77,9 +88,11 @@ enum LibrarySorting {
                 let x = ranks[a.ref] ?? Int.max, y = ranks[b.ref] ?? Int.max
                 if x != y { return x < y }
             case .modified, .modifiedAscending:
-                if a.modified != b.modified { return sort == .modified ? (a.modified ?? 0) > (b.modified ?? 0) : (a.modified ?? 0) < (b.modified ?? 0) }
+                let x = a.modified ?? 0, y = b.modified ?? 0
+                if x != y { return sort == .modified ? x > y : x < y }
             case .created, .createdAscending:
-                if a.created != b.created { return sort == .created ? (a.created ?? 0) > (b.created ?? 0) : (a.created ?? 0) < (b.created ?? 0) }
+                let x = a.created ?? 0, y = b.created ?? 0
+                if x != y { return sort == .created ? x > y : x < y }
             case .type:
                 if a.kind != b.kind { return a.kind < b.kind }
             case .name, .nameDescending: break
@@ -95,17 +108,12 @@ enum LibrarySorting {
         // account for the one-point rounding difference in the 361 pt safe content width.
         max(1, min(3, Int((max(width, 0) + NibSpacing.l + NibStroke.thin) / (NibMetrics.coverSizeCompact.width + NibSpacing.l))))
     }
-    static func snapshot(_ rows: [LibraryRow]) -> NSDiffableDataSourceSnapshot<Int, String> {
-        var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
-        snapshot.appendSections([0, 1])
-        var folders: [String] = [], documents: [String] = []
-        var seen = Set<String>()
-        for row in rows where seen.insert(row.ref).inserted {
-            if row.isFolder { folders.append(row.ref) } else { documents.append(row.ref) }
+    static func sections(_ rows: [LibraryRow]) -> (folders: [LibraryRow], documents: [LibraryRow]) {
+        var folders: [LibraryRow] = [], documents: [LibraryRow] = []
+        for row in rows {
+            if row.isFolder { folders.append(row) } else { documents.append(row) }
         }
-        snapshot.appendItems(folders, toSection: 0)
-        snapshot.appendItems(documents, toSection: 1)
-        return snapshot
+        return (folders, documents)
     }
 }
 

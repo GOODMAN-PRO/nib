@@ -1,6 +1,5 @@
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
 import NibContracts
 import NibDesign
 
@@ -29,6 +28,7 @@ struct LibraryGridView: View {
     @State private var dragSelection = LibrarySelection()
     @State private var selecting = false
     @State private var marquee: CGRect?
+    @State private var searchText = ""
     var body: some View {
         Group {
             if model.isLoading && model.rows.isEmpty { ProgressView(String(localized: "Loading library")) }
@@ -53,12 +53,24 @@ struct LibraryGridView: View {
                                 .frame(width: marquee.width, height: marquee.height).offset(x: marquee.minX, y: marquee.minY).allowsHitTesting(false)
                         }
                     }
+                    .background(LibraryPointerMarquee { start, point, ended in
+                        if !selecting {
+                            guard !frames.values.contains(where: { $0.contains(start) }) else { return }
+                            selecting = true; dragSelection = model.selection; dragSelection.beginMarquee()
+                        }
+                        let rect = CGRect(x: min(start.x, point.x), y: min(start.y, point.y), width: abs(point.x - start.x), height: abs(point.y - start.y))
+                        if ended { selecting = false; marquee = nil }
+                        else {
+                            marquee = rect; dragSelection.marquee(rect, frames: frames)
+                            model.setView(["selection": "replace", "refs": .array(dragSelection.refs.sorted().map(JSONValue.string))])
+                        }
+                    })
                     .onPreferenceChange(LibraryFrames.self) { frames = $0 }
                     .simultaneousGesture(selectionGesture, including: model.selection.isSelecting ? .all : .subviews)
                     .padding(.bottom, NibMetrics.canvasBottomInsetCompact)
                 }
                 .scrollDisabled(model.selection.isSelecting && selecting)
-                .searchable(text: Binding(get: { model.search }, set: { model.setView(["search": .string($0)]) }), prompt: String(localized: "Search this folder"))
+                .searchable(text: $searchText, prompt: String(localized: "Search this folder"))
                 .overlay {
                     if model.visibleRows.isEmpty {
                         NibEmptyState(symbol: .search, title: String(localized: "No matching items"),
@@ -68,10 +80,18 @@ struct LibraryGridView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onAppear { searchText = model.search }
+        .onChange(of: model.search) { _, value in if value != searchText { searchText = value } }
+        .task(id: searchText) {
+            guard searchText != model.search else { return }
+            do { try await Task.sleep(for: .milliseconds(180)); try Task.checkCancellation() }
+            catch { return }
+            model.setView(["search": .string(searchText)])
+        }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
     }
-    private var folders: [LibraryRow] { model.visibleRows.filter(\.isFolder) }
-    private var documents: [LibraryRow] { model.visibleRows.filter { !$0.isFolder } }
+    private var folders: [LibraryRow] { model.folderRows }
+    private var documents: [LibraryRow] { model.documentRows }
     private var gutter: CGFloat { sizeClass == .compact ? NibSpacing.l : NibMetrics.libraryGutter }
     private var coverWidth: CGFloat { sizeClass == .compact ? NibMetrics.coverSizeCompact.width : NibMetrics.coverSize.width }
     private var coverColumns: [GridItem] {
@@ -87,7 +107,7 @@ struct LibraryGridView: View {
                 ForEach(folders) { row in
                     cell(row)
                         .nibReflowItem(row.ref, in: model.folderReflow)
-                        .nibReflowDraggable(row.ref, in: model.folderReflow, order: folders.map(\.ref)) { model.drop($0) }
+                        .nibReflowDraggable(row.ref, in: model.folderReflow, order: model.folderRefs) { model.drop($0) }
                 }
             }
         }
@@ -97,7 +117,7 @@ struct LibraryGridView: View {
                 ForEach(documents) { row in
                     cell(row)
                         .nibReflowItem(row.ref, in: model.reflow)
-                        .nibReflowDraggable(row.ref, in: model.reflow, order: documents.map(\.ref)) { model.drop($0) }
+                        .nibReflowDraggable(row.ref, in: model.reflow, order: model.documentRefs) { model.drop($0) }
                 }
             }
         }
@@ -107,7 +127,7 @@ struct LibraryGridView: View {
             ForEach(model.visibleRows) { row in
                 cell(row, list: true)
                     .nibReflowItem(row.ref, in: row.isFolder ? model.folderReflow : model.reflow)
-                    .nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow, order: model.visibleRows.filter { $0.isFolder == row.isFolder }.map(\.ref)) { model.drop($0) }
+                    .nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow, order: row.isFolder ? model.folderRefs : model.documentRefs) { model.drop($0) }
             }
         }
     }
@@ -122,7 +142,10 @@ struct LibraryGridView: View {
                 else { LibraryCard(row: row, model: model) }
             }
             .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
-            .accessibilityLabel(row.name)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(row.accessibilityLabel)
+            .accessibilityValue(row.accessibilityValue)
+            .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
             .contextMenu {
                 LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
             } preview: { LibraryCard(row: row, model: model) }
@@ -133,16 +156,15 @@ struct LibraryGridView: View {
             Color.clear.preference(key: LibraryFrames.self, value: [row.ref: geometry.frame(in: .named("library.selection"))])
         } }
         .libraryDropTarget(row.isFolder ? row.ref : nil)
-        .onDrop(of: [.text], isTargeted: nil) { providers in
-            guard row.isFolder else { return false }
-            return LibraryDrop.accept(providers, model: model, destination: row.ref)
-        }
+
     }
     private var selectionGesture: some Gesture {
         DragGesture(minimumDistance: NibSpacing.xs + NibSpacing.xxs, coordinateSpace: .named("library.selection"))
             .onChanged { value in
                 guard model.selection.isSelecting else { return }
                 if !selecting {
+                    guard abs(value.translation.width) > abs(value.translation.height) * 1.5,
+                          frames.values.contains(where: { $0.contains(value.startLocation) }) else { return }
                     selecting = true; dragSelection = model.selection
                     if let index = model.visibleRows.firstIndex(where: { frames[$0.ref]?.contains(value.startLocation) == true }) {
                         dragSelection.beginRange(at: index)
@@ -150,7 +172,7 @@ struct LibraryGridView: View {
                 }
                 if let index = model.visibleRows.firstIndex(where: { frames[$0.ref]?.contains(value.startLocation) == true }) {
                     let end = model.visibleRows.firstIndex(where: { frames[$0.ref]?.contains(value.location) == true }) ?? index
-                    dragSelection.extendRange(to: end, order: model.visibleRows.map(\.ref))
+                    dragSelection.extendRange(to: end, order: model.visibleRefs)
                 } else {
                     let rect = CGRect(x: min(value.startLocation.x, value.location.x), y: min(value.startLocation.y, value.location.y),
                                       width: abs(value.location.x - value.startLocation.x), height: abs(value.location.y - value.startLocation.y))
@@ -169,7 +191,7 @@ struct LibraryCard: View {
     var body: some View {
         if let row {
             if row.isFolder {
-                NibFolderTile(name: row.name, count: row.items.map { String(localized: "\($0) items") } ?? String(localized: "Folder"),
+                NibFolderTile(name: row.name, count: row.items.map(LibraryRow.itemCount) ?? String(localized: "Folder"),
                     color: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) } ?? NibColor.labelSecondary,
                     glyph: row.icon.flatMap { NibSymbol(systemName: $0).map(NibFolderGlyph.symbol) } ?? row.icon.map(NibFolderGlyph.emoji) ?? .symbol(.folderFill),
                     isTargeted: model.hasLibraryDrag, isFused: model.dropTarget == row.ref)
@@ -177,7 +199,7 @@ struct LibraryCard: View {
                         if model.selection.isSelecting { NibBadge(.type(model.selection.refs.contains(row.ref) ? .checkCircleFill : .circle)).padding(NibSpacing.xs) }
                     }
             } else {
-                NibDocumentCard(title: row.name, subtitle: row.pages.map { String(localized: "\($0) pages") } ?? String(localized: "Document"),
+                NibDocumentCard(title: row.name, subtitle: row.pages.map(LibraryRow.pageCount) ?? String(localized: "Document"),
                     isFavorite: row.favorite == true, typeBadge: badge(row.kind),
                     isSelected: model.selection.isSelecting ? model.selection.refs.contains(row.ref) : nil, absorbOffset: model.absorbing[row.ref]) {
                         LibraryCover(row: row, model: model, loadsThumbnail: thumbnail)
@@ -193,12 +215,16 @@ struct LibraryCard: View {
 struct LibraryCover: View {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
+    @ObservedObject private var cache: LibraryCoverCache
     var loadsThumbnail = true
     @State private var image: UIImage?
+    init(row: LibraryRow, model: LibraryViewModel, loadsThumbnail: Bool = true) {
+        self.row = row; self.model = model; self.loadsThumbnail = loadsThumbnail; self.cache = model.coverCache
+    }
     var body: some View {
         ZStack {
             NibPaper.white.color
-            if !isLocked, let rendered = image ?? model.coverCache.object(forKey: cacheKey as NSString) { Image(uiImage: rendered).resizable().scaledToFit() }
+            if !isLocked, let rendered = image ?? model.coverCache.images.object(forKey: cacheKey as NSString) { Image(uiImage: rendered).resizable().scaledToFit() }
             else { Image(nib: isLocked ? .lock : .notebook).font(NibFont.display).foregroundStyle(NibColor.labelTertiary) }
         }
         .overlay(alignment: .topLeading) {
@@ -208,7 +234,7 @@ struct LibraryCover: View {
             }.padding(NibSpacing.xs)
         }
         .accessibilityLabel(status)
-        .task(id: row.ref + String(row.modified ?? 0)) { await load() }
+        .task(id: cacheKey + String(cache.revisions[row.nodeID] ?? 0)) { await load() }
     }
     private var status: String {
         [row.locked == true ? String(localized: "Locked") : "", row.favorite == true ? String(localized: "Favourite") : "",
@@ -217,20 +243,8 @@ struct LibraryCover: View {
     private var isLocked: Bool { row.locked == true || model.app.services.lock?.isLocked(row.nodeID) == true }
     private var cacheKey: String { row.ref + String(row.modified ?? 0) }
     private func load() async {
-        guard !isLocked else { image = nil; return }
-        if let cached = model.coverCache.object(forKey: cacheKey as NSString) { image = cached; return }
-        guard loadsThumbnail, let renderer = model.app.services.renderer else { return }
-        do {
-            let document = try await model.app.bus.execute(CommandIDs.queryGet, ["ref": .string(row.ref), "depth": 1], session: model.session)
-            guard let page = document["pages"]?.arrayValue?.first else { return }
-            let ref = page["ref"]?.stringValue
-            let id = ref.flatMap { NodeRef($0)?.pageID } ?? page["id"]?.stringValue.map { NibID($0) }
-            guard let id, !Task.isCancelled else { return }
-            let result = await renderer.thumbnail(doc: row.nodeID, page: id, maxPixelSize: 512)
-            guard !Task.isCancelled else { return }
-            image = result.map { UIImage(cgImage: $0) }
-            if let image { model.coverCache.setObject(image, forKey: cacheKey as NSString, cost: (image.cgImage?.bytesPerRow ?? 0) * (image.cgImage?.height ?? 0)) }
-        } catch { image = nil }
+        guard loadsThumbnail else { return }
+        image = await model.coverCache.thumbnail(row, app: model.app)
     }
 }
 
@@ -272,27 +286,46 @@ struct LibraryRenameField: View {
     }
 }
 
-@MainActor
-enum LibraryDrop {
-    static func accept(_ providers: [NSItemProvider], model: LibraryViewModel, destination: String?, trash: Bool = false) -> Bool {
-        let supported = providers.filter { $0.canLoadObject(ofClass: NSString.self) }
-        guard !supported.isEmpty else { return false }
-        for provider in supported {
-            _ = provider.loadObject(ofClass: NSString.self) { object, _ in
-                guard let text = object as? String else { return }
-                let refs = text.split(separator: "\n").map(String.init).filter { ref in
-                    if case .folder? = NodeRef(ref) { return true }
-                    if case .document? = NodeRef(ref) { return true }
-                    return false
-                }
-                guard !refs.isEmpty else { return }
-                Task { @MainActor in
-                    var params: JSONValue = ["refs": .array(refs.map(JSONValue.string))]
-                    if let destination, destination != "lib" { params = params.merging(["folder": .string(destination)]) }
-                    model.perform(trash ? CommandIDs.libraryTrash : CommandIDs.libraryMove, params)
-                }
-            }
+/// A click-drag from empty space selects with a mouse/trackpad, independently of touch scrolling.
+private struct LibraryPointerMarquee: UIViewRepresentable {
+    var changed: (CGPoint, CGPoint, Bool) -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(changed) }
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.attach = { [weak coordinator = context.coordinator] view in coordinator?.attach(view) }
+        return view
+    }
+    func updateUIView(_ uiView: Probe, context: Context) { context.coordinator.changed = changed }
+    static func dismantleUIView(_ uiView: Probe, coordinator: Coordinator) { coordinator.detach() }
+    final class Probe: UIView {
+        var attach: ((Probe) -> Void)?
+        override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { attach?(self) } }
+    }
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var changed: (CGPoint, CGPoint, Bool) -> Void
+        weak var probe: UIView?
+        var start = CGPoint.zero
+        lazy var pan = UIPanGestureRecognizer(target: self, action: #selector(drag))
+        init(_ changed: @escaping (CGPoint, CGPoint, Bool) -> Void) { self.changed = changed }
+        func attach(_ view: Probe) {
+            detach(); probe = view
+            var ancestor = view.superview
+            while let current = ancestor, !(current is UIScrollView) { ancestor = current.superview }
+            guard let ancestor else { return }
+            pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+            pan.cancelsTouchesInView = false; pan.delegate = self
+            ancestor.addGestureRecognizer(pan)
         }
-        return true
+        func detach() { pan.view?.removeGestureRecognizer(pan) }
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
+        @objc func drag() {
+            guard let probe else { return }
+            let point = pan.location(in: probe)
+            if pan.state == .began {
+                let translation = pan.translation(in: probe)
+                start = CGPoint(x: point.x - translation.x, y: point.y - translation.y)
+            }
+            changed(start, point, pan.state == .ended || pan.state == .cancelled || pan.state == .failed)
+        }
     }
 }

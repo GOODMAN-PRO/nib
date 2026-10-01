@@ -51,14 +51,42 @@ final class LibrarySortingTests: XCTestCase {
         XCTAssertThrowsError(try LibraryOrder.inserting(["A"], into: order, after: "A", before: nil))
         XCTAssertThrowsError(try LibraryOrder.inserting(["X"], into: order, after: nil, before: nil))
     }
-    func testSnapshotOfFiveThousandNodesUnderThreeHundredMilliseconds() {
-        let rows = (0..<5000).map { row("doc:D\($0)", "Notebook \($0)", folder: $0 < 100) }
+    func testRealFiveThousandRowPipelineAndReorderUnderThreeHundredMilliseconds() throws {
+        let input = (0..<5000).reversed().map { row("doc:D\($0)", "Notebook \($0)", folder: $0 < 100) }
+        let wire = try JSONValue.from(input)
+        for sort in [LibrarySort.name, .manual] {
+            let start = CFAbsoluteTimeGetCurrent()
+            let decoded = try wire.decode([LibraryRow].self)
+            let sorted = LibrarySorting.rows(decoded, sort: sort, filter: .all, manual: input.map(\.ref), search: "Notebook")
+            let sections = LibrarySorting.sections(sorted)
+            XCTAssertEqual(sections.folders.count, 100)
+            XCTAssertEqual(sections.documents.count, 4900)
+            XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, 0.300)
+        }
         let start = CFAbsoluteTimeGetCurrent()
-        let snapshot = LibrarySorting.snapshot(rows)
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-        XCTAssertEqual(snapshot.numberOfItems, 5000)
-        XCTAssertEqual(snapshot.numberOfItems(inSection: 0), 100)
-        XCTAssertLessThan(elapsed, 0.300)
+        let refs = input.map(\.ref)
+        let moved = try LibraryOrder.inserting([refs[0]], into: refs, after: refs.last, before: nil)
+        let sorted = LibrarySorting.rows(input, sort: .manual, manual: moved)
+        let sections = LibrarySorting.sections(sorted)
+        XCTAssertEqual(sections.documents.last?.ref, refs[0])
+        XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, 0.300)
+    }
+    func testNilAndZeroDatesUseStableNameAndRefTies() {
+        var a = row("doc:A", "Same"), b = row("doc:B", "Same")
+        a.modified = nil; a.created = nil; b.modified = 0; b.created = 0
+        for sort in [LibrarySort.modified, .modifiedAscending, .created, .createdAscending] {
+            XCTAssertEqual(LibrarySorting.rows([b, a], sort: sort).map(\.ref), [a.ref, b.ref])
+            XCTAssertEqual(LibrarySorting.rows([a, b], sort: sort).map(\.ref), [a.ref, b.ref])
+        }
+    }
+    func testAccessibleLabelAndValueIncludeStatesAndPluralCounts() {
+        var document = row("doc:A", "Notebook")
+        document.locked = true; document.favorite = true; document.sync = SyncBadge.error.rawValue; document.pages = 1
+        XCTAssertEqual(document.accessibilityLabel, "Notebook")
+        XCTAssertEqual(document.accessibilityValue, "Locked, Favourite, Sync error, 1 page")
+        document.pages = 2; document.sync = SyncBadge.syncing.rawValue
+        XCTAssertEqual(document.accessibilityValue, "Locked, Favourite, Syncing, 2 pages")
+        XCTAssertEqual(LibraryRow.itemCount(1), "1 item")
     }
     func testSelectionSwipeAndPointerMarqueeKeepBaseline() {
         var selection = LibrarySelection()

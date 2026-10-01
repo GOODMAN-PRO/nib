@@ -8,17 +8,20 @@ import NibTesting
 
 @MainActor
 final class FeatLibraryUITests: XCTestCase {
+    private var controllers: [UIViewController] = []
     private func harness() -> Harness {
         let h = Harness(features: [FeatLibraryUIFeature.self])
         h.session.document = nil
         for doc in Fixtures.allDocuments { try? h.library.move(doc, to: nil) }
         installList(h)
+        controllers.append(LibraryRootViewController(app: h.app, navigator: LibraryTestNavigator(app: h.app, session: h.session)))
         return h
     }
     private func installList(_ h: Harness) {
         h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryList, title: "List Library", summary: "List the test library.", effect: .read, target: .library)) { params, _ in
             let folder = try LibraryModels.folder(params["folder"]?.stringValue)
-            let rows = params["recursive"]?.boolValue == true ? h.library.allNodes() : h.library.children(of: folder)
+            let nodes = params["recursive"]?.boolValue == true ? h.library.allNodes() : h.library.children(of: folder)
+            let rows = params["kinds"] == ["folder"] ? nodes.filter { $0.kind == .folder } : nodes
             return ["nodes": try JSONValue.from(rows.map(LibraryRow.from)), "total": .number(Double(rows.count))]
         }
     }
@@ -64,7 +67,7 @@ final class FeatLibraryUITests: XCTestCase {
         let model = LibraryModels.get(h.app).model(h.session)
         model.testUndoManager = manager
         await model.reload()
-        let before = model.visibleRows.map(\.ref)
+        let previousSort = model.sort
         manager.beginUndoGrouping()
         _ = try await h.app.bus.execute(CommandIDs.libraryReorder, ["refs": ["doc:FIXTUREDOC01"]], session: h.session)
         manager.endUndoGrouping()
@@ -75,7 +78,8 @@ final class FeatLibraryUITests: XCTestCase {
         // Command replay is asynchronous, but the inverse is already on UIKit's redo stack.
         XCTAssertTrue(manager.canRedo)
         for _ in 0..<30 { await Task.yield() }
-        XCTAssertEqual(h.app.settings.json(LibraryOrder.key(nil))?.arrayValue?.compactMap(\.stringValue), before)
+        XCTAssertNil(h.app.settings.json(LibraryOrder.key(nil)))
+        XCTAssertEqual(model.sort, previousSort)
         manager.redo()
         for _ in 0..<30 { await Task.yield() }
         XCTAssertTrue(manager.canUndo)
@@ -177,6 +181,159 @@ final class FeatLibraryUITests: XCTestCase {
         h.session.floatingHost?.postToast("Moved")
         XCTAssertEqual(model.floating.toast?.message, "Moved")
     }
+    func testCoverUsesFirstPageWithoutQueryGetAndSharesCacheAcrossWindows() async throws {
+        let h = harness(), renderer = LibraryTestRenderer()
+        h.app.services.renderer = renderer
+        XCTAssertNil(h.app.commands.descriptor(CommandIDs.queryGet))
+        let model = LibraryModels.get(h.app).model(h.session)
+        let row = try XCTUnwrap(h.library.node(Fixtures.docID)).mapRow
+        let image = await model.coverCache.thumbnail(row, app: h.app)
+        XCTAssertNotNil(image)
+        XCTAssertEqual(renderer.requests.count, 1)
+        XCTAssertEqual(renderer.requests.first?.0, Fixtures.docID)
+        XCTAssertEqual(renderer.requests.first?.1, try h.app.workspace.peekContent(Fixtures.docID).pages.first?.id)
+        XCTAssertTrue(h.app.workspace.cachedPages(Fixtures.docID).isEmpty)
+        let other = EditorSession(); h.app.services.sessions.add(other)
+        XCTAssertTrue(LibraryModels.get(h.app).model(other).coverCache === model.coverCache)
+    }
+    func testSessionModelReleasedAfterControllerAndSessionRemoval() async throws {
+        let h = harness(), session = EditorSession()
+        h.app.services.sessions.add(session)
+        var controller: LibraryRootViewController? = LibraryRootViewController(app: h.app, navigator: LibraryTestNavigator(app: h.app, session: session))
+        weak var model = controller?.model
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["layout": "list"], session: session)
+        XCTAssertEqual(model?.layout, .list)
+        h.app.services.sessions.remove(session)
+        controller = nil
+        XCTAssertNil(model)
+        XCTAssertNil(LibraryModels.get(h.app).models[session.id])
+    }
+    func testDryRunSetViewValidatesWithoutMutatingOrPresenting() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.ui.panels.register(PanelDescriptor(id: "test.dry", title: "Dry", icon: NibSymbol.folder.name, placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        let before = h.app.settings.json(LibraryOrder.viewKey(Fixtures.folderID))
+        let result = try await h.app.bus.execute(Invocation(command: CommandIDs.librarySetView,
+            params: ["folder": "folder:FIXTUREFLD01", "layout": "list", "sort": "name", "panel": "test.dry", "params": ["hello": true]], session: h.session, dryRun: true))
+        XCTAssertEqual(result.value["placement"], "sheet")
+        XCTAssertNil(model.folder); XCTAssertNil(model.modal)
+        XCTAssertEqual(model.layout, .grid)
+        XCTAssertTrue(h.session.openPanels.isEmpty)
+        XCTAssertEqual(h.app.settings.json(LibraryOrder.viewKey(Fixtures.folderID)), before)
+    }
+    func testFolderNavigationClosesTabInSession() async throws {
+        let h = harness()
+        h.app.ui.panels.register(PanelDescriptor(id: "test.tab", title: "Tab", icon: NibSymbol.folder.name, placement: .libraryTab, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "test.tab"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "folder:FIXTUREFLD01"], session: h.session)
+        XCTAssertFalse(h.session.openPanels.contains("test.tab"))
+    }
+    func testOffscreenChangesAndCommitsDoNotQueryCatalogAndSelectionDoesNotSort() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var requests: [JSONValue] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryList, title: "List", summary: "Record list requests", effect: .read, target: .library)) { params, _ in
+            requests.append(params)
+            return ["nodes": try JSONValue.from(h.library.children(of: nil).map(LibraryRow.from))]
+        }
+        await model.reload()
+        XCTAssertEqual(requests.last?["kinds"], ["folder"])
+        requests = []
+        let passes = model.sortPasses
+        for _ in 0..<10 {
+            h.app.events.emit(NibEventType.committed, doc: Fixtures.docID)
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "toggle", "refs": ["doc:FIXTUREDOC01"]], session: h.session)
+        }
+        h.app.events.emit(NibEventType.libraryChanged)
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertTrue(model.isDirty)
+        XCTAssertEqual(model.sortPasses, passes)
+        await model.appear()
+        XCTAssertEqual(requests.count, 2)
+    }
+    func testReorderUndoAfterTrashingSiblingRestoresSortAndAbsentOrder() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.reload()
+        let result = try await h.app.bus.execute(CommandIDs.libraryReorder, ["refs": ["doc:FIXTUREDOC01"]], session: h.session)
+        let sibling = try XCTUnwrap(model.rows.first { !$0.isFolder && $0.nodeID != Fixtures.docID })
+        try h.library.trash(sibling.nodeID)
+        _ = try await h.app.bus.execute(CommandIDs.libraryReorder, try XCTUnwrap(result["undo"]), session: h.session)
+        XCTAssertEqual(model.sort, .modified)
+        XCTAssertNil(h.app.settings.json(LibraryOrder.key(nil)))
+        XCTAssertEqual(result["previousSort"], "modified")
+        XCTAssertEqual(result["hadOrder"], false)
+    }
+
+    func testShowLibraryWithoutInvokingOrRegisteredSessionUsesNavigatorWindow() async throws {
+        let h = harness()
+        let window = LibraryTestNavigator(app: h.app, session: h.session)
+        h.app.ui.activeNavigator = window
+        h.app.services.sessions.remove(h.session)
+        await FeatLibraryUIFeature.start(h.app)
+        _ = try await h.app.bus.execute(CommandIDs.windowShowLibrary, ["folder": "folder:FIXTUREFLD01"])
+        XCTAssertEqual(LibraryModels.get(h.app).model(h.session).folder, Fixtures.folderID)
+    }
+    func testDropRoutesFolderRootTrashAndSelectedCombine() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.reload()
+        var commands: [(String, JSONValue)] = []
+        for id in [CommandIDs.libraryMove, CommandIDs.libraryTrash] {
+            h.app.commands.register(CommandDescriptor(id: id, title: "Drop", summary: "Record drop routing", effect: .library, target: .library)) { params, _ in
+                commands.append((id, params)); return [:]
+            }
+        }
+        let refs = model.documentRefs
+        model.reflow.layout = NibReflowLayout(columns: 3, cell: NibMetrics.coverSize)
+        for destination in ["folder:FIXTUREFLD01", "lib", "trash"] {
+            model.reflow.begin(refs[0], order: refs, at: .zero)
+            model.dropTarget = destination
+            model.dropFrame = CGRect(x: 10, y: 10, width: 20, height: 20)
+            model.drop(.none)
+            for _ in 0..<30 { await Task.yield() }
+            XCTAssertEqual(commands.last?.0, destination == "trash" ? CommandIDs.libraryTrash : CommandIDs.libraryMove)
+            XCTAssertEqual(commands.last?.1["refs"], .array([.string(refs[0])]))
+            XCTAssertEqual(commands.last?.1["folder"], destination == "lib" || destination == "trash" ? nil : .string(destination))
+            XCTAssertNil(model.dropTarget); XCTAssertNil(model.dropFrame)
+            XCTAssertNotNil(model.floating.toast)
+            model.reflow.cancel()
+        }
+        model.selection.refs = Set(refs.prefix(2))
+        model.drop(.combine(refs[0], into: refs[2]))
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(commands.last?.1["refs"], .array(refs.prefix(2).map(JSONValue.string)))
+        XCTAssertEqual(commands.last?.1["folder"], .string(refs[2]))
+    }
+    func testDropOptimisticReorderAndFailureReload() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        let refs = model.documentRefs
+        let move = NibReflowMove(id: refs[0], from: 0, to: refs.count - 1, in: refs)
+        var request: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryReorder, title: "Reorder", summary: "Fail after recording", effect: .library, target: .library)) { params, _ in
+            request = params; throw NibError.unavailable("Reorder failed")
+        }
+        model.drop(.reorder(move))
+        XCTAssertEqual(model.documentRefs.last, refs[0])
+        for _ in 0..<60 { await Task.yield() }
+        XCTAssertEqual(request, LibraryOrder.moveParams(move, folder: nil))
+        XCTAssertEqual(model.documentRefs, refs)
+        XCTAssertEqual(model.floating.toast?.message, NibError.unavailable("Reorder failed").message)
+    }
+    func testMovePickerCreateThenMoveIntoNewFolder() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var commands: [(String, JSONValue)] = []
+        for id in [CommandIDs.folderCreate, CommandIDs.libraryMove] {
+            h.app.commands.register(CommandDescriptor(id: id, title: "Picker", summary: "Record picker commands", effect: .library, target: .library)) { params, _ in
+                commands.append((id, params)); return id == CommandIDs.folderCreate ? ["ref": "folder:NEWFOLDER01"] : [:]
+            }
+        }
+        let result = try await MovePickerActions.createFolder(title: "New folder", destination: "folder:FIXTUREFLD01", model: model)
+        XCTAssertEqual(commands.last?.1, ["title": "New folder", "parent": "folder:FIXTUREFLD01"])
+        try await MovePickerActions.move(refs: ["doc:FIXTUREDOC01"], destination: try XCTUnwrap(result["ref"]?.stringValue), model: model)
+        XCTAssertEqual(commands.last?.1, ["refs": ["doc:FIXTUREDOC01"], "folder": "folder:NEWFOLDER01"])
+        try await MovePickerActions.move(refs: ["doc:FIXTUREDOC01"], destination: "lib", model: model)
+        XCTAssertNil(commands.last?.1["folder"])
+    }
+
 }
 
 @MainActor
@@ -196,4 +353,18 @@ private final class LibraryTestNavigator: SceneNavigator {
     }
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) { rootViewController = viewController }
+}
+
+private extension LibraryNode { var mapRow: LibraryRow { LibraryRow.from(self) } }
+
+private final class LibraryTestRenderer: PageRenderer {
+    var requests: [(DocumentID, PageID, Int)] = []
+    func render(_ request: RenderRequest) async throws -> RenderResult { throw NibError.unavailable("Unused in this test") }
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
+        requests.append((doc, page, maxPixelSize))
+        return CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+                         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.makeImage()
+    }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
 }

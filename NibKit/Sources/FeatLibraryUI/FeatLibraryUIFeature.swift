@@ -76,47 +76,57 @@ struct LibrarySetView: NibCommand {
         effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> JSONValue {
-        guard let app = ctx.app, let session = ctx.activeSession else { throw NibError.unavailable("A library window is required") }
-        let model = LibraryModels.get(app).model(session)
-        if let folder = p.folder {
-            let id = try LibraryModels.folder(folder)
-            if let id, ctx.services.library?.node(id)?.kind != .folder { throw NibError.notFound("Library folder") }
-            model.folder = id
-            model.restoreView()
-            model.tab = nil
-            model.selection.clear()
+        guard let app = ctx.app, let session = ctx.activeSession ?? ctx.navigator?.session else { throw NibError.unavailable("A library window is required") }
+        let folder = try p.folder.map { try LibraryModels.folder($0) }
+        if let id = folder ?? nil, ctx.services.library?.node(id)?.kind != .folder { throw NibError.notFound("Library folder") }
+        let descriptor = p.panel.flatMap { app.ui.panels.get($0) }
+        if let panel = p.panel, panel != "documents", !(p.close == true && session.openPanels.contains(panel)) {
+            guard let descriptor else { throw NibError.notFound("Panel \(panel)") }
+            guard descriptor.placement != .sidebarTab else { throw NibError.invalid("This panel requires an open document", path: "$.panel") }
         }
-        // Validate presentation before changing any panel state.
+        if let selection = p.selection, !["all", "clear", "begin", "toggle", "replace"].contains(selection) {
+            throw NibError.invalid("Unknown selection operation", path: "$.selection")
+        }
+        let existing = LibraryModels.get(app).models[session.id]
+        let targetFolder = p.folder != nil ? folder ?? nil : existing?.folder
+        let saved = app.settings.json(LibraryOrder.viewKey(targetFolder))
+        let targetLayout = p.layout ?? (p.folder == nil ? existing?.layout : nil) ?? LibraryLayout(rawValue: saved?["layout"]?.stringValue ?? "") ?? .grid
+        let targetSort = p.sort ?? (p.folder == nil ? existing?.sort : nil) ?? LibrarySort(rawValue: saved?["sort"]?.stringValue ?? "") ?? .modified
+        let targetFilter = p.filter ?? (p.folder == nil ? existing?.filter : nil) ?? LibraryFilter(rawValue: saved?["filter"]?.stringValue ?? "") ?? .all
+        let result: JSONValue
+        if let panel = p.panel, panel != "documents" {
+            result = p.close == true ? ["panel": .string(panel), "closed": true] :
+                ["panel": .string(panel), "placement": .string(descriptor?.placement == .floating ? "sheet" : descriptor!.placement.rawValue)]
+        } else {
+            result = ["folder": .string(targetFolder.map { NodeRef.folder($0).description } ?? "lib"),
+                      "layout": .string(targetLayout.rawValue), "sort": .string(targetSort.rawValue), "filter": .string(targetFilter.rawValue)]
+        }
+        guard !ctx.dryRun else { return result }
+        let model = existing ?? LibraryModels.get(app).model(session)
+        if p.folder != nil {
+            model.folder = targetFolder; model.restoreView(); model.closeTab(); model.selection.clear()
+        }
         if let panel = p.panel {
-            if panel == "documents" {
-                model.closeTab()
-            } else {
-                if p.close == true, session.openPanels.contains(panel) {
-                    model.closePanel(panel)
-                    return ["panel": .string(panel), "closed": true]
-                }
-                guard let descriptor = app.ui.panels.get(panel) else { throw NibError.notFound("Panel \(panel)") }
-                guard descriptor.placement != .sidebarTab else { throw NibError.invalid("This panel requires an open document", path: "$.panel") }
+            if panel == "documents" { model.closeTab() }
+            else {
                 if p.close == true { model.closePanel(panel) }
-                else { model.openPanel(descriptor, params: p.params ?? [:]) }
-                let placement = descriptor.placement == .floating ? "sheet" : descriptor.placement.rawValue
-                return p.close == true ? ["panel": .string(panel), "closed": true] : ["panel": .string(panel), "placement": .string(placement)]
+                else if let descriptor { model.openPanel(descriptor, params: p.params ?? [:]) }
+                if p.folder != nil { await model.markDirty() }
+                return result
             }
         }
-        if let layout = p.layout { model.layout = layout }
-        if let sort = p.sort { model.sort = sort }
-        if let filter = p.filter { model.filter = filter }
+        model.layout = targetLayout; model.sort = targetSort; model.filter = targetFilter
         if p.layout != nil || p.sort != nil || p.filter != nil {
             app.settings.setJSON(LibraryOrder.viewKey(model.folder), ["layout": .string(model.layout.rawValue), "sort": .string(model.sort.rawValue), "filter": .string(model.filter.rawValue)])
         }
         if let selection = p.selection {
             switch selection {
-            case "all": model.selection.selectAll(model.visibleRows.map(\.ref))
+            case "all": model.selection.selectAll(model.visibleRefs)
             case "clear": model.selection.clear()
             case "begin": model.selection.isSelecting = true
             case "toggle": for ref in p.refs ?? [] { model.selection.toggle(ref) }
             case "replace": model.selection.isSelecting = true; model.selection.refs = Set(p.refs ?? [])
-            default: throw NibError.invalid("Unknown selection operation", path: "$.selection")
+            default: break
             }
         }
         if let menu = p.menu { model.menu = menu == "none" ? nil : menu }
@@ -124,20 +134,20 @@ struct LibrarySetView: NibCommand {
         if p.renameSelected == true, model.selection.refs.count == 1 { model.renaming = model.selection.refs.first }
         if let search = p.search { model.search = search }
         if let sidebar = p.sidebar { model.sidebarVisible = sidebar }
-        model.applySort()
-        if p.folder != nil { await model.reload() }
-        return ["folder": .string(model.folder.map { NodeRef.folder($0).description } ?? "lib"), "layout": .string(model.layout.rawValue),
-                "sort": .string(model.sort.rawValue), "filter": .string(model.filter.rawValue)]
+        if p.sort != nil || p.filter != nil || p.search != nil { model.applySort() }
+        if p.folder != nil { await model.markDirty() }
+        return result
     }
 }
 
 struct LibraryReorder: NibCommand {
-    struct Params: Codable { var refs: [String]; var folder: String?; var after: String?; var before: String?; var recordUndo: Bool? }
+    struct Params: Codable { var refs: [String]; var folder: String?; var after: String?; var before: String?; var recordUndo: Bool?; var previousSort: LibrarySort?; var hadOrder: Bool? }
     typealias Output = JSONValue
     static let descriptor = CommandDescriptor(id: "library.reorder", title: "Reorder",
         summary: "Order sibling documents or folders after or before another sibling; select Manual sort and return the previous order for replay or Undo.",
         params: .obj(["refs": .arr(.ref), "folder": .str("folder:<id>, omitted for root"), "after": .ref, "before": .ref,
-                      "recordUndo": .bool("false when replaying an existing window undo step")], required: ["refs"]),
+                      "recordUndo": .bool("false when replaying an existing window undo step"),
+                      "previousSort": .str(choices: LibrarySort.allCases.map(\.rawValue)), "hadOrder": .bool("Restore the previous manual-order key")], required: ["refs"]),
         examples: [["refs": ["doc:FIXTUREDOC01"], "folder": "folder:FIXTUREFLD01"]], effect: .library, target: .library)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> JSONValue {
@@ -146,25 +156,34 @@ struct LibraryReorder: NibCommand {
         let library = try ctx.services.require(ctx.services.library, "the library")
         if let folder, library.node(folder)?.kind != .folder { throw NibError.notFound("Library folder") }
         let children = library.children(of: folder).map(LibraryRow.from)
-        let stored = app.settings.json(LibraryOrder.key(folder))?.arrayValue?.compactMap(\.stringValue) ?? []
+        let savedOrder = app.settings.json(LibraryOrder.key(folder))
+        let stored = savedOrder?.arrayValue?.compactMap(\.stringValue) ?? []
         let sessionModel = ctx.activeSession.map { LibraryModels.get(app).model($0) }
         let view = app.settings.json(LibraryOrder.viewKey(folder))
         let sort = sessionModel.flatMap { $0.folder == folder ? $0.sort : nil } ?? LibrarySort(rawValue: view?["sort"]?.stringValue ?? "") ?? .modified
         let previous = LibrarySorting.rows(children, sort: sort, manual: stored).map(\.ref)
-        let next = try LibraryOrder.inserting(p.refs, into: previous, after: p.after, before: p.before)
-        let undo: JSONValue = ["refs": .array(previous.map(JSONValue.string)), "folder": .string(folder.map { NodeRef.folder($0).description } ?? "lib")]
+        let restoring = p.previousSort != nil
+        let current = Set(previous)
+        let refs = restoring ? p.refs.filter { current.contains($0) } : p.refs
+        let moving = Set(refs)
+        let next = restoring ? refs + previous.filter { !moving.contains($0) } : try LibraryOrder.inserting(refs, into: previous, after: p.after, before: p.before)
+        let undo: JSONValue = ["refs": .array(previous.map(JSONValue.string)), "folder": .string(folder.map { NodeRef.folder($0).description } ?? "lib"),
+                               "previousSort": .string(sort.rawValue), "hadOrder": .bool(savedOrder != nil), "recordUndo": false]
+        let nextSort = p.previousSort ?? .manual
         guard !ctx.dryRun else { return ["previous": .array(previous.map(JSONValue.string)), "undo": undo] }
-        app.settings.setJSON(LibraryOrder.key(folder), .array(next.map(JSONValue.string)))
-        app.settings.setJSON(LibraryOrder.viewKey(folder), (view ?? [:]).merging(["sort": "manual"]))
+        app.settings.setJSON(LibraryOrder.key(folder), restoring && p.hadOrder == false ? nil : .array(next.map(JSONValue.string)))
+        app.settings.setJSON(LibraryOrder.viewKey(folder), (view ?? [:]).merging(["sort": .string(nextSort.rawValue)]))
         for model in LibraryModels.get(app).models.values where model.folder == folder {
-            model.sort = .manual
+            model.sort = nextSort
             model.applySort()
         }
         if p.recordUndo != false, let model = sessionModel {
-            model.registerUndo(order: previous, inverse: next, folder: folder)
+            let redo: JSONValue = ["refs": .array(next.map(JSONValue.string)), "folder": .string(folder.map { NodeRef.folder($0).description } ?? "lib"),
+                                   "previousSort": .string(nextSort.rawValue), "hadOrder": .bool(!(restoring && p.hadOrder == false)), "recordUndo": false]
+            model.registerUndo(undo: undo, redo: redo)
         }
         ctx.events.emit(NibEventType.libraryChanged, principal: ctx.principal, payload: ["folder": .string(folder?.raw ?? "lib")])
-        return ["previous": .array(previous.map(JSONValue.string)), "order": .array(next.map(JSONValue.string)), "undo": undo]
+        return ["previousSort": .string(sort.rawValue), "hadOrder": .bool(savedOrder != nil), "previous": .array(previous.map(JSONValue.string)), "order": .array(next.map(JSONValue.string)), "undo": undo]
     }
 }
 
