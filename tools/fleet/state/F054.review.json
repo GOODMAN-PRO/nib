@@ -1,0 +1,125 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:127-140 (AppleTranscriptSession.append/finish), used at 298, 309, 352, 419",
+      "problem": "One silent or slow recognition window ends live transcription and fails on-device regeneration. finish() throws when the window produced no lines: either Speech's error (SFSpeech reports 'No speech detected' when a request holds only silence) or the 6 s .timeout. In localRecording that error leaves the while loop, the job Task reports it and exits, so nothing more is transcribed for the rest of the recording. A one-minute pause in a lecture is enough. In transcribe() (transcript.regenerate onDevice), one silent 60 s chunk fails the whole regeneration. Also, append() drops buffers once the session has completed (line 127), but the loop still advances `cursor` (line 342) before it checks isComplete (line 351). Audio read in the tick where Speech completed early is therefore lost. And when partial lines exist, an error or timeout is silently treated as success, so a truncated window gets persisted.",
+      "fix": "Have finish() return a result like `(lines, complete: Bool, error: NibError?)`. Treat Speech's no-speech error, or a window that F052's SilenceMap marks as silent, as `[]` and not as a failure. In localRecording/transcribe, catch per-window errors: record them in `errors[ref]` and the status event, then roll to a new session and keep going instead of ending the job. Before reading a chunk, check `session.isComplete` and roll over, and advance `cursor` only for audio that a live session accepted. Make the deadline scale with the window length (e.g. max(6, 0.5 × window seconds)). Add tests where TestSpeechSession throws a no-speech error or returns [] for one window and later windows are still persisted."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptPanel.swift:27-47, 153",
+      "problem": "The panel's recording list never refreshes. transcript.list runs only in reload(), and reload() runs only from `.task(id: context.session?.document)`. The event handler (tx.committed, transcript.changed) and the 2 s poll call only refresh(), and refresh() returns early while selectedClip is empty. Repro: open a notebook with no recordings, open the Transcript tab, and start recording with live transcription on. The panel keeps showing 'No recordings yet' and never shows the live transcript (S-049/S-050). With one clip selected, a new recording never appears in the picker until the panel is reopened.",
+      "fix": "In the subscription, when `event.type == NibEventType.committed && event.doc == session?.document` (or when an AudioRecordingPayload arrives), call `await reload()` instead of refresh(). reload() already keeps a still-valid selection. When an AudioRecordingPayload with state \"recording\" arrives for a clip in this document, select that clip so the live transcript appears. Add a TranscriptPanelModel test: create a clip after the model loads, emit the commit, and assert that `clips` and `selectedClip` update."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:179-203 (TranscriptAudioReader.snapshot); TranscriptCommands.swift:87-89",
+      "problem": "Cloud transcription fails for any recording longer than about 4 minutes. snapshot() turns the whole clip into 16-bit linear PCM WAV at the recorder's hardware rate (F052 records mono at the input rate, usually 48 kHz). That is about 5.8 MB per minute. The OpenAI-compatible provider (OpenAICompatibleProvider.transcribe) uploads the file in a single multipart request, and Whisper-style endpoints reject uploads over 25 MB. So a 5 minute lecture or longer gets a 413 or provider error, both from the Regenerate button and from live cloud mode. Each call also writes the full WAV to tmp: a 2 h clip is about 690 MB.",
+      "fix": "Encode a compact upload instead of WAV. Use AVAudioFile(forWriting:) with `AVFormatIDKey: kAudioFormatMPEG4AAC` into a .m4a at 16 kHz mono (about 0.5 MB/min). Or downsample to 16 kHz mono 16-bit and split the clip into chunks of 10 minutes or less (bounded by bytes), call `ai.transcribe` per chunk, and shift each returned segment's `start` by the chunk offset before re-indexing. Add a test that a 6-minute clip produces several bounded uploads (FakeAIService that records the file sizes)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:261-277 (cloudRecording)",
+      "problem": "Live cloud transcription runs transcript.regenerate on the whole recording every 60 s. That re-uploads everything recorded so far each minute, so total upload and conversion grow quadratically: a 2 h lecture uploads about 120 h of audio and writes about 40 GB of temp WAV. Each regenerate also gives every index a new rev, so a correction the user makes in the panel during the recording is overwritten on the next tick, with no undo. Regenerate's conflict check only covers edits made while that one call is running. Any error (for example a conflict from a concurrent edit or Regenerate tap) also ends the job for the rest of the recording.",
+      "fix": "Transcribe only the new audio. Snapshot the range [last, elapsed) (TranscriptAudioReader.read already takes from/through; write that range to a compact file), call ai.transcribe on it, shift the starts by `last`, and store the lines with transcript.append, which never replaces existing indices or corrections. Keep transcript.regenerate for explicit user requests. Treat per-window errors as recoverable: report them and retry the window on the next tick."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptCommands.swift:55-61 (TranscriptRegenerate descriptor); TranscriptPanel.swift:275-277",
+      "problem": "Regenerate permanently replaces every transcript line, including the user's own transcript.editSegment corrections, which lose to the new revs. It cannot be undone, yet it is not marked `destructive: true`. ARCHITECTURE.md §6 says to mark destructive anything that deletes or overwrites. The panel runs it from an always-visible full-width footer button with no confirmation, so one tap erases all corrections. This breaks DESIGN.md §1.8 / Slop 'asks inline before anything destructive'.",
+      "fix": "Add `destructive: true` to the descriptor. In the panel, put Regenerate behind an inline confirmation (a NibBanner with a 'Replace Transcript' action, or the system confirmationDialog) that says corrections will be replaced. Optionally keep lines whose rev came from editSegment unless the user chooses to replace them."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptCommands.swift:198-200 (TranscriptSeek), 166 (TranscriptInsert)",
+      "problem": "Large notebooks pay heavily for a timestamp tap or a line insert. TranscriptSeek calls `workspace.items(doc, page:)` on every live page. That is synchronous persistence I/O on the main actor, and each page stays in the workspace's pageItems cache permanently. On a 500-page notebook, one tap on a timestamp loads all 500 pages into memory and stalls the UI. TranscriptInsert calls `workspace.page(ofItem:in:)` on every insert, even when the id is freshly generated by NibID.make(), so every drag or Insert on Page also loads every page.",
+      "fix": "In Seek, take `let cached = workspace.cachedPages(doc)` first. Skip any page whose `workspace.contentRevision(doc, page:)` is non-nil with `wallMs < (clip.start + line.start) * 1000`: nothing on it changed after the window opened, so it cannot hold ink from the window. Afterwards, call `workspace.evictPages(doc, keeping: cached ∪ {winner})` (the G10 pattern). Also consider moving the scan off the main actor via `peek`. In Insert, run the collision check only when `p.id != nil`, and check the target page (`allItems(doc, page:)`) instead of the whole document."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptStore.swift:135-142 (persist)",
+      "problem": "Every transcript write re-puts the whole AudioClip record with a fresh rev: each editSegment, each regenerate, and each live window, roughly once a minute while recording. AudioClip is a whole-record LWW (ARCHITECTURE §4.3), so this device's copy (old name, old summary) beats a concurrent change to the same clip on another device. Repro: rename the recording on the iPhone (audio.rename), then correct a transcript line on the iPad before sync. After sync the rename is gone, and an F089 summary written on the other device is lost the same way. The spec asks editSegment/regenerate to write only this device's transcript file.",
+      "fix": "Call `tx.put(current)` only when `current.transcriptFile == nil` (the first sidecar write for a legacy clip). Otherwise leave the record alone and announce the change with the doc-scoped `transcript.changed` event that persist() already emits. Observers such as NibIndex can listen for that event. Add a two-harness test where device 8 renames the clip, device 7 edits a line, and the merged clip keeps the new name."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptPanel.swift:114-121, 138-139, 241",
+      "problem": "An edit draft can be saved to the wrong recording. The recording Picker stays visible in edit mode, and changing `selectedClip` keeps `editIndex` and the non-empty `editText`. Save then sends transcript.editSegment with the new clip and the old index, so the newly selected recording's line N is permanently overwritten with text from a different recording (undoable: false).",
+      "fix": "Store the clip with the draft (`editClip`) and send that on Save. Alternatively, reset `editIndex`/`editText` in `.onChange(of: model.selectedClip)` and hide the Picker while `editIndex != nil`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptCommands.swift:69-78, 95-108; LiveTranscriber.swift:359",
+      "problem": "Regeneration has three concurrency gaps. (1) The `regenerating` check (line 69) and the insert (line 77) are separated by an await (line 74), so two calls can both start, and the first one's defer clears the lock while the second is still running. (2) The snapshot comparison (line 95) and the write (line 108) are separate actor calls, so an edit that lands between them is overwritten by higher revs. (3) A regenerate that runs while a live job is active allocates or retires the indices that the live window reserved, so TranscriptAppend later drops that window's lines as 'existing'.",
+      "fix": "Insert into `regenerating` before the first await, with `defer` removal right after. Add a `TranscriptFiles.replace(base:device:expected:lines:)` that compares the merged state with `expected` and writes in one actor call. Refuse regenerate (`.conflict`, 'stop live transcription first') while `live.jobs[clip] != nil`, or make the live job re-read nextIndex before it appends."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:279-291",
+      "problem": "A restarted live job transcribes the recording again from the start and duplicates lines. When a job has ended (live toggled off, or an error) and F052 emits another \"recording\" event (resume after pause), recording() starts a new job with cursor = 0 and windowIndex = next free index. Every minute already transcribed is then appended a second time under new indices.",
+      "fix": "Start `cursor` and `windowStart` at `committed.map { $0.start + $0.duration }.max() ?? 0`, or keep a per-clip cursor in LiveTranscriber that outlives the job. Add a test: record, stop the job, emit recording again, and assert there are no duplicate starts."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptStore.swift:32-41 (TranscriptFiles.merge)",
+      "problem": "The merge compares raw Rev values instead of `Rev.effective(now:)`. ARCHITECTURE §4.3 and LWW.merge distrust revs more than 24 h in the future. Here a line written by a device with a wrong clock wins forever. A later correction from this device is also capped by HLCClock.observe at now+24h, so it loses: editSegment reports success but transcript.get still shows the old text.",
+      "fix": "Compute `let now = UInt64(Date().timeIntervalSince1970 * 1000)` once and compare `(line.rev ?? .zero).effective(now: now)` against the old value. Add a merge test with a far-future rev."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:398-401; TranscriptPanel.swift:27-35, 154-161, 170-171",
+      "problem": "There is a lot of avoidable churn while transcribing. preview() emits a global `transcript.changed` bus event for every Speech partial result, several per second, which fills the 5,000-event ring that the MCP bridge long-polls. The panel spawns a Task for every app event of any type, including laser and commit events. It re-runs transcript.get (directory listing plus a JSON decode of every device file) on every partial result, on every tx.committed in any document, and every 2 s. Its TimelineView also re-renders and re-filters the whole list 4 times a second even when nothing is playing.",
+      "fix": "Throttle the preview notifications (at most about 1/s), or make LiveTranscriber's previews observable to the panel directly. Filter on event.type before hopping to the main actor, and refresh on committed events only for the panel's document. Wrap the list in TimelineView only while `playback?.playing == true`, and compute the filtered lines once per change."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptPanel.swift:49-60, 129-132",
+      "problem": "Errors stay on screen and stale data stays actionable. `model.error` is cleared only by run(), so one failed refresh leaves the error up after later reads succeed. When reading the newly selected clip fails, the previous clip's transcript stays on screen, and its timestamps and menus now act on the new `selectedClip`. Errors are also drawn as raw destructive Text instead of the NibBanner notice row (DESIGN.md §14.18), with no Retry.",
+      "fix": "Set `error = nil` after a successful refresh. Set `transcript = nil` when the selection changes or the read fails. Show errors with `NibBanner(message, action: NibAction(\"Retry\") { … })`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptPanel.swift:218-222",
+      "problem": "Follow-along highlighting drifts when Skip Silence is on. The panel extrapolates `t + elapsed × rate`, but F052's PlaybackPlan jumps over silent intervals and emits no playback event when it skips. After the first skipped gap, the highlighted line falls behind the audio.",
+      "fix": "Get the position from the player instead of extrapolating. Poll `audio.status` (or the playback service position) while playing, or have F052 emit an AudioPlaybackPayload at each skip boundary and use only `t` between events."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:261-272; FeatTranscriptionFeature.swift:23-24",
+      "problem": "Cloud transcription can be turned on without confirmation. AI or plugins can set `transcription.cloud` and `transcription.live` with settings.set, which is not user-only. The live cloud loop then runs transcript.regenerate through `app.bus.execute`, whose principal defaults to `.user`, so the gateway never confirms the upload of the user's audio. The code comment says 'Sensitive command preserves gateway confirmation for AI/plugin-origin recordings', which is not what happens.",
+      "fix": "Make enabling cloud transcription user-only. Either check `ctx.principal.isUser` in a dedicated `transcript.setCloud` command and declare the setting `readOnly` for settings.set, or put the key under the user-only `security.` prefix. Otherwise, pass the recording's originating principal to the cloud upload."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/LiveTranscriber.swift:92-95, 111",
+      "problem": "This differs from the spec, which asks for `requiresOnDeviceRecognition` only 'when supported'. session() throws for every locale without on-device support, so Apple Speech cannot transcribe those languages at all and request.requiresOnDeviceRecognition is always true.",
+      "fix": "Allow server recognition when `supportsOnDeviceRecognition` is false and say so in Recording Settings, or have the spec owner record the on-device-only decision."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptStore.swift:65-74",
+      "problem": "One unreadable or partially synced file from another device (`<base>.<other>.json`) makes read() throw `.conflict`. That blocks transcript.get, editSegment, regenerate and live appends for the clip, and the hint ('restore the file from backup') is something the user cannot act on.",
+      "fix": "For files from other devices, skip the bad file, log it, and return its name in TranscriptGet.Output.error. Keep throwing only for this device's own file, which write() must never overwrite."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptPanel.swift:319-338; LiveTranscriber.swift:73-82",
+      "problem": "Before Speech is authorised, languages() builds no recognizers, so every language is listed as 'On-device model unavailable'. That is misleading download guidance (S-091). 'Enable Speech Recognition' is also shown even after access is granted.",
+      "fix": "Return the authorisation status with the language list. Until it is authorised, show 'Enable Speech Recognition to check availability' in place of per-row availability, and hide the button once access is granted."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTranscription/TranscriptCommands.swift:167-170; TranscriptPanel.swift:163-164, 206",
+      "problem": "There is some token misuse and polish to fix. The inserted text box takes its size from UI metrics (`NibMetrics.panelWidth`, `hitTarget`) used as page geometry, and a drop near the right edge makes a 44 pt wide box. The hidden ⌥⌘F search shortcut shows no KeyHint (Slop checklist: every shortcut shows its KeyHint). `NibColor.fill3.opacity(0)` is used instead of `Color.clear`.",
+      "fix": "Size the box from the page (for example width = min(pageWidth − 2·margin, 480 pt), and clamp x so the box fits on the page). Expose the search shortcut via `.nibShortcutHint`, or register it as a KeyCommandDescriptor. Use `Color.clear` for the inactive row background."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTranscriptionTests/FeatTranscriptionTests.swift",
+      "problem": "The tests skip the riskiest paths. TestSpeechSession never fails or returns empty, so the silent-window, timeout and early-completion paths are never exercised. The cloud live loop, TranscriptAppend's handling of corrections, a job restart, the panel model (clip list refresh, edit draft on clip switch) and TranscriptCopy all have no tests.",
+      "fix": "Add tests for each fix above. Use a TestSpeechSession that can throw or return [] per window, a FakeAIService that records upload sizes and call ranges, and a TranscriptPanelModel test for reload on commit and for resetting the draft when the clip changes."
+    }
+  ]
+}

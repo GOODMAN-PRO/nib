@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTemplateUI/TemplatePickerCommand.swift:151-232 (TemplateApply), FeatTemplateUIFeature.swift:13, ChangeTemplateSheet.swift:79, CustomTemplateStore.swift:202-204",
+      "problem": "F045 registers `template.apply`, a command that is not in the ARCHITECTURE §6.5 catalogue (§15.3 says to register exactly the listed ids; `Scripts/lint.py --feature F045` warns about it). The spec routes the Change Template sheet to page.setTemplate. The custom-cover marker only exists inside this command. It overloads `Background.template` with the unregistered id `templateui.customCover` and also writes page ext keys, and the catalogue paths drop or ignore it. page.setBackground rebuilds `.ofPDF`/`.ofImage` without `template`, and F005's page.setTemplate `isCover` only checks template backgrounds. So after AI, a plugin or F021/F022 replace a custom cover with paper through page.setTemplate, `coverEnabled` stays true and the stale `templateui.customCover` ext stays on page 1. The command also re-implements F005's coverEnabled/defaultTemplate meta logic. For custom backgrounds it resizes pages directly in `ctx.mutate`, which skips F005's warning about items left outside the page.",
+      "fix": "Delete TemplateApply. The Change Template sheet runs one `commands.batch` (one undo step): page.setTemplate {pages, template, params, size, landscape} for built-ins, or page.setBackground with the asset stored via `asset.put` for custom files, then `node.set` to write the page-1 ext marker and `doc` meta `coverEnabled`. Define the marker only as `PageRecord.ext[\"templateui.customCover\"]` and stop overloading `Background.template`. Report the F005 isCover/coverFlag follow-up as a contract gap in the summary rather than editing F005."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTemplateUI/FeatTemplateUIFeature.swift:40-42",
+      "problem": "F045 registers its own `.appMenu` item `templateui.manage` (\"Manage Notebook Templates\"). F027 already registers `settings.menu.templates` (\"Manage Templates\") in `.appMenu`, which opens `PanelIDs.templates` (see origin/feat/F027 FeatSettingsFeature.swift, AppMenu.items). Once both are on main, the app menu shows the entry twice. The spec says F027's app menu opens the panel.",
+      "fix": "Remove the `.appMenu` MenuItemDescriptor. Keep only the panel registration under `PanelIDs.templates` (and the key command, if wanted)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTemplateUI/CustomTemplateStore.swift:56-66; TemplateLibraryView.swift:79-90",
+      "problem": "`groups()` throws when any synced `group.<dev>.json` cannot be decoded, has a mismatched id, or holds any entry it does not recognise. That includes a kind or blob extension written by a newer app version on another device. Every template command then fails: listCustom, import, delete, locate, choose. `TemplateBrowserModel.load()` calls template.listCustom before template.list, so a single bad file from another device also leaves the picker, Change Template and Manage Templates without any built-in templates. The user cannot choose anything (`choice` is nil), so F021/F022's template.choose is unusable. The error code is also `invalid_params`, which is wrong for a file the user did not send.",
+      "fix": "In `groups()`, skip unreadable or invalid files and entries, and log them with os.Logger(subsystem: \"app.nib\", category: \"templateui\") instead of throwing. In `load()`, fetch template.list first or in its own do/catch, so built-ins always load. Add a test that writes a corrupt group file and a file with an unknown kind, and asserts that listCustom and the built-in list still work."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTemplateUI/CustomTemplateStore.swift:153-157",
+      "problem": "Default-group fallback bug: once the default `custom` group has been deleted (it is tombstoned and kept), every template.import without `group` takes the `includeDeleted` branch and creates a new random-id group titled \"Custom\". Deleting the default group and then importing three files gives three \"Custom\" groups. This is the main D-046/D-047 path, because the UI's \"Custom (default)\" choice sends no group.",
+      "fix": "When `custom` is tombstoned, reuse an existing live fallback group. For example, take the first live group whose title is the localized \"Custom\", or store the fallback id under a synced setting. Alternatively, revive `custom` by writing it with a new rev and `deleted = false`. Add a test: delete the default group, import twice, and assert exactly one live Custom group."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTemplateUI/CustomTemplateStore.swift:161,195-199,45-77; TemplatePickerCommand.swift:119,197",
+      "problem": "Synchronous file I/O runs on the main actor inside commands, against ARCHITECTURE §14 (file I/O off the main actor; commands block it for at most 16 ms). `background()` reads the whole template file (up to the 200 MB import cap) and calls `assets.put` synchronously in template.choose and template.apply, once per document. `importFile` writes the blob on the main actor. `groups()` scans directories and decodes every group JSON several times per command, and again on every `libraryChanged` or `SettingsStore.didChange` reload of the browser model.",
+      "fix": "Read the file and call `assets.put`/`putTemporary` inside Task.detached; AssetStore is documented as thread-safe. Write the blob in the same detached task as `prepare`. Read the merged groups once per command, and do that scan off the main actor too."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTemplateUI/TemplateLibraryView.swift:406-408; CustomTemplateStore.swift:145-146",
+      "problem": "(PLAUSIBLE, device-only, not testable in hostless CI) `.fileImporter` returns a security-scoped URL, but the view only passes `url.absoluteString` to template.import. The command rebuilds the URL through `ctx.inputFile` and calls `startAccessingSecurityScopedResource()` on that new URL object. The new object does not carry the picker's sandbox extension, so the call returns false and reading files from iCloud Drive or other providers fails. F035 avoids this by copying the file first (ElementsPopover.importPicked).",
+      "fix": "In the fileImporter handler, call `startAccessingSecurityScopedResource()` on the picked URL. Copy the file with `assets.putTemporary` (or into a temp folder) and pass `tmp:<name>` to template.import, then call `stopAccessingSecurityScopedResource()` in a defer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTemplateUI/CustomTemplateStore.swift:117-121,61",
+      "problem": "Group delete marks only the group as deleted, not its templates, and the group winner is plain last-writer-wins. A concurrent rename on another device with a higher rev brings the group back with `deleted == false`, and every template in it reappears. Blobs are never removed, so deleted templates keep using storage forever.",
+      "fix": "Make deletion win in the merge: once any device file has `deleted == true`, the group stays deleted. Mark each template deleted when its group is deleted. Optionally, remove blobs that no live entry has referenced for N days."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTemplateUITests/FeatTemplateUITests.swift:52-68,231-268",
+      "problem": "The two-device merge test makes its edits one after another against the same folder. Each writer reads the other's latest state first, so divergent concurrent snapshots, delete-versus-rename conflicts and merge-order independence are never tested. The snapshot test only checks the image size, so a blank or clipped screen would still pass.",
+      "fix": "Write two device files by hand from the same base, each with a different edit (rename vs delete, edits to the same entry with different revs). Assert that merging gives the same result in both orders. In the snapshot test, assert something meaningful, such as non-blank pixels or the accessibility labels of the tiles."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTemplateUI/TemplatePickerCommand.swift:195-198",
+      "problem": "A dry run of template.apply with `custom: true` (an AI preview) writes asset files into every target document's package before the transaction is rolled back.",
+      "fix": "When `ctx.dryRun` is set, use `putTemporary` or skip the copy and return the planned change."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTemplateUI/TemplateLibraryView.swift:301-309,38,396-398,186,28,212,252",
+      "problem": "Design gaps. With \"Show hidden\" on, hidden templates look the same as visible ones; only the accessibility hint says they are hidden. Errors appear as a raw red footnote instead of `NibBanner` (NibDesign v2). The grid does not use `.nibFadeBottomEdge()` (DESIGN §14.6). Orientation and Paper/Cover use menu pickers, where §14.6 asks for an orientation segmented control and a cover tab. The 150 pt group list width is computed as `settingsSectionListWidth - rowThumbnailWidth - xl` instead of from a token.",
+      "fix": "Dim hidden tiles with `NibOpacity.recede` and add a \"Hidden\" caption. Show errors with `NibBanner(_, style: .warning, action: Retry)`. Add `.nibFadeBottomEdge()` to the grid. Use segmented pickers for orientation and kind. Use a named metric for the group list width, or request one."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTemplateUI/FeatTemplateUIFeature.swift:79-133; TemplatePickerCommand.swift:87,121-125",
+      "problem": "Command ids are written as string literals (\"template.import\", \"template.listCustom\" and others) although `CommandIDs.templateImport` and the rest exist. Also, in template.choose with kind cover, choosing \"No cover\" returns a builtin.blank paper background, tinted with the cloth colour. This is not documented, and a caller applying it to page 1 gets blank paper instead of no cover.",
+      "fix": "Use the `CommandIDs.template*` constants. For kind cover + No cover, either document the blank result in the summary or return a distinct result (for example, throw `user_denied` or return `background: null`), and test it."
+    }
+  ]
+}
