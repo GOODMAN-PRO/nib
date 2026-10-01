@@ -71,7 +71,7 @@ private final class PenToolObservation {
         pending = true
         idle.forEach { $0.cancel() }; idle = []
         guard let app else { return }
-        for session in app.services.sessions.sessions where session.inking.isInking {
+        for session in app.services.sessions.sessions {
             idle.append(session.inking.observe { [weak self] signal in
                 if !signal.isInking { self?.flush() }
             })
