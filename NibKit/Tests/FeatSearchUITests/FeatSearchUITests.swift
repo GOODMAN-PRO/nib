@@ -799,14 +799,27 @@ final class FeatSearchUITests: XCTestCase {
             try await Task.sleep(nanoseconds: 500_000_000)
             host.view.layoutIfNeeded()
             let input = try XCTUnwrap(descendants(UITextField.self, in: host.view).first { $0.text == state.query })
+            let results = try XCTUnwrap(descendants(UIScrollView.self, in: host.view)
+                .filter { $0.bounds.height > NibMetrics.barHeight }
+                .max { $0.bounds.height < $1.bounds.height })
+            // Resizing reflows live droplets. Measure their resting geometry after the real
+            // display-link springs settle, rather than assuming a loaded simulator finishes in 0.5 s.
+            var previousFrames: [CGRect] = []
+            var stableSamples = 0
+            for _ in 0..<30 {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                host.view.layoutIfNeeded()
+                let frames = [input.convert(input.bounds, to: window), results.convert(results.bounds, to: window)]
+                stableSamples = frames == previousFrames ? stableSamples + 1 : 0
+                previousFrames = frames
+                if stableSamples >= 3 { break }
+            }
+            XCTAssertGreaterThanOrEqual(stableSamples, 3, "Search geometry must settle after resizing")
             let inputFrame = input.convert(input.bounds, to: window)
             XCTAssertGreaterThan(inputFrame.width, 0)
             XCTAssertGreaterThanOrEqual(inputFrame.minX, NibMetrics.chromeInset)
             XCTAssertLessThanOrEqual(inputFrame.maxX, size.width - NibMetrics.chromeInset - NibMetrics.hitTarget,
                 "The query must leave room for the Close search control inside the window")
-            let results = try XCTUnwrap(descendants(UIScrollView.self, in: host.view)
-                .filter { $0.bounds.height > NibMetrics.barHeight }
-                .max { $0.bounds.height < $1.bounds.height })
             let resultsFrame = results.convert(results.bounds, to: window)
             let expectedWidth = size.width > size.height ? NibMetrics.searchWidth : size.width - 2 * NibMetrics.chromeInset
             XCTAssertEqual(resultsFrame.width, expectedWidth, accuracy: 1)
