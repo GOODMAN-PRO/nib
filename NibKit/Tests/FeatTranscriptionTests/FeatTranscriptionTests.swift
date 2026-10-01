@@ -161,16 +161,14 @@ final class FeatTranscriptionTests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.settingsSet, ["name": "transcription.live", "value": true])
         live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
         live.recording(AudioRecordingPayload(clip: ref, state: "stopped", duration: 61))
+        await live.waitForRecording(ref)
+        XCTAssertNil(live.errors[ref])
         let store = try TranscriptStore.of(h.app.services)
         let clip = try store.clip(ref, workspace: h.app.workspace)
-        let deadline = Date().addingTimeInterval(4)
-        var lines = try await store.read(clip)
-        while lines.count < 2 && Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-            lines = try await store.read(clip)
-        }
+        let lines = try await store.read(clip)
         XCTAssertEqual(lines.map(\.start), [0, 60])
         XCTAssertEqual(speech.sessions.count, 2)
+        XCTAssertTrue(speech.sessions.allSatisfy { $0.frames > 0 && $0.cancelled })
     }
 
     func testPauseDrainsQueuedAudioBeforeClosingSpeechSession() async throws {

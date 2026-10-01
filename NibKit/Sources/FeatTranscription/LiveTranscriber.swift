@@ -253,6 +253,11 @@ final class LiveTranscriber {
         }
     }
 
+    /// Wait until the current recording has drained and persisted its final windows.
+    func waitForRecording(_ ref: String) async {
+        await jobs[ref]?.value
+    }
+
     private func cloudRecording(_ ref: String) async throws {
         guard let app else { return }
         let clip = try await recordingClip(ref)
@@ -359,6 +364,9 @@ final class LiveTranscriber {
                 }
                 sessionStarted = Date()
             }
+            // A stopped file is complete: drain the next window immediately rather than
+            // waiting for the polling interval used while audio is still being recorded.
+            if stopped { continue }
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }
