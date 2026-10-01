@@ -19,6 +19,9 @@ enum PluginRules {
     /// Bundle ≤ 20 MB (docs/PLUGIN_API.md §1), measured over the installed files.
     static let maxBundleBytes: Int64 = 20 * 1_048_576
     static let maxFiles = 2_000
+    static let maxEntries = maxFiles * 2
+    static let maxPathBytes = 1_024
+    static let maxPathDepth = 32
     static let maxInlineFiles = 500
     /// The code viewer shows at most this much of the entry script.
     static let codePreviewBytes = 64 * 1_024
@@ -103,8 +106,22 @@ enum PluginPackageHash {
         try compute(files: files(folder))
     }
 
+    struct Snapshot {
+        var sha256: String
+        var manifest: Data?
+        var previews: [CodePreview]
+    }
+
     static func compute(files: [File]) throws -> String {
+        try snapshot(files: files, captureContents: false).sha256
+    }
+
+    /// Consent contents come from the very same reads that contribute to the grant's hash.
+    static func snapshot(files: [File], captureContents: Bool = true) throws -> Snapshot {
         var hasher = SHA256()
+        var manifest: Data?
+        var previews: [CodePreview] = []
+        var total: UInt64 = 0
         for file in files {
             guard let handle = try? FileHandle(forReadingFrom: file.url) else {
                 throw NibError(.unavailable, "\(file.path) cannot be read yet", hint: "wait until the library finished syncing")
@@ -112,6 +129,13 @@ enum PluginPackageHash {
             defer { try? handle.close() }
             let size = handle.seekToEndOfFile()
             handle.seek(toFileOffset: 0)
+            total += size
+            if captureContents, total > UInt64(PluginRules.maxBundleBytes) {
+                throw PluginRules.tooBig(Int64(clamping: total))
+            }
+            let isManifest = captureContents && file.path == "manifest.json"
+            let isText = captureContents
+            var contents = Data()
             hasher.update(data: Data(file.path.utf8))
             hasher.update(data: Data([0]))
             hasher.update(data: Data(String(size).utf8))
@@ -121,13 +145,25 @@ enum PluginPackageHash {
                 let chunk = handle.readData(ofLength: Int(min(remaining, 1_048_576)))
                 if chunk.isEmpty { break }
                 hasher.update(data: chunk)
+                if isManifest {
+                    contents.append(chunk)
+                } else if isText, contents.count < PluginRules.codePreviewBytes {
+                    contents.append(chunk.prefix(PluginRules.codePreviewBytes - contents.count))
+                }
                 remaining -= UInt64(chunk.count)
             }
             guard remaining == 0 else {
                 throw NibError(.unavailable, "\(file.path) changed while it was read", hint: "try again in a moment")
             }
+            if isManifest { manifest = contents }
+            if isText {
+                let preview = contents.prefix(PluginRules.codePreviewBytes)
+                previews.append(CodePreview(path: file.path, text: String(decoding: preview, as: UTF8.self),
+                                            totalBytes: Int64(clamping: size), isTruncated: UInt64(preview.count) < size))
+            }
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return Snapshot(sha256: hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+                        manifest: manifest, previews: previews)
     }
 }
 
@@ -138,6 +174,10 @@ enum PluginPackageHash {
 /// files the hash ignores.
 enum StagingPath {
     static func sanitize(_ raw: String) throws -> String? {
+        guard raw.utf8.count <= PluginRules.maxPathBytes,
+              raw.split(separator: "/").count <= PluginRules.maxPathDepth else {
+            throw NibError(.invalidParams, "plugin paths are limited to \(PluginRules.maxPathBytes) bytes and \(PluginRules.maxPathDepth) levels")
+        }
         if raw.contains("\0") || raw.contains("\\") || raw.hasPrefix("/") || raw.hasPrefix("~")
             || PluginRules.matches(raw, "^[A-Za-z]:") {
             throw escape(raw)
@@ -178,6 +218,14 @@ enum PackageStager {
     final class Budget {
         private(set) var bytes: Int64 = 0
         private(set) var files = 0
+        private(set) var entries = 0
+
+        func addEntry() throws {
+            entries += 1
+            guard entries <= PluginRules.maxEntries else {
+                throw NibError(.invalidParams, "the plugin has more than \(PluginRules.maxEntries) entries (files and folders)")
+            }
+        }
 
         func addFile() throws {
             files += 1
@@ -187,7 +235,10 @@ enum PackageStager {
         }
 
         func check(pending: Int64) throws {
-            guard bytes + pending <= PluginRules.maxBundleBytes else { throw PluginRules.tooBig(bytes + pending) }
+            guard pending >= 0, pending <= PluginRules.maxBundleBytes - bytes else {
+                let (total, overflow) = bytes.addingReportingOverflow(pending)
+                throw PluginRules.tooBig(overflow ? Int64.max : total)
+            }
         }
 
         func commit(_ written: Int64) {
@@ -234,6 +285,7 @@ enum PackageStager {
         let budget = Budget()
         var seen = Set<String>()
         for entry in archive {
+            try budget.addEntry()
             guard let relative = try StagingPath.sanitize(entry.path) else { continue }
             switch entry.type {
             case .symlink:
@@ -247,6 +299,14 @@ enum PackageStager {
                 }
                 try budget.addFile()
                 try budget.check(pending: Int64(clamping: entry.uncompressedSize))
+                // A stored entry's payload size must equal its uncompressed size. ZIPFoundation reads only the
+                // latter, so reject a misleading header before it can conceal bytes from the chunk checks.
+                if !entry.isCompressed {
+                    try budget.check(pending: Int64(clamping: entry.compressedSize))
+                    guard entry.compressedSize == entry.uncompressedSize else {
+                        throw NibError(.invalidParams, "\(relative) has inconsistent stored sizes in \(name)")
+                    }
+                }
                 let target = try StagingPath.resolve(relative, in: dest)
                 try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
                 guard fm.createFile(atPath: target.path, contents: nil) else {
@@ -280,15 +340,15 @@ enum PackageStager {
 
     static func copyFolder(_ source: URL, into dest: URL) throws {
         let fm = FileManager.default
-        guard let subpaths = try? fm.subpathsOfDirectory(atPath: source.path) else {
+        guard let enumerator = fm.enumerator(at: source, includingPropertiesForKeys: nil) else {
             throw NibError(.notFound, "the folder \(source.lastPathComponent) cannot be read")
         }
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)
         let budget = Budget()
-        // Sorted, so a linked folder is met (and refused) before anything beneath it.
-        for raw in subpaths.sorted() {
+        for case let from as URL in enumerator {
+            try budget.addEntry()
+            let raw = String(from.path.dropFirst(source.path.count + 1))
             guard let relative = try StagingPath.sanitize(raw) else { continue }
-            let from = source.appendingPathComponent(raw)
             let attributes = try fm.attributesOfItem(atPath: from.path)
             let type = attributes[.type] as? FileAttributeType
             if type == .typeSymbolicLink {
@@ -410,7 +470,8 @@ final class StagingArea {
     var package: URL { root.appendingPathComponent("package", isDirectory: true) }
 
     func remove() {
-        try? FileManager.default.removeItem(at: root)
+        let folder = root
+        Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: folder) }
     }
 
     static var defaultParent: URL {
@@ -449,7 +510,7 @@ enum PluginSource: Equatable {
     case gallery(base: URL, files: [String])
 
     /// Exactly one of `url`, `path` or `files` (with `base` for a gallery entry's list of files).
-    static func from(url: String?, path: String?, files: JSONValue?, base: String?, index: String?) throws -> PluginSource {
+    static func from(url: String?, path: String?, files: JSONValue?, base: String?, index: String?, expectedHash: String? = nil) throws -> PluginSource {
         func given(_ s: String?) -> String? {
             guard let t = s?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
             return t
@@ -488,10 +549,14 @@ enum PluginSource: Equatable {
                 paths.append(s)
             }
             guard !paths.isEmpty else { throw NibError.invalid("files is empty", path: "$.files") }
-            return .gallery(base: try GallerySource.resolveBase(base, index: given(index)), files: paths)
+            return .gallery(base: try GallerySource.resolveBase(base, index: given(index), allowHTTP: hasExpectedHash(expectedHash)), files: paths)
         default:
             throw NibError(.invalidParams, "files is an object {path: contents} or, with base, a list of paths", path: "$.files")
         }
+    }
+
+    static func hasExpectedHash(_ hash: String?) -> Bool {
+        !(hash?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     /// `path` as something `CommandContext.inputFile` resolves: tmp: refs and file URLs as given, absolute paths as file
@@ -506,10 +571,10 @@ enum PluginSource: Equatable {
 
 /// Gallery entries whose files are served raw (docs/PLUGIN_API.md §8: `base` relative to the index URL + `files`).
 enum GallerySource {
-    static func resolveBase(_ base: String, index: String?) throws -> URL {
+    static func resolveBase(_ base: String, index: String?, allowHTTP: Bool = false) throws -> URL {
         let indexURL = index.flatMap { URL(string: $0) }
         guard let resolved = URL(string: base, relativeTo: indexURL)?.absoluteURL,
-              let scheme = resolved.scheme?.lowercased(), scheme == "https" || scheme == "http", resolved.host != nil else {
+              let scheme = resolved.scheme?.lowercased(), scheme == "https" || (allowHTTP && scheme == "http"), resolved.host != nil else {
             throw NibError(.invalidParams, "base must be an https URL, or a path relative to index", path: "$.base",
                            hint: "pass the gallery index URL as index when base is relative")
         }
@@ -517,6 +582,21 @@ enum GallerySource {
         if text.hasSuffix("/") { return resolved }
         guard let folder = URL(string: text + "/") else { throw NibError.invalid("base is not a URL", path: "$.base") }
         return folder
+    }
+
+    /// `inputFile` exposes no response or per-download cap. HEAD catches an announced oversize before GET;
+    /// the actual staged bytes are still checked because the server may omit or misstate Content-Length.
+    static func expectedLength(_ url: URL) async throws -> Int64 {
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 60
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw NibError.unavailable("gallery response") }
+        if http.statusCode == 405 || http.statusCode == 501 { return 0 }
+        guard (200..<300).contains(http.statusCode) else {
+            throw NibError(.unavailable, "download failed: \(url.absoluteString)")
+        }
+        return max(0, response.expectedContentLength)
     }
 
     /// One listed file under `base`; it must stay under `base` once resolved.
@@ -532,6 +612,26 @@ enum GallerySource {
             throw StagingPath.escape(relative)
         }
         return (url, clean)
+    }
+}
+
+/// Serialises staging and reservations while up to four downloads run concurrently, off the main actor.
+private actor GalleryStager {
+    private let budget = PackageStager.Budget()
+    private var reserved: Int64 = 0
+
+    func reserve(_ length: Int64) throws {
+        guard length <= PluginRules.maxBundleBytes - reserved else { throw PluginRules.tooBig(length) }
+        try budget.check(pending: reserved + length)
+        reserved += length
+    }
+
+    func place(_ file: URL, as name: String, into dest: URL, reservation: Int64) throws {
+        reserved -= reservation
+        let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        try budget.check(pending: reserved + size)
+        try PackageStager.place(file, as: name, into: dest, budget: budget)
     }
 }
 
@@ -673,6 +773,7 @@ struct PluginPackage {
     var files: [PackageFileInfo]
     var totalBytes: Int64
     var code: CodePreview?
+    var previews: [CodePreview] = []
 
     /// `unwrap`: a package whose files sit in one top-level folder (a zip of the plugin's folder) is accepted.
     /// `folderName`: an installed package's folder must be named after its id. Runs off the main actor.
@@ -684,15 +785,17 @@ struct PluginPackage {
         }
         let total = files.reduce(Int64(0)) { $0 + $1.size }
         guard total <= PluginRules.maxBundleBytes else { throw PluginRules.tooBig(total) }
-        guard let data = try? Data(contentsOf: root.appendingPathComponent("manifest.json")) else {
+        let snapshot = try PluginPackageHash.snapshot(files: files)
+        guard let data = snapshot.manifest else {
             throw NibError(.invalidParams, "manifest.json is missing from the plugin",
                            hint: "a plugin is a folder (or a .nibplugin zip of it) with manifest.json and its entry script at the top")
         }
         let manifest = try ManifestCheck.decode(data)
         try ManifestCheck.validate(manifest, root: root, folderName: folderName)
-        return PluginPackage(root: root, manifest: manifest, sha256: try PluginPackageHash.compute(files: files),
+        return PluginPackage(root: root, manifest: manifest, sha256: snapshot.sha256,
                              files: files.map { PackageFileInfo(path: $0.path, bytes: $0.size) }, totalBytes: total,
-                             code: CodePreview.read(manifest.entry, in: root))
+                             code: snapshot.previews.first { $0.path == manifest.entry },
+                             previews: snapshot.previews.filter { ["js", "html", "css", "json"].contains(URL(fileURLWithPath: $0.path).pathExtension.lowercased()) })
     }
 
     static func locateRoot(_ folder: URL) -> URL {
@@ -727,17 +830,17 @@ struct InstalledPackage {
 /// Moves packages into and out of the library's plugins folder, coordinated with file providers (iCloud Drive,
 /// Dropbox…) like every other library write. Runs off the main actor.
 enum PackagePlacer {
-    /// Replaces `dest` with `source`: the new files land beside it first, the old folder is kept until the new one is in
-    /// place and restored when the swap fails.
-    static func place(_ source: URL, at dest: URL, in plugins: URL) throws {
+    /// Replaces `dest` with `source`: the new files land beside it first, the old folder is kept through the grant
+    /// write and restored when the swap or approval fails.
+    static func place(_ source: URL, at dest: URL, in plugins: URL) throws -> URL? {
         let fm = FileManager.default
         try fm.createDirectory(at: plugins, withIntermediateDirectories: true)
         var coordinationError: NSError?
         var failure: Error?
+        var backup: URL?
         NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: dest, options: .forReplacing,
                                                          error: &coordinationError) { target in
             let incoming = plugins.appendingPathComponent(".incoming-" + UUID().uuidString, isDirectory: true)
-            var backup: URL?
             do {
                 try fm.moveItem(at: source, to: incoming)
                 if fm.fileExists(atPath: target.path) {
@@ -746,7 +849,6 @@ enum PackagePlacer {
                     backup = previous
                 }
                 try fm.moveItem(at: incoming, to: target)
-                if let previous = backup { try? fm.removeItem(at: previous) }
             } catch {
                 if let previous = backup, !fm.fileExists(atPath: target.path) { try? fm.moveItem(at: previous, to: target) }
                 try? fm.removeItem(at: incoming)
@@ -756,6 +858,33 @@ enum PackagePlacer {
         if let error = coordinationError ?? failure {
             throw NibError(.unavailable, "the plugin could not be written into the library: \(error.localizedDescription)",
                            hint: "check that the library folder is reachable and has space, then try again")
+        }
+        return backup
+    }
+
+    /// Called only after a failed hash check or grant write; the previous grant remains intact.
+    static func restore(_ backup: URL?, at dest: URL) throws {
+        var coordinationError: NSError?
+        var failure: Error?
+        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: dest, options: .forReplacing,
+                                                         error: &coordinationError) { target in
+            do {
+                let fm = FileManager.default
+                if fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
+                if let backup { try fm.moveItem(at: backup, to: target) }
+            } catch { failure = error }
+        }
+        if let error = coordinationError ?? failure { throw error }
+    }
+
+    /// Interrupted transactions leave only hidden working directories, never loadable plugins.
+    static func removeStale(in plugins: URL) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: plugins.path) else { return }
+        for url in try fm.contentsOfDirectory(at: plugins, includingPropertiesForKeys: [.isDirectoryKey]) {
+            guard url.lastPathComponent.hasPrefix(".incoming-") || url.lastPathComponent.hasPrefix(".previous-"),
+                  try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
+            try remove(url)
         }
     }
 
@@ -839,7 +968,7 @@ final class PluginGrantFile {
     func set(_ grant: StoredGrant?, for id: String) throws {
         lock.lock()
         defer { lock.unlock() }
-        var all = (try? readLocked()) ?? [:]
+        var all = try readLocked()
         all[id] = try grant.map { try JSONValue.from($0) }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -849,9 +978,21 @@ final class PluginGrantFile {
     }
 
     private func readLocked() throws -> [String: JSONValue] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode([String: JSONValue].self, from: data)
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return [:]
+        }
+        do {
+            return try JSONDecoder().decode([String: JSONValue].self, from: data)
+        } catch let error as DecodingError {
+            let stamp = Int(Date().timeIntervalSince1970 * 1_000)
+            let aside = url.deletingLastPathComponent().appendingPathComponent("PluginGrants.corrupt-\(stamp)-\(UUID().uuidString).json")
+            try FileManager.default.moveItem(at: url, to: aside)
+            installLog.error("corrupt plugin grants saved to \(aside.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return [:]
+        }
     }
 }
 
@@ -1022,6 +1163,18 @@ final class PluginInstaller {
     /// Plugin ids being installed or reviewed right now (a second request for the same id is a conflict).
     private var busy = Set<String>()
     private let sheet = SheetConsentPresenter()
+    private var cleanupTasks: [URL: Task<Void, Error>] = [:]
+
+    func prepare(_ services: NibServices) async throws {
+        let plugins = try pluginsFolder(services)
+        if let task = cleanupTasks[plugins] { return try await task.value }
+        let task = Task.detached(priority: .utility) { try PackagePlacer.removeStale(in: plugins) }
+        cleanupTasks[plugins] = task
+        do { try await task.value } catch {
+            cleanupTasks[plugins] = nil
+            throw error
+        }
+    }
 
     init(grants: PluginGrantFile = PluginGrantFile(), consent: PluginConsentPresenting? = nil,
          stagingParent: URL = StagingArea.defaultParent) {
@@ -1087,19 +1240,21 @@ final class PluginInstaller {
     func install(_ source: PluginSource, expectedHash: String?, ctx: CommandContext) async throws -> PluginInstallResult {
         try Self.refusePlugins(ctx, "install")
         let plugins = try pluginsFolder(ctx.services)
+        try await prepare(ctx.services)
+        let expected = expectedHash?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let presenter: PluginConsentPresenting? = ctx.dryRun ? nil : try consentPresenter(ctx)
         let staging = try StagingArea(parent: stagingParent)
         defer { staging.remove() }
 
-        let info = try await fetch(source, into: staging.package, ctx: ctx)
+        let info = try await fetch(source, into: staging.package, expectedHash: expected, ctx: ctx)
         let stagedFolder = staging.package
         let package = try await Task.detached(priority: .userInitiated) {
             try PluginPackage.inspect(stagedFolder, unwrap: true)
         }.value
         let manifest = package.manifest
         let id = manifest.id
-        if let expected = expectedHash?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !expected.isEmpty,
-           expected != package.sha256 {
+        let verified = expected.map { !$0.isEmpty && $0 == package.sha256 } ?? false
+        if let expected, !expected.isEmpty, !verified {
             throw NibError(.invalidParams, "the plugin's files do not match the expected sha256 (got \(package.sha256))",
                            path: "$.sha256", hint: "the gallery entry is out of date or the download was altered; do not install it")
         }
@@ -1116,9 +1271,12 @@ final class PluginInstaller {
             throw NibError(.conflict, "\(manifest.name) \(old.version) is installed; \(manifest.version) is older",
                            hint: "uninstall it first (plugin.uninstall) to go back to an older version")
         }
+        let useGrant = oldGrant != nil && oldGrant?.sha256 != existing?.sha256
         let diff = PermissionDiff.between(
-            oldPermissions: existing == nil ? nil : (oldManifest?.permissions ?? oldGrant?.permissions ?? oldGrant?.scopes),
-            oldHosts: existing == nil ? nil : (oldManifest.map(ManifestCheck.hosts) ?? oldGrant?.hosts),
+            oldPermissions: useGrant ? (oldGrant?.permissions ?? oldGrant?.scopes)
+                : existing == nil ? nil : (oldManifest?.permissions ?? oldGrant?.permissions ?? oldGrant?.scopes),
+            oldHosts: useGrant ? oldGrant?.hosts
+                : existing == nil ? nil : (oldManifest.map(ManifestCheck.hosts) ?? oldGrant?.hosts),
             oldCommands: oldManifest.map { ManifestCheck.aiCommands($0).map { $0.id } },
             new: manifest)
 
@@ -1153,7 +1311,7 @@ final class PluginInstaller {
             : .update(from: oldManifest?.version ?? oldGrant?.version)
         let request = PluginConsentRequest(kind: kind, package: package, source: info, requestedBy: ctx.principal, diff: diff,
                                            previousConsent: existing == nil ? nil : oldGrant.map { Set($0.scopes) },
-                                           galleryVerified: expectedHash != nil)
+                                           galleryVerified: verified)
         guard let presenter = presenter else { throw NibError.unavailable("the consent sheet") }
         let decision = try await presenter.requestConsent(request, navigator: ctx.navigator)
         guard case let .approve(consented) = decision else {
@@ -1167,37 +1325,59 @@ final class PluginInstaller {
 
         // Stop the running copy, swap the files, check them, then trust exactly what was approved.
         let host = host(ctx)
-        if existing != nil, !sameFiles {
-            host?.unload(id)
-            let packageRoot = package.root
-            do {
-                try await Task.detached(priority: .userInitiated) { try PackagePlacer.place(packageRoot, at: dest, in: plugins) }.value
-            } catch {
-                try? await host?.load(id)
-                throw error
-            }
-        } else if existing == nil {
-            let packageRoot = package.root
-            try await Task.detached(priority: .userInitiated) { try PackagePlacer.place(packageRoot, at: dest, in: plugins) }.value
-        }
-        let installedHash = try await Task.detached(priority: .userInitiated) { try PluginPackageHash.compute(dest) }.value
-        guard installedHash == package.sha256 else {
-            throw NibError(.conflict, "\(manifest.name) changed while it was being installed, so it was not approved",
-                           hint: "install it again")
-        }
+        let replacing = !sameFiles
+        var backup: URL?
+        var placed = false
         let granted = PluginRules.canonical(consented.intersection(diff.declared))
-        try grants.set(StoredGrant(sha256: installedHash, scopes: granted, source: info.grantString,
-                                   version: manifest.version, permissions: diff.declared, hosts: diff.hosts), for: id)
+        if existing != nil, replacing { host?.unload(id) }
+        do {
+            if replacing {
+                let packageRoot = package.root
+                backup = try await Task.detached(priority: .userInitiated) {
+                    try PackagePlacer.place(packageRoot, at: dest, in: plugins)
+                }.value
+                placed = true
+            }
+            let installedHash = try await Task.detached(priority: .userInitiated) { try PluginPackageHash.compute(dest) }.value
+            guard installedHash == package.sha256 else {
+                throw NibError(.conflict, "\(manifest.name) changed while it was being installed, so it was not approved",
+                               hint: "install it again")
+            }
+            try grants.set(StoredGrant(sha256: installedHash, scopes: granted, source: info.grantString,
+                                       version: manifest.version, permissions: diff.declared, hosts: diff.hosts), for: id)
+        } catch {
+            if placed {
+                let previous = backup
+                do {
+                    try await Task.detached(priority: .userInitiated) { try PackagePlacer.restore(previous, at: dest) }.value
+                } catch let restoreError {
+                    installLog.error("could not restore \(id, privacy: .public): \(restoreError.localizedDescription, privacy: .public)")
+                }
+            }
+            if existing != nil { try? await host?.load(id) }
+            throw error
+        }
+        if let backup {
+            await Task.detached(priority: .utility) { try? PackagePlacer.remove(backup) }.value
+        }
         installLog.info("installed \(id, privacy: .public) \(manifest.version, privacy: .public) from \(info.kind.rawValue, privacy: .public)")
         let outcome = await activate(id, fresh: existing == nil, ctx: ctx)
         return result(existing == nil ? "installed" : sameFiles ? "approved" : "updated", state: outcome.state,
                       enabled: outcome.enabled, granted: granted, error: outcome.error)
     }
 
+    static func checkTransport(_ url: URL?, expectedHash: String?) throws {
+        if url?.scheme?.lowercased() == "http", !PluginSource.hasExpectedHash(expectedHash) {
+            throw NibError(.invalidParams, "plugin downloads require https, or a non-empty sha256 for http",
+                           path: "$.sha256", hint: "use https or supply the expected package hash")
+        }
+    }
+
     /// Stages a source (downloads and copies run off the main actor).
-    private func fetch(_ source: PluginSource, into dest: URL, ctx: CommandContext) async throws -> SourceInfo {
+    private func fetch(_ source: PluginSource, into dest: URL, expectedHash: String?, ctx: CommandContext) async throws -> SourceInfo {
         switch source {
         case .url(let text):
+            try Self.checkTransport(URL(string: text), expectedHash: expectedHash)
             let file = try await ctx.inputFile(text)
             defer { PackageStager.discardDownload(file) }
             try await Task.detached(priority: .userInitiated) { try PackageStager.unpack(file, into: dest) }.value
@@ -1213,19 +1393,48 @@ final class PluginInstaller {
             try await Task.detached(priority: .userInitiated) { try PackageStager.writeInline(files, into: dest) }.value
             return SourceInfo(kind: .inline, detail: ctx.principal.description)
         case .gallery(let base, let list):
+            try Self.checkTransport(base, expectedHash: expectedHash)
             guard list.count <= PluginRules.maxFiles else {
                 throw NibError(.invalidParams, "the plugin has more than \(PluginRules.maxFiles) files", path: "$.files")
             }
-            try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-            let budget = PackageStager.Budget()
-            for (i, relative) in list.enumerated() {
+            // Validate the whole list before any network work, including case-insensitive duplicates.
+            var seen = Set<String>()
+            let remotes = try list.enumerated().map { i, relative in
                 let remote = try GallerySource.fileURL(relative, base: base, path: "$.files[\(i)]")
-                let file = try await ctx.inputFile(remote.url.absoluteString)
-                defer { PackageStager.discardDownload(file) }
-                let name = remote.relative
-                try await Task.detached(priority: .userInitiated) {
-                    try PackageStager.place(file, as: name, into: dest, budget: budget)
-                }.value
+                guard seen.insert(remote.relative.lowercased()).inserted else {
+                    throw NibError(.invalidParams, "the package lists \(remote.relative) twice", path: "$.files[\(i)]")
+                }
+                return remote
+            }
+            // HEAD is a download too: apply the same non-user policy before sending it.
+            if !ctx.principal.isUser {
+                guard base.scheme?.lowercased() == "https", ctx.bus.gateway.grants(ctx.principal).contains(.network) else {
+                    throw NibError(.permissionDenied, "gallery downloads need https and the 'network' permission")
+                }
+            }
+            let staging = GalleryStager()
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var next = 0
+                func enqueue(_ remote: (url: URL, relative: String)) {
+                    group.addTask {
+                        let length = try await GallerySource.expectedLength(remote.url)
+                        try await staging.reserve(length)
+                        let file = try await ctx.inputFile(remote.url.absoluteString)
+                        defer { PackageStager.discardDownload(file) }
+                        try Task.checkCancellation()
+                        try await staging.place(file, as: remote.relative, into: dest, reservation: length)
+                    }
+                }
+                while next < min(4, remotes.count) {
+                    enqueue(remotes[next])
+                    next += 1
+                }
+                while try await group.next() != nil {
+                    if next < remotes.count {
+                        enqueue(remotes[next])
+                        next += 1
+                    }
+                }
             }
             return SourceInfo(kind: .gallery, detail: base.absoluteString)
         }
@@ -1236,6 +1445,7 @@ final class PluginInstaller {
     func review(_ id: String, ctx: CommandContext) async throws -> PluginReviewResult {
         try Self.refusePlugins(ctx, "approve")
         try Self.checkID(id)
+        try await prepare(ctx.services)
         let folder = try pluginsFolder(ctx.services).appendingPathComponent(id, isDirectory: true)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -1291,15 +1501,16 @@ final class PluginInstaller {
     func uninstall(_ id: String, removeData: Bool, ctx: CommandContext) async throws -> PluginUninstallResult {
         try Self.refusePlugins(ctx, "remove")
         try Self.checkID(id)
+        try await prepare(ctx.services)
         let folder = try pluginsFolder(ctx.services).appendingPathComponent(id, isDirectory: true)
         let data = try dataFolder(ctx.services).appendingPathComponent(id, isDirectory: true)
         let fm = FileManager.default
         let installed = fm.fileExists(atPath: folder.path)
         let grant = grants.grant(id)
-        guard installed || grant != nil else {
+        let hasData = removeData && fm.fileExists(atPath: data.path)
+        guard installed || grant != nil || hasData else {
             throw NibError(.notFound, "plugin \(id) is not installed", path: "$.id", hint: "call plugin.list to see installed plugins")
         }
-        let hasData = removeData && fm.fileExists(atPath: data.path)
         if ctx.dryRun {
             return PluginUninstallResult(id: id, removed: installed, grantRemoved: grant != nil, dataRemoved: hasData)
         }

@@ -130,8 +130,93 @@ struct InstallKit {
     }
 
     /// Nothing is left behind in the staging folder.
-    var stagingIsEmpty: Bool {
-        ((try? FileManager.default.contentsOfDirectory(atPath: installer.stagingParent.path)) ?? []).isEmpty
+    func waitForStagingRemoval() async -> Bool {
+        for _ in 0..<100 {
+            if ((try? FileManager.default.contentsOfDirectory(atPath: installer.stagingParent.path)) ?? []).isEmpty { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return false
+    }
+}
+
+/// Exercises the real CommandContext.inputFile downloader without contacting a server.
+final class GalleryURLProtocol: URLProtocol {
+    struct Fixture {
+        var data: Data
+        var status = 200
+        var announcedBytes: Int64? = nil
+    }
+
+    private static let lock = NSLock()
+    private static var fixtures: [String: Fixture] = [:]
+    private static var requests: [(String, String)] = []
+    private static var active = 0
+    private static var peak = 0
+    private let completionLock = NSLock()
+    private var ended = false
+    private var work: DispatchWorkItem?
+
+    static func begin(_ fixtures: [String: Fixture]) {
+        lock.lock()
+        self.fixtures = fixtures
+        requests = []
+        active = 0
+        peak = 0
+        lock.unlock()
+        URLProtocol.registerClass(Self.self)
+    }
+
+    static var gets: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests.filter { $0.0 == "GET" }.map { $0.1 }
+    }
+
+    static var maxConcurrentRequests: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peak
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "plugins.f079.test" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let url = request.url!
+        let method = request.httpMethod ?? "GET"
+        Self.lock.lock()
+        let fixture = Self.fixtures[url.path] ?? Fixture(data: Data(), status: 404)
+        Self.requests.append((method, url.path))
+        Self.active += 1
+        Self.peak = max(Self.peak, Self.active)
+        Self.lock.unlock()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let bytes = fixture.announcedBytes ?? Int64(fixture.data.count)
+            let response = HTTPURLResponse(url: url, statusCode: fixture.status, httpVersion: "HTTP/1.1",
+                                           headerFields: ["Content-Length": String(bytes)])!
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if method != "HEAD" { self.client?.urlProtocol(self, didLoad: fixture.data) }
+            self.endRequest()
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+        self.work = work
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.02, execute: work)
+    }
+
+    override func stopLoading() {
+        work?.cancel()
+        endRequest()
+    }
+
+    private func endRequest() {
+        completionLock.lock()
+        defer { completionLock.unlock() }
+        guard !ended else { return }
+        ended = true
+        Self.lock.lock()
+        Self.active -= 1
+        Self.lock.unlock()
     }
 }
 
@@ -179,7 +264,8 @@ final class FeatPluginInstallTests: XCTestCase {
         XCTAssertEqual(request.kind, .install)
         XCTAssertTrue(request.isAuthoredInline)
         XCTAssertEqual(request.code?.path, "main.js")
-        XCTAssertTrue(kit.stagingIsEmpty)
+        let stagingRemoved = await kit.waitForStagingRemoval()
+        XCTAssertTrue(stagingRemoved)
     }
 
     // Acceptance: storage.set then reload keeps the plugin enabled (hash unchanged).
@@ -280,7 +366,8 @@ final class FeatPluginInstallTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: kit.folder("dev.nib.evil").path))
         XCTAssertNil(kit.installer.grants.grant("dev.nib.evil"))
-        XCTAssertTrue(kit.stagingIsEmpty)
+        let stagingRemoved = await kit.waitForStagingRemoval()
+        XCTAssertTrue(stagingRemoved)
         XCTAssertEqual(kit.consent.requests.count, 1, "a refused package never reaches the consent sheet")
     }
 
@@ -339,7 +426,8 @@ final class FeatPluginInstallTests: XCTestCase {
         } catch {
             XCTAssertEqual((error as? NibError)?.code, .userDenied)
         }
-        XCTAssertTrue(kit.stagingIsEmpty)
+        let stagingRemoved = await kit.waitForStagingRemoval()
+        XCTAssertTrue(stagingRemoved)
     }
 
     func testUpdatesShowThePermissionDiffAndAskAgainWhenTheyNeedMore() async throws {
@@ -378,6 +466,75 @@ final class FeatPluginInstallTests: XCTestCase {
             XCTFail("downgrades are refused")
         } catch {
             XCTAssertEqual((error as? NibError)?.code, .conflict)
+        }
+    }
+
+    func testSyncedUnapprovedUpdateDiffsAgainstThisDevicesGrant() async throws {
+        for version in ["2.0.0", "3.0.0"] {
+            let kit = try InstallKit()
+            _ = try await kit.install(kit.inline())
+            let synced = TestFiles.manifest(version: "2.0.0", permissions: ["document:read", "network"], hosts: ["new.example.com"])
+            try TestFiles.write([("manifest.json", synced)], into: kit.folder())
+            let r = try await kit.install(kit.inline(TestFiles.manifest(version: version,
+                permissions: ["document:read", "network"], hosts: ["new.example.com"])))
+            let request = try XCTUnwrap(kit.consent.requests.last)
+            XCTAssertEqual(r.added, ["network"])
+            XCTAssertEqual(request.diff.addedHosts, ["new.example.com"])
+            XCTAssertTrue(request.requiresReview)
+            XCTAssertFalse(ConsentSheetModel(request: request).canApprove)
+            XCTAssertTrue(request.initialConsent.contains("network"), "new permissions require the explicit review gate")
+        }
+    }
+
+    func testFailedGrantWriteRestoresTheOldPackageAndReloadsTheHost() async throws {
+        let kit = try InstallKit()
+        let before = try await kit.install(kit.inline())
+        let oldGrantFile = kit.installer.grants
+        let oldGrant = oldGrantFile.grant("dev.nib.cards")
+        let blocker = kit.base.appendingPathComponent("blocker")
+        try Data("file, not a directory".utf8).write(to: blocker)
+        kit.consent.respond = { request in
+            kit.installer.grants = PluginGrantFile(url: blocker.appendingPathComponent("PluginGrants.json"))
+            return .approve(request.initialConsent)
+        }
+        do {
+            _ = try await kit.install(kit.inline(TestFiles.manifest(version: "2.0.0")))
+            XCTFail("the grant write must fail")
+        } catch {
+            XCTAssertEqual(try PluginPackageHash.compute(kit.folder()), before.sha256)
+            XCTAssertEqual(oldGrantFile.grant("dev.nib.cards"), oldGrant)
+            XCTAssertNotNil(kit.host.handle("dev.nib.cards"))
+            XCTAssertEqual(kit.host.loads.count, 2, "the old running package is reloaded")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: kit.plugins.path), ["dev.nib.cards"])
+        }
+    }
+
+    func testStartupRemovesInterruptedTransactionFolders() async throws {
+        let kit = try InstallKit()
+        for name in [".incoming-interrupted", ".previous-interrupted", ".keep", "dev.nib.other"] {
+            try TestFiles.write([("main.js", "keep")], into: kit.plugins.appendingPathComponent(name))
+        }
+        _ = try await kit.install(kit.inline())
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: kit.plugins.path)),
+                       [".keep", "dev.nib.other", "dev.nib.cards"])
+    }
+
+    func testReviewRejectsChangesWhileConsentIsOpen() async throws {
+        let kit = try InstallKit()
+        _ = try await kit.install(kit.inline())
+        let oldGrant = kit.installer.grants.grant("dev.nib.cards")
+        try TestFiles.write([("main.js", "changed();")], into: kit.folder())
+        kit.consent.respond = { request in
+            try? TestFiles.write([("manifest.json", TestFiles.manifest(permissions: ["network"], hosts: ["unshown.example.com"]))],
+                                into: kit.folder())
+            return .approve(request.initialConsent)
+        }
+        do {
+            _ = try await kit.h.run("plugin.review", ["id": "dev.nib.cards"])
+            XCTFail("changed consent contents cannot be approved")
+        } catch {
+            XCTAssertEqual((error as? NibError)?.code, .conflict)
+            XCTAssertEqual(kit.installer.grants.grant("dev.nib.cards"), oldGrant)
         }
     }
 
@@ -420,6 +577,63 @@ final class FeatPluginInstallTests: XCTestCase {
         }
     }
 
+    func testRemoveDataCanRetryAfterPackageAndGrantAreGone() async throws {
+        let kit = try InstallKit()
+        let data = kit.h.library.metadataURL.appendingPathComponent("plugin-data/dev.nib.cards")
+        try TestFiles.write([("storage.json", "{}")], into: data)
+        let result = try await kit.h.run("plugin.uninstall", ["id": "dev.nib.cards", "removeData": true])
+            .decode(PluginUninstallResult.self)
+        XCTAssertEqual(result, PluginUninstallResult(id: "dev.nib.cards", removed: false, grantRemoved: false, dataRemoved: true))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
+    func testBlankSha256NeverShowsAVerifiedBadge() async throws {
+        for hash in ["", " \n\t "] {
+            let kit = try InstallKit()
+            var params = try XCTUnwrap(kit.inline().objectValue)
+            params["sha256"] = .string(hash)
+            _ = try await kit.install(.object(params))
+            let request = try XCTUnwrap(kit.consent.requests.first)
+            XCTAssertFalse(request.galleryVerified)
+            XCTAssertNil(request.hashVerificationText)
+        }
+    }
+
+    func testAnAIReplayingADryRunHashCannotClaimGalleryVerificationAndShowsAllTextCode() async throws {
+        let kit = try InstallKit()
+        let html = "<script>window.nib.call('document.list')</script>"
+        let css = String(repeating: "a", count: PluginRules.codePreviewBytes + 10)
+        let params = kit.inline(extra: ["panels/view.html": .string(html), "extra.js": "otherCode();", "style.css": .string(css)])
+        let preview = try await kit.h.app.bus.execute(Invocation(command: "plugin.install", params: params,
+            principal: .ai("chat1"), session: kit.h.session, dryRun: true)).value.decode(PluginInstallResult.self)
+        var install = try XCTUnwrap(params.objectValue)
+        install["sha256"] = .string(preview.sha256)
+        _ = try await kit.install(.object(install), as: .ai("chat1"))
+        let request = try XCTUnwrap(kit.consent.requests.first)
+        XCTAssertTrue(request.galleryVerified, "the supplied hash matches, but its provenance is the caller")
+        XCTAssertEqual(request.hashVerificationText, "Matches the sha256 the caller supplied")
+        XCTAssertEqual(Set(request.previews.map { $0.path }), ["main.js", "manifest.json", "panels/view.html", "extra.js", "style.css"])
+        XCTAssertEqual(request.previews.first { $0.path == "panels/view.html" }?.text, html)
+        let style = try XCTUnwrap(request.previews.first { $0.path == "style.css" })
+        XCTAssertEqual(style.text.utf8.count, PluginRules.codePreviewBytes)
+        XCTAssertTrue(style.isTruncated)
+    }
+
+    func testCleartextPackageDownloadsRequireANonEmptyHash() async throws {
+        let kit = try InstallKit()
+        for params: JSONValue in [["url": "http://plugins.f079.test/cards.nibplugin"],
+                                  ["url": "http://plugins.f079.test/cards.nibplugin", "sha256": " "],
+                                  ["base": "http://plugins.f079.test/cards/", "files": ["main.js"]]] {
+            do {
+                _ = try await kit.install(params)
+                XCTFail("cleartext without a hash must be refused before fetching")
+            } catch {
+                XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+            }
+        }
+        XCTAssertTrue(kit.consent.requests.isEmpty)
+    }
+
     func testGallerySha256IsVerifiedAndDryRunPreviewsWithoutInstalling() async throws {
         let kit = try InstallKit()
         let params = kit.inline()
@@ -449,6 +663,100 @@ final class FeatPluginInstallTests: XCTestCase {
         XCTAssertEqual(kit.consent.requests.first?.galleryVerified, true)
     }
 
+    func testGalleryFilesDownloadPlaceAndRejectDuplicatesBeforeFetching() async throws {
+        let kit = try InstallKit()
+        let files = ["manifest.json": TestFiles.manifest(), "main.js": "1", "panel.html": "<p>panel</p>",
+                     "style.css": "body {}", "extra.js": "2", "nested/extra.json": "{}"]
+        GalleryURLProtocol.begin(Dictionary(uniqueKeysWithValues: files.map {
+            ("/cards/" + $0.key, GalleryURLProtocol.Fixture(data: Data($0.value.utf8)))
+        }))
+        defer { URLProtocol.unregisterClass(GalleryURLProtocol.self) }
+        let result = try await kit.install(["base": "https://plugins.f079.test/cards/",
+                                           "files": .array(files.keys.sorted().map { .string($0) })])
+        XCTAssertEqual(result.status, "installed")
+        XCTAssertEqual(result.source, "gallery:https://plugins.f079.test/cards/")
+        for (path, text) in files {
+            XCTAssertEqual(try String(contentsOf: kit.folder().appendingPathComponent(path)), text)
+        }
+        XCTAssertEqual(Set(GalleryURLProtocol.gets), Set(files.keys.map { "/cards/" + $0 }))
+        XCTAssertGreaterThan(GalleryURLProtocol.maxConcurrentRequests, 1)
+        XCTAssertLessThanOrEqual(GalleryURLProtocol.maxConcurrentRequests, 4)
+        let count = GalleryURLProtocol.gets.count
+        do {
+            _ = try await kit.install(["base": "https://plugins.f079.test/cards/", "files": ["main.js", "MAIN.js"]])
+            XCTFail("case-insensitive duplicates must be rejected")
+        } catch {
+            XCTAssertTrue((error as? NibError)?.message.contains("twice") == true)
+        }
+        XCTAssertEqual(GalleryURLProtocol.gets.count, count)
+    }
+
+    func testGalleryPreflightRejectsFilesExceedingTheRemainingBudgetWithoutDownloading() async throws {
+        let kit = try InstallKit()
+        GalleryURLProtocol.begin([
+            "/cards/big.bin": .init(data: Data(), announcedBytes: PluginRules.maxBundleBytes + 1),
+        ])
+        defer { URLProtocol.unregisterClass(GalleryURLProtocol.self) }
+        do {
+            _ = try await kit.install(["base": "https://plugins.f079.test/cards/", "files": ["big.bin"]])
+            XCTFail("the announced bytes must fit before GET")
+        } catch {
+            XCTAssertTrue((error as? NibError)?.message.contains("20 MB") == true, "\(error)")
+        }
+        XCTAssertTrue(GalleryURLProtocol.gets.isEmpty)
+        XCTAssertTrue(kit.consent.requests.isEmpty)
+        let removed = await kit.waitForStagingRemoval()
+        XCTAssertTrue(removed)
+    }
+
+    func testGalleryActualBytesCannotBypassTheBudgetAndDownloadErrorsInstallNothing() async throws {
+        let kit = try InstallKit()
+        GalleryURLProtocol.begin([
+            "/cards/lying.bin": .init(data: Data(repeating: 0x61, count: Int(PluginRules.maxBundleBytes) + 1), announcedBytes: 1),
+            "/cards/missing.js": .init(data: Data(), status: 404),
+        ])
+        defer { URLProtocol.unregisterClass(GalleryURLProtocol.self) }
+        for file in ["lying.bin", "missing.js"] {
+            do {
+                _ = try await kit.install(["base": "https://plugins.f079.test/cards/", "files": [.string(file)]])
+                XCTFail("a failed download must not be installed")
+            } catch {
+                XCTAssertEqual((error as? NibError)?.code, file == "lying.bin" ? .invalidParams : .unavailable, "\(error)")
+            }
+        }
+        XCTAssertTrue(kit.consent.requests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: kit.folder().path))
+        let removed = await kit.waitForStagingRemoval()
+        XCTAssertTrue(removed)
+    }
+
+    func testHTTPWithAHashMustMatchBeforeConsent() async throws {
+        let kit = try InstallKit()
+        let manifest = TestFiles.manifest()
+        let root = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try TestFiles.write([("manifest.json", manifest), ("main.js", "1")], into: root)
+        let hash = try PluginPackageHash.compute(root)
+        GalleryURLProtocol.begin([
+            "/cards/manifest.json": .init(data: Data(manifest.utf8)),
+            "/cards/main.js": .init(data: Data("1".utf8)),
+        ])
+        defer { URLProtocol.unregisterClass(GalleryURLProtocol.self) }
+        let params: JSONValue = ["base": "http://plugins.f079.test/cards/", "files": ["manifest.json", "main.js"],
+                                 "sha256": .string(String(repeating: "0", count: 64))]
+        do {
+            _ = try await kit.install(params)
+            XCTFail("http packages still need a matching hash")
+        } catch {
+            XCTAssertEqual((error as? NibError)?.path, "$.sha256")
+        }
+        XCTAssertTrue(kit.consent.requests.isEmpty)
+        var matching = try XCTUnwrap(params.objectValue)
+        matching["sha256"] = .string(hash)
+        let result = try await kit.install(.object(matching))
+        XCTAssertEqual(result.sha256, hash)
+    }
+
     func testTheNibpluginImporterInstallsThroughPluginInstall() async throws {
         let kit = try InstallKit()
         let zip = TestFiles.tempDir().appendingPathComponent("Cards.nibplugin")
@@ -473,7 +781,8 @@ final class FeatPluginInstallTests: XCTestCase {
         } catch {
             XCTAssertEqual((error as? NibError)?.code, .unavailable)
         }
-        XCTAssertTrue(kit.stagingIsEmpty)
+        let stagingRemoved = await kit.waitForStagingRemoval()
+        XCTAssertTrue(stagingRemoved)
     }
 
     func testWithoutAPluginHostThePluginIsInstalledButNotLoaded() async throws {

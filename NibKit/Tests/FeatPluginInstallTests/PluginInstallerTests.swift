@@ -14,6 +14,8 @@ enum TestZip {
         var data: Data
         /// st_mode: 0o100644 file, 0o120777 symbolic link, 0o040755 folder.
         var mode: UInt32 = 0o100644
+        var declaredSize: UInt32? = nil
+        var deflated = false
 
         static func file(_ path: String, _ text: String) -> Entry { Entry(path: path, data: Data(text.utf8)) }
         static func link(_ path: String, to target: String) -> Entry { Entry(path: path, data: Data(target.utf8), mode: 0o120777) }
@@ -25,20 +27,22 @@ enum TestZip {
         var central = Data()
         for entry in entries {
             let name = Data(entry.path.utf8)
+            let payload = entry.deflated ? deflateStoredBlocks(entry.data) : entry.data
+            let method: UInt16 = entry.deflated ? 8 : 0
             let crc = crc32(entry.data)
             let offset = UInt32(out.count)
             out.append(le32(0x0403_4b50))
-            out.append(le16(20)); out.append(le16(0x0800)); out.append(le16(0))
+            out.append(le16(20)); out.append(le16(0x0800)); out.append(le16(method))
             out.append(le16(0)); out.append(le16(20_513))
-            out.append(le32(crc)); out.append(le32(UInt32(entry.data.count))); out.append(le32(UInt32(entry.data.count)))
+            out.append(le32(crc)); out.append(le32(UInt32(payload.count))); out.append(le32(entry.declaredSize ?? UInt32(entry.data.count)))
             out.append(le16(UInt16(name.count))); out.append(le16(0))
             out.append(name)
-            out.append(entry.data)
+            out.append(payload)
 
             central.append(le32(0x0201_4b50))
-            central.append(le16(0x0314)); central.append(le16(20)); central.append(le16(0x0800)); central.append(le16(0))
+            central.append(le16(0x0314)); central.append(le16(20)); central.append(le16(0x0800)); central.append(le16(method))
             central.append(le16(0)); central.append(le16(20_513))
-            central.append(le32(crc)); central.append(le32(UInt32(entry.data.count))); central.append(le32(UInt32(entry.data.count)))
+            central.append(le32(crc)); central.append(le32(UInt32(payload.count))); central.append(le32(entry.declaredSize ?? UInt32(entry.data.count)))
             central.append(le16(UInt16(name.count))); central.append(le16(0)); central.append(le16(0))
             central.append(le16(0)); central.append(le16(0))
             central.append(le32(entry.mode << 16))
@@ -52,6 +56,21 @@ enum TestZip {
         out.append(le16(UInt16(entries.count))); out.append(le16(UInt16(entries.count)))
         out.append(le32(UInt32(central.count))); out.append(le32(centralOffset))
         out.append(le16(0))
+        return out
+    }
+
+    /// Raw DEFLATE with uncompressed blocks (RFC 1951), to exercise a false uncompressed size in the inflater.
+    static func deflateStoredBlocks(_ data: Data) -> Data {
+        var out = Data()
+        var offset = 0
+        repeat {
+            let count = min(65_535, data.count - offset)
+            out.append(offset + count == data.count ? 1 : 0)
+            out.append(le16(UInt16(count)))
+            out.append(le16(~UInt16(count)))
+            out.append(data[offset..<(offset + count)])
+            offset += count
+        } while offset < data.count
         return out
     }
 
@@ -225,6 +244,73 @@ final class PluginInstallerTests: XCTestCase {
         XCTAssertThrowsError(try budget.check(pending: 1))
     }
 
+    func testDirectoryOnlyArchivesAndFoldersHaveAnEntryLimit() throws {
+        let source = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: source) }
+        let entries = (0...PluginRules.maxEntries).map { TestZip.Entry.folder("folder-\($0)") }
+        let zip = source.appendingPathComponent("directories.nibplugin")
+        try TestZip.make(entries).write(to: zip)
+        let dest = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: dest) }
+        XCTAssertThrowsError(try PackageStager.unzip(zip, into: dest)) { error in
+            XCTAssertTrue((error as? NibError)?.message.contains("entries") == true)
+        }
+        let folders = source.appendingPathComponent("folders")
+        for entry in entries {
+            try FileManager.default.createDirectory(at: folders.appendingPathComponent(entry.path), withIntermediateDirectories: true)
+        }
+        XCTAssertThrowsError(try PackageStager.copyFolder(folders, into: dest)) { error in
+            XCTAssertTrue((error as? NibError)?.message.contains("entries") == true)
+        }
+        XCTAssertThrowsError(try StagingPath.sanitize(String(repeating: "a", count: PluginRules.maxPathBytes + 1)))
+        XCTAssertThrowsError(try StagingPath.sanitize(Array(repeating: "a", count: PluginRules.maxPathDepth + 1).joined(separator: "/")))
+    }
+
+    func testZipBudgetUsesActualChunksWhenDeclaredSizeLies() throws {
+        let root = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let zip = root.appendingPathComponent("lying.nibplugin")
+        for deflated in [false, true] {
+            let entry = TestZip.Entry(path: "big.bin", data: Data(repeating: 0x61, count: Int(PluginRules.maxBundleBytes) + 1),
+                                      declaredSize: 1, deflated: deflated)
+            try TestZip.make([entry]).write(to: zip)
+            XCTAssertThrowsError(try PackageStager.unzip(zip, into: root.appendingPathComponent("out"))) { error in
+                XCTAssertTrue((error as? NibError)?.message.contains("20 MB") == true, "\(error)")
+            }
+        }
+    }
+
+    func testHashSnapshotRetainsTheExactManifestAndCodeBytesItHashed() throws {
+        let root = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifest = TestFiles.manifest(permissions: ["network"], hosts: ["approved.example.com"])
+        try TestFiles.write([("manifest.json", manifest), ("main.js", "approved();"), ("panel.html", "<p>approved</p>")], into: root)
+        let snapshot = try PluginPackageHash.snapshot(files: PluginPackageHash.files(root))
+        let hash = try PluginPackageHash.compute(root)
+        try TestFiles.write([("manifest.json", TestFiles.manifest(permissions: ["network"], hosts: ["unshown.example.com"])),
+                             ("panel.html", "<script>changed()</script>")], into: root)
+        XCTAssertEqual(snapshot.sha256, hash)
+        XCTAssertNotEqual(snapshot.sha256, try PluginPackageHash.compute(root))
+        XCTAssertEqual(ManifestCheck.hosts(try ManifestCheck.decode(XCTUnwrap(snapshot.manifest))), ["approved.example.com"])
+        XCTAssertEqual(snapshot.previews.first { $0.path == "panel.html" }?.text, "<p>approved</p>")
+    }
+
+    func testPackageReplacementRetainsItsBackupUntilCommittedAndCanRollBack() throws {
+        let root = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let plugins = root.appendingPathComponent("plugins")
+        let old = plugins.appendingPathComponent("dev.nib.cards")
+        let new = root.appendingPathComponent("new")
+        try TestFiles.write([("main.js", "old")], into: old)
+        try TestFiles.write([("main.js", "new")], into: new)
+        let backup = try XCTUnwrap(PackagePlacer.place(new, at: old, in: plugins))
+        XCTAssertEqual(try String(contentsOf: backup.appendingPathComponent("main.js")), "old")
+        XCTAssertEqual(try String(contentsOf: old.appendingPathComponent("main.js")), "new")
+        try PackagePlacer.restore(backup, at: old)
+        XCTAssertEqual(try String(contentsOf: old.appendingPathComponent("main.js")), "old")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+    }
+
     func testZipOfThePluginFolderIsUnwrappedAndValidated() throws {
         let zip = TestFiles.tempDir().appendingPathComponent("cards.zip")
         try TestZip.make([.folder("dev.nib.cards"), .file("__MACOSX/dev.nib.cards/._main.js", "fork")]
@@ -334,6 +420,26 @@ final class PluginInstallerTests: XCTestCase {
         XCTAssertNotNil(file.grant("dev.other.tool"))
     }
 
+    func testCorruptGrantsArePreservedAndIOErrorsCannotOverwriteTheFile() throws {
+        let root = TestFiles.tempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("PluginGrants.json")
+        let damaged = Data("not JSON".utf8)
+        try damaged.write(to: url)
+        let file = PluginGrantFile(url: url)
+        try file.set(StoredGrant(sha256: "abc", scopes: ["app"]), for: "dev.nib.cards")
+        let aside = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .first { $0.lastPathComponent.hasPrefix("PluginGrants.corrupt-") })
+        XCTAssertEqual(try Data(contentsOf: aside), damaged)
+        XCTAssertEqual(file.grant("dev.nib.cards")?.sha256, "abc")
+
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try TestFiles.write([("untouched", "keep")], into: url)
+        XCTAssertThrowsError(try file.set(StoredGrant(sha256: "new", scopes: []), for: "dev.nib.cards"))
+        XCTAssertEqual(try String(contentsOf: url.appendingPathComponent("untouched")), "keep")
+    }
+
     func testSourcesNeedExactlyOneKindAndGalleryPathsStayUnderBase() throws {
         XCTAssertThrowsError(try PluginSource.from(url: nil, path: nil, files: nil, base: nil, index: nil))
         XCTAssertThrowsError(try PluginSource.from(url: "https://a.example/p.nibplugin", path: "/tmp/p", files: nil, base: nil, index: nil))
@@ -352,6 +458,8 @@ final class PluginInstallerTests: XCTestCase {
                        "https://raw.example.com/nib/plugins/examples/hello-world/panels/word%20count.html")
         XCTAssertThrowsError(try GallerySource.fileURL("../../secret.js", base: base, path: "$"))
         XCTAssertThrowsError(try GallerySource.resolveBase("ftp://example.com/p/", index: nil))
+        XCTAssertThrowsError(try GallerySource.resolveBase("http://example.com/p/", index: nil))
+        XCTAssertEqual(try GallerySource.resolveBase("http://example.com/p/", index: nil, allowHTTP: true).scheme, "http")
         XCTAssertThrowsError(try GallerySource.resolveBase("examples/", index: nil), "a relative base needs the index")
     }
 

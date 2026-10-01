@@ -20,6 +20,11 @@ public enum FeatPluginInstallFeature: NibFeature {
 
     public static func start(_ app: NibApp) async {
         guard !NibApp.isHostlessTest else { return }
+        do {
+            try await PluginInstaller.shared(app.services).prepare(app.services)
+        } catch {
+            installLog.error("plugin transaction cleanup failed: \(error.localizedDescription, privacy: .public)")
+        }
         let reminder = ReviewReminder(app: app)
         app.services.set(reminder, for: ReviewReminder.serviceKey)
         reminder.start()

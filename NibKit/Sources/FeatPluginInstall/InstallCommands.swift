@@ -72,7 +72,7 @@ struct PluginInstallCommand: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         try PluginInstaller.refusePlugins(ctx, "install")
-        let source = try PluginSource.from(url: p.url, path: p.path, files: p.files, base: p.base, index: p.index)
+        let source = try PluginSource.from(url: p.url, path: p.path, files: p.files, base: p.base, index: p.index, expectedHash: p.sha256)
         return try await PluginInstaller.shared(ctx.services).install(source, expectedHash: p.sha256, ctx: ctx)
     }
 }

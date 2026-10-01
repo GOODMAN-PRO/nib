@@ -41,6 +41,7 @@ struct PluginConsentRequest {
     struct Detail: Equatable {
         var title: String
         var value: String
+        var isInstructions = false
     }
 
     var kind: Kind
@@ -54,7 +55,8 @@ struct PluginConsentRequest {
     var files: [PackageFileInfo]
     var totalBytes: Int64
     var code: CodePreview?
-    /// The package matched the sha256 the gallery listed.
+    var previews: [CodePreview]
+    /// The package matched the non-empty sha256 supplied by the caller.
     var galleryVerified: Bool
 
     init(kind: Kind, package: PluginPackage, source: SourceInfo, requestedBy: Principal, diff: PermissionDiff,
@@ -69,7 +71,14 @@ struct PluginConsentRequest {
         self.files = package.files
         self.totalBytes = package.totalBytes
         self.code = package.code
+        self.previews = package.previews
         self.galleryVerified = galleryVerified
+    }
+
+    var hashVerificationText: String? {
+        guard galleryVerified else { return nil }
+        return requestedBy.isUser ? String(localized: "Matches the hash the gallery lists")
+                                  : String(localized: "Matches the sha256 the caller supplied")
     }
 
     /// Re-consent on expansion: an update (or a changed plugin) that asks for more must be checked before approval.
@@ -155,7 +164,7 @@ enum ConsentWords {
         add(String(localized: "Settings"), (c?.settings?["properties"]?.objectValue?.keys).map { Array($0).sorted() } ?? [])
         if let text = c?.ai?.instructions?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
             out.append(PluginConsentRequest.Detail(title: String(localized: "Instructions for the assistant"),
-                                                   value: String(text.prefix(PluginRules.maxInstructions))))
+                                                   value: text, isInstructions: true))
         }
         return out
     }
@@ -479,7 +488,24 @@ struct ConsentSheet: View {
         if !list.isEmpty {
             Section {
                 ForEach(list, id: \.title) { detail in
-                    NibRow(detail.title, subtitle: detail.value)
+                    if detail.isInstructions {
+                        DisclosureGroup {
+                            detailValue(detail.value)
+                        } label: {
+                            Text(detail.title)
+                                .font(NibFont.body)
+                                .foregroundStyle(NibColor.label)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+                            Text(detail.title)
+                                .font(NibFont.body)
+                                .foregroundStyle(NibColor.label)
+                                .fixedSize(horizontal: false, vertical: true)
+                            detailValue(detail.value)
+                        }
+                    }
                 }
             } header: {
                 Text(String(localized: "What it adds"))
@@ -521,35 +547,27 @@ struct ConsentSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityLabel(model.showsFullHash ? String(localized: "SHA-256 hash \(sha)")
                                                         : String(localized: "SHA-256 hash, first 12 characters \(String(sha.prefix(12)))"))
-            if request.galleryVerified {
+            if let verification = request.hashVerificationText {
                 HStack(spacing: NibSpacing.xs) {
                     Image(nib: .checkCircle)
                         .foregroundStyle(NibColor.success)
                         .accessibilityHidden(true)
-                    Text(String(localized: "Matches the hash the gallery lists"))
+                    Text(verification)
                         .foregroundStyle(NibColor.label)
                 }
                 .font(NibFont.footnote)
             }
             HStack(spacing: NibSpacing.l) {
-                Button(model.showsFullHash ? String(localized: "Hide Full Hash") : String(localized: "Show Full Hash")) {
+                NibButton(model.showsFullHash ? String(localized: "Hide Full Hash") : String(localized: "Show Full Hash"),
+                          kind: .plain, size: .compact) {
                     model.showsFullHash.toggle()
                 }
-                .frame(minHeight: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
-                .hoverEffect(.highlight)
                 if model.showsFullHash {
-                    Button(String(localized: "Copy Hash")) {
+                    NibButton(String(localized: "Copy Hash"), kind: .plain, size: .compact) {
                         UIPasteboard.general.string = sha
                     }
-                    .frame(minHeight: NibMetrics.hitTarget)
-                    .contentShape(Rectangle())
-                    .hoverEffect(.highlight)
                 }
             }
-            .font(NibFont.footnote)
-            .foregroundStyle(NibColor.accent)
-            .buttonStyle(.plain)
         }
         .padding(.vertical, NibSpacing.xs)
         .accessibilityElement(children: .contain)
@@ -560,21 +578,22 @@ struct ConsentSheet: View {
         if let preview = request.code {
             Section {
                 DisclosureGroup(isExpanded: $model.showsCode) {
-                    NibCodeBlock(preview.text) {
-                        UIPasteboard.general.string = preview.text
-                    }
-                    if preview.isTruncated {
-                        Text(String(localized: "Showing the first \(ConsentWords.size(Int64(PluginRules.codePreviewBytes))) of \(ConsentWords.size(preview.totalBytes))."))
-                            .font(NibFont.footnote)
-                            .foregroundStyle(NibColor.labelSecondary)
-                    }
+                    codePreview(preview)
                 } label: {
                     NibRow(preview.path, subtitle: ConsentWords.size(preview.totalBytes), icon: .inlineCode)
                 }
                 if request.files.count > 1 {
                     DisclosureGroup(isExpanded: $model.showsFiles) {
                         ForEach(request.files, id: \.path) { file in
-                            NibRow(file.path, subtitle: ConsentWords.size(file.bytes))
+                            if let preview = request.previews.first(where: { $0.path == file.path }) {
+                                DisclosureGroup {
+                                    codePreview(preview)
+                                } label: {
+                                    fileLabel(file)
+                                }
+                            } else {
+                                fileLabel(file)
+                            }
                         }
                     } label: {
                         NibRow(String(localized: "Every file"), subtitle: String(localized: "\(request.files.count) files"),
@@ -589,6 +608,38 @@ struct ConsentSheet: View {
             }
         }
     }
+
+    private func detailValue(_ value: String) -> some View {
+        Text(value)
+            .font(NibFont.callout)
+            .foregroundStyle(NibColor.labelSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+    }
+
+    private func fileLabel(_ file: PackageFileInfo) -> some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            Text(file.path)
+                .font(NibFont.body)
+                .foregroundStyle(NibColor.label)
+                .fixedSize(horizontal: false, vertical: true)
+            detailValue(ConsentWords.size(file.bytes))
+        }
+    }
+
+    @ViewBuilder
+    private func codePreview(_ preview: CodePreview) -> some View {
+        NibCodeBlock(preview.text) {
+            UIPasteboard.general.string = preview.text
+        }
+        if preview.isTruncated {
+            Text(String(localized: "Showing the first \(ConsentWords.size(Int64(PluginRules.codePreviewBytes))) of \(ConsentWords.size(preview.totalBytes))."))
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
 }
 
 /// Below iOS 26 the sheet is the opaque grouped surface (`.nibSheet`); on iOS 26 the system's own sheet material shows.
