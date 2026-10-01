@@ -1551,7 +1551,9 @@ final class FeatCreateTests: XCTestCase {
                 let initialFormY = formFrame.minY
                 let initialCategoryY = categoryFrame.minY
                 let offset = initialCategoryY - NibSpacing.m
-                region.setContentOffset(CGPoint(x: 0, y: offset), animated: false)
+                // SwiftUI's horizontal content margin is represented by the resting x offset.
+                // Scroll only vertically, as a drag in this vertical scroll view would.
+                region.setContentOffset(CGPoint(x: region.contentOffset.x, y: offset), animated: false)
                 for _ in 0..<5 {
                     host.view.setNeedsLayout()
                     host.view.layoutIfNeeded()
