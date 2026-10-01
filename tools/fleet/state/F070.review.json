@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSyncUI/CloudStatusPanel.swift:126-131 (per-source status map), :145-163 (syncState / documentStatus); NibKit/Sources/FeatSyncUI/RepairTools.swift:96-105; NibKit/Tests/FeatSyncUITests/FeatSyncUITests.swift:41",
+      "problem": "Error and warning states that their emitters never clear stay stuck for the whole session. CloudStatusModel keys statuses by source and document, and a state is replaced only by a later event from the same source. The real store (F001 PackagePersistence) emits only error (writeFailed, walFailed, unreadable) and warning (futureRevision, newerFormat). It never sends a recovery state. Scenario: an iCloud folder is briefly unavailable, so the write fails and 'store:<doc>' becomes error. The debounced retry then succeeds silently. From then on the Cloud & Backup button shows exclamationmark.icloud with 'Sync needs attention', and the document stays in 'Documents Needing Attention' with 'Changes could not be saved'. Neither Sync Now nor Repair Library clears it; only switching the library root does. The 'syncui:' entry has the same problem: a failed or partial repair leaves 'error' or 'warning' outranking every later successful 'sync' idle. testTypedEventsKeepSourcesIndependentAndRecover passes only because it emits a store 'ok' event that the real store never sends.",
+      "fix": "(1) In NibStore/PackagePersistence.swift (F001 file, allowed on this branch), keep a `reportedFailure: Set<DocumentID>`. Insert into it in failed(_:_:) and report(_:_:) on failures. After the next successful write or clean read of that doc, emit StoreStatus.payload(\"ok\", \"saved\", …) and remove the doc from the set. (2) In CloudStatusModel.consume, drop every status entry of a document when NibEventType.docClosed arrives for it. After a successful library.repair, drop the stale 'store:' and 'syncui:' errors of documents that are no longer reported, or emit 'ok' for them. (3) Replace the fake store 'ok' in the test with the event sequence the real emitters produce: writeFailed, then the new 'ok'. Also test that a repair 'error' followed by a successful repair returns syncState to Up to date."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSyncUI/CloudStatusPanel.swift:137-140 (refresh on every library.changed / sync.status / backup.status / doc.opened), :200-228 (full recursive library.list loop), :165-180 (attentionDocuments)",
+      "problem": "The model re-enumerates the whole library on the main actor after almost every event, even when the panel has never been opened. FeatSyncUIFeature.start creates the model, so it is subscribed from launch. Each refresh pages library.list {recursive: true}. F002's LibraryList.run walks every folder, sorts all nodes with a localized comparison, and builds a NodeRow for every node on EVERY page call. Paging then stops at the 20 KB AI result budget (LibraryPaging.budget), which is about 60-80 document rows per page. A 5,000-document library therefore needs about 70 calls, each doing a full traversal, sort and map: roughly 350k NodeRow.make calls and 70 sorts of 5,000 items on the main actor per refresh. This runs on every rename, create, doc open, sync state change, backup event and repair event. On top of that, attentionDocuments is O(documents x statuses): it parses a DocumentID per row and runs documentStatus, which filters all statuses with hasSuffix. The panel body evaluates it twice per render.",
+      "fix": "Do not page library.list for this. Build the rows from the in-memory catalog: `app.services.library?.allNodes()` filtered to `.document` nodes whose `sync` is `.error` or `.downloading`, plus the documents named by attention events. Look titles up with `services.library?.node(id)` (O(1)). Only re-read the catalog on libraryChanged, and only while the panel or status button is visible. For sync.status and backup.status, update the status map and re-query only backup.status and webdav.status, throttled to at most once a second. Index statuses as `[DocumentID: [source: CloudSyncState]]`, so documentStatus is a dictionary lookup, and compute attentionDocuments once per change instead of in the view body."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSyncUI/FeatSyncUIFeature.swift:66-69",
+      "problem": "FeatSyncUIFeature.start awaits model.refresh(). NibApp.start runs feature starts one after another (`for f in features { await f.start(self) }`), so every feature after syncui waits, and `app.isStarted` stays false, until refresh finishes. That refresh is the full paged library enumeration described above, plus library.locations (which opens the security-scoped bookmark of every known library folder), backup.status and webdav.status. On a large or iCloud-backed library this adds seconds to launch for an indicator the user has not looked at.",
+      "fix": "Do not await in start. Either create the model and call `model.requestRefresh()`, which runs in its own Task and returns at once, or rely on the CloudStatusButton/CloudStatusPanel `.task` to load lazily. Add a test asserting that start returns before a suspended library.list handler resumes. Use the same continuation pattern as testSlowQueryCannotOverwriteNewerSnapshot."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSyncUI/RepairTools.swift:6-23, :80-81",
+      "problem": "The catalogue rebuild depends on F002 internals that are not in the contract. CatalogCacheRepair re-implements NibLibrary's private cache path (FNV-1a of the standardized root path, under 'Nib/library/catalog-%016llx.json'), and relies on refresh() doing a full scan when that file is missing. If F002 changes the key, the directory or its rebuild trigger, repair quietly becomes an incremental refresh while still reporting catalogRebuilt: true. testCacheInvalidationOnlyTouchesCurrentRoot only checks F070's own copy of the formula. No contract request was filed (ARCHITECTURE §15.11). The full rebuild also runs synchronously on the main actor (FolderLibrary.refresh reads every package head), so the 'Working…' row cannot update during a large repair.",
+      "fix": "File docs/contract-requests/F070-library-rebuild.md asking for `LibraryService.rebuildCatalog() async` (F002 already has `rebuild()` and `refreshInBackground`), and call it once it lands. Until then, keep the workaround but report `catalogRebuilt` only when the cache file exists again after `library.refresh()`. Note that F111's integration test is the only real check of this path."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSyncUI/FeatSyncUIFeature.swift:48-62",
+      "problem": "The libraryItem menu entry treats any selected node as a document. For a folder, `context.nodes.first` is a FolderID, so the menu shows 'Sync: Not checked yet' and opens the panel with doc = \"doc:<folderId>\". The panel then shows a 'Document Sync' section titled 'Document' for a folder.",
+      "fix": "In isVisible and params, take the first node for which `context.app.services.library?.node(id)?.kind == .document` (or `context.doc`). Hide the entry for folder-only selections. Add a test that builds a MenuContext with Fixtures.folderID."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSyncUI/FeatSyncUIFeature.swift:28-41",
+      "problem": "Overlay placement does not match DESIGN.md §14.1. The container banner has no kind filter, so a two-line NibBanner with 'Move Library…' sits at topLeading over the canvas of every open document for as long as the library is in the container. That is permanent for users who took onboarding's warned 'keep in app' opt-out. The status button is fixed at .topTrailing, but on iPhone New is at the bottom trailing edge, so the 'near New' requirement is not met in compact width.",
+      "fix": "Add `context.kind == nil &&` to the containerBanner isVisible, so it shows in the library and the panel only. Place the status button `.bottomTrailing` when `context.isCompact` (register two descriptors, or pick the placement from isCompact) so it sits beside the iPhone New droplet."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSyncUI/CloudStatusPanel.swift:306-341",
+      "problem": "'Duplicate and Verify' checks very little. It passes when query.get on the copy returns any non-empty object. A document with a downloadTimeout error (evicted iCloud pages still missing) is copied in its incomplete state and then reported as 'Copy created and readable'.",
+      "fix": "Disable the action while documentStatus is 'downloading'. Verify by comparing the copy against the original: page count from the catalog (or query.get on the original at depth 1), and item counts per page when the original is readable. Report a mismatch as 'The copy is missing N pages'. Add a success-path test and a mismatch test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSyncUI/CloudStatusPanel.swift:24, 175, 296-297, 413-414, 429-435, 480, 489-490",
+      "problem": "Copy and symbol problems. Counts are not pluralised: 'Downloading 1 files…', '1 records merged', '1 documents still need attention'. '0 documents queued' always shows for WebDAV (pending is a non-optional Int, and it counts files, not documents). 'WebDAV Settings' and 'Backup Settings' are not verb + object (Slop checklist). Documents outside the catalogue are titled with their raw id ('Document 01HX…'). 'Not available: Enable this feature in Settings.' appears even when FeatBackup or FeatWebDAV is not installed, so there is nothing to enable. 'Back Up Now' uses NibSymbol.share although NibSymbol.backup exists (NibDesign v2). 'Move Library…' always sends copy: false, so a library shared with other devices fails with an error and the panel offers no 'Copy Library…' alternative.",
+      "fix": "Use inflected strings (`String(localized: \"Downloading ^[\\(n) file](inflect: true)…\")`, or an xcstrings plural). Hide the pending row when it is 0 and label WebDAV pending as files. Rename the buttons to 'Open WebDAV Settings' and 'Open Backup Settings'. Use 'Untitled Document' instead of the raw id. Hide the WebDAV and Backup sections when their status command is not registered. Use `.backup`. When relocate fails with invalidParams on $.copy, show a 'Copy Library…' button that sends {copy: true}."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatSyncUITests/FeatSyncUITests.swift:21-31, 66-102",
+      "problem": "One acceptance criterion is only tested indirectly. 'The container banner shows when library.inContainer' is checked through model.inContainer and the overlay's registration, never through the overlay's visibility. Also untested: the read-only banner's isVisible with app.isReadOnly, the menu contextTitle, and attention rows for documents that appear only in events.",
+      "fix": "Assert that `h.app.ui.visibleChromeOverlays(ChromeContext(app: h.app, session: h.session)).map(\\.id)` contains \"syncui.containerBanner\" exactly when the NSNumber flag is true (and, after the placement fix, not when kind is .notebook). Assert that the read-only overlay is visible for a ReadOnlyPersistence document with kind .notebook. Assert `menu.resolvedTitle(for:)` for a document with a store error, and for a folder. Assert that an error event for a document missing from library.list produces one attention row."
+    }
+  ]
+}
