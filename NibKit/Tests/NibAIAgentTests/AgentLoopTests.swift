@@ -16,6 +16,7 @@ final class ScriptedProvider: AIProvider {
     private(set) var requests: [ChatRequest] = []
     /// Round index → seconds to wait before streaming (cancellation tests).
     var delays: [Int: Double] = [:]
+    var failures: [Int: NibError] = [:]
 
     init(vision: Bool = true, tools: Bool = true, _ rounds: [Round]) {
         config = AIProviderConfig(name: "Scripted", kind: .openAICompatible, baseURL: URL(string: "http://127.0.0.1:9/v1")!,
@@ -32,6 +33,7 @@ final class ScriptedProvider: AIProvider {
         requests.append(request)
         let events = rounds.isEmpty ? [.textDelta("(end of script)"), .stop(reason: "end_turn")] : rounds.removeFirst()(request)
         let delay = delays[index] ?? 0
+        let failure = failures[index]
         return AsyncThrowingStream { continuation in
             let task = Task {
                 if delay > 0 {
@@ -41,6 +43,10 @@ final class ScriptedProvider: AIProvider {
                         continuation.finish(throwing: CancellationError())
                         return
                     }
+                }
+                if let failure = failure {
+                    continuation.finish(throwing: failure)
+                    return
                 }
                 for e in events { continuation.yield(e) }
                 continuation.finish()
@@ -380,6 +386,24 @@ final class AgentLoopTests: XCTestCase {
         let next = second["rows"]?.arrayValue ?? []
         XCTAssertEqual(next.first?["i"]?.intValue, shown.count, "the next page starts where the first stopped")
         XCTAssertFalse(next.isEmpty)
+
+        // A 30 KB row in the middle needs text pages, followed by a cursor back into the list.
+        let pager = ResultPager()
+        let large: JSONValue = ["text": .string(String(repeating: "x", count: 30_000))]
+        var page = pager.fit(["rows": [["i": 0], large, ["i": 2]]])
+        XCTAssertEqual(page["rows"]?.arrayValue?.count, 1)
+        page = try pager.next(XCTUnwrap(page["cursor"]?.stringValue))
+        let resume = try XCTUnwrap(page["resumeCursor"]?.stringValue)
+        var parts = page["part"]?.stringValue ?? ""
+        while let cursor = page["cursor"]?.stringValue {
+            XCTAssertLessThanOrEqual(ResultPager.size(page), NibLimits.aiToolResultBytes)
+            page = try pager.next(cursor)
+            parts += page["part"]?.stringValue ?? ""
+        }
+        XCTAssertLessThanOrEqual(ResultPager.size(page), NibLimits.aiToolResultBytes)
+        XCTAssertEqual(try JSONValue.parse(parts), large)
+        let final = try pager.next(resume)
+        XCTAssertEqual(final["rows"]?[0]?["i"]?.intValue, 2)
     }
 
     /// nib_render: vision models get a PNG (long edge ≤ 1568 px, mapping adjusted); others get the page text.
@@ -455,6 +479,90 @@ final class AgentLoopTests: XCTestCase {
         XCTAssertEqual(response?.text, "")
         let stored = agent.chatStore.messages("CHATTEST0001")
         XCTAssertEqual(stored.last?.cancelled, true)
+    }
+
+    func testCancelDuringToolCallFinishesPromptlyAndCancelsWork() async throws {
+        let provider = P(events: [
+            [P.call("slow", "nib_run", ["command": "test.slow"]), .stop(reason: "tool_use")],
+            P.answer("Next turn")
+        ])
+        let (h, agent) = AgentFixture.make(provider)
+        var entered = false
+        var cancelled = false
+        let command = CommandDescriptor(id: "test.slow", title: "Slow", summary: "Wait before committing.",
+                                        params: .obj([:]), examples: [[:]], effect: .read, target: .app)
+        h.app.commands.register(command) { _, _ in
+            entered = true
+            do { try await Task.sleep(nanoseconds: 10_000_000_000) }
+            catch { cancelled = true; throw error }
+            return ["done": true]
+        }
+        let consumer = Task { @MainActor () -> AIResponse? in
+            var response: AIResponse?
+            for try await event in agent.stream(AgentFixture.request("Wait", mode: .ask)) {
+                if case .finished(let value) = event { response = value }
+            }
+            return response
+        }
+        for _ in 0..<100 where !entered { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(entered)
+        let stopped = Date()
+        agent.cancel(chatID: "CHATTEST0001")
+        let response = try await consumer.value
+        XCTAssertNotNil(response)
+        XCTAssertLessThan(Date().timeIntervalSince(stopped), 2)
+        XCTAssertEqual(agent.chatStore.messages("CHATTEST0001").last?.cancelled, true)
+        for _ in 0..<100 where !cancelled { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(cancelled)
+        let next = try await agent.complete(AgentFixture.request("Continue", mode: .ask))
+        XCTAssertEqual(next.text, "Next turn", "cancel releases the running-chat slot")
+    }
+
+    func testFailedTurnResentVisibleHistoryDoesNotDuplicateMessages() async throws {
+        let provider = P(events: [[], P.answer("Recovered")])
+        provider.failures[0] = NibError(.unavailable, "Scripted failure")
+        let (_, agent) = AgentFixture.make(provider)
+        do {
+            _ = try await agent.complete(AgentFixture.request("u1", mode: .ask))
+            XCTFail("expected provider failure")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        XCTAssertEqual(agent.messages(chatID: "CHATTEST0001").map(\.text), ["u1"])
+        var request = AgentFixture.request("u2", mode: .ask)
+        request.messages = [AIMessage(role: "user", text: "u1"), AIMessage(role: "user", text: "u2")]
+        _ = try await agent.complete(request)
+        XCTAssertEqual(agent.chatStore.messages("CHATTEST0001").filter { $0.role == "user" }.map(\.text), ["u1", "u2"])
+    }
+
+    func testTrimmedHistoryStartsWithUser() async throws {
+        let provider = P(events: [P.answer("a1"), P.answer("a2"), P.answer("a3")])
+        let (_, agent) = AgentFixture.make(provider)
+        agent.historyLimit = 4
+        for question in ["u1", "u2", "u3"] {
+            _ = try await agent.complete(AgentFixture.request(question, mode: .ask))
+        }
+        XCTAssertEqual(provider.requests[2].messages.map(\.role), [.user, .assistant, .user])
+    }
+
+    func testNestedAIAskChangesReachTheOuterTurn() async throws {
+        let provider = P(events: [
+            [P.call("nested", "nib_run", ["command": "ai.ask", "params": ["prompt": "Add a note", "mode": "edit"]]),
+             .stop(reason: "tool_use")],
+            [P.call("write", "nib_run", ["command": "test.addNote", "params": AgentFixture.note("Nested", id: "NESTEDNOTE01")]),
+             .stop(reason: "tool_use")],
+            P.answer("Inner done"), P.answer("Outer done")
+        ])
+        let (h, agent) = AgentFixture.make(provider)
+        var finished: [NibEvent] = []
+        let token = h.app.events.subscribe { event in
+            if event.type == NibEventType.aiTurnFinished { finished.append(event) }
+        }
+        defer { token.cancel() }
+        let response = try await agent.complete(AgentFixture.request("Delegate"))
+        XCTAssertEqual(response.changes.created, ["item:FIXTUREDOC01/FIXTUREPG002/NESTEDNOTE01"])
+        XCTAssertEqual(agent.chatStore.messages("CHATTEST0001").last?.changes, response.changes)
+        XCTAssertEqual(agent.chatStore.messages("CHATTEST0001").last?.group, response.group)
+        XCTAssertEqual(finished.last?.changes, response.changes)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
     }
 
     /// Confirmations follow `security.ai.confirmationPolicy` (set with gateway.setPolicy for the "ai" kind); a denied

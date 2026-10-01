@@ -208,6 +208,14 @@ final class ChatStore {
         return s
     }
 
+    func ownerDoc(_ chat: String) -> DocumentID? { state(chat)?.meta?.doc.map { DocumentID($0) } }
+
+    /// Bare chat ids carry no document ref for the gateway to inspect.
+    func checkAccess(_ chat: String, principal: Principal, gateway: Gateway) throws {
+        guard !principal.isUser, let doc = ownerDoc(chat), gateway.isLocked(doc) else { return }
+        throw NibError(.locked, "the conversation belongs to a locked document", hint: "ask the user to unlock it first")
+    }
+
     func messages(_ chat: String) -> [ChatRecord] { state(chat)?.messages ?? [] }
 
     /// True when the conversation was deleted (on any device).
@@ -337,11 +345,16 @@ final class ChatStore {
                 modified: (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0,
                 size: (attributes?[.size] as? NSNumber)?.intValue ?? 0)
             let isOwn = parsed.device == deviceHex
-            if !isOwn && !ChatStore.isDeviceHex(parsed.device) { conflicts[parsed.chat, default: []].append(name) }
-            guard signatures[name] != signature else { continue }
-            signatures[name] = signature
+            let isConflict = !isOwn && !ChatStore.isDeviceHex(parsed.device)
+            guard isConflict || signatures[name] != signature else { continue }
             guard let data = try? Data(contentsOf: url) else { continue }
             let (records, lines) = ChatStore.decodeLines(data)
+            // Retry unreadable/partially downloaded copies on the next scan; never delete undecoded records.
+            if isConflict {
+                guard records.count == lines else { continue }
+                conflicts[parsed.chat, default: []].append(name)
+            }
+            signatures[name] = signature
             var state = chats[parsed.chat] ?? ChatState()
             for r in records {
                 clock.observe(r.rev)
@@ -383,12 +396,9 @@ final class ChatStore {
     private func foldConflicts(_ chat: String, files: [String], in dir: URL) {
         guard let state = chats[chat] else { return }
         let records = state.isDeleted ? state.meta.map { [$0] } ?? [] : ChatStore.ordered(state)
-        rewriteOwnFile(chat, records: records)
         let urls = files.map { dir.appendingPathComponent($0) }
+        rewriteOwnFile(chat, records: records, removing: urls)
         for f in files { signatures[f] = nil }
-        io.async {
-            for u in urls { try? FileManager.default.removeItem(at: u) }
-        }
     }
 
     private func compactIfNeeded(_ chat: String) {
@@ -398,7 +408,7 @@ final class ChatStore {
         rewriteOwnFile(chat, records: state.isDeleted ? state.meta.map { [$0] } ?? [] : ChatStore.ordered(state))
     }
 
-    private func rewriteOwnFile(_ chat: String, records: [ChatRecord]) {
+    private func rewriteOwnFile(_ chat: String, records: [ChatRecord], removing conflicts: [URL] = []) {
         guard let dir = currentDirectory() else { return }
         let url = dir.appendingPathComponent(ownFileName(chat))
         let data = ChatStore.encodeLines(records)
@@ -412,6 +422,7 @@ final class ChatStore {
             do {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 try data.write(to: url, options: .atomic)
+                for conflict in conflicts { try FileManager.default.removeItem(at: conflict) }
             } catch {
                 agentLog.error("chat file not written: \(error.localizedDescription, privacy: .public)")
             }
@@ -477,9 +488,15 @@ final class ChatStore {
                 try data.write(to: url, options: .atomic)
                 return
             }
-            let handle = try FileHandle(forWritingTo: url)
+            let handle = try FileHandle(forUpdating: url)
             defer { try? handle.close() }
-            try handle.seekToEnd()
+            let end = try handle.seekToEnd()
+            if end > 0 {
+                try handle.seek(toOffset: end - 1)
+                let last = try handle.read(upToCount: 1)
+                try handle.seekToEnd()
+                if last?.first != 0x0A { try handle.write(contentsOf: Data([0x0A])) }
+            }
             try handle.write(contentsOf: data)
         } catch {
             agentLog.error("chat file not appended: \(error.localizedDescription, privacy: .public)")

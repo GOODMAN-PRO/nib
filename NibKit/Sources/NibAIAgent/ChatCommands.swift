@@ -141,13 +141,16 @@ struct AIAsk: NibCommand {
         }
         let session = ctx.activeSession
         let scope = try ChatCommands.scope(p.scope, refs: p.refs, session: session)
+        if ctx.dryRun {
+            return AIResponse(text: "", group: ctx.group)
+        }
         guard let ai = ctx.services.ai else {
             throw NibError(.unavailable, "no AI is set up", hint: "add a provider in Settings › AI")
         }
         let request = AIRequest(chatID: p.chat, messages: [AIMessage(role: "user", text: prompt)], mode: mode, scope: scope,
                                 principal: ctx.principal, group: ctx.group)
-        // A read-only caller keeps the turn read-only; so does a dry run, whose tool calls could not be rolled back.
-        let readOnly = ctx.readOnly || ctx.dryRun
+        // A read-only caller keeps the turn read-only. Dry runs return before contacting the provider.
+        let readOnly = ctx.readOnly
         guard let agent = ai as? AgentService else {
             // Another AIService implementation runs the turn itself.
             var r = request
@@ -254,7 +257,9 @@ struct AIChatRename: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         try ChatCommands.checkChatID(p.chat)
-        try ChatCommands.agent(ctx).chatStore.rename(p.chat, title: p.title)
+        let agent = try ChatCommands.agent(ctx)
+        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try agent.chatStore.rename(p.chat, title: p.title)
         return NoResult()
     }
 }
@@ -273,6 +278,7 @@ struct AIChatDelete: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         try ChatCommands.checkChatID(p.chat)
         let agent = try ChatCommands.agent(ctx)
+        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
         agent.cancel(chatID: p.chat)
         try agent.chatStore.delete(p.chat)
         return NoResult()
@@ -300,7 +306,9 @@ struct AIChatFeedback: NibCommand {
         guard ["up", "down", "none"].contains(p.rating) else {
             throw NibError(.invalidParams, "rating is 'up', 'down' or 'none'", path: "$.rating")
         }
-        try ChatCommands.agent(ctx).chatStore.rate(p.chat, message: p.message, rating: p.rating == "none" ? nil : p.rating)
+        let agent = try ChatCommands.agent(ctx)
+        try agent.chatStore.checkAccess(p.chat, principal: ctx.principal, gateway: ctx.bus.gateway)
+        try agent.chatStore.rate(p.chat, message: p.message, rating: p.rating == "none" ? nil : p.rating)
         return NoResult()
     }
 }

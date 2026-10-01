@@ -154,6 +154,11 @@ final class AgentService: AIService {
             return .failure(NibError(.invalidParams, "the request has no message", path: "$.messages"))
         }
         let chatID = request.chatID ?? NibID.make().raw
+        let basePrincipal = caller?.principal ?? request.principal
+        if request.chatID != nil {
+            do { try chatStore.checkAccess(chatID, principal: basePrincipal, gateway: app.gateway) }
+            catch { return .failure(NibError.wrap(error)) }
+        }
         if request.chatID != nil && chatStore.isDeleted(chatID) {
             return .failure(NibError(.notFound, "conversation '\(chatID)' was deleted", path: "$.chat",
                                      hint: "start a new conversation"))
@@ -169,7 +174,6 @@ final class AgentService: AIService {
             return .failure(NibError.wrap(error))
         }
 
-        let basePrincipal = caller?.principal ?? request.principal
         let persisted = AgentService.persists(request, principal: basePrincipal)
         let principal = AgentService.effectivePrincipal(basePrincipal, chat: chatID, persisted: persisted)
         let readOnly = request.mode == .ask || (caller?.readOnly ?? false)
@@ -179,7 +183,7 @@ final class AgentService: AIService {
         let config = provider.config
 
         // Conversation: stored history (when continuing) + the new messages.
-        let stored = persisted && request.chatID != nil ? chatStore.messages(chatID) : []
+        let stored = persisted && request.chatID != nil ? chatStore.visibleMessages(chatID) : []
         let fresh = AgentService.newMessages(incoming, after: stored)
         if persisted {
             let firstUser = stored.first(where: { $0.role == "user" })?.text
@@ -252,11 +256,13 @@ final class AgentService: AIService {
     /// The request's messages that are not already stored: callers may send only the new message or the whole
     /// conversation again.
     static func newMessages(_ incoming: [AIMessage], after stored: [ChatRecord]) -> [AIMessage] {
-        guard !stored.isEmpty, incoming.count > stored.count else { return incoming }
-        let prefix = zip(stored, incoming).allSatisfy { s, m in
+        let shown = stored.filter { !($0.role == "assistant" && ($0.text ?? "").isEmpty) }
+        guard !shown.isEmpty, incoming.count > shown.count else { return incoming }
+        let prefix = zip(shown, incoming).allSatisfy { s, m in
             (s.role ?? "user") == m.role && (s.text ?? "") == m.text
+                && (s.images ?? []) == (m.images ?? []).map(\.name)
         }
-        return prefix ? Array(incoming.dropFirst(stored.count)) : incoming
+        return prefix ? Array(incoming.dropFirst(shown.count)) : incoming
     }
 
     /// The most recent messages within the history budget (the newest message is always kept).
@@ -268,7 +274,9 @@ final class AgentService: AIService {
             out.append(m)
             characters += m.text.count
         }
-        return out.reversed()
+        var history = Array(out.reversed())
+        while history.count > 1 && history.first?.role != "user" { history.removeFirst() }
+        return history
     }
 
     /// A stored or new message for the provider: text plus its images (temporary assets, else the scope document's).

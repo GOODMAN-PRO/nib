@@ -145,7 +145,13 @@ final class AgentToolRunner {
         inv.depth = setup.depth
         inv.inheritedPolicy = setup.inheritedPolicy
         do {
-            let r = try await execute(inv)
+            var r = try await execute(inv)
+            // ai.ask executes its tools in separate contexts. Until CommandContext can merge an external
+            // ChangeSummary, recover the nested turn's summary from its response for agent accounting.
+            if inv.command == "ai.ask", let changes = r.value["changes"],
+               let nested = try? changes.decode(ChangeSummary.self) {
+                r.changes.merge(nested)
+            }
             return ToolOutcome(parts: [.text(format(r, tool: name, dryRun: inv.dryRun).jsonString())],
                                isError: AgentToolRunner.batchFailedEntirely(r, command: inv.command),
                                changes: inv.dryRun ? ChangeSummary() : r.changes, command: inv.command)
@@ -264,7 +270,7 @@ final class AgentToolRunner {
         var mapping = result.value
         guard let asset = result.value["asset"]?.stringValue, asset.hasPrefix("tmp:"),
               let url = bus.services.assets?.temporaryURL(AssetRef(String(asset.dropFirst(4)))) else {
-            return ToolOutcome(parts: [.text(mapping.jsonString())], isError: false, changes: ChangeSummary(), command: call.command)
+            return ToolOutcome(parts: [.text(pager.fit(mapping).jsonString())], isError: false, changes: ChangeSummary(), command: call.command)
         }
         let maxEdge = AgentToolRunner.maxImageEdge
         let fitted = await Task.detached(priority: .userInitiated) { () -> ImageFit.Result? in
@@ -281,7 +287,7 @@ final class AgentToolRunner {
             o["note"] = "page point = [region[0] + x / pxPerPt, region[1] + y / pxPerPt] for image pixel [x, y]"
             mapping = .object(o)
         }
-        return ToolOutcome(parts: [.text(mapping.jsonString()), .image(data: image.data, mime: "image/png")],
+        return ToolOutcome(parts: [.text(pager.fit(mapping).jsonString()), .image(data: image.data, mime: "image/png")],
                            isError: false, changes: ChangeSummary(), command: call.command)
     }
 
@@ -318,7 +324,7 @@ final class ResultPager {
     private enum Stored {
         /// `base` (the object around the list, nil when the result is a bare list), the list's key and its elements.
         case items(base: [String: JSONValue]?, key: String, items: [JSONValue])
-        case text(String)
+        case text(String, resume: String?)
     }
 
     let limit: Int
@@ -343,7 +349,7 @@ final class ResultPager {
             }
         }
         let text = value.jsonString()
-        remember(id, .text(text))
+        remember(id, .text(text, resume: nil))
         return textPage(id: id, text: text, from: 0)
     }
 
@@ -358,15 +364,15 @@ final class ResultPager {
         switch entry {
         case let .items(base, key, items):
             guard offset < items.count,
-                  let page = itemsPage(id: id, base: base, key: key, items: items, from: offset, oversizeFirst: true) else {
+                  let page = itemsPage(id: id, base: base, key: key, items: items, from: offset) else {
                 throw NibError(.invalidParams, "result cursor '\(cursor)' is out of range", path: "$.cursor")
             }
             return page
-        case .text(let text):
+        case .text(let text, let resume):
             guard offset < text.utf8.count else {
                 throw NibError(.invalidParams, "result cursor '\(cursor)' is out of range", path: "$.cursor")
             }
-            return textPage(id: id, text: text, from: offset)
+            return textPage(id: id, text: text, from: offset, resume: resume)
         }
     }
 
@@ -396,9 +402,8 @@ final class ResultPager {
         }
     }
 
-    /// Elements from `start` that fit; nil when not even one does, unless `oversizeFirst` (later pages always progress).
-    private func itemsPage(id: String, base: [String: JSONValue]?, key: String, items: [JSONValue], from start: Int,
-                           oversizeFirst: Bool = false) -> JSONValue? {
+    /// Elements from `start` that fit; an oversized element has its own text cursor and a list resume cursor.
+    private func itemsPage(id: String, base: [String: JSONValue]?, key: String, items: [JSONValue], from start: Int) -> JSONValue? {
         var frame = base ?? [:]
         frame[key] = []
         frame["truncated"] = true
@@ -414,8 +419,11 @@ final class ResultPager {
             end += 1
         }
         if end == start {
-            guard oversizeFirst else { return nil }
-            end = start + 1
+            let textID = NibID.make().raw
+            let text = items[start].jsonString()
+            let resume = start + 1 < items.count ? ResultPager.prefix + id + ":" + String(start + 1) : nil
+            remember(textID, .text(text, resume: resume))
+            return textPage(id: textID, text: text, from: 0, resume: resume)
         }
         var page = base ?? [:]
         page[key] = .array(Array(items[start..<end]))
@@ -428,7 +436,7 @@ final class ResultPager {
         return .object(page)
     }
 
-    private func textPage(id: String, text: String, from offset: Int) -> JSONValue {
+    private func textPage(id: String, text: String, from offset: Int, resume: String? = nil) -> JSONValue {
         let bytes = Array(text.utf8)
         var chunk = max(256, (limit - 400) * 2 / 3)
         while true {
@@ -439,6 +447,7 @@ final class ResultPager {
                 "offset": .number(Double(offset)), "total": .number(Double(bytes.count)),
                 "note": "the result is JSON text split into parts; join the parts in order"
             ]
+            if let resume = resume { page["resumeCursor"] = .string(resume) }
             if end < bytes.count {
                 page["truncated"] = true
                 page["cursor"] = .string(ResultPager.prefix + id + ":" + String(end))
@@ -455,39 +464,53 @@ final class ResultPager {
 
 // MARK: - Time limits
 
-/// Runs `body` with a time limit. On timeout the caller gets `timeout()` at once; the body keeps running to its end
-/// (commands cannot be interrupted safely) and its result is dropped.
+/// Runs `body` with a time limit. Timeout and caller cancellation cancel the work and release the caller at once.
+/// Commands must cooperate with cancellation before committing; an uncooperative late result is discarded.
 @MainActor
 enum Deadline {
-    private final class Race {
+    private final class Race<T> {
         var done = false
         var timer: Task<Void, Never>?
+        var work: Task<Void, Never>?
+        var continuation: CheckedContinuation<T, Error>?
+
+        func finish(_ result: Result<T, Error>, cancelWork: Bool = false) {
+            guard !done else { return }
+            done = true
+            timer?.cancel()
+            if cancelWork { work?.cancel() }
+            continuation?.resume(with: result)
+            continuation = nil
+            timer = nil
+            work = nil
+        }
     }
 
     static func run<T>(seconds: TimeInterval, timeout: @escaping @MainActor () -> NibError,
                        _ body: @escaping @MainActor () async throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
-            let race = Race()
-            let work = Task { @MainActor in
-                do {
-                    let value = try await body()
-                    guard !race.done else { return }
-                    race.done = true
-                    race.timer?.cancel()
-                    continuation.resume(returning: value)
-                } catch {
-                    guard !race.done else { return }
-                    race.done = true
-                    race.timer?.cancel()
-                    continuation.resume(throwing: error)
+        let race = Race<T>()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                race.continuation = continuation
+                race.work = Task { @MainActor in
+                    do {
+                        try Task.checkCancellation()
+                        let value = try await body()
+                        race.finish(.success(value))
+                    } catch {
+                        race.finish(.failure(error))
+                    }
+                }
+                race.timer = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                    guard !Task.isCancelled else { return }
+                    race.finish(.failure(timeout()), cancelWork: true)
                 }
             }
-            race.timer = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
-                guard !Task.isCancelled, !race.done else { return }
-                race.done = true
-                work.cancel()
-                continuation.resume(throwing: timeout())
+        } onCancel: {
+            Task { @MainActor in
+                race.finish(.failure(CancellationError()), cancelWork: true)
             }
         }
     }
