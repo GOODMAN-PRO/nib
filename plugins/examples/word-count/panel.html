@@ -29,6 +29,10 @@ nib.onMessage(m => {
   context.textContent = m.pageNumber ? "Page " + m.pageNumber : (m.page ? "Current page" : "Open a page to count its words.");
 });
 nib.postMessage({type: "refresh"});
+window.addEventListener("pagehide", () => nib.postMessage({type: "closed"}));
+document.addEventListener("visibilitychange", () => {
+  nib.postMessage({type: document.hidden ? "closed" : "refresh"});
+});
 </script>
 </body>
 </html>

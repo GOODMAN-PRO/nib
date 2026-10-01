@@ -62,7 +62,7 @@
         "manifest.json",
         "panel.html"
       ],
-      "sha256": "5c9c949e44928832ec6fc721fbabd7cfb265b60876a43d4b9bb12cc138771e26"
+      "sha256": "b61cce532b4b537f2487394a462fd4b1b69dadb35a0fb832bb46e011ca1345cb"
     },
     {
       "id": "dev.nib.wordcomplete",
@@ -83,7 +83,7 @@
         "main.js",
         "manifest.json"
       ],
-      "sha256": "3cc214df8d726ce563a92b70ccbc1258289164b1986b8132752a66773adbe0e7"
+      "sha256": "1c0300ea01020b061bf9fd52b7a82b961ddab807d94f07d523e9809c5dde1cff"
     },
     {
       "id": "dev.nib.planner",

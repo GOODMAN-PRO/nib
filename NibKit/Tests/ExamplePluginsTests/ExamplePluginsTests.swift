@@ -5,6 +5,13 @@ import NibTesting
 @testable import NibPluginRuntime
 @testable import FeatPluginInstall
 import FeatPluginPanels
+import FeatQuery
+import NibIndex
+import FeatTextBox
+import NibLibrary
+import FeatStudyEditor
+import FeatInkSynth
+import FeatDocChrome
 
 /// Files remain repository artifacts, rather than copies embedded in the test bundle, so a changed script or
 /// manifest is exercised exactly as the gallery ships it. The simulator shares the build machine's filesystem.
@@ -64,10 +71,11 @@ private final class ExampleFixtureCommands {
     var openedPanels: [String] = []
     var getCalls = 0
 
-    init(_ h: Harness) { self.h = h; register() }
+    init(_ h: Harness) { self.h = h; h.app.services.recognizer = recognizer; register() }
 
     private func command(_ id: String, effect: Effect, target: CommandTarget = .document,
                          _ handler: @escaping @MainActor (JSONValue, CommandContext) async throws -> JSONValue) {
+        guard h.app.commands.descriptor(id) == nil else { return }
         h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Harness fixture for \(id).",
                                                   params: .obj([:]), effect: effect, target: target,
                                                   owner: "example-fixtures"), handler: handler)
@@ -88,7 +96,8 @@ private final class ExampleFixtureCommands {
     private func register() {
         command("query.context", effect: .read) { [self] _, ctx in
             let session = ctx.activeSession
-            var out: [String: JSONValue] = ["selection": ["refs": .array((session?.selection.refs ?? []).map(JSONValue.string))]]
+            var out: [String: JSONValue] = ["selection": ["refs": .array((session?.selection.refs ?? []).map(JSONValue.string))],
+                                           "session": ["openPanels": .array((session?.openPanels.sorted() ?? []).map(JSONValue.string))]]
             if let d = session?.document {
                 out["document"] = ["ref": .string(NodeRef.document(d).description), "title": .string(h.library.node(d)?.title ?? "")]
                 if let p = session?.page {
@@ -102,11 +111,17 @@ private final class ExampleFixtureCommands {
             getCalls += 1
             guard let raw = params["ref"]?.stringValue, case let .item(d, p, i)? = NodeRef(raw) else { throw NibError.invalid("expected item ref") }
             let item = try ctx.workspace.item(d, page: p, id: i)
-            var out = try JSONValue.from(item).objectValue ?? [:]
-            out["ref"] = .string(raw)
+            // Mirror query.get's summary: points are opt-in and no hidden Item revision is returned.
+            var out: [String: JSONValue] = ["ref": .string(raw), "kind": .string(item.kind.rawValue),
+                                            "bbox": try JSONValue.from(item.bounds), "layer": .number(Double(item.layer))]
             if let stroke = item.stroke {
                 out["tool"] = .string(stroke.style.tool.rawValue)
                 out["color"] = try JSONValue.from(stroke.style.color)
+                out["width"] = .number(stroke.style.width)
+                out["pointCount"] = .number(Double(stroke.points.count))
+                if params["points"] == true {
+                    out["stroke"] = try JSONValue.from(stroke)
+                }
             }
             return .object(out)
         }
@@ -169,6 +184,7 @@ private final class ExampleFixtureCommands {
         command("panel.open", effect: .session, target: .app) { [self] params, ctx in
             let id = try XCTUnwrap(params["id"]?.stringValue)
             let panel = try XCTUnwrap(ctx.ui?.panels.get(id))
+            ctx.activeSession?.openPanels.insert(id)
             openedPanels.append(id)
             return ["id": .string(id), "placement": .string(panel.placement.rawValue)]
         }
@@ -197,7 +213,9 @@ private final class ExampleKit {
 
     init() throws {
         h = Harness(features: [NibPluginRuntimeFeature.self, NibPluginHostFeature.self, FeatPluginPanelsFeature.self,
-                               FeatPluginInstallFeature.self])
+                               FeatPluginInstallFeature.self, FeatQueryFeature.self, NibIndexFeature.self,
+                               FeatTextBoxFeature.self, NibLibraryFeature.self, FeatStudyEditorFeature.self,
+                               FeatInkSynthFeature.self, FeatDocChromeFeature.self])
         api = ExampleFixtureCommands(h)
         host = try XCTUnwrap(h.app.services.get(ServiceKeys.pluginHost, as: PluginHost.self))
         runtime = try XCTUnwrap(h.app.services.get(ServiceKeys.pluginRuntime, as: PluginRuntime.self))
@@ -243,6 +261,11 @@ final class ExamplePluginsTests: XCTestCase {
             let folder = ExampleFiles.root.appendingPathComponent(try XCTUnwrap(entry["base"]?.stringValue))
             let files = try PluginPackageHash.files(folder).map(\.path)
             XCTAssertEqual(entry["files"]?.arrayValue?.compactMap(\.stringValue), files)
+            let gallery = try PluginSource.from(url: nil, path: nil, files: entry["files"],
+                                                base: entry["base"]?.stringValue,
+                                                index: "https://example.com/plugins/index.json",
+                                                expectedHash: entry["sha256"]?.stringValue)
+            XCTAssertEqual(gallery, .gallery(base: try XCTUnwrap(URL(string: "https://example.com/plugins/examples/" + folder.lastPathComponent + "/", relativeTo: nil)), files: files))
             XCTAssertEqual(entry["sha256"]?.stringValue, try PluginPackageHash.compute(folder))
             XCTAssertEqual(try PluginFolderHash.compute(folder), try PluginPackageHash.compute(folder))
             let manifest = try JSONDecoder().decode(PluginManifest.self, from: Data(contentsOf: folder.appendingPathComponent("manifest.json")))
@@ -265,8 +288,13 @@ final class ExamplePluginsTests: XCTestCase {
         for entry in try ExampleFiles.index() {
             let folder = try XCTUnwrap(entry["base"]?.stringValue).split(separator: "/")[1]
             let manifest = try await kit.install(String(folder))
+            try assertContributions(manifest, kit: kit)
             switch String(folder) {
-            case "hello-world": _ = try await kit.h.run("dev.nib.hello.stamp", ["id": "EXAMPLEHELLO"])
+            case "hello-world":
+                let toolbarID = try XCTUnwrap(manifest.contributes?.toolbar?.first?.id)
+                let toolbar = try XCTUnwrap(kit.h.app.ui.toolbar.get(toolbarID))
+                _ = try await kit.h.run(try XCTUnwrap(toolbar.command), ["id": "EXAMPLEHELLO"])
+                XCTAssertEqual(kit.ui.toasts.count, 1)
             case "flashcards-from-selection":
                 kit.h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
                 kit.api.recognizer.script = [TextRecognition(text: "Velocity — Displacement over time", bbox: .zero, source: "ink")]
@@ -393,6 +421,72 @@ final class ExamplePluginsTests: XCTestCase {
         XCTAssertEqual(empty["words"], 0)
     }
 
+    func testWordCountSegmentsThaiDevanagariAndCJK() async throws {
+        let kit = try ExampleKit()
+        defer { kit.close() }
+        _ = try await kit.install("word-count")
+        for text in ["สวัสดี ครับ", "नमस्ते दुनिया", "你好世界"] {
+            kit.api.recognizer.script = [TextRecognition(text: text, bbox: .zero, source: "ink")]
+            let result = try await kit.h.run("dev.nib.wordcount.count")
+            XCTAssertEqual(result["words"], 4, text) // Two segmented words plus “Hello Nib”.
+        }
+    }
+
+    func testWordCountAvoidsRecognitionWhenClosedOrAnotherDocumentCommits() async throws {
+        let kit = try ExampleKit()
+        defer { kit.close() }
+        _ = try await kit.install("word-count")
+        kit.h.app.events.emit(NibEventType.committed, doc: Fixtures.docID)
+        kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, 0)
+        _ = try await kit.h.run("dev.nib.wordcount.show")
+        let before = kit.api.recognizer.strokeCalls
+        kit.h.app.events.emit(NibEventType.committed, doc: "OTHERDOC01")
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, before)
+        for _ in 0..<8 { kit.h.app.events.emit(NibEventType.committed, doc: Fixtures.docID) }
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, before)
+        let refreshed = await eventually { kit.api.recognizer.strokeCalls == before + 1 }
+        XCTAssertTrue(refreshed)
+        // The authoritative session state closes the panel even if its web message is lost.
+        kit.h.session.openPanels.remove("dev.nib.wordcount.panel")
+        kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, before + 1)
+        kit.host.handle("dev.nib.wordcount")?.postMessage(from: "dev.nib.wordcount.panel", message: ["type": "closed"])
+        kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, before + 1)
+    }
+
+    func testWordCompleteAcceptsThaiDevanagariAndCJK() async throws {
+        let kit = try ExampleKit()
+        defer { kit.close() }
+        _ = try await kit.install("word-complete")
+        for (partial, completion) in [("สว", "สวัสดี"), ("नम", "नमस्ते"), ("你", "你好")] {
+            kit.api.partialWord(partial)
+            kit.ai.responses = [.init(text: try JSONValue.from(["options": [completion]]).jsonString())]
+            let result = try await kit.h.run("dev.nib.wordcomplete.suggest")
+            XCTAssertEqual(result["completion"]?.stringValue, completion)
+        }
+        XCTAssertEqual(kit.api.inkCalls.count, 3)
+    }
+
+    func testWordCompleteBoundsSelectionBeforeQueryingOrSendingToAI() async throws {
+        let kit = try ExampleKit()
+        defer { kit.close() }
+        _ = try await kit.install("word-complete")
+        let refs = (0..<201).map { JSONValue.string("item:FIXTUREDOC01/FIXTUREPG001/INK\($0)") }
+        await assertError(.invalidParams) {
+            _ = try await kit.h.run("dev.nib.wordcomplete.suggest", ["selection": .array(refs)])
+        }
+        XCTAssertEqual(kit.api.getCalls, 0)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, 0)
+        XCTAssertTrue(kit.ai.requests.isEmpty)
+    }
+
     func testWordCompleteFiltersAISuggestionsAppendsSuffixAndUndoRedo() async throws {
         let kit = try ExampleKit()
         defer { kit.close() }
@@ -434,7 +528,12 @@ final class ExamplePluginsTests: XCTestCase {
         kit.ui.choice = 0
         kit.ui.onChoose = {
             var item = try kit.h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
-            item.stroke?.style.width = 5
+            // Keep bbox, point count and style identical; only an interior point changes.
+            let bounds = item.bounds
+            let count = item.stroke?.points.count
+            item.stroke?.points[1].force = 0.25
+            XCTAssertEqual(item.bounds, bounds)
+            XCTAssertEqual(item.stroke?.points.count, count)
             try await kit.h.insert([item])
         }
         kit.ai.responses = [.init(text: "{\"options\":[\"hello\"]}")]
@@ -497,6 +596,36 @@ final class ExamplePluginsTests: XCTestCase {
         let board = try XCTUnwrap(kit.h.app.content.boardTemplates.get("dev.nib.starter.retro"))
         XCTAssertEqual(board.spec["nodes"]?.arrayValue?.count, 3)
         XCTAssertEqual(board.spec["layout"], "flow")
+    }
+
+    private func assertContributions(_ manifest: PluginManifest, kit: ExampleKit) throws {
+        for command in manifest.contributes?.commands ?? [] {
+            XCTAssertEqual(kit.h.app.commands.descriptor(command.id)?.owner, manifest.id)
+        }
+        for toolbar in manifest.contributes?.toolbar ?? [] {
+            let registered = try XCTUnwrap(kit.h.app.ui.toolbar.get(toolbar.id))
+            XCTAssertEqual(registered.owner, manifest.id)
+            XCTAssertEqual(registered.command, toolbar.command)
+        }
+        for (index, menu) in (manifest.contributes?.menus ?? []).enumerated() {
+            let registered = try XCTUnwrap(kit.h.app.ui.menus.get("\(manifest.id).menu.\(index)"))
+            XCTAssertEqual(registered.owner, manifest.id)
+            XCTAssertEqual(registered.location.rawValue, menu.location)
+            XCTAssertEqual(registered.location, .objectMenu)
+            XCTAssertEqual(registered.command, menu.command)
+        }
+        for panel in manifest.contributes?.panels ?? [] {
+            XCTAssertEqual(kit.h.app.ui.panels.get(panel.id)?.owner, manifest.id)
+        }
+        for template in manifest.contributes?.templates ?? [] {
+            XCTAssertEqual(kit.h.app.content.templates.get(template.id)?.owner, manifest.id)
+        }
+        for elements in manifest.contributes?.elements ?? [] {
+            XCTAssertEqual(kit.h.app.content.elementCollections.get(elements.id)?.owner, manifest.id)
+        }
+        for board in manifest.contributes?.boardTemplates ?? [] {
+            XCTAssertEqual(kit.h.app.content.boardTemplates.get(board.id)?.owner, manifest.id)
+        }
     }
 
     private func assertError(_ code: NibError.Code, operation: () async throws -> Void,
