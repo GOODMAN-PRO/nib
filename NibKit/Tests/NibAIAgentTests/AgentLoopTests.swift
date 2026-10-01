@@ -447,7 +447,8 @@ final class AgentLoopTests: XCTestCase {
             [P.call(UUID().uuidString, "nib_run", ["command": "test.bigList", "params": ["count": 1]]), .stop(reason: "tool_use")]
         }
         let provider = P([loop, loop, loop])
-        let (_, agent) = AgentFixture.make(provider)
+        let (h, agent) = AgentFixture.make(provider)
+        h.app.settings.set(AgentSettings.maxSteps, 10)
         let r = try await agent.complete(AgentFixture.request("Loop forever", mode: .ask, maxSteps: 2))
         XCTAssertEqual(provider.requests.count, 3)
         XCTAssertTrue(r.text.hasSuffix("(Stopped after 2 tool steps.)"))
@@ -456,6 +457,89 @@ final class AgentLoopTests: XCTestCase {
             if case .text(let t) = part { return t.contains("limit of 2 tool steps") }
             return false
         })
+    }
+
+    /// The synced preference limits ordinary requests even when their request budget is still the default 40.
+    func testUserStepLimitStopsTheLoop() async throws {
+        let loop: P.Round = { _ in
+            [P.call(UUID().uuidString, "nib_run", ["command": "test.bigList", "params": ["count": 1]]),
+             .stop(reason: "tool_use")]
+        }
+        let provider = P([loop, loop, loop])
+        let (h, agent) = AgentFixture.make(provider)
+        let key = SettingKey("ai.maxSteps", default: 40, synced: true)
+        h.app.settings.set(key, 2)
+        var finished: [NibEvent] = []
+        let sub = h.app.events.subscribe { e in
+            if e.type == NibEventType.aiTurnFinished { finished.append(e) }
+        }
+        defer { sub.cancel() }
+
+        var toolRounds = 0
+        var response: AIResponse?
+        for try await event in agent.stream(AgentFixture.request("Loop forever", mode: .ask)) {
+            switch event {
+            case .toolFinished(_, let ok, _):
+                XCTAssertTrue(ok)
+                toolRounds += 1
+            case .finished(let r): response = r
+            default: break
+            }
+        }
+
+        XCTAssertEqual(toolRounds, 2)
+        XCTAssertEqual(provider.requests.count, 3, "the final provider round must not execute more tools")
+        XCTAssertTrue(try XCTUnwrap(response).text.hasSuffix("(Stopped after 2 tool steps.)"))
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertEqual(finished.first?.payload?["steps"]?.intValue, 2)
+        XCTAssertEqual(finished.first?.payload?["stepLimitReached"]?.boolValue, true)
+        XCTAssertTrue(h.app.settings.undeclaredNames.isEmpty)
+    }
+
+    /// Interactive ai.ask turns can use a preference above the AIRequest default of 40.
+    func testAIAskUsesHigherUserStepLimit() async throws {
+        let loop: P.Round = { _ in
+            [P.call(UUID().uuidString, "nib_run", ["command": "test.bigList", "params": ["count": 1]]),
+             .stop(reason: "tool_use")]
+        }
+        let provider = P(Array(repeating: loop, count: 41) + [{ _ in P.answer("Done.") }])
+        let (h, _) = AgentFixture.make(provider)
+        h.app.settings.set(AgentSettings.maxSteps, 80)
+        var finished: [NibEvent] = []
+        let sub = h.app.events.subscribe { e in
+            if e.type == NibEventType.aiTurnFinished { finished.append(e) }
+        }
+        defer { sub.cancel() }
+
+        let r = try await h.app.bus.execute(Invocation(command: "ai.ask",
+            params: ["prompt": "Read until done", "scope": .string(AgentFixture.page2Ref)],
+            principal: .user, session: h.session))
+
+        XCTAssertEqual(r.value["text"]?.stringValue, "Done.")
+        XCTAssertEqual(provider.requests.count, 42)
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertEqual(finished.first?.payload?["steps"]?.intValue, 41)
+        XCTAssertNil(finished.first?.payload?["stepLimitReached"])
+    }
+
+    /// The command passes the clamped preference through the AIService contract, including alternative services.
+    func testAIAskPassesClampedUserStepLimitToFakeAIService() async throws {
+        let h = Harness(features: [NibAIAgentFeature.self])
+        let ai = FakeAIService(bus: h.app.bus)
+        h.app.services.ai = ai
+        let key = SettingKey("ai.maxSteps", default: 40, synced: true)
+        let descriptor = try XCTUnwrap(h.app.settings.descriptor(key.name))
+        XCTAssertTrue(descriptor.synced)
+        XCTAssertEqual(descriptor.defaultValue.intValue, 40)
+        for (setting, expected) in [(2, 2), (80, 80), (0, 1), (150, 100)] {
+            h.app.settings.set(key, setting)
+            ai.responses = [.init(text: "Done.", toolCalls: [(command: "commands.list", params: [:])])]
+            let r = try await h.app.bus.execute(Invocation(command: "ai.ask", params: ["prompt": "List commands"],
+                                                         principal: .user, session: h.session))
+            XCTAssertEqual(r.value["text"]?.stringValue, "Done.")
+            XCTAssertEqual(ai.requests.last?.maxSteps, expected)
+        }
+        XCTAssertTrue(h.app.settings.undeclaredNames.isEmpty)
     }
 
     /// Cancelling a chat stops the turn; the stream still finishes with what was done so far.

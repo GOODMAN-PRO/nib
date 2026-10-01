@@ -1739,10 +1739,11 @@
       "name": "Note replay",
       "module": "FeatReplay",
       "layer": "ui",
-      "description": "While a clip plays, sets `session.replay` (time from the player, mode) at 30 Hz so the canvas re-renders changed strokes (the renderer implements the modes). Stroke↔audio linkage = stroke `t0` inside [clip.start, clip.start+duration] on pages of the same document. Tapping handwriting in replay mode seeks to t0 − start − 1 s (a `TapHandlerDescriptor`, order 50, handled only while a replay is active); optional follow-along page switching and full-screen replay. Acceptance: linkage unit tests (clips, pages, copies with new t0 don't link). Playback time comes from `NibEventType.audioPlayback` events decoded as `AudioPlaybackPayload` (clip, t, playing, rate, at; contracts-v2 G3), and `audio.setPlayback` with no params returns the live status. Commands owned: replay.setMode {mode} (session); replay.seekToItem {ref} (session); replay.tapAt {page, point, ref?, gesture?} (session). Module FeatReplay, entry type FeatReplayFeature (id \"replay\"); import only NibContracts, NibDesign, Apple frameworks and the allowed packages; follow ARCHITECTURE.md §15.",
+      "description": "While a clip plays, sets `session.replay` (time from the player, mode) at 30 Hz so the canvas re-renders changed strokes (the renderer implements the modes). Stroke↔audio linkage = stroke `t0` inside [clip.start, clip.start+duration] on pages of the same document. Tapping handwriting in replay mode seeks to t0 − start − 1 s (a `TapHandlerDescriptor`, order 50, handled only while a replay is active); optional follow-along page switching and full-screen replay. Acceptance: linkage unit tests (clips, pages, copies with new t0 don't link). All replay linkage reads use F003 query.get/query.find through the caller's query closure, preserving gateway permissions and lock checks; a missing query feature surfaces unavailable, with no workspace fallback. Playback time comes from `NibEventType.audioPlayback` events decoded as `AudioPlaybackPayload` (clip, t, playing, rate, at; contracts-v2 G3), and `audio.setPlayback` with no params returns the live status. Commands owned: replay.setMode {mode} (session); replay.seekToItem {ref} (session); replay.tapAt {page, point, ref?, gesture?} (session). Module FeatReplay, entry type FeatReplayFeature (id \"replay\"); import only NibContracts, NibDesign, Apple frameworks and the allowed packages; follow ARCHITECTURE.md §15.",
       "complexity": "medium",
       "priority": 2,
       "dependsOn": [
+        "F003",
         "F052"
       ],
       "files": [
@@ -1780,7 +1781,8 @@
       ],
       "tests": [
         "NibKit/Tests/FeatTranscriptionTests/FeatTranscriptionTests.swift",
-        "NibKit/Tests/FeatTranscriptionTests/TranscriptStoreTests.swift"
+        "NibKit/Tests/FeatTranscriptionTests/TranscriptStoreTests.swift",
+        "NibKit/Tests/FeatTranscriptionTests/TranscriptPanelTests.swift"
       ],
       "inventory": [
         "S-049",
@@ -1995,6 +1997,7 @@
       "complexity": "hard",
       "priority": 2,
       "dependsOn": [
+        "F004",
         "F084"
       ],
       "files": [

@@ -80,7 +80,7 @@ struct LibrarySetView: NibCommand {
         let folder = try p.folder.map { try LibraryModels.folder($0) }
         if let id = folder ?? nil, ctx.services.library?.node(id)?.kind != .folder { throw NibError.notFound("Library folder") }
         let descriptor = p.panel.flatMap { app.ui.panels.get($0) }
-        if let panel = p.panel, panel != "documents", !(p.close == true && session.openPanels.contains(panel)) {
+        if let panel = p.panel, panel != "documents", p.close != true {
             guard let descriptor else { throw NibError.notFound("Panel \(panel)") }
             guard descriptor.placement != .sidebarTab else { throw NibError.invalid("This panel requires an open document", path: "$.panel") }
         }
@@ -95,8 +95,12 @@ struct LibrarySetView: NibCommand {
         let targetFilter = p.filter ?? (p.folder == nil ? existing?.filter : nil) ?? LibraryFilter(rawValue: saved?["filter"]?.stringValue ?? "") ?? .all
         let result: JSONValue
         if let panel = p.panel, panel != "documents" {
-            result = p.close == true ? ["panel": .string(panel), "closed": true] :
-                ["panel": .string(panel), "placement": .string(descriptor?.placement == .floating ? "sheet" : descriptor!.placement.rawValue)]
+            if p.close == true {
+                let wasOpen = session.openPanels.contains(panel) || existing?.tab?.id == panel || existing?.modal?.id == panel
+                result = ["panel": .string(panel), "closed": .bool(wasOpen)]
+            } else {
+                result = ["panel": .string(panel), "placement": .string(descriptor?.placement == .floating ? "sheet" : descriptor!.placement.rawValue)]
+            }
         } else {
             result = ["folder": .string(targetFolder.map { NodeRef.folder($0).description } ?? "lib"),
                       "layout": .string(targetLayout.rawValue), "sort": .string(targetSort.rawValue), "filter": .string(targetFilter.rawValue)]

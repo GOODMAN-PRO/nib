@@ -8,6 +8,8 @@ enum AgentSettings {
     /// AI.md §4: the commands offered as their own tools besides the meta-tools (shared with the bridge, which reads
     /// the name untyped). Synced: the choice follows the library.
     static let directTools = SettingKey(NibSettings.aiDirectToolsName, default: NibSettings.defaultAIDirectTools, synced: true)
+    /// Shared with F086's AI settings page; the preference follows the library.
+    static let maxSteps = SettingKey("ai.maxSteps", default: 40, synced: true)
 }
 
 // MARK: - Catalogue

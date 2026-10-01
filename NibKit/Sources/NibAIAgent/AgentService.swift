@@ -198,11 +198,12 @@ final class AgentService: AIService {
                                          pluginHost: app.services.get(ServiceKeys.pluginHost, as: PluginHosting.self),
                                          exposure: principal.exposure, readOnly: readOnly, requested: request.tools,
                                          supportsTools: config.supportsTools)
+        let userMax = min(max(app.settings.get(AgentSettings.maxSteps), 1), 100)
         let loop = AgentLoop(
             bus: app.bus, pluginHost: app.services.get(ServiceKeys.pluginHost, as: PluginHosting.self),
             setup: AgentLoop.Setup(provider: provider, config: config, history: history, mode: request.mode,
                                    readOnly: readOnly, scope: request.scope, system: request.system,
-                                   jsonOutput: request.jsonOutput, maxSteps: min(max(request.maxSteps, 1), 100),
+                                   jsonOutput: request.jsonOutput, maxSteps: min(max(request.maxSteps, 1), userMax),
                                    principal: principal, group: group, session: session,
                                    depth: caller?.depth ?? 0, inheritedPolicy: caller?.inheritedPolicy,
                                    toolbox: toolbox, toolTimeout: toolTimeout, contextTimeout: contextTimeout))

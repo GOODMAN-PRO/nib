@@ -9,6 +9,18 @@ final class FeatMathTests: XCTestCase {
     private let ink = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"
     private let math = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"
 
+    @discardableResult
+    private func registerRenderPage(_ h: Harness) throws -> MathRenderPageDouble {
+        let render = MathRenderPageDouble(asset: try h.assets.putTemporary(Fixtures.pngData, ext: "png"))
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.renderPage, title: "Render Page", summary: "Test selection render",
+            params: .obj(["page": .ref, "region": .rect, "background": .bool(), "layers": .arr(.int(min: 0, max: 4))], required: ["page"]),
+            effect: .read)) { params, _ in
+            render.requests.append(params)
+            return ["asset": .string("tmp:" + render.asset.name), "pxPerPt": 1, "region": params["region"] ?? .null]
+        }
+        return render
+    }
+
     func testExplicitConversionPreservesSourceAndUndoRedo() async throws {
         let h = Harness(features: [FeatMathFeature.self])
         let before = try h.snapshot()
@@ -45,8 +57,8 @@ final class FeatMathTests: XCTestCase {
     func testVisionProviderGetsSelectionImageAndNoTools() async throws {
         let h = Harness(features: [FeatMathFeature.self])
         let ai = FakeAIService(responses: [.init(text: #"{"lines":["\\frac{a}{b}","x^{2}"]}"#)])
-        let renderer = FakeRenderer()
-        h.app.services.ai = ai; h.app.services.renderer = renderer
+        let render = try registerRenderPage(h)
+        h.app.services.ai = ai
         let before = try h.snapshot()
         let result = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink)]])
         XCTAssertEqual(result["source"]?.stringValue, "ai")
@@ -57,9 +69,13 @@ final class FeatMathTests: XCTestCase {
         XCTAssertEqual(ai.requests.first?.scope?.refs, [ink])
         XCTAssertEqual(ai.requests.first?.messages.first?.images?.count, 1)
         XCTAssertTrue(ai.requests.first?.jsonOutput == true)
-        XCTAssertEqual(renderer.requests.count, 1)
+        XCTAssertEqual(ai.requests.first?.messages.first?.images?.first, render.asset)
+        XCTAssertEqual(render.requests.count, 1)
         let bounds = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID).bounds
-        XCTAssertEqual(renderer.requests.first?.region, bounds)
+        XCTAssertEqual(render.requests.first?["page"], .string(NodeRef.page(Fixtures.docID, Fixtures.page1).description))
+        XCTAssertEqual(render.requests.first?["region"], try JSONValue.from([bounds.x, bounds.y, bounds.width, bounds.height]))
+        XCTAssertEqual(render.requests.first?["background"], true)
+        XCTAssertEqual(render.requests.first?["layers"], [0])
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
@@ -68,7 +84,8 @@ final class FeatMathTests: XCTestCase {
         let h = Harness(features: [FeatMathFeature.self])
         let ai = FakeAIService(responses: [.init(text: "not JSON")])
         let recognizer = FakeRecognizer([TextRecognition(text: "x² + 1/2", bbox: .zero, source: "ink")])
-        h.app.services.ai = ai; h.app.services.renderer = FakeRenderer(); h.app.services.recognizer = recognizer
+        try registerRenderPage(h)
+        h.app.services.ai = ai; h.app.services.recognizer = recognizer
         let result = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink)]])
         XCTAssertEqual(result["source"]?.stringValue, "offline")
         XCTAssertEqual(result["lines"]?.arrayValue?.first?.stringValue, "x^{2} + \\frac{1}{2}")
@@ -78,13 +95,69 @@ final class FeatMathTests: XCTestCase {
 
     func testConversionWithoutLatexUsesRecognizerAndIsUndoable() async throws {
         let h = Harness(features: [FeatMathFeature.self])
-        h.app.services.renderer = FakeRenderer()
+        try registerRenderPage(h)
         h.app.services.ai = FakeAIService(responses: [.init(text: #"{"lines":["x+1=2"]}"#)])
         let before = try h.snapshot()
         try await h.run(CommandIDs.mathConvert, ["refs": [.string(ink)], "id": "RECOGMATH01"])
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
         h.app.bus.undo(Fixtures.docID)
         XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testMissingRenderCommandIsUnavailableEvenWithRendererService() async throws {
+        let h = Harness(features: [FeatMathFeature.self])
+        let renderer = FakeRenderer()
+        let ai = FakeAIService(responses: [.init(text: #"{"lines":["x"]}"#)])
+        let recognizer = FakeRecognizer([TextRecognition(text: "x", bbox: .zero, source: "ink")])
+        h.app.services.renderer = renderer
+        h.app.services.ai = ai
+        h.app.services.recognizer = recognizer
+        let before = try h.snapshot()
+        for command in [CommandIDs.mathRecognize, CommandIDs.mathConvert] {
+            do {
+                try await h.run(command, ["refs": [.string(ink)]])
+                XCTFail("Recognition succeeded without render.page")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .unavailable)
+                XCTAssertTrue(error.message.contains(CommandIDs.renderPage))
+            }
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+        XCTAssertTrue(renderer.requests.isEmpty)
+        XCTAssertTrue(ai.requests.isEmpty)
+        XCTAssertEqual(recognizer.imageCalls, 0)
+    }
+
+    func testRenderCommandErrorsPropagateWithoutRecognitionOrMutation() async throws {
+        for code: NibError.Code in [.permissionDenied, .locked] {
+            let h = Harness(features: [FeatMathFeature.self])
+            let renderer = FakeRenderer()
+            let ai = FakeAIService(responses: [.init(text: #"{"lines":["x"]}"#)])
+            let recognizer = FakeRecognizer([TextRecognition(text: "x", bbox: .zero, source: "ink")])
+            h.app.services.renderer = renderer
+            h.app.services.ai = ai
+            h.app.services.recognizer = recognizer
+            let expected = NibError(code, "Selection rendering denied")
+            var renderCalls = 0
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.renderPage, title: "Render Page", summary: "Reject the test render", effect: .read)) { _, _ in
+                renderCalls += 1
+                throw expected
+            }
+            let before = try h.snapshot()
+            for command in [CommandIDs.mathRecognize, CommandIDs.mathConvert] {
+                do {
+                    try await h.run(command, ["refs": [.string(ink)]])
+                    XCTFail("Recognition ignored a render.page error")
+                } catch let error as NibError { XCTAssertEqual(error, expected) }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+            }
+            XCTAssertEqual(renderCalls, 2)
+            XCTAssertTrue(renderer.requests.isEmpty)
+            XCTAssertTrue(ai.requests.isEmpty)
+            XCTAssertEqual(recognizer.imageCalls, 0)
+        }
     }
 
     func testInvalidLatexAndDuplicateIDsLeaveDocumentUntouched() async throws {
@@ -256,21 +329,12 @@ final class FeatMathTests: XCTestCase {
         second.id = NibID("SECONDINK01"); second.layer = 1
         try await h.insert([second])
         let secondRef = NodeRef.item(Fixtures.docID, Fixtures.page1, second.id).description
-        let renderer = FakeRenderer()
-        h.app.services.renderer = renderer
+        let render = try registerRenderPage(h)
         h.app.services.ai = FakeAIService(responses: [.init(text: #"{"lines":["x"]}"#)])
         let before = try h.snapshot()
         _ = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink), .string(secondRef)]])
-        XCTAssertEqual(renderer.requests.first?.layers, [0, 1])
-        var renderedLayers: JSONValue?
-        let asset = try h.assets.putTemporary(Fixtures.pngData, ext: "png")
-        h.app.commands.register(CommandDescriptor(id: CommandIDs.renderPage, title: "Render Selection", summary: "Test renderer", effect: .read)) { params, _ in
-            renderedLayers = params["layers"]
-            return ["asset": .string("tmp:" + asset.name)]
-        }
-        h.app.services.ai = FakeAIService(responses: [.init(text: #"{"lines":["x"]}"#)])
-        _ = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink), .string(secondRef)]])
-        XCTAssertEqual(renderedLayers, [0, 1])
+        XCTAssertEqual(render.requests.count, 1)
+        XCTAssertEqual(render.requests.first?["layers"], [0, 1])
         for refs: [String] in [[ink, secondRef], [ink, "item:FIXTUREDOC01/OTHERPAGE001/SECONDINK01"]] {
             do { try await h.run(CommandIDs.mathConvert, ["refs": .array(refs.map(JSONValue.string)), "latex": ["x"]]); XCTFail("Invalid selection converted") }
             catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
@@ -284,7 +348,7 @@ final class FeatMathTests: XCTestCase {
 
     func testRecognisedRevisionsProtectSheetConversion() async throws {
         let h = Harness(features: [FeatMathFeature.self])
-        h.app.services.renderer = FakeRenderer()
+        try registerRenderPage(h)
         h.app.services.ai = FakeAIService(responses: [.init(text: #"{"lines":["x"]}"#)])
         let recognition = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink)]])
         var item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
@@ -300,7 +364,7 @@ final class FeatMathTests: XCTestCase {
 
     func testInkChangedDuringDelayedRecognitionConflicts() async throws {
         let h = Harness(features: [FeatMathFeature.self])
-        h.app.services.renderer = FakeRenderer()
+        try registerRenderPage(h)
         let started = expectation(description: "Provider suspended")
         let ai = DelayedMathAI(fake: FakeAIService(responses: [.init(text: #"{"lines":["x"]}"#)])) { started.fulfill() }
         h.app.services.ai = ai
@@ -356,6 +420,13 @@ final class FeatMathTests: XCTestCase {
         XCTAssertEqual(h.app.commands.descriptor(CommandIDs.mathCopy)?.effect, .read)
         XCTAssertEqual(h.app.commands.descriptor(CommandIDs.mathConvert)?.owner, "math")
     }
+}
+
+@MainActor
+private final class MathRenderPageDouble {
+    let asset: AssetRef
+    var requests: [JSONValue] = []
+    init(asset: AssetRef) { self.asset = asset }
 }
 
 /// A deterministic suspension around the shared FakeAIService, so the test can edit ink mid-request.

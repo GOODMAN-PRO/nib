@@ -147,8 +147,9 @@ struct AIAsk: NibCommand {
         guard let ai = ctx.services.ai else {
             throw NibError(.unavailable, "no AI is set up", hint: "add a provider in Settings › AI")
         }
+        let userMax = min(max(ctx.services.settings.get(AgentSettings.maxSteps), 1), 100)
         let request = AIRequest(chatID: p.chat, messages: [AIMessage(role: "user", text: prompt)], mode: mode, scope: scope,
-                                principal: ctx.principal, group: ctx.group)
+                                principal: ctx.principal, group: ctx.group, maxSteps: userMax)
         // A read-only caller keeps the turn read-only. Dry runs return before contacting the provider.
         let readOnly = ctx.readOnly
         guard let agent = ai as? AgentService else {

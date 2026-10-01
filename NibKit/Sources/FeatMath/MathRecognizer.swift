@@ -57,36 +57,17 @@ enum MathRecognizer {
         let region = selection.bounds
         let pageRef = NodeRef.page(selection.doc, selection.page).description
         let layers = Set(selection.items.map(\.layer))
-        let image: CGImage
-        let asset: AssetRef
-        if ctx.bus.registry.entry(CommandIDs.renderPage) != nil {
-            let result = try await ctx.execute(CommandIDs.renderPage,
-                                               ["page": .string(pageRef), "region": try JSONValue.from([region.x, region.y, region.width, region.height]), "background": true, "layers": try JSONValue.from(layers.sorted())])
-            guard let name = result["asset"]?.stringValue else { throw NibError(.internalError, "render.page returned no image") }
-            let url = try await ctx.inputFile(name)
-            image = try await Task.detached(priority: .userInitiated) {
-                guard let loaded = UIImage(contentsOfFile: url.path)?.cgImage else { throw NibError(.internalError, "The selection image could not be read") }
-                return loaded
-            }.value
-            asset = AssetRef(name.hasPrefix("tmp:") ? String(name.dropFirst(4)) : name)
-        } else {
-            // F004's command may not be installed in a feature-only host. Use its contract service.
-            guard let renderer = ctx.services.renderer, let assets = ctx.services.assets else {
-                throw NibError.unavailable("Math recognition needs the page renderer")
-            }
-            let scale = min(2, 1568 / max(1, max(region.width, region.height)))
-            let result = try await renderer.render(RenderRequest(doc: selection.doc, page: selection.page, region: region,
-                                                                 scale: scale, layers: layers))
-            image = result.image
-            let data = try await Task.detached(priority: .userInitiated) {
-                guard let data = UIImage(cgImage: image).pngData() else { throw NibError(.internalError, "The selection image could not be encoded") }
-                return data
-            }.value
-            asset = try assets.putTemporary(data, ext: "png")
-        }
+        let result = try await ctx.execute(CommandIDs.renderPage,
+                                          ["page": .string(pageRef), "region": try JSONValue.from([region.x, region.y, region.width, region.height]), "background": true, "layers": try JSONValue.from(layers.sorted())])
+        guard let name = result["asset"]?.stringValue else { throw NibError(.internalError, "render.page returned no image") }
+        let url = try await ctx.inputFile(name)
+        let image = try await Task.detached(priority: .userInitiated) {
+            guard let loaded = UIImage(contentsOfFile: url.path)?.cgImage else { throw NibError(.internalError, "The selection image could not be read") }
+            return loaded
+        }.value
+        let asset = AssetRef(name.hasPrefix("tmp:") ? String(name.dropFirst(4)) : name)
         try Task.checkCancellation()
         var warning: String?
-    var revs: [Rev]? = nil
         if let ai = ctx.services.ai, ai.isConfigured, ai.supportsVision {
             do {
                 let request = AIRequest(system: "Transcribe only the selected handwritten mathematics. Return JSON {\"lines\":[\"LaTeX\"]}, one entry per line. Do not solve, explain or call tools.",

@@ -7,6 +7,143 @@ import NibDesign
 import NibTesting
 @testable import FeatReplay
 
+/// F003-shaped reads for replay's isolated tests, registered so every read goes through the bus.
+/// Small document batches exercise the shared pages/outline/audio cursor without importing FeatQuery.
+@MainActor
+enum ReplayQueryTestFeature: NibFeature {
+    static let id = "replay-query-tests"
+
+    static func register(_ app: NibApp) {
+        app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Get", summary: "F003 query fixture",
+            params: .obj(["ref": .ref, "depth": .int(), "fields": .arr(.str()), "cursor": .str()], required: ["ref"]),
+            effect: .read)) { params, ctx in
+            guard let raw = params["ref"]?.stringValue, let ref = NodeRef(raw), let doc = ref.documentID else {
+                throw NibError.invalid("Expected a document node ref", path: "$.ref")
+            }
+            if !ctx.principal.isUser, ctx.services.lock?.isLocked(doc) == true {
+                return ["ref": .string(raw), "locked": true]
+            }
+            let content = try ctx.workspace.content(doc)
+            let depth = params["depth"]?.intValue ?? 1
+            let fields = params["fields"]?.arrayValue?.compactMap(\.stringValue)
+            switch ref {
+            case .document:
+                var result: JSONValue = ["ref": .string(raw), "kind": "document",
+                    "documentKind": .string(content.meta.kind.rawValue), "meta": try JSONValue.from(content.meta),
+                    "locked": .bool(ctx.services.lock?.isLocked(doc) ?? false)]
+                if depth > 0 {
+                    let pages = try content.livePages.enumerated().map { index, page in
+                        try project(["ref": .string(NodeRef.page(doc, page.id).description), "kind": "page",
+                                     "index": .number(Double(index))], record: JSONValue.from(page), depth: depth, fields: fields)
+                    }
+                    let outline = try content.liveOutline.map { entry in
+                        try project(["ref": .string(NodeRef.outline(doc, entry.id).description), "kind": "outline",
+                                     "title": .string(entry.title)], record: JSONValue.from(entry), depth: depth, fields: fields)
+                    }
+                    let audio = try content.liveAudio.map { clip in
+                        try project(["ref": .string(NodeRef.audio(doc, clip.id).description), "kind": "audio",
+                                     "name": .string(clip.name), "start": rounded(clip.start), "duration": rounded(clip.duration)],
+                                    record: JSONValue.from(clip), depth: depth, fields: fields)
+                    }
+                    result = try paged(result, sections: [("pages", pages), ("outline", outline), ("audio", audio)],
+                                       params: params, limit: 2)
+                }
+                return result
+            case let .audio(_, id):
+                guard let clip = content.liveAudio.first(where: { $0.id == id }) else { throw NibError.notFound(raw) }
+                return try JSONValue.from(clip).merging(["ref": .string(raw)])
+            case let .page(_, page):
+                guard let record = content.page(page) else { throw NibError.notFound(raw) }
+                var result: JSONValue = ["ref": .string(raw), "kind": "page"]
+                if record.deleted { result = result.merging(["trashed": true]) }
+                if depth > 0 {
+                    let items = try ctx.workspace.items(doc, page: page).map {
+                        try itemRow($0, doc: doc, page: page, depth: depth, fields: fields)
+                    }
+                    result = try paged(result, sections: [("items", items)], params: params, limit: 200)
+                }
+                return result
+            case let .item(_, page, id):
+                return try itemRow(ctx.workspace.item(doc, page: page, id: id), doc: doc, page: page, depth: 2, fields: fields)
+            default:
+                throw NibError.unsupported("Replay query fixture for \(raw)")
+            }
+        }
+        app.commands.register(CommandDescriptor(id: CommandIDs.queryFind, title: "Find", summary: "F003 spatial query fixture",
+            params: .obj(["in": .ref, "kinds": .arr(.str()), "bbox": .rect, "limit": .int(), "cursor": .str()], required: ["in"]),
+            effect: .read)) { params, ctx in
+            guard let raw = params["in"]?.stringValue, case let .page(doc, page)? = NodeRef(raw) else {
+                throw NibError.invalid("Expected a page ref", path: "$.in")
+            }
+            if !ctx.principal.isUser, ctx.services.lock?.isLocked(doc) == true {
+                return ["in": .string(raw), "locked": true, "items": []]
+            }
+            let kinds = params["kinds"]?.arrayValue?.compactMap(\.stringValue)
+            let values = params["bbox"]?.arrayValue?.compactMap(\.doubleValue) ?? []
+            let area = values.count == 4 ? Rect(x: values[0], y: values[1], width: values[2], height: values[3]) : nil
+            let items = try ctx.workspace.items(doc, page: page).filter { item in
+                let matchesKind = kinds.map { $0.contains(item.kind.rawValue) || $0.contains(item.stroke?.style.tool.rawValue ?? "") } ?? true
+                return matchesKind && (area.map { item.bounds.intersects($0) } ?? true)
+            }.map { summary($0, doc: doc, page: page) }
+            return try paged(["in": .string(raw), "count": .number(Double(items.count))], sections: [("items", items)],
+                             params: params, limit: params["limit"]?.intValue ?? 100)
+        }
+    }
+
+    private static func rounded(_ value: Double) -> JSONValue { .number((value * 100).rounded() / 100) }
+
+    private static func summary(_ item: Item, doc: DocumentID, page: PageID) -> JSONValue {
+        let bounds = item.bounds
+        var result: JSONValue = ["ref": .string(NodeRef.item(doc, page, item.id).description),
+            "kind": .string(item.kind.rawValue), "layer": .number(Double(item.layer)),
+            "bbox": .array([bounds.x, bounds.y, bounds.width, bounds.height].map(rounded))]
+        if let stroke = item.stroke {
+            result = result.merging(["tool": .string(stroke.style.tool.rawValue), "pointCount": .number(Double(stroke.points.count))])
+        }
+        return result
+    }
+
+    private static func itemRow(_ item: Item, doc: DocumentID, page: PageID, depth: Int, fields: [String]?) throws -> JSONValue {
+        var copy = item
+        copy.stroke?.points = []
+        var record = try JSONValue.from(copy).objectValue ?? [:]
+        record["bbox"] = summary(item, doc: doc, page: page)["bbox"]
+        if var stroke = record["stroke"]?.objectValue {
+            for key in ["pts", "ptsB64", "fmt"] { stroke[key] = nil }
+            stroke["pointCount"] = .number(Double(item.stroke?.points.count ?? 0))
+            record["stroke"] = .object(stroke)
+        }
+        return project(summary(item, doc: doc, page: page), record: .object(record), depth: depth, fields: fields)
+    }
+
+    private static func project(_ summary: JSONValue, record: JSONValue, depth: Int, fields: [String]?) -> JSONValue {
+        if let fields {
+            var result: [String: JSONValue] = [:]
+            for key in ["ref", "kind"] + fields { result[key] = summary[key] ?? record[key] }
+            return .object(result)
+        }
+        return depth < 2 ? summary : record.merging(["ref": summary["ref"] ?? .null])
+    }
+
+    private static func paged(_ base: JSONValue, sections: [(String, [JSONValue])], params: JSONValue, limit: Int) throws -> JSONValue {
+        guard let offset = Int(params["cursor"]?.stringValue ?? "0"), offset >= 0 else {
+            throw NibError.invalid("Invalid cursor", path: "$.cursor")
+        }
+        let count = sections.reduce(0) { $0 + $1.1.count }
+        let end = min(count, offset + limit)
+        var result = base.objectValue ?? [:]
+        var start = 0
+        for (key, rows) in sections {
+            let lower = min(rows.count, max(0, offset - start))
+            let upper = min(rows.count, max(lower, end - start))
+            result[key] = .array(Array(rows[lower..<upper]))
+            start += rows.count
+        }
+        if end < count { result["cursor"] = .string(String(end)); result["truncated"] = true }
+        return .object(result)
+    }
+}
+
 @MainActor
 final class ReplayPlayerFake {
     var clip: String? = "audio:FIXTUREDOC01/FIXTUREAUD01"
@@ -47,9 +184,9 @@ final class ReplayPlayerFake {
 @MainActor
 final class FeatReplayTests: XCTestCase {
     func testCommandConformanceAndTapRegistration() async {
-        let problems = await CommandConformance.check(features: [FeatReplayFeature.self], owners: [FeatReplayFeature.id])
+        let problems = await CommandConformance.check(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self], owners: [FeatReplayFeature.id])
         XCTAssertEqual(problems, [])
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         XCTAssertEqual(Set(h.app.commands.all().filter { $0.owner == "replay" }.map(\.id)),
                        [CommandIDs.replaySetMode, CommandIDs.replaySeekToItem, CommandIDs.replayTapAt])
         let tap = h.app.content.tapHandlers.get("replay.handwriting")
@@ -59,7 +196,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testLivePlayerTimeWinsOverStaleEventAndPausePreservesReplay() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         let controller = try XCTUnwrap(ReplayController.of(h.app.services))
         let event = h.app.events.emit(AudioPlaybackPayload(clip: player.clip!, t: 1, playing: true, rate: 2, at: 1))
@@ -78,7 +215,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testEventOnlyInterpolationLoadsClipWithoutAudioCommands() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let controller = try XCTUnwrap(ReplayController.of(h.app.services))
         let ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
         controller.receive(h.app.events.emit(AudioPlaybackPayload(clip: ref, t: 10, playing: true, rate: 2, at: 100)))
@@ -95,7 +232,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testReplayTicksDoNotInvokeMutatingAudioStatusOrEmitPlayback() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         // Model F052's missing-silence-map path: even a no-param status read restarts the engine.
         player.restartsOnStatusRead = true
@@ -114,7 +251,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testTapSwitchesLinkedClipsAndPreservesPlayingState() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         let second = AudioClip(id: "REPLAYCLIP02", name: "Second", file: "audio/second.caf", start: 1_700_001_000, duration: 20)
         h.app.commands.register(CommandDescriptor(id: "test.addClip", title: "Add Clip", summary: "Test fixture", effect: .edit)) { _, ctx in
@@ -140,7 +277,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testTapeTapFallsThroughToTapeHandler() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         var ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
         ink.id = "REPLAYTAPE01"; ink.stroke?.style.tool = .tape
@@ -153,7 +290,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testModesArePerWindowAndSessionActionsDoNotChangeUndoHistory() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         let other = EditorSession(); other.document = Fixtures.docID; other.page = Fixtures.page2
         h.app.services.sessions.add(other)
@@ -170,7 +307,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testTapOnlyHandlesLinkedHandwritingWhileReplayIsActiveAndKeepsPause() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         let tap: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [80, 122],
                               "ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "gesture": "tap"]
@@ -192,7 +329,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testSeekToItemStartsLinkedClipAndUnlinkedCopyIsRejected() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app); player.clip = nil
         let result = try await h.run(CommandIDs.replaySeekToItem, ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"])
         XCTAssertEqual(result["clip"], "audio:FIXTUREDOC01/FIXTUREAUD01")
@@ -208,7 +345,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testFollowAlongCrossesPagesAndRewindsWithoutAffectingOtherDocuments() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         var ink = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
         ink.id = "REPLAYPAGE02"; ink.stroke?.t0 = 1_700_000_250
@@ -240,22 +377,29 @@ final class FeatReplayTests: XCTestCase {
         let readStarted = expectation(description: "Changed page read started")
         h.app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Get", summary: "Paged query fixture", effect: .read)) { params, _ in
             let ref = params["ref"]?.stringValue ?? ""
-            if ref.hasPrefix("audio:") { return try JSONValue.from(clip) }
+            if ref.hasPrefix("audio:") { return try JSONValue.from(clip).merging(["ref": .string(ref)]) }
             if ref.hasPrefix("doc:") {
                 documentReads += 1
-                return ["pages": [["ref": "page:FIXTUREDOC01/FIXTUREPG001"], ["ref": "page:FIXTUREDOC01/FIXTUREPG002"]]]
+                XCTAssertEqual(params["depth"], 1)
+                return ["ref": .string(ref), "kind": "document", "documentKind": "notebook", "locked": false,
+                        "pages": [["ref": "page:FIXTUREDOC01/FIXTUREPG001", "kind": "page"],
+                                  ["ref": "page:FIXTUREDOC01/FIXTUREPG002", "kind": "page"]], "outline": [], "audio": []]
             }
+            XCTAssertEqual(params["depth"], 2)
+            XCTAssertEqual(params["fields"], ["kind", "stroke", "bbox", "deleted"])
             pageReads.append(ref)
             if ref == "page:FIXTUREDOC01/FIXTUREPG002" {
                 if suspendSecond {
                     await withCheckedContinuation { pending = $0; readStarted.fulfill() }
                 }
-                if removeSecond { return ["items": []] }
-                return ["items": [["ref": "item:FIXTUREDOC01/FIXTUREPG002/REPLAYINK002", "kind": "stroke",
-                                   "stroke": ["t0": 1_700_000_250]]]]
+                if removeSecond { return ["ref": .string(ref), "kind": "page", "items": []] }
+                return ["ref": .string(ref), "kind": "page", "items": [["ref": "item:FIXTUREDOC01/FIXTUREPG002/REPLAYINK002",
+                                   "kind": "stroke", "deleted": false, "bbox": [70, 110, 30, 30],
+                                   "stroke": ["t0": 1_700_000_250, "style": ["tool": "pen"]]]]]
             }
-            return ["items": [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "kind": "stroke",
-                               "stroke": ["t0": 1_700_000_100]]]]
+            return ["ref": .string(ref), "kind": "page", "items": [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01",
+                               "kind": "stroke", "deleted": false, "bbox": [70, 110, 30, 30],
+                               "stroke": ["t0": 1_700_000_100, "style": ["tool": "pen"]]]]]
         }
         _ = try await h.run(CommandIDs.replaySetMode, ["mode": "spotlight", "followAlong": true])
         let controller = try XCTUnwrap(ReplayController.of(h.app.services))
@@ -284,7 +428,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testReplayMenusRequireAudioAndLinkedStrokeAndShowKeyHints() throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let menu = try XCTUnwrap(h.app.ui.menus.get("replay.options"))
         XCTAssertTrue(menu.isVisible(MenuContext(app: h.app, session: h.session)))
         XCTAssertFalse(menu.isVisible(MenuContext(app: h.app, doc: Fixtures.textDocID)))
@@ -303,7 +447,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testClosedSessionOptionsArePrunedEvenWithoutAClip() throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let controller = try XCTUnwrap(ReplayController.of(h.app.services))
         controller.options(for: h.session).mode = .reveal
         h.app.services.sessions.remove(h.session)
@@ -312,7 +456,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testDryRunDoesNotChangeReplayOptionsOrSeekPlayer() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         let before = player.t
         _ = try await h.app.bus.execute(Invocation(command: CommandIDs.replaySeekToItem,
@@ -328,7 +472,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testOptionsLayoutAndSnapshotsAtPhoneAndAccessibilitySizes() {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let options = ReplayOptions()
         let view = ReplayOptionsView(app: h.app, session: h.session, options: options)
         for variant in NibSnapshot.Variant.allCases {
@@ -340,7 +484,7 @@ final class FeatReplayTests: XCTestCase {
         XCTAssertNotNil(NibSnapshot.image(view.nibLiquidMode(.calm), size: CGSize(width: 768, height: 1024)))
     }
     func testWhiteboardReplayPublishesTimeAndClearsOnUnload() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         h.session.document = Fixtures.whiteboardID; h.session.page = Fixtures.boardID
         let clip = AudioClip(id: "REPLAYBOARD01", name: "Board", file: "audio/board.caf", start: 100, duration: 20)
         h.app.commands.register(CommandDescriptor(id: "test.addBoardClip", title: "Add Clip", summary: "Test fixture", effect: .edit)) { _, ctx in
@@ -367,7 +511,7 @@ final class FeatReplayTests: XCTestCase {
     }
 
     func testHeadlessFullScreenFailureLeavesNoOrphanSessionOrOptions() async throws {
-        let h = Harness(features: [FeatReplayFeature.self])
+        let h = Harness(features: [ReplayQueryTestFeature.self, FeatReplayFeature.self])
         let player = ReplayPlayerFake(); player.install(h.app)
         let source = ReplayTestEditor(app: h.app, session: h.session, doc: Fixtures.docID)
         h.session.editor = source

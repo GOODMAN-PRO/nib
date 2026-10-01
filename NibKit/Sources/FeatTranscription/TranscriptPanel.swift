@@ -15,7 +15,10 @@ final class TranscriptPanelModel: ObservableObject {
             if selectedClip != oldValue { transcript = nil; editIndex = nil; editText = ""; editClip = nil }
         }
     }
-    @Published var transcript: TranscriptGet.Output?
+    @Published var transcript: TranscriptGet.Output? {
+        didSet { summary = TranscriptSummary.read(transcript?.summary) }
+    }
+    @Published private(set) var summary: TranscriptSummary?
     @Published var error: String?
     @Published var busy = false
     @Published var playback: AudioPlaybackPayload?
@@ -93,6 +96,10 @@ final class TranscriptPanelModel: ObservableObject {
         editClip = selectedClip; editIndex = line.index; editText = line.text
     }
 
+    func seekSummaryWindow(_ window: TranscriptSummary.Window) {
+        run(TranscriptSeek.descriptor.id, ["clip": .string(selectedClip), "t": .number(window.start)])
+    }
+
     func run(_ command: String, _ params: JSONValue) {
         Task { @MainActor in
             busy = true; error = nil
@@ -128,6 +135,7 @@ struct TranscriptPanel: View {
     @State private var tab = TranscriptTab.transcript
     @State private var settings = false
     @State private var follow = true
+    @State private var translated = true
     @State private var confirmRegenerate = false
     @FocusState private var searchFocused: Bool
 
@@ -289,7 +297,18 @@ struct TranscriptPanel: View {
 
     private var summary: some View {
         ScrollView {
-            if let summary = model.transcript?.summary, !summary.isEmpty {
+            if let summary = model.summary {
+                VStack(alignment: .leading, spacing: NibSpacing.l) {
+                    if summary.hasTranslation {
+                        NibToggle(String(localized: "Translated to \(Locale.current.localizedString(forLanguageCode: summary.targetLanguage) ?? summary.targetLanguage)"), isOn: $translated)
+                    }
+                    let windows = summary.filteredWindows(search: search)
+                    if windows.isEmpty { NibEmptyState(symbol: .search, title: String(localized: "No matching summary text")) }
+                    ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
+                        summaryWindow(window)
+                    }
+                }.padding(NibSpacing.l)
+            } else if let summary = model.transcript?.summary, !summary.isEmpty {
                 let paragraphs = summary.components(separatedBy: "\n").filter { search.isEmpty || $0.localizedStandardContains(search) }
                 if paragraphs.isEmpty { NibEmptyState(symbol: .search, title: String(localized: "No matching summary text")) }
                 VStack(alignment: .leading, spacing: NibSpacing.m) {
@@ -309,6 +328,41 @@ struct TranscriptPanel: View {
             } else {
                 NibEmptyState(symbol: .assistant, title: String(localized: "No summary yet"),
                     message: String(localized: "Summarise this recording with your connected AI provider."))
+            }
+        }
+    }
+
+    private func summaryWindow(_ window: TranscriptSummary.Window) -> some View {
+        let content = translated ? window.translatedContent : window.content
+        return VStack(alignment: .leading, spacing: NibSpacing.s) {
+            Button {
+                model.seekSummaryWindow(window)
+            } label: {
+                Text(Self.timestamp(window.start) + " – " + Self.timestamp(window.end))
+                    .font(NibFont.hud).foregroundStyle(NibColor.accent)
+                    .frame(minHeight: NibMetrics.hitTarget, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }.buttonStyle(.plain).hoverEffect(.highlight)
+                .accessibilityLabel(String(localized: "Play from \(Self.timestamp(window.start)) and show linked notes"))
+            Text(Locale.current.localizedString(forLanguageCode: window.language) ?? window.language)
+                .font(NibFont.caption1Emphasis).foregroundStyle(NibColor.labelSecondary)
+            ScrollView(.horizontal) {
+                HStack(spacing: NibSpacing.s) {
+                    ForEach(window.flags, id: \.self) { flag in NibBadge(.capsule(flag.title)) }
+                }
+            }
+            summarySection(String(localized: "Key Points"), lines: content.keyPoints)
+            summarySection(String(localized: "Decisions"), lines: content.decisions)
+            summarySection(String(localized: "Action Items"), lines: content.actionItems.map(\.display))
+            Divider().overlay(NibColor.separator)
+        }
+    }
+
+    @ViewBuilder private func summarySection(_ title: String, lines: [String]) -> some View {
+        if !lines.isEmpty {
+            Text(title).font(NibFont.bodyEmphasis).accessibilityAddTraits(.isHeader)
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, text in
+                Text(text).font(NibFont.body).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
             }
         }
     }
@@ -509,7 +563,74 @@ final class TranscriptDropAttachment: NSObject, CanvasAttachment, UIDropInteract
     }
 }
 
-/// Summaries owned by F089 remain plain text; timestamp links also work with Markdown timeline rows.
+/// Local mirror of F089's version-1 JSON stored in AudioClip.summary, without a feature-module dependency.
+struct TranscriptSummary: Decodable {
+    let version: Int
+    let targetLanguage: String
+    let windows: [Window]
+    let incomplete: Bool?
+
+    static func read(_ value: String?) -> TranscriptSummary? {
+        guard let value, let data = value.data(using: .utf8),
+              let summary = try? JSONDecoder().decode(Self.self, from: data), summary.version == 1 else { return nil }
+        return summary
+    }
+
+    var hasTranslation: Bool { windows.contains { $0.translation != nil } }
+
+    func filteredWindows(search: String) -> [Window] {
+        windows.filter { window in
+            search.isEmpty || (window.content.searchStrings + (window.translation?.searchStrings ?? []))
+                .contains { $0.localizedStandardContains(search) }
+        }
+    }
+
+    struct Window: Decodable {
+        let start: Double
+        let end: Double
+        let language: String
+        let sources: [Source]
+        let content: Content
+        let translation: Content?
+        let flags: [Flag]
+        var translatedContent: Content { (translation?.isEmpty == false ? translation : nil) ?? content }
+    }
+
+    struct Source: Decodable {
+        let index: Int
+        let rev: Rev?
+        let hash: String
+    }
+
+    struct Content: Decodable {
+        let keyPoints: [String]
+        let decisions: [String]
+        let actionItems: [ActionItem]
+        var isEmpty: Bool { keyPoints.isEmpty && decisions.isEmpty && actionItems.isEmpty }
+        var searchStrings: [String] { keyPoints + decisions + actionItems.map(\.display) }
+    }
+
+    struct ActionItem: Decodable {
+        let text: String
+        let owner: String?
+        let due: String?
+        var display: String { ([text] + [owner, due].compactMap { $0 }).joined(separator: " · ") }
+    }
+
+    enum Flag: String, Decodable {
+        case lowConfidence, noisy, overlap, gaps
+        var title: String {
+            switch self {
+            case .lowConfidence: return String(localized: "Low confidence")
+            case .noisy: return String(localized: "Noisy audio")
+            case .overlap: return String(localized: "Overlapping speech")
+            case .gaps: return String(localized: "Transcript gaps")
+            }
+        }
+    }
+}
+
+/// Legacy plain-text summaries may contain timestamp links in Markdown timeline rows.
 enum TranscriptSummaryTime {
     static func firstTimestamp(in text: String) -> Double? {
         guard let regex = try? NSRegularExpression(pattern: #"(?<!\d)(\d{1,3}):(\d{2})(?::(\d{2}))?(?!\d)"#),

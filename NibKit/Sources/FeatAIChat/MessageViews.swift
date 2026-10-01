@@ -391,7 +391,7 @@ final class ChatBlockEditor: UIViewController, DocumentEditing {
     private var scrollIDs = Set<ObjectIdentifier>()
     private var events: EventSubscription?
     private(set) var controls: [String: UIHostingController<ChatBlockButton>] = [:]
-    private var previews: [String: UIHostingController<ChatProofMark>] = [:]
+    private(set) var previews: [String: UIHostingController<ChatProofMark>] = [:]
 
     init(wrapped: UIViewController, editing: DocumentEditing, app: NibApp) {
         self.wrapped = wrapped; self.forwardedEditor = editing; self.app = app
@@ -420,7 +420,9 @@ final class ChatBlockEditor: UIViewController, DocumentEditing {
         updateAccessories()
     }
     override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated); session.editor = self; view.setNeedsLayout()
+        super.viewDidAppear(animated)
+        // The wrapped editor owns session.editor, including its selection and command queue.
+        view.setNeedsLayout()
     }
     func reveal(page: PageID, rect: Rect?, animated: Bool) { forwardedEditor.reveal(page: page, rect: rect, animated: animated) }
     func reveal(block: NibID, animated: Bool) { forwardedEditor.reveal(block: block, animated: animated) }
@@ -439,6 +441,16 @@ final class ChatBlockEditor: UIViewController, DocumentEditing {
             if let raw = node.accessibilityIdentifier, case .block(let doc, let id)? = NodeRef(raw),
                doc == documentID, blocks.contains(where: { $0.id == id }) {
                 rows[raw] = node.convert(node.bounds, to: accessories)
+                return
+            }
+            // F047 renders one section with one collection item per live block, in document order.
+            if let collection = node as? UICollectionView, collection.numberOfSections == 1,
+               collection.numberOfItems(inSection: 0) == blocks.count {
+                for cell in collection.visibleCells {
+                    guard let index = collection.indexPath(for: cell), index.section == 0,
+                          blocks.indices.contains(index.item) else { continue }
+                    rows[NodeRef.block(documentID, blocks[index.item].id).description] = cell.convert(cell.bounds, to: accessories)
+                }
                 return
             }
             if let table = node as? UITableView, table.numberOfSections == 1, table.numberOfRows(inSection: 0) == blocks.count {

@@ -28,77 +28,53 @@ struct ReplayInk: Equatable {
     var isTape = false
 }
 
-/// Queries retain caller permissions. The fallback is only for builds in which F003 has not registered its API.
-/// It uses the real workspace, and disappears from the path as soon as query.get/query.find are available.
+/// All reads use F003 through the caller's query closure, retaining gateway permissions and lock checks.
 @MainActor
 enum ReplayReader {
     typealias Query = (String, JSONValue) async throws -> JSONValue
 
     static func clip(_ ref: String, app: NibApp, query: Query) async throws -> AudioClip {
-        guard case let .audio(doc, id)? = NodeRef(ref) else { throw NibError.invalid("Expected an audio ref", path: "$.clip") }
-        if app.commands.entry(CommandIDs.queryGet) != nil {
-            let json = try await query(CommandIDs.queryGet, ["ref": .string(ref)])
-            let clip = try (json["audio"] ?? json).decode(AudioClip.self)
-            guard !clip.deleted, clip.id == id else { throw NibError.notFound(ref) }
-            return clip
-        }
-        try checkLock(doc, app: app)
-        guard let clip = try app.workspace.content(doc).liveAudio.first(where: { $0.id == id }) else {
-            throw NibError.notFound(ref)
-        }
+        guard case let .audio(_, id)? = NodeRef(ref) else { throw NibError.invalid("Expected an audio ref", path: "$.clip") }
+        let json = try await query(CommandIDs.queryGet, ["ref": .string(ref)])
+        try requireExpanded(json)
+        let clip = try json.decode(AudioClip.self)
+        guard !clip.deleted, clip.id == id else { throw NibError.notFound(ref) }
         return clip
     }
 
     static func clips(_ doc: DocumentID, app: NibApp, query: Query) async throws -> [AudioClip] {
-        if app.commands.entry(CommandIDs.queryGet) != nil {
-            var clips: [AudioClip] = []
-            var cursor: String?
-            var seen = Set<String>()
-            repeat {
-                var params: JSONValue = ["ref": .string(NodeRef.document(doc).description), "depth": 2]
-                if let cursor { params = params.merging(["cursor": .string(cursor)]) }
-                let json = try await query(CommandIDs.queryGet, params)
-                if json["locked"]?.boolValue == true { throw NibError(.locked, "Unlock the note to replay its handwriting") }
-                // Document children share a cursor; clips may not occur until after the pages and outline.
-                if let audio = json["audio"] { clips += try audio.decode([AudioClip].self).filter { !$0.deleted } }
-                cursor = json["cursor"]?.stringValue
-                if let cursor, !seen.insert(cursor).inserted { throw NibError(.invariantViolation, "The audio query repeated its cursor") }
-            } while cursor != nil
-            return clips
-        }
-        try checkLock(doc, app: app)
-        return try app.workspace.content(doc).liveAudio
+        var clips: [AudioClip] = []
+        var cursor: String?
+        var seen = Set<String>()
+        repeat {
+            var params: JSONValue = ["ref": .string(NodeRef.document(doc).description), "depth": 2]
+            if let cursor { params = params.merging(["cursor": .string(cursor)]) }
+            let json = try await query(CommandIDs.queryGet, params)
+            try requireExpanded(json)
+            // Document children share a cursor; clips may not occur until after the pages and outline.
+            if let audio = json["audio"] { clips += try audio.decode([AudioClip].self).filter { !$0.deleted } }
+            cursor = json["cursor"]?.stringValue
+            if let cursor, !seen.insert(cursor).inserted { throw NibError(.invariantViolation, "The audio query repeated its cursor") }
+        } while cursor != nil
+        return clips
     }
 
     static func kind(_ doc: DocumentID, app: NibApp, query: Query) async throws -> DocumentKind {
-        if app.commands.entry(CommandIDs.queryGet) != nil {
-            let json = try await query(CommandIDs.queryGet, ["ref": .string(NodeRef.document(doc).description), "depth": 0])
-            if let raw = json["documentKind"]?.stringValue ?? json["meta"]?["kind"]?.stringValue,
-               let kind = DocumentKind(rawValue: raw) { return kind }
-            throw NibError(.unsupported, "The document query did not return its kind")
-        }
-        try checkLock(doc, app: app)
-        return try app.workspace.content(doc).meta.kind
+        let json = try await query(CommandIDs.queryGet, ["ref": .string(NodeRef.document(doc).description), "depth": 0])
+        try requireExpanded(json)
+        if let raw = json["documentKind"]?.stringValue, let kind = DocumentKind(rawValue: raw) { return kind }
+        throw NibError(.unsupported, "The document query did not return its kind")
     }
 
     static func ink(_ ref: String, app: NibApp, query: Query) async throws -> ReplayInk? {
-        guard case let .item(doc, page, id)? = NodeRef(ref) else { throw NibError.invalid("Expected an item ref", path: "$.ref") }
-        if app.commands.entry(CommandIDs.queryGet) != nil {
-            let json = try await query(CommandIDs.queryGet, ["ref": .string(ref), "fields": ["kind", "stroke", "bbox", "deleted", "tool"]])
-            return decodeInk(json, ref: ref, page: page)
-        }
-        try checkLock(doc, app: app)
-        guard let record = try app.workspace.content(doc).page(page), !record.deleted else { throw NibError.notFound(ref) }
-        let item = try app.workspace.item(doc, page: page, id: id)
-        guard item.kind == .stroke, let stroke = item.stroke else { return nil }
-        return ReplayInk(ref: ref, page: page, t0: stroke.t0, bounds: item.bounds, isTape: stroke.style.tool == .tape)
+        guard case let .item(_, page, _)? = NodeRef(ref) else { throw NibError.invalid("Expected an item ref", path: "$.ref") }
+        let json = try await query(CommandIDs.queryGet, ["ref": .string(ref), "fields": ["kind", "stroke", "bbox", "deleted", "tool"]])
+        // A locked item is still readable; F003's locked-document response has no kind or payload.
+        if json["kind"] == nil { try requireExpanded(json) }
+        return decodeInk(json, ref: ref, page: page)
     }
 
     static func pages(_ doc: DocumentID, app: NibApp, query: Query) async throws -> [PageID] {
-        guard app.commands.entry(CommandIDs.queryGet) != nil else {
-            try checkLock(doc, app: app)
-            return try app.workspace.content(doc).livePages.map(\.id)
-        }
         var pages: [PageID] = []
         var cursor: String?
         var seen = Set<String>()
@@ -106,10 +82,9 @@ enum ReplayReader {
             var params: JSONValue = ["ref": .string(NodeRef.document(doc).description), "depth": 1]
             if let cursor { params = params.merging(["cursor": .string(cursor)]) }
             let result = try await query(CommandIDs.queryGet, params)
-            if result["locked"]?.boolValue == true { throw NibError(.locked, "Unlock the note to replay its handwriting") }
+            try requireExpanded(result)
             for row in result["pages"]?.arrayValue ?? [] where row["deleted"]?.boolValue != true {
                 if let ref = row["ref"]?.stringValue, case let .page(d, page)? = NodeRef(ref), d == doc { pages.append(page) }
-                else if let id = row["id"]?.stringValue { pages.append(NibID(id)) }
             }
             cursor = result["cursor"]?.stringValue
             if let cursor, !seen.insert(cursor).inserted { throw NibError(.invariantViolation, "The page query repeated its cursor") }
@@ -118,33 +93,24 @@ enum ReplayReader {
     }
 
     static func inks(_ doc: DocumentID, page: PageID, app: NibApp, query: Query) async throws -> [ReplayInk] {
-        if app.commands.entry(CommandIDs.queryGet) != nil {
-            var out: [ReplayInk] = []
-            var cursor: String?
-            var seen = Set<String>()
-            repeat {
-                var params: JSONValue = ["ref": .string(NodeRef.page(doc, page).description), "depth": 2,
-                                         "fields": ["kind", "stroke", "bbox", "deleted"]]
-                if let cursor { params = params.merging(["cursor": .string(cursor)]) }
-                let result = try await query(CommandIDs.queryGet, params)
-                if result["locked"]?.boolValue == true { throw NibError(.locked, "Unlock the note to replay its handwriting") }
-                if result["deleted"]?.boolValue == true { return [] }
-                for row in result["items"]?.arrayValue ?? [] {
-                    guard let ref = row["ref"]?.stringValue, case let .item(d, pg, _)? = NodeRef(ref), d == doc, pg == page else { continue }
-                    if let ink = decodeInk(row, ref: ref, page: page) { out.append(ink) }
-                }
-                cursor = result["cursor"]?.stringValue
-                if let cursor, !seen.insert(cursor).inserted { throw NibError(.invariantViolation, "The ink query repeated its cursor") }
-            } while cursor != nil
-            return out
-        }
-        try checkLock(doc, app: app)
-        guard let record = try app.workspace.content(doc).page(page), !record.deleted else { return [] }
-        return try app.workspace.items(doc, page: page).compactMap { item in
-            guard !item.deleted, item.kind == .stroke, let stroke = item.stroke else { return nil }
-            return ReplayInk(ref: NodeRef.item(doc, page, item.id).description, page: page,
-                             t0: stroke.t0, bounds: item.bounds, isTape: stroke.style.tool == .tape)
-        }
+        var out: [ReplayInk] = []
+        var cursor: String?
+        var seen = Set<String>()
+        repeat {
+            var params: JSONValue = ["ref": .string(NodeRef.page(doc, page).description), "depth": 2,
+                                     "fields": ["kind", "stroke", "bbox", "deleted"]]
+            if let cursor { params = params.merging(["cursor": .string(cursor)]) }
+            let result = try await query(CommandIDs.queryGet, params)
+            try requireExpanded(result)
+            if result["trashed"]?.boolValue == true || result["deleted"]?.boolValue == true { return [] }
+            for row in result["items"]?.arrayValue ?? [] {
+                guard let ref = row["ref"]?.stringValue, case let .item(d, pg, _)? = NodeRef(ref), d == doc, pg == page else { continue }
+                if let ink = decodeInk(row, ref: ref, page: page) { out.append(ink) }
+            }
+            cursor = result["cursor"]?.stringValue
+            if let cursor, !seen.insert(cursor).inserted { throw NibError(.invariantViolation, "The ink query repeated its cursor") }
+        } while cursor != nil
+        return out
     }
 
     static func inks(_ doc: DocumentID, app: NibApp, query: Query) async throws -> [ReplayInk] {
@@ -156,9 +122,6 @@ enum ReplayReader {
     }
 
     static func hit(_ doc: DocumentID, page: PageID, point: Point, app: NibApp, query: Query) async throws -> ReplayInk? {
-        guard app.commands.entry(CommandIDs.queryFind) != nil else {
-            return try await inks(doc, page: page, app: app, query: query).last { $0.bounds.contains(point) }
-        }
         var hit: ReplayInk?
         var cursor: String?
         var seen = Set<String>()
@@ -167,6 +130,7 @@ enum ReplayReader {
                                      "bbox": [.number(point.x - 0.5), .number(point.y - 0.5), 1, 1], "limit": 200]
             if let cursor { params = params.merging(["cursor": .string(cursor)]) }
             let result = try await query(CommandIDs.queryFind, params)
+            try requireExpanded(result)
             for row in result["items"]?.arrayValue ?? [] {
                 guard let ref = row["ref"]?.stringValue, case let .item(d, pg, _)? = NodeRef(ref), d == doc, pg == page else { continue }
                 // F003 find summaries have no t0. Resolve only spatial hits, never every stroke in the note.
@@ -178,13 +142,13 @@ enum ReplayReader {
         return hit
     }
 
-    private static func checkLock(_ doc: DocumentID, app: NibApp) throws {
-        if app.services.lock?.isLocked(doc) == true { throw NibError(.locked, "Unlock the note to replay its handwriting") }
+    private static func requireExpanded(_ result: JSONValue) throws {
+        if result["locked"]?.boolValue == true { throw NibError(.locked, "Unlock the note to replay its handwriting") }
     }
 
     private static func decodeInk(_ json: JSONValue, ref: String, page: PageID) -> ReplayInk? {
         guard json["deleted"]?.boolValue != true, json["kind"]?.stringValue == "stroke",
-              let t0 = json["stroke"]?["t0"]?.doubleValue ?? json["t0"]?.doubleValue, t0.isFinite else { return nil }
+              let t0 = json["stroke"]?["t0"]?.doubleValue, t0.isFinite else { return nil }
         let values = json["bbox"]?.arrayValue?.compactMap(\.doubleValue) ?? []
         let bounds = values.count == 4 ? Rect(x: values[0], y: values[1], width: values[2], height: values[3]) : .zero
         return ReplayInk(ref: ref, page: page, t0: t0, bounds: bounds,
@@ -351,7 +315,8 @@ final class ReplayController: NSObject, ObservableObject {
     private var query: ReplayReader.Query {
         { [weak app] command, params in
             guard let app else { throw NibError(.unavailable, "Replay is no longer available") }
-            return try await app.bus.execute(command, params)
+            // This is a feature dependency read, like CommandContext.execute, so a missing provider is unavailable.
+            return try await app.bus.execute(Invocation(command: command, params: params, depth: 1)).value
         }
     }
 

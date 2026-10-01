@@ -42,6 +42,80 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertNil(LibraryModels.get(h.app).model(other).folder)
         XCTAssertEqual(LibraryModels.get(h.app).model(other).selection.refs.count, 0)
     }
+    func testLibraryWindowListsNilKindChromeOverlaysInRegistryOrder() throws {
+        let h = harness()
+        let model = LibraryModels.get(h.app).model(h.session)
+        let navigator = LibraryTestNavigator(app: h.app, session: h.session)
+        model.navigator = navigator
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.libraryStatus", owner: "test", placement: .topTrailing, surface: .none, order: 20,
+            isVisible: { $0.kind == nil && !$0.isCompact }) { _ in AnyView(EmptyView()) })
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.libraryStatusCompact", owner: "test", placement: .bottomTrailing, surface: .pill, order: 20,
+            isVisible: { $0.kind == nil && $0.isCompact }) { _ in AnyView(EmptyView()) })
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.containerBanner", owner: "test", placement: .topLeading, surface: .none, order: 10,
+            isInteractive: false, isVisible: { $0.kind == nil }) { _ in AnyView(EmptyView()) })
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.documentOnly", owner: "test", placement: .top, docKinds: [.notebook]) { _ in AnyView(EmptyView()) })
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.hidden", owner: "test", placement: .center,
+            isVisible: { _ in false }) { _ in AnyView(EmptyView()) })
+
+        let context = model.chromeContext(isCompact: false)
+        XCTAssertNil(context.kind)
+        XCTAssertTrue(context.app === h.app)
+        XCTAssertTrue(context.session === h.session)
+        XCTAssertTrue(context.navigator === navigator)
+        let overlays = model.visibleChromeOverlays(context)
+        XCTAssertEqual(overlays.map(\.id), ["test.containerBanner", "test.libraryStatus"])
+        XCTAssertEqual(overlays.map(\.placement), [.topLeading, .topTrailing])
+        XCTAssertEqual(overlays.map(\.surface), [.none, .none])
+        XCTAssertFalse(try XCTUnwrap(overlays.first).isInteractive)
+        XCTAssertEqual(model.visibleChromeOverlays(model.chromeContext(isCompact: true)).map(\.id),
+                       ["test.containerBanner", "test.libraryStatusCompact"])
+    }
+    func testLibraryChromeRefreshesForItsWindowSessionAndRegistryReplacement() async throws {
+        let h = harness()
+        let model = LibraryModels.get(h.app).model(h.session)
+        var show = false
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.live", owner: "test", placement: .topLeading,
+            isVisible: { $0.kind == nil && (show || $0.session.readOnly) }) { _ in AnyView(EmptyView()) })
+        for _ in 0..<30 { await Task.yield() }
+        let context = model.chromeContext(isCompact: false)
+        XCTAssertTrue(model.visibleChromeOverlays(context).isEmpty)
+        let revision = model.registryRevision
+        h.app.ui.setNeedsChromeUpdate(EditorSession())
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(model.registryRevision, revision, "Another window must not invalidate this library")
+        show = true
+        h.app.ui.setNeedsChromeUpdate(h.session)
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertGreaterThan(model.registryRevision, revision)
+        XCTAssertEqual(model.visibleChromeOverlays(context).map(\.id), ["test.live"])
+        show = false
+        let sessionRevision = model.registryRevision
+        h.session.readOnly = true
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertGreaterThan(model.registryRevision, sessionRevision)
+        XCTAssertEqual(model.visibleChromeOverlays(context).map(\.id), ["test.live"])
+
+        let generation = h.app.ui.chromeOverlays.generation
+        let registryRevision = model.registryRevision
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "test.live", owner: "test", placement: .bottomTrailing, surface: .bar,
+            isVisible: { $0.kind == nil }) { _ in AnyView(EmptyView()) })
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertGreaterThan(h.app.ui.chromeOverlays.generation, generation)
+        XCTAssertGreaterThan(model.registryRevision, registryRevision)
+        let replacement = try XCTUnwrap(model.visibleChromeOverlays(context).first)
+        XCTAssertEqual(replacement.placement, .bottomTrailing)
+        XCTAssertEqual(replacement.surface, .bar)
+        h.app.ui.chromeOverlays.unregister(id: "test.live")
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertTrue(model.visibleChromeOverlays(context).isEmpty)
+    }
     func testReorderFromReflowPersistsManualAndReturnedOrderReplaysUndo() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
@@ -100,10 +174,27 @@ final class FeatLibraryUITests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": .string(PanelIDs.trash), "params": ["test": true]], session: h.session)
         XCTAssertEqual(model.tab?.id, PanelIDs.trash)
         XCTAssertEqual(model.tab?.params, ["test": true])
-        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "test.sheet", "close": true], session: h.session)
+        let closed = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "test.sheet", "close": true], session: h.session)
+        XCTAssertEqual(closed["closed"], .bool(true))
         XCTAssertNil(model.modal)
         XCTAssertFalse(h.session.openPanels.contains("test.sheet"))
         XCTAssertTrue(h.session.openPanels.contains(PanelIDs.trash))
+    }
+    func testClosingRegisteredSheetThatIsNotOpenReturnsFalse() async throws {
+        let h = harness()
+        h.app.ui.panels.register(PanelDescriptor(id: "test.sheet", title: "Sheet", icon: NibSymbol.folder.name, placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        let result = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "test.sheet", "close": true], session: h.session)
+        XCTAssertEqual(result["panel"], "test.sheet")
+        XCTAssertEqual(result["closed"], .bool(false))
+        XCTAssertNil(LibraryModels.get(h.app).model(h.session).modal)
+        XCTAssertFalse(h.session.openPanels.contains("test.sheet"))
+    }
+    func testClosingUnregisteredPanelThatIsNotOpenReturnsFalse() async throws {
+        let h = harness()
+        let result = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "test.unknown", "close": true], session: h.session)
+        XCTAssertEqual(result["panel"], "test.unknown")
+        XCTAssertEqual(result["closed"], .bool(false))
+        XCTAssertTrue(h.session.openPanels.isEmpty)
     }
     func testFloatingAndFullScreenPanelsAndUnregisteredDismissal() async throws {
         let h = harness()

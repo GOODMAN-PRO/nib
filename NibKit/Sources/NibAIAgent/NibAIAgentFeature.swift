@@ -13,6 +13,9 @@ public enum NibAIAgentFeature: NibFeature {
         app.settings.declare(AgentSettings.directTools,
                              summary: "Commands the AI gets as their own tools besides the meta-tools (command ids).",
                              owner: id, schema: .arr(.str("command id, e.g. 'page.add'")))
+        // Match F086's declaration so either feature registration order uses the same routing and validation.
+        app.settings.declare(AgentSettings.maxSteps, summary: "Maximum tool rounds in an AI turn.",
+                             owner: id, schema: .int(min: 1, max: 100))
         let settings = app.settings
         app.gateway.setPolicy(forPrincipalKind: "ai") { [weak settings] _ in
             settings?.get(NibSettings.aiConfirmationPolicy) ?? .destructive

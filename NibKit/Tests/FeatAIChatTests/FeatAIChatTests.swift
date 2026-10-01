@@ -207,7 +207,10 @@ final class FeatAIChatTests: XCTestCase {
 
     func testTextDocumentAccessoryPreservesEditorAndMapsEachVisibleBlock() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
-        let editor = AccessoryTestEditor(session: h.session)
+        let blocks = try h.app.workspace.content(Fixtures.textDocID).liveBlocks
+        let refs = blocks.map { NodeRef.block(Fixtures.textDocID, $0.id).description }
+        let editor = AccessoryTestEditor(session: h.session, blockCount: blocks.count)
+        XCTAssertTrue(h.session.editor === editor)
         h.app.ui.editors.register(DocumentEditorDescriptor(kind: .textDocument, owner: "textdoc") { _, _, _ in editor })
         await FeatAIChatFeature.start(h.app)
         let factory = try XCTUnwrap(h.app.ui.editors.get(DocumentKind.textDocument.rawValue))
@@ -215,33 +218,85 @@ final class FeatAIChatTests: XCTestCase {
         wrapper.loadViewIfNeeded()
         wrapper.view.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
         wrapper.view.layoutIfNeeded()
-        editor.table.frame = CGRect(x: 120, y: 0, width: 680, height: 768)
-        editor.table.reloadData(); editor.table.layoutIfNeeded()
+        editor.collection.frame = CGRect(x: 120, y: 0, width: 680, height: 768)
+        editor.collection.reloadData(); editor.collection.layoutIfNeeded()
+        wrapper.beginAppearanceTransition(true, animated: false)
+        wrapper.endAppearanceTransition()
+        XCTAssertTrue(h.session.editor === editor)
+        XCTAssertTrue(wrapper.forwardedEditor === editor)
         wrapper.updateAccessories()
-        XCTAssertEqual(wrapper.controls.count, 3)
-        XCTAssertNotNil(wrapper.controls["block:FIXTUREDOC02/FIXTUREBLK01"])
+        XCTAssertEqual(Set(wrapper.controls.keys), Set(refs))
+        for cell in editor.collection.visibleCells {
+            XCTAssertNil(cell.accessibilityIdentifier)
+            let index = try XCTUnwrap(editor.collection.indexPath(for: cell))
+            let control = try XCTUnwrap(wrapper.controls[refs[index.item]])
+            let rect = cell.convert(cell.bounds, to: wrapper.view)
+            XCTAssertEqual(control.view.frame.minY, rect.minY, accuracy: 0.1)
+        }
+
+        let target = NodeRef.block(Fixtures.textDocID, Fixtures.paragraphBlockID).description
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let proposal = ChatProposal(number: 1, command: CommandIDs.blockUpdate, params: ["ref": .string(target), "text": "Preview"],
+            title: "Revise block", changes: ChangeSummary(updated: [target]), originals: [:], destructive: false,
+            target: target, previewText: "Preview", group: "BLOCKPREVIEW")
+        let before = try h.snapshotAll()
+        model.proposals = [proposal]
+        wrapper.updateAccessories()
+        let mark = try XCTUnwrap(wrapper.previews[proposal.id])
+        let blockIndex = try XCTUnwrap(refs.firstIndex(of: target))
+        let cell = try XCTUnwrap(editor.collection.cellForItem(at: IndexPath(item: blockIndex, section: 0)))
+        XCTAssertEqual(mark.view.frame.minY, cell.convert(cell.bounds, to: wrapper.view).maxY, accuracy: 0.1)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        model.showsProposalsOnPage = false
+        wrapper.updateAccessories()
+        XCTAssertTrue(wrapper.previews.isEmpty)
+        model.showsProposalsOnPage = true
+        model.proposals[0].included = false
+        wrapper.updateAccessories()
+        XCTAssertTrue(wrapper.previews.isEmpty)
+
         wrapper.reveal(block: Fixtures.paragraphBlockID, animated: false)
         XCTAssertEqual(editor.revealed, Fixtures.paragraphBlockID)
         wrapper.reloadAll()
         XCTAssertEqual(editor.reloads, 1)
         XCTAssertTrue(wrapper.wrapped === editor)
+        XCTAssertTrue(h.session.editor === editor)
     }
 
 }
 
 @MainActor
-private final class AccessoryTestEditor: UIViewController, DocumentEditing, UITableViewDataSource {
+private final class AccessoryTestEditor: UIViewController, DocumentEditing, UICollectionViewDataSource {
     let documentID = Fixtures.textDocID
     let session: EditorSession
     var canvasHost: CanvasHost? { nil }
-    let table = UITableView()
+    let collection: UICollectionView
+    let blockCount: Int
     var revealed: NibID?
     var reloads = 0
-    init(session: EditorSession) { self.session = session; super.init(nibName: nil, bundle: nil) }
+    init(session: EditorSession, blockCount: Int) {
+        self.session = session
+        self.blockCount = blockCount
+        let layout = UICollectionViewFlowLayout()
+        layout.itemSize = CGSize(width: 680, height: 80)
+        layout.minimumLineSpacing = 0
+        layout.minimumInteritemSpacing = 0
+        collection = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        super.init(nibName: nil, bundle: nil)
+        session.editor = self
+    }
     required init?(coder: NSCoder) { nil }
-    override func viewDidLoad() { super.viewDidLoad(); view.addSubview(table); table.dataSource = self; table.rowHeight = 80 }
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { 3 }
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell { UITableViewCell() }
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(collection)
+        collection.dataSource = self
+        collection.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "block")
+    }
+    func numberOfSections(in collectionView: UICollectionView) -> Int { 1 }
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int { blockCount }
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        collectionView.dequeueReusableCell(withReuseIdentifier: "block", for: indexPath)
+    }
     func reveal(page: PageID, rect: Rect?, animated: Bool) { revealed = page }
     func reveal(block: NibID, animated: Bool) { revealed = block }
     func reloadAll() { reloads += 1 }
