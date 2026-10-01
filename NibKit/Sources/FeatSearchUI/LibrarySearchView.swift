@@ -77,7 +77,7 @@ struct LibrarySearchOverlay: View {
 @MainActor
 func searchBinding(app: NibApp, session: EditorSession, state: SearchState) -> Binding<String> {
     Binding(get: { state.query }, set: { query in
-        app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "query": .string(query)], session: session)
+        SearchRuntime.from(app).type(query, session: session, state: state)
     })
 }
 
@@ -121,8 +121,8 @@ struct SearchResults: View {
                             }.padding(.vertical, NibSpacing.s)
                         }.scrollIndicators(.hidden)
                     }
-                    if state.isIndexing {
-                        NibBanner(String(localized: "Indexing \(state.remainingPages) pages…"), style: .info, symbol: .search)
+                    if state.remainingPages > 0 {
+                        NibBanner(String(localized: "Indexing ^[\(state.remainingPages) page](inflect: true)…"), style: .info, symbol: .search)
                     }
                     if let error = state.error {
                         NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again")) {
@@ -130,7 +130,7 @@ struct SearchResults: View {
                         })
                     } else if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         if state.scope == "lib" {
-                            Text(String(localized: "Recently opened")).font(NibFont.headline)
+                            Text(String(localized: "Recently opened")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
                             if state.recentRows.isEmpty {
                                 NibEmptyState(symbol: .recents, title: String(localized: "No recently opened documents"),
                                     message: String(localized: "Open a notebook, then find it here."))
@@ -141,7 +141,7 @@ struct SearchResults: View {
                                     app.perform(CommandIDs.searchOpen, ["scope": "lib", "close": true], session: session)
                                 } label: {
                                     HStack(spacing: NibSpacing.m) {
-                                        Image(nib: .recents).foregroundStyle(NibColor.labelSecondary)
+                                        Image(nib: .recents).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
                                         Text(row.title).font(NibFont.body).foregroundStyle(NibColor.label)
                                         Spacer(minLength: NibSpacing.s)
                                     }
@@ -151,13 +151,14 @@ struct SearchResults: View {
                                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
                             }
                         } else {
-                            NibEmptyState(symbol: .search, title: String(localized: "Find in this document"),
+                            NibEmptyState(symbol: .search, title: state.scope.hasPrefix("folder:")
+                                ? String(localized: "Find in this folder") : String(localized: "Find in this document"),
                                 message: String(localized: "Search handwriting, typed notes and PDF text."))
                         }
                     } else if state.visibleMatches.isEmpty && !state.loading {
                         NibEmptyState(symbol: .search, title: String(localized: "No results for “\(state.query)”"),
                             message: state.isIndexing
-                                ? String(localized: "Handwriting search needs recognition to finish: \(state.remainingPages) pages left.")
+                                ? String(localized: "Handwriting search needs recognition to finish: ^[\(state.remainingPages) page](inflect: true) left.")
                                 : String(localized: "Try fewer words or choose All to search every source."))
                     } else {
                         ForEach(SearchGroup.allCases) { group in
@@ -170,6 +171,13 @@ struct SearchResults: View {
                                 }
                             }
                         }
+                        if let cursor = state.cursor {
+                            NibButton(String(localized: "Load more results"), kind: .plain) {
+                                loadMore()
+                            }
+                            .id(cursor)
+                            .onAppear { loadMore() }
+                        }
                     }
                 }
                 .foregroundStyle(NibColor.label)
@@ -181,6 +189,9 @@ struct SearchResults: View {
             }
         }
     }
+    private func loadMore() {
+        app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "more": true], session: session)
+    }
 }
 
 @MainActor
@@ -190,6 +201,7 @@ struct SearchResultRow: View {
     @ObservedObject var state: SearchState
     let hit: SearchMatch
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.displayScale) private var displayScale
     @State private var snippetImage: UIImage?
     var body: some View {
         Button {
@@ -209,9 +221,15 @@ struct SearchResultRow: View {
                 if let snippetImage {
                     Image(uiImage: snippetImage).resizable().scaledToFit()
                         .frame(width: NibMetrics.searchSnippetSize.width, height: NibMetrics.searchSnippetSize.height)
-                        .overlay {
-                            NibSwatch(highlighter: .lemon).color.opacity(NibHighlighter.lightPaperOpacity)
-                                .blendMode(.multiply)
+                        .overlay(alignment: .topLeading) {
+                            if let rect = hit.rect, let region = snippetRegion {
+                                NibSwatch(highlighter: .lemon).color.opacity(NibHighlighter.lightPaperOpacity)
+                                    .frame(width: rect.width / region.width * NibMetrics.searchSnippetSize.width,
+                                           height: rect.height / region.height * NibMetrics.searchSnippetSize.height)
+                                    .blendMode(.multiply)
+                                    .offset(x: (rect.x - region.x) / region.width * NibMetrics.searchSnippetSize.width,
+                                            y: (rect.y - region.y) / region.height * NibMetrics.searchSnippetSize.height)
+                            }
                         }
                         .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail))
                         .accessibilityHidden(true)
@@ -237,18 +255,30 @@ struct SearchResultRow: View {
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(state.selectedID == hit.id ? .isSelected : [])
         .accessibilityHint(String(localized: "Open the matching page"))
-        .task(id: hit.id) { await loadSnippet() }
+        .task(id: hit.id + String(Double(displayScale))) { await loadSnippet() }
+    }
+    private var snippetRegion: Rect? {
+        guard let rect = hit.rect, !rect.isEmpty else { return nil }
+        let aspect = Double(NibMetrics.searchSnippetSize.width / NibMetrics.searchSnippetSize.height)
+        let width = max(rect.width, rect.height * aspect) * 1.4
+        let height = width / aspect
+        return Rect(x: rect.midX - width / 2, y: rect.midY - height / 2, width: width, height: height)
     }
     private func loadSnippet() async {
-        guard hit.kind == "ink", let page = hit.page, let rect = hit.rect else { return }
+        guard hit.kind == "ink", let page = hit.page, let region = snippetRegion else { return }
+        if let cached = state.snippetImages[hit.id], cached.scale == Double(displayScale) {
+            snippetImage = cached.image
+            return
+        }
         do {
             let rendered = try await app.bus.execute(CommandIDs.renderPage,
-                ["page": .string(page), "region": try JSONValue.from(rect), "scale": 1], session: session)
+                ["page": .string(page), "region": try JSONValue.from(region), "scale": .number(Double(displayScale))], session: session)
             guard let asset = rendered["asset"]?.stringValue,
                   let url = app.services.assets?.temporaryURL(AssetRef(asset)) else { return }
             let data = try await Task.detached { try Data(contentsOf: url) }.value
             guard !Task.isCancelled else { return }
             snippetImage = UIImage(data: data)
+            if let snippetImage { state.snippetImages[hit.id] = SearchSnippet(image: snippetImage, scale: Double(displayScale)) }
         } catch {
             // The recognised text remains a complete accessible result when a page render is unavailable.
             snippetImage = nil

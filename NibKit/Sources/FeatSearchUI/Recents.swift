@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 import NibContracts
 import NibDesign
 
@@ -19,7 +20,12 @@ struct SearchMatch: Codable, Equatable, Identifiable {
     var alternative: String?
     var time: Double?
     var score: Double
-    var id: String { [ref, kind, snippet, String(time ?? -1)].joined(separator: "|") }
+    var id: String {
+        // Exact duplicate hits share an id; every field, including geometry, participates.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return (try? encoder.encode(self).base64EncodedString()) ?? ref
+    }
     var group: SearchGroup {
         if kind == "title" { return .titles }
         if kind == "outline" { return .outlines }
@@ -120,6 +126,11 @@ struct RecentRow: Identifiable {
     var id: String { ref }
 }
 
+struct SearchSnippet {
+    var image: UIImage
+    var scale: Double
+}
+
 @MainActor
 final class SearchState: ObservableObject {
     @Published var scope = "lib"
@@ -135,6 +146,11 @@ final class SearchState: ObservableObject {
     @Published var instant = false
     @Published var focusGeneration = 0
     var generation = 0
+    var cursor: String?
+    var seenCursors = Set<String>()
+    var pendingReveal: SearchMatch?
+    var snippetImages: [String: SearchSnippet] = [:]
+    var document: DocumentID? { NodeRef(scope)?.documentID }
     var flashID: String?
     var flashUntil: Date?
     var visibleMatches: [SearchMatch] { matches.filter { filter.includes($0) } }
@@ -144,13 +160,7 @@ final class SearchState: ObservableObject {
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
     var countLabel: String {
         if let selectedIndex { return String(localized: "\(selectedIndex + 1) of \(visibleMatches.count)") }
-        return String(localized: "\(visibleMatches.count) matches")
-    }
-    func stepIndex(forward: Bool) -> Int? {
-        let count = visibleMatches.count
-        guard count > 0 else { return nil }
-        guard let current = selectedIndex else { return forward ? 0 : count - 1 }
-        return (current + (forward ? 1 : count - 1)) % count
+        return String(localized: "^[\(visibleMatches.count) match](inflect: true)")
     }
 }
 
@@ -164,11 +174,17 @@ final class SearchRuntime {
     private var states: [NibID: SearchState] = [:]
     private var panelSubscriptions: [NibID: AnyCancellable] = [:]
     private var watchTask: Task<Void, Never>?
-    private var lastEvent: UInt64 = 0
+    private var documentSubscriptions: [NibID: AnyCancellable] = [:]
+    private var refreshTasks: [NibID: Task<Void, Never>] = [:]
+    private var typingTasks: [NibID: Task<Void, Never>] = [:]
     private var progress: IndexProgressPayload?
 
     init(app: NibApp) { self.app = app }
-    deinit { watchTask?.cancel() }
+    deinit {
+        watchTask?.cancel()
+        for task in refreshTasks.values { task.cancel() }
+        for task in typingTasks.values { task.cancel() }
+    }
     static func from(_ app: NibApp) -> SearchRuntime {
         if let runtime = app.services.get(key, as: SearchRuntime.self) { return runtime }
         let runtime = SearchRuntime(app: app)
@@ -189,11 +205,80 @@ final class SearchRuntime {
                 state.generation += 1
                 state.loading = false
                 state.flashID = nil
+                if let session { self?.cancelPending(session) }
                 self?.app?.ui.setNeedsChromeUpdate(session)
             }
             wasOpen = open
         }
+        documentSubscriptions[session.id] = session.$document.sink { [weak self, weak state, weak session] doc in
+            guard let self, let state, let session, state.isPresented,
+                  !state.isLibraryScope, state.document != doc else { return }
+            self.cancelPending(session)
+            state.generation += 1
+            state.matches = []
+            state.selectedID = nil
+            state.cursor = nil
+            state.flashID = nil
+            state.loading = false
+            if let doc {
+                state.scope = NodeRef.document(doc).description
+                // Published delivers in willSet; execute after the session has finished switching.
+                self.scheduleRefresh(session, state: state, delay: 0)
+            } else {
+                state.isPresented = false
+            }
+            self.app?.ui.setNeedsChromeUpdate(session)
+        }
         return state
+    }
+    func cancelPending(_ session: EditorSession) {
+        refreshTasks.removeValue(forKey: session.id)?.cancel()
+        typingTasks.removeValue(forKey: session.id)?.cancel()
+    }
+    func type(_ query: String, session: EditorSession, state: SearchState) {
+        cancelPending(session)
+        state.query = query
+        state.generation += 1
+        state.matches = []
+        state.selectedID = nil
+        state.cursor = nil
+        state.loading = true
+        typingTasks[session.id] = Task { @MainActor [weak self, weak session, weak state] in
+            do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
+            guard let self, let session, let state, state.isPresented, let app = self.app else { return }
+            do {
+                _ = try await app.bus.execute(CommandIDs.searchOpen,
+                    ["scope": .string(state.scope), "refresh": true], session: session)
+            } catch { /* load exposes the failure in the search banner. */ }
+        }
+    }
+    private func scheduleRefresh(_ session: EditorSession, state: SearchState, delay: UInt64 = 1_000_000_000) {
+        refreshTasks.removeValue(forKey: session.id)?.cancel()
+        state.generation += 1
+        refreshTasks[session.id] = Task { @MainActor [weak self, weak session, weak state] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+                while session?.inking.isInking == true {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                guard !Task.isCancelled, let self, let session, let state,
+                      state.isPresented, let app = self.app else { return }
+                _ = try await app.bus.execute(CommandIDs.searchOpen,
+                    ["scope": .string(state.scope), "refresh": true], session: session)
+            } catch { /* Cancellation is normal; load exposes other failures. */ }
+        }
+    }
+    private func contains(_ doc: DocumentID, scope: String) -> Bool {
+        if scope == "lib" { return true }
+        if let scopedDoc = NodeRef(scope)?.documentID { return scopedDoc == doc }
+        guard case .folder(let folder) = NodeRef(scope) else { return false }
+        var parent = app?.services.library?.node(doc)?.parent
+        var seen = Set<FolderID>()
+        while let current = parent, seen.insert(current).inserted {
+            if current == folder { return true }
+            parent = app?.services.library?.node(current)?.parent
+        }
+        return false
     }
     func start() {
         guard watchTask == nil, let app else { return }
@@ -204,23 +289,27 @@ final class SearchRuntime {
         }
         let stream = app.events.stream()
         let replay = app.events.events(since: 0, limit: app.events.capacity)
+        let replayEnd = replay.last?.seq ?? 0
         watchTask = Task { @MainActor [weak self] in
             for event in replay { await self?.receive(event) }
             for await event in stream {
                 guard !Task.isCancelled else { return }
-                await self?.receive(event)
+                if event.seq > replayEnd { await self?.receive(event) }
             }
         }
     }
     func receive(_ event: NibEvent) async {
-        guard event.seq > lastEvent, let app else { return }
-        lastEvent = event.seq
-        if event.type == NibEventType.docOpened, let doc = event.doc {
+        guard let app else { return }
+        let opened = event.type == NibEventType.sessionDocument ||
+            (event.type == NibEventType.docOpened && app.services.sessions.sessions.contains { $0.document == event.doc })
+        if opened, let doc = event.doc {
             recents.record(doc, at: event.at)
             // Persist through the existing registered settings command, one key per document.
             do {
-                _ = try await app.bus.execute(CommandIDs.settingsSet,
-                    ["name": .string(Self.recentPrefix + doc.raw), "value": .number(event.at)])
+                if let at = recents.documents.first(where: { $0.doc == doc })?.at {
+                    _ = try await app.bus.execute(CommandIDs.settingsSet,
+                        ["name": .string(Self.recentPrefix + doc.raw), "value": .number(at)])
+                }
                 let kept = Set(recents.documents.map { Self.recentPrefix + $0.id })
                 for name in app.settings.names(prefix: Self.recentPrefix) where !kept.contains(name) {
                     _ = try await app.bus.execute(CommandIDs.settingsSet, ["name": .string(name), "value": .null])
@@ -234,16 +323,21 @@ final class SearchRuntime {
             progress = payload
             for state in states.values { state.progress = payload }
         }
-        if event.type == NibEventType.committed || event.type == NibEventType.libraryChanged ||
-            event.type == NibEventType.docOpened || event.decode(IndexProgressPayload.self)?.running == false {
+        if event.type == NibEventType.libraryChanged || opened || event.decode(IndexProgressPayload.self)?.running == false {
             for session in app.services.sessions.sessions {
                 guard let state = states[session.id], state.isPresented else { continue }
-                app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "refresh": true], session: session)
+                if opened {
+                    guard state.scope == "lib", state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                } else if let doc = event.doc, !contains(doc, scope: state.scope) { continue }
+                scheduleRefresh(session, state: state)
             }
         }
         let live = Set(app.services.sessions.sessions.map(\.id))
         states = states.filter { live.contains($0.key) }
         panelSubscriptions = panelSubscriptions.filter { live.contains($0.key) }
+        documentSubscriptions = documentSubscriptions.filter { live.contains($0.key) }
+        for id in refreshTasks.keys where !live.contains(id) { refreshTasks.removeValue(forKey: id)?.cancel() }
+        for id in typingTasks.keys where !live.contains(id) { typingTasks.removeValue(forKey: id)?.cancel() }
     }
 
     func load(_ state: SearchState, context ctx: CommandContext) async throws {
@@ -258,49 +352,65 @@ final class SearchRuntime {
                 var rows: [RecentRow] = []
                 if state.scope == "lib" {
                     for recent in recents.documents {
-                        guard state.generation == generation else { return }
-                        let ref = NodeRef.document(recent.doc).description
-                        do {
-                            let node = try await ctx.execute(CommandIDs.queryGet, ["ref": .string(ref)])
-                            guard node["deleted"]?.boolValue != true, node["trashedAt"]?.doubleValue == nil,
-                                  node["locked"]?.boolValue != true else { continue }
-                            rows.append(RecentRow(ref: ref,
-                                title: node["title"]?.stringValue ?? node["meta"]?["title"]?.stringValue ?? String(localized: "Untitled notebook"),
-                                kind: node["kind"]?.stringValue ?? node["meta"]?["kind"]?.stringValue ?? "notebook"))
-                        } catch let error as NibError where error.code == .notFound || error.code == .locked || error.code == .permissionDenied {
-                            continue
-                        }
+                        guard let node = app?.services.library?.node(recent.doc), node.kind == .document,
+                              node.trashedAt == nil, app?.services.lock?.isLocked(recent.doc) != true else { continue }
+                        rows.append(RecentRow(ref: NodeRef.document(recent.doc).description,
+                            title: node.title, kind: node.documentKind?.rawValue ?? DocumentKind.notebook.rawValue))
                     }
                 }
                 guard generation == state.generation else { return }
                 state.matches = []
                 state.selectedID = nil
+                state.cursor = nil
+                state.seenCursors = []
+                state.snippetImages = [:]
                 state.recentRows = rows
             } else {
-                var hits: [SearchMatch] = []
-                var cursor: String?
-                var seenCursors = Set<String>()
-                repeat {
-                    var params: JSONValue = ["query": .string(query), "scope": .string(state.scope), "limit": 500]
-                    if let cursor { params = params.merging(["cursor": .string(cursor)]) }
-                    let response = try await ctx.execute(CommandIDs.searchText, params).decode(SearchResponse.self)
-                    guard generation == state.generation else { return }
-                    hits.append(contentsOf: response.results)
-                    cursor = response.truncated ? response.cursor : nil
-                    if let cursor, !seenCursors.insert(cursor).inserted {
-                        throw NibError(.invariantViolation, "Search returned a repeated result cursor.")
-                    }
-                } while cursor != nil
-                var ids = Set<String>()
-                state.matches = hits.filter { ids.insert($0.id).inserted }
+                state.cursor = nil
+                state.seenCursors = []
+                let response = try await ctx.execute(CommandIDs.searchText,
+                    ["query": .string(query), "scope": .string(state.scope), "limit": 100]).decode(SearchResponse.self)
+                guard generation == state.generation, !Task.isCancelled else { return }
+                state.matches = exactUnique(response.results)
+                state.cursor = response.truncated ? response.cursor : nil
+                state.recentRows = []
+                state.snippetImages = state.snippetImages.filter { key, _ in state.matches.contains { $0.id == key } }
                 if !state.visibleMatches.contains(where: { $0.id == state.selectedID }) { state.selectedID = nil }
             }
         } catch {
             guard generation == state.generation else { return }
+            guard !Task.isCancelled else { return }
             state.error = NibError.wrap(error).message
             state.matches = []
             state.selectedID = nil
             throw error
         }
     }
+    func loadMore(_ state: SearchState, context ctx: CommandContext) async throws {
+        guard state.isPresented, !state.loading, let cursor = state.cursor else { return }
+        let generation = state.generation
+        state.loading = true
+        defer { if state.generation == generation { state.loading = false } }
+        do {
+            guard state.seenCursors.insert(cursor).inserted else {
+                throw NibError(.invariantViolation, "Search returned a repeated result cursor.")
+            }
+            let response = try await ctx.execute(CommandIDs.searchText,
+                ["query": .string(state.query.trimmingCharacters(in: .whitespacesAndNewlines)),
+                 "scope": .string(state.scope), "limit": 100, "cursor": .string(cursor)]).decode(SearchResponse.self)
+            guard generation == state.generation, !Task.isCancelled else { return }
+            state.matches = exactUnique(state.matches + response.results)
+            state.cursor = response.truncated ? response.cursor : nil
+        } catch {
+            guard generation == state.generation, !Task.isCancelled else { return }
+            state.error = NibError.wrap(error).message
+            throw error
+        }
+    }
+    private func exactUnique(_ hits: [SearchMatch]) -> [SearchMatch] {
+        var result: [SearchMatch] = []
+        for hit in hits where !result.contains(hit) { result.append(hit) }
+        return result
+    }
+
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import SwiftUI
 import UIKit
 import NibContracts
@@ -31,7 +32,7 @@ public enum FeatSearchUIFeature: NibFeature {
         library.providesHeader = true
         app.ui.panels.register(library)
         var toolbar = ToolbarItemDescriptor(id: "searchui.find", title: String(localized: "Find in document"),
-            icon: NibSymbol.search.name, group: .navTrailing, order: 20, owner: id,
+            icon: NibSymbol.search.name, group: .navLeading, order: 200, owner: id,
             command: CommandIDs.searchOpen, params: ["scope": "document"],
             shortcut: KeyShortcut("f", [.command]), docKinds: Set(DocumentKind.allCases))
         toolbar.isOn = { $0.openPanels.contains(SearchOpen.documentPanel) }
@@ -57,7 +58,7 @@ public enum FeatSearchUIFeature: NibFeature {
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.field", owner: id, placement: .top,
             surface: .none, isVisible: { context in
                 let state = SearchRuntime.from(context.app).state(context.session)
-                return !context.isCompact && !state.isLibraryScope && state.isPresented
+                return !context.isCompact && !state.isLibraryScope && state.isPresented && state.document == context.session.document
             }, makeView: { context in
                 AnyView(DocumentSearchField(app: context.app, session: context.session,
                     state: SearchRuntime.from(context.app).state(context.session)))
@@ -65,7 +66,7 @@ public enum FeatSearchUIFeature: NibFeature {
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.counter", owner: id, placement: .bottom, surface: .none,
             isVisible: { context in
                 let state = SearchRuntime.from(context.app).state(context.session)
-                return !state.isLibraryScope && state.isPresented && !state.visibleMatches.isEmpty
+                return !state.isLibraryScope && state.isPresented && state.document == context.session.document && !state.visibleMatches.isEmpty
             }, makeView: { context in
                 AnyView(SearchCounter(app: context.app, session: context.session,
                     state: SearchRuntime.from(context.app).state(context.session)))
@@ -86,6 +87,7 @@ struct SearchOpen: NibCommand {
         var close: Bool?
         var instant: Bool?
         var refresh: Bool?
+        var more: Bool?
     }
     // Raw-string decoding yields invalid_params for unsupported filters.
     enum SearchFilterValue: String, Codable { case all, handwriting, typed, pdf, audio, cards }
@@ -96,20 +98,28 @@ struct SearchOpen: NibCommand {
             "query": .str("words to find; empty shows recently opened documents"),
             "filter": .str(choices: SearchFilter.allCases.map(\.rawValue)),
             "match": .int("zero-based index in filtered results", min: 0), "close": .bool(),
-            "instant": .bool("keyboard invocation, no animation"), "refresh": .bool("refresh without reopening")], required: ["scope"]),
+            "instant": .bool("keyboard invocation, no animation"), "refresh": .bool("refresh without reopening"), "more": .bool("load the next page of results")], required: ["scope"]),
         examples: [["scope": "lib"], ["scope": "doc:FIXTUREDOC01", "query": "Hello"]],
         effect: .session, target: .app, undoable: false)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard let app = ctx.app, let session = ctx.activeSession else { throw NibError(.unavailable, "Search needs an active window.") }
-        let scope = try resolvedScope(p.scope, session: session)
         let runtime = SearchRuntime.from(app)
         let state = runtime.state(session)
+        if p.refresh == true && !state.isPresented { return output(state) }
+        if p.more == true {
+            guard try resolvedScope(p.scope, session: session) == state.scope else { return output(state) }
+            try await runtime.loadMore(state, context: ctx)
+            return output(state)
+        }
+        if p.refresh != true { runtime.cancelPending(session) }
         if p.close == true {
             state.isPresented = false
             state.generation += 1
             state.loading = false
             state.flashID = nil
+            state.pendingReveal = nil
+            state.cursor = nil
             session.floatingHost?.dismiss(libraryOverlay)
             if session.openPanels.contains(libraryPanel) || session.openPanels.contains(documentPanel) {
                 _ = try await ctx.execute(CommandIDs.panelClose, ["id": .string(state.isLibraryScope ? libraryPanel : documentPanel)])
@@ -117,7 +127,11 @@ struct SearchOpen: NibCommand {
             app.ui.setNeedsChromeUpdate(session)
             return output(state)
         }
-        if scope != state.scope {
+        let scope = try resolvedScope(p.scope, session: session)
+        let scopeChanged = scope != state.scope
+        if scopeChanged {
+            state.generation += 1
+            state.cursor = nil
             state.scope = scope
             state.query = ""
             state.filter = .all
@@ -145,10 +159,16 @@ struct SearchOpen: NibCommand {
                 }
             }
         }
-        if p.match == nil && (changed || p.filter == nil || state.matches.isEmpty) {
+        let requestedQuery = state.query
+        if changed || scopeChanged || state.matches.isEmpty || p.refresh == true || (p.match == nil && p.filter == nil) {
             try await runtime.load(state, context: ctx)
         }
         if let index = p.match {
+            guard state.isPresented, state.scope == scope, state.query == requestedQuery, !Task.isCancelled else { return output(state) }
+            while !state.visibleMatches.indices.contains(index), state.cursor != nil, !state.loading {
+                try await runtime.loadMore(state, context: ctx)
+            }
+            guard state.isPresented, state.scope == scope, state.query == requestedQuery, !Task.isCancelled else { return output(state) }
             guard state.visibleMatches.indices.contains(index) else {
                 throw NibError(.invalidParams, "The search result no longer exists.", path: "$.match", hint: "Call search.open with the query again.")
             }
@@ -177,11 +197,17 @@ struct SearchOpen: NibCommand {
         }
         var params: JSONValue = ["doc": .string(hit.doc), "mode": "replace"]
         if let page = hit.page { params = params.merging(["page": .string(page)]) }
+        state.selectedID = hit.id
+        state.pendingReveal = hit
+        defer { if state.pendingReveal == hit { state.pendingReveal = nil } }
         if session.document != doc || session.editor == nil {
             _ = try await ctx.execute(CommandIDs.docOpen, params)
         }
-        guard session.document == doc else { throw NibError(.unavailable, "The document could not be opened.") }
-        state.selectedID = hit.id
+        if session.document != doc {
+            let switched = await DocumentSwitchWaiter.wait(session: session, document: doc)
+            guard switched else { return } // A refused or cancelled open gate is quiet.
+        }
+        guard session.document == doc, state.pendingReveal == hit else { return }
         if let page = hit.page.flatMap({ NodeRef($0)?.pageID }) {
             session.page = page
             session.editor?.reveal(page: page, rect: hit.rect, animated: false)
@@ -190,6 +216,9 @@ struct SearchOpen: NibCommand {
         } else if case .card = NodeRef(hit.ref) {
             // The shared reveal command can address non-page editor nodes by reference.
             _ = try await ctx.execute(CommandIDs.viewReveal, ["ref": .string(hit.ref)])
+        }
+        if hit.kind == "transcript", let time = hit.time {
+            _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(hit.ref), "t": .number(time)])
         }
         state.flashID = hit.id
         state.flashUntil = Date().addingTimeInterval(NibMotion.hudLinger)
@@ -214,13 +243,54 @@ struct SearchStep: NibCommand {
         examples: [["direction": "next"], ["direction": "previous"]], effect: .session, target: .app, undoable: false)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> SearchOpen.Output {
         guard let app = ctx.app, let session = ctx.activeSession else { throw NibError(.unavailable, "Search needs an active window.") }
-        let state = SearchRuntime.from(app).state(session)
-        guard state.isPresented, !state.isLibraryScope, let index = state.stepIndex(forward: p.direction == "next") else {
+        let runtime = SearchRuntime.from(app)
+        let state = runtime.state(session)
+        guard state.isPresented, !state.isLibraryScope, state.document == session.document else {
             return SearchOpen.output(state)
         }
-        try await SearchOpen.navigate(state.visibleMatches[index], state: state, context: ctx)
+        let forward = p.direction == "next"
+        if forward, state.selectedIndex == state.visibleMatches.count - 1, state.cursor != nil {
+            try await runtime.loadMore(state, context: ctx)
+        }
+        let hits = state.visibleMatches.filter { NodeRef($0.doc)?.documentID == session.document }
+        guard !hits.isEmpty else { return SearchOpen.output(state) }
+        let current = hits.firstIndex { $0.id == state.selectedID }
+        let index = current.map { ($0 + (forward ? 1 : hits.count - 1)) % hits.count } ?? (forward ? 0 : hits.count - 1)
+        try await SearchOpen.navigate(hits[index], state: state, context: ctx)
         return SearchOpen.output(state)
     }
 }
 
 extension Notification.Name { static let searchHighlightsChanged = Notification.Name("NibSearchHighlightsChanged") }
+
+/// Observes a gated document open without assuming the shell replaces its editor synchronously.
+@MainActor
+private final class DocumentSwitchWaiter {
+    private var subscription: AnyCancellable?
+    private var timeout: Task<Void, Never>?
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    static func wait(session: EditorSession, document: DocumentID) async -> Bool {
+        if session.document == document { return true }
+        let waiter = DocumentSwitchWaiter()
+        return await withCheckedContinuation { continuation in
+            waiter.continuation = continuation
+            waiter.subscription = session.$document.sink { value in
+                if value == document { waiter.finish(true) }
+            }
+            waiter.timeout = Task { @MainActor in
+                do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
+                waiter.finish(false)
+            }
+        }
+    }
+    private func finish(_ switched: Bool) {
+        guard let continuation else { return }
+        self.continuation = nil
+        subscription?.cancel()
+        subscription = nil
+        timeout?.cancel()
+        timeout = nil
+        continuation.resume(returning: switched)
+    }
+}

@@ -24,6 +24,8 @@ final class FeatSearchUITests: XCTestCase {
             params: .obj(["ref": .ref], required: ["ref"]), effect: .read)) { p, _ in
                 guard let ref = p["ref"]?.stringValue, let doc = NodeRef(ref)?.documentID,
                       let node = h.library.node(doc) else { throw NibError.notFound("document") }
+                // F003 loads content and emits this event on its first document read.
+                h.app.events.emit(NibEventType.docOpened, doc: doc)
                 return ["ref": .string(ref), "title": .string(node.title), "kind": "notebook"]
             }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel", summary: "Test panel host.",
@@ -38,8 +40,13 @@ final class FeatSearchUITests: XCTestCase {
             }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open Document", summary: "Test document navigator.",
             params: .anything(), effect: .session)) { p, ctx in
-                ctx.activeSession?.document = p["doc"]?.stringValue.flatMap { NodeRef($0)?.documentID }
-                ctx.activeSession?.page = p["page"]?.stringValue.flatMap { NodeRef($0)?.pageID }
+                let session = ctx.activeSession
+                // Match the shell's async openGate path instead of hiding it with a synchronous switch.
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    session?.document = p["doc"]?.stringValue.flatMap { NodeRef($0)?.documentID }
+                    session?.page = p["page"]?.stringValue.flatMap { NodeRef($0)?.pageID }
+                }
                 return [:]
             }
     }
@@ -97,10 +104,15 @@ final class FeatSearchUITests: XCTestCase {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let result = hit(Fixtures.boardID, doc: Fixtures.whiteboardID, docKind: "whiteboard")
         installDependencies(h, hits: [result])
+        let editor = SearchTestEditor(h)
+        h.session.editor = editor
         try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Hello"])
         try await h.run(CommandIDs.searchOpen, ["scope": "lib", "match": 0])
         XCTAssertEqual(h.session.document, Fixtures.whiteboardID)
         XCTAssertEqual(h.session.page, Fixtures.boardID)
+        XCTAssertEqual(editor.lastPage, Fixtures.boardID)
+        XCTAssertEqual(editor.lastRect, result.rect)
+        XCTAssertFalse(editor.animated)
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertEqual(state.flashID, result.id)
         XCTAssertGreaterThan(try XCTUnwrap(state.flashUntil), Date())
@@ -167,14 +179,21 @@ final class FeatSearchUITests: XCTestCase {
         h.app.commands.register(CommandDescriptor(id: CommandIDs.searchText, title: "Search", summary: "Paged index fake.",
             params: .anything(), effect: .read)) { params, _ in
                 calls += 1
+                XCTAssertEqual(params["limit"]?.intValue, 100)
                 if params["cursor"] == nil {
                     return try JSONValue.from(SearchResponse(results: [first], total: 2, truncated: true, cursor: "next"))
                 }
                 return try JSONValue.from(SearchResponse(results: [first, second], total: 2, truncated: false))
             }
         try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+        let state = SearchRuntime.from(h.app).state(h.session)
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(state.matches.count, 1)
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "match": 0])
+        try await h.run(CommandIDs.searchStep, ["direction": "next"])
         XCTAssertEqual(calls, 2)
-        XCTAssertEqual(SearchRuntime.from(h.app).state(h.session).matches.count, 2)
+        XCTAssertEqual(state.matches.count, 2)
+        XCTAssertEqual(state.selectedID, second.id)
     }
 
     func testLateQueryResponseCannotReplaceNewResults() async throws {
@@ -200,6 +219,200 @@ final class FeatSearchUITests: XCTestCase {
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertEqual(state.matches.map(\.text), ["new"])
         XCTAssertFalse(state.loading)
+    }
+
+    func testRecentsUseCatalogWithoutQueryGetAndIgnoreBackgroundReads() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        // Drain replay first so initial fixture opens cannot overwrite the test's timestamps.
+        for _ in 0..<20 { await Task.yield() }
+        runtime.recents.record(Fixtures.docID, at: Date().timeIntervalSince1970 + 1)
+        runtime.recents.record(Fixtures.textDocID, at: Date().timeIntervalSince1970 + 2)
+        runtime.recents.record(Fixtures.whiteboardID, at: Date().timeIntervalSince1970 + 3)
+        let before = runtime.recents.documents
+        var reads = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Get", summary: "Emitting read fake.",
+            params: .anything(), effect: .read)) { p, _ in
+                reads += 1
+                let doc = p["ref"]?.stringValue.flatMap { NodeRef($0)?.documentID }
+                h.app.events.emit(NibEventType.docOpened, doc: doc)
+                return ["title": "A read"]
+            }
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib"])
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "refresh": true])
+        XCTAssertEqual(reads, 0)
+        XCTAssertEqual(runtime.recents.documents, before)
+        XCTAssertEqual(runtime.state(h.session).recentRows.map(\.ref), before.map { NodeRef.document($0.doc).description })
+        // Actually exercise the emitting fake for a background document read.
+        try await h.run(CommandIDs.queryGet, ["ref": "doc:FIXTUREDOC02"])
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(runtime.recents.documents, before)
+        XCTAssertFalse(runtime.recents.documents.contains { $0.doc == Fixtures.studySetID })
+    }
+
+    func testReopeningCachedDocumentMovesItToTop() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        for _ in 0..<20 { await Task.yield() }
+        _ = try h.app.workspace.content(Fixtures.docID)
+        _ = try h.app.workspace.content(Fixtures.textDocID)
+        h.session.document = Fixtures.textDocID
+        for _ in 0..<20 { await Task.yield() }
+        h.session.document = Fixtures.docID
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(runtime.recents.documents.first?.doc, Fixtures.docID)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib"])
+        XCTAssertEqual(runtime.state(h.session).recentRows.first?.ref, "doc:FIXTUREDOC01")
+    }
+
+    func testRecentsExcludeTrashedLockedAndMissingCatalogEntries() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        for _ in 0..<20 { await Task.yield() }
+        for (index, doc) in Fixtures.allDocuments.enumerated() { runtime.recents.record(doc, at: Double(index)) }
+        runtime.recents.record("MISSINGDOC", at: 100)
+        runtime.recents.record(Fixtures.folderID, at: 101)
+        try h.library.trash(Fixtures.textDocID)
+        let lock = FakeLockService()
+        lock.locked.insert(Fixtures.studySetID)
+        h.app.services.lock = lock
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib"])
+        XCTAssertEqual(Set(runtime.state(h.session).recentRows.map(\.ref)), ["doc:FIXTUREDOC01", "doc:FIXTUREDOC04"])
+    }
+
+    func testDocumentSwitchRescopesKeepsQueryAndStepCannotOpenOldDocument() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [hit()])
+        let runtime = SearchRuntime.from(h.app)
+        try await h.run(CommandIDs.searchOpen, ["scope": "page:FIXTUREDOC01/FIXTUREPG001", "query": "Hello"])
+        let state = runtime.state(h.session)
+        h.session.document = Fixtures.textDocID
+        XCTAssertEqual(state.scope, "doc:FIXTUREDOC02")
+        XCTAssertEqual(state.query, "Hello")
+        XCTAssertTrue(state.matches.isEmpty)
+        try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(h.session.document, Fixtures.textDocID)
+        // Even a stale or malformed backend hit must not take Command-G back to A.
+        state.matches = [hit()]
+        try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(h.session.document, Fixtures.textDocID)
+        h.session.document = nil
+        XCTAssertFalse(state.isPresented)
+        XCTAssertTrue(state.matches.isEmpty)
+    }
+
+    func testQueryAndMatchInOneCallSelectNewQuery() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let old = hit(text: "old")
+        let new = hit(Fixtures.page2, text: "new")
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.searchText, title: "Search", summary: "Query-aware fake.",
+            params: .anything(), effect: .read)) { p, _ in
+                let result = p["query"]?.stringValue == "new" ? new : old
+                return try JSONValue.from(SearchResponse(results: [result], total: 1, truncated: false))
+            }
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "old"])
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "new", "match": 0])
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+        let state = SearchRuntime.from(h.app).state(h.session)
+        XCTAssertEqual(state.selectedID, new.id)
+        XCTAssertEqual(state.matches, [new])
+    }
+
+    func testCommitsDoNotRefreshAndIndexCompletionCoalescesWhileInking() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        for _ in 0..<20 { await Task.yield() }
+        var calls = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.searchText, title: "Search", summary: "Counting index fake.",
+            params: .anything(), effect: .read)) { _, _ in
+                calls += 1
+                return try JSONValue.from(SearchResponse(results: [self.hit()], total: 1, truncated: false))
+            }
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+        for _ in 0..<30 { h.app.events.emit(NibEventType.committed, doc: Fixtures.docID) }
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(calls, 1, "Pen commits must not bypass the indexer's debounce")
+        h.session.inking.begin()
+        for _ in 0..<10 { h.app.events.emit(IndexProgressPayload(running: false, done: 1, total: 1, pending: 0), doc: Fixtures.docID) }
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(calls, 1)
+        h.session.inking.end()
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(calls, 2)
+        h.app.events.emit(IndexProgressPayload(running: false, done: 1, total: 1, pending: 0), doc: Fixtures.textDocID)
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(calls, 2, "Another document is outside this search scope")
+    }
+
+    func testTypingDebouncesAndCloseCancelsPendingWork() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        let runtime = SearchRuntime.from(h.app)
+        let state = runtime.state(h.session)
+        try await h.run(CommandIDs.searchOpen, ["scope": "document"])
+        var queries: [String] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.searchText, title: "Search", summary: "Typing fake.",
+            params: .anything(), effect: .read)) { p, _ in
+                queries.append(p["query"]?.stringValue ?? "")
+                return try JSONValue.from(SearchResponse(results: [], total: 0, truncated: false))
+            }
+        let binding = searchBinding(app: h.app, session: h.session, state: state)
+        for query in ["h", "he", "hel", "hello"] { binding.wrappedValue = query }
+        XCTAssertEqual(state.query, "hello")
+        XCTAssertTrue(queries.isEmpty)
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(queries, ["hello"])
+        binding.wrappedValue = "closed"
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "close": true])
+        try await Task.sleep(nanoseconds: 250_000_000)
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "refresh": true])
+        XCTAssertEqual(queries, ["hello"])
+        XCTAssertFalse(state.isPresented)
+    }
+
+    func testDistinctRectanglesAreNotDeduplicated() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let first = hit()
+        var second = first
+        second.rect = Rect(x: 72, y: 240, width: 210, height: 30)
+        XCTAssertNotEqual(first.id, second.id)
+        installDependencies(h, hits: [first, first, second])
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+        let state = SearchRuntime.from(h.app).state(h.session)
+        XCTAssertEqual(state.matches, [first, second])
+        try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(state.selectedID, second.id)
+    }
+
+    func testTranscriptResultSeeksAndPlaysMatchedTime() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        var transcript = hit(kind: "transcript")
+        transcript.ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
+        transcript.time = 42
+        installDependencies(h, hits: [transcript])
+        var played: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.audioPlay, title: "Play", summary: "Playback fake.",
+            params: .anything(), effect: .session)) { p, _ in played = p; return [:] }
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Hello", "match": 0])
+        XCTAssertEqual(played?["clip"]?.stringValue, transcript.ref)
+        XCTAssertEqual(played?["t"]?.doubleValue, 42)
+    }
+
+    func testOutOfOrderEventsAreStillReceived() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        // No stream watcher: deliver the events in reverse sequence explicitly.
+        let runtime = SearchRuntime(app: h.app)
+        let opened = h.app.events.emit(NibEventType.sessionDocument, doc: Fixtures.textDocID)
+        let progress = h.app.events.emit(IndexProgressPayload(running: false, done: 10, total: 10, pending: 0))
+        await runtime.receive(progress)
+        await runtime.receive(opened)
+        XCTAssertEqual(runtime.recents.documents.first?.doc, Fixtures.textDocID)
     }
 
     func testHighlightsTransformAndHideDuringLiveInk() {
