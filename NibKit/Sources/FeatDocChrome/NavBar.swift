@@ -49,18 +49,21 @@ struct NavStatusItem: Identifiable, Equatable {
 struct NavBarItems: Equatable {
     var leading: [NavItem]
     var trailing: [NavItem]
+    /// iPad: a separate 44 pt droplet, 16 pt beyond the editing group.
+    var assistant: NavItem? = nil
     /// Compact windows: items that moved into More.
     var overflow: [NavItem] = []
     /// Optional status controls in the leading group, immediately after the title (contracts-v2.3).
     var afterTitle: [NavStatusItem] = []
 }
 
-/// Builds the nav bar (D-079): leading Library, Sidebar, Search, Assistant, Read Only, Bookmark; trailing Add Page,
-/// Share and Export, More; plus every `ui.toolbar` item registered for `navLeading` / `navTrailing`, with its live
-/// state evaluated for the window's session (contracts-v2 `isOn`, `isEnabled`, `sessionParams`, `sessionTitle`,
-/// `sessionIcon`). A feature that registers its own item for one of these commands replaces the chrome's built-in one.
+/// Builds the §14.2 bar composition by action, keeping feature-provided live state and parameters. Library and
+/// title/status lead; Undo, Redo, Search, Bookmark, Share and More trail, followed by the separate assistant droplet.
+/// Remaining registered actions stay reachable through More. A feature's action replaces its built-in equivalent.
 @MainActor
 enum NavBarModel {
+    static let undo = "chrome.nav.undo"
+    static let redo = "chrome.nav.redo"
     static let library = "chrome.nav.library"
     static let sidebar = "chrome.nav.sidebar"
     static let search = "chrome.nav.search"
@@ -127,7 +130,8 @@ enum NavBarModel {
         }
         if let panel = input.assistantPanel,
            !taken("panel.open", { $0["id"]?.stringValue == panel }),
-           !taken("panel.close", { $0["id"]?.stringValue == panel }) {
+           !taken("panel.close", { $0["id"]?.stringValue == panel }),
+           !features.contains(where: { isAssistant($0) }) {
             let isOpen = input.assistantOpen
             leading.append(NavItem(id: assistant, title: String(localized: "Assistant"),
                                    symbol: isOpen ? NibSymbol.assistantOpen : NibSymbol.assistant, isOn: isOpen,
@@ -148,6 +152,14 @@ enum NavBarModel {
                                    action: .command("page.setBookmarked", ["pages": pages, "on": .bool(!on)])))
         }
 
+        for (id, command, title, symbol) in [
+            (undo, "edit.undo", String(localized: "Undo"), NibSymbol.undo),
+            (redo, "edit.redo", String(localized: "Redo"), NibSymbol.redo)
+        ] where input.commandExists(command) && !taken(command) {
+            trailing.append(NavItem(id: id, title: title, symbol: symbol, order: 0,
+                                    action: .command(command, ["doc": .string(NodeRef.document(input.doc).description)])))
+        }
+
         if input.hasMenu(.addPage) {
             trailing.append(NavItem(id: addPage, title: String(localized: "Add Page"), symbol: .addPage, order: 800,
                                     action: .menu(.addPage)))
@@ -163,41 +175,44 @@ enum NavBarModel {
         let afterTitle = statuses.sorted { ($0.order, $0.id) < ($1.order, $1.id) }.map {
             NavStatusItem(id: $0.id, showsInCompactWidth: $0.showsInCompactWidth)
         }
-        return NavBarItems(leading: leading.sorted(by: byOrder), trailing: trailing.sorted(by: byOrder),
+        let all = (leading + trailing).sorted(by: byOrder)
+        let assistantItem = all.first { isAssistant($0) }
+        let editing = all.filter { editingOrder($0) != nil }.sorted {
+            (editingOrder($0) ?? 0, $0.order, $0.id) < (editingOrder($1) ?? 0, $1.order, $1.id)
+        }
+        return NavBarItems(leading: all.filter { $0.id == library }, trailing: editing, assistant: assistantItem,
+                           overflow: all.filter { $0.id != library && !isAssistant($0) && editingOrder($0) == nil },
                            afterTitle: afterTitle)
     }
 
-    /// Compact windows (DESIGN.md §14.2, iPhone): leading keeps Library (the title joins it); trailing keeps the first
-    /// feature item (Undo), the Assistant and More; everything else moves into More. Items registered for regular
-    /// widths only (`showsInCompactWidth` false) do not show at all. After-title status controls keep their slot;
-    /// their providers collapse the label to the dot using `ChromeContext.isCompact`.
+    static func isAssistant(_ item: NavItem) -> Bool {
+        if item.id == assistant { return true }
+        guard case let .command(command, params) = item.action else { return false }
+        return command == "ai.chat.open" || command == "ai.chat.close"
+            || (["panel.open", "panel.close"].contains(command) && params["id"]?.stringValue == PanelIDs.assistant)
+    }
+
+    static func editingOrder(_ item: NavItem) -> Int? {
+        if case let .command(command, _) = item.action {
+            return ["edit.undo": 0, "edit.redo": 1, "search.open": 2, "page.setBookmarked": 3][command]
+        }
+        if item.id == share { return 4 }
+        if item.id == more { return 5 }
+        return nil
+    }
+
+    /// Compact navigation retains these actions by command identity, independent of registry placement or order.
     static func split(_ items: NavBarItems, compact: Bool) -> NavBarItems {
         guard compact else { return items }
-        var leading: [NavItem] = []
-        var assistantItem: NavItem?
-        var kept: NavItem?
-        var more: NavItem?
-        var overflow: [NavItem] = []
-        for item in items.leading where item.showsInCompactWidth {
-            switch item.id {
-            case library: leading.append(item)
-            case assistant: assistantItem = item
-            default: overflow.append(item)
-            }
-        }
-        for item in items.trailing where item.showsInCompactWidth {
-            if item.id == NavBarModel.more {
-                more = item
-            } else if case .menu = item.action {
-                overflow.append(item)
-            } else if kept == nil {
-                kept = item
-            } else {
-                overflow.append(item)
-            }
-        }
-        let trailing = [kept, assistantItem, more].compactMap { $0 }
-        return NavBarItems(leading: leading, trailing: trailing, overflow: overflow,
+        let all = items.leading + items.trailing + [items.assistant].compactMap { $0 } + items.overflow
+        let undoItem = all.first { if case .command("edit.undo", _) = $0.action { return true }; return false }
+        let assistantItem = all.first { isAssistant($0) }
+        let moreItem = all.first { $0.id == more }
+        let leading = all.filter { $0.id == library }
+        let trailing = [undoItem, assistantItem, moreItem].compactMap { $0 }
+        let kept = Set((leading + trailing).map(\.id))
+        return NavBarItems(leading: leading, trailing: trailing,
+                           overflow: all.filter { !kept.contains($0.id) && $0.showsInCompactWidth },
                            afterTitle: items.afterTitle.filter(\.showsInCompactWidth))
     }
 
@@ -273,9 +288,21 @@ struct NavBarView: View {
             .layoutPriority(1)
             Spacer(minLength: NibSpacing.l)
             NibBarGroup(id: "chrome.bar.trailing") {
-                ForEach(items.trailing) { item in button(item) }
+                ForEach(items.trailing) { item in
+                    if !compact, NavBarModel.editingOrder(item) == 2,
+                       items.trailing.contains(where: { (NavBarModel.editingOrder($0) ?? 6) < 2 }) {
+                        NibBarSeparator()
+                    }
+                    button(item)
+                }
             }
             .fixedSize(horizontal: true, vertical: false)
+            if let assistant = items.assistant {
+                button(assistant)
+                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+                    .droplet("chrome.bar.assistant", style: .bar)
+                    .padding(.leading, NibSpacing.l)
+            }
         }
     }
 

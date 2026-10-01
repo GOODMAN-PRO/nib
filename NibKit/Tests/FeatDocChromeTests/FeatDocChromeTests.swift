@@ -160,6 +160,151 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(ChromeRegion.avoidingKeyboard(CGRect(x: 0, y: 834, width: 1194, height: 334), in: region), region)
     }
 
+    func testAssistantDefaultsToTrailingRegardlessOfDescriptorOrNavigatorPreference() async throws {
+        for placement in [PanelPlacement.floating, .sidebarTab] {
+            let assistant = panel(PanelIDs.assistant, placement)
+            for right in [false, true] {
+                XCTAssertEqual(PanelResolver.spot(of: assistant, override: nil, sidebarOnRight: right), .right)
+                XCTAssertEqual(PanelResolver.spot(of: assistant, override: "floating", sidebarOnRight: right), .floating)
+                XCTAssertEqual(PanelResolver.spot(of: assistant, override: "left", sidebarOnRight: right), .left)
+            }
+        }
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        h.app.ui.panels.register(panel(PanelIDs.assistant, .floating))
+        try await h.run("panel.open", ["id": .string(PanelIDs.assistant), "params": ["thread": "kept"]])
+        let state = try chromeState(h)
+        XCTAssertEqual(state.spot(of: PanelIDs.assistant), .right)
+        XCTAssertEqual(state.params[PanelIDs.assistant], ["thread": "kept"])
+        XCTAssertTrue(state.floating.isEmpty)
+        h.app.settings.setJSON(ChromeSettings.placementName(PanelIDs.assistant), "floating")
+        try await h.run("panel.open", ["id": .string(PanelIDs.assistant)])
+        XCTAssertEqual(state.spot(of: PanelIDs.assistant), .floating)
+        XCTAssertEqual(state.params[PanelIDs.assistant], ["thread": "kept"])
+        XCTAssertEqual(ChromeLayout.floatingHeight, 560)
+    }
+
+    func testAssistantLandscapeReservesItsFullWidthEvenBelowSidebarBreakpoint() throws {
+        for size in [CGSize(width: 1194, height: 834), CGSize(width: 844, height: 700)] {
+            let layout = ChromeLayout(size: size, safeArea: .zero, left: nil, right: NibMetrics.panelWidth,
+                                      mode: .sidebar, assistantTrailing: true)
+            let panel = try XCTUnwrap(layout.right)
+            XCTAssertEqual(panel.width, 344)
+            XCTAssertEqual(layout.presentation, .docked)
+            XCTAssertEqual(layout.editor.maxX, panel.minX)
+            XCTAssertLessThanOrEqual(layout.toolbar.maxX, panel.minX)
+            XCTAssertNil(layout.assistantBottom)
+        }
+    }
+
+    func testAssistantPortraitDetentsReserveBottomClearanceAndSurviveRotation() throws {
+        let state = ChromeState()
+        state.open(PanelIDs.assistant, at: .right, params: ["thread": "kept"])
+        let safe = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
+        for detent in AssistantDetent.allCases {
+            state.assistantDetent = detent
+            let portrait = ChromeLayout(size: CGSize(width: 834, height: 1194), safeArea: safe,
+                                        left: nil, right: 344, mode: .sidebar,
+                                        assistantTrailing: true, assistantDetent: state.assistantDetent)
+            let panel = try XCTUnwrap(portrait.assistantBottom)
+            XCTAssertEqual(panel.width, 802)
+            XCTAssertEqual(panel.height, 1150 * detent.fraction, accuracy: 0.001)
+            XCTAssertEqual(portrait.editor.maxY - portrait.editorInsets.bottom, panel.minY - NibSpacing.l)
+            XCTAssertLessThanOrEqual(portrait.toolbar.maxY, panel.minY - NibSpacing.l)
+            XCTAssertNil(portrait.right)
+            let landscape = ChromeLayout(size: CGSize(width: 1194, height: 834), safeArea: safe,
+                                         left: nil, right: 344, mode: .sidebar,
+                                         assistantTrailing: true, assistantDetent: state.assistantDetent)
+            XCTAssertNil(landscape.assistantBottom)
+            XCTAssertEqual(state.assistantDetent, detent)
+            XCTAssertEqual(state.params[PanelIDs.assistant], ["thread": "kept"])
+        }
+        XCTAssertEqual(AssistantDetent.medium.released(translation: -100), .expanded)
+        XCTAssertEqual(AssistantDetent.expanded.released(translation: 100), .medium)
+        XCTAssertEqual(AssistantDetent.medium.released(translation: -5), .medium)
+    }
+
+    func testAssistantPhoneRemainsASheetWithoutAnInvisibleReservedColumn() {
+        let state = ChromeState()
+        state.open(PanelIDs.assistant, at: .right)
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 874, height: 402)] {
+            let layout = ChromeLayout(size: size, safeArea: .zero, left: nil, right: 344, mode: .sidebar,
+                                      idiom: .phone, assistantTrailing: true)
+            XCTAssertEqual(PresentedSheet.current(state, compact: layout.isCompact), .sidebar(.right))
+            XCTAssertNil(layout.right)
+            XCTAssertNil(layout.assistantBottom)
+            XCTAssertEqual(layout.editor.size, size)
+        }
+    }
+
+    func testEveryPaletteDockReservesTheFusedFootprintInEditorAndOverlayRegions() {
+        let size = CGSize(width: 1194, height: 834)
+        for edge in NibDock.allCases {
+            var layout = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
+            layout.avoidPalette(NibPaletteDock(edge: edge), thickness: 56,
+                                optionsSize: CGSize(width: 280, height: 44))
+            switch edge {
+            case .top:
+                XCTAssertEqual(layout.editorInsets.top, 68 + 56 + 44 - 1 + 16)
+                XCTAssertEqual(layout.overlayRegion.minY, layout.editorInsets.top)
+            case .bottom:
+                XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 44 - 1 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxY, size.height - layout.editorInsets.bottom)
+            case .leading:
+                XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 280 - 1 + 16)
+                XCTAssertEqual(layout.overlayRegion.minX, layout.editorInsets.left)
+            case .trailing:
+                XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 280 - 1 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxX, size.width - layout.editorInsets.right)
+            }
+            XCTAssertEqual(layout.editor.size, size, "content still scrolls under the palette")
+        }
+    }
+
+    func testMeasuredOptionsWidthChangesSideClearanceAndClosingChromeRestoresIt() {
+        let size = CGSize(width: 1194, height: 834)
+        let closed = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
+        var narrow = closed
+        var wide = closed
+        narrow.avoidPalette(NibPaletteDock(edge: .leading), thickness: 56,
+                            optionsSize: CGSize(width: 200, height: 44))
+        wide.avoidPalette(NibPaletteDock(edge: .leading), thickness: 56,
+                          optionsSize: CGSize(width: 320, height: 44))
+        XCTAssertEqual(wide.editorInsets.left - narrow.editorInsets.left, 120)
+        XCTAssertEqual(closed.editorInsets.left, 0)
+        var rightSidebar = ChromeLayout(size: size, safeArea: .zero, left: nil, right: 344,
+                                       mode: .sidebar, assistantTrailing: true)
+        rightSidebar.avoidPalette(NibPaletteDock(edge: .trailing), thickness: 56,
+                                  optionsSize: CGSize(width: 200, height: 44))
+        XCTAssertEqual(rightSidebar.editorInsets.right, 16 + 56 + 200 - 1 + 16,
+                       "the sidebar's reserved width is not counted again inside the editor")
+    }
+
+    func testPhoneLandscapePaletteLeavesAUsableViewportWithoutDoubleCountingCanvasInsets() {
+        let safe = UIEdgeInsets(top: 0, left: 59, bottom: 21, right: 59)
+        var layout = ChromeLayout(size: CGSize(width: 874, height: 402), safeArea: safe,
+                                  left: nil, right: nil, mode: .sidebar, idiom: .phone, verticalSizeClass: .compact)
+        layout.avoidPalette(NibPaletteDock(edge: .bottom), thickness: 56, optionsSize: CGSize(width: 280, height: 44))
+        XCTAssertEqual(layout.editorInsets.bottom, 21 + 8 + 56 + 44 - 1 + 16)
+        for compactCanvas in [true, false] {
+            let additional = EditorHost.additionalInsets(layout.editorInsets, system: safe,
+                                                          canvas: true, compactCanvas: compactCanvas)
+            let bottom = additional.bottom + safe.bottom + (compactCanvas ? 80 : 16)
+            XCTAssertEqual(bottom, layout.editorInsets.bottom)
+            let top = additional.top + safe.top + 64
+            XCTAssertGreaterThan(layout.editor.height - top - bottom, 180)
+            XCTAssertEqual(additional.left, 0)
+            XCTAssertEqual(additional.right, 0)
+        }
+    }
+
+    func testEditorInsetConversionUpdatesAllEdgesAndCanClearPreviousReservations() {
+        let safe = UIEdgeInsets(top: 24, left: 16, bottom: 20, right: 16)
+        let desired = UIEdgeInsets(top: 207, left: 180, bottom: 140, right: 220)
+        XCTAssertEqual(EditorHost.additionalInsets(desired, system: safe),
+                       UIEdgeInsets(top: 183, left: 164, bottom: 120, right: 204))
+        XCTAssertEqual(EditorHost.additionalInsets(safe, system: safe), .zero)
+    }
+
     // MARK: Chrome overlays
 
     func testOverlayGeometryPlacesAndStacksEachPlacement() {
@@ -633,13 +778,15 @@ final class FeatDocChromeTests: XCTestCase {
             hasSidebar: true, sidebarVisible: false, assistantPanel: "ai.chat", assistantOpen: false, registered: [],
             commandExists: { _ in true }, hasMenu: { _ in true })
         let built = NavBarModel.build(input)
-        XCTAssertEqual(built.leading.map(\.id), [NavBarModel.library, NavBarModel.sidebar, NavBarModel.search,
-                                                 NavBarModel.assistant, NavBarModel.readOnly, NavBarModel.bookmark])
-        XCTAssertEqual(built.trailing.map(\.id), [NavBarModel.addPage, NavBarModel.share, NavBarModel.more])
-        for item in built.leading where item.id != NavBarModel.library {
+        XCTAssertEqual(built.leading.map(\.id), [NavBarModel.library])
+        XCTAssertEqual(built.trailing.map(\.id), [NavBarModel.undo, NavBarModel.redo, NavBarModel.search,
+                                                  NavBarModel.bookmark, NavBarModel.share, NavBarModel.more])
+        XCTAssertEqual(built.assistant?.id, NavBarModel.assistant)
+        XCTAssertEqual(built.overflow.map(\.id), [NavBarModel.sidebar, NavBarModel.readOnly, NavBarModel.addPage])
+        for item in built.overflow where item.id != NavBarModel.addPage {
             guard case .command = item.action else { return XCTFail("\(item.id) must run a command") }
         }
-        let bookmark = built.leading.first { $0.id == NavBarModel.bookmark }
+        let bookmark = built.trailing.first { $0.id == NavBarModel.bookmark }
         XCTAssertEqual(bookmark?.action, .command("page.setBookmarked",
                                                   ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "on": true]))
 
@@ -647,16 +794,53 @@ final class FeatDocChromeTests: XCTestCase {
         input.registered = [ToolbarItemDescriptor(id: "readonly.toggle", title: "Read Only", icon: "lock",
                                                   group: .navLeading, order: 400, owner: "readonly",
                                                   command: "view.setReadOnly", params: ["on": true])]
-        let replaced = NavBarModel.build(input).leading.map(\.id)
+        let replaced = NavBarModel.build(input).overflow.map(\.id)
         XCTAssertTrue(replaced.contains("readonly.toggle"))
         XCTAssertFalse(replaced.contains(NavBarModel.readOnly))
 
-        // Compact: Library stays leading; Assistant and More trail; the rest moves into More.
+        // Compact: Library stays leading; Undo, Assistant and More trail; the rest moves into More.
         let compact = NavBarModel.split(NavBarModel.build(input), compact: true)
         XCTAssertEqual(compact.leading.map(\.id), [NavBarModel.library])
-        XCTAssertEqual(compact.trailing.map(\.id), [NavBarModel.assistant, NavBarModel.more])
+        XCTAssertEqual(compact.trailing.map(\.id), [NavBarModel.undo, NavBarModel.assistant, NavBarModel.more])
         XCTAssertTrue(compact.overflow.map(\.id).contains(NavBarModel.sidebar))
         XCTAssertTrue(compact.overflow.map(\.id).contains(NavBarModel.addPage))
+    }
+
+    func testCompactUndoAndAssistantIgnoreFeatureRegistrySideAndOrdering() {
+        for group in [ToolbarGroup.navLeading, .navTrailing] {
+            var undo = ToolbarItemDescriptor(id: "feature.undo", title: "Undo", icon: NibSymbol.undo.name,
+                                             group: group, order: 999, owner: "test", command: "edit.undo")
+            undo.isEnabled = { _ in false }
+            undo.showsInCompactWidth = false // Required compact actions still take precedence.
+            let search = ToolbarItemDescriptor(id: "feature.search", title: "Search", icon: NibSymbol.search.name,
+                                               group: .navTrailing, order: 0, owner: "test", command: "search.open")
+            let assistant = ToolbarItemDescriptor(id: "feature.assistant", title: "Assistant", icon: NibSymbol.assistant.name,
+                                                  group: group, order: 1, owner: "test", command: "panel.open",
+                                                  params: ["id": .string(PanelIDs.assistant)])
+            let input = NavBarModel.Input(
+                doc: Fixtures.docID, kind: .notebook, page: Fixtures.page1, readOnly: false, bookmarked: false, tool: "pen",
+                hasSidebar: true, sidebarVisible: false, assistantPanel: PanelIDs.assistant, assistantOpen: false,
+                registered: [search, assistant, undo], commandExists: { _ in false }, hasMenu: { _ in false },
+                session: EditorSession())
+            let regular = NavBarModel.build(input)
+            XCTAssertEqual(regular.leading.map(\.id), [NavBarModel.library])
+            XCTAssertEqual(regular.assistant?.id, assistant.id)
+            let compact = NavBarModel.split(regular, compact: true)
+            XCTAssertEqual(compact.trailing.map(\.id), [undo.id, assistant.id, NavBarModel.more])
+            XCTAssertEqual(compact.trailing.first?.isEnabled, false)
+            XCTAssertTrue(compact.overflow.contains { $0.id == search.id })
+            XCTAssertFalse(compact.overflow.contains { $0.id == undo.id || $0.id == assistant.id })
+        }
+    }
+
+    func testSidebarKeepsPrimaryLabelsAndAllAdditionalPanelsInOverflow() {
+        let extra = (0..<6).map { panel("extra.\($0)", .sidebarTab) }
+        let primary = SidebarNavigation.primaryIDs.map { panel($0, .sidebarTab) }
+        let tabs = extra + primary.reversed()
+        XCTAssertEqual(SidebarNavigation.primary(tabs).map(\.id), SidebarNavigation.primaryIDs)
+        XCTAssertEqual(SidebarNavigation.additional(tabs).map(\.id), extra.map(\.id))
+        XCTAssertEqual(Set((SidebarNavigation.primary(tabs) + SidebarNavigation.additional(tabs)).map(\.id)),
+                       Set(tabs.map(\.id)), "no installed panel becomes unreachable")
     }
 
     func testAfterTitleStatusesKeepTheirSlotOnCompactWidth() {
@@ -679,7 +863,7 @@ final class FeatDocChromeTests: XCTestCase {
             registered: [bridge, regularOnly, legacy, presence], commandExists: { _ in false }, hasMenu: { _ in false })
         let regular = NavBarModel.build(input)
         XCTAssertEqual(regular.afterTitle.map(\.id), ["presence", "bridge", "regularOnly"])
-        XCTAssertTrue(regular.leading.contains { $0.id == "legacy" })
+        XCTAssertTrue(regular.trailing.contains { $0.id == "legacy" })
         XCTAssertFalse(regular.leading.contains { $0.id == "bridge" })
         let compact = NavBarModel.split(regular, compact: true)
         XCTAssertEqual(compact.afterTitle.map(\.id), ["presence", "bridge"])
@@ -717,7 +901,8 @@ final class FeatDocChromeTests: XCTestCase {
             registered: [bookmark, redo], commandExists: { _ in true }, hasMenu: { _ in false }, session: session)
         let regular = NavBarModel.build(input)
         XCTAssertTrue(regular.trailing.map(\.id).contains("undo.redo"))
-        XCTAssertFalse(regular.leading.map(\.id).contains(NavBarModel.bookmark), "the feature's bookmark replaces ours")
+        XCTAssertTrue(regular.trailing.map(\.id).contains("outline.bookmark"))
+        XCTAssertFalse(regular.trailing.map(\.id).contains(NavBarModel.bookmark), "the feature's bookmark replaces ours")
         let compact = NavBarModel.split(regular, compact: true)
         XCTAssertFalse((compact.trailing + compact.overflow).map(\.id).contains("undo.redo"),
                        "regular-width-only items do not show on compact width")

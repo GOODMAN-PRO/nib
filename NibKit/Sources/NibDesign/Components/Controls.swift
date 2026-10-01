@@ -320,13 +320,18 @@ public struct NibSearchField: View {
         self.onSubmit = onSubmit
     }
 
+    var foreground: AnyShapeStyle {
+        style == .onDroplet ? AnyShapeStyle(.primary) : AnyShapeStyle(NibColor.label)
+    }
+
     public var body: some View {
         HStack(spacing: NibSpacing.s) {
             Image(nib: .search)
                 .font(NibFont.body)
-                .foregroundStyle(NibColor.labelSecondary)
+                .foregroundStyle(style == .onDroplet ? AnyShapeStyle(.primary) : AnyShapeStyle(NibColor.labelSecondary))
                 .accessibilityHidden(true)
-            TextField(prompt, text: $text)
+            TextField(prompt, text: $text, prompt: Text(prompt).foregroundStyle(foreground))
+                .foregroundStyle(foreground)
                 .font(NibFont.body)
                 .submitLabel(.search)
                 .onSubmit(onSubmit)
@@ -337,7 +342,7 @@ public struct NibSearchField: View {
                     text = ""
                 } label: {
                     Image(nib: .clearText)
-                        .foregroundStyle(NibColor.labelTertiary)
+                        .foregroundStyle(style == .onDroplet ? AnyShapeStyle(.primary) : AnyShapeStyle(NibColor.labelTertiary))
                         .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
                 }
                 .buttonStyle(NibPressStyle(shape: Circle()))

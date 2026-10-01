@@ -32,6 +32,9 @@ struct ChromeLayout: Equatable {
     var bar: CGRect
     /// The editor (canvas) frame: the whole window unless a sidebar is docked.
     var editor: CGRect
+    /// Clearance within the editor, including chrome on every dock edge.
+    var editorInsets: UIEdgeInsets
+    var assistantBottom: CGRect?
     /// The tool palette's layer (`ui.screens.toolbarView`): the full window height, between open sidebars, so the
     /// palette never docks under a panel and its right dock moves to a docked assistant's leading edge. NibDesign's
     /// dock region keeps the palette below the bars by itself (safe area + 8 + 44 + 16).
@@ -58,7 +61,8 @@ struct ChromeLayout: Equatable {
 
     /// `left` / `right`: the width of the panel a side shows, nil when that side is closed.
     init(size: CGSize, safeArea: UIEdgeInsets, left leftWidth: CGFloat?, right rightWidth: CGFloat?, mode: SidebarMode,
-         idiom: UIUserInterfaceIdiom = .pad, verticalSizeClass: UIUserInterfaceSizeClass = .regular) {
+         idiom: UIUserInterfaceIdiom = .pad, verticalSizeClass: UIUserInterfaceSizeClass = .regular,
+         assistantTrailing: Bool = false, assistantDetent: AssistantDetent = .medium) {
         let inset = NibMetrics.chromeInset
         let width = size.width
         let height = size.height
@@ -70,6 +74,8 @@ struct ChromeLayout: Equatable {
         let minX = safeArea.left + inset
         let maxX = max(minX, width - safeArea.right - inset)
         let column = CGRect(x: minX, y: top, width: maxX - minX, height: bottom - top)
+        let bottomAssistant = assistantTrailing && !compact && height >= width
+        let rightWidth = bottomAssistant ? nil : rightWidth
         let anyOpen = leftWidth != nil || rightWidth != nil
 
         var presentation = SidebarPresentation.overlay
@@ -79,7 +85,7 @@ struct ChromeLayout: Equatable {
         var window: CGRect?
         if compact {
             presentation = .sheet
-        } else if mode == .window && anyOpen {
+        } else if mode == .window && anyOpen && !assistantTrailing {
             window = column
         } else {
             left = leftWidth.map { CGRect(x: minX, y: top, width: min($0, column.width), height: column.height) }
@@ -87,10 +93,12 @@ struct ChromeLayout: Equatable {
                 let clamped = min(w, column.width)
                 return CGRect(x: maxX - clamped, y: top, width: clamped, height: column.height)
             }
-            let editorMinX = left?.maxX ?? 0
             let editorMaxX = right?.minX ?? width
-            if anyOpen && width >= ChromeLayout.dockingWidth
-                && editorMaxX - editorMinX >= ChromeLayout.minimumDockedEditorWidth {
+            let proposedMinX = left?.maxX ?? 0
+            let editorMinX = assistantTrailing && editorMaxX - proposedMinX < ChromeLayout.minimumDockedEditorWidth
+                ? 0 : proposedMinX
+            if (assistantTrailing && right != nil) || (anyOpen && width >= ChromeLayout.dockingWidth
+                && editorMaxX - editorMinX >= ChromeLayout.minimumDockedEditorWidth) {
                 presentation = .docked
                 editor = CGRect(x: editorMinX, y: 0, width: editorMaxX - editorMinX, height: height)
             }
@@ -111,6 +119,9 @@ struct ChromeLayout: Equatable {
         self.presentation = presentation
         self.bar = bar
         self.editor = editor
+        self.editorInsets = UIEdgeInsets(top: bar.maxY + NibSpacing.s, left: max(0, safeArea.left - editor.minX),
+                                         bottom: safeArea.bottom, right: max(0, editor.maxX - (width - safeArea.right)))
+        self.assistantBottom = nil
         self.toolbar = CGRect(x: toolMinX, y: 0, width: toolMaxX - toolMinX, height: height)
         self.toolbarInsets = EdgeInsets(top: safeArea.top, leading: max(0, safeArea.left - toolMinX),
                                         bottom: safeArea.bottom, trailing: max(0, toolMaxX - (width - safeArea.right)))
@@ -123,31 +134,96 @@ struct ChromeLayout: Equatable {
         self.overlayRegion = overlay
         let toastBottom = compact ? overlay.maxY + NibSpacing.xxl : height - safeArea.bottom
         self.toast = CGRect(x: toolMinX, y: 0, width: toolMaxX - toolMinX, height: max(0, toastBottom))
-    }
-
-    /// Reserve the horizontal palette's resting band using the same dock geometry as NibToolPalette. The toolbar
-    /// is padded by toolbarInsets, so its local dock frame is translated back into container coordinates here.
-    mutating func avoidPalette(_ dock: NibPaletteDock, thickness: CGFloat, optionsHeight: CGFloat = 0) {
-        guard !dock.isVertical else { return }
-        let region = DropletDockModel.region(size: toolbarContentSize, safeArea: EdgeInsets(), compact: isCompact)
-        let model = DropletDockModel(region: region, length: region.width, thickness: thickness, compact: isCompact)
-        let frame = model.frame(for: dock).offsetBy(dx: toolbar.minX + toolbarInsets.leading,
-                                                  dy: toolbar.minY + toolbarInsets.top)
-        let extra = max(0, optionsHeight - 1) // The options bar fuses with a 1 pt overlap (§10.4).
-        if dock.edge == .top {
-            let top = frame.maxY + extra + NibSpacing.l
-            overlayRegion = ChromeRegion.below(top, in: overlayRegion)
-            floatingRegion = ChromeRegion.below(top, in: floatingRegion)
-        } else if dock.edge == .bottom {
-            let bottom = frame.minY - extra - NibSpacing.l
-            overlayRegion = ChromeRegion.above(bottom, in: overlayRegion)
-            floatingRegion = ChromeRegion.above(bottom, in: floatingRegion)
+        if bottomAssistant {
+            let panelHeight = (height - safeArea.top - safeArea.bottom) * assistantDetent.fraction
+            let panelTop = max(top, height - safeArea.bottom - panelHeight)
+            assistantBottom = CGRect(x: minX, y: panelTop, width: maxX - minX,
+                                     height: max(0, height - safeArea.bottom - panelTop))
+            // The toolbar moves with the dock; the editor keeps its full frame and can still scroll under it.
+            toolbar.size.height = max(0, panelTop - NibSpacing.l)
+            toolbarInsets.bottom = 0
+            editorInsets.bottom = height - panelTop + NibSpacing.l
+            overlayRegion = ChromeRegion.above(panelTop - NibSpacing.l, in: overlayRegion)
+            floatingRegion = ChromeRegion.above(panelTop - NibSpacing.l, in: floatingRegion)
+            toast.size.height = max(0, panelTop)
         }
     }
+
+    /// The measured options bar is fused to the palette with a 1 pt overlap. Reserve its whole cross-axis
+    /// footprint, even when the options collapse during scrolling, so the fitted page does not jump under the pen.
+    mutating func avoidPalette(_ dock: NibPaletteDock, thickness: CGFloat, optionsHeight: CGFloat = 0,
+                               optionsSize: CGSize? = nil) {
+        let region = DropletDockModel.region(size: toolbarContentSize, safeArea: EdgeInsets(), compact: isCompact)
+        let model = DropletDockModel(region: region, length: dock.isVertical ? region.height : region.width,
+                                    thickness: thickness, compact: isCompact)
+        let dock = model.validated(dock)
+        let palette = model.frame(for: dock).offsetBy(dx: toolbar.minX + toolbarInsets.leading,
+                                                    dy: toolbar.minY + toolbarInsets.top)
+        let options = optionsSize ?? CGSize(width: optionsHeight, height: optionsHeight)
+        var occupied = palette
+        if options.width > 0 && options.height > 0 {
+            let frame: CGRect
+            switch dock.edge {
+            case .top:
+                frame = CGRect(x: palette.midX - options.width / 2, y: palette.maxY - 1,
+                               width: options.width, height: options.height)
+            case .bottom:
+                frame = CGRect(x: palette.midX - options.width / 2, y: palette.minY - options.height + 1,
+                               width: options.width, height: options.height)
+            case .leading:
+                frame = CGRect(x: palette.maxX - 1, y: palette.midY - options.height / 2,
+                               width: options.width, height: options.height)
+            case .trailing:
+                frame = CGRect(x: palette.minX - options.width + 1, y: palette.midY - options.height / 2,
+                               width: options.width, height: options.height)
+            }
+            occupied = palette.union(frame)
+        }
+        avoidPalette(occupied: occupied, edge: dock.edge)
+    }
+
+    /// Accepts the union in container coordinates; both overlay layout and editor fit/reveal use this same bound.
+    mutating func avoidPalette(occupied: CGRect, edge: NibDock) {
+        guard !occupied.isNull, !occupied.isEmpty else { return }
+        let gap = NibSpacing.l
+        switch edge {
+        case .top:
+            let top = occupied.maxY + gap
+            editorInsets.top = max(editorInsets.top, top - editor.minY)
+            overlayRegion = ChromeRegion.below(top, in: overlayRegion)
+            floatingRegion = ChromeRegion.below(top, in: floatingRegion)
+        case .bottom:
+            let bottom = occupied.minY - gap
+            editorInsets.bottom = max(editorInsets.bottom, editor.maxY - bottom)
+            overlayRegion = ChromeRegion.above(bottom, in: overlayRegion)
+            floatingRegion = ChromeRegion.above(bottom, in: floatingRegion)
+        case .leading:
+            let leading = occupied.maxX + gap
+            editorInsets.left = max(editorInsets.left, leading - editor.minX)
+            overlayRegion = ChromeRegion.after(leading, in: overlayRegion)
+            floatingRegion = ChromeRegion.after(leading, in: floatingRegion)
+        case .trailing:
+            let trailing = occupied.minX - gap
+            editorInsets.right = max(editorInsets.right, editor.maxX - trailing)
+            overlayRegion = ChromeRegion.before(trailing, in: overlayRegion)
+            floatingRegion = ChromeRegion.before(trailing, in: floatingRegion)
+        }
+    }
+
 }
 
-/// Explicit obstacle clearance never changes the bars, the canvas or the toolbar's full-window coordinates.
+/// Shared clipping operations for overlay regions; editor clearance is propagated separately as edge insets.
 enum ChromeRegion {
+    static func after(_ leading: CGFloat, in region: CGRect) -> CGRect {
+        let x = min(region.maxX, max(region.minX, leading))
+        return CGRect(x: x, y: region.minY, width: max(0, region.maxX - x), height: region.height)
+    }
+
+    static func before(_ trailing: CGFloat, in region: CGRect) -> CGRect {
+        CGRect(x: region.minX, y: region.minY, width: max(0, min(region.maxX, trailing) - region.minX),
+               height: region.height)
+    }
+
     static func below(_ top: CGFloat, in region: CGRect) -> CGRect {
         let y = min(region.maxY, max(region.minY, top))
         return CGRect(x: region.minX, y: y, width: region.width, height: max(0, region.maxY - y))
@@ -448,8 +524,8 @@ final class ChromeDocumentModel: ObservableObject {
 
 /// Ticks whenever the live state of nav-bar items may have changed (contracts-v2 `isOn`, `isEnabled`, `sessionTitle`,
 /// `sessionIcon`, `sessionParams`): commits, undo and redo in this document, the window's selection and open panels,
-/// and `UIRegistries.setNeedsChromeUpdate`. Only the nav bar observes it, so a stroke's commit re-evaluates the bar and
-/// nothing else.
+/// and `UIRegistries.setNeedsChromeUpdate`. The nav bar and options measurement observe it; the editor is not
+/// re-laid out unless the measured options footprint actually changes.
 @MainActor
 final class ChromeLiveState: ObservableObject {
     @Published private(set) var tick = 0
@@ -800,6 +876,7 @@ struct ChromeRootView: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     @ScaledMetric(relativeTo: .body) private var paletteThickness = NibMetrics.paletteThickness
     @State private var openMenu: ChromeMenu? = nil
+    @State private var optionsSizes: [String: CGSize] = [:]
 
     init(chrome: ChromeWindow, editor: UIViewController, toolbar: AnyView?, inking: ChromeInkingMirror,
          backdrop: ChromeBackdrop, overlays: ChromeOverlayModel, floating: NibFloatingHost, live: ChromeLiveState,
@@ -823,7 +900,7 @@ struct ChromeRootView: View {
         ZStack(alignment: .topLeading) {
             NibColor.desk
                 .fullScreenCover(isPresented: coverBinding) { coverContent }
-            EditorHost(controller: editor, topInset: max(0, layout.bar.maxY + NibSpacing.s - geometry.safeArea.top))
+            EditorHost(controller: editor, insets: layout.editorInsets, viewportWidth: layout.editor.width)
                 .frame(width: layout.editor.width, height: layout.editor.height)
                 .position(x: layout.editor.midX, y: layout.editor.midY)
                 .animation(motion, value: layout.editor)
@@ -831,6 +908,18 @@ struct ChromeRootView: View {
                 NibDropletContainer(inking: inking.state) {
                     overlay(layout, motion: motion)
                 }
+            }
+        }
+        .background {
+            if toolbar != nil, !model.snapshot.readOnly {
+                ChromeOptionsMeasurement(chrome: chrome, live: live, tool: model.snapshot.tool,
+                                         kind: model.snapshot.kind) { tool, size in
+                    if optionsSizes[tool] != size { optionsSizes[tool] = size }
+                }
+                .id(model.snapshot.tool)
+                .hidden()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
             }
         }
         // Settings › Appearance › Liquid (contracts-v2 NibSettings.liquidMode) for the whole container.
@@ -846,8 +935,10 @@ struct ChromeRootView: View {
     private var currentLayout: ChromeLayout {
         var layout = ChromeLayout(size: geometry.size, safeArea: geometry.safeArea, left: sidebarWidth(.left),
                                   right: sidebarWidth(.right), mode: state.mode, idiom: geometry.idiom,
-                                  verticalSizeClass: geometry.verticalSizeClass)
-        if toolbar != nil, !model.snapshot.readOnly {
+                                  verticalSizeClass: geometry.verticalSizeClass,
+                                  assistantTrailing: state.tabs[.right] == PanelIDs.assistant,
+                                  assistantDetent: state.assistantDetent)
+        if paletteFits(layout), toolbar != nil, !model.snapshot.readOnly {
             // Read F016's existing setting; do not redeclare its key or depend on the feature's private runtime.
             let saved = chrome.app.settings.json("toolbar.dock")
             let edge = saved?["edge"]?.stringValue.flatMap { NibDock(commandValue: $0) }
@@ -860,9 +951,16 @@ struct ChromeRootView: View {
                 || active?.activeToolMenu != nil || active?.settings != nil
             layout.avoidPalette(dockModel.validated(dock),
                                 thickness: min(max(paletteThickness, NibMetrics.paletteThickness), NibMetrics.paletteThicknessMax),
-                                optionsHeight: hasOptions ? NibMetrics.barHeight : 0)
+                                optionsHeight: hasOptions ? NibMetrics.barHeight : 0,
+                                optionsSize: hasOptions ? optionsSizes[model.snapshot.tool] : .zero)
         }
         return layout
+    }
+
+    /// At the 90% assistant detent there is no band left for a palette plus options and a writable viewport.
+    /// Restore it at 45% or when the assistant closes; never lay it across the dock's header or the page's last line.
+    private func paletteFits(_ layout: ChromeLayout) -> Bool {
+        layout.assistantBottom == nil || state.assistantDetent == .medium
     }
 
     private var liquidMode: NibLiquidMode {
@@ -873,7 +971,8 @@ struct ChromeRootView: View {
     private func sidebarWidth(_ side: SidebarSide) -> CGFloat? {
         guard let id = state.tabs[side], let panel = chrome.app.ui.panels.get(id),
               PanelResolver.accepts(panel, kind: model.snapshot.kind) else { return nil }
-        return panel.placement == .sidebarTab ? NibMetrics.navigatorWidth : NibMetrics.panelWidth(typeSize)
+        return panel.id == PanelIDs.assistant || panel.placement != .sidebarTab
+            ? NibMetrics.panelWidth(typeSize) : NibMetrics.navigatorWidth
     }
 
     private func floatingSize(_ layout: ChromeLayout) -> CGSize {
@@ -890,7 +989,7 @@ struct ChromeRootView: View {
             sidebars(layout)
             ChromeOverlayLayer(model: overlays, inking: inking, region: layout.overlayRegion,
                                keyboardFrame: geometry.keyboardFrame)
-            if let toolbar {
+            if let toolbar, paletteFits(layout) {
                 // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).
                 toolbar
                     .environment(\.horizontalSizeClass, layout.isCompact ? .compact : .regular)
@@ -916,6 +1015,13 @@ struct ChromeRootView: View {
 
     @ViewBuilder
     private func sidebars(_ layout: ChromeLayout) -> some View {
+        if let frame = layout.assistantBottom, let panel = chrome.assistantPanel(kind: model.snapshot.kind) {
+            AssistantDockView(chrome: chrome, panel: panel, detent: $state.assistantDetent)
+                .frame(width: frame.width, height: frame.height)
+                .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
+                .droplet("chrome.assistant.bottom", style: .panel)
+                .position(x: frame.midX, y: frame.midY)
+        }
         if let frame = layout.window, let side = windowSide, let content = sidebarContent(side) {
             let frame = panelFrame(frame, id: content.selected.id)
             SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected, mode: .window,
@@ -1014,10 +1120,15 @@ struct ChromeRootView: View {
             }
         case .sidebar(let side)?:
             if let content = sidebarContent(side) {
-                SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected,
-                                 mode: state.mode, presentation: .sheet, showsModeToggle: false)
-                    .environment(\.horizontalSizeClass, geometry.isCompact ? .compact : .regular)
-                    .presentationDetents([.large])
+                if content.selected.id == PanelIDs.assistant {
+                    PanelSheetView(chrome: chrome, panel: content.selected)
+                        .presentationDetents([.medium, .large])
+                } else {
+                    SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected,
+                                     mode: state.mode, presentation: .sheet, showsModeToggle: false)
+                        .environment(\.horizontalSizeClass, geometry.isCompact ? .compact : .regular)
+                        .presentationDetents([.large])
+                }
             }
         case .floating(let id)?:
             if let panel = chrome.app.ui.panels.get(id) {
@@ -1054,17 +1165,88 @@ struct ChromeRootView: View {
     }
 }
 
+/// Measures the public tool-menu provider with the same NibDesign bar content as F016. This layout-only view
+/// stays outside the liquid container and never registers a duplicate droplet or intercepts an editor touch.
+/// Keep the expanded measurement while scrolling collapses the options, avoiding fit/scroll feedback loops.
+struct ChromeOptionsMeasurement: View {
+    let chrome: ChromeWindow
+    @ObservedObject var live: ChromeLiveState
+    let tool: String
+    let kind: DocumentKind
+    let measured: (String, CGSize) -> Void
+
+    var body: some View {
+        let _ = live.tick
+        let descriptor = chrome.app.ui.toolbarItems(for: kind).first { ($0.toolID ?? $0.id) == tool }
+        let menu = chrome.app.ui.toolMenus.get(tool)?.makeView(chrome.session)
+            ?? descriptor?.activeToolMenu?(chrome.session)
+        HStack(spacing: 0) {
+            if let menu { menu }
+            if descriptor?.settings != nil {
+                if menu != nil { NibBarSeparator() }
+                NibIconButton(.chevronDown, label: String(localized: "Tool Settings"), size: .bar) {}
+            }
+        }
+        .padding(.horizontal, NibSpacing.xs)
+        .frame(height: NibMetrics.barHeight)
+        .nibChromeTypeCap()
+        .fixedSize(horizontal: true, vertical: true)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+            guard size.width.isFinite, size.height.isFinite else { return }
+            measured(tool, size)
+        }
+    }
+}
+
 /// Hosts the editor view controller the shell built (it stays the same instance for the life of the window).
 struct EditorHost: UIViewControllerRepresentable {
     let controller: UIViewController
-    /// Extra safe area so the canvas lays pages out below the bars and scrolls them under the chrome.
-    let topInset: CGFloat
+    /// Total safe clearance within the editor. Subtract the system contribution before applying additional insets.
+    let insets: UIEdgeInsets
+    let viewportWidth: CGFloat
+
+    static func additionalInsets(_ desired: UIEdgeInsets, system: UIEdgeInsets,
+                                 canvas: Bool = false, compactCanvas: Bool = false) -> UIEdgeInsets {
+        // CanvasHost already reserves its baseline bars and phone palette. Only add the uncovered difference;
+        // double-counting that baseline leaves almost no usable height on a landscape phone.
+        let top = canvas ? NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m : 0
+        let bottom = canvas ? (compactCanvas ? NibMetrics.canvasBottomInsetCompact : NibSpacing.l) : 0
+        return UIEdgeInsets(top: max(0, desired.top - system.top - top), left: max(0, desired.left - system.left),
+                            bottom: max(0, desired.bottom - system.bottom - bottom),
+                            right: max(0, desired.right - system.right))
+    }
+
+    final class Coordinator {
+        var reloadPending = false
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIViewController(context: Context) -> UIViewController { controller }
 
     func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
-        if uiViewController.additionalSafeAreaInsets.top != topInset {
-            uiViewController.additionalSafeAreaInsets.top = topInset
+        let existing = uiViewController.additionalSafeAreaInsets
+        let safe = uiViewController.view.safeAreaInsets
+        let system = UIEdgeInsets(top: max(0, safe.top - existing.top), left: max(0, safe.left - existing.left),
+                                  bottom: max(0, safe.bottom - existing.bottom), right: max(0, safe.right - existing.right))
+        let editing = uiViewController as? DocumentEditing
+        let canvas = editing?.canvasHost != nil
+        let compactCanvas = uiViewController.traitCollection.horizontalSizeClass == .compact
+            || viewportWidth < NibMetrics.compactBreakpoint
+        let additional = Self.additionalInsets(insets, system: system, canvas: canvas, compactCanvas: compactCanvas)
+        guard existing != additional else { return }
+        uiViewController.additionalSafeAreaInsets = additional
+        // Safe-area changes update scrolling immediately. Refresh fit through the public editor contract too:
+        // the canvas retains the user's zoom/anchor, but recomputes fitted zoom for the new usable viewport.
+        if canvas, !context.coordinator.reloadPending {
+            let coordinator = context.coordinator
+            coordinator.reloadPending = true
+            DispatchQueue.main.async { [weak uiViewController] in
+                coordinator.reloadPending = false
+                guard let uiViewController else { return }
+                uiViewController.view.layoutIfNeeded()
+                (uiViewController as? DocumentEditing)?.reloadAll()
+            }
         }
     }
 }

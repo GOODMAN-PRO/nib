@@ -11,6 +11,14 @@ public enum FeatAIChatFeature: NibFeature {
         ChatCommands.register(app)
         app.settings.declarePrefix("aichat.tokens.", synced: false, summary: "Observed token usage for each conversation on this device.",
                                    owner: id, schema: .int(min: 0))
+        let placement = "chrome.panelPlacement." + PanelIDs.assistant
+        app.settings.declare(SettingKey(placement, default: "right"),
+                             summary: "Assistant panel placement.", owner: id,
+                             schema: .str(choices: ["left", "right", "floating"]))
+        // Chrome reads the stored placement, not the declaration's default. Seed only an unset choice.
+        if app.settings.json(placement) == nil { app.settings.setJSON(placement, "right") }
+        // Keep the full-width panel host: sidebarTab is the 240 pt notebook navigator. The placement above docks
+        // this 344 pt panel trailing and reserves its canvas inset; Floating remains an explicit user choice.
         var panel = PanelDescriptor(id: PanelIDs.assistant, title: String(localized: "Assistant"),
                                     icon: NibSymbol.assistant.name, placement: .floating, order: 850, owner: id) { context in
             let model = ChatRuntime.get(context.app).model(for: context.session)

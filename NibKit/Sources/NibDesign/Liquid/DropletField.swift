@@ -76,6 +76,7 @@ final class DropletField {
         var visible: Bool
         var startedAt: CFTimeInterval
         var closingAt: CFTimeInterval?
+        var lastSource: CGPoint?
     }
 
     enum ReshapePhase: Equatable {
@@ -290,7 +291,10 @@ final class DropletField {
         dismissers[id] = nil
         beads[id] = nil
         beadNodes[id] = nil
-        nodes[id] = nil
+        // Keep the observable identity: SwiftUI may still hold this node across a layout reattachment.
+        nodes[id]?.presentation = DropletPresentation(hidden: true)
+        pendingBuds[id] = nil
+        clearBonds(id)
         anchors = anchors.filter { $0.value.owner != id }
         wake()
     }
@@ -337,6 +341,8 @@ final class DropletField {
         guard NibGeometry.isUsable(rect) else { return }
         if worldAnchors[id] != rect { worldAnchors[id] = rect }
     }
+
+    func removeWorldAnchor(_ id: String) { worldAnchors[id] = nil }
 
     func setBackdrop(_ pages: [CGRect]) {
         let pages = pages.filter(NibGeometry.isUsable)
@@ -680,7 +686,7 @@ final class DropletField {
         if presented {
             if e.bud?.presented == true { return }
             var bud = BudState(source: source, owner: anchors[source]?.owner ?? source, presented: true, revealed: false,
-                               visible: true, startedAt: now, closingAt: nil)
+                               visible: true, startedAt: now, closingAt: nil, lastSource: sourcePoint(source))
             if instant || physicsOff {
                 e.dyn.offset.snap(to: .zero)
                 e.dyn.size.snap(to: CGPoint(x: e.rest.width, y: e.rest.height))
@@ -702,39 +708,65 @@ final class DropletField {
             bud.presented = false
             bud.revealed = false
             if instant || physicsOff {
-                bud.visible = false
+                finishClosing(&e, bud: &bud)
             } else {
                 bud.closingAt = now
             }
             e.bud = bud
         } else if e.bud == nil {
             e.bud = BudState(source: source, owner: anchors[source]?.owner ?? source, presented: false, revealed: false,
-                             visible: false, startedAt: now, closingAt: nil)
+                             visible: false, startedAt: now, closingAt: nil, lastSource: sourcePoint(source))
         }
         entries[id] = e
         wake()
     }
 
+    /// Removes every bridge immediately when a body leaves the rendered field.
+    private func clearBonds(_ id: String) {
+        bonds = bonds.filter { $0.key.a != id && $0.key.b != id }
+        links = links.filter { $0.a != id && $0.b != id }
+        necks.removeAll { $0.id.hasPrefix(id + "|") || $0.id.hasSuffix("|" + id) }
+        satellites.removeAll { $0.target == id }
+        meniscuses[id] = nil
+    }
+
+    private func finishClosing(_ e: inout Entry, bud: inout BudState) {
+        bud.visible = false
+        bud.revealed = false
+        bud.closingAt = nil
+        e.contentAlpha = 1
+        e.dyn.offset.snap(to: .zero)
+        e.dyn.size.snap(to: CGPoint(x: e.rest.width, y: e.rest.height))
+        e.dyn.corner.snap(to: cornerTarget(e.style, e.rest.size))
+        e.dyn.positionSpring = NibMotion.snap
+        e.dyn.sizeSpring = NibMotion.budSize
+        clearBonds(e.id)
+    }
+
     private func stepBud(_ e: inout Entry, now: CFTimeInterval) {
         guard var bud = e.bud else { return }
+        if let source = sourcePoint(bud.source) { bud.lastSource = source }
         if bud.presented {
             if !bud.revealed && now - bud.startedAt >= NibMotion.budRevealDelay { bud.revealed = true }
-        } else if let closingAt = bud.closingAt, now - closingAt >= 0.07, let src = sourcePoint(bud.source) {
-            e.dyn.positionSpring = NibMotion.retract
-            e.dyn.sizeSpring = NibMotion.retract
-            e.dyn.offset.target = CGPoint(x: src.x - e.rest.midX, y: src.y - e.rest.midY)
-            e.dyn.size.target = CGPoint(x: 28, y: 28)
-            e.dyn.corner.target = 14
-            let c = visualCentre(e)
-            let d = ((c.x - src.x) * (c.x - src.x) + (c.y - src.y) * (c.y - src.y)).squareRoot()
-            if e.dyn.size.x.value < 34 && d < 5 {
-                bud.visible = false
-                bud.closingAt = nil
-                e.dyn.offset.snap(to: .zero)
-                e.dyn.size.snap(to: CGPoint(x: e.rest.width, y: e.rest.height))
-                e.dyn.corner.snap(to: cornerTarget(e.style, e.rest.size))
-                e.dyn.positionSpring = NibMotion.snap
-                e.dyn.sizeSpring = NibMotion.budSize
+        } else if let closingAt = bud.closingAt, now - closingAt >= 0.07 {
+            let elapsed = now - closingAt
+            if let src = sourcePoint(bud.source) ?? bud.lastSource {
+                e.dyn.positionSpring = NibMotion.retract
+                e.dyn.sizeSpring = NibMotion.retract
+                e.dyn.offset.target = CGPoint(x: src.x - e.rest.midX, y: src.y - e.rest.midY)
+                e.dyn.size.target = CGPoint(x: 28, y: 28)
+                e.dyn.corner.target = 14
+                let c = visualCentre(e)
+                let distance = hypot(c.x - src.x, c.y - src.y)
+                if (e.dyn.size.x.value < 34 && distance < 5) || elapsed >= 2 * NibMotion.retract.response + 0.07 {
+                    finishClosing(&e, bud: &bud)
+                }
+            } else {
+                // No source ever registered: shrink in place, with the same bounded closing lifetime.
+                e.dyn.sizeSpring = NibMotion.retract
+                e.dyn.size.target = CGPoint(x: 28, y: 28)
+                e.dyn.corner.target = 14
+                if elapsed >= 2 * NibMotion.retract.response + 0.07 { finishClosing(&e, bud: &bud) }
             }
         }
         e.bud = bud
@@ -885,6 +917,10 @@ final class DropletField {
             for j in (i + 1)..<ids.count {
                 guard let a = entries[ids[i]], let b = entries[ids[j]] else { continue }
                 let key = PairKey(ids[i], ids[j])
+                guard isDrawn(a), isDrawn(b) else {
+                    bonds[key] = nil
+                    continue
+                }
                 let boxA = visualBox(a), boxB = visualBox(b)
                 let g = DropletPhysics.gap(boxA, boxB, minCorner: min(cornerRadius(a), cornerRadius(b)))
                 let params = neckParams(a, b)
@@ -1010,6 +1046,8 @@ final class DropletField {
     // MARK: Frame loop
 
     func wake() {
+        // Geometry and visibility must be available even while the display link is parked (or inking).
+        publish()
         let state = ProcessInfo.processInfo.thermalState
         let hot = state == .serious || state == .critical
         if hot != isThermallyThrottled { isThermallyThrottled = hot }
@@ -1019,10 +1057,9 @@ final class DropletField {
         driver?.start()
     }
 
-    func tick(_ dt: CFTimeInterval) -> Bool {
+    func tick(_ dt: CFTimeInterval, now: CFTimeInterval = CACurrentMediaTime()) -> Bool {
         guard !isInking, dt.isFinite, dt > 0 else { return false }
         let step = CGFloat(dt)
-        let now = CACurrentMediaTime()
         var busy = false
         for id in order {
             guard var e = entries[id], e.hasRest else { continue }

@@ -683,6 +683,77 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertEqual(tables, 2)
     }
 
+    func testPlaceholderContrastOnLightAndDarkEditorBackgrounds() throws {
+        let editor = openEditor(harness())
+        let background = try XCTUnwrap(editor.view.backgroundColor)
+        let textView = BlockTextView()
+        textView.style = BlockStyle.make(kind: .heading1)
+        textView.placeholder = "Title"
+        textView.alwaysShowsPlaceholder = true
+        let label = try XCTUnwrap(textView.subviews.compactMap { $0 as? UILabel }.first)
+        let foreground = try XCTUnwrap(label.textColor)
+        XCTAssertFalse(label.isHidden)
+
+        func components(_ colour: UIColor, _ traits: UITraitCollection) throws -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) {
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            let resolved = colour.resolvedColor(with: traits)
+            XCTAssertTrue(resolved.getRed(&r, green: &g, blue: &b, alpha: &a))
+            return (r, g, b, a)
+        }
+        func luminance(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CGFloat {
+            func linear(_ value: CGFloat) -> CGFloat {
+                value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        }
+
+        // Resolve the same label through appearance changes, including Increase Contrast.
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            for contrast in [UIAccessibilityContrast.normal, .high] {
+                let traits = UITraitCollection(traitsFrom: [UITraitCollection(userInterfaceStyle: appearance),
+                                                           UITraitCollection(accessibilityContrast: contrast)])
+                let fg = try components(foreground, traits)
+                let bg = try components(background, traits)
+                XCTAssertEqual(bg.a, 1)
+                let alpha = fg.a * label.alpha * textView.alpha
+                let text = luminance(fg.r * alpha + bg.r * (1 - alpha),
+                                     fg.g * alpha + bg.g * (1 - alpha),
+                                     fg.b * alpha + bg.b * (1 - alpha))
+                let surface = luminance(bg.r, bg.g, bg.b)
+                let ratio = (max(text, surface) + 0.05) / (min(text, surface) + 0.05)
+                XCTAssertGreaterThanOrEqual(ratio, 4.5, "Placeholder must also pass for small body/caption text: \(traits)")
+            }
+        }
+    }
+
+    func testPlaceholderStylingAndVisibilityStaySeparateFromEnteredText() throws {
+        let textView = BlockTextView()
+        textView.alwaysShowsPlaceholder = true
+        textView.placeholder = "Title"
+        let label = try XCTUnwrap(textView.subviews.compactMap { $0 as? UILabel }.first)
+        for style in [BlockStyle.make(kind: .heading1), BlockStyle.make(kind: .paragraph),
+                      BlockStyle.make(kind: .image, caption: true)] {
+            textView.style = style
+            textView.text = ""
+            textView.updatePlaceholder()
+            XCTAssertFalse(label.isHidden)
+            XCTAssertEqual(label.text, "Title")
+            XCTAssertEqual(label.font.pointSize, style.baseFont.pointSize)
+            XCTAssertTrue(label.font.fontDescriptor.symbolicTraits.contains(.traitItalic))
+            XCTAssertFalse(style.baseFont.fontDescriptor.symbolicTraits.contains(.traitItalic))
+            XCTAssertFalse(label.isAccessibilityElement)
+            XCTAssertFalse(label.isUserInteractionEnabled)
+
+            textView.attributedText = style.attributed(RichText(plain: "My notes"))
+            textView.updatePlaceholder()
+            XCTAssertTrue(label.isHidden)
+            XCTAssertEqual(textView.text, "My notes")
+            textView.text = ""
+            textView.updatePlaceholder()
+            XCTAssertFalse(label.isHidden)
+        }
+    }
+
     func testTextSelectionMenuEntriesAppearOverSelectedBlockText() throws {
         let h = harness()
         var define = MenuItemDescriptor(

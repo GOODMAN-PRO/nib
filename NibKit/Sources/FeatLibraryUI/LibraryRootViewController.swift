@@ -389,14 +389,21 @@ final class LibraryRootViewController: UIViewController {
     }
 }
 
+enum LibraryPresentation {
+    static func isCompact(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
+        idiom == .phone || size.width < NibMetrics.compactBreakpoint || size.height < NibMetrics.compactBreakpoint
+    }
+}
+
 struct LibraryRootView: View {
     @ObservedObject var model: LibraryViewModel
     @State private var targets: [String: CGRect] = [:]
     @State private var chromeFrames: [String: CGRect] = [:]
+    @State private var searchText = ""
     var body: some View {
         GeometryReader { geometry in
-            let compact = geometry.size.width < NibMetrics.compactBreakpoint
-            let inlineSidebar = geometry.size.width >= NibMetrics.librarySidebarBreakpoint
+            let compact = LibraryPresentation.isCompact(size: geometry.size, idiom: UIDevice.current.userInterfaceIdiom)
+            let inlineSidebar = !compact && geometry.size.width >= NibMetrics.librarySidebarBreakpoint
             ZStack {
                 let context = model.chromeContext(isCompact: compact)
                 let overlays = model.visibleChromeOverlays(context)
@@ -405,7 +412,27 @@ struct LibraryRootView: View {
                         sidebar(compact: compact).frame(width: inlineSidebar ? NibMetrics.sidebarWidth : nil)
                     }
                     if !compact || !model.sidebarVisible {
-                        if compact { NavigationStack { content(compact: compact) }.frame(maxWidth: .infinity, maxHeight: .infinity) }
+                        if compact {
+                            NavigationStack {
+                                content(compact: true)
+                                    .navigationTitle(model.tab == nil ? model.title : "")
+                                    .navigationBarTitleDisplayMode(geometry.size.height < NibMetrics.compactBreakpoint ? .inline : .large)
+                                    .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic),
+                                                prompt: String(localized: "Search this folder"))
+                                    .toolbar {
+                                        ToolbarItem(placement: .topBarLeading) {
+                                            NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                        }
+                                        ToolbarItemGroup(placement: .topBarTrailing) {
+                                            NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                                                .libraryChromeFrame("anchor.library.sort")
+                                            NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) {
+                                                model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"])
+                                            }
+                                        }
+                                    }
+                            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
                         else { content(compact: compact).frame(maxWidth: .infinity, maxHeight: .infinity) }
                     }
                 }
@@ -420,7 +447,7 @@ struct LibraryRootView: View {
                                                   titleBottom: compact && model.sidebarVisible
                                                     ? chromeFrames["title"]?.maxY ?? NibSpacing.x6 + NibSpacing.l
                                                     : NibSpacing.x6 + NibSpacing.l) {
-                            if !inlineSidebar && (!compact || !model.sidebarVisible) {
+                            if !inlineSidebar && !compact {
                                 NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
                                     .libraryChromeFrame("top.sidebar")
                                     .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topLeading, isControls: true))
@@ -442,7 +469,7 @@ struct LibraryRootView: View {
                                 let anchor = model.chromeAnchor(overlay, context: context)
                                 if overlay.placement != .anchored || anchor != nil {
                                     LibraryChromeOverlaySurface(overlay: overlay, context: context)
-                                        .libraryChromeFrame((overlay.placement.isLibraryTop ? "top." : "overlay.") + overlay.id)
+                                        .libraryChromeFrame((LibraryChromeOverlayLayout.placement(overlay.placement, compact: compact).isLibraryTop ? "top." : "overlay.") + overlay.id)
                                         .layoutValue(key: LibraryChromeOverlaySlot.self,
                                                      value: .init(placement: overlay.placement, anchor: anchor,
                                                                   isBanner: overlay.surface == .none && [.topLeading, .top].contains(overlay.placement)))
@@ -486,6 +513,14 @@ struct LibraryRootView: View {
                     }
                 }
             }
+            .onAppear { searchText = model.search }
+            .onChange(of: model.search) { _, value in if value != searchText { searchText = value } }
+            .task(id: searchText) {
+                guard searchText != model.search else { return }
+                do { try await Task.sleep(for: .milliseconds(180)); try Task.checkCancellation() }
+                catch { return }
+                model.setView(["search": .string(searchText)])
+            }
             .task { await model.appear() }
             .onDisappear { model.isVisible = false }
         }
@@ -496,17 +531,15 @@ struct LibraryRootView: View {
     private var fullScreenBinding: Binding<LibraryPanel?> {
         Binding(get: { model.modal?.presentation == .fullScreen ? model.modal : nil }, set: { if $0 == nil, let modal = model.modal { model.setView(["panel": .string(modal.id), "close": true]) } })
     }
-    private var topChromeBottom: CGFloat {
-        chromeFrames.filter { $0.key.hasPrefix("top.") }.values.map(\.maxY).max() ?? 0
-    }
-    private var compactChromeHeight: CGFloat {
-        max(0, topChromeBottom - (chromeFrames["title"]?.maxY ?? 0))
+    private var topChromeClearance: CGFloat {
+        // Heights are local to this safe area. Absolute overlay maxY would count navigation/search twice.
+        let height = chromeFrames.filter { $0.key.hasPrefix("top.") }.values.map(\.height).max() ?? NibMetrics.barHeight
+        return height + NibSpacing.l + NibMetrics.minimumRestingGap
     }
     private func sidebar(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             Text(String(localized: "Library")).font(NibFont.display).foregroundStyle(NibColor.label).padding(.top, NibSpacing.x6)
                 .libraryChromeFrame(compact ? "title" : "sidebar.title")
-            if compact && compactChromeHeight > 0 { Color.clear.frame(height: compactChromeHeight) }
             ScrollView {
                 VStack(spacing: NibSpacing.xs) {
                     Button { model.setView(["panel": "documents", "folder": "lib", "sidebar": false]) } label: {
@@ -535,7 +568,10 @@ struct LibraryRootView: View {
                 NibIconButton(.settings, label: String(localized: "App Menu")) { model.setView(["menu": "app"]) }
                     .libraryChromeFrame("anchor.library.app")
             }
-        }.padding(NibSpacing.l).background(NibColor.backgroundSecondary).libraryDropTarget("sidebar")
+        }
+        .padding(NibSpacing.l)
+        .padding(.bottom, compact ? NibMetrics.canvasBottomInsetCompact : 0)
+        .background(NibColor.backgroundSecondary).libraryDropTarget("sidebar")
     }
     @ViewBuilder private func content(compact: Bool) -> some View {
         if let tab = model.tab { LibraryPanelView(panel: tab, model: model) }
@@ -545,23 +581,19 @@ struct LibraryRootView: View {
                     if let banner = model.libraryBanner(isCompact: compact) {
                         banner.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    HStack {
+                    if !compact {
                         Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
-                        Spacer()
-                        if compact {
-                            NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
-                                .libraryChromeFrame("anchor.library.sort")
-                            NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
-                        }
+                            .libraryChromeFrame("title")
                     }
-                    .libraryChromeFrame("title")
                     Text(LibraryRow.itemCount(model.visibleRows.count) + " · " + model.sort.title).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
-                    ScrollView(.horizontal) {
-                        HStack(spacing: NibSpacing.s) {
-                            breadcrumb(String(localized: "Documents"), ref: "lib")
-                            ForEach(model.breadcrumbs) { row in
-                                Image(nib: .forward).foregroundStyle(NibColor.labelTertiary).accessibilityHidden(true)
-                                breadcrumb(row.name, ref: row.ref)
+                    if !compact || model.folder != nil {
+                        ScrollView(.horizontal) {
+                            HStack(spacing: NibSpacing.s) {
+                                breadcrumb(String(localized: "Documents"), ref: "lib")
+                                ForEach(model.breadcrumbs) { row in
+                                    Image(nib: .forward).foregroundStyle(NibColor.labelTertiary).accessibilityHidden(true)
+                                    breadcrumb(row.name, ref: row.ref)
+                                }
                             }
                         }
                     }
@@ -571,13 +603,10 @@ struct LibraryRootView: View {
                     }
                     LibraryGridView(model: model)
                         .environment(\.horizontalSizeClass, compact ? .compact : .regular)
-                        // The library owns vertical scrolling so its header stays in the same content flow.
-                        .scrollDisabled(true)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
-                .padding(.top, max(NibSpacing.x6 + NibSpacing.l, topChromeBottom + NibMetrics.minimumRestingGap))
+                .padding(.top, compact ? NibSpacing.s : topChromeClearance)
             }
         }
     }
@@ -649,6 +678,10 @@ struct LibraryChromeOverlayLayout: Layout {
     var compact: Bool
     var titleBottom: CGFloat
 
+    static func placement(_ placement: ChromePlacement, compact: Bool) -> ChromePlacement {
+        compact && placement == .topTrailing ? .bottomTrailing : placement
+    }
+
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         proposal.replacingUnspecifiedDimensions()
     }
@@ -659,7 +692,7 @@ struct LibraryChromeOverlayLayout: Layout {
                                    width: max(0, bounds.width - (inlineSidebar ? NibMetrics.sidebarWidth : 0)), height: bounds.height)
         let offer = ProposedViewSize(width: contentBounds.width, height: bounds.height)
         var sizes = subviews.map { $0.sizeThatFits(offer) }
-        let groups = Dictionary(grouping: subviews.indices) { subviews[$0][LibraryChromeOverlaySlot.self].placement }
+        let groups = Dictionary(grouping: subviews.indices) { Self.placement(subviews[$0][LibraryChromeOverlaySlot.self].placement, compact: compact) }
         var banners = subviews.compactMap { $0[LibraryChromeBannerFrame.self] }
         var topStacks = CGRect.null
         // Leave the top-leading banner room beside the sidebar button and the New/status group.
@@ -667,8 +700,8 @@ struct LibraryChromeOverlayLayout: Layout {
         let trailingControls = trailing.filter { subviews[$0][LibraryChromeOverlaySlot.self].isControls }
         let trailingOverlays = trailing.filter { !subviews[$0][LibraryChromeOverlaySlot.self].isControls }
         let trailingWidth = trailingControls.reduce(CGFloat(0)) { $0 + sizes[$1].width }
-            + (trailingOverlays.map { sizes[$0].width }.max() ?? 0)
-            + (trailingControls.isEmpty || trailingOverlays.isEmpty ? 0 : gap)
+            + trailingOverlays.reduce(CGFloat(0)) { $0 + sizes[$1].width }
+            + gap * CGFloat(max(0, trailing.count - 1))
         let leading = groups[.topLeading] ?? []
         let leadingWidth = leading.filter { subviews[$0][LibraryChromeOverlaySlot.self].isControls }
             .reduce(CGFloat(0)) { $0 + sizes[$1].width + gap }
@@ -687,7 +720,33 @@ struct LibraryChromeOverlayLayout: Layout {
             let overlays = descriptors.filter { subviews[$0][LibraryChromeOverlaySlot.self].isBanner }
                 + descriptors.filter { !subviews[$0][LibraryChromeOverlaySlot.self].isBanner }
             let controlSize = controls.map { sizes[$0] } ?? .zero
-            let overlayWidth = overlays.map { sizes[$0].width }.max() ?? 0
+            if [.topTrailing, .bottomTrailing].contains(placement) {
+                let rowBounds = placement == .topTrailing ? contentBounds : bounds
+                let row = (controls.map { [$0] } ?? []) + overlays
+                guard !row.isEmpty else { continue }
+                let available = max(0, rowBounds.width - controlSize.width - gap * CGFloat(max(0, row.count - 1)))
+                let statusWidth = available / CGFloat(max(1, overlays.count))
+                for index in overlays {
+                    sizes[index] = subviews[index].sizeThatFits(.init(width: min(sizes[index].width, statusWidth), height: bounds.height))
+                }
+                let height = row.map { sizes[$0].height }.max() ?? 0
+                let width = row.reduce(CGFloat(0)) { $0 + sizes[$1].width } + gap * CGFloat(max(0, row.count - 1))
+                let selectionHeight = (groups[.bottom] ?? []).filter { subviews[$0][LibraryChromeOverlaySlot.self].isControls }
+                    .map { sizes[$0].height }.max() ?? 0
+                let bottomClearance = selectionHeight > 0 ? selectionHeight + gap : 0
+                var rect = CGRect(x: rowBounds.maxX - width,
+                                  y: placement == .bottomTrailing ? bounds.maxY - height - bottomClearance : bounds.minY,
+                                  width: width, height: height)
+                rect = avoidingBanners(rect, banners: banners, bottom: placement == .bottomTrailing)
+                var x = rect.minX
+                for index in row {
+                    let size = sizes[index]
+                    subviews[index].place(at: CGPoint(x: x, y: rect.midY - size.height / 2), anchor: .topLeading, proposal: .init(size))
+                    x += size.width + gap
+                }
+                if placement.isLibraryTop { topStacks = topStacks.union(rect) }
+                continue
+            }
             let bottom = [.bottomLeading, .bottom, .bottomTrailing].contains(placement)
             let centred = [.leading, .center, .trailing].contains(placement)
             let totalHeight = overlays.reduce(CGFloat(0)) { $0 + sizes[$1].height }
@@ -700,11 +759,7 @@ struct LibraryChromeOverlayLayout: Layout {
                 if controlBottom > 0 { y += controlBottom + gap }
             }
             if let controls {
-                var x = horizontalOrigin(placement, width: controlSize.width, in: placement.isLibraryTop ? contentBounds : bounds)
-                if [.topTrailing, .bottomTrailing].contains(placement), !overlays.isEmpty {
-                    // Status is on the right of New, and its entire stack reserves space clear of the controls.
-                    x -= overlayWidth + gap
-                }
+                let x = horizontalOrigin(placement, width: controlSize.width, in: placement.isLibraryTop ? contentBounds : bounds)
                 let rect = avoidingBanners(CGRect(x: x, y: bottom ? bounds.maxY - controlSize.height : topY,
                                                  width: controlSize.width, height: controlSize.height), banners: banners, bottom: bottom)
                 subviews[controls].place(at: rect.origin,
@@ -826,19 +881,31 @@ private struct LibraryDragMonitor: View {
     }
 }
 
-private struct LibraryStackedCarrier: View {
+struct LibraryStackedCarrier: View {
     let ref: String
     @ObservedObject var model: LibraryViewModel
     var body: some View {
         let stack = model.selection.refs.contains(ref) ? Array(model.rows.filter { model.selection.refs.contains($0.ref) && $0.ref != ref }.prefix(2)) : []
         ZStack {
             ForEach(Array(stack.enumerated().reversed()), id: \.element.ref) { index, row in
-                LibraryCard(row: row, model: model, thumbnail: false)
+                carrierCover(row)
                     .rotationEffect(.degrees(Double(index + 1) * NibReflowMetrics.libraryStackFanDegrees))
                     .offset(x: CGFloat(index + 1) * NibSpacing.xs, y: CGFloat(index + 1) * NibSpacing.xs)
             }
-            LibraryCard(row: model.rows.first { $0.ref == ref }, model: model, thumbnail: false)
+            if let row = model.rows.first(where: { $0.ref == ref }) { carrierCover(row) }
         }.accessibilityHidden(true)
+    }
+
+    @ViewBuilder private func carrierCover(_ row: LibraryRow) -> some View {
+        if row.isFolder {
+            LibraryCard(row: row, model: model, thumbnail: false)
+        } else {
+            // NibReflowCarrier supplies the measured cover dimensions and the .card style's 3 pt envelope.
+            LibraryCover(row: row, model: model, loadsThumbnail: false)
+                .clipShape(UnevenRoundedRectangle(topLeadingRadius: NibRadius.coverSpine, bottomLeadingRadius: NibRadius.coverSpine,
+                                                 bottomTrailingRadius: NibRadius.coverEdge, topTrailingRadius: NibRadius.coverEdge))
+                .nibElevation(.coverLifted)
+        }
     }
 }
 

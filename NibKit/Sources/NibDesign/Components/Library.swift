@@ -14,6 +14,8 @@ public struct NibDocumentCard<Cover: View>: View {
     let absorbOffset: CGSize?
     let cover: Cover
     @Environment(\.nibDropletIsLifted) private var isLifted
+    @Environment(\.nibReflowCoverOnly) private var coverOnly
+    @Environment(\.nibReflowMeasureCover) private var measureCover
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     public init(title: String, subtitle: String, isFavorite: Bool = false, typeBadge: NibSymbol? = nil,
@@ -46,26 +48,31 @@ public struct NibDocumentCard<Cover: View>: View {
                         NibCheckBead(isOn: isSelected).padding(6)
                     }
                 }
-                .nibElevation(isLifted ? .coverLifted : .cover)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(NibFont.footnoteEmphasis)
-                    .foregroundStyle(NibColor.label)
-                    .lineLimit(2)
-                HStack(spacing: 4) {
-                    if isFavorite {
-                        Image(nib: .starFill)
-                            .font(.system(size: 10))
-                            .accessibilityLabel(String(localized: "Favourite", bundle: .module))
-                    }
-                    Text(subtitle)
-                        .font(NibFont.caption1)
-                        .lineLimit(1)
+                .nibElevation(isLifted || coverOnly ? .coverLifted : .cover)
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: NibReflowMetrics.space) } action: { frame in
+                    if !coverOnly { measureCover?(frame) }
                 }
-                .foregroundStyle(NibColor.labelSecondary)
+            if !coverOnly {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(NibFont.footnoteEmphasis)
+                        .foregroundStyle(NibColor.label)
+                        .lineLimit(2)
+                    HStack(spacing: 4) {
+                        if isFavorite {
+                            Image(nib: .starFill)
+                                .font(.system(size: 10))
+                                .accessibilityLabel(String(localized: "Favourite", bundle: .module))
+                        }
+                        Text(subtitle)
+                            .font(NibFont.caption1)
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(NibColor.labelSecondary)
+                }
+                .opacity(isLifted ? 0 : 1)
+                .animation(NibMotion.fade, value: isLifted)
             }
-            .opacity(isLifted ? 0 : 1)
-            .animation(NibMotion.fade, value: isLifted)
         }
         .frame(width: size.width, alignment: .leading)
         .scaleEffect(absorbOffset == nil ? 1 : 0.12)
@@ -351,5 +358,25 @@ public struct NibPageBeads: View {
         .animation(NibMotion.glide.animation, value: index)
         .accessibilityElement()
         .accessibilityLabel(String(localized: "Step \(index + 1) of \(count)", bundle: .module))
+    }
+}
+
+/// Cover bounds travel through the shared component, so existing feature cards need no drag-specific wrapper.
+private struct NibReflowMeasureCoverKey: EnvironmentKey {
+    static let defaultValue: ((CGRect) -> Void)? = nil
+}
+
+private struct NibReflowCoverOnlyKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var nibReflowMeasureCover: ((CGRect) -> Void)? {
+        get { self[NibReflowMeasureCoverKey.self] }
+        set { self[NibReflowMeasureCoverKey.self] = newValue }
+    }
+    var nibReflowCoverOnly: Bool {
+        get { self[NibReflowCoverOnlyKey.self] }
+        set { self[NibReflowCoverOnlyKey.self] = newValue }
     }
 }

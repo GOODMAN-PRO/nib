@@ -158,9 +158,12 @@ public struct NibIconButton: View {
                 .foregroundStyle(tint)
                 .frame(width: disc ?? 40, height: disc ?? 40)
                 .background {
-                    if disc != nil {
+                    if disc != nil || isOn {
                         Circle().fill(NibColor.fill3)
                     }
+                }
+                .overlay {
+                    if isOn { Circle().strokeBorder(.primary, lineWidth: NibSpacing.xxs) }
                 }
                 .opacity(isEnabled ? 1 : NibOpacity.disabled)
                 .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)

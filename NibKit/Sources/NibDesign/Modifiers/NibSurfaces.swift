@@ -39,28 +39,48 @@ struct NibSystemGlass: Equatable {
     }
 }
 
+/// The native material wraps its foreground directly. Kept in one host so a sibling glass shape cannot accidentally
+/// lens labels; its returned view structure is also inspectable by hostless tests.
+@available(iOS 26.0, *)
+struct NibNativeGlass<Foreground: View>: View {
+    let effect: Glass
+    let shape: NibDropletShape
+    @ViewBuilder let foreground: () -> Foreground
+
+    var body: some View {
+        foreground().glassEffect(effect, in: shape)
+    }
+}
+
 /// Body colour is shared by frozen glass and the dark-paper contrast exception (DESIGN.md §2.3).
 /// It is always beneath the system material; no extra rim, sheen or coloured light is painted over glass.
 enum NibGlassBodyTint {
-    static func color(_ kind: NibGlass, paperShare: Double = 0) -> Color {
+    static func color(_ kind: NibGlass, paperShare: Double = 0, colorScheme: ColorScheme? = nil) -> Color {
+        Color(uiColor: resolvedColor(kind, paperShare: paperShare, colorScheme: colorScheme))
+    }
+
+    static func resolvedColor(_ kind: NibGlass, paperShare: Double = 0, colorScheme: ColorScheme? = nil) -> UIColor {
+        let dynamic: UIColor
         switch kind {
-        case .deep: return NibColor.deepBody
-        case .tinted: return NibColor.accent
-        case .bead: return NibColor.beadBody
+        case .deep: dynamic = NibUIColor.deepBody
+        case .tinted: dynamic = NibUIColor.accent
+        case .bead: dynamic = NibUIColor.beadBody
         case .clear:
             let share = paperShare.isFinite ? min(max(paperShare, 0), 1) : 0
-            return Color(uiColor: UIColor { traits in
+            dynamic = UIColor { traits in
                 let base = NibUIColor.clearBody.resolvedColor(with: traits)
                 let paper = NibUIColor.clearBodyOnPaper.resolvedColor(with: traits)
                 return base.withAlphaComponent(base.cgColor.alpha + (paper.cgColor.alpha - base.cgColor.alpha) * CGFloat(share))
-            })
+            }
         }
+        guard let colorScheme else { return dynamic }
+        return dynamic.resolvedColor(with: UITraitCollection(userInterfaceStyle: colorScheme == .dark ? .dark : .light))
     }
 
     static func systemUnderlay(_ kind: NibGlass, colorScheme: ColorScheme, paperShare: Double) -> Color {
         guard colorScheme == .dark else { return .clear }
-        if kind == .deep { return NibColor.deepBody }
-        if kind == .clear && paperShare > 0.6 { return color(.clear, paperShare: paperShare) }
+        if kind == .deep { return color(.deep, colorScheme: colorScheme) }
+        if kind == .clear && paperShare > 0.6 { return color(.clear, paperShare: paperShare, colorScheme: colorScheme) }
         return .clear
     }
 }
@@ -126,16 +146,18 @@ struct NibGlassModifier: ViewModifier {
             // The glass is applied to the content itself, as Apple's custom-view guide does: its foreground effects
             // (vibrant labels, the interactive response) reach the controls. One modifier chain in every state, so a
             // Pencil down or a Liquid change never rebuilds the content.
-            content
-                .background { systemUnderlay }
-                .glassEffect(systemGlass, in: shape)
-                .background {
-                    GeometryReader { proxy in
-                        Color.clear
-                            .onAppear { restFrame = proxy.frame(in: NibLiquid.space) }
-                            .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in restFrame = frame }
-                    }
+            NibNativeGlass(effect: systemGlass, shape: shape) {
+                content
+                    .foregroundStyle(.primary)
+                    .background { systemUnderlay }
+            }
+            .background {
+                GeometryReader { proxy in
+                    Color.clear
+                        .onAppear { restFrame = proxy.frame(in: NibLiquid.space) }
+                        .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in restFrame = frame }
                 }
+            }
         } else {
             content.background { fallback }
         }
@@ -148,7 +170,7 @@ struct NibGlassModifier: ViewModifier {
     }
 
     private var tint: Color {
-        NibGlassBodyTint.color(kind, paperShare: paperShare)
+        NibGlassBodyTint.color(kind, paperShare: paperShare, colorScheme: colorScheme)
     }
 
     private var paperShare: Double { DropletField.paperShare(restFrame, in: backdrop) }

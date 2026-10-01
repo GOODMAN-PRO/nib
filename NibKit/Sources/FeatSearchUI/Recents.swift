@@ -160,7 +160,7 @@ final class SearchState: ObservableObject {
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
     var countLabel: String {
         if let selectedIndex { return String(localized: "\(selectedIndex + 1) of \(visibleMatches.count)") }
-        return String(localized: "^[\(visibleMatches.count) match](inflect: true)")
+        return String(AttributedString(localized: "^[\(visibleMatches.count) match](inflect: true)").characters)
     }
 }
 

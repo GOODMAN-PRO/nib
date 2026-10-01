@@ -163,16 +163,11 @@ enum BoardLimitGate {
 }
 
 enum MinimapLayout {
-    /// Keep a full resting gap above the page HUD and the bottom palette, including its fused options bar.
-    /// Compact-height windows include iPhone landscape even when their horizontal size class is regular.
-    static func bottomClearance(compact: Bool, compactHeight: Bool = false, hasOptionsBar: Bool = true) -> CGFloat {
-        let bottomInset = compact || compactHeight ? NibMetrics.canvasBottomInsetCompact : NibMetrics.chromeInset
-        let hud = bottomInset + NibMetrics.hudHeight + NibSpacing.l
-        guard compact || compactHeight else { return hud }
-        let palette = NibMetrics.barTopGap + NibMetrics.paletteThicknessMax
-            + (hasOptionsBar ? NibMetrics.barHeightMax - 1 : 0) + NibSpacing.l
-        return max(hud, palette)
-    }
+    /// Join the page HUD's stack, after its order of 100. The chrome measures both views and leaves
+    /// `NibMetrics.minimumRestingGap` above the HUD's actual frame, in the region already cleared of the
+    /// palette, fused options and keyboard. No second size-class-specific clearance calculation.
+    static let placement = ChromePlacement.bottomTrailing
+    static let order = 101
 }
 
 /// The parts of the overlay that take touches; the gaps between them stay canvas.
@@ -186,6 +181,7 @@ final class MinimapHitFrames {
     private(set) var frames: [MinimapPart: CGRect] = [:]
 
     func set(_ part: MinimapPart, _ frame: CGRect?) { frames[part] = frame }
+    func clear() { frames.removeAll() }
 }
 
 // MARK: - Model
@@ -216,8 +212,6 @@ final class MinimapModel: ObservableObject {
     @Published var compact = false {
         didSet { if oldValue != compact { updateGeometry() } }
     }
-    /// The visible canvas region, converted into the window's droplet container and cleared of its bottom chrome.
-    @Published var floatingRegion: CGRect?
     /// Where the overlay's parts are, so only they (not the gaps between them) take touches.
     let hitFrames = MinimapHitFrames()
 
@@ -521,10 +515,11 @@ final class MinimapModel: ObservableObject {
 @MainActor
 final class MinimapAttachment: CanvasAttachment {
     static let id = "whiteboard.minimap"
+    /// Attachments in different windows must not replace each other's overlay registrations.
+    let overlayID = MinimapAttachment.id + "." + UUID().uuidString
     private(set) var model: MinimapModel?
     private var subscriptions: [EventSubscription] = []
     private var observers: [NSObjectProtocol] = []
-    private var modelChanges: AnyCancellable?
     private var sessionChanges: AnyCancellable?
     private weak var host: CanvasHost?
     private weak var floatingHost: FloatingHosting?
@@ -534,6 +529,19 @@ final class MinimapAttachment: CanvasAttachment {
         let model = MinimapModel(app: host.app, doc: host.documentID, session: host.session)
         model.host = host
         self.model = model
+        host.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: overlayID, owner: FeatWhiteboardFeature.id, placement: MinimapLayout.placement,
+            surface: .none, order: MinimapLayout.order,
+            // Each part already has its own droplet: no enclosing glass body or second recede opacity.
+            recedesWhileWriting: false, docKinds: [.whiteboard],
+            isVisible: { [weak self, weak model] context in
+                guard let self, let model, self.model === model else { return false }
+                return context.session === model.session && context.session.document == model.doc
+            },
+            makeView: { [weak model] _ in
+                guard let model else { return AnyView(EmptyView()) }
+                return AnyView(MinimapOverlay(model: model))
+            }))
         subscriptions.append(host.app.bus.observeCommits { [weak model] changes in model?.committed(changes) })
         subscriptions.append(host.session.inking.observe { [weak model] signal in model?.inkingChanged(signal.isInking) })
         observers.append(NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: host.app.settings,
@@ -541,10 +549,7 @@ final class MinimapAttachment: CanvasAttachment {
             guard (note.userInfo?["name"] as? String) == Whiteboard.minimapVisible.name else { return }
             Task { @MainActor in model?.settingsChanged() }
         })
-        // Layout follows changes to the board and the active tool's options, after their published state lands.
-        modelChanges = model.objectWillChange.sink { [weak self] _ in
-            Task { @MainActor in self?.layout() }
-        }
+        // The chrome owns placement; the attachment only tracks canvas traits and coordinate conversion.
         sessionChanges = host.session.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in self?.layout() }
         }
@@ -555,13 +560,13 @@ final class MinimapAttachment: CanvasAttachment {
     }
 
     func detach(from host: CanvasHost) {
-        floatingHost?.dismiss(Self.id)
+        host.app.ui.chromeOverlays.unregister(id: overlayID)
         floatingHost = nil
+        model?.hitFrames.clear()
         subscriptions.forEach { $0.cancel() }
         subscriptions = []
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers = []
-        modelChanges = nil
         sessionChanges = nil
         model = nil
         self.host = nil
@@ -575,7 +580,8 @@ final class MinimapAttachment: CanvasAttachment {
     func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
         guard let model else { return false }
         if model.blocksWriting(isPencil: isPencil) { return true }
-        guard let floatingHost, floatingHost.isPresenting(Self.id),
+        guard host.session.document == model.doc, let floatingHost,
+              floatingHost === host.session.floatingHost,
               let point = floatingHost.containerRect(CGRect(origin: viewPoint, size: .zero), from: host.canvasView)?.origin
         else { return false }
         let parts = Array(model.hitFrames.frames.values).filter { !$0.isEmpty }
@@ -609,8 +615,8 @@ final class MinimapAttachment: CanvasAttachment {
         return Rect.bounding([a.point, c.point])
     }
 
-    /// Present through the window's host, so every surface joins the chrome's single droplet container. Converting
-    /// canvas bounds (rather than using their scrolling origin directly) also keeps the minimap fixed during pans.
+    /// The shared chrome stack positions this overlay above the measured page HUD, including the palette's
+    /// fused options clearance. Keep only sizing and hit-test conversion here; panning never changes placement.
     private func layout() {
         guard let host, let model else { return }
         let canvas = host.canvasView
@@ -619,58 +625,16 @@ final class MinimapAttachment: CanvasAttachment {
             || canvas.bounds.width < NibMetrics.compactBreakpoint
         if model.compact != compact { model.compact = compact }
         if canvas.traitCollection.displayScale > 0 { model.displayScale = canvas.traitCollection.displayScale }
-        guard let floating = host.session.floatingHost else {
-            floatingHost?.dismiss(Self.id)
-            floatingHost = nil
-            if model.floatingRegion != nil { model.floatingRegion = nil }
-            return
+        if floatingHost !== host.session.floatingHost {
+            model.hitFrames.clear()
+            floatingHost = host.session.floatingHost
         }
-        if floatingHost !== floating {
-            floatingHost?.dismiss(Self.id)
-            floatingHost = floating
-        }
-        if !floating.isPresenting(Self.id) {
-            floating.present(Self.id) {
-                MinimapFloatingOverlay(model: model, updateLayout: { [weak self] in self?.layout() })
-            }
-        }
-        let safe = canvas.safeAreaInsets
-        let clearance = MinimapLayout.bottomClearance(compact: compact, compactHeight: compactHeight)
-        let region = canvas.bounds.inset(by: UIEdgeInsets(top: safe.top + NibMetrics.chromeInset,
-                                                       left: safe.left + NibMetrics.chromeInset,
-                                                       bottom: safe.bottom + clearance,
-                                                       right: safe.right + NibMetrics.chromeInset))
-        let converted = floating.containerRect(region, from: canvas)
-        if model.floatingRegion != converted { model.floatingRegion = converted }
     }
 }
 
 // MARK: - Views
 
-/// Full-window floating content. Only the minimap's parts take touches; the canvas remains reachable in the gaps.
-struct MinimapFloatingOverlay: View {
-    @ObservedObject var model: MinimapModel
-    let updateLayout: @MainActor () -> Void
-
-    var body: some View {
-        GeometryReader { proxy in
-            if let region = model.floatingRegion, region.width > 0, region.height > 0 {
-                MinimapOverlay(model: model)
-                    .frame(width: region.width, height: region.height, alignment: .bottomTrailing)
-                    .position(x: region.midX, y: region.midY)
-            }
-            // The reference view may join the window after attach; re-convert when the layer is laid out.
-            Color.clear
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-                .onGeometryChange(for: CGSize.self) { _ in proxy.size } action: { _ in
-                    Task { @MainActor in updateLayout() }
-                }
-        }
-        .task { updateLayout() }
-    }
-}
-
+/// Measured by the same chrome layout as the page HUD. Only the parts take touches; gaps stay canvas.
 struct MinimapOverlay: View {
     @ObservedObject var model: MinimapModel
 

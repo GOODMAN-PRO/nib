@@ -18,6 +18,8 @@ public struct NibEmptyState: View {
         self.secondary = secondary
     }
 
+    static var messageForeground: Color { NibColor.label }
+
     public var body: some View {
         VStack(spacing: 0) {
             Image(nib: symbol)
@@ -32,7 +34,7 @@ public struct NibEmptyState: View {
             if let message {
                 Text(message)
                     .font(NibFont.callout)
-                    .foregroundStyle(NibColor.labelSecondary)
+                    .foregroundStyle(Self.messageForeground)
                     .multilineTextAlignment(.center)
                     .padding(.top, NibSpacing.s)
             }

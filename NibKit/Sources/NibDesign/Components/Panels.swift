@@ -9,12 +9,16 @@ public struct NibPopoverPanel<Content: View>: View {
     let subtitle: String?
     let width: CGFloat
     let content: Content
+    let maxHeight: CGFloat
+    @State private var contentHeight: CGFloat = NibMetrics.popoverMaxHeight
+    @Environment(DropletField.self) private var field: DropletField?
 
     public init(title: String, subtitle: String? = nil, width: CGFloat = NibMetrics.popoverWidth,
-                @ViewBuilder content: () -> Content) {
+                maxHeight: CGFloat = NibMetrics.popoverMaxHeight, @ViewBuilder content: () -> Content) {
         self.title = title
         self.subtitle = subtitle
         self.width = width
+        self.maxHeight = maxHeight
         self.content = content()
     }
 
@@ -35,13 +39,21 @@ public struct NibPopoverPanel<Content: View>: View {
                 content
             }
             .padding(NibSpacing.l)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
         }
         .scrollBounceBehavior(.basedOnSize)
-        .frame(width: width)
-        .frame(maxHeight: NibMetrics.popoverMaxHeight)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: min(width, viewport.width))
+        .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
+    }
+
+    private var viewport: CGSize {
+        guard let bounds = field?.bounds, NibGeometry.isUsable(bounds) else {
+            return CGSize(width: width, height: maxHeight)
+        }
+        return CGSize(width: max(0, bounds.width - 2 * NibMetrics.chromeInset),
+                      height: max(0, bounds.height - 2 * NibMetrics.chromeInset))
     }
 }
 
@@ -57,27 +69,66 @@ public enum NibBudPlacement: Sendable {
         case centre
     }
 
-    /// The centre of a `size` popover beside `anchor`, `gap` away, clamped (across the placement axis) inside `bounds`
-    /// inset by the 16 pt chrome inset. All in one coordinate space.
+    private var opposite: Self {
+        switch self {
+        case .below: return .above
+        case .above: return .below
+        case .leading: return .trailing
+        case .trailing: return .leading
+        }
+    }
+
+    private func insetBounds(_ bounds: CGRect) -> CGRect {
+        let bounds = NibGeometry.rect(bounds)
+        let inset = NibMetrics.chromeInset
+        return CGRect(x: bounds.minX + min(inset, bounds.width / 2),
+                      y: bounds.minY + min(inset, bounds.height / 2),
+                      width: max(0, bounds.width - 2 * inset), height: max(0, bounds.height - 2 * inset))
+    }
+
+    private func room(beside anchor: CGRect, gap: CGFloat, in bounds: CGRect) -> CGFloat {
+        switch self {
+        case .below: return max(0, bounds.maxY - anchor.maxY - gap)
+        case .above: return max(0, anchor.minY - bounds.minY - gap)
+        case .leading: return max(0, anchor.minX - bounds.minX - gap)
+        case .trailing: return max(0, bounds.maxX - anchor.maxX - gap)
+        }
+    }
+
+    /// Constrain the scrolling viewport before measuring it, choosing the larger side if necessary.
+    func availableSize(beside anchor: CGRect, gap: CGFloat, in bounds: CGRect) -> CGSize {
+        let anchor = NibGeometry.rect(anchor), gap = max(0, NibGeometry.finite(gap))
+        let b = insetBounds(bounds)
+        let room = max(room(beside: anchor, gap: gap, in: b), opposite.room(beside: anchor, gap: gap, in: b))
+        switch self {
+        case .below, .above: return CGSize(width: b.width, height: min(b.height, room))
+        case .leading, .trailing: return CGSize(width: min(b.width, room), height: b.height)
+        }
+    }
+
+    /// Prefer the requested side, flip when it cannot fit, then clamp both axes to the chrome inset.
     func centre(size: CGSize, beside anchor: CGRect, gap: CGFloat, in bounds: CGRect,
                 alignment: Alignment = .top) -> CGPoint {
         let size = NibGeometry.size(size), anchor = NibGeometry.rect(anchor)
-        let gap = NibGeometry.finite(gap)
-        let b = NibGeometry.rect(bounds).insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
+        let gap = max(0, NibGeometry.finite(gap)), b = insetBounds(bounds)
+        let extent = (self == .below || self == .above) ? size.height : size.width
+        let preferred = room(beside: anchor, gap: gap, in: b)
+        let alternate = opposite.room(beside: anchor, gap: gap, in: b)
+        let side = preferred < extent && alternate > preferred ? opposite : self
         let sideY = alignment == .top ? anchor.minY - NibSpacing.l + size.height / 2 : anchor.midY
         var c: CGPoint
-        switch self {
+        switch side {
         case .below: c = CGPoint(x: anchor.midX, y: anchor.maxY + gap + size.height / 2)
         case .above: c = CGPoint(x: anchor.midX, y: anchor.minY - gap - size.height / 2)
         case .trailing: c = CGPoint(x: anchor.maxX + gap + size.width / 2, y: sideY)
         case .leading: c = CGPoint(x: anchor.minX - gap - size.width / 2, y: sideY)
         }
-        switch self {
-        case .below, .above:
-            c.x = min(max(c.x, b.minX + size.width / 2), max(b.minX + size.width / 2, b.maxX - size.width / 2))
-        case .leading, .trailing:
-            c.y = min(max(c.y, b.minY + size.height / 2), max(b.minY + size.height / 2, b.maxY - size.height / 2))
+        func clamp(_ value: CGFloat, min lower: CGFloat, max upper: CGFloat, extent: CGFloat) -> CGFloat {
+            guard extent <= upper - lower else { return (lower + upper) / 2 }
+            return Swift.min(Swift.max(value, lower + extent / 2), upper - extent / 2)
         }
+        c.x = clamp(c.x, min: b.minX, max: b.maxX, extent: size.width)
+        c.y = clamp(c.y, min: b.minY, max: b.maxY, extent: size.height)
         return NibGeometry.point(c)
     }
 }
@@ -111,15 +162,23 @@ public struct NibBudPopover<Content: View>: View {
     }
 
     public var body: some View {
-        let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
-        let anchor = field?.anchorRect(source) ?? .zero
-        let bounds = field?.bounds ?? .zero
-        NibPopoverPanel(title: title, subtitle: subtitle, width: width) { content }
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
-            .droplet(id, style: .popover)
-            .budsFrom(source, isPresented: $isPresented)
-            .position(placement.centre(size: size, beside: anchor, gap: gap, in: bounds))
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        GeometryReader { proxy in
+            let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
+            let anchor = field?.anchorRect(source) ?? .zero
+            let frame = proxy.frame(in: NibLiquid.space)
+            let safe = proxy.safeAreaInsets
+            let bounds = CGRect(x: frame.minX + safe.leading, y: frame.minY + safe.top,
+                                width: max(0, frame.width - safe.leading - safe.trailing),
+                                height: max(0, frame.height - safe.top - safe.bottom))
+            let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
+            let centre = placement.centre(size: size, beside: anchor, gap: gap, in: bounds)
+            NibPopoverPanel(title: title, subtitle: subtitle, width: min(width, available.width),
+                            maxHeight: available.height) { content }
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+                .droplet(id, style: .popover)
+                .budsFrom(source, isPresented: $isPresented)
+                .position(x: centre.x - frame.minX, y: centre.y - frame.minY)
+        }
     }
 }
 

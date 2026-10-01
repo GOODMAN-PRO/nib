@@ -34,6 +34,10 @@ final class ShellViewController: UIViewController, SceneNavigator {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
+        registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
+            (shell: ShellViewController, _: UITraitCollection) in
+            shell.synchroniseContentAppearance()
+        }
         failureObserver = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: nil, queue: .main) { [weak self] note in
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
             Task { @MainActor in self?.toastIfActive(message) }
@@ -47,6 +51,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        synchroniseContentAppearance()
         reclaimKeyFocusIfNeeded()
     }
 
@@ -209,6 +214,8 @@ final class ShellViewController: UIViewController, SceneNavigator {
     func presentModal(_ viewController: UIViewController) {
         var top: UIViewController = self
         while let presented = top.presentedViewController { top = presented }
+        // Resolve from this scene, never from a process-global current trait collection.
+        viewController.overrideUserInterfaceStyle = traitCollection.userInterfaceStyle
         top.present(viewController, animated: true)
     }
 
@@ -357,6 +364,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
             old.removeFromParent()
         }
         addChild(vc)
+        setOverrideTraitCollection(chromeTraits, forChild: vc)
         view.addSubview(vc.view)
         vc.didMove(toParent: self)
         content = vc
@@ -365,6 +373,28 @@ final class ShellViewController: UIViewController, SceneNavigator {
         contentPresentationDidChange()
         // The new screen may take focus as it appears; only when nothing did does the shell take it.
         Task { @MainActor [weak self] in self?.reclaimKeyFocusIfNeeded() }
+    }
+
+    private var chromeTraits: UITraitCollection {
+        UITraitCollection(traitsFrom: [
+            UITraitCollection(userInterfaceStyle: traitCollection.userInterfaceStyle),
+            UITraitCollection(accessibilityContrast: traitCollection.accessibilityContrast)
+        ])
+    }
+
+    /// Child hosting controllers can be created before joining the window. Refresh their inherited scene traits
+    /// both at attachment and on changes, without changing document/paper colours or rebuilding their state.
+    private func synchroniseContentAppearance() {
+        for child in children {
+            setOverrideTraitCollection(chromeTraits, forChild: child)
+            child.viewIfLoaded?.setNeedsLayout()
+            child.viewIfLoaded?.setNeedsDisplay()
+        }
+        var presented = presentedViewController
+        while let controller = presented {
+            controller.overrideUserInterfaceStyle = traitCollection.userInterfaceStyle
+            presented = controller.presentedViewController
+        }
     }
 
     private func refreshTabBar() {

@@ -753,16 +753,19 @@ final class FeatWhiteboardTests: XCTestCase {
         h.session.floatingHost = floating
         let minimap = MinimapAttachment()
         minimap.attach(to: host)
-        XCTAssertTrue(floating.isPresenting(MinimapAttachment.id))
+        XCTAssertNotNil(h.app.ui.chromeOverlays.get(minimap.overlayID))
+        XCTAssertTrue(floating.entries.isEmpty, "placement belongs to the shared chrome stack")
         XCTAssertTrue(host.canvasView.subviews.isEmpty, "floating chrome belongs to the window, not the scrolling canvas")
         XCTAssertEqual(minimap.model?.itemCount, 1)
         XCTAssertEqual(minimap.model?.limit, BoardLimitStatus.ok)
 
         minimap.canvasDidChange(host)
-        let region = try XCTUnwrap(minimap.model?.floatingRegion)
-        XCTAssertEqual(region.maxX, floating.origin.x + host.canvasView.bounds.width - NibMetrics.chromeInset)
-        XCTAssertEqual(region.maxY, floating.origin.y + host.canvasView.bounds.height
-                       - MinimapLayout.bottomClearance(compact: false))
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(minimap.overlayID))
+        XCTAssertEqual(overlay.placement, .bottomTrailing)
+        XCTAssertEqual(overlay.surface, .none, "each part keeps its own droplet, with no enclosing glass")
+        XCTAssertFalse(overlay.recedesWhileWriting, "the part droplets already recede in the shared container")
+        // Frames reported by SwiftUI are in container coordinates, independent of the canvas scroll origin.
+        let region = CGRect(x: 40, y: 100, width: 700, height: 600)
         XCTAssertFalse(minimap.hitTest(CGPoint(x: 8, y: 8), host: host), "the top-left corner is canvas")
         XCTAssertFalse(minimap.hitTest(CGPoint(x: 500, y: 500), host: host), "unreported frames never claim canvas")
 
@@ -777,7 +780,8 @@ final class FeatWhiteboardTests: XCTestCase {
 
         host.canvasView.bounds.origin = CGPoint(x: 500, y: -200)
         minimap.canvasDidChange(host)
-        XCTAssertEqual(minimap.model?.floatingRegion, region, "the minimap stays fixed when the canvas pans")
+        XCTAssertEqual(frames.frames[.map], CGRect(x: region.maxX - 208, y: region.maxY - 200,
+                                                width: 208, height: 144), "the minimap stays fixed when the canvas pans")
         XCTAssertTrue(minimap.hitTest(CGPoint(x: mapPoint.x + 500, y: mapPoint.y - 200), host: host))
 
         // Only the parts take touches: the gap between the map and the controls row stays canvas.
@@ -788,7 +792,8 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertTrue(MinimapAttachment.overlayTakes(CGPoint(x: 10, y: 190), parts: []), "before layout the whole overlay")
 
         minimap.detach(from: host)
-        XCTAssertFalse(floating.isPresenting(MinimapAttachment.id))
+        XCTAssertNil(h.app.ui.chromeOverlays.get(minimap.overlayID))
+        XCTAssertTrue(frames.frames.isEmpty)
         XCTAssertNil(minimap.model)
     }
 
@@ -799,39 +804,102 @@ final class FeatWhiteboardTests: XCTestCase {
         let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
         let minimap = MinimapAttachment()
         minimap.attach(to: host)
-        XCTAssertNil(minimap.model?.floatingRegion)
+        XCTAssertNotNil(h.app.ui.chromeOverlays.get(minimap.overlayID))
+        XCTAssertFalse(minimap.hitTest(.zero, host: host), "no window coordinate conversion before the host arrives")
         XCTAssertTrue(host.canvasView.subviews.isEmpty)
+        let frames = try XCTUnwrap(minimap.model?.hitFrames)
 
         let first = MinimapTestFloatingHost()
         first.canConvert = false
         h.session.floatingHost = first
         minimap.canvasDidChange(host)
-        XCTAssertTrue(first.isPresenting(MinimapAttachment.id))
-        XCTAssertNil(minimap.model?.floatingRegion, "wait until the layer joins the canvas's window")
+        let controls = CGRect(x: 100, y: 200, width: 184, height: 40)
+        frames.set(.controls, controls)
+        let point = CGPoint(x: controls.midX - first.origin.x, y: controls.midY - first.origin.y)
+        XCTAssertFalse(minimap.hitTest(point, host: host), "wait until the layer joins the canvas's window")
         first.canConvert = true
         minimap.canvasDidChange(host)
-        XCTAssertNotNil(minimap.model?.floatingRegion)
+        XCTAssertTrue(minimap.hitTest(point, host: host))
 
         let second = MinimapTestFloatingHost()
+        second.origin = CGPoint(x: 80, y: 100)
         h.session.floatingHost = second
+        XCTAssertFalse(minimap.hitTest(point, host: host), "never use the old host's conversion")
         minimap.canvasDidChange(host)
-        XCTAssertFalse(first.isPresenting(MinimapAttachment.id))
-        XCTAssertTrue(second.isPresenting(MinimapAttachment.id))
+        XCTAssertTrue(frames.frames.isEmpty, "discard frames from the previous container")
+        XCTAssertFalse(minimap.hitTest(point, host: host))
+        frames.set(.controls, controls)
+        XCTAssertTrue(minimap.hitTest(CGPoint(x: controls.midX - second.origin.x,
+                                             y: controls.midY - second.origin.y), host: host))
+        XCTAssertTrue(first.entries.isEmpty)
+        XCTAssertTrue(second.entries.isEmpty, "the chrome renders the overlay once")
 
         h.session.floatingHost = nil
         minimap.canvasDidChange(host)
-        XCTAssertFalse(second.isPresenting(MinimapAttachment.id))
-        XCTAssertNil(minimap.model?.floatingRegion)
+        XCTAssertTrue(frames.frames.isEmpty)
+        XCTAssertFalse(minimap.hitTest(point, host: host))
+        let descriptor = try XCTUnwrap(h.app.ui.chromeOverlays.get(minimap.overlayID))
+        let context = ChromeContext(app: h.app, session: h.session, kind: .whiteboard)
         minimap.detach(from: host)
+        XCTAssertNil(h.app.ui.chromeOverlays.get(minimap.overlayID))
+        XCTAssertFalse(descriptor.isVisible(context), "a retained descriptor cannot revive a detached minimap")
     }
 
-    func testMinimapClearsPageHUDAndFusedPaletteOptionsInLandscape() {
-        let regular = MinimapLayout.bottomClearance(compact: false)
-        XCTAssertEqual(regular, NibMetrics.chromeInset + NibMetrics.hudHeight + NibSpacing.l)
-        let landscape = MinimapLayout.bottomClearance(compact: false, compactHeight: true)
-        XCTAssertGreaterThanOrEqual(landscape, NibMetrics.canvasBottomInsetCompact + NibMetrics.hudHeight + NibSpacing.l)
-        XCTAssertGreaterThanOrEqual(landscape, NibMetrics.barTopGap + NibMetrics.paletteThicknessMax
-                                   + NibMetrics.barHeightMax - 1 + NibSpacing.l)
-        XCTAssertEqual(landscape, MinimapLayout.bottomClearance(compact: true))
+    func testMinimapClearsPageHUDAndFusedPaletteOptionsInLandscape() throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
+        // The page HUD's public registration contract: measured in the bottom-trailing stack, order 100.
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "canvas.pageHUD", owner: "canvas", placement: .bottomTrailing, surface: .hud, order: 100,
+            docKinds: [.whiteboard], makeView: { _ in AnyView(Text("100 %")) }))
+        let minimap = MinimapAttachment()
+        minimap.attach(to: host)
+        defer { minimap.detach(from: host) }
+        let generation = h.app.ui.chromeOverlays.generation
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 852, height: 393),
+                     CGSize(width: 1024, height: 768)] {
+            host.canvasView.bounds.size = size
+            minimap.canvasDidChange(host)
+            for compact in [false, true] {
+                let context = ChromeContext(app: h.app, session: h.session, kind: .whiteboard, isCompact: compact)
+                let stack = h.app.ui.visibleChromeOverlays(context).filter { $0.placement == .bottomTrailing }
+                XCTAssertEqual(stack.map(\.id), ["canvas.pageHUD", minimap.overlayID],
+                               "the shared layout stacks minimap above the measured HUD after palette/options clearance")
+                XCTAssertEqual(stack.last?.surface, ChromeSurface.none)
+            }
+        }
+        XCTAssertEqual(h.app.ui.chromeOverlays.generation, generation, "rotation does not create a second overlay")
+        XCTAssertEqual(NibMetrics.minimumRestingGap, 16, "the shared stack uses the full resting gap")
+    }
+
+    func testMinimapChromeRegistrationsStayInTheirOwnWindowAndDocument() throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let other = EditorSession()
+        other.document = Fixtures.whiteboardID
+        other.page = Fixtures.boardID
+        let firstHost = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
+        let secondHost = FakeCanvasHost(app: h.app, session: other, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
+        let first = MinimapAttachment()
+        let second = MinimapAttachment()
+        first.attach(to: firstHost)
+        second.attach(to: secondHost)
+        defer {
+            first.detach(from: firstHost)
+            second.detach(from: secondHost)
+        }
+        let firstContext = ChromeContext(app: h.app, session: h.session, kind: .whiteboard)
+        let secondContext = ChromeContext(app: h.app, session: other, kind: .whiteboard)
+        XCTAssertNotEqual(first.overlayID, second.overlayID)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(firstContext).map(\.id), [first.overlayID])
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(secondContext).map(\.id), [second.overlayID])
+        h.session.document = nil
+        XCTAssertTrue(h.app.ui.visibleChromeOverlays(firstContext).isEmpty)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(secondContext).map(\.id), [second.overlayID])
+        let notebook = ChromeContext(app: h.app, session: other, kind: .notebook)
+        XCTAssertTrue(h.app.ui.visibleChromeOverlays(notebook).isEmpty)
     }
 }

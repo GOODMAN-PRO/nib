@@ -77,6 +77,40 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertFalse(SearchFilter.pdf.includes(hit()))
     }
 
+    func testCountLabelResolvesInflectionForZeroOneAndMultipleMatches() {
+        let state = SearchState()
+        for (count, expected) in [(0, "0 matches"), (1, "1 match"), (3, "3 matches")] {
+            state.matches = (0..<count).map { hit(text: "Match \($0)") }
+            XCTAssertEqual(state.countLabel, expected)
+        }
+    }
+
+    func testCountLabelUsesFilteredMatchesAndPreservesSelectedPosition() {
+        let state = SearchState()
+        let first = hit(text: "First typed match")
+        let handwriting = hit(kind: "ink")
+        let last = hit(text: "Last typed match")
+        state.matches = [first, handwriting, last]
+        state.selectedID = last.id
+        XCTAssertEqual(state.countLabel, "3 of 3")
+
+        state.filter = .typed
+        XCTAssertEqual(state.countLabel, "2 of 2")
+        state.selectedID = first.id
+        XCTAssertEqual(state.countLabel, "1 of 2")
+        state.selectedID = nil
+        XCTAssertEqual(state.countLabel, "2 matches")
+
+        state.selectedID = handwriting.id
+        XCTAssertEqual(state.countLabel, "2 matches", "A filtered-out selection shows the visible count")
+        state.filter = .handwriting
+        XCTAssertEqual(state.countLabel, "1 of 1")
+        state.selectedID = nil
+        XCTAssertEqual(state.countLabel, "1 match")
+        state.filter = .pdf
+        XCTAssertEqual(state.countLabel, "0 matches")
+    }
+
     func testResultNavigatesExactPageRectAndDoesNotCreateUndoSteps() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let hits = [hit(), hit(Fixtures.page2)]

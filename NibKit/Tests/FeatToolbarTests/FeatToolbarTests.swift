@@ -1,6 +1,8 @@
 import XCTest
 import SwiftUI
+import UIKit
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatToolbar
 
@@ -129,6 +131,87 @@ final class FeatToolbarTests: XCTestCase {
     func testConformance() async {
         let problems = await CommandConformance.check(features: [FeatToolbarFeature.self])
         XCTAssertEqual(problems, [])
+    }
+
+    /// Vertical fitting must get a usable form height even when List has no intrinsic content height.
+    func testCustomizationSheetHasAnIdealSizeBeforeRowsAreLaidOut() {
+        let h = harness()
+        for scheme in [ColorScheme.light, .dark] {
+            let host = UIHostingController(rootView:
+                ToolbarCustomizationView(app: h.app, onDone: {})
+                    .environment(\.colorScheme, scheme)
+                    .fixedSize())
+            let fitted = host.sizeThatFits(in: Self.portrait)
+            XCTAssertEqual(fitted.width, NibMetrics.newDocumentSheetSize.width, accuracy: 1)
+            XCTAssertEqual(fitted.height, NibMetrics.newDocumentSheetSize.height, accuracy: 1,
+                           "Fitted presentation must allocate the form, not just its header")
+        }
+    }
+
+    /// Exercise the actual List viewport, including short windows and AX3; all the extra rows stay scrollable.
+    func testCustomizationSheetBoundsItsListToTheAvailableViewport() async throws {
+        let h = harness()
+        for index in 0..<30 {
+            h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                id: "plugin.\(index)", title: "Plugin Tool \(index)", icon: "pencil.tip",
+                group: .tools, order: 100 + index, owner: "test.plugin", toolID: "plugin.\(index)"))
+        }
+        let viewports = [Self.portrait, Self.landscape, Self.phone, CGSize(width: 320, height: 300)]
+        for viewport in viewports {
+            for type in [DynamicTypeSize.large, .accessibility3] {
+                let host = UIHostingController(rootView:
+                    ToolbarCustomizationView(app: h.app, onDone: {})
+                        .environment(\.dynamicTypeSize, type))
+                host.safeAreaRegions = []
+                let fitted = host.sizeThatFits(in: viewport)
+                XCTAssertLessThanOrEqual(fitted.width, viewport.width)
+                XCTAssertLessThanOrEqual(fitted.height, viewport.height)
+                XCTAssertGreaterThan(fitted.height, NibMetrics.hitTarget * 4)
+
+                let window = UIWindow(frame: CGRect(origin: .zero, size: fitted))
+                window.rootViewController = host
+                window.isHidden = false
+                defer {
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                host.view.frame = window.bounds
+                host.view.layoutIfNeeded()
+                try await waitUntil("customisation list layout") {
+                    self.scrollViews(in: host.view).contains {
+                        $0.bounds.height > 0 && $0.contentSize.height > $0.bounds.height
+                    }
+                }
+                let list = try XCTUnwrap(scrollViews(in: host.view).first {
+                    $0.contentSize.height > $0.bounds.height
+                })
+                XCTAssertGreaterThan(list.bounds.height, NibMetrics.hitTarget * 2,
+                                     "The editable list must have more than a sliver below the header")
+                let frame = list.convert(list.bounds, to: host.view)
+                XCTAssertGreaterThanOrEqual(frame.minY, NibMetrics.hitTarget,
+                                            "The header remains above the scrolling list")
+                XCTAssertLessThanOrEqual(frame.maxY, host.view.bounds.maxY + 1)
+                XCTAssertTrue(list.isScrollEnabled)
+                let bottom = list.contentSize.height - list.bounds.height + list.adjustedContentInset.bottom
+                list.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+                XCTAssertEqual(list.contentOffset.y, bottom, accuracy: 1,
+                               "Rows beyond the allocated viewport remain reachable")
+            }
+        }
+    }
+
+    func testCustomizationEmbeddedInSettingsUsesTheParentViewport() {
+        let h = harness()
+        let host = UIHostingController(rootView: ToolbarCustomizationView(app: h.app, onDone: nil))
+        let viewport = CGSize(width: 480, height: 800)
+        let fitted = host.sizeThatFits(in: viewport)
+        XCTAssertEqual(fitted.width, viewport.width, accuracy: 1)
+        XCTAssertEqual(fitted.height, viewport.height, accuracy: 1,
+                       "Settings must not inherit the standalone sheet's height cap")
+    }
+
+    private func scrollViews(in view: UIView) -> [UIScrollView] {
+        (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
     }
 
     /// Defaults, unknown items and precedence rules of the layout, without an app.
