@@ -9,6 +9,7 @@ struct GalleryView: View {
     let app: NibApp
     @StateObject private var model: PluginManagerModel
     @State private var search = ""
+    @State private var debouncedSearch = ""
     @State private var category = ""
     @State private var author = ""
     @State private var savedOnly = false
@@ -19,7 +20,7 @@ struct GalleryView: View {
         _model = StateObject(wrappedValue: PluginManagerModel(app: app))
     }
     var filters: JSONValue {
-        var values: [String: JSONValue] = ["query": .string(search), "saved": .bool(savedOnly)]
+        var values: [String: JSONValue] = ["query": .string(debouncedSearch), "saved": .bool(savedOnly)]
         if !category.isEmpty { values["category"] = .string(category) }
         if !author.isEmpty { values["author"] = .string(author) }
         return .object(values)
@@ -35,7 +36,7 @@ struct GalleryView: View {
                 VStack(alignment: .leading, spacing: NibSpacing.s) { filterControls }
             }.padding(.horizontal, NibSpacing.xxl)
             if model.loading { ProgressView(String(localized: "Loading gallery")).padding(.horizontal, NibSpacing.xxl) }
-            if let error = model.error { ManagerError(message: error) { Task { await model.loadGallery(filters) } } }
+            if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Try Again")) { Task { await model.loadGallery(filters.merging(["refresh": true])) } }) }
             List {
                 if !author.isEmpty {
                     Section {
@@ -45,8 +46,9 @@ struct GalleryView: View {
                 ForEach(model.indexes) { index in
                     Section(index.name) {
                         if let error = index.error {
-                            ManagerError(message: error) { Task { await model.loadGallery(filters) } }
-                        } else if index.plugins.isEmpty {
+                            NibBanner(error, style: .warning, action: NibAction(String(localized: "Try Again")) { Task { await model.loadGallery(filters.merging(["refresh": true])) } })
+                        }
+                        if index.plugins.isEmpty, index.error == nil {
                             Text(String(localized: "No matching items in this gallery.")).font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
                         }
                         ForEach(index.plugins, id: \.key) { entry in
@@ -67,6 +69,10 @@ struct GalleryView: View {
             guard let name = note.userInfo?["name"] as? String,
                   name == NibSettings.pluginGalleries.name || name.hasPrefix(ManagerSettings.savedPrefix) else { return }
             Task { await model.loadGallery(filters) }
+        }
+        .task(id: search) {
+            do { try await Task.sleep(nanoseconds: 300_000_000) } catch { return }
+            debouncedSearch = search
         }
         .task(id: filters) {
             await model.loadGallery(filters)
@@ -95,19 +101,18 @@ struct GalleryEntryRow: View {
     let entry: GalleryEntry
     @ObservedObject var model: PluginManagerModel
     let showAuthor: () -> Void
-    @State private var saved: Bool?
     @State private var saving = false
     @State private var expanded = false
+    @State private var replacing = false
     var installed: InstalledPlugin? { model.plugins.first { $0.id == entry.id } }
-    var isUpdate: Bool {
-        guard let installed, let current = PluginVersion(installed.version), let candidate = PluginVersion(entry.version) else { return false }
-        return current < candidate
-    }
+    var isUpdate: Bool { installed.map { entry.isUpdate(for: $0) } ?? false }
+    var isReplacement: Bool { installed.map { !entry.matchesSource(of: $0) } ?? false }
+    var galleryName: String { model.indexes.first { $0.index == entry.index }?.name ?? URL(string: entry.index)?.host ?? entry.index }
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
             NibRow(entry.name, subtitle: entry.version + " · " + entry.category, icon: entry.kind == "content" ? .templates : .puzzle) {
-                NibIconButton((saved ?? entry.saved) ? .bookmarkFill : .bookmark,
-                    label: (saved ?? entry.saved) ? String(localized: "Unsave \(entry.name)") : String(localized: "Save \(entry.name)"), size: .panel) { save() }
+                NibIconButton(entry.saved ? .bookmarkFill : .bookmark,
+                    label: entry.saved ? String(localized: "Unsave \(entry.name)") : String(localized: "Save \(entry.name)"), size: .panel) { save() }
                     .disabled(saving)
             }
             if !entry.author.isEmpty {
@@ -142,22 +147,32 @@ struct GalleryEntryRow: View {
                 }
             }
         }.padding(.vertical, NibSpacing.s)
+        .alert(String(localized: "Replace \(entry.name) from another source?"), isPresented: $replacing) {
+            Button(String(localized: "Cancel"), role: .cancel) {}
+            Button(String(localized: "Review Replacement"), role: .destructive) { model.perform(CommandIDs.pluginInstall, entry.installParams) }
+        } message: {
+            Text(String(localized: "This package comes from \(galleryName), a different source than the installed plugin. It will replace the installed package and may be controlled by another publisher."))
+        }
     }
     @ViewBuilder private var actions: some View {
-        NibButton(installed == nil ? String(localized: "Install Plugin") : (isUpdate ? String(localized: "Review Update") : String(localized: "Installed")),
-                  symbol: .importFile, kind: .secondary) { model.perform(CommandIDs.pluginInstall, entry.installParams) }
-            .disabled(model.busy || (installed != nil && !isUpdate))
+        if isReplacement {
+            NibButton(String(localized: "Replace with version \(entry.version) from \(galleryName)"), symbol: .importFile, kind: .destructivePlain) { replacing = true }
+                .disabled(model.busy)
+        } else {
+            NibButton(installed == nil ? String(localized: "Install Plugin") : (isUpdate ? String(localized: "Review Update") : String(localized: "Installed")),
+                      symbol: .importFile, kind: .secondary) { model.perform(CommandIDs.pluginInstall, entry.installParams) }
+                .disabled(model.busy || (installed != nil && !isUpdate))
+        }
         NibButton(expanded ? String(localized: "Hide Details") : String(localized: "Show Details"), kind: .plain) { expanded.toggle() }
     }
     private func save() {
         guard !saving else { return }
-        let next = !(saved ?? entry.saved)
+        let next = !entry.saved
         saving = true
         Task { @MainActor in
             defer { saving = false }
             do {
                 _ = try await model.call(CommandIDs.settingsSet, ["name": .string(ManagerSettings.savedKey(entry)), "value": .bool(next)])
-                saved = next
             } catch { model.error = NibError.wrap(error).message }
         }
     }

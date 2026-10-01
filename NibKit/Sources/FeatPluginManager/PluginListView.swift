@@ -10,6 +10,7 @@ import NibDesign
 final class PluginManagerModel: ObservableObject {
     let app: NibApp
     @Published var plugins: [InstalledPlugin] = []
+    @Published private var consented: [String: [String]] = [:]
     @Published var indexes: [GalleryIndex] = []
     @Published var error: String?
     @Published var busy = false
@@ -32,9 +33,12 @@ final class PluginManagerModel: ObservableObject {
         do {
             let value = try await call(CommandIDs.pluginList)
             let entries = try (value["plugins"] ?? []).decode([InstalledPlugin].self)
+            let store = app.services.get(ManagerGrants.serviceKey, as: ManagerGrants.self)
+            let grants = try await Task.detached { try store?.read() ?? [:] }.value
             let setting = try await call(CommandIDs.settingsGet, ["name": .string(NibSettings.pluginGalleries.name)])
             guard generation == pluginGeneration, !Task.isCancelled else { return }
             plugins = entries
+            consented = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, ManagerGrants.scopes($0.id, hash: $0.sha256, grants: grants)) })
             galleries = setting["value"]?.arrayValue?.compactMap(\.stringValue) ?? []
             error = nil
         } catch { if generation == pluginGeneration, !Task.isCancelled { self.error = NibError.wrap(error).message } }
@@ -84,12 +88,12 @@ final class PluginManagerModel: ObservableObject {
             }
         }
     }
+    func consentedScopes(for plugin: InstalledPlugin) -> [String] { consented[plugin.id] ?? [] }
+    func loadUpdates(refresh: Bool = false) async {
+        await loadGallery(["ids": .array(plugins.map { .string($0.id) }), "refresh": .bool(refresh)])
+    }
     func update(for plugin: InstalledPlugin) -> GalleryEntry? {
-        indexes.flatMap(\.plugins).filter { entry in
-            entry.id == plugin.id && PluginVersion(entry.version).map { candidate in
-                PluginVersion(plugin.version).map { $0 < candidate } ?? false
-            } == true
-        }.max { lhs, rhs in
+        indexes.flatMap(\.plugins).filter { $0.isUpdate(for: plugin) }.max { lhs, rhs in
             guard let a = PluginVersion(lhs.version), let b = PluginVersion(rhs.version) else { return false }; return a < b
         }
     }
@@ -109,7 +113,10 @@ struct PluginListView: View {
     }
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            NibPanelHeader(title: String(localized: "Plugins"), symbol: .puzzle, onClose: {
+                app.perform(CommandIDs.panelClose, ["id": .string(ManagerCommands.managerPanel)])
+                close?()
+            }) {
                 Menu {
                     Button(String(localized: "Install from Files")) { app.perform(ManagerCommands.installFile) }
                     Button(String(localized: "Install from URL")) { showURL = true }
@@ -118,16 +125,11 @@ struct PluginListView: View {
                     Label { Text(String(localized: "Install from…")) } icon: { Image(nib: .importFile) }
                         .font(NibFont.button).frame(minHeight: NibMetrics.hitTarget)
                 }
-                Spacer()
                 NibIconButton(.command, label: String(localized: "Open Developer Console"), size: .panel) {
                     app.perform(CommandIDs.panelOpen, ["id": .string(ManagerCommands.consolePanel)])
                 }
-                if let close {
-                    NibIconButton(.xmark, label: String(localized: "Close Plugins"), size: .round,
-                        shortcut: .cancelAction) { app.perform(CommandIDs.panelClose, ["id": .string(ManagerCommands.managerPanel)]); close() }
-                }
-            }.padding(.horizontal, NibSpacing.l)
-            if let error = model.error { ManagerError(message: error) { Task { await refresh() } } }
+            }
+            if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Try Again")) { Task { await refresh() } }) }
             GeometryReader { proxy in
                 if proxy.size.width >= NibMetrics.pluginManagerSheetSize.width && !typeSize.isAccessibilitySize {
                     HStack(spacing: 0) {
@@ -151,16 +153,22 @@ struct PluginListView: View {
         .tint(NibColor.accent)
         .nibSheet(isPresented: $showURL) { PluginURLSheet(model: model) }
         .task { await refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange)) { _ in Task { await model.loadPlugins() } }
+        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange)
+            .filter { note in
+                if let registry = note.object as? CommandRegistry { return registry === app.commands }
+                guard let owner = note.userInfo?[RegistryChange.ownerKey] as? String else { return false }
+                return model.plugins.contains { $0.id == owner }
+            }
+            .debounce(for: .milliseconds(250), scheduler: RunLoop.main)) { _ in Task { await model.loadPlugins() } }
         .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange)) { note in
             guard let name = note.userInfo?["name"] as? String,
                   name == NibSettings.pluginGalleries.name || name.hasPrefix("pluginhost.disabled.") else { return }
-            Task { await model.loadPlugins(); if name == NibSettings.pluginGalleries.name { await model.loadGallery() } }
+            Task { await model.loadPlugins(); if name == NibSettings.pluginGalleries.name { await model.loadUpdates() } }
         }
     }
     private func refresh() async {
         await model.loadPlugins()
-        await model.loadGallery(["refresh": true])
+        await model.loadUpdates(refresh: true)
     }
     private func pluginList(compact: Bool) -> some View {
         List {
@@ -215,7 +223,7 @@ struct PluginDetailView: View {
     @State private var manifest: JSONValue = [:]
     @State private var settings: [String: JSONValue] = [:]
     @State private var remove = false
-        @State private var showLogs = false
+    @State private var showLogs = false
     var current: InstalledPlugin { model.plugins.first { $0.id == plugin.id } ?? plugin }
     var body: some View {
         List {
@@ -235,10 +243,14 @@ struct PluginDetailView: View {
                 }
             }
             Section(String(localized: "Permissions")) {
+                if current.state != "running" {
+                    Text(String(localized: "Not running. Consented permissions apply when this plugin runs."))
+                        .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                }
                 ForEach(current.permissions, id: \.self) { scope in
                     NibPermissionRow(PermissionCopy.sentence(scope, hosts: current.networkHosts), symbol: PermissionCopy.symbol(scope)) {
                         NibToggle(PermissionCopy.sentence(scope, hosts: current.networkHosts), isOn: Binding(
-                            get: { current.granted.contains(scope) }, set: { value in
+                            get: { model.consentedScopes(for: current).contains(scope) }, set: { value in
                                 model.perform(ManagerCommands.permission, ["id": .string(current.id), "scope": .string(scope), "enabled": .bool(value)])
                             })).labelsHidden().disabled(model.busy || current.needsReview)
                     }
@@ -358,17 +370,6 @@ struct PluginSettingField: View {
     }
 }
 
-struct ManagerError: View {
-    let message: String
-    let retry: () -> Void
-    var body: some View {
-        VStack(alignment: .leading, spacing: NibSpacing.s) {
-            Text(message).font(NibFont.callout).foregroundStyle(NibColor.destructive)
-            NibButton(String(localized: "Try Again"), symbol: .retry, kind: .plain, action: retry)
-        }.padding(NibSpacing.l).frame(maxWidth: .infinity, alignment: .leading).accessibilityElement(children: .contain)
-    }
-}
-
 enum PermissionCopy {
     static func sentence(_ scope: String, hosts: [String] = []) -> String {
         switch scope {
@@ -378,7 +379,7 @@ enum PermissionCopy {
         case "library:write": return String(localized: "Change your library")
         case "destructive": return String(localized: "Delete content")
         case "ai": return String(localized: "Use your AI provider")
-        case "network": return String(localized: "Reach the network: \(hosts.joined(separator: ", "))")
+        case "network": return hosts.isEmpty ? String(localized: "Use network access (no hosts allowed)") : String(localized: "Reach the network: \(hosts.joined(separator: ", "))")
         case "app": return String(localized: "Use app commands")
         default: return scope
         }

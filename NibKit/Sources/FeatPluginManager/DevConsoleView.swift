@@ -25,7 +25,7 @@ struct DevConsoleView: View {
             })
             ScrollView {
                 VStack(alignment: .leading, spacing: NibSpacing.l) {
-                    if let error = model.error { ManagerError(message: error) { Task { await model.loadPlugins() } } }
+                    if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Try Again")) { Task { await model.loadPlugins() } }) }
                     Picker(String(localized: "Plugin"), selection: $pluginID) {
                         Text(String(localized: "Choose a plugin")).tag("")
                         ForEach(model.plugins) { Text($0.name).tag($0.id) }
@@ -33,9 +33,8 @@ struct DevConsoleView: View {
                     if model.plugins.isEmpty {
                         Text(String(localized: "Create a plugin or install one to evaluate JavaScript.")).font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
                     }
-                    TextEditor(text: $javascript).font(NibFont.code)
-                        .frame(minHeight: NibMetrics.hitTarget * 2)
-                        .scrollContentBackground(.hidden).background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field))
+                    NibField(text: $javascript, prompt: String(localized: "JavaScript to evaluate"), lines: 3...12)
+                        .font(NibFont.code)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                         .accessibilityLabel(String(localized: "JavaScript to evaluate"))
                     NibButton(evaluating ? String(localized: "Evaluating…") : String(localized: "Evaluate JavaScript"), symbol: .play,
@@ -96,10 +95,10 @@ struct PluginLogView: View {
                 Text(String(localized: "No log output yet")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             } else {
                 if monospaced {
-                    NibCodeBlock(lines.joined(separator: "\n")).accessibilityLabel(String(localized: "Plugin logs"))
+                    NibCodeBlock(lines.joined(separator: "\n")).accessibilityLabel(String(localized: "Plugin logs")).accessibilityValue(lines.joined(separator: "\n"))
                 } else {
                     Text(lines.joined(separator: "\n")).font(NibFont.caption1).textSelection(.enabled)
-                        .accessibilityLabel(String(localized: "Plugin logs"))
+                        .accessibilityLabel(String(localized: "Plugin logs")).accessibilityValue(lines.joined(separator: "\n"))
                 }
             }
             if truncated { Text(String(localized: "Showing the most recent log lines.")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
@@ -131,7 +130,7 @@ struct NewPluginSheet: View {
     var body: some View {
         VStack(spacing: NibSpacing.l) {
             NibSheetHeader(String(localized: "New Plugin"), primaryTitle: String(localized: "Review and Create"),
-                isPrimaryEnabled: !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (id.isEmpty || PluginSkeleton.validID(id)),
+                isPrimaryEnabled: !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.count <= 120 && (id.isEmpty || PluginSkeleton.validCommandID(id)),
                 onCancel: { dismiss() }) {
                     var params: JSONValue = ["name": .string(name)]
                     if !id.isEmpty { params = params.merging(["id": .string(id)]) }

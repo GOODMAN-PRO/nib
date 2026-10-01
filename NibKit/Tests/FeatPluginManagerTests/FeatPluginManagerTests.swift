@@ -42,7 +42,110 @@ final class FeatPluginManagerTests: XCTestCase {
         XCTAssertEqual(saved["total"]?.intValue, 1)
         let filtered = try await h.app.bus.execute(CommandIDs.galleryList, ["index": .string(custom), "author": "Ada", "category": "Planners", "query": "weekly"])
         XCTAssertEqual(filtered["total"]?.intValue, 1)
+        let byID = try await h.app.bus.execute(CommandIDs.galleryList, ["ids": ["dev.test.two"]])
+        XCTAssertEqual(byID["total"]?.intValue, 2)
         XCTAssertTrue(h.app.settings.undeclaredNames.isEmpty)
+    }
+    func testNonUserGalleryIndexRequiresConfiguredPublisher() async throws {
+        let h = Harness(features: [FeatPluginManagerFeature.self])
+        let custom = "https://example.com/index.json"
+        let payload: JSONValue = ["version": 1, "name": "Trusted", "plugins": .array([gallery("dev.test.one", author: "Ada", category: "Study")])]
+        h.app.services.set(GalleryClient(fetcher: GalleryFixtureFetcher(documents: [custom: try JSONEncoder().encode(payload)])), for: GalleryClient.serviceKey)
+        h.app.gateway.grants = { principal in
+            if case .plugin = principal { return [.app] }
+            return Gateway.defaultGrants(principal)
+        }
+        for principal in [Principal.plugin("dev.test.caller"), .ai("chat")] {
+            do {
+                _ = try await h.app.bus.execute(CommandIDs.galleryList, ["index": .string(custom)], principal: principal)
+                XCTFail("Unlisted index must be denied")
+            } catch { XCTAssertEqual((error as? NibError)?.code, .permissionDenied) }
+        }
+        h.app.settings.set(NibSettings.pluginGalleries, [custom])
+        let result = try await h.app.bus.execute(CommandIDs.galleryList, ["index": .string(custom)], principal: .plugin("dev.test.caller"))
+        XCTAssertEqual(result["total"]?.intValue, 1)
+    }
+    func installed(source: String?, version: String = "1.0.0", enabled: Bool = true) throws -> InstalledPlugin {
+        let value: JSONValue = ["id": "dev.test.cards", "name": "Cards", "version": .string(version),
+            "state": .string(enabled ? "running" : "disabled"), "enabled": .bool(enabled), "needsReview": false,
+            "permissions": ["app", "network"], "granted": [], "networkHosts": ["example.com"], "sha256": "hash",
+            "source": source.map(JSONValue.string) ?? .null, "commands": []]
+        return try value.decode(InstalledPlugin.self)
+    }
+    func testUpdatesRequireSameSourceAndNewerSemanticVersion() throws {
+        let h = Harness(features: [FeatPluginManagerFeature.self])
+        let model = PluginManagerModel(app: h.app)
+        let source = "https://example.com/plugins/cards/"
+        let payload: JSONValue = ["version": 1, "name": "Publisher", "plugins": [["id": "dev.test.cards", "name": "Cards", "version": "1.1.0",
+            "base": .string(source), "files": ["manifest.json"]]]]
+        var entry = try XCTUnwrap(GalleryClient.parse(JSONEncoder().encode(payload), index: URL(string: "https://example.com/index.json")!).plugins.first)
+        let plugin = try installed(source: "gallery:" + source)
+        model.indexes = [GalleryIndex(index: entry.index, name: "Publisher", plugins: [entry])]
+        XCTAssertEqual(model.update(for: plugin)?.version, "1.1.0")
+        entry.base = "https://evil.example/plugins/cards/"
+        entry.version = "9.0.0"
+        model.indexes[0].plugins = [entry]
+        XCTAssertNil(model.update(for: plugin))
+        entry.base = source
+        entry.version = "1.0.0-rc.1"
+        model.indexes[0].plugins = [entry]
+        XCTAssertNil(model.update(for: plugin))
+        entry.version = "1.0.0"
+        model.indexes[0].plugins = [entry]
+        XCTAssertNotNil(model.update(for: try installed(source: "gallery:" + source, version: "1.0.0-rc.1")))
+        entry.base = nil
+        entry.url = source + "cards-2.nibplugin"
+        XCTAssertTrue(entry.matchesSource(of: try installed(source: "url:" + source + "cards-1.nibplugin")))
+        XCTAssertFalse(entry.matchesSource(of: try installed(source: "url:https://example.com/other/cards-1.nibplugin")))
+        XCTAssertFalse(entry.matchesSource(of: try installed(source: "url:https://evil.example/plugins/cards/cards-1.nibplugin")))
+        XCTAssertFalse(entry.matchesSource(of: try installed(source: nil)))
+    }
+    func testSkeletonManifestAndToolNameLimits() throws {
+        let files = try PluginSkeleton.files(id: "dev.test.hello", name: "Hello")
+        let data = Data(try XCTUnwrap(files["manifest.json"]?.stringValue).utf8)
+        let manifest = try JSONDecoder().decode(PluginManifest.self, from: data)
+        XCTAssertEqual(manifest.id, "dev.test.hello")
+        XCTAssertLessThanOrEqual(manifest.id.count, 128)
+        XCTAssertLessThanOrEqual((manifest.id + ".hello").replacingOccurrences(of: ".", with: "__").count, 64)
+        let boundary = "dev." + String(repeating: "a", count: 52)
+        XCTAssertTrue(PluginSkeleton.validCommandID(boundary))
+        XCTAssertNoThrow(try PluginSkeleton.files(id: boundary, name: "Hello"))
+        XCTAssertFalse(PluginSkeleton.validCommandID(boundary + "a"))
+        XCTAssertThrowsError(try PluginSkeleton.files(id: boundary + "a", name: "Hello"))
+        XCTAssertFalse(PluginSkeleton.validID("dev." + String(repeating: "a", count: 125)))
+    }
+    func testDisabledPluginDisplaysPersistedConsentAndRevocationRewritesGrant() async throws {
+        let h = Harness(features: [FeatPluginManagerFeature.self])
+        let plugin = try installed(source: "gallery:https://example.com/plugins/cards/", enabled: false)
+        let manifest = try PluginManifest.fixture(id: plugin.id, permissions: plugin.permissions)
+        let host = ManagerHostFake(manifest: manifest)
+        host.enabled = false
+        let folder = h.library.metadataURL.appendingPathComponent(plugin.id)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try JSONEncoder().encode(manifest).write(to: folder.appendingPathComponent("manifest.json"))
+        host.folderURL = folder
+        h.app.services.set(host, for: ServiceKeys.pluginHost)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.pluginList, title: "List", summary: "List test plugins.", effect: .read, target: .app)) { _, _ in
+            ["plugins": try JSONValue.from([plugin])]
+        }
+        let url = h.library.metadataURL.appendingPathComponent("disabled-grants.json")
+        let grants: JSONValue = [.init(plugin.id): ["sha256": "hash", "scopes": ["app", "network"]]]
+        try JSONEncoder().encode(grants).write(to: url)
+        let store = ManagerGrants(url: url)
+        h.app.services.set(store, for: ManagerGrants.serviceKey)
+        let model = PluginManagerModel(app: h.app)
+        await model.loadPlugins()
+        XCTAssertNil(model.error)
+        XCTAssertTrue(model.consentedScopes(for: plugin).contains("network"))
+        XCTAssertTrue(model.plugins[0].granted.isEmpty)
+        let inspected = try await h.app.bus.execute(ManagerCommands.inspect, ["id": .string(plugin.id)])
+        XCTAssertEqual(inspected["consented"], ["app", "network"])
+        _ = try await h.app.bus.execute(ManagerCommands.permission, ["id": .string(plugin.id), "scope": "network", "enabled": false])
+        await model.loadPlugins()
+        XCTAssertFalse(model.consentedScopes(for: plugin).contains("network"))
+        XCTAssertEqual(try store.read()[plugin.id]?["scopes"], ["app"])
+        XCTAssertTrue(host.loads.isEmpty)
+        XCTAssertTrue(ManagerGrants.scopes(plugin.id, hash: "changed", grants: try store.read()).isEmpty)
     }
     func testNewPluginForwardsEscapedSkeletonThroughInstaller() async throws {
         let h = Harness(features: [FeatPluginManagerFeature.self])
@@ -102,6 +205,13 @@ final class FeatPluginManagerTests: XCTestCase {
         let url = try XCTUnwrap(h.assets.temporaryURL(ref))
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "first\nlast\n")
     }
+    func testEvaluationTruncationPreservesUTF8AndBoundsDisplaySize() {
+        let result = ManagerTextPage.truncate(String(repeating: "日🖊", count: 20_000), maxBytes: 64 * 1_024)
+        XCTAssertLessThanOrEqual(result.utf8.count, 64 * 1_024)
+        XCTAssertTrue(result.hasSuffix("Result truncated."))
+        XCTAssertFalse(result.contains("�"))
+        XCTAssertEqual(ManagerTextPage.truncate("2", maxBytes: 64 * 1_024), "2")
+    }
     func testManifestPagingPreservesUTF8AndRejectsMidCharacterCursor() throws {
         let text = String(repeating: "日🖊e\u{301}", count: 1_000)
         let data = Data(text.utf8)
@@ -120,7 +230,9 @@ final class FeatPluginManagerTests: XCTestCase {
     }
     func testPermissionEnablingRequiresConsentAndDoesNotRestoreOtherRevokedScopes() async throws {
         let h = Harness(features: [FeatPluginManagerFeature.self])
-        let host = ManagerHostFake(manifest: try PluginManifest.fixture(permissions: ["app", "network", "ai"]))
+        var manifest = try PluginManifest.fixture(permissions: ["app", "network", "ai"])
+        manifest.network = try JSONValue.object(["hosts": ["api.example.com"]]).decode(PluginNetwork.self)
+        let host = ManagerHostFake(manifest: manifest)
         h.app.services.set(host, for: ServiceKeys.pluginHost)
         let url = h.library.metadataURL.appendingPathComponent("test-grants.json")
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -138,6 +250,10 @@ final class FeatPluginManagerTests: XCTestCase {
         _ = try await h.app.bus.execute(ManagerCommands.permission, params)
         XCTAssertEqual(try store.read()[host.runtime.manifest.id]?["scopes"], ["app", "network"])
         XCTAssertEqual(h.confirmer.requests.count, 2)
+        XCTAssertTrue(h.confirmer.requests.last?.command.title.contains("api.example.com") == true)
+        XCTAssertTrue(h.confirmer.requests.last?.command.title.hasPrefix("Allow Fixture to reach") == true)
+        _ = try await h.app.bus.execute(ManagerCommands.permission, params)
+        XCTAssertEqual(h.confirmer.requests.count, 2, "An already-consented scope must not ask again")
     }
     func testGalleryPageBudgetDoesNotSkipLargeRows() async throws {
         let h = Harness(features: [FeatPluginManagerFeature.self])
@@ -271,10 +387,11 @@ final class ManagerHostFake: PluginHosting {
     let runtime: ManagerRuntimeFake
     var loads: [String] = []
     var folderURL: URL?
+    var enabled = true
     init(manifest: PluginManifest) { runtime = ManagerRuntimeFake(manifest: manifest) }
-    var installed: [PluginInfo] { [PluginInfo(id: runtime.manifest.id, name: "Fixture", version: "1.0.0", enabled: true,
+    var installed: [PluginInfo] { [PluginInfo(id: runtime.manifest.id, name: "Fixture", version: "1.0.0", enabled: enabled,
         needsReview: false, permissions: runtime.manifest.permissions, sha256: "hash")] }
-    func handle(_ id: String) -> PluginRuntimeHandle? { id == runtime.manifest.id ? runtime : nil }
+    func handle(_ id: String) -> PluginRuntimeHandle? { enabled && id == runtime.manifest.id ? runtime : nil }
     func folder(_ id: String) -> URL? { id == runtime.manifest.id ? folderURL : nil }
     func load(_ id: String) async throws { loads.append(id) }
     func unload(_ id: String) {}

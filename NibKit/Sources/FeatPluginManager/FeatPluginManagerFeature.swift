@@ -74,6 +74,10 @@ final class ManagerGrants {
         do { return try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: url)) }
         catch { throw NibError(.unavailable, "Plugin grants could not be read. Review the plugin again.") }
     }
+    static func scopes(_ id: String, hash: String, grants: [String: JSONValue]) -> [String] {
+        guard let grant = grants[id], grant["sha256"]?.stringValue == hash else { return [] }
+        return grant["scopes"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
     func set(_ id: String, hash: String, scopes: [String]) throws {
         var all = try read()
         guard var grant = all[id]?.objectValue, grant["sha256"]?.stringValue == hash else {
@@ -88,10 +92,16 @@ final class ManagerGrants {
 
 enum PluginSkeleton {
     static func validID(_ id: String) -> Bool {
-        id.count <= 160 && id.range(of: #"^[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z0-9]+(?:[.-][a-z0-9]+)*$"#, options: .regularExpression) != nil
+        id.count <= 128 && id.range(of: #"^[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z0-9]+(?:[.-][a-z0-9]+)*$"#, options: .regularExpression) != nil
+    }
+    static func validCommandID(_ id: String) -> Bool {
+        validID(id) && (id + ".hello").replacingOccurrences(of: ".", with: "__").count <= 64
     }
     static func files(id: String, name: String) throws -> JSONValue {
         guard validID(id) else { throw NibError.invalid("Use a reverse-DNS plugin id such as dev.example.hello.", path: "$.id") }
+        guard validCommandID(id) else {
+            throw NibError.invalid("The hello command id must fit 64 characters with dots written as __. Use a shorter plugin id.", path: "$.id")
+        }
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, name.count <= 120 else {
             throw NibError.invalid("Enter a plugin name of 1 to 120 characters.", path: "$.name")
         }
@@ -136,68 +146,39 @@ enum ManagerCommands {
         app.commands.register(CommandDescriptor(id: "gallery.list", title: String(localized: "List Gallery"),
             summary: "List configured gallery indexes, filtering compatible plugins/content packs by search, category, author or saved state; cursor pages results.",
             params: .obj(["index": .str("one HTTPS index; omitted uses configured indexes plus Nib Community"),
-                "query": .str(), "category": .str(), "author": .str(), "saved": .bool(),
+                "ids": .arr(.str(), "only these plugin ids"), "query": .str(), "category": .str(), "author": .str(), "saved": .bool(),
                 "cursor": .int(min: 0), "limit": .int(min: 1, max: 50), "refresh": .bool("refresh cached indexes")], required: []),
             examples: [[:]], effect: .read, target: .app)) { p, ctx in
             let configured = ctx.services.settings.get(NibSettings.pluginGalleries)
+            if !ctx.principal.isUser, let index = p["index"]?.stringValue,
+               index != GalleryClient.defaultIndex, !configured.contains(index) {
+                throw NibError(.permissionDenied, "Non-user callers may read only the default or configured gallery indexes.", path: "$.index")
+            }
             let indexes = p["index"]?.stringValue.map { [$0] } ?? ([GalleryClient.defaultIndex] + configured).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
             let client = ctx.services.get(GalleryClient.serviceKey, as: GalleryClient.self) ?? GalleryClient()
             if p["refresh"]?.boolValue == true, p["cursor"] == nil { client.invalidate() }
             let offset = p["cursor"]?.intValue ?? 0
             let limit = p["limit"]?.intValue ?? 30
-            var output: [GalleryIndex] = []
-            var total = 0
-            var included = 0
-            var bytes = 0
-            var pageFull = false
-            // A bounded number of indexes protects command latency on slow or untrusted publishers.
             guard indexes.count <= 20 else { throw NibError.invalid("Configure at most 20 gallery indexes.", path: "$.index") }
-            let loaded = try await withThrowingTaskGroup(of: (Int, GalleryIndex).self) { group in
-                for (position, index) in indexes.enumerated() {
-                    group.addTask {
-                        do { return (position, try await client.load(index)) }
-                        catch {
-                            try Task.checkCancellation()
-                            return (position, GalleryIndex(index: String(index.prefix(2_048)),
-                                name: String((URL(string: index)?.host ?? index).prefix(200)), plugins: [],
-                                error: String(NibError.wrap(error).message.prefix(500))))
-                        }
-                    }
-                }
-                var results: [(Int, GalleryIndex)] = []
-                for try await result in group { results.append(result) }
-                return results.sorted { $0.0 < $1.0 }.map { $0.1 }
-            }
-            try Task.checkCancellation()
-            let headers = loaded.map { section -> GalleryIndex in
-                var section = section; section.plugins = []; return section
-            }
-            let headerBytes = try JSONEncoder().encode(headers).count
+            var filterValues: [String: JSONValue] = [:]
+            for key in ["ids", "query", "category", "author", "saved"] { if let value = p[key] { filterValues[key] = value } }
+            let listing = try await client.listing(indexes: indexes, filters: .object(filterValues), settings: ctx.services.settings)
+            var output = listing.headers
+            let headerBytes = try JSONEncoder().encode(output).count
             guard headerBytes <= 7_500 else { throw NibError.invalid("The configured galleries exceed the result budget. Request one index at a time.", path: "$.index") }
             let entryBudget = 18_500 - headerBytes
-            for var result in loaded {
-                var page: [GalleryEntry] = []
-                for var entry in result.plugins {
-                    entry.saved = ctx.services.settings.json(ManagerSettings.savedKey(entry))?.boolValue == true
-                    if let query = p["query"]?.stringValue, !query.isEmpty,
-                       ![entry.name, entry.description, entry.author, entry.category].joined(separator: " ").localizedStandardContains(query) { continue }
-                    if let category = p["category"]?.stringValue, entry.category != category { continue }
-                    if let author = p["author"]?.stringValue, entry.author != author { continue }
-                    if p["saved"]?.boolValue == true, !entry.saved { continue }
-                    let position = total
-                    total += 1
-                    let size = (try JSONEncoder().encode(entry)).count
-                    if position >= offset, !pageFull {
-                        if included < limit, bytes + size < entryBudget {
-                            page.append(entry); included += 1; bytes += size
-                        } else { pageFull = true }
-                    }
-                }
-                result.plugins = page
-                output.append(result)
+            var included = 0
+            var bytes = 0
+            // Only size the requested slice. Cached rows before/after it need no work on later pages.
+            for row in listing.rows.dropFirst(offset).prefix(limit) {
+                let size = try JSONEncoder().encode(row.entry).count
+                guard bytes + size < entryBudget else { break }
+                output[row.section].plugins.append(row.entry)
+                included += 1
+                bytes += size
             }
-            return ["indexes": try JSONValue.from(output), "total": .number(Double(total)),
-                    "cursor": offset + included < total ? .number(Double(offset + included)) : .null]
+            return ["indexes": try JSONValue.from(output), "total": .number(Double(listing.rows.count)),
+                    "cursor": offset + included < listing.rows.count ? .number(Double(offset + included)) : .null]
         }
         app.commands.register(CommandDescriptor(id: inspect, title: String(localized: "Inspect Plugin"),
             summary: "Read an installed plugin's manifest and contributed settings, tools, panels and commands.",
@@ -209,7 +190,11 @@ enum ManagerCommands {
             let data = try await Task.detached { try Data(contentsOf: folder.appendingPathComponent("manifest.json")) }.value
             guard data.count <= 512 * 1_024 else { throw NibError.invalid("The manifest is too large.") }
             _ = try JSONDecoder().decode(PluginManifest.self, from: data)
+            let plugin = host.installed.first { $0.id == pluginID }
+            let grants = try ctx.services.get(ManagerGrants.serviceKey, as: ManagerGrants.self)?.read() ?? [:]
+            let consented = plugin.map { ManagerGrants.scopes(pluginID, hash: $0.sha256, grants: grants) } ?? []
             return try ManagerTextPage.page(data, offset: p["cursor"]?.intValue ?? 0)
+                .merging(["consented": .array(consented.map(JSONValue.string))])
         }
         app.commands.register(CommandDescriptor(id: evaluate, title: String(localized: "Evaluate JavaScript"),
             summary: "Evaluate JavaScript in a running plugin's sandbox; user-only because evaluate has no caller-context parameter.",
@@ -222,7 +207,7 @@ enum ManagerCommands {
                 throw NibError.invalid("Enter JavaScript smaller than 64 KB.", path: "$.javascript")
             }
             guard let handle = try host(ctx).handle(id) else { throw NibError(.unavailable, "Enable and review this plugin before evaluating JavaScript.") }
-            return ["text": .string(await handle.evaluate(source))]
+            return ["text": .string(ManagerTextPage.truncate(await handle.evaluate(source), maxBytes: 64 * 1_024))]
         }
         app.commands.register(CommandDescriptor(id: create, title: String(localized: "New Plugin"),
             summary: "Create a hello-world plugin skeleton through plugin.install, with the normal permission consent and folder installation.",
@@ -285,17 +270,25 @@ enum ManagerCommands {
             let grant = try grants.read()[pluginID]
             guard grant?["sha256"]?.stringValue == plugin.sha256 else { throw NibError(.permissionDenied, "The plugin changed. Review it first.") }
             var scopes = Set(grant?["scopes"]?.arrayValue?.compactMap(\.stringValue) ?? [])
-            if enabled {
+            if enabled, !scopes.contains(scope) {
                 guard let presenter = ctx.bus.gateway.confirmationPresenter(for: .user),
                       var descriptor = ctx.bus.registry.descriptor(permission) else { throw NibError.unavailable("permission confirmation") }
-                descriptor.title = String(localized: "Allow \(PermissionCopy.sentence(scope)) for \(plugin.name)?")
+                var hosts = host.handle(pluginID)?.manifest.network?.hosts ?? []
+                if scope == "network", host.handle(pluginID) == nil, let folder = host.folder(pluginID) {
+                    hosts = try await Task.detached {
+                        let data = try Data(contentsOf: folder.appendingPathComponent("manifest.json"))
+                        guard data.count <= 512 * 1_024 else { throw NibError.invalid("The manifest is too large.") }
+                        return try JSONDecoder().decode(PluginManifest.self, from: data).network?.hosts ?? []
+                    }.value
+                }
+                descriptor.title = String(localized: "Allow \(plugin.name) to \(PermissionCopy.sentence(scope, hosts: hosts).lowercased())?")
                 if case .deny = await presenter.confirm(ConfirmationRequest(principal: .user, command: descriptor, params: p)) {
                     throw NibError(.userDenied, "Permission change cancelled.")
                 }
                 scopes.insert(scope)
-            } else { scopes.remove(scope) }
+            } else if !enabled { scopes.remove(scope) }
             try grants.set(pluginID, hash: plugin.sha256, scopes: Array(scopes))
-            try await host.load(pluginID)
+            if plugin.enabled { try await host.load(pluginID) }
             return ["id": .string(pluginID), "scope": .string(scope), "enabled": .bool(enabled)]
         }
         app.commands.register(CommandDescriptor(id: installFile, title: String(localized: "Install Plugin from Files"),
@@ -389,6 +382,13 @@ struct PluginArchive {
 
 /// Byte offsets remain exact across emoji and combining marks; pages fit under the 20 KB JSON read budget.
 enum ManagerTextPage {
+    static func truncate(_ text: String, maxBytes: Int) -> String {
+        guard text.utf8.count > maxBytes else { return text }
+        let suffix = "\n" + String(localized: "Result truncated.")
+        var bytes = Array(text.utf8.prefix(maxBytes - suffix.utf8.count))
+        while String(bytes: bytes, encoding: .utf8) == nil { bytes.removeLast() }
+        return String(decoding: bytes, as: UTF8.self) + suffix
+    }
     static func page(_ data: Data, offset: Int) throws -> JSONValue {
         guard offset >= 0, offset <= data.count, offset == data.count || data[offset] & 0xc0 != 0x80 else {
             throw NibError.invalid("Use the cursor from the previous manifest page.", path: "$.cursor")
