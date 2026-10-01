@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIActions/AIActionCommands.swift:109-111, :145, :123-126 (ActionSource.pages / documentText / pageText)",
+      "problem": "This works around contracts-v2 G21 (query paging) instead of using it. query.get caps results at 20 KB and pages them with cursor + truncated. The document query puts pages, outline and audio rows behind one cursor (origin/feat/F003 QueryShapes.documentJSON, limit 500). ActionSource throws `unsupported` when it sees `truncated` instead of following the cursor. Notebooks with more than about 170 pages, or fewer pages plus an existing outline or audio clips, therefore fail outline.generate and document-scope ai.quiz. doc.suggestTitle catches `.unsupported` and returns {title: null} for them even when a first line exists (breaks D-007/S-044). The hint 'request specific pages' cannot help, because the document query runs before `pages` is filtered. recognize.pageText is also paged (truncated + cursor, about 18.5 KB of blocks with bboxes, itemIDs and words per call), and pageText() drops everything after the first chunk. Dense handwritten pages then give silently partial sources for outlines, quizzes and titles.",
+      "fix": "Add a cursor loop: call query.get {ref: doc, depth: 1, cursor} and recognize.pageText {page, cursor}, appending `pages` and `blocks` while `truncated == true`, and stop on the existing 128 KB `bounded` budget. Alternatively, read the page, block and card lists directly from `ctx.workspace.content(doc)` after checkLock. Add Harness tests in which the fixture query.get and recognize.pageText return truncated + cursor."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIActions/AIActionCommands.swift:92-94, :134-143, :216 (ActionSource.node depth 1 for blocks/cards)",
+      "problem": "Text-document and study-set sources are read with query.get depth 1, one bus call per block or card (N+1). At depth 1 the real query.get returns the summary row, whose `text` is clipped to 500 characters plus an ellipsis (origin/feat/F003 QueryShapes.swift:13 summaryTextLimit = 500, blockRow/cardRow). So every long paragraph that reaches a quiz, title or block-scope source is silently cut. The test fixture's query.get (FeatAIActionsTests.swift:75-80) returns the full RichText, so the tests cannot catch this.",
+      "fix": "Read blocks and cards with depth 2 and use `plainText` (blocks) and full card faces. Better: take `liveBlocks`/`liveCards` text from `ctx.workspace.content(doc)` in one read instead of N bus calls. Make the fixture return the real depth-1 shape (clipped `text`) so a test covers it."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIActions/BuiltinActions.swift:57-58 (aiactions.image)",
+      "problem": "'Generate image (services.ai.generateImage or Image Playground fallback)' is a prompt only. No command in the repo calls `services.ai.generateImage`; the only caller is AgentService.generateImage itself. The agent therefore has no tool for the 'chat image-generation workflow' the prompt tells it to use. The action runs through ai.ask, which needs a configured provider, so with no provider the Image Playground fallback (image.pick source playground) is never reached. S-010 is not implemented on either path.",
+      "fix": "Add an executable path: a command such as `ai.generateImage {prompt, page?, point?}` (add the CommandIDs constant or raise a contract gap) that calls services.ai.generateImage. It stores the PNG as a tmp asset (asset.upload) and returns it for F085's Modify/Insert/Discard flow, and falls back to `image.pick {source: \"playground\", page, refs}` on `unsupported`/`unavailable`. Point the descriptor prompt at that command, and test both branches with FakeAIService."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIActions/TitleSuggester.swift:59-61 (SuggestTitle.run)",
+      "problem": "doc.suggestTitle is specified never to fail for QuickNote (F021's exit prompt reads `title`), and its summary promises the first recognised line as the fallback. When a provider is configured but the call fails (offline, HTTP 4xx/5xx, timeout, rate limit) or returns non-JSON (common with small Ollama models), `AIActionCommands.complete` / `TitleBuilder.parse` throw. The command then errors even though `firstLine` is already computed.",
+      "fix": "Wrap the AI call and the parse in do/catch. Rethrow CancellationError only, and return [\"title\": .string(firstLine)] for any NibError or URLError. Add a test with a FakeAIService that throws, and one that returns \"not json\", both expecting the first-line title."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIActions/AIActionCommands.swift:283-301 (AIQuiz study-set insertion)",
+      "problem": "Cards are added one card.add at a time after doc.create. The bus does not roll back earlier nested commits when a later nested call throws. If a card.add fails or the task is cancelled partway, the command fails but leaves an empty or partly filled 'Quiz' study set (or partial cards in an existing set). linkUndoAcrossDocuments() is also skipped on that path.",
+      "fix": "Wrap the creation and insertion loop in do/catch. On error, call `ctx.bus.revert(group: ctx.group, doc: <set>)` and trash the newly created set via library.trash before rethrowing. Check `Task.checkCancellation()` before the writes begin."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIActions/BuiltinActions.swift:29-30 (aiactions.translateInsert)",
+      "problem": "'Insert translation' has `.page` scope but is offered for `.textDocument` (writingKinds). A text-document session has no page, so ai.ask's scope resolution ('page' with session.page == nil) throws 'no page is open'. The block.insert branch of the prompt can never run.",
+      "fix": "Limit translateInsert to canvasKinds. Add a text-document variant (e.g. `aiactions.translateInsertBlocks`, scope `.block` or `.document`, kinds [.textDocument]) that uses block.insert."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIActions/OutlineGenerator.swift:28-35 (OutlineBuilder.parse)",
+      "problem": "OutlineEntry is documented as max depth 3, but parent chains from the model or the caller are accepted at any depth (0 <- 1 <- 2 <- 3 <- 4...). outline.generate can therefore write outlines that violate the model invariant FeatOutline relies on.",
+      "fix": "Track depth[index] = parent.map { depth[$0] + 1 } ?? 0 in parse, and reject (invalid_params at $.entries[i].parent) or re-parent entries deeper than 3. Add a parser test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIActions/OutlineGenerator.swift:57-65",
+      "problem": "outline.generate never checks `ctx.isReadOnly(doc)` (contracts-v2 G2), and `ctx.mutate` does not enforce it. The command spends an AI call and then writes outline entries into a document whose persistence refuses writes. ai.quiz does check this for its destination.",
+      "fix": "Before the AI call (and before the preview), throw NibError(.permissionDenied, \"The document is read-only\") when `ctx.isReadOnly(doc)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIActions/BuiltinActions.swift:97-100 (UserActions observer)",
+      "problem": "Every SettingsStore.didChange triggers a full unregister and re-register of all user actions, including slider drags and sync merges of unrelated keys. That churns the aiActions registry and its change notifications.",
+      "fix": "Read `note.userInfo?[\"name\"] as? String` and refresh only when it is nil or has the prefix `UserActions.prefix`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIActions/AIActionCommands.swift:302; NibKit/Tests/FeatAIActionsTests/AIActionTests.swift:115",
+      "problem": "ai.quiz returns `chatID` from a `jsonOutput: true` request. The real AgentService.persists() never stores such requests and returns chatID nil, so the 'quiz in chat' output never carries a conversation. The test asserts \"fake-chat\" from FakeAIService, which hides this.",
+      "fix": "Drop chatID from Output, since the chat quiz is the ai.ask turn that called ai.quiz. Or, if a stored conversation is wanted, pass an explicit chatID. Change the test to match the real persistence rule."
+    }
+  ]
+}
