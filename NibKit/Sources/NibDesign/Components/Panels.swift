@@ -455,9 +455,11 @@ public struct NibPanelHeader<Trailing: View>: View {
                 }
             }
             Spacer(minLength: NibSpacing.s)
-            menu
-            NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
-                          action: onClose)
+            HStack(spacing: 0) {
+                menu
+                NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
+                              action: onClose)
+            }
         }
         .padding(.leading, NibSpacing.l)
         .padding(.trailing, NibSpacing.xs)

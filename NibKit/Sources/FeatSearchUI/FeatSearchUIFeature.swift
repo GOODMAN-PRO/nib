@@ -243,8 +243,6 @@ struct SearchOpen: NibCommand {
         if hit.kind == "transcript", let time = hit.time {
             _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(hit.ref), "t": .number(time)])
         }
-        state.flashID = hit.id
-        state.flashUntil = Date().addingTimeInterval(NibMotion.hudLinger)
         if state.isLibraryScope {
             state.isPresented = false
             session.floatingHost?.dismiss(libraryOverlay)
@@ -252,6 +250,10 @@ struct SearchOpen: NibCommand {
                 _ = try await ctx.execute(CommandIDs.panelClose, ["id": .string(libraryPanel)])
             }
         }
+        // Closing the search panel clears its old highlights. Install the revealed match afterwards so
+        // that dismissal cannot erase the new editor's flash.
+        state.flashID = hit.id
+        state.flashUntil = Date().addingTimeInterval(NibMotion.hudLinger)
         ctx.app?.ui.setNeedsChromeUpdate(session)
         // Notify attachments after a new editor has been installed by doc.open.
         NotificationCenter.default.post(name: .searchHighlightsChanged, object: state)

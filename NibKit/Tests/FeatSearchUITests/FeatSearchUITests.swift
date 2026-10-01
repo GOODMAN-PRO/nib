@@ -882,6 +882,8 @@ final class FeatSearchUITests: XCTestCase {
             state.progress = IndexProgressPayload(running: true, done: 0, total: 12, pending: 12)
             XCTAssertEqual(state.emptyPresentation, .indexing)
             XCTAssertEqual(state.indexingMessage, "Handwriting in 12 pages is still being indexed.")
+            state.progress = IndexProgressPayload(running: true, done: 11, total: 12, pending: 1)
+            XCTAssertEqual(state.indexingMessage, "Handwriting in 1 page is still being indexed.")
             state.matches = [hit()]
             XCTAssertNil(state.emptyPresentation, "Indexing must not hide available results")
             XCTAssertNotNil(state.indexingMessage)

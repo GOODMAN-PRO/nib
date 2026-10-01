@@ -276,11 +276,12 @@ final class FeatCanvasTests: XCTestCase {
                 let h = Harness(features: [FeatCanvasFeature.self])
                 h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
                 h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
-                h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                var openingTool = ToolbarItemDescriptor(
                     id: "test.openingTool", title: "Opening Tool", icon: "", group: .lasso, order: 0,
                     owner: "test", toolID: h.session.tool,
-                    activeToolMenu: settingsOnly ? nil : { _ in AnyView(EmptyView()) },
-                    settings: { _ in AnyView(EmptyView()) }))
+                    settings: { _ in AnyView(EmptyView()) })
+                if !settingsOnly { openingTool.activeToolMenu = { _ in AnyView(EmptyView()) } }
+                h.app.ui.toolbar.register(openingTool)
                 // The heading and two-line opening paragraph have enough blank header to recover useful height.
                 let title = Item(kind: .text, text: TextBoxItem(
                     frame: Frame(x: 72, y: 72, w: 400, h: 32), text: RichText(plain: "Motion & forces")))

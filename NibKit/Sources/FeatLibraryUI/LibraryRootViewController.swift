@@ -178,12 +178,15 @@ final class LibraryViewModel: ObservableObject {
     private func refreshSidebarCounts() {
         let nodes = app.services.library?.allNodes() ?? []
         let documents = nodes.filter { $0.kind == .document }
-        var counts = ["documents": documents.count,
-                      "recents": documents.filter { recentDate($0.id) != nil }.count,
-                      "studySets": documents.filter { $0.documentKind == .studySet }.count,
-                      PanelIDs.favourites: nodes.filter(\.favorite).count,
-                      PanelIDs.trash: app.services.library?.trashedNodes().count ?? 0,
-                      "collabpresence.shared": app.settings.names(prefix: "collab.shared.").filter { app.settings.json($0)?["local"]?.stringValue != nil }.count]
+        var counts: [String: Int] = [:]
+        counts["documents"] = documents.count
+        counts["recents"] = documents.filter { recentDate($0.id) != nil }.count
+        counts["studySets"] = documents.filter { $0.documentKind == .studySet }.count
+        counts[PanelIDs.favourites] = nodes.filter(\.favorite).count
+        counts[PanelIDs.trash] = app.services.library?.trashedNodes().count ?? 0
+        counts["collabpresence.shared"] = app.settings.names(prefix: "collab.shared.").filter {
+            app.settings.json($0)?["local"]?.stringValue != nil
+        }.count
         if let plugins = app.services.get(ServiceKeys.pluginHost, as: (any PluginHosting).self) {
             counts[PanelIDs.gallery] = plugins.installed.count
         } else { counts[PanelIDs.gallery] = 0 }
@@ -1138,7 +1141,7 @@ struct LibrarySidebarPlace: Identifiable {
 }
 
 struct LibraryStorageNotice: View {
-    static var message: String { String(localized: "Reinstalling can delete notes.") }
+    static var message: String { String(localized: "A reinstall risks note loss.") }
     let move: () -> Void
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {

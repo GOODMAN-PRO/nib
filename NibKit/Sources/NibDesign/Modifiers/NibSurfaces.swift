@@ -70,11 +70,23 @@ struct NibNativeGlass<Foreground: View>: View {
     /// facet across a large panel. Underlays still use the matching continuous silhouette.
     @ViewBuilder private func material<V: View>(on foreground: V) -> some View {
         if let radius = shape.cornerRadius {
-            foreground.glassEffect(effect, in: RoundedRectangle(cornerRadius: NibGeometry.dimension(radius),
-                                                                style: .continuous))
+            foreground.modifier(NibNativeGlassOptics(effect: effect,
+                shape: RoundedRectangle(cornerRadius: NibGeometry.dimension(radius), style: .continuous)))
         } else {
-            foreground.glassEffect(effect, in: Capsule())
+            foreground.modifier(NibNativeGlassOptics(effect: effect, shape: Capsule()))
         }
+    }
+}
+
+/// Preserve the native primitive in the view's type as well as the compositor input. The system glass modifier
+/// erases its shape type, so keeping this typed boundary lets hostless checks verify the actual optical geometry.
+@available(iOS 26.0, *)
+private struct NibNativeGlassOptics<Geometry: Shape>: ViewModifier {
+    let effect: Glass
+    let shape: Geometry
+
+    func body(content: Content) -> some View {
+        content.glassEffect(effect, in: shape)
     }
 }
 

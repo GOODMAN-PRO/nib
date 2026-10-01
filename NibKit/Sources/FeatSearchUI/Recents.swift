@@ -188,7 +188,7 @@ final class SearchState: ObservableObject {
     var indexingMessage: String? {
         guard isIndexing else { return nil }
         if remainingPages > 0 {
-            return String(localized: "Handwriting in ^[\(remainingPages) page](inflect: true) is still being indexed.")
+            return String(AttributedString(localized: "Handwriting in ^[\(remainingPages) page](inflect: true) is still being indexed.").characters)
         }
         return String(localized: "Handwriting is still being indexed.")
     }

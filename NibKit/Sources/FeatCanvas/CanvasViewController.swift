@@ -684,13 +684,18 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         }
     }
 
-    /// A short landscape window should open on the writing, rather than spending its usable height on the
-    /// page's blank header. Keep fit width and a token-sized margin above the first painted item. Only explicit
-    /// page navigation / fit and untouched fitted relayouts use this; a manual reading anchor is never moved.
+    /// A short landscape window with bottom-docked tools should open on the writing, rather than spending its
+    /// usable height on the page's blank header. Top-docked tools keep the page-first fit below their full rail.
+    /// Keep fit width and a token-sized margin above the first painted item. Only explicit page navigation / fit
+    /// and untouched fitted relayouts use this; a manual reading anchor is never moved.
     private func openingMarginOffset(_ page: PageID) -> CGFloat {
         let size = scrollView.bounds.size
         guard isCompact, size.width > size.height, size.height < NibMetrics.compactBreakpoint,
+              app.ui.screens.toolbarView != nil, !session.readOnly,
               let pageSize = shown[page]?.size else { return 0 }
+        let savedDock = app.settings.json(CommandIDs.toolbarDock)?["edge"]?.stringValue
+        let dock = savedDock.flatMap { NibDock(commandValue: $0) } ?? .bottom
+        guard dock == .bottom else { return 0 }
         let firstInk = ((try? app.workspace.items(documentID, page: page)) ?? [])
             .filter { !$0.deleted && host.visibleLayers.contains($0.layer) }
             .compactMap { Self.contentBounds($0, app.content) }
