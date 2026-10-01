@@ -525,7 +525,7 @@ final class FeatToolbarTests: XCTestCase {
         let h = harness()
         h.app.ui.toolbar.register(ToolbarItemDescriptor(
             id: "testtools.sharedAccessory", title: "Shared Accessory", icon: "ruler", group: .accessories,
-            order: 50, owner: TestToolsFeature.id, docKinds: Set(DocumentKind.allCases), command: "ruler.toggle"))
+            order: 50, owner: TestToolsFeature.id, command: "ruler.toggle", docKinds: Set(DocumentKind.allCases)))
         let model = ToolbarModel(app: h.app, session: h.session)
 
         for (document, kind, expected) in [
