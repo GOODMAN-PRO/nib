@@ -157,7 +157,7 @@ struct NativeGlassBackdropLayer: View {
                     : NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paper)
                 return NativeGlassBackdropCanvas.Fill(path: render.path.applying(offset), tint: tint)
             }
-            NativeGlassBackdropCanvas(fills: fills).equatable()
+            return NativeGlassBackdropCanvas(fills: fills).equatable()
         }
     }
 }
