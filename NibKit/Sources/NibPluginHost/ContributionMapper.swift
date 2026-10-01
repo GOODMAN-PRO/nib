@@ -30,10 +30,11 @@ struct ContributionMapper {
     private var contributes: PluginContributions? { manifest.contributes }
 
     /// Registers every contribution. Throws (before registering anything) when an id is already taken by someone else.
-    func map() throws {
+    /// `pdfs` are the plugin's PDF templates, converted beforehand off the main actor (`convertPDFTemplates`); a PDF
+    /// template without a page there is left out.
+    func map(pdfs: [String: PDFTemplateConverter.Page] = [:]) throws {
         try checkConflicts()
         let c = contributes
-        let pdfs = try pdfTemplates()
         mapCommands()
         declareSettings()
         mapMenus(c)
@@ -317,21 +318,33 @@ struct ContributionMapper {
 
     /// A hook runs the plugin's read-only hook command as `.plugin(id)` before every matching call, from anyone, exactly
     /// like a command hook in `bus.hooks`: {command, params} in, `{}` / `{params}` out, a throw vetoes. The host adds
-    /// one guard: plugin hooks never see or veto the calls that manage plugins or touch security settings, so a plugin
-    /// can never stop the user from disabling it.
+    /// guards (`HookPolicy`): plugin hooks never see or veto the calls that manage plugins, open the plugin manager or
+    /// touch security settings, so a plugin can never stop the user from disabling it; replacement params can never
+    /// turn a call into one of those (the call keeps running as its caller, so that would borrow the caller's rights);
+    /// and a hook that cannot answer (not running, timed out, lost the scope it reads with) lets the call pass.
     private func mapCommandHooks(_ c: PluginContributions?) {
         let pid = self.pid
         for (i, h) in (c?.commandHooks ?? []).enumerated() {
             let hookCommand = h.command
             var d = CommandHookDescriptor.guarding(id: "\(pid).hook.\(i)", owner: pid, commands: h.commands,
                                                    order: 1000 + i) { command, params, ctx in
-                if HookPolicy.isExempt(command, params: params, registry: ctx.bus.registry) { return nil }
-                let r = try await ctx.bus.execute(Invocation(command: hookCommand,
+                let registry = ctx.bus.registry
+                if HookPolicy.isExempt(command, params: params, registry: registry) { return nil }
+                guard let hook = registry.descriptor(hookCommand),
+                      hook.scopes.isSubset(of: ctx.bus.gateway.grants(.plugin(pid))) else { return nil }
+                let r: InvocationResult
+                do {
+                    r = try await ctx.bus.execute(Invocation(command: hookCommand,
                                                              params: ["command": .string(command), "params": params],
                                                              principal: .plugin(pid), session: ctx.session, group: ctx.group,
                                                              dryRun: ctx.dryRun, depth: ctx.depth + 1, readOnly: true,
                                                              inheritedPolicy: ctx.inheritedPolicy, skipHooks: true))
+                } catch let error where HookPolicy.letsPass(error) {
+                    hostLog.error("hook \(hookCommand, privacy: .public) did not answer for \(command, privacy: .public): \(NibError.wrap(error).message, privacy: .public)")
+                    return nil
+                }
                 guard let replaced = r.value["params"], replaced != .null else { return nil }
+                try HookPolicy.checkReplacement(command, original: params, replacement: replaced, registry: registry)
                 return replaced
             }
             d.command = hookCommand
@@ -366,17 +379,29 @@ struct ContributionMapper {
     // MARK: Templates
 
     /// PDF templates are converted once, when the plugin loads (vector paths from the page, text through the PDF
-    /// service), so rendering stays a pure DisplayList like every other template.
-    private func pdfTemplates() throws -> [String: PDFTemplateConverter.Page] {
-        var out: [String: PDFTemplateConverter.Page] = [:]
-        for (i, t) in (contributes?.templates ?? []).enumerated() where t.kind == "pdf" {
-            let url = try PluginPaths.existing(t.file ?? "", in: folder, path: "$.contributes.templates[\(i)].file")
-            guard let page = PDFTemplateConverter.convert(url, text: app.services.pdf?.textBlocks(url, page: 0)) else {
-                throw NibError(.invalidParams, "\(t.file ?? "") is not a readable PDF", path: "$.contributes.templates[\(i)].file")
-            }
-            out[t.id] = page
+    /// service), so rendering stays a pure DisplayList like every other template. The content-stream scan (the costly,
+    /// file-driven part, bounded by `PDFTemplateConverter`'s budgets) runs off the main actor; the PDF service is asked
+    /// for page 1's text on the main actor, where services are used.
+    static func convertPDFTemplates(_ manifest: PluginManifest, folder: URL,
+                                    pdf: PDFService?) async throws -> [String: PDFTemplateConverter.Page] {
+        var jobs: [PDFTemplateJob] = []
+        for (i, t) in (manifest.contributes?.templates ?? []).enumerated() where t.kind == "pdf" {
+            let path = "$.contributes.templates[\(i)].file"
+            let url = try PluginPaths.existing(t.file ?? "", in: folder, path: path)
+            jobs.append(PDFTemplateJob(id: t.id, file: t.file ?? "", path: path, url: url,
+                                       text: pdf?.textBlocks(url, page: 0)))
         }
-        return out
+        guard !jobs.isEmpty else { return [:] }
+        return try await Task.detached(priority: .userInitiated) { () throws -> [String: PDFTemplateConverter.Page] in
+            var out: [String: PDFTemplateConverter.Page] = [:]
+            for job in jobs {
+                guard let page = PDFTemplateConverter.convert(job.url, text: job.text) else {
+                    throw NibError(.invalidParams, "\(job.file) is not a readable PDF", path: job.path)
+                }
+                out[job.id] = page
+            }
+            return out
+        }.value
     }
 
     private func mapTemplates(_ c: PluginContributions?, pdfs: [String: PDFTemplateConverter.Page]) {
@@ -469,7 +494,7 @@ struct ContributionMapper {
                 app.ui.inspectors.register(InspectorDescriptor(id: "\(pid).inspector.\(t.type)", title: t.title,
                                                                icon: "slider.horizontal.3", itemKinds: [.custom],
                                                                order: 1000 + i, owner: pid, drawKeys: [drawKey]) { ctx in
-                    AnyView(CustomItemInspector(context: ctx, fields: fields))
+                    AnyView(CustomItemInspector(context: ctx, fields: fields, drawKey: drawKey))
                 })
             }
         }
@@ -536,16 +561,68 @@ enum PluginSettingsNames {
 // MARK: - Command hooks policy
 
 enum HookPolicy {
+    /// Panels of the plugin manager (F080): opening or closing them is how the user reaches the switch that turns a
+    /// plugin off.
+    static let managerPanelPrefix = "pluginmanager."
+
     /// Calls plugin hooks never see: plugin management (`plugin.*`, anything carrying `plugins:manage`), `security`
-    /// commands, and settings calls on `security.*` names.
+    /// commands, settings calls on `security.*` and `pluginhost.*` names, the way to the plugin switches
+    /// (`settings.open`, `panel.open` / `panel.close` of the plugin manager's panels), and a call that forwards calls
+    /// (`commands.batch`) when one of its calls is exempt.
     @MainActor
     static func isExempt(_ command: String, params: JSONValue, registry: CommandRegistry) -> Bool {
-        if command.hasPrefix("plugin.") { return true }
-        if let d = registry.descriptor(command), d.scopes.contains(.pluginsManage) || d.scopes.contains(.security) {
+        if command.hasPrefix("plugin.") || command == CommandIDs.settingsOpen { return true }
+        if command == CommandIDs.panelOpen || command == CommandIDs.panelClose,
+           let id = params["id"]?.stringValue, isPluginManagerPanel(id) {
             return true
         }
-        if command.hasPrefix("settings."), params["name"]?.stringValue?.hasPrefix("security.") == true { return true }
+        if command.hasPrefix("settings."), let name = params["name"]?.stringValue, isProtectedSetting(name) { return true }
+        guard let d = registry.descriptor(command) else { return false }
+        if d.scopes.contains(.pluginsManage) || d.scopes.contains(.security) { return true }
+        if d.forwardsCalls {
+            for call in params["calls"]?.arrayValue ?? [] {
+                guard let nested = call["command"]?.stringValue else { continue }
+                if isExempt(nested, params: call["params"] ?? [:], registry: registry) { return true }
+            }
+        }
         return false
+    }
+
+    static func isProtectedSetting(_ name: String) -> Bool {
+        name.hasPrefix("security.") || name.hasPrefix(PluginEnablement.prefix)
+    }
+
+    static func isPluginManagerPanel(_ id: String) -> Bool {
+        id == PanelIDs.gallery || id.hasPrefix(managerPanelPrefix)
+    }
+
+    /// Replacement params a hook returned: the call keeps running as its caller, so a hook may reshape it but never
+    /// turn it into an exempt call (a user's `settings.set` of a harmless name rewritten to a security setting), never
+    /// point a settings call at another setting, and never rewrite the calls a forwarding command runs (a veto is
+    /// still allowed).
+    @MainActor
+    static func checkReplacement(_ command: String, original: JSONValue, replacement: JSONValue,
+                                 registry: CommandRegistry) throws {
+        if replacement == original { return }
+        if isExempt(command, params: replacement, registry: registry) {
+            throw NibError(.permissionDenied,
+                           "a plugin hook cannot turn '\(command)' into a call on plugin management or security settings")
+        }
+        if command.hasPrefix("settings."), replacement["name"] != original["name"] {
+            throw NibError(.permissionDenied, "a plugin hook cannot change which setting '\(command)' touches",
+                           path: "$.name")
+        }
+        if registry.descriptor(command)?.forwardsCalls == true {
+            throw NibError(.permissionDenied, "a plugin hook can veto '\(command)' but cannot change the calls it runs",
+                           path: "$.calls")
+        }
+    }
+
+    /// Errors of the hook command that are not the plugin's answer: it is not running (stopped, stopping, disabled,
+    /// not installed) or it did not answer in time. Those let the call pass; anything the plugin throws is a veto.
+    static func letsPass(_ error: Error) -> Bool {
+        let code = NibError.wrap(error).code
+        return code == .unavailable || code == .timeout
     }
 }
 
@@ -901,6 +978,15 @@ final class TemplateRenderCache {
 
 // MARK: - PDF templates
 
+/// One PDF template to convert off the main actor: its file and the text the PDF service found on page 1.
+struct PDFTemplateJob {
+    var id: String
+    var file: String
+    var path: String
+    var url: URL
+    var text: [TextRecognition]?
+}
+
 /// Turns the first page of a template PDF into a DisplayList: filled and stroked paths (lines, rectangles, curves
 /// flattened; form XObjects followed) from the page's content stream, and text lines from the PDF service. Images and
 /// shadings are left out; the page keeps the paper colour under them.
@@ -913,6 +999,12 @@ final class PDFTemplateConverter {
     static let maxOps = 20_000
     static let curveSegments = 8
     static let maxFormDepth = 8
+    /// Operator callbacks one conversion handles: a template whose content paints little but repeats (form XObjects
+    /// drawn over and over, nested up to `maxFormDepth`) stops here instead of rescanning forever.
+    static let maxSteps = 200_000
+    /// Form XObjects drawn, and the bytes of their streams, per conversion.
+    static let maxForms = 512
+    static let maxFormBytes = 32 * 1_048_576
 
     private struct GState {
         var ctm = CGAffineTransform.identity
@@ -929,6 +1021,9 @@ final class PDFTemplateConverter {
     private var subpaths: [(points: [CGPoint], closed: Bool)] = []
     private var current: [CGPoint] = []
     private var formDepth = 0
+    private var steps = 0
+    private var forms = 0
+    private var formBytes = 0
     private(set) var ops: [DisplayOp] = []
 
     private init(base: CGAffineTransform) {
@@ -978,7 +1073,8 @@ final class PDFTemplateConverter {
     private static func with(_ info: UnsafeMutableRawPointer?, _ body: (PDFTemplateConverter) -> Void) {
         guard let info = info else { return }
         let c = Unmanaged<PDFTemplateConverter>.fromOpaque(info).takeUnretainedValue()
-        guard c.ops.count < maxOps else { return }
+        guard c.ops.count < maxOps, c.steps < maxSteps else { return }
+        c.steps += 1
         body(c)
     }
 
@@ -1219,6 +1315,12 @@ final class PDFTemplateConverter {
               let dict = CGPDFStreamGetDictionary(stream) else { return }
         var subtype: UnsafePointer<CChar>?
         guard CGPDFDictionaryGetName(dict, "Subtype", &subtype), let st = subtype, String(cString: st) == "Form" else { return }
+        var length: CGPDFInteger = 0
+        _ = CGPDFDictionaryGetInteger(dict, "Length", &length)
+        guard forms < PDFTemplateConverter.maxForms,
+              formBytes + max(0, Int(length)) <= PDFTemplateConverter.maxFormBytes else { return }
+        forms += 1
+        formBytes += max(0, Int(length))
         var matrix = CGAffineTransform.identity
         var array: CGPDFArrayRef?
         if CGPDFDictionaryGetArray(dict, "Matrix", &array), let a = array, CGPDFArrayGetCount(a) == 6 {
@@ -1666,27 +1768,30 @@ struct PluginSettingsForm: View {
 }
 
 /// The inspector of a plugin's custom item type: a form over `data`; a change goes through `item.update` for every
-/// selected item of the type, as one undo step.
+/// selected item of the type (`drawKey` = "custom.<plugin>.<type>"; other plugins' custom items in a mixed selection
+/// are left alone), as one undo step.
 struct CustomItemInspector: View {
     let context: InspectorContext
     let fields: [SchemaField]
+    let drawKey: String
 
     var body: some View {
-        SchemaFormView(fields: fields, values: context.items.first?.custom?.data.objectValue ?? [:], style: .inspector) { key, value in
-            CustomItemInspector.write(key, value, context)
+        SchemaFormView(fields: fields, values: context.items.first(where: { $0.drawKey == drawKey })?.custom?.data.objectValue ?? [:],
+                       style: .inspector) { key, value in
+            CustomItemInspector.write(key, value, context, drawKey: drawKey)
         }
     }
 
     @MainActor
-    static func write(_ key: String, _ value: JSONValue, _ context: InspectorContext) {
+    static func write(_ key: String, _ value: JSONValue, _ context: InspectorContext, drawKey: String) {
         let app = context.app
         let group = NibID.make().raw
-        let ids = context.items.filter { $0.kind == .custom }.map { $0.id }
+        let ids = context.items.filter { $0.kind == .custom && $0.drawKey == drawKey }.map { $0.id }
         Task { @MainActor in
             for id in ids {
                 // The current item, not the inspector's snapshot, so quick successive edits all land.
                 guard let item = try? app.workspace.item(context.doc, page: context.page, id: id),
-                      var custom = item.custom else { continue }
+                      item.drawKey == drawKey, var custom = item.custom else { continue }
                 custom.data = CustomItemInspector.updated(custom.data, key: key, value: value)
                 do {
                     let patch: JSONValue = ["custom": try JSONValue.from(custom)]

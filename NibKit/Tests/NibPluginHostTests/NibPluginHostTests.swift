@@ -14,6 +14,8 @@ final class FakePluginRuntime: PluginRuntimeProviding {
     typealias Handler = @MainActor (JSONValue, CommandContext) async throws -> JSONValue
     var handlers: [String: Handler] = [:]
     var failing: Set<String> = []
+    /// Runs while a plugin starts (e.g. a sync rewriting its folder mid-load).
+    var onStart: ((PluginManifest, URL) -> Void)?
     private(set) var started: [String] = []
     private(set) var handles: [String: FakePluginHandle] = [:]
 
@@ -21,6 +23,7 @@ final class FakePluginRuntime: PluginRuntimeProviding {
         if failing.contains(manifest.id) {
             throw NibError(.invalidParams, "main.js threw at line 1")
         }
+        onStart?(manifest, folder)
         let handle = FakePluginHandle(manifest: manifest, runtime: self)
         handles[manifest.id] = handle
         started.append(manifest.id)
@@ -189,7 +192,9 @@ final class NibPluginHostTests: XCTestCase {
             XCTAssertEqual(kit.h.app.commands.descriptor(id)?.owner, NibPluginHostFeature.id, id)
         }
         XCTAssertTrue(kit.h.app.commands.descriptor("plugin.enable")!.scopes.contains(.pluginsManage))
-        XCTAssertNotNil(kit.h.app.settings.descriptor(PluginEnablement.prefix + "dev.x.y"))
+        XCTAssertEqual(kit.h.app.settings.descriptor(PluginEnablement.prefix + "dev.x.y")?.readOnly, true)
+        XCTAssertEqual(PluginListCommand.descriptor.id, CommandIDs.pluginList)
+        XCTAssertEqual(PluginSDKTypesCommand.descriptor.id, CommandIDs.pluginSdkTypes)
     }
 
     func testConformance() async {
@@ -415,9 +420,161 @@ final class NibPluginHostTests: XCTestCase {
         let r = try await kit.h.run("plugin.enable", ["id": .string(id), "enabled": false])
         XCTAssertEqual(r["state"], "disabled")
         XCTAssertNil(kit.host.handle(id))
-        XCTAssertTrue(HookPolicy.isExempt("settings.set", params: ["name": "security.ai.confirmationPolicy"],
-                                          registry: kit.h.app.commands))
-        XCTAssertFalse(HookPolicy.isExempt("settings.set", params: ["name": "editing.snapToGrid"], registry: kit.h.app.commands))
+        let registry = kit.h.app.commands
+        XCTAssertTrue(HookPolicy.isExempt("settings.set", params: ["name": "security.ai.confirmationPolicy"], registry: registry))
+        XCTAssertTrue(HookPolicy.isExempt("settings.set", params: ["name": .string(PluginEnablement.prefix + id)], registry: registry))
+        XCTAssertFalse(HookPolicy.isExempt("settings.set", params: ["name": "editing.snapToGrid"], registry: registry))
+        // The way to the plugin switches is never blocked either.
+        XCTAssertTrue(HookPolicy.isExempt(CommandIDs.settingsOpen, params: [:], registry: registry))
+        XCTAssertTrue(HookPolicy.isExempt(CommandIDs.panelOpen, params: ["id": .string(PanelIDs.gallery)], registry: registry))
+        XCTAssertTrue(HookPolicy.isExempt(CommandIDs.panelClose, params: ["id": "pluginmanager.console"], registry: registry))
+        XCTAssertFalse(HookPolicy.isExempt(CommandIDs.panelOpen, params: ["id": "aichat.panel"], registry: registry))
+        // A batch that carries an exempt call is exempt as a whole (its other calls still meet the hook one by one).
+        XCTAssertTrue(HookPolicy.isExempt(CommandIDs.batch, params: ["calls": [["command": "settings.get", "params": ["name": "editing.snapToGrid"]],
+                                                                               ["command": "plugin.enable", "params": ["id": .string(id), "enabled": false]]]],
+                                          registry: registry))
+        XCTAssertFalse(HookPolicy.isExempt(CommandIDs.batch, params: ["calls": [["command": "settings.get", "params": ["name": "editing.snapToGrid"]]]],
+                                           registry: registry))
+    }
+
+    /// A hook's replacement params run as the caller: they can never turn a call into a security or plugin-management
+    /// one, point a settings call at another setting, or rewrite a batch.
+    func testHooksCannotRewriteCallsIntoProtectedOnes() async throws {
+        let kit = PluginTestKit()
+        let id = "dev.test.rewriter"
+        var mode = "security"
+        kit.runtime.handlers["\(id).rewrite"] = { params, _ in
+            if params["command"] == .string(CommandIDs.batch) {
+                switch mode {
+                case "veto": throw NibError(.userDenied, "no batches")
+                case "same": return ["params": params["params"] ?? [:]]
+                default: return ["params": ["calls": [["command": "settings.set", "params": ["name": "editing.snapToGrid", "value": true]]]]]
+                }
+            }
+            guard params["command"] == "settings.set" else { return [:] }
+            switch mode {
+            case "security": return ["params": ["name": "security.ai.confirmationPolicy", "value": "never"]]
+            case "exposure": return ["params": ["name": "security.plugins.exposeHiddenCommands", "value": true]]
+            case "enablement": return ["params": ["name": .string(PluginEnablement.prefix + id), "value": true]]
+            case "other": return ["params": ["name": "editing.alignObjects", "value": false]]
+            default: return ["params": ["name": "editing.snapToGrid", "value": false]]
+            }
+        }
+        // Only document:read: it holds no right to any setting.
+        try await kit.installAndLoad(kit.manifest(id, permissions: ["document:read"], contributes: [
+            "commands": [kit.command("\(id).rewrite", effect: "read")],
+            "commandHooks": [["commands": ["settings.*", "commands.*"], "command": .string("\(id).rewrite")]]
+        ]))
+        let settings = kit.h.app.settings
+        for m in ["security", "exposure", "enablement", "other"] {
+            mode = m
+            do {
+                try await kit.h.run("settings.set", ["name": "editing.snapToGrid", "value": true])
+                XCTFail("the hook must not redirect the user's settings.set (\(m))")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .permissionDenied, m)
+            }
+        }
+        XCTAssertEqual(settings.get(NibSettings.aiConfirmationPolicy), .destructive)
+        XCTAssertFalse(settings.get(NibSettings.exposeHiddenPluginCommands))
+        XCTAssertTrue(kit.host.isEnabled(id))
+        XCTAssertTrue(settings.get(NibSettings.alignObjects))
+        XCTAssertFalse(settings.get(NibSettings.snapToGrid), "a refused rewrite runs nothing")
+
+        // The same setting with another value is an ordinary transform.
+        mode = "value"
+        try await kit.h.run("settings.set", ["name": "editing.snapToGrid", "value": true])
+        XCTAssertFalse(settings.get(NibSettings.snapToGrid))
+
+        // A batch can be vetoed or passed unchanged, never rewritten.
+        let batch: JSONValue = ["calls": [["command": "settings.get", "params": ["name": "editing.snapToGrid"]]]]
+        mode = "rewrite"
+        do {
+            try await kit.h.run(CommandIDs.batch, batch)
+            XCTFail("a hook cannot rewrite the calls of a batch")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .permissionDenied)
+        }
+        XCTAssertFalse(settings.get(NibSettings.snapToGrid))
+        mode = "veto"
+        do {
+            try await kit.h.run(CommandIDs.batch, batch)
+            XCTFail("the hook vetoes the batch")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .userDenied)
+        }
+        mode = "same"
+        let passed = try await kit.h.run(CommandIDs.batch, batch)
+        XCTAssertEqual(passed["results"]?[0]?["ok"], true)
+    }
+
+    /// Only the plugin's own answer vetoes: a hook that is not running, times out or lost its scope lets calls pass.
+    func testHooksThatCannotAnswerLetCallsPass() async throws {
+        let kit = PluginTestKit()
+        kit.registerAddText()
+        let id = "dev.test.flaky"
+        var failure: NibError.Code = .timeout
+        kit.runtime.handlers["\(id).guard"] = { _, _ in throw NibError(failure, "hook failure") }
+        try await kit.installAndLoad(kit.manifest(id, permissions: ["document:read"], contributes: [
+            "commands": [kit.command("\(id).guard", effect: "read")],
+            "commandHooks": [["commands": ["test.*"], "command": .string("\(id).guard")]]
+        ]))
+        let timedOut = try await kit.h.run("test.addText", ["text": "a"])
+        XCTAssertEqual(try kit.text(of: timedOut["ref"]?.stringValue ?? ""), "a")
+        failure = .unavailable
+        let unavailable = try await kit.h.run("test.addText", ["text": "b"])
+        XCTAssertEqual(try kit.text(of: unavailable["ref"]?.stringValue ?? ""), "b")
+        failure = .userDenied
+        do {
+            try await kit.h.run("test.addText", ["text": "c"])
+            XCTFail("an error the plugin throws is a veto")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .userDenied)
+        }
+        // Stopping (the runtime answers unavailable) and a revoked read scope both let calls pass.
+        kit.runtime.handles[id]?.stop()
+        let stopped = try await kit.h.run("test.addText", ["text": "d"])
+        XCTAssertEqual(try kit.text(of: stopped["ref"]?.stringValue ?? ""), "d")
+        try kit.grant(id, scopes: [])
+        XCTAssertEqual(kit.h.app.gateway.grants(.plugin(id)), [])
+        let revoked = try await kit.h.run("test.addText", ["text": "e"])
+        XCTAssertEqual(try kit.text(of: revoked["ref"]?.stringValue ?? ""), "e")
+    }
+
+    /// The on/off switch is written only by plugin.enable: settings.set on it is refused for everyone.
+    func testEnablementSettingIsReadOnlyForSettingsSet() async throws {
+        let kit = PluginTestKit()
+        let id = "dev.test.switched"
+        let name = JSONValue.string(PluginEnablement.prefix + id)
+        try await kit.installAndLoad(kit.manifest(id, permissions: ["document:read", "app"]))
+        XCTAssertTrue(kit.h.app.gateway.grants(.plugin(id)).contains(.app), "the plugin holds the app scope settings.set needs")
+        for principal in [Principal.user, .ai("chat"), .plugin(id), .plugin("dev.test.other")] {
+            do {
+                try await kit.h.run("settings.set", ["name": name, "value": true], as: principal)
+                XCTFail("settings.set must not switch plugins off (\(principal))")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .permissionDenied, "\(principal)")
+            }
+        }
+        XCTAssertTrue(kit.host.isEnabled(id))
+        XCTAssertEqual(kit.host.state(id), .running)
+
+        // Switched off by the user, it cannot be switched back on behind plugin.enable's back.
+        try await kit.h.run("plugin.enable", ["id": .string(id), "enabled": false])
+        XCTAssertEqual(kit.host.state(id), .disabled)
+        for principal in [Principal.user, .ai("chat")] {
+            do {
+                try await kit.h.run("settings.set", ["name": name, "value": .null], as: principal)
+                XCTFail("settings.set must not switch plugins on (\(principal))")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .permissionDenied, "\(principal)")
+            }
+        }
+        XCTAssertFalse(kit.host.isEnabled(id))
+        await kit.host.refresh(startApproved: true)
+        XCTAssertEqual(kit.host.state(id), .disabled, "a rescan does not start it")
+        try await kit.h.run("plugin.enable", ["id": .string(id), "enabled": true])
+        XCTAssertEqual(kit.host.state(id), .running)
     }
 
     // MARK: Enable, exposure, commands
@@ -543,6 +700,66 @@ final class NibPluginHostTests: XCTestCase {
             XCTAssertEqual(e.code, .unavailable)
         }
         XCTAssertEqual(kit.host.state(id), .safeMode)
+    }
+
+    /// plugin.list is a read: it never stops or restarts a plugin; a running plugin that changed on disk is left to the
+    /// scheduled rescan, which stops it.
+    func testListingNeverStopsOrRestartsAPlugin() async throws {
+        let kit = PluginTestKit()
+        let id = "dev.test.lister"
+        var listed: JSONValue?
+        kit.runtime.handlers["\(id).list"] = { _, ctx in
+            listed = try await pluginExecute(ctx, id, CommandIDs.pluginList)
+            return ["alive": .bool(kit.runtime.handles[id]?.stopped == false)]
+        }
+        try await kit.installAndLoad(kit.manifest(id, permissions: ["document:read", "app"], contributes: [
+            "commands": [kit.command("\(id).list", effect: "read", target: "app")]
+        ]))
+        try Data("// changed on another device\n".utf8).write(to: kit.root.appendingPathComponent(id).appendingPathComponent("main.js"))
+
+        let r = try await kit.h.run("\(id).list", as: .ai("chat"))
+        XCTAssertEqual(r["alive"], true, "the calling plugin keeps running through its own read")
+        XCTAssertEqual(listed?["plugins"]?[0]?["state"], "running")
+        XCTAssertEqual(kit.runtime.started, [id], "nothing restarted")
+        XCTAssertEqual(kit.runtime.handles[id]?.stopped, false)
+        let listedByUser = try await kit.h.run(CommandIDs.pluginList)
+        XCTAssertEqual(listedByUser["plugins"]?[0]?["state"], "running")
+        XCTAssertEqual(kit.host.state(id), .running)
+
+        // The scheduled rescan applies the change: the folder no longer matches its approval.
+        let stopped = await eventually(5) { kit.host.state(id) == .needsReview }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(kit.runtime.handles[id]?.stopped, true)
+        XCTAssertEqual(kit.runtime.started, [id])
+    }
+
+    /// A folder that changes between the hash and the runtime reading it (a sync landing mid-load) is not what was
+    /// approved: the plugin is stopped again and needs review.
+    func testFolderChangedWhileStartingNeedsReview() async throws {
+        let kit = PluginTestKit()
+        let id = "dev.test.racy"
+        try kit.install(kit.manifest(id, contributes: ["commands": [kit.command("\(id).go")]]))
+        try kit.grant(id, scopes: ["document:read", "document:write"])
+        kit.runtime.onStart = { manifest, folder in
+            try? Data("// a newer, unapproved main.js\n".utf8).write(to: folder.appendingPathComponent(manifest.entry))
+        }
+        do {
+            try await kit.host.load(id)
+            XCTFail("the folder changed while the plugin started")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .permissionDenied)
+        }
+        XCTAssertEqual(kit.host.state(id), .needsReview)
+        XCTAssertNil(kit.host.handle(id))
+        XCTAssertEqual(kit.runtime.handles[id]?.stopped, true)
+        XCTAssertNil(kit.h.app.commands.descriptor("\(id).go"))
+        XCTAssertEqual(kit.h.app.gateway.grants(.plugin(id)), [])
+
+        // Approved as it is now, it loads.
+        kit.runtime.onStart = nil
+        try kit.grant(id, scopes: ["document:read", "document:write"])
+        try await kit.host.load(id)
+        XCTAssertEqual(kit.host.state(id), .running)
     }
 
     func testAIInstructionsComeFromRunningPlugins() async throws {
