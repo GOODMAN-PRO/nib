@@ -1,1 +1,141 @@
-{}
+{
+  "version": 1,
+  "name": "Nib Examples",
+  "plugins": [
+    {
+      "id": "dev.nib.hello",
+      "name": "Hello",
+      "version": "1.0.0",
+      "description": "Stamp a greeting on the current page and show a toast.",
+      "author": "Nib",
+      "permissions": [
+        "document:read",
+        "document:write"
+      ],
+      "category": "Writing",
+      "kind": "plugin",
+      "minApi": 1,
+      "base": "examples/hello-world/",
+      "files": [
+        "main.js",
+        "manifest.json"
+      ],
+      "sha256": "369a26915d30094824318c4a143125733f0e4c0a677cbd756c42a49e2653b7b3"
+    },
+    {
+      "id": "dev.nib.cards",
+      "name": "Selection → Flashcards",
+      "version": "1.0.0",
+      "description": "Turn selected 'term — definition' lines into a study set.",
+      "author": "Nib",
+      "permissions": [
+        "document:read",
+        "library:write",
+        "document:write"
+      ],
+      "category": "Study",
+      "kind": "plugin",
+      "minApi": 1,
+      "base": "examples/flashcards-from-selection/",
+      "files": [
+        "main.js",
+        "manifest.json"
+      ],
+      "sha256": "2dafa6c40b7ee474c83b15366def428b92f04a9d735d1ef946b9c2fd4805ed91"
+    },
+    {
+      "id": "dev.nib.wordcount",
+      "name": "Word Count",
+      "version": "1.0.0",
+      "description": "A live word count panel for recognised handwriting, typed text and PDF text.",
+      "author": "Nib",
+      "permissions": [
+        "document:read",
+        "app"
+      ],
+      "category": "Writing",
+      "kind": "plugin",
+      "minApi": 1,
+      "base": "examples/word-count/",
+      "files": [
+        "main.js",
+        "manifest.json",
+        "panel.html"
+      ],
+      "sha256": "5c9c949e44928832ec6fc721fbabd7cfb265b60876a43d4b9bb12cc138771e26"
+    },
+    {
+      "id": "dev.nib.wordcomplete",
+      "name": "Word Complete",
+      "version": "1.0.0",
+      "description": "Bring back handwriting word completion using the user's AI provider.",
+      "author": "Nib",
+      "permissions": [
+        "document:read",
+        "document:write",
+        "ai"
+      ],
+      "category": "Writing",
+      "kind": "plugin",
+      "minApi": 1,
+      "base": "examples/word-complete/",
+      "files": [
+        "main.js",
+        "manifest.json"
+      ],
+      "sha256": "3cc214df8d726ce563a92b70ccbc1258289164b1986b8132752a66773adbe0e7"
+    },
+    {
+      "id": "dev.nib.planner",
+      "name": "Weekly Planner",
+      "version": "1.0.0",
+      "description": "A seven-day planner with paper, accent, heading and writing-line parameters.",
+      "author": "Nib",
+      "permissions": [],
+      "category": "Templates",
+      "kind": "content",
+      "minApi": 1,
+      "base": "examples/weekly-planner/",
+      "files": [
+        "main.js",
+        "manifest.json"
+      ],
+      "sha256": "e4b15998c703aeb15556b6839eabb3f7fa20d3b0c8c41e6bcfb97fa01ca4c480"
+    },
+    {
+      "id": "dev.nib.graph",
+      "name": "Graph Paper",
+      "version": "1.0.0",
+      "description": "A generated pack of 5 mm, 10 mm and quarter-inch grid papers with adjustable spacing and colours.",
+      "author": "Nib",
+      "permissions": [],
+      "category": "Templates",
+      "kind": "content",
+      "minApi": 1,
+      "base": "examples/graph-paper/",
+      "files": [
+        "main.js",
+        "manifest.json"
+      ],
+      "sha256": "bd588d2bf00d0d986b479e655ef8cc118e7aebd829346cfe40c751269e538875"
+    },
+    {
+      "id": "dev.nib.starter",
+      "name": "Starter Pack",
+      "version": "1.0.0",
+      "description": "A cover, ruled and dot papers, reusable arrows, and a retrospective board framework.",
+      "author": "Nib",
+      "permissions": [],
+      "category": "Templates",
+      "kind": "content",
+      "minApi": 1,
+      "base": "examples/starter-pack/",
+      "files": [
+        "elements/arrows.json",
+        "main.js",
+        "manifest.json"
+      ],
+      "sha256": "4aed1606c66fa2e6431bb2e1b3d511080cba67d472207974b0c247748563384f"
+    }
+  ]
+}

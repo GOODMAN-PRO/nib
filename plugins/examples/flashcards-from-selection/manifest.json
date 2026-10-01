@@ -1,1 +1,90 @@
-{}
+{
+  "id": "dev.nib.cards",
+  "name": "Selection → Flashcards",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "Turn selected 'term — definition' lines into a study set.",
+  "entry": "main.js",
+  "permissions": [
+    "document:read",
+    "library:write",
+    "document:write"
+  ],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "dev.nib.cards.fromSelection",
+        "title": "Make Flashcards",
+        "summary": "Create a study set from 'term — definition' lines in selected handwriting or text.",
+        "params": {
+          "type": "object",
+          "properties": {
+            "selection": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Item ref."
+              }
+            },
+            "separator": {
+              "type": "string",
+              "description": "Delimiter between the front and back; default —."
+            },
+            "title": {
+              "type": "string",
+              "description": "Optional study set title."
+            },
+            "id": {
+              "type": "string",
+              "description": "Optional study set document id."
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Caller-chosen card id, in parsed line order."
+              }
+            }
+          }
+        },
+        "examples": [
+          {}
+        ],
+        "effect": "library",
+        "target": "library",
+        "aiDirect": true
+      }
+    ],
+    "menus": [
+      {
+        "location": "objectMenu",
+        "command": "dev.nib.cards.fromSelection",
+        "title": "Flashcards",
+        "icon": "rectangle.stack",
+        "when": {
+          "minSelection": 1,
+          "selectionKinds": [
+            "stroke",
+            "text"
+          ]
+        }
+      }
+    ],
+    "settings": {
+      "type": "object",
+      "properties": {
+        "separator": {
+          "type": "string",
+          "default": "—"
+        }
+      }
+    },
+    "ai": {
+      "instructions": "When the user asks to turn selected notes into flashcards, call dev.nib.cards.fromSelection."
+    }
+  }
+}
