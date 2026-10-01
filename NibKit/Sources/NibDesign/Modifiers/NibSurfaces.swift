@@ -7,8 +7,9 @@ public struct NibDropletShape: Shape {
     public init(cornerRadius: CGFloat? = nil) { self.cornerRadius = cornerRadius }
 
     public func path(in rect: CGRect) -> Path {
+        guard NibGeometry.isUsable(rect) else { return Path() }
         let capsule = min(rect.width, rect.height) / 2
-        let r = min(cornerRadius ?? capsule, capsule)
+        let r = min(NibGeometry.dimension(cornerRadius ?? capsule), capsule)
         return Path(roundedRect: rect, cornerRadius: max(0, r), style: .continuous)
     }
 }

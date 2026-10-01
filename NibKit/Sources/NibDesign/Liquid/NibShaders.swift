@@ -35,6 +35,8 @@ enum NibOptics {
     static let beadRim: CGFloat = 0.8
 
     static func smoothstep(_ a: CGFloat, _ b: CGFloat, _ x: CGFloat) -> CGFloat {
+        guard a.isFinite, b.isFinite, x.isFinite else { return 0 }
+        guard b > a else { return x < a ? 0 : 1 }
         let t = min(max((x - a) / (b - a), 0), 1)
         return t * t * (3 - 2 * t)
     }

@@ -112,8 +112,13 @@ public struct NibFloatingLayer: View {
         .background {
             GeometryReader { proxy in
                 Color.clear
-                    .onAppear { host.layerOrigin = proxy.frame(in: NibLiquid.space).origin }
-                    .onChange(of: proxy.frame(in: NibLiquid.space).origin) { _, origin in host.layerOrigin = origin }
+                    .onAppear {
+                        let origin = proxy.frame(in: NibLiquid.space).origin
+                        if NibGeometry.isFinite(origin) { host.layerOrigin = origin }
+                    }
+                    .onChange(of: proxy.frame(in: NibLiquid.space).origin) { _, origin in
+                        if NibGeometry.isFinite(origin) { host.layerOrigin = origin }
+                    }
             }
         }
         .onChange(of: host.anchors, initial: true) { _, anchors in

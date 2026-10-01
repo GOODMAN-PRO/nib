@@ -73,7 +73,7 @@ public enum NibMotion {
     /// Surface tension: water at UI scale is tight and quick. clamp(0.14·√(minor / 44), 0.14, 0.26) s at ζ 0.68
     /// (about 5 % overshoot, under one visible cycle). Stretch springs never go below ζ 0.65 (DESIGN.md §9.1).
     public static func wobble(minor: CGFloat) -> NibSpring {
-        let r = min(max(0.14 * (minor / 44).squareRoot(), 0.14), 0.26)
+        let r = min(max(0.14 * (NibGeometry.dimension(minor) / 44).squareRoot(), 0.14), 0.26)
         return NibSpring(response: Double(r), dampingRatio: 0.68)
     }
 

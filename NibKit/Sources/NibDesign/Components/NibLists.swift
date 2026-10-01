@@ -107,8 +107,9 @@ public struct NibMiniPageThumbnail<Content: View>: View {
     }
 
     public var body: some View {
+        let size = NibGeometry.aspectSize(width: width, ratio: aspectRatio, minimumRatio: 0.01)
         content
-            .frame(width: width, height: width / max(aspectRatio, 0.01))
+            .frame(width: size.width, height: size.height)
             .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
             .nibElevation(.paper)
             .accessibilityHidden(true)

@@ -92,9 +92,9 @@ public struct NibSlider: View {
 
     public var body: some View {
         GeometryReader { proxy in
-            let w = max(1, proxy.size.width - 28)
+            let w = max(1, NibGeometry.dimension(proxy.size.width) - 28)
             let span = max(range.upperBound - range.lowerBound, Double.ulpOfOne)
-            let fraction = CGFloat((value - range.lowerBound) / span)
+            let fraction = min(max(NibGeometry.finite(CGFloat((value - range.lowerBound) / span)), 0), 1)
             let s = DropletPhysics.clampStretch(stretch, cap: 0.10)
             ZStack(alignment: .leading) {
                 Capsule()
@@ -124,6 +124,7 @@ public struct NibSlider: View {
     }
 
     private func update(_ g: DragGesture.Value, width w: CGFloat, span: Double) {
+        guard g.location.x.isFinite, w.isFinite, w > 0, span.isFinite else { return }
         let f = min(max((g.location.x - 14) / w, 0), 1)
         value = range.lowerBound + Double(f) * span
         if let hit = detents.first(where: { abs($0 - value) < span * 0.01 }), hit != lastDetent {

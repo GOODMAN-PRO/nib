@@ -61,7 +61,9 @@ public enum NibBudPlacement: Sendable {
     /// inset by the 16 pt chrome inset. All in one coordinate space.
     func centre(size: CGSize, beside anchor: CGRect, gap: CGFloat, in bounds: CGRect,
                 alignment: Alignment = .top) -> CGPoint {
-        let b = bounds.insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
+        let size = NibGeometry.size(size), anchor = NibGeometry.rect(anchor)
+        let gap = NibGeometry.finite(gap)
+        let b = NibGeometry.rect(bounds).insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
         let sideY = alignment == .top ? anchor.minY - NibSpacing.l + size.height / 2 : anchor.midY
         var c: CGPoint
         switch self {
@@ -76,7 +78,7 @@ public enum NibBudPlacement: Sendable {
         case .leading, .trailing:
             c.y = min(max(c.y, b.minY + size.height / 2), max(b.minY + size.height / 2, b.maxY - size.height / 2))
         }
-        return c
+        return NibGeometry.point(c)
     }
 }
 

@@ -57,19 +57,23 @@ public struct DropletDockModel: Equatable, Sendable {
     /// docked assistant panel moves the right dock to its leading edge).
     public static func region(size: CGSize, safeArea s: EdgeInsets, compact: Bool,
                               reservedTrailing: CGFloat = 0) -> CGRect {
+        let size = NibGeometry.size(size)
+        let s = EdgeInsets(top: NibGeometry.dimension(s.top), leading: NibGeometry.dimension(s.leading),
+                           bottom: NibGeometry.dimension(s.bottom), trailing: NibGeometry.dimension(s.trailing))
+        let reservedTrailing = NibGeometry.dimension(reservedTrailing)
         let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
         let bottom = s.bottom + (compact ? NibSpacing.s : NibSpacing.l)
-        return CGRect(x: s.leading + NibSpacing.l, y: top,
+        return NibGeometry.rect(CGRect(x: s.leading + NibSpacing.l, y: top,
                       width: max(0, size.width - s.leading - s.trailing - 2 * NibSpacing.l - reservedTrailing),
-                      height: max(0, size.height - top - bottom))
+                      height: max(0, size.height - top - bottom)))
     }
 
-    public func size(for edge: NibDock) -> CGSize { edge.isVertical ? vertical : horizontal }
+    public func size(for edge: NibDock) -> CGSize { NibGeometry.size(edge.isVertical ? vertical : horizontal) }
 
     /// The frame docked at `dock`: `along` 0…1 slides it from the start of its edge to the end.
     public func frame(for dock: NibPaletteDock) -> CGRect {
-        let s = size(for: dock.edge), r = region
-        let t = min(max(dock.along, 0), 1)
+        let s = size(for: dock.edge), r = NibGeometry.rect(region)
+        let t = min(max(NibGeometry.finite(dock.along, fallback: 0.5), 0), 1)
         func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
         let c: CGPoint
         switch dock.edge {
@@ -78,16 +82,17 @@ public struct DropletDockModel: Equatable, Sendable {
         case .top: c = CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.minY + s.height / 2)
         case .bottom: c = CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.maxY - s.height / 2)
         }
-        return CGRect(x: c.x - s.width / 2, y: c.y - s.height / 2, width: s.width, height: s.height)
+        return NibGeometry.rect(CGRect(x: c.x - s.width / 2, y: c.y - s.height / 2, width: s.width, height: s.height))
     }
 
     /// The `along` that centres the droplet on `point` (clamped to its edge).
     public func along(for point: CGPoint, on edge: NibDock) -> CGFloat {
+        guard NibGeometry.isFinite(point), NibGeometry.isFinite(region) else { return 0.5 }
         let s = size(for: edge)
         let t = edge.isVertical
             ? (point.y - (region.minY + s.height / 2)) / max(1, region.height - s.height)
             : (point.x - (region.minX + s.width / 2)) / max(1, region.width - s.width)
-        return min(max(t, 0), 1)
+        return min(max(NibGeometry.finite(t, fallback: 0.5), 0), 1)
     }
 
     public func along(ofFrame frame: CGRect, on edge: NibDock) -> CGFloat {
@@ -97,6 +102,7 @@ public struct DropletDockModel: Equatable, Sendable {
     /// Distance from `p` to the line the droplet's centre sits on at `edge` (perpendicular to the edge; anywhere along
     /// it counts), plus 40 pt for the top.
     public func distance(from p: CGPoint, to edge: NibDock) -> CGFloat {
+        guard NibGeometry.isFinite(p), NibGeometry.isFinite(region) else { return .greatestFiniteMagnitude }
         let s = size(for: edge)
         switch edge {
         case .leading: return abs(p.x - (region.minX + s.width / 2))
@@ -137,7 +143,7 @@ public struct DropletDockModel: Equatable, Sendable {
 
     /// A dock this device does not offer (a side edge on iPhone) becomes the bottom, else the first dock offered.
     public func validated(_ dock: NibPaletteDock) -> NibPaletteDock {
-        if docks.contains(dock.edge) { return dock }
+        if docks.contains(dock.edge) { return NibPaletteDock(edge: dock.edge, along: NibGeometry.finite(dock.along, fallback: 0.5)) }
         return NibPaletteDock(edge: docks.contains(.bottom) ? .bottom : docks[0], along: 0.5)
     }
 
@@ -159,18 +165,20 @@ public struct DropletDockModel: Equatable, Sendable {
 
     /// How far across the gap the tongue reaches before it touches: 0 at `off`, 1 at `join` (smoothstep).
     public static func meniscusReach(gap: CGFloat) -> CGFloat {
+        guard gap.isFinite else { return 0 }
         let t = min(max((meniscusOff - gap) / (meniscusOff - meniscusJoin), 0), 1)
         return t * t * (3 - 2 * t)
     }
 
     /// The gap at which a fused meniscus pinches: where t falls below the thinnest bridge the field can hold.
     public static func meniscusPinchGap(minimumNeck: CGFloat) -> CGFloat {
-        meniscusOff * (1 - pow(min(minimumNeck / meniscusThickness, 1), 1 / 0.7))
+        meniscusOff * (1 - pow(min(NibGeometry.dimension(minimumNeck) / meniscusThickness, 1), 1 / 0.7))
     }
 
     public static func hasArrived(centre: CGPoint, at target: CGPoint) -> Bool {
+        guard NibGeometry.isFinite(centre), NibGeometry.isFinite(target) else { return false }
         let dx = centre.x - target.x, dy = centre.y - target.y
-        return (dx * dx + dy * dy).squareRoot() <= arrivalTolerance
+        return hypot(dx, dy) <= arrivalTolerance
     }
 }
 
@@ -230,6 +238,16 @@ struct DockMeniscus: Equatable {
     /// One frame. `body` is the droplet's visual box; `enabled` is false under Reduce Motion, Calm and Liquid Off (no
     /// necks) and while the droplet is not drawn. Returns true while anything moves.
     mutating func step(_ dt: CGFloat, body: CGRect, enabled: Bool, minimumNeck: CGFloat) -> Bool {
+        guard NibGeometry.isUsable(body), target.map(NibGeometry.isUsable) ?? true,
+              last.map(NibGeometry.isUsable) ?? true else {
+            target = nil
+            last = nil
+            phase = .idle
+            segment = nil
+            thickness.snap(to: 0)
+            extent.snap(to: 0)
+            return false
+        }
         if let target { last = target }
         guard let dock = last else {
             segment = nil
@@ -286,13 +304,13 @@ struct DockMeniscus: Equatable {
         }
         let ca = CGPoint(x: body.midX, y: body.midY), cb = CGPoint(x: dock.midX, y: dock.midY)
         var dx = g.pointB.x - g.pointA.x, dy = g.pointB.y - g.pointA.y
-        var length = (dx * dx + dy * dy).squareRoot()
+        var length = hypot(dx, dy)
         if length < 0.5 {
             dx = cb.x - ca.x
             dy = cb.y - ca.y
-            length = (dx * dx + dy * dy).squareRoot()
+            length = hypot(dx, dy)
         }
-        guard length > 0.001, thickness.value > 0.8 else {
+        guard length.isFinite, length > 0.001, thickness.value > 0.8 else {
             segment = nil
             return moving
         }
@@ -526,7 +544,7 @@ struct DropletDockableModifier: ViewModifier {
     func body(content: Content) -> some View {
         GeometryReader { proxy in
             let compact = sizeClass == .compact
-            let origin = proxy.frame(in: NibLiquid.space).origin
+            let origin = NibGeometry.point(proxy.frame(in: NibLiquid.space).origin)
             let model = DropletDockModel(
                 region: DropletDockModel.region(size: proxy.size, safeArea: proxy.safeAreaInsets, compact: compact,
                                                 reservedTrailing: reservedTrailing)
@@ -550,7 +568,7 @@ struct DropletDockableModifier: ViewModifier {
                     }
                     .position(x: frame.midX - origin.x, y: frame.midY - origin.y)
             }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
             .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
             .onAppear { if laidOut == nil { laidOut = wanted } }
             .onChange(of: wanted) { _, next in adopt(next, model: model) }

@@ -469,7 +469,7 @@ public struct NibToolPalette<Settings: View>: View {
             let r = region(proxy)
             let a = arrange(maxLength: current.isVertical ? r.height : r.width)
             let map = slots(a)
-            let origin = proxy.frame(in: NibLiquid.space).origin
+            let origin = NibGeometry.point(proxy.frame(in: NibLiquid.space).origin)
             let d = current
             let c = centre(d, in: r)
             let bounds = CGRect(origin: .zero, size: proxy.size)
@@ -488,7 +488,7 @@ public struct NibToolPalette<Settings: View>: View {
                 }
                 if let opts = resolvedOptions(selection), let along = map[selection] {
                     NibToolOptionsBar(id: id + ".options") { opts.bar }
-                        .onGeometryChange(for: CGSize.self) { $0.size } action: { optionsSize = $0 }
+                        .onGeometryChange(for: CGSize.self) { $0.size } action: { if NibGeometry.isFinite($0) { optionsSize = NibGeometry.size($0) } }
                         .position(placement(d).centre(size: optionsSize, beside: slotAt(along), gap: -1, in: bounds,
                                                       alignment: .centre))
                     if let pop = opts.popover {
@@ -500,7 +500,7 @@ public struct NibToolPalette<Settings: View>: View {
                     }
                 }
             }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
             .onChange(of: AnchorKey(dock: d, slots: map), initial: true) { _, key in
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
@@ -844,7 +844,7 @@ struct NibSelectionBead: View {
         let node = field?.beadNode(paletteID)
         let head = node?.head ?? fallbackHead, tail = node?.tail ?? fallbackHead
         let g = BeadPhysics.geometry(head: head, tail: tail, radius: NibMetrics.beadRadius)
-        let across = thickness / 2
+        let across = NibGeometry.dimension(thickness) / 2
         let systemGlass = field?.usesSystemGlass ?? false
         Canvas { context, _ in
             func point(_ a: CGFloat) -> CGPoint { vertical ? CGPoint(x: across, y: a) : CGPoint(x: a, y: across) }

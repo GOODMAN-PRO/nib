@@ -291,9 +291,10 @@ public struct NibPageThumbnail<Content: View>: View {
     }
 
     public var body: some View {
+        let size = NibGeometry.aspectSize(width: width, ratio: aspectRatio)
         VStack(spacing: 6) {
             content
-                .frame(width: width, height: width / aspectRatio)
+                .frame(width: size.width, height: size.height)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
                 .nibElevation(.paper)
                 .overlay {

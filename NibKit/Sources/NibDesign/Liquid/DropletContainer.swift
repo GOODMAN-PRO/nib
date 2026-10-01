@@ -43,8 +43,8 @@ public struct NibDropletContainer<Content: View>: View {
         .background {
             GeometryReader { proxy in
                 Color.clear
-                    .onAppear { field.bounds = CGRect(origin: .zero, size: proxy.size) }
-                    .onChange(of: proxy.size) { _, size in field.bounds = CGRect(origin: .zero, size: size) }
+                    .onAppear { field.updateBounds(proxy.size) }
+                    .onChange(of: proxy.size) { _, size in field.updateBounds(size) }
             }
         }
         .environment(field)
@@ -116,7 +116,7 @@ struct ClusterLayer<Cell: View>: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            ForEach(field.clusters) { c in
+            ForEach(field.clusters.filter { NibGeometry.isUsable($0.frame) }) { c in
                 cell(c)
                     .frame(width: c.frame.width, height: c.frame.height)
                     .offset(x: c.frame.minX, y: c.frame.minY)
@@ -237,7 +237,8 @@ struct NeckGlassLayer: View {
     var body: some View {
         let glass: Glass = field.isFrozen ? .identity : .regular
         ZStack(alignment: .topLeading) {
-            ForEach(field.necks) { n in
+            ForEach(field.necks.filter { NibGeometry.isFinite($0.from) && NibGeometry.isFinite($0.to)
+                && $0.length.isFinite && $0.thickness.isFinite && $0.thickness > 0 }) { n in
                 Capsule()
                     .fill(field.isFrozen ? NibColor.clearBody : Color.clear)
                     .frame(width: max(n.length, 1), height: n.thickness)
@@ -245,7 +246,7 @@ struct NeckGlassLayer: View {
                     .rotationEffect(.radians(Double(n.angle)))
                     .position(n.midpoint)
             }
-            ForEach(field.satellites) { s in
+            ForEach(field.satellites.filter { NibGeometry.isFinite($0.centre.value) && $0.radius.value.isFinite }) { s in
                 Circle()
                     .fill(field.isFrozen ? NibColor.clearBody : Color.clear)
                     .frame(width: max(0, s.radius.value * 2), height: max(0, s.radius.value * 2))
