@@ -1,0 +1,95 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:319-325 (ExportDialog.submit \"print\") with PrintController.swift:77-80 (PrintPageSelection.resolve)",
+      "problem": "Pageless documents cannot be printed from the UI. A text document stores blocks and has no PageRecords, so ExportDocument.pages is empty. submit(\"print\") always calls PrintPageSelection.resolve(pages: nil, ...), which builds an empty set and throws \"Select available pages to print.\" Print in the Share & Export menu, the Print button in the export dialog, and Cmd+P all end at this banner for text documents. PresentPrint.run lines 52-56 handle this case, but the dialog validates before it ever reaches that code. This breaks D-104 and P-079 for a whole document kind.",
+      "fix": "In submit(\"print\"), validate only when selection.documents[0].pages is non-empty, as PresentPrint.run does, or drop the client-side pre-check and let print.present return the error. Add a test that drives the dialog's print submission for a document with zero pages and a pdf-extension exporter for .textDocument, and asserts export.run is called without pages."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:166-167 (ExportDraft.init options) and :251, :303-305",
+      "problem": "Exports and prints from the dialog now include layers hidden on this device by default. The draft always seeds ExportOptionKeys.visibleLayersOnly: false. F041's export.run hook writes visibleLayersOnly/visibleLayers only \"unless the caller already chose (visibleLayers given or visibleLayersOnly: false)\", so an explicit false switches it off for every UI export and print. That contradicts G26/F066 (\"F041's hook ... fills both from the layers hidden on this device, so exports match the screen\"). A user who hid an answer or draft layer shares it without knowing.",
+      "fix": "Do not seed visibleLayersOnly in ExportDraft.init. The toggle already reads a missing key as true. Write the key only when the user flips the toggle: true leaves visibleLayers for the hook to fill, false opts out. Or seed it from the session's hidden layers for that document. Add a test with a fake export.run hook that applies the F041 rule, and assert that the dialog's default params leave the hook free to act."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatExportUI/ShareCommands.swift:259-267 (SystemExportPresenter.show, iPad path)",
+      "problem": "On iPad, with a document open (the common case), the export popover buds from \"chrome.anchor.share\". No module registers that anchor id: it is not in NibContracts, the spec or FeatDocChrome. NibBudPopover then gets field.anchorRect(source) == nil and uses .zero. The popover grows from the window's top-left corner and is clamped there, instead of from Share as DESIGN.md §14.7 requires. The exportui.source anchor the code computes and registers 3 lines earlier is used only when no document is open. The cross-module literal is the kind of magic id that G18 replaced with constants.",
+      "fix": "Always pass the anchor this feature registered (source = \"exportui.source\") to NibBudPopover. If the chrome must own the Share anchor, add a well-known anchor id constant to NibContracts through a contracts change and have F017 register it. Do not reference an id that nothing provides. Also anchor the UIActivityViewController and UIPrintInteractionController popovers (ExportPresentation.anchor, PrintController.swift:173-176) to the same rect instead of the root view's top centre."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:77-91 (folder expansion through query.tree) and :106-130 (document load through query.get); NibKit/Tests/FeatExportUITests/FeatExportUITests.swift:18-39",
+      "problem": "ExportSelection.load parses result shapes that no contract defines, from FeatQuery, which is still a stub on main. It expects query.tree {root} to return a flat \"nodes\" array of {kind:\"document\", ref, locked} rows that include every nested subfolder. ARCHITECTURE describes query.tree as a tree with an optional depth, and F066's own hint calls it with {\"ref\": \"lib\"}. It expects query.get on a doc to return \"documentKind\" (no other code uses this key) and page rows with \"ref\"/\"index\". The tests replace both commands with adapters that return exactly these invented shapes, so the folder and library export path is unverified. If the real query.tree nests children or limits depth, a folder export throws \"There are no documents to export.\", or misses locked or other-kind documents in subfolders.",
+      "fix": "Load the selection from typed contracts, as F066's ExportScope does. Expand folders with ctx.services.library children(of:), recursively, or allNodes() for lib. Take the kind from ctx.workspace.peekContent(doc).meta.kind, the title from services.library.node(doc)?.title, and the pages from peekContent(doc).livePages with their order index. You already call peekContent for sourceBookmark, so this adds no load. Remove the query.get/query.tree adapters from the test harness and test against the Harness fixtures (FIXTUREFLD01 with a nested subfolder)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:249-262 (dialog toggles)",
+      "problem": "The D-101 export options dialog does not show options that F066 implements and that the shared D-101 row assigns to this UI. Missing are sticky notes (expanded or icon, ExportOptions.stickyNotes), comments as PDF text annotations (comments), image scale 2x/3x (scale) for png/jpeg, and the searchable-text layer for flattened PDFs (searchableText). F067 is the only UI over export.run, so a user cannot export sticky notes as icons, drop comments, or pick 3x images.",
+      "fix": "Add the missing controls to ExportDialog, writing the F066 keys in draft.options. Show a \"Sticky notes\" NibSegmentedControl (As on page / Expanded / Icon → stickyNotes \"asIs\" / \"expanded\" / \"icon\", F066's StickyExport raw values) and an \"Include comments\" NibToggle for pdf. Show a 2x/3x NibSegmentedControl (scale) for png/jpeg, and a \"Searchable text\" toggle when the pdf mode is flattened. Extend testOptionKeysAndExporterKindsCSVAndFolderZip to assert that each key reaches export.run."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:142-145 (format filter)",
+      "problem": "A library selection that mixes kinds (notebook + text document) is offered only nibnote/zip. A format is listed only when its own docKinds cover every selected kind. F066's ExportDispatch.plan, however, maps \"pdf\" to \"textdoc.pdf\" by file extension per kind, so the PDF export would work.",
+      "fix": "Offer one entry per file extension when every selected kind has an exporter with that id or extension, mirroring ExportDispatch.plan. Pass the generic id (\"pdf\") so export.run dispatches per kind."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ShareCommands.swift:100-111 (SaveToSource)",
+      "problem": "A dry run by a user opens the overwrite confirmation, because ctx.dryRun is checked after confirmer.confirm. A denial then returns userDenied instead of {wouldReplace}.",
+      "fix": "Return [\"wouldReplace\": ...] right after resolving the exporter, before the confirmation. Add a test asserting zero confirmer requests and zero export.run calls for dryRun."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ShareCommands.swift:113-116 (SaveToSource export.run options)",
+      "problem": "Save-back does not pass visibleLayersOnly, so the F041 hook sets it to true whenever a layer is hidden on this device. Hidden-layer ink is then removed from the user's original PDF on overwrite.",
+      "fix": "Pass ExportOptionKeys.visibleLayersOnly: false explicitly in the save-back options, so the source keeps every layer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ShareCommands.swift:187-193 (SourceOverwrite.resolve) and :194-210 (replace)",
+      "problem": "A stale bookmark is treated as \"The source file has moved\". Bookmarks often go stale after a rename, a provider sync or an app update while still resolving to the right file, which blocks save-back for no reason. Separately, Data.write(.atomic) to a security-scoped file has to create a sibling temp file in a directory the app may not have access to (File Provider locations), so the save can fail there.",
+      "fix": "When stale, continue with the resolved URL if it exists and is a regular file. Only refuse when resolution fails. Optionally refresh the bookmark through a meta command. In replace, if the atomic write fails with a permission error, retry with FileManager.replaceItemAt(target, withItemAt: exported) inside the same coordinated write, then with a non-atomic write. Add a test with a stale bookmark."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ShareCommands.swift:291-310 (SystemExportPresenter.deliver)",
+      "problem": "The continuations are not guarded. If parent.present fails (the parent is mid-transition), neither completion ever runs, so the command hangs and the temp folder is never removed. If UIActivityViewController calls completionWithItemsHandler more than once, the CheckedContinuation is resumed twice, which is a fatal trap.",
+      "fix": "In the handler, set activity.completionWithItemsHandler = nil before resuming, and keep a resumed flag. After present, check whether controller.presentingViewController is nil and resume false. Do the same for the picker's fileCompletion."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:306-313 (openPrint) and :328 with ShareCommands.swift:44-56",
+      "problem": "Opening Print from the export dialog discards the user's edited toggles, because only doc and pages are passed. Separately, the \"This page\" scope is resolved twice. submit sends the page captured when the dialog opened together with scope=current, and PresentExport re-resolves current from the active session. If the page changes (keyboard navigation, AI) before submission, a different page is exported.",
+      "fix": "Pass draft.options to print.present in openPrint. In submit, convert .current into an explicit page list (scope \"selected\" with the captured page), or have PresentExport keep the explicit pages when scope == current."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/PrintController.swift:116-144 (MixedPageRenderer / choosePaper) and FeatExportUITests.swift:189-204",
+      "problem": "In mixed-size jobs, pages are aspect-fitted to the first page's paper without rotation. A landscape page in a portrait job prints at about 70% scale, which defeats the \"mixed paper sizes\" requirement. The test draws blank pages and asserts only that an image exists, so it would pass even if nothing were drawn.",
+      "fix": "In drawPage, rotate by 90 degrees when the page's aspect (after page.rotation) is opposite to printableRect's, then aspect-fit. In the test, draw an asymmetric mark on pages of different sizes and orientations, and assert the mark's pixel location and the scale."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/ExportDialog.swift:211-219, 234-244, 264 and ShareCommands.swift:71",
+      "problem": "Several deviations from DESIGN.md. Format: notebooks always get 5 formats (pdf, png, jpeg, nibnote, zip), so the specified Format segmented control (PDF · Images · Nib file · Text) never appears and a menu Picker is used. Progress uses NibTraceRow, which DESIGN reserves for AI loading, instead of NibProgressBar. The completion toast is a generic \"Export complete\". The Selected-pages chooser is an eager VStack of one NibToggle per page with no thumbnails, which is slow and hard to use on 1000-page notebooks. The text field is hand-rolled instead of a NibDesign field component.",
+      "fix": "Group png/jpeg into one \"Images\" segment with a format sub-choice, so the segmented control fits. Show a NibProgressBar (indeterminate until F066 emits progress) in the popover, and toast \"Exported N pages\". Render the page chooser as a LazyVGrid of NibMiniPageThumbnail with check beads. Use NibField (or a NibDesign form-field variant) for the file name and the ranges."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatExportUI/FeatExportUIFeature.swift:11-38",
+      "problem": "Share & Export lists both \"Export…\" (order 100) and \"Export all…\" (order 120), and both open the same dialog. D-104 parity+ promises \"Print selected pages directly\", but the sidebarSelection Print item opens the options dialog first. The \"Save changes to source…\" menu title does not name the source file, although the spec asks for 'Save changes to <source>'. A folder export's default file name is \"<n> documents\" instead of the folder name.",
+      "fix": "Register the generic \"Export…\" only for the library and sidebar locations, not .shareExport. Have the sidebarSelection Print item pass ready: true. Give the saveSource item a contextTitle that resolves the bookmark's lastPathComponent. Default ExportDraft.name to the folder's library title when a single folder ref is exported."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatExportUITests/FeatExportUITests.swift",
+      "problem": "The acceptance criterion \"dialog produces the expected export.run params for each scope\" is tested only through export.present with hand-built params. ExportDialog.submit/openPrint is never driven. The library multi-document selection (run params with several docs and no pages), the folder-zip run, printing a pageless document, the hidden-layer default, the SaveToSource dry run, multi-file save-back refusal and stale bookmarks are untested.",
+      "fix": "Factor submit's param building into a pure function, e.g. ExportDraft.submitParams(destination:selection:), test it for current, selected, all, board, library multi-doc and folder, and cover print for a pageless document. Add tests for the dry run, multi-file and stale-bookmark paths of SaveToSource."
+    }
+  ]
+}
