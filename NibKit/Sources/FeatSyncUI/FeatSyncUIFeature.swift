@@ -18,7 +18,9 @@ public enum FeatSyncUIFeature: NibFeature {
         app.ui.settingsPages.register(SettingsPageDescriptor(
             id: "syncui.repair", title: String(localized: "Library Repair"), icon: NibSymbol.retry.name,
             section: .sync, order: 70, owner: id) { app in
-                AnyView(RepairToolsView(app: app, model: CloudStatusModel.shared(app)).padding(NibSpacing.xl))
+                AnyView(RepairToolsView(app: app, model: CloudStatusModel.shared(app)).padding(NibSpacing.xl)
+                    .onAppear { CloudStatusModel.shared(app).visibilityBegan() }
+                    .onDisappear { CloudStatusModel.shared(app).visibilityEnded() })
             })
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: id + ".cloudBackup", title: String(localized: "Cloud & Backup"),
@@ -27,14 +29,19 @@ public enum FeatSyncUIFeature: NibFeature {
         // Library hosts can render these descriptors in their existing window container, beside New.
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
             id: "syncui.libraryStatus", owner: id, placement: .topTrailing, surface: .none,
-            isVisible: { $0.kind == nil }) { context in
+            isVisible: { $0.kind == nil && !$0.isCompact }) { context in
                 AnyView(CloudStatusButton(app: context.app, model: CloudStatusModel.shared(context.app),
                                          compact: context.isCompact))
             })
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "syncui.libraryStatusCompact", owner: id, placement: .bottomTrailing, surface: .none,
+            isVisible: { $0.kind == nil && $0.isCompact }) { context in
+                AnyView(CloudStatusButton(app: context.app, model: CloudStatusModel.shared(context.app), compact: true))
+            })
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
             id: "syncui.containerBanner", owner: id, placement: .topLeading, surface: .none,
             recedesWhileWriting: true, isVisible: { context in
-                context.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true
+                context.kind == nil && context.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true
             }) { context in
                 AnyView(ContainerLibraryBanner(app: context.app))
             })
@@ -50,21 +57,25 @@ public enum FeatSyncUIFeature: NibFeature {
             icon: NibSymbol.syncDone.name, location: .libraryItem, order: 70, owner: id,
             command: CommandIDs.panelOpen, params: { context in
                 var params: [String: JSONValue] = ["id": .string(PanelIDs.cloudBackup)]
-                if let doc = context.nodes.first ?? context.doc { params["doc"] = .string(NodeRef.document(doc).description) }
+                if let doc = selectedDocument(context) { params["doc"] = .string(NodeRef.document(doc).description) }
                 return .object(params)
             }, isVisible: { context in
-                !context.nodes.isEmpty || context.doc != nil
+                selectedDocument(context) != nil
             })
         menu.contextTitle = { context in
-            guard let doc = context.nodes.first ?? context.doc else { return String(localized: "Cloud & Backup") }
+            guard let doc = selectedDocument(context) else { return String(localized: "Cloud & Backup") }
             let model = CloudStatusModel.shared(context.app)
             return String(localized: "Sync: \(model.documentStatus(doc).title)")
         }
         app.ui.menus.register(menu)
     }
 
+    private static func selectedDocument(_ context: MenuContext) -> DocumentID? {
+        context.nodes.first { context.app.services.library?.node($0)?.kind == .document } ?? context.doc
+    }
+
     public static func start(_ app: NibApp) async {
-        let model = CloudStatusModel.shared(app)
-        await model.refresh()
+        // Subscribe at launch; catalog and service queries start only when a host appears.
+        _ = CloudStatusModel.shared(app)
     }
 }

@@ -2,7 +2,11 @@ import Foundation
 import NibContracts
 
 /// The catalogue is derived data; a repair never deletes document packages or resets their revisions.
-/// F002's refresh deliberately performs a full scan when this root's cache file is absent.
+/// Temporary F002 cache workaround pending `LibraryService.rebuildCatalog() async`.
+/// F111's repair-recreates-catalog integration scenario is the real check of this private path.
+/// The contract request belongs at docs/contract-requests/F070-library-rebuild.md; this feature's
+/// write scope excludes that path and NibContracts/F002. The API should force and await a full
+/// background rebuild without callers knowing the cache path or refresh trigger.
 struct CatalogCacheRepair {
     static func cacheURL(root: URL, support: URL) -> URL {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325
@@ -64,10 +68,12 @@ struct LibraryRepair: NibCommand {
                          indexRebuilt: false, dryRun: ctx.dryRun)
         guard !ctx.dryRun else { return out }
         let requestedRoot = library.rootURL
+        let sequence = ctx.events.lastSeq
         state.running = true
         defer { state.running = false }
         ctx.events.emit(SyncStatusPayload(state: "checking", source: "syncui", reason: "repair",
                                          message: String(localized: "Rebuilding the library catalogue…")))
+        await Task.yield()
         do {
             // Complete pending saves before reading remote records. Do not close documents: their undo stacks stay.
             for doc in ctx.workspace.loadedDocuments where !ctx.isReadOnly(doc) {
@@ -78,7 +84,7 @@ struct LibraryRepair: NibCommand {
             }
             try CatalogCacheRepair.invalidate(root: library.rootURL, support: support)
             library.refresh()
-            out.catalogRebuilt = true
+            out.catalogRebuilt = FileManager.default.fileExists(atPath: CatalogCacheRepair.cacheURL(root: requestedRoot, support: support).path)
             let root = library.rootURL
             let report = try await ctx.execute(CommandIDs.syncNow)
             guard root == library.rootURL else {
@@ -98,6 +104,7 @@ struct LibraryRepair: NibCommand {
             guard requestedRoot == library.rootURL else {
                 throw NibError(.conflict, String(localized: "The library changed during repair. Repair the current library again."))
             }
+            ctx.services.get(CloudStatusModel.key, as: CloudStatusModel.self)?.repairCompleted(out, since: sequence)
             ctx.events.emit(SyncStatusPayload(state: out.errors.isEmpty ? "ok" : "warning", source: "syncui",
                                              reason: "repair", message: out.errors.isEmpty
                                                 ? String(localized: "Library repair finished.")

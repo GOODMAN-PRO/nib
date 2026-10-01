@@ -7,11 +7,13 @@ import NibDesign
 struct CloudSyncState: Equatable {
     var state: String
     var message: String?
+    var reason: String?
     var files: [String]
 
     init(_ payload: SyncStatusPayload) {
         state = payload.state
         message = payload.message
+        reason = payload.reason
         files = payload.files ?? []
     }
 
@@ -21,7 +23,7 @@ struct CloudSyncState: Equatable {
         switch state {
         case "checking": return String(localized: "Checking for changes…")
         case "syncing": return String(localized: "Syncing…")
-        case "downloading": return files.isEmpty ? String(localized: "Downloading…") : String(localized: "Downloading \(files.count) files…")
+        case "downloading": return files.isEmpty ? String(localized: "Downloading…") : String(localized: "Downloading ^[\(files.count) file](inflect: true)…")
         case "error": return String(localized: "Sync needs attention")
         case "warning": return String(localized: "Check sync warning")
         case "ok", "idle", "synced": return String(localized: "Up to date")
@@ -62,12 +64,21 @@ final class CloudStatusModel {
     @ObservationIgnored private var subscription: EventSubscription?
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var refreshRequested = false
+    @ObservationIgnored private var locationRequested = false
+    @ObservationIgnored private var catalogDirty = true
+    @ObservationIgnored private var visibleHosts = 0
+    @ObservationIgnored private var lastServiceRefresh = Date.distantPast
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var querySequence = 0
     @ObservationIgnored private var sequences: [String: UInt64] = [:]
+    @ObservationIgnored private var documentSequences: [DocumentID: UInt64] = [:]
     private var rootSequence: UInt64 = 0
-    private var statuses: [String: CloudSyncState] = [:]
-    var documents: [CloudDocument] = []
+    private var statuses: [DocumentID: [String: CloudSyncState]] = [:]
+    private var globalStatuses: [String: CloudSyncState] = [:]
+    private var catalogDocuments: [DocumentID: CloudDocument] = [:]
+    private(set) var documents: [CloudDocument] = []
+    private(set) var attentionDocuments: [CloudDocument] = []
+    private(set) var syncState = CloudSyncState(SyncStatusPayload(state: "unknown", source: "sync"))
     var locationName = String(localized: "Library location unavailable")
     var locationPath: String?
     var provider = String(localized: "Files")
@@ -76,10 +87,10 @@ final class CloudStatusModel {
     var webdav: JSONValue?
     var backupError: String?
     var webdavError: String?
-    var queryError: String?
     var actionError: String?
     var receipt: String?
     var verificationRef: String?
+    var canCopyLibrary = false
     var busy = false
     var loading = false
 
@@ -110,85 +121,157 @@ final class CloudStatusModel {
     }
 
     func consume(_ event: NibEvent, scheduleQueries: Bool = true) {
-        if event.type == NibEventType.libraryChanged, event.payload?["root"]?.boolValue == true {
+        let rootChanged = event.type == NibEventType.libraryChanged && event.payload?["root"]?.boolValue == true
+        if rootChanged {
             guard event.seq > rootSequence else { return }
             rootSequence = event.seq
             generation += 1
             statuses.removeAll()
+            globalStatuses.removeAll()
             sequences.removeAll()
-            documents.removeAll()
+            documentSequences.removeAll()
+            catalogDocuments.removeAll()
             backup = nil
             webdav = nil
             verificationRef = nil
             receipt = nil
+            canCopyLibrary = false
         }
         guard event.seq >= rootSequence else { return }
+        if event.type == NibEventType.docClosed, let doc = event.doc {
+            guard event.seq > (documentSequences[doc] ?? 0) else { return }
+            documentSequences[doc] = event.seq
+            statuses.removeValue(forKey: doc)
+            updateDerivedState()
+        }
         if let payload = event.decode(SyncStatusPayload.self) {
             let key = Self.statusKey(source: payload.source, doc: event.doc)
-            guard event.seq > (sequences[key] ?? 0) else { return }
+            guard event.seq > (sequences[key] ?? 0),
+                  event.doc.map({ event.seq > (documentSequences[$0] ?? 0) }) ?? true else { return }
             sequences[key] = event.seq
-            statuses[key] = CloudSyncState(payload)
-            app?.ui.setNeedsChromeUpdate()
+            if let doc = event.doc { statuses[doc, default: [:]][payload.source] = CloudSyncState(payload) }
+            else { globalStatuses[payload.source] = CloudSyncState(payload) }
+            updateDerivedState()
         }
         if event.type == NibEventType.libraryChanged {
+            catalogDirty = true
             inContainer = app?.services.get("library.inContainer", as: NSNumber.self)?.boolValue ?? false
+            if visibleHosts > 0 { readCatalogIfNeeded() }
+            else if rootChanged { updateDerivedState() }
             app?.ui.setNeedsChromeUpdate()
         }
-        if scheduleQueries, [NibEventType.libraryChanged, NibEventType.backupStatus,
-                             NibEventType.syncStatus, NibEventType.docOpened].contains(event.type) {
+        guard scheduleQueries, visibleHosts > 0 else { return }
+        if rootChanged { requestRefresh(includeLocation: true) }
+        else if [NibEventType.backupStatus, NibEventType.syncStatus].contains(event.type) {
             requestRefresh()
         }
     }
 
     static func statusKey(source: String, doc: DocumentID?) -> String { source + ":" + (doc?.raw ?? "") }
 
-    var syncState: CloudSyncState {
-        let states = statuses.filter { !$0.key.hasPrefix("backup:") && !$0.key.hasPrefix("webdav:") }.values
-        let winner = states.max { $0.rank < $1.rank }
-        let downloads = states.filter { $0.state == "downloading" }.flatMap(\.files)
-        if let winner, winner.state == "downloading" {
-            var result = winner
-            result.files = downloads
-            return result
-        }
-        return winner ?? CloudSyncState(SyncStatusPayload(state: "unknown", source: "sync"))
-    }
-
     func documentStatus(_ doc: DocumentID) -> CloudSyncState {
-        let suffix = ":" + doc.raw
-        let states = statuses.filter { $0.key.hasSuffix(suffix) }.values
-        if let result = states.max(by: { $0.rank < $1.rank }) { return result }
-        let badge = documents.first { $0.documentID == doc }?.badge ?? "unknown"
-        return CloudSyncState(SyncStatusPayload(state: badge, source: "catalog"))
+        let catalog = catalogDocuments[doc]?.badge ?? app?.services.library?.node(doc)?.sync.rawValue ?? "unknown"
+        let fallback = CloudSyncState(SyncStatusPayload(state: catalog, source: "catalog"))
+        return (Array(statuses[doc]?.values ?? [:].values) + [fallback]).max { $0.rank < $1.rank } ?? fallback
     }
 
-    var attentionDocuments: [CloudDocument] {
-        var all = documents
-        // A failed package might not be in the current catalogue. Preserve its repair row and its stable ref.
-        for key in statuses.keys {
-            guard let separator = key.firstIndex(of: ":") else { continue }
-            let raw = String(key[key.index(after: separator)...])
-            guard !raw.isEmpty, let state = statuses[key], state.needsAttention,
-                  !all.contains(where: { $0.documentID.raw == raw }) else { continue }
-            let doc = DocumentID(raw)
-            all.append(CloudDocument(ref: NodeRef.document(doc).description,
-                                     title: String(localized: "Document \(raw)"), badge: "error",
-                                     readOnly: app?.isReadOnly(doc) ?? false, locked: false))
+    func isDownloading(_ doc: DocumentID) -> Bool {
+        catalogDocuments[doc]?.badge == "downloading" || app?.services.library?.node(doc)?.sync == .downloading
+            || statuses[doc]?.values.contains { $0.state == "downloading" || $0.reason == "downloadTimeout" } == true
+    }
+
+    private func documentRow(_ doc: DocumentID) -> CloudDocument {
+        if let row = catalogDocuments[doc] { return row }
+        let node = app?.services.library?.node(doc)
+        return CloudDocument(ref: NodeRef.document(doc).description,
+                             title: node?.title ?? String(localized: "Untitled Document"),
+                             badge: node?.sync.rawValue ?? "unknown",
+                             readOnly: app?.isReadOnly(doc) ?? false, locked: node?.locked ?? false)
+    }
+
+    private func updateDerivedState() {
+        let states = globalStatuses.filter { !["backup", "webdav"].contains($0.key) }.map(\.value)
+            + statuses.values.flatMap { $0.filter { !["backup", "webdav"].contains($0.key) }.map(\.value) }
+            + catalogDocuments.values.map { CloudSyncState(SyncStatusPayload(state: $0.badge, source: "catalog")) }
+        syncState = states.max { $0.rank < $1.rank }
+            ?? CloudSyncState(SyncStatusPayload(state: "unknown", source: "sync"))
+        if syncState.state == "downloading" { syncState.files = states.filter { $0.state == "downloading" }.flatMap(\.files) }
+        let eventDocuments = statuses.filter { $0.value.values.contains { $0.needsAttention || $0.running } }.keys
+        let candidates = Set(catalogDocuments.keys).union(eventDocuments)
+        documents = candidates.map { documentRow($0) }.sorted {
+            $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
-        return all.filter { $0.readOnly || $0.badge == "error" || documentStatus($0.documentID).needsAttention }
-            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        attentionDocuments = documents.filter {
+            let state = documentStatus($0.documentID)
+            return $0.readOnly || state.needsAttention || state.state == "downloading"
+        }
+        app?.ui.setNeedsChromeUpdate()
     }
 
-    func requestRefresh() {
+    private func readCatalogIfNeeded() {
+        guard catalogDirty, let app else { return }
+        catalogDirty = false
+        catalogDocuments = Dictionary(uniqueKeysWithValues: (app.services.library?.allNodes() ?? []).compactMap { node in
+            guard node.kind == .document,
+                  node.sync == .error || node.sync == .downloading || app.isReadOnly(node.id) else { return nil }
+            let row = CloudDocument(ref: NodeRef.document(node.id).description, title: node.title,
+                                    badge: node.sync.rawValue, readOnly: app.isReadOnly(node.id), locked: node.locked)
+            return (node.id, row)
+        })
+        updateDerivedState()
+    }
+
+    func visibilityBegan() {
+        visibleHosts += 1
+        readCatalogIfNeeded()
+        requestRefresh(includeLocation: true)
+    }
+
+    func visibilityEnded() {
+        visibleHosts = max(0, visibleHosts - 1)
+        if visibleHosts == 0 {
+            refreshTask?.cancel()
+            refreshTask = nil
+            refreshRequested = false
+            locationRequested = false
+            querySequence += 1
+            loading = false
+        }
+    }
+
+    /// Only successful repair evidence clears stale save/repair alerts, never an unrelated sync idle.
+    func repairCompleted(_ report: LibraryRepair.Output, since sequence: UInt64) {
+        let unresolved = Set((report.errors.map(\.ref) + report.skippedReadOnly).compactMap { NodeRef($0)?.documentID })
+        let libraryFailed = report.errors.contains { NodeRef($0.ref)?.documentID == nil }
+        if !libraryFailed {
+            for doc in Array(statuses.keys) where !unresolved.contains(doc) && !isDownloading(doc) && app?.isReadOnly(doc) != true {
+                for source in ["store", "syncui"] where (sequences[Self.statusKey(source: source, doc: doc)] ?? 0) <= sequence {
+                    // Clock and format warnings need evidence from their emitter, not merely an empty merge report.
+                    if source == "store", statuses[doc]?[source]?.state != "error" { continue }
+                    statuses[doc]?.removeValue(forKey: source)
+                }
+                if statuses[doc]?.isEmpty == true { statuses.removeValue(forKey: doc) }
+            }
+        }
+        updateDerivedState()
+    }
+
+    func requestRefresh(includeLocation: Bool = false) {
         refreshRequested = true
+        locationRequested = locationRequested || includeLocation
         guard refreshTask == nil else { return }
         refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while self.refreshRequested && !Task.isCancelled {
+                let delay = max(0, 1 - Date().timeIntervalSince(self.lastServiceRefresh))
+                if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+                guard !Task.isCancelled else { return }
+                let location = self.locationRequested
                 self.refreshRequested = false
-                await self.refresh()
+                self.locationRequested = false
+                await self.refresh(includeLocation: location)
             }
-            self.refreshTask = nil
+            if !Task.isCancelled { self.refreshTask = nil }
         }
     }
 
@@ -197,36 +280,18 @@ final class CloudStatusModel {
         return try await app.bus.execute(Invocation(command: id, params: params, readOnly: true)).value
     }
 
-    func refresh() async {
+    func refresh(includeLocation: Bool = true) async {
         guard let app else { return }
+        readCatalogIfNeeded()
         let ticket = generation
         querySequence += 1
         let request = querySequence
         let root = app.services.library?.rootURL
+        lastServiceRefresh = Date()
         loading = true
         defer { if request == querySequence { loading = false } }
-        var rows: [CloudDocument] = []
-        var listError: String?
-        do {
-            var cursor: String?
-            var seen = Set<String>()
-            repeat {
-                var params: [String: JSONValue] = ["recursive": true, "limit": 1000]
-                if let cursor { params["cursor"] = .string(cursor) }
-                let value = try await query(CommandIDs.libraryList, .object(params))
-                for node in value["nodes"]?.arrayValue ?? [] {
-                    guard let ref = node["ref"]?.stringValue, case .document(let doc)? = NodeRef(ref) else { continue }
-                    rows.append(CloudDocument(ref: ref, title: node["title"]?.stringValue ?? String(localized: "Untitled Document"),
-                                              badge: node["sync"]?.stringValue ?? "unknown", readOnly: app.isReadOnly(doc),
-                                              locked: node["locked"]?.boolValue ?? false))
-                }
-                cursor = value["cursor"]?.stringValue
-                if let cursor, !seen.insert(cursor).inserted {
-                    throw NibError(.invariantViolation, "library.list repeated a cursor")
-                }
-            } while cursor != nil
-        } catch { listError = NibError.wrap(error).message }
-        let location = try? await query(CommandIDs.libraryLocations)
+        let location = includeLocation ? try? await query(CommandIDs.libraryLocations) : nil
+        guard !Task.isCancelled else { return }
         var newBackup: JSONValue?
         var newWebdav: JSONValue?
         var newBackupError: String?
@@ -235,13 +300,12 @@ final class CloudStatusModel {
             do { newBackup = try await query(CommandIDs.backupStatus) }
             catch { newBackupError = NibError.wrap(error).message }
         }
+        guard !Task.isCancelled else { return }
         if app.commands.entry(CommandIDs.webdavStatus) != nil {
             do { newWebdav = try await query(CommandIDs.webdavStatus) }
             catch { newWebdavError = NibError.wrap(error).message }
         }
-        guard ticket == generation, request == querySequence, root == app.services.library?.rootURL else { return }
-        documents = rows
-        queryError = listError
+        guard !Task.isCancelled, ticket == generation, request == querySequence, root == app.services.library?.rootURL else { return }
         backup = newBackup
         webdav = newWebdav
         backupError = newBackupError
@@ -251,7 +315,7 @@ final class CloudStatusModel {
             locationName = current["name"]?.stringValue ?? String(localized: "Library")
             locationPath = current["path"]?.stringValue
             provider = Self.providerName(current["provider"]?.stringValue)
-        } else {
+        } else if includeLocation {
             locationName = String(localized: "Library location unavailable")
             locationPath = nil
         }
@@ -266,7 +330,7 @@ final class CloudStatusModel {
         }
     }
 
-    func serviceState(_ source: String) -> CloudSyncState? { statuses[source + ":"] }
+    func serviceState(_ source: String) -> CloudSyncState? { globalStatuses[source] }
 
     static func pending(_ snapshot: JSONValue?) -> Int? {
         snapshot?["pending"]?.intValue ?? snapshot?["queued"]?.intValue ?? snapshot?["queue"]?.arrayValue?.count
@@ -281,6 +345,7 @@ final class CloudStatusModel {
     func perform(_ command: String, params: JSONValue = [:], session: EditorSession? = nil) {
         guard !busy, let app else { return }
         let ticket = generation
+        let sequence = app.events.lastSeq
         busy = true
         actionError = nil
         receipt = nil
@@ -292,19 +357,31 @@ final class CloudStatusModel {
                 guard ticket == self.generation else { return }
                 if command == CommandIDs.libraryRepair {
                     let report = try result.decode(LibraryRepair.Output.self)
+                    self.repairCompleted(report, since: sequence)
                     self.receipt = report.errors.isEmpty
-                        ? String(localized: "Catalogue rebuilt. \(report.merged) records merged.")
-                        : String(localized: "Catalogue rebuilt. \(report.errors.count) documents still need attention.")
+                        ? String(localized: "Catalogue checked. ^[\(report.merged) record](inflect: true) merged.")
+                        : report.errors.count == 1
+                            ? String(localized: "Catalogue checked. One document still needs attention.")
+                            : String(localized: "Catalogue checked. ^[\(report.errors.count) document](inflect: true) still need attention.")
                 }
                 await self.refresh()
-            } catch { if ticket == self.generation { self.actionError = NibError.wrap(error).message } }
+            } catch {
+                if ticket == self.generation {
+                    let failure = NibError.wrap(error)
+                    self.actionError = failure.message
+                    if command == CommandIDs.libraryRelocate, failure.code == .invalidParams, failure.path == "$.copy" {
+                        self.canCopyLibrary = true
+                    }
+                }
+            }
         }
     }
 
     /// The duplicate is preserved even if verification fails, and the original is never removed.
     /// Opening the copy lets the user check its pages before deciding what to keep.
     func duplicateAndVerify(_ document: CloudDocument, session: EditorSession?) {
-        guard !busy, let app else { return }
+        guard !busy, !isDownloading(document.documentID),
+              !document.readOnly, !document.locked, let app else { return }
         let ticket = generation
         busy = true
         actionError = nil
@@ -316,6 +393,18 @@ final class CloudStatusModel {
             var copyRef: String?
             do {
                 guard app.commands.entry(CommandIDs.queryGet) != nil else { throw NibError.unavailable("document verification") }
+                let readSequence = app.events.lastSeq
+                app.workspace.persistence.flush(document.documentID)
+                let original = try? await self.query(CommandIDs.queryGet, ["ref": .string(document.ref), "depth": 1])
+                let originalHead = try? app.workspace.persistence.loadHead(document.documentID)
+                let expectedPages = originalHead?.livePages.count
+                    ?? app.services.library?.node(document.documentID)?.pageCount
+                    ?? original?["pages"]?.arrayValue?.count
+                guard ticket == self.generation else { return }
+                try self.requireCleanRead(document.documentID, since: readSequence)
+                guard !app.isReadOnly(document.documentID), !self.isDownloading(document.documentID) else {
+                    throw NibError(.unavailable, String(localized: "Wait until the original is downloaded and readable before making a copy."))
+                }
                 let duplicated = try await app.bus.execute(CommandIDs.libraryDuplicate,
                                                            ["refs": [.string(document.ref)]], session: session)
                 guard ticket == self.generation else { return }
@@ -330,7 +419,32 @@ final class CloudStatusModel {
                 guard case .object(let object) = contents, !object.isEmpty else {
                     throw NibError(.invariantViolation, String(localized: "No readable contents were returned for the copy."))
                 }
-                self.receipt = String(localized: "Copy created and readable. Open it to verify the contents before removing the original.")
+                guard case .document(let copyID)? = NodeRef(ref), let expectedPages else {
+                    throw NibError(.unavailable, String(localized: "The original's page count could not be checked."))
+                }
+                let copyHead = try app.workspace.persistence.loadHead(copyID)
+                let missing = expectedPages - copyHead.livePages.count
+                guard missing == 0 else {
+                    throw NibError(.invariantViolation, missing > 0
+                                   ? String(localized: "The copy is missing ^[\(missing) page](inflect: true).")
+                                   : String(localized: "The copy's page count does not match the original."))
+                }
+                // Read every copied page, including iCloud-evicted pages; a nonempty query object is not verification.
+                for (index, page) in copyHead.livePages.enumerated() {
+                    let copiedItems = try app.workspace.persistence.loadItems(copyID, page: page.id).filter { !$0.deleted }
+                    if let originalHead {
+                        let originalPage = originalHead.livePages[index]
+                        let originalItems = try app.workspace.persistence.loadItems(document.documentID, page: originalPage.id).filter { !$0.deleted }
+                        guard copiedItems.count == originalItems.count else {
+                            throw NibError(.invariantViolation, String(localized: "The copy's item count does not match the original on page \(index + 1)."))
+                        }
+                    }
+                }
+                try self.requireCleanRead(document.documentID, since: readSequence)
+                try self.requireCleanRead(copyID, since: readSequence)
+                self.receipt = originalHead == nil
+                    ? String(localized: "Copy created. Its page count matches the catalogue, but the original could not be read. Open both to verify the contents.")
+                    : String(localized: "Copy created and readable. Page and item counts match the original. Open it to verify the contents before removing the original.")
                 await self.refresh()
             } catch {
                 guard ticket == self.generation else { return }
@@ -339,6 +453,14 @@ final class CloudStatusModel {
             }
         }
     }
+
+    private func requireCleanRead(_ doc: DocumentID, since sequence: UInt64) throws {
+        if let state = statuses[doc]?["store"], state.state == "error",
+           (sequences[Self.statusKey(source: "store", doc: doc)] ?? 0) > sequence {
+            throw NibError(.unavailable, state.message ?? String(localized: "Some document files could not be read."))
+        }
+    }
+
 }
 
 @MainActor
@@ -346,8 +468,9 @@ struct ContainerLibraryBanner: View {
     let app: NibApp
     var body: some View {
         NibBanner(String(localized: "Your library is inside Nib. Reinstalling with another signer can delete it. Move it to a folder outside the app."),
-                  action: NibAction(String(localized: "Move Library…")) {
-                      app.perform(CommandIDs.libraryRelocate, ["copy": false])
+                  action: NibAction(CloudStatusModel.shared(app).canCopyLibrary ? String(localized: "Copy Library…") : String(localized: "Move Library…")) {
+                      let model = CloudStatusModel.shared(app)
+                      model.perform(CommandIDs.libraryRelocate, params: ["copy": .bool(model.canCopyLibrary)])
                   })
     }
 }
@@ -368,7 +491,8 @@ struct CloudStatusButton: View {
             }
         }
         .accessibilityValue(model.syncState.title)
-        .task { await model.refresh() }
+        .onAppear { model.visibilityBegan() }
+        .onDisappear { model.visibilityEnded() }
     }
     private func open() { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.cloudBackup)]) }
 }
@@ -395,7 +519,7 @@ struct CloudStatusPanel: View {
                     if let doc = selectedDocumentID, context.app.isReadOnly(doc) {
                         NibBanner(String(localized: "This document is read-only. Update Nib if it was written by a newer version."))
                     }
-                    if let error = model.actionError ?? model.queryError { NibBanner(error) }
+                    if let error = model.actionError { NibBanner(error) }
                     if let receipt = model.receipt { NibBanner(receipt, style: .info) }
                     if let ref = model.verificationRef {
                         NibButton(String(localized: "Open Copy to Verify"), symbol: .notebook, kind: .plain) {
@@ -412,11 +536,15 @@ struct CloudStatusPanel: View {
                         commandButton(String(localized: "Sync Now"), CommandIDs.syncNow, symbol: .syncing)
                         commandButton(String(localized: "Move Library…"), CommandIDs.libraryRelocate,
                                       params: ["copy": false], symbol: .folder)
+                        if model.canCopyLibrary {
+                            commandButton(String(localized: "Copy Library…"), CommandIDs.libraryRelocate,
+                                          params: ["copy": true], symbol: .copy)
+                        }
                     }
                     if let doc = selectedDocumentID {
                         NibInspectorSection(String(localized: "Document Sync")) {
                             let state = model.documentStatus(doc)
-                            NibRow(model.documents.first { $0.documentID == doc }?.title ?? String(localized: "Document"),
+                            NibRow(context.app.services.library?.node(doc)?.title ?? String(localized: "Untitled Document"),
                                    subtitle: state.title, icon: state.symbol)
                             if let message = state.message {
                                 Text(message).font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
@@ -424,15 +552,19 @@ struct CloudStatusPanel: View {
                             }
                         }
                     }
-                    NibInspectorSection(String(localized: "WebDAV")) {
-                        serviceSummary(source: "webdav", snapshot: model.webdav, error: model.webdavError)
-                        commandButton(String(localized: "Sync WebDAV Now"), CommandIDs.webdavSyncNow, symbol: .syncing)
-                        settingsButton(owner: "webdav", title: String(localized: "WebDAV Settings"))
+                    if context.app.commands.entry(CommandIDs.webdavStatus) != nil {
+                        NibInspectorSection(String(localized: "WebDAV")) {
+                            serviceSummary(source: "webdav", snapshot: model.webdav, error: model.webdavError)
+                            commandButton(String(localized: "Sync WebDAV Now"), CommandIDs.webdavSyncNow, symbol: .syncing)
+                            settingsButton(owner: "webdav", title: String(localized: "Open WebDAV Settings"))
+                        }
                     }
-                    NibInspectorSection(String(localized: "Backup")) {
-                        serviceSummary(source: "backup", snapshot: model.backup, error: model.backupError)
-                        commandButton(String(localized: "Back Up Now"), CommandIDs.backupNow, symbol: .share)
-                        settingsButton(owner: "backup", title: String(localized: "Backup Settings"))
+                    if context.app.commands.entry(CommandIDs.backupStatus) != nil {
+                        NibInspectorSection(String(localized: "Backup")) {
+                            serviceSummary(source: "backup", snapshot: model.backup, error: model.backupError)
+                            commandButton(String(localized: "Back Up Now"), CommandIDs.backupNow, symbol: .backup)
+                            settingsButton(owner: "backup", title: String(localized: "Open Backup Settings"))
+                        }
                     }
                     if !model.attentionDocuments.isEmpty {
                         NibInspectorSection(String(localized: "Documents Needing Attention")) {
@@ -446,6 +578,7 @@ struct CloudStatusPanel: View {
                                         model.duplicateAndVerify(document, session: context.session)
                                     }
                                     .disabled(model.busy || document.readOnly || document.locked ||
+                                              model.isDownloading(document.documentID) ||
                                               context.app.commands.entry(CommandIDs.libraryDuplicate) == nil ||
                                               context.app.commands.entry(CommandIDs.queryGet) == nil)
                                     if document.locked { Text(String(localized: "Unlock this document before making a copy."))
@@ -463,7 +596,8 @@ struct CloudStatusPanel: View {
             .scrollBounceBehavior(.basedOnSize)
         }
         .background(NibColor.backgroundSecondary)
-        .task { await model.refresh() }
+        .onAppear { model.visibilityBegan() }
+        .onDisappear { model.visibilityEnded() }
         .accessibilityIdentifier("syncui.cloudBackup")
     }
 
@@ -486,8 +620,10 @@ struct CloudStatusPanel: View {
             NibRow(snapshot?["enabled"]?.boolValue == false || snapshot?["configured"]?.boolValue == false
                    ? String(localized: "Not configured") : String(localized: "Ready"))
         }
-        if let pending = CloudStatusModel.pending(snapshot) {
-            NibRow(String(localized: "\(pending) documents queued"))
+        if let pending = CloudStatusModel.pending(snapshot), pending > 0 {
+            NibRow(source == "webdav"
+                   ? String(localized: "^[\(pending) file](inflect: true) queued")
+                   : String(localized: "^[\(pending) document](inflect: true) queued"))
         }
         if let date = snapshot?[source == "backup" ? "lastRun" : "lastSync"]?.doubleValue, date > 0 {
             NibRow(String(localized: "Last completed"), subtitle: Date(timeIntervalSince1970: date).formatted(date: .abbreviated, time: .shortened))
