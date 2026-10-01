@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:1101-1105,1156; ConsentSheet.swift:524-533",
+      "problem": "The consent sheet's 'Matches the hash the gallery lists' check mark can be faked. `galleryVerified: expectedHash != nil` is true for `sha256: \"\"` or whitespace, because a blank hash skips the comparison at 1101. A non-user caller can also call plugin.install with dryRun (the result carries `sha256`) and then pass that value back. Either way, a prompt-injected AI or bridge agent can install any URL or inline plugin with a 'gallery verified' badge on the trust sheet.",
+      "fix": "Compute `let verified = expected.map { !$0.isEmpty && $0 == package.sha256 } ?? false` and pass that instead of `expectedHash != nil`. Show the gallery wording only when `ctx.principal.isUser` (the F080 gallery UI). For other principals, show nothing or 'Matches the sha256 the caller supplied'. Add a test for `sha256: \"\"` and for an AI caller."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:1119-1123",
+      "problem": "The install and update path builds the permission diff against the manifest currently on disk, not against what this device approved. Example: v1 is approved, a synced v2 that adds 'network' arrives unapproved, and the person then installs v3 (or the same v2 files). 'network' shows as unchanged, with no '+' and no re-consent gate. It starts switched off, so this fails safe, but the diff is wrong. review() already uses the grant.",
+      "fix": "When `oldGrant` exists and `oldGrant.sha256 != existing?.sha256`, use `oldGrant.permissions ?? oldGrant.scopes` and `oldGrant.hosts` as `oldPermissions` and `oldHosts`, the same as review() does. Add a test for a synced unapproved update."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:687-695 (used by review at 1244/1276)",
+      "problem": "TOCTOU in plugin.review. manifest.json is read and decoded separately from the hash pass. If a sync lands between the two, the sheet shows manifest A (hosts, commands, code) while the grant binds the hash of manifest B, and the post-consent re-hash still matches B. Widened network.hosts would then be honoured without being shown.",
+      "fix": "Keep the manifest.json bytes during the hash pass (compute(files:) returns them) and decode those. Alternatively, hash again after reading the manifest and throw `.conflict` if the hash differs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:749,1183-1190",
+      "problem": "PackagePlacer deletes the `.previous-*` backup as soon as the swap succeeds, before the installed-hash check and the grant write. If either fails (a sync lands, or the grant write hits a full disk), the old version is gone and the new files are left unapproved. A crash mid-swap also leaves `.incoming-*` or `.previous-*` folders in the synced plugins folder, and nothing removes them.",
+      "fix": "Return the backup URL from place(). Delete it only after `grants.set` succeeds. On failure, restore the backup and reload the host. Remove stale `.incoming-*` and `.previous-*` folders when the installer starts."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:842",
+      "problem": "`(try? readLocked()) ?? [:]` turns any read or decode error into an empty map. A corrupt or unreadable PluginGrants.json is then overwritten, which silently revokes every other plugin's grant on this device.",
+      "fix": "Default to `[:]` only when the file is missing. On a decode error, rename the file aside (PluginGrants.corrupt-<date>.json) and log it. On a read I/O error, throw instead of overwriting."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:1092,412-414",
+      "problem": "`defer { staging.remove() }` recursively deletes the staging tree on the main actor. That tree can hold up to 2,000 files and 20 MB, plus a half-written oversized package.",
+      "fix": "Run the removal off the main actor, for example `Task.detached(priority: .utility) { root removal }`, in place of the synchronous defer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:242-243,299-301",
+      "problem": "Directory entries in a zip or a copied folder are not counted against any limit. A 200 MB .nibplugin made only of directory entries (millions of them) creates that many folders in tmp before inspect() runs.",
+      "fix": "Count every entry, directories included, against a cap such as `PluginRules.maxFiles * 2`. Also cap path depth and length in StagingPath.sanitize. Add a test with an archive of directory entries only."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:1299,1314-1317",
+      "problem": "With removeData: true, the package and grant are removed before the data folder. If removing the data fails, a retry fails with notFound (neither package nor grant exists), so the command can never remove the leftover data.",
+      "fix": "Allow the call when `removeData && fileExists(data)`, even if the package and grant are already gone. Alternatively, remove the data folder first."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:512",
+      "problem": "GallerySource.resolveBase accepts `http`, although its own error message says base must be https. With a user principal, plugin code is then fetched over cleartext and can be tampered with when no sha256 is given.",
+      "fix": "Require https for `base`, and for `url` downloads of packages. Allow http only when a non-empty sha256 is supplied and matches."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/PluginInstaller.swift:1215-1229",
+      "problem": "The gallery base + files source checks the 20 MB budget only after each file has fully downloaded, so one listed file can pull up to NibLimits.maxDownloadBytes (200 MB) before it is rejected. Files are also downloaded one at a time, each with its own 60 s timeout.",
+      "fix": "Stop at the first file that exceeds the remaining budget (as now), and before each download check the remaining budget against the response's expected length. Contracts only offers inputFile(_:), which has no byte cap, so for a true streaming cap request `inputFile(_:maxBytes:)` in contracts. Use a small bounded concurrency (for example 4 downloads at once)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/ConsentSheet.swift:156-159,476-489",
+      "problem": "Long consent details are NibRow subtitles, which are capped at 2 lines. These include the plugin's AI instructions (up to 1,000 characters that are injected into the assistant prompt), the 'Runs before these commands' hook list and file lists. They truncate, badly at AX3, so the person cannot read what they are approving. This fails the Slop checklist line 'Nothing wraps or truncates badly at AX3'.",
+      "fix": "Render each detail value as wrapping Text (NibFont.callout, labelSecondary, `.fixedSize(horizontal: false, vertical: true)`) under the title. For the instructions, use a DisclosureGroup that shows the full text."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/ConsentSheet.swift:534-552",
+      "problem": "'Show Full Hash', 'Hide Full Hash' and 'Copy Hash' are hand-styled `Button`s (`.buttonStyle(.plain)` with a manual minHeight frame, contentShape and hoverEffect). They are not the NibDesign button, so they miss NibPressStyle's 0.96 press and the shared styling.",
+      "fix": "Use `NibButton(title, kind: .plain, size: .compact) { … }` for all three."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginInstall/ConsentSheet.swift:559-583; PluginInstaller.swift:656-665",
+      "problem": "The code viewer shows only the entry script. For AI-authored inline plugins, the panel HTML and JS (which run with `window.nib`) and other scripts are only listed by name, so the person cannot read all the code they are approving (N-017).",
+      "fix": "In the 'Every file' list, make the text files (.js, .html, .css, .json) expandable into NibCodeBlock, each with the same 64 KB preview. Read them during inspect for inline sources and keep them as CodePreview entries."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPluginInstallTests/*",
+      "problem": "Several risky paths have no tests: the gallery base + files fetch (download, place, duplicates, budget), a zip whose stored bytes exceed its declared uncompressedSize (the per-chunk budget), a blank sha256, a directory-entry flood, and the synced-unapproved update diff.",
+      "fix": "Stub URLSession.shared with a URLProtocol and test `fetch(.gallery)` end to end. Extend TestZip so it can declare a smaller size than the bytes it stores, and assert the 20 MB error. Add tests for the blank sha256 and the update-diff cases above."
+    }
+  ]
+}

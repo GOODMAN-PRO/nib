@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibAIAgent/AgentService.swift:157-191 (turn: chat history load); NibKit/Sources/NibAIAgent/ChatCommands.swift:134-159 (AIAsk), 255-305 (AIChatRename/AIChatDelete/AIChatFeedback)",
+      "problem": "Conversations of locked documents are reachable by non-user principals. ai.chat.list hides them (visible()), but ai.ask {chat: X} loads the stored history of chat X (chatStore.messages) and sends it to the provider without checking the chat's meta.doc against gateway.isLocked. The gateway cannot catch it because `chat` is a bare id, not a ref, so Gateway.referencedDocuments ignores it. A bridge client or plugin that learned a chat id (from an earlier ai.chat.list or an ai.turn.finished payload) can ask 'repeat this conversation' and read the locked notebook's content. rename/delete/feedback likewise modify locked-document chats for any principal (delete is silent under policy 'never'). This breaks the locked-documents rule (AI.md §6, ARCHITECTURE §15.8).",
+      "fix": "Add one helper, e.g. `ChatStore.ownerDoc(chat) -> DocumentID?` (state(chat)?.meta?.doc). In AgentService.turn, when request.chatID != nil and the base principal (caller?.principal ?? request.principal) is not .user and gateway.isLocked(ownerDoc) is true, return NibError(.locked, \"the conversation belongs to a locked document\", hint: \"ask the user to unlock it first\") before reading history. Run the same check in AIChatRename/AIChatDelete/AIChatFeedback.run when !ctx.principal.isUser. Add a test: lock Fixtures.docID with FakeLockService, then expect .locked from ai.ask {chat}, ai.chat.rename, ai.chat.delete and ai.chat.feedback as .ai/.bridge, and expect success as .user."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibAIAgent/AgentTools.swift:459-494 (Deadline.run), used by AgentToolRunner.execute (159-168) and AgentLoop.run (150-162)",
+      "problem": "Cancel does not stop an in-flight tool call. Deadline.run runs the body in an unstructured Task and waits on withCheckedThrowingContinuation, so cancelling the turn (cancel(chatID:) or stream termination) never reaches the running bus.execute. If the user presses Stop while a destructive call waits on the confirmation sheet, or while a long render/recognize runs, the turn keeps running for up to toolTimeout (120 s). During that time running[chatID] blocks the chat ('already answering'), and if the user then taps Allow the edit still commits after Stop. On timeout, work.cancel() also contradicts the doc comment ('the body keeps running to its end'), and changes a late-finishing call commits are dropped from outcome.changes. testCancelStopsTheTurn only covers cancelling during the provider stream.",
+      "fix": "In Deadline.run, wrap the continuation in withTaskCancellationHandler. onCancel should hop to the MainActor (Task { @MainActor in … }), and if !race.done, set race.done = true, cancel race.timer and work, and resume(throwing: CancellationError()). AgentLoop.run then sees Task.isCancelled after runner.run and returns cancelled. Correct the comment to say the body is cancelled. Add a test: a stand-in destructive command whose FakeConfirmer never answers (or a command that sleeps 10 s), cancel(chatID:) while it runs, and assert the stream finishes in under 2 s with cancelled == true."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibAIAgent/ChatStore.swift:332-360 (refresh), 383-392 (foldConflicts), 401-419 (rewriteOwnFile)",
+      "problem": "Folding conflict copies can permanently lose chat messages. A conflict file is added to `conflicts` before it is read (line 340). If Data(contentsOf:) fails (line 343: a dataless or still-downloading file-provider item, a coordination error), its records are never absorbed, yet foldConflicts still rewrites this device's file without them and deletes the copy. foldConflicts also queues the deletion right after rewriteOwnFile, which swallows write errors (disk full, permissions). So the conflict copies are removed even when the merged file was never written, and their unique records survive only in memory until the app quits.",
+      "fix": "Only fold files whose records were actually decoded. Record readable conflict names in refresh, and skip and retry the others on the next scan. Make the own-file rewrite and the deletion one io-queue job: `io.async { do { try createDirectory; try data.write(to: own, options: .atomic); for u in urls { try? removeItem(at: u) } } catch { log; leave the conflict files } }`, so copies are removed only after the merged file is safely on disk. Add a test that makes the own-file write fail (point the own file path at a directory, or use a read-only folder) and asserts the conflict copy still exists."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/AgentService.swift:182-189, 254-260 (newMessages)",
+      "problem": "newMessages compares the incoming messages with chatStore.messages(chatID), which includes the hidden empty assistant records of failed or cancelled turns. AIService.messages(chatID:) returns visibleMessages, which leaves those records out. A caller that resends the conversation it was shown (the documented 'whole conversation again' mode) after a failed turn gets a prefix mismatch, or fails the count > stored.count check, so the whole conversation is appended again as duplicate user and assistant records.",
+      "fix": "Match against the visible list: `let shown = stored.filter { !($0.role == \"assistant\" && ($0.text ?? \"\").isEmpty) }`. Then, when incoming.count > shown.count and the first shown.count messages match on role, text and image names, return the suffix. Otherwise return incoming. Add a test: a failed first turn, then resending [u1, u2] stores only u2."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/ChatStore.swift:472-487 (appendData), 461-470 (decodeLines)",
+      "problem": "After a write torn by a crash, the file ends without a newline. appendData seeks to the end and writes the next record straight onto the fragment, so decodeLines rejects the merged line and the new message is lost along with the torn one.",
+      "fix": "In appendData, before writing, read the file's last byte (handle.seek(toOffset: size - 1); readData(ofLength: 1)). If it is not 0x0A, write a 0x0A first. Add a test that writes a truncated line, appends a record, and checks the record decodes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/AgentTools.swift:399-419 (ResultPager.itemsPage oversizeFirst), 264-285 (render mapping)",
+      "problem": "The 20 KB cap is not enforced on continuation pages. When a later list element is larger than the page budget, oversizeFirst returns it whole, for example one item from nib_get {points: true} holding a long stroke, or a long block, giving a tool result of hundreds of KB. The nib_render mapping text (which includes `marks` for every item on a busy page) is never passed through pager.fit either.",
+      "fix": "When a single element from `start` does not fit, return a text page of that element instead: store it as Stored.text under a new id, and return {key: [], \"part\": …, \"cursor\": textCursor, \"resume\": itemsCursor(start + 1)}. Alternatively, return the base page with that element replaced by {\"truncated\": true, \"cursor\": …}. Pass the nib_render mapping through pager.fit before building the text part. Extend testLargeResultsArePagedWithACursor with a 30 KB row in the middle."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/ChatCommands.swift:159-162; NibKit/Sources/NibAIAgent/AgentTools.swift:147-151",
+      "problem": "Edits made by a nested ai.ask turn are missing from the accounting. Its tool calls run through bus.execute in separate CommandContexts, so InvocationResult.changes for ai.ask is always empty (ctx.summary is private(set)). An outer AI turn that calls nib_run ai.ask therefore records no changes in ToolOutcome.changes, in the stored answer's changes or group, or in ai.turn.finished. The chat bubble shows 0 changes for edits that did happen.",
+      "fix": "In AgentToolRunner.run, when inv.command == \"ai.ask\", decode r.value[\"changes\"] as ChangeSummary and merge it into the ToolOutcome changes. File docs/contract-requests/F084-nested-summary.md asking for a CommandContext API to merge an external ChangeSummary, so bus callers (bridge /api/v1/call, commands.batch) see the changes too."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/ChatCommands.swift:149-150 (AIAsk dry run)",
+      "problem": "A dry run of ai.ask (nib_run dry_run, or a batch preview containing it) still calls the external provider, which sends note content off the device and costs tokens. It also persists a new conversation and emits ai.turn.finished. That breaks the dry-run contract: nothing is persisted, recorded or emitted.",
+      "fix": "If ctx.dryRun, return an AIResponse(text: \"\", group: ctx.group) with a note such as 'preview: ai.ask runs the model only for real', without calling agent.complete. Or at least pass a flag that skips chatStore writes and the event."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/ChatStore.swift:322-365 (refresh), 315-317 (flush)",
+      "problem": "refresh runs on the MainActor. It blocks on io.sync {} for pending writes, lists the folder, stats every chat file, and reads and JSON-decodes every changed file. The first summaries() call of a session reads every conversation in the library on the main thread, and every forced refresh (rename, delete, rate) stats the whole folder. With hundreds of long chats this stalls the UI.",
+      "fix": "Do the listing, stat and decode on the io queue, and merge the decoded records into `chats` on the MainActor afterwards (async refresh, with the synchronous path kept only for tests). Alternatively, index summaries from the meta lines and decode a chat's messages lazily when state(chat) is first asked for."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIAgent/AgentService.swift:263-272 (trimmed)",
+      "problem": "Trimming to historyLimit or historyCharacters can leave the history starting with an assistant message (for example 20 stored pairs plus a new message keeps 40 messages beginning with a1). Strict-alternation chat templates used by OpenAI-compatible local servers (LM Studio, vLLM, some Ollama models) reject that with 'roles must alternate user/assistant'.",
+      "fix": "After trimming, drop leading messages until the first has role \"user\" (keep the newest message regardless)."
+    },
+    {
+      "severity": "minor",
+      "where": "branch feat/F084 vs origin/feat/F078",
+      "problem": "F084 merged F078 at 04ddf46. origin/feat/F078 has since gained 252ae8a, which closes plugin hook, contribution and enablement privilege gaps and changes PluginRegistry and ContributionMapper, both of which F084's plugin direct tools and instructions read. F084's green CI was therefore run against the pre-fix plugin host.",
+      "fix": "Merge origin/feat/F078 (252ae8a) into feat/F084 and re-run CI before landing. F084 does not touch those files, so the merge is clean."
+    }
+  ]
+}
