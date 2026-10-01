@@ -118,7 +118,7 @@ struct BackupConfiguration: Codable, Equatable {
 
 enum BackupSettings {
     static let destination = SettingKey("backup.destination", default: BackupDestination(kind: "none"))
-    static let format = SettingKey("backup.format", default: "nib", synced: true)
+    static let format = SettingKey("backup.format", default: "nib")
     static let folder = SettingKey("backup.folder", default: "Nib Backups")
     static let frequent = SettingKey("backup.frequent", default: false)
     static let bookmark = SettingKey<Data?>("backup.bookmark", default: nil)
@@ -157,6 +157,8 @@ enum BackupSettings {
 /// trigger work. The baseline is stored separately from the frequently-written queue, one file per document.
 struct BackupContentStamp: Codable, Equatable {
     var records: [String: String] = [:]
+    // Optional for queues stamped before revision caching was introduced.
+    var pageRevisions: [String: Rev]?
     func hasChanges(since old: BackupContentStamp) -> Bool {
         records.contains { old.records[$0.key] != $0.value }
     }

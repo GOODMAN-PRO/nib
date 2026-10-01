@@ -18,7 +18,7 @@ struct BackupManual: NibCommand {
     typealias Params = NoResult
     typealias Output = JSONValue
     static let descriptor = CommandDescriptor(id: CommandIDs.backupManual, title: String(localized: "Create Library Backup"),
-        summary: "ZIP the library without caches or locked documents and save it with Files. Foreground only; interruption requires a fresh run. Restore with import.pick.",
+        summary: "ZIP the library without caches or locked documents and save it with Files. Foreground only; restarts from the beginning after interruption. Restore with import.pick.",
         examples: [[:]], effect: .session, target: .app, extraScopes: [.libraryRead], userPresence: true, undoable: false)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("Manual backup requires a foreground window") }
@@ -65,6 +65,18 @@ struct BackupConfigure: NibCommand {
         }
         if p.destination.kind == "folder", ctx.services.settings.get(BackupSettings.bookmark) == nil {
             throw NibError.unavailable("Choose a Files-provider folder with backup.chooseFolder first")
+        }
+        if p.destination.kind == "webdav" {
+            do {
+                let path = (try BackupWriter.components(folder) + ["Nib-Backup-Validation.zip"]).joined(separator: "/")
+                _ = try await ctx.bus.execute(Invocation(command: CommandIDs.webdavPut,
+                    params: ["path": .string(path), "file": "tmp:backup-validation.zip", "overwrite": true],
+                    principal: ctx.principal, session: ctx.session, group: ctx.group, dryRun: true,
+                    depth: ctx.depth + 1, inheritedPolicy: ctx.inheritedPolicy))
+            } catch {
+                throw NibError(.invalidParams, "WebDAV backup destination is unavailable: " + NibError.wrap(error).message,
+                    path: "$.destination", hint: "Configure WebDAV first and choose a backup folder outside its library folder")
+            }
         }
         let config = BackupConfiguration(destination: BackupDestination(kind: p.destination.kind, folder: p.destination.kind == "webdav" ? folder : nil),
                                          format: p.format, folder: folder, exclusions: exclusions, frequent: p.frequent ?? previous.frequent)

@@ -62,7 +62,7 @@ struct BackupSettingsPage: View {
                     NibRow(String(localized: "Pending documents")) {
                         Text(status.queued, format: .number).font(NibFont.body).foregroundStyle(NibColor.labelSecondary)
                     }
-                    if status.running {
+                    if status.running && !status.manual {
                         NibProgressBar(value: status.progress).accessibilityLabel(String(localized: "Backup progress"))
                         Text(String(localized: "Keep Nib open until the backup finishes.")).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                     }
@@ -86,6 +86,10 @@ struct BackupSettingsPage: View {
                 NibButton(String(localized: "Create Library Backup"), symbol: .backup, kind: .plain, expands: sizeClass == .compact) {
                     model.send(CommandIDs.backupManual)
                 }.disabled(model.status?.running == true)
+                if let status = model.status, status.running && status.manual {
+                    NibProgressBar(value: status.progress).accessibilityLabel(String(localized: "Manual backup progress"))
+                    Text(String(localized: "Keep Nib open until the backup finishes.")).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+                }
                 NibButton(String(localized: "Restore from ZIP"), kind: .plain) { model.send(CommandIDs.importPick) }
                     .disabled(model.status?.running == true)
             } header: { Text(String(localized: "Manual backup and restore")) } footer: {

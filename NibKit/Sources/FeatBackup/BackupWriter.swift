@@ -20,7 +20,12 @@ enum BackupWriter {
         let replaced = title.precomposedStringWithCanonicalMapping.map { char -> Character in
             char == "/" || char == "\\" || char == ":" || char.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) ? "_" : char
         }
-        let value = String(String(replaced).prefix(100)).trimmingCharacters(in: .whitespacesAndNewlines)
+        var shortened = ""
+        for char in replaced {
+            guard shortened.utf8.count + String(char).utf8.count <= 150 else { break }
+            shortened.append(char)
+        }
+        let value = shortened.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty || value == "." || value == ".." ? "Untitled" : value
     }
 
@@ -41,12 +46,11 @@ enum BackupWriter {
         return parts.joined(separator: "/")
     }
 
-    static func isCache(_ relative: String) -> Bool {
-        relative.split(separator: "/").contains { component in
-            let name = component.lowercased()
-            return ["cache", "caches", ".cache", "thumbnails", "previews", ".ds_store", "tmp", "temp"].contains(name)
-                || name.hasSuffix(".partial") || name.hasSuffix(".tmp")
-        }
+    /// No cache directories are defined by the library layout. These are disposable files only.
+    static func isJunkFile(_ relative: String, isDirectory: Bool) -> Bool {
+        guard !isDirectory else { return false }
+        let name = (relative as NSString).lastPathComponent.lowercased()
+        return name == ".ds_store" || name.hasSuffix(".partial") || name.hasSuffix(".tmp")
     }
 
     static func archive(root: URL, blocked: [URL], progress: Progress, unlockedDocuments: Set<DocumentID>? = nil, lockedDocuments: Set<DocumentID> = []) async throws -> URL {
@@ -59,57 +63,67 @@ enum BackupWriter {
             defer { if scoped { root.stopAccessingSecurityScopedResource() } }
             let base = root.standardizedFileURL.resolvingSymlinksInPath().path
             let denied = blocked.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
-            var failure: Error?
-            guard let iterator = fm.enumerator(at: root, includingPropertiesForKeys: [.isSymbolicLinkKey, .isDirectoryKey],
-                                               options: [], errorHandler: { _, error in failure = error; return false }) else {
-                throw NibError.unavailable("The library folder could not be read")
+            let archive = try Archive(url: output, accessMode: .create)
+            progress.totalUnitCount = 1
+            var count: Int64 = 0
+            func relative(_ url: URL) -> String {
+                String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1))
             }
-            var files: [(URL, String)] = []
-            for case let url as URL in iterator {
-                if progress.isCancelled { throw CancellationError() }
+            func allowed(_ url: URL) throws -> Bool {
                 let resolved = url.standardizedFileURL.resolvingSymlinksInPath().path
                 let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
-                let relative = String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1))
-                if values.isSymbolicLink == true || !resolved.hasPrefix(base + "/") || isCache(relative)
-                    || denied.contains(where: { resolved == $0 || resolved.hasPrefix($0 + "/") }) {
-                    if values.isDirectory == true { iterator.skipDescendants() }
-                    continue
-                }
-                if values.isDirectory == true, [NibFormat.packageExtension, "nib"].contains(url.pathExtension.lowercased()),
-                   let unlockedDocuments {
-                    // Catalog paths can change during moves, and trash paths are implementation-defined. Read the
-                    // package identity too, so a locked package cannot slip into the raw ZIP, even under a second path.
-                    let heads = try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil).filter {
-                        $0.lastPathComponent.hasPrefix("doc.") && $0.pathExtension == "json"
-                    }
-                    let identities = try heads.map { try JSONDecoder().decode(DocumentContent.self, from: Data(contentsOf: $0)).meta }
-                    if identities.contains(where: { lockedDocuments.contains($0.id) || ($0.locked && !unlockedDocuments.contains($0.id)) }) {
-                        iterator.skipDescendants()
-                        continue
-                    }
-                }
-                files.append((url, relative))
+                return values.isSymbolicLink != true && resolved.hasPrefix(base + "/")
+                    && !isJunkFile(relative(url), isDirectory: values.isDirectory == true)
+                    && !denied.contains(where: { resolved == $0 || resolved.hasPrefix($0 + "/") })
             }
-            if let failure { throw failure }
-            progress.totalUnitCount = Int64(max(1, files.count))
-            let archive = try Archive(url: output, accessMode: .create)
-            for (_, path) in files.sorted(by: { $0.1 < $1.1 }) {
+            func add(_ url: URL) throws {
                 if progress.isCancelled { throw CancellationError() }
-                // Coordinated reads cooperate with Files providers and the library persistence writer.
-                var coordinationError: NSError?, writeError: Error?
-                let coordinator = NSFileCoordinator()
-                coordinator.coordinate(readingItemAt: root.appendingPathComponent(path), options: [], error: &coordinationError) { source in
-                    do {
-                        let child = Progress(totalUnitCount: 1)
-                        progress.addChild(child, withPendingUnitCount: 1)
-                        try archive.addEntry(with: path, fileURL: source, compressionMethod: .deflate, progress: child)
-                    } catch { writeError = error }
+                count += 1
+                progress.totalUnitCount = count + 1
+                let child = Progress(totalUnitCount: 1)
+                progress.addChild(child, withPendingUnitCount: 1)
+                try archive.addEntry(with: relative(url), fileURL: url, compressionMethod: .deflate, progress: child)
+            }
+            func coordinated(_ url: URL, body: (URL) throws -> Void) throws {
+                var coordinationError: NSError?, readError: Error?
+                NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { source in
+                    do { try body(source) } catch { readError = error }
                 }
                 if let coordinationError { throw coordinationError }
-                if let writeError { throw writeError }
+                if let readError { throw readError }
             }
+            func walk(_ directory: URL, insidePackage: Bool) throws {
+                // Enumeration and every entry read in a package share its coordinated read, so a page and its
+                // assets cannot be taken from different sync versions.
+                for url in try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isSymbolicLinkKey, .isDirectoryKey]).sorted(by: { $0.path < $1.path }) {
+                    if progress.isCancelled { throw CancellationError() }
+                    guard try allowed(url) else { continue }
+                    let isDirectory = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+                    let isPackage = isDirectory && [NibFormat.packageExtension, "nib"].contains(url.pathExtension.lowercased())
+                    if isPackage && !insidePackage {
+                        try coordinated(url) { source in
+                            if let unlockedDocuments {
+                                let heads = try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil).filter {
+                                    $0.lastPathComponent.hasPrefix("doc.") && $0.pathExtension == "json"
+                                }
+                                let identities = try heads.map { try JSONDecoder().decode(DocumentContent.self, from: Data(contentsOf: $0)).meta }
+                                if identities.contains(where: { lockedDocuments.contains($0.id) || ($0.locked && !unlockedDocuments.contains($0.id)) }) { return }
+                            }
+                            try add(source)
+                            try walk(source, insidePackage: true)
+                        }
+                    } else if insidePackage {
+                        try add(url)
+                        if isDirectory { try walk(url, insidePackage: true) }
+                    } else {
+                        try coordinated(url) { try add($0) }
+                        if isDirectory { try walk(url, insidePackage: false) }
+                    }
+                }
+            }
+            try walk(root, insidePackage: false)
             if progress.isCancelled { throw CancellationError() }
-            if files.isEmpty { progress.completedUnitCount = 1 }
+            progress.completedUnitCount += 1
             completed = true
             return output
         }.value
@@ -158,7 +172,15 @@ enum BackupWriter {
 
 /// Hashing runs away from the UI actor; the caller loads at most one page's records at a time.
 actor BackupStampBuilder {
-    private var stamp = BackupContentStamp()
+    private var stamp: BackupContentStamp
+    init(previous: BackupContentStamp?, pages: Set<String>) {
+        stamp = BackupContentStamp()
+        stamp.records = (previous?.records ?? [:]).filter {
+            $0.key.hasPrefix("item:") && pages.contains(String($0.key.dropFirst(5).split(separator: "/").first ?? ""))
+        }
+        stamp.pageRevisions = [:]
+    }
+    func revision(_ revision: Rev?, page: PageID) { stamp.pageRevisions?[page.raw] = revision }
     func add(_ records: [(String, JSONValue)]) throws {
         for (ref, record) in records {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
@@ -167,6 +189,8 @@ actor BackupStampBuilder {
         }
     }
     func addItems(_ items: [Item], page: PageID) throws {
+        let prefix = "item:" + page.raw + "/"
+        stamp.records = stamp.records.filter { !$0.key.hasPrefix(prefix) }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         for var item in items where !item.deleted {
             item.rev = .zero

@@ -51,6 +51,7 @@ struct BackupStatusInfo: Codable {
     var error: String?
     var skippedLocked: Int
     var nextRun: Double?
+    var manual: Bool
     var manualInterrupted: Bool
 }
 
@@ -70,6 +71,13 @@ final class BackupEngine {
     private var observers: [NSObjectProtocol] = []
     private var timer: Timer?
     private var scheduled: Task<Bool, Never>?
+    private var pendingCommit: Task<Void, Never>?
+    private var scheduledDue: Double?
+    // Lifecycle and archive hooks keep interruption tests independent of a foreground simulator window.
+    var archive: (URL, [URL], Progress, Set<DocumentID>, Set<DocumentID>) async throws -> URL = {
+        try await BackupWriter.archive(root: $0, blocked: $1, progress: $2, unlockedDocuments: $3, lockedDocuments: $4)
+    }
+    var resumeManual: (() -> Void)?
     private var previousNodes: [LibraryNode] = []
     private var generation = UUID()
     private(set) var running = false
@@ -88,7 +96,7 @@ final class BackupEngine {
     }
 
     deinit {
-        commitSubscription?.cancel(); eventSubscription?.cancel(); timer?.invalidate()
+        pendingCommit?.cancel(); commitSubscription?.cancel(); eventSubscription?.cancel(); timer?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
 
@@ -137,12 +145,12 @@ final class BackupEngine {
                 Task { @MainActor in
                     guard let self else { return }
                     self.scheduled?.cancel()
-                    if let progress = self.manualProgress { progress.cancel(); self.manualInterrupted = true; self.emit() }
+                    self.interruptManualForBackground()
                     self.schedule()
                 }
             })
             observers.append(NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.tick() }
+                Task { @MainActor in self?.resumeInterruptedManual(); self?.tick() }
             })
             // A cheap foreground check; no exports or network requests until the selected interval is due.
             timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -158,13 +166,45 @@ final class BackupEngine {
             if case let .meta(_, _, after) = mutation { return after.locked }
             return false
         }) { manualProgress?.cancel() }
-        guard loaded, let app, BackupSettings.read(app.settings).destination.kind != "none" else { return }
-        let nodes = app.services.library?.allNodes() ?? []
-        let allowed = eligible(nodes)
-        for doc in Set(changes.mutations.filter(BackupQueue.triggers).map(\.document)) where allowed.contains(doc) {
-            queue.enqueue(doc, at: now().timeIntervalSince1970)
+        let documents = Set(changes.mutations.filter(BackupQueue.triggers).map(\.document))
+        guard !documents.isEmpty, loaded, let app,
+              app.settings.get(BackupSettings.destination).kind != "none" else { return }
+        var config: BackupConfiguration?
+        var queued = false
+        for doc in documents {
+            // An existing entry only needs a fresh token, protecting edits made during an in-flight export.
+            if queue.entries.contains(where: { $0.document == doc }) {
+                queue.enqueue(doc, at: now().timeIntervalSince1970); queued = true
+                continue
+            }
+            guard let node = app.services.library?.node(doc), node.kind == .document, node.trashedAt == nil else { continue }
+            if config == nil { config = BackupSettings.read(app.settings) }
+            guard !BackupQueue.excluded(node.title, substrings: config?.exclusions ?? []) else { continue }
+            queue.enqueue(doc, at: now().timeIntervalSince1970); queued = true
         }
-        persist(); schedule(); emit()
+        if queued { coalesceCommitEffects() }
+    }
+
+    private func coalesceCommitEffects() {
+        guard pendingCommit == nil else { return }
+        pendingCommit = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+            guard let self else { return }
+            self.pendingCommit = nil
+            self.persist(); self.schedule(); self.emit()
+        }
+    }
+
+    func interruptManualForBackground() {
+        guard let progress = manualProgress else { return }
+        manualInterrupted = true; progress.cancel(); emit()
+    }
+
+    func resumeInterruptedManual() {
+        guard manualInterrupted, !running, let app else { return }
+        manualInterrupted = false
+        if let resumeManual { resumeManual() }
+        else { app.perform(CommandIDs.backupManual) }
     }
 
     func libraryChanged() async {
@@ -187,9 +227,9 @@ final class BackupEngine {
                     if try app.workspace.persistence.loadHead(node.id).meta.locked { continue }
                 }
                 let old = try await store.loadStamp(node.id)
-                let fresh = try await contentStamp(node.id, persistence: app.workspace.persistence)
+                let fresh = try await contentStamp(node.id, persistence: app.workspace.persistence, previous: old)
                 guard generation == runGeneration else { return }
-                if let old, fresh.hasChanges(since: old) { changed.insert(node.id) }
+                if old == nil || fresh.hasChanges(since: old!) { changed.insert(node.id) }
                 // Even ignored changes advance the baseline, so restoring a removed record is a new change.
                 try await store.saveStamp(fresh, document: node.id)
             } catch { report(error) }
@@ -201,9 +241,9 @@ final class BackupEngine {
 
     /// Persistence, rather than cached Workspace pages, sees unopened documents downloaded by WebDAV too.
     /// Exclude only the specified non-triggers; content, attachments, audio records and plugin data remain visible.
-    func contentStamp(_ doc: DocumentID, persistence: DocumentPersistence) async throws -> BackupContentStamp {
+    func contentStamp(_ doc: DocumentID, persistence: DocumentPersistence, previous: BackupContentStamp? = nil) async throws -> BackupContentStamp {
         let head = try persistence.loadHead(doc)
-        let builder = BackupStampBuilder()
+        let builder = BackupStampBuilder(previous: previous, pages: Set(head.livePages.map { $0.id.raw }))
         var meta = head.meta
         meta.rev = .zero; meta.favorite = false; meta.sourceBookmark = nil; meta.trashedFrom = nil
         var records: [(String, JSONValue)] = [("meta", try JSONValue.from(meta))]
@@ -217,8 +257,12 @@ final class BackupEngine {
         try await builder.add(records)
         for page in head.livePages {
             try Task.checkCancellation()
-            let items = try persistence.loadItems(doc, page: page.id)
-            try await builder.addItems(items, page: page.id)
+            let revision = persistence.contentRevision(doc, page: page.id)
+            await builder.revision(revision, page: page.id)
+            if revision == nil || previous?.pageRevisions?[page.id.raw] != revision {
+                let items = try persistence.loadItems(doc, page: page.id)
+                try await builder.addItems(items, page: page.id)
+            }
         }
         return await builder.result()
     }
@@ -239,7 +283,7 @@ final class BackupEngine {
         if BackupSettings.read(app.settings).destination.kind != "none" {
             for id in eligible(nodes).sorted() { queue.enqueue(id, at: now().timeIntervalSince1970) }
         }
-        queue.lastAttempt = nil
+        queue.lastAttempt = now().timeIntervalSince1970 - BackupQueue.interval(frequent: BackupSettings.read(app.settings).frequent)
         previousNodes = nodes
         error = nil; state = running ? "syncing" : "idle"
         do { try await persist().value }
@@ -259,7 +303,7 @@ final class BackupEngine {
         guard let app else {
             return BackupStatusInfo(configuration: BackupConfiguration(destination: BackupDestination(kind: "none"), format: "nib", folder: "", exclusions: [], frequent: false),
                 folderName: "", folderChosen: false, queued: 0, running: false, state: "error", progress: 0,
-                error: "Backup unavailable", skippedLocked: 0, manualInterrupted: false)
+                error: "Backup unavailable", skippedLocked: 0, manual: false, manualInterrupted: false)
         }
         let config = BackupSettings.read(app.settings)
         let next = queue.entries.isEmpty || config.destination.kind == "none" ? nil :
@@ -267,7 +311,7 @@ final class BackupEngine {
         return BackupStatusInfo(configuration: config, folderName: app.settings.get(BackupSettings.folderName),
             folderChosen: app.settings.get(BackupSettings.bookmark) != nil, queued: queue.entries.count, running: running,
             state: state, progress: manualProgress?.fractionCompleted ?? progress, lastAttempt: queue.lastAttempt,
-            lastSuccess: queue.lastSuccess, error: error, skippedLocked: skippedLocked, nextRun: next, manualInterrupted: manualInterrupted)
+            lastSuccess: queue.lastSuccess, error: error, skippedLocked: skippedLocked, nextRun: next, manual: manualProgress != nil, manualInterrupted: manualInterrupted)
     }
 
     func emit() {
@@ -278,10 +322,12 @@ final class BackupEngine {
     func report(_ failure: Error) { error = NibError.wrap(failure).message; state = "error"; emit() }
 
     func schedule() {
-        guard let app, !queue.entries.isEmpty else { return }
+        guard let app, !queue.entries.isEmpty else { scheduledDue = nil; return }
         let config = BackupSettings.read(app.settings)
-        guard config.destination.kind != "none" else { return }
+        guard config.destination.kind != "none" else { scheduledDue = nil; return }
         let due = (queue.lastAttempt ?? queue.entries.map(\.queuedAt).min() ?? now().timeIntervalSince1970) + BackupQueue.interval(frequent: config.frequent)
+        guard due != scheduledDue else { return }
+        scheduledDue = due
         app.scheduleBackgroundTask(FeatBackupFeature.backgroundID, earliestIn: max(1, due - now().timeIntervalSince1970))
     }
     func tick() {
@@ -337,6 +383,8 @@ final class BackupEngine {
                 guard let node = library.node(entry.document), node.trashedAt == nil else { queue.acknowledge(entry); continue }
                 if isLocked(entry.document, node: node, ctx: ctx) { skippedLocked += 1; continue }
                 ctx.workspace.persistence.flush(entry.document)
+                let oldStamp = try await store.loadStamp(entry.document)
+                let stamp = try await contentStamp(entry.document, persistence: ctx.workspace.persistence, previous: oldStamp)
                 let formats = config.format == "both" ? ["nibnote", "pdf"] : [config.format == "nib" ? "nibnote" : "pdf"]
                 for format in formats {
                     try Task.checkCancellation()
@@ -361,7 +409,6 @@ final class BackupEngine {
                         }
                     }
                 }
-                let stamp = try await contentStamp(entry.document, persistence: ctx.workspace.persistence)
                 if generation == runGeneration {
                     try await store.saveStamp(stamp, document: entry.document)
                     if generation == runGeneration { queue.acknowledge(entry) }
@@ -393,7 +440,9 @@ final class BackupEngine {
     func manual(_ ctx: CommandContext) async throws -> JSONValue {
         guard !running else { throw NibError.unavailable("A backup is already running") }
         let library = try ctx.services.require(ctx.services.library, "Library")
-        let assets = try ctx.services.require(ctx.services.assets, "Asset store")
+        let navigator = ctx.navigator
+        // Window callers export the ZIP directly; only headless callers need a temporary asset.
+        let assets = navigator == nil ? try ctx.services.require(ctx.services.assets, "Asset store") : nil
         let nodes = library.allNodes() + library.trashedNodes()
         var blocked: [URL] = []
         var unlockedDocuments = Set<DocumentID>()
@@ -410,7 +459,9 @@ final class BackupEngine {
         }
         if ctx.dryRun { return ["skippedLocked": .number(Double(skippedLocked))] }
         let progress = Progress(totalUnitCount: 1)
-        let lifecycle = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in progress.cancel() }
+        let lifecycle = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.interruptManualForBackground() }
+        }
         manualProgress = progress; manualInterrupted = false; running = true; state = "syncing"; error = nil; emit()
         let publisher = Task { @MainActor [weak self] in
             while !Task.isCancelled {
@@ -418,30 +469,41 @@ final class BackupEngine {
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-        defer { NotificationCenter.default.removeObserver(lifecycle); publisher.cancel(); manualProgress = nil; running = false; emit() }
+        defer {
+            NotificationCenter.default.removeObserver(lifecycle); publisher.cancel(); manualProgress = nil; running = false; emit()
+            // Activation may arrive before cancellation finishes unwinding.
+            if !NibApp.isHostlessTest, UIApplication.shared.applicationState == .active { resumeInterruptedManual() }
+        }
         do {
             let url = try await withTaskCancellationHandler {
-                try await BackupWriter.archive(root: library.rootURL, blocked: blocked, progress: progress, unlockedDocuments: unlockedDocuments, lockedDocuments: lockedDocuments)
+                try await archive(library.rootURL, blocked, progress, unlockedDocuments, lockedDocuments)
             } onCancel: { progress.cancel() }
             defer { try? FileManager.default.removeItem(at: url) }
             for node in library.allNodes() + library.trashedNodes() where unlockedDocuments.contains(node.id) {
                 if isLocked(node.id, node: node, ctx: ctx) { progress.cancel() }
             }
             guard !progress.isCancelled else { throw CancellationError() }
-            let ref = try await Task.detached(priority: .utility) {
-                try assets.putTemporary(Data(contentsOf: url, options: .mappedIfSafe), ext: "zip")
-            }.value
-            guard let navigator = ctx.navigator else { throw NibError.unavailable("Open a window to save the manual backup") }
-            try await userInterface.saveArchive(url, navigator: navigator)
+            var result: [String: JSONValue] = ["name": .string(url.lastPathComponent),
+                "skippedLocked": .number(Double(skippedLocked)), "restoreCommand": .string(CommandIDs.importPick)]
+            if let navigator {
+                try await userInterface.saveArchive(url, navigator: navigator)
+            } else if let assets {
+                let ref = try await Task.detached(priority: .utility) {
+                    try assets.putTemporary(Data(contentsOf: url, options: .mappedIfSafe), ext: "zip")
+                }.value
+                result["asset"] = .string("tmp:" + ref.name)
+            }
             state = skippedLocked == 0 ? "ok" : "warning"
             if skippedLocked > 0 { error = String(localized: "Locked documents were skipped. Unlock them and create another backup to include them.") }
-            return ["asset": .string("tmp:" + ref.name), "name": .string(url.lastPathComponent),
-                    "skippedLocked": .number(Double(skippedLocked)), "restoreCommand": .string(CommandIDs.importPick)]
+            return .object(result)
         } catch {
             if progress.isCancelled || error is CancellationError {
-                manualInterrupted = true; state = "warning"
-                self.error = String(localized: "Manual backup was interrupted. Start it again to create a fresh ZIP.")
-                throw NibError(.unavailable, String(localized: "Manual backup was interrupted. Start it again to create a fresh ZIP."))
+                state = "warning"
+                self.error = String(localized: "Manual backup was interrupted. It restarts when Nib returns to the foreground.")
+                throw NibError(.unavailable, self.error!)
+            }
+            if let failure = error as? NibError, failure.code == .userDenied {
+                state = "idle"; self.error = nil; emit(); throw failure
             }
             report(error); throw NibError.wrap(error)
         }

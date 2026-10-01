@@ -90,7 +90,20 @@ final class BackupQueueTests: XCTestCase {
             XCTAssertThrowsError(try BackupWriter.components(path))
         }
         XCTAssertEqual(try BackupWriter.components(""), [])
-        XCTAssertTrue(BackupWriter.isCache("Book.nibnote/caches/thumbnail.png"))
-        XCTAssertFalse(BackupWriter.isCache("Book.nibnote/audio/clip.caf"))
+        XCTAssertFalse(BackupWriter.isJunkFile("Book.nibnote/caches/thumbnail.png", isDirectory: false))
+        XCTAssertFalse(BackupWriter.isJunkFile("Temp.tmp", isDirectory: true))
+        XCTAssertTrue(BackupWriter.isJunkFile("Book.nibnote/.DS_Store", isDirectory: false))
+        XCTAssertTrue(BackupWriter.isJunkFile("Book.nibnote/write.partial", isDirectory: false))
+        XCTAssertFalse(BackupWriter.isJunkFile("Book.nibnote/audio/clip.caf", isDirectory: false))
     }
+    func testLongUnicodeTitlesFitDestinationComponents() throws {
+        let folder = LibraryNode(id: Fixtures.folderID, kind: .folder, title: String(repeating: "漢字", count: 100), path: "School")
+        let doc = LibraryNode(id: Fixtures.docID, kind: .document, title: String(repeating: "📓漢字", count: 100), path: "Notes", parent: folder.id)
+        let path = try BackupWriter.relativePath(node: doc, nodes: [folder, doc], folder: "Backups", extension: "nibnote.zip")
+        let parts = try BackupWriter.components(path)
+        XCTAssertEqual(parts.count, 3)
+        XCTAssertTrue(parts.allSatisfy { $0.utf8.count <= 200 })
+        XCTAssertTrue(parts.last!.hasSuffix("-FIXTUREDOC01.nibnote.zip"))
+    }
+
 }
