@@ -30,7 +30,7 @@ public final class NibPageThumbnailView: UIView {
     public init(width: CGFloat = NibMetrics.rowThumbnailWidth, aspectRatio: CGFloat = 595.0 / 842.0) {
         self.width = width
         self.aspectRatio = aspectRatio
-        super.init(frame: CGRect(x: 0, y: 0, width: width, height: width / max(aspectRatio, 0.01)))
+        super.init(frame: CGRect(origin: .zero, size: NibGeometry.aspectSize(width: width, ratio: aspectRatio, minimumRatio: 0.01)))
         setUp()
     }
 
@@ -60,7 +60,7 @@ public final class NibPageThumbnailView: UIView {
     }
 
     public override var intrinsicContentSize: CGSize {
-        CGSize(width: width, height: width / max(aspectRatio, 0.01))
+        NibGeometry.aspectSize(width: width, ratio: aspectRatio, minimumRatio: 0.01)
     }
 
     public override func layoutSubviews() {

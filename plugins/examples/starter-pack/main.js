@@ -1,1 +1,2 @@
-// Scaffold placeholder, owned by F082 (Example plugins & plugin test fixtures). Replace this file.
+// Content-only pack: the host registers templates, elements and board frameworks.
+console.log("Starter Pack content loaded");

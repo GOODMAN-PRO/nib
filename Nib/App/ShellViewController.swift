@@ -130,6 +130,10 @@ final class ShellViewController: UIViewController, SceneNavigator {
         showsDocument = false
         shownKind = nil
         display(app.ui.screens.libraryRoot?(app, self) ?? FallbackLibraryViewController(app: app, navigator: self))
+        // Apply the requested folder to this window after the library has created its session model.
+        if app.commands.entry(CommandIDs.librarySetView) != nil {
+            app.perform(CommandIDs.librarySetView, ["folder": .string(folder.map { NodeRef.folder($0).description } ?? "lib")], session: session)
+        }
     }
 
     func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {

@@ -49,9 +49,11 @@ public struct NibReflowLayout: Equatable, Sendable {
 
     public func slot(_ index: Int) -> CGRect {
         let c = max(columns, 1)
-        return CGRect(x: origin.x + CGFloat(index % c) * (cell.width + spacing.width),
+        let cell = NibGeometry.size(cell), origin = NibGeometry.point(origin)
+        let spacing = CGSize(width: NibGeometry.finite(spacing.width), height: NibGeometry.finite(spacing.height))
+        return NibGeometry.rect(CGRect(x: origin.x + CGFloat(index % c) * (cell.width + spacing.width),
                       y: origin.y + CGFloat(index / c) * (cell.height + spacing.height),
-                      width: cell.width, height: cell.height)
+                      width: cell.width, height: cell.height))
     }
 
     public func slots(count: Int) -> [CGRect] { (0..<max(count, 0)).map { slot($0) } }
@@ -123,15 +125,15 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
     public init?(ids: [ID], slots: [CGRect], dragged: ID, combines: Bool = true,
                  hysteresis: CGFloat = NibReflowMetrics.hysteresis,
                  outsideMargin: CGFloat = NibReflowMetrics.outsideMargin, dwell: Double = NibReflowMetrics.dwell) {
-        guard ids.count == slots.count, let i = ids.firstIndex(of: dragged) else { return nil }
+        guard ids.count == slots.count, slots.allSatisfy(NibGeometry.isFinite), let i = ids.firstIndex(of: dragged) else { return nil }
         self.ids = ids
         self.slots = slots
         self.from = i
         self.insertion = i
-        self.hysteresis = hysteresis
+        self.hysteresis = NibGeometry.dimension(hysteresis)
         self.combines = combines
-        self.outsideMargin = outsideMargin
-        self.dwell = dwell
+        self.outsideMargin = NibGeometry.dimension(outsideMargin)
+        self.dwell = dwell.isFinite ? max(0, dwell) : NibReflowMetrics.dwell
     }
 
     public var dragged: ID { ids[from] }
@@ -152,12 +154,12 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
     public func offset(of id: ID) -> CGSize {
         guard let i = ids.firstIndex(of: id) else { return .zero }
         let a = slots[i], b = slots[targetIndex(ofIndex: i)]
-        return CGSize(width: b.midX - a.midX, height: b.midY - a.midY)
+        return CGSize(width: NibGeometry.finite(b.midX - a.midX), height: NibGeometry.finite(b.midY - a.midY))
     }
 
     /// The cover whose shown frame's inner 70 % holds `p` (never the dragged one): a combine target.
     public func combineCandidate(at p: CGPoint) -> ID? {
-        guard combines else { return nil }
+        guard combines, NibGeometry.isFinite(p) else { return nil }
         let inset = (1 - NibReflowMetrics.combineCore) / 2
         for i in ids.indices where i != from {
             let r = slots[targetIndex(ofIndex: i)]
@@ -186,7 +188,7 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
     }
 
     private mutating func advance(_ p: CGPoint, paused: Bool, now: Double?) -> Bool {
-        guard !paused, combineCandidate(at: p) == nil else { return false }
+        guard NibGeometry.isFinite(p), !paused, combineCandidate(at: p) == nil else { return false }
         let n = nearest(p)
         guard n.index != insertion else {
             pending = nil
@@ -239,7 +241,7 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
 
     static func distance(_ p: CGPoint, _ r: CGRect) -> CGFloat {
         let dx = p.x - r.midX, dy = p.y - r.midY
-        return (dx * dx + dy * dy).squareRoot()
+        return NibGeometry.dimension(hypot(dx, dy))
     }
 }
 
@@ -322,6 +324,7 @@ public final class NibReflow<ID: Hashable> {
 
     /// Lifts `id` (in `order`, the items as the grid shows them) under the finger at `point` (reflow space).
     public func begin(_ id: ID, order: [ID], at point: CGPoint) {
+        guard NibGeometry.isFinite(point), NibGeometry.isFinite(spaceOrigin) else { return }
         cancelArming()
         cancelDwell()
         landingWork?.cancel()
@@ -330,7 +333,7 @@ public final class NibReflow<ID: Hashable> {
             if let layout {
                 ids.append(x)
                 slots.append(layout.slot(i))
-            } else if let f = frames[x] {
+            } else if let f = frames[x], NibGeometry.isUsable(f) {
                 ids.append(x)
                 slots.append(f)
             }
@@ -350,7 +353,7 @@ public final class NibReflow<ID: Hashable> {
     /// The finger moved (reflow space): the carrier follows, the gap reflows (unless paused, held, or waiting out the
     /// dwell on a cover), a combine arms.
     public func move(to point: CGPoint) {
-        guard let m = model, var l = lift, l.phase == .dragging else { return }
+        guard NibGeometry.isFinite(point), NibGeometry.isFinite(spaceOrigin), let m = model, var l = lift, l.phase == .dragging else { return }
         l.location = global(point)
         lift = l
         finger = point
@@ -491,7 +494,7 @@ public extension View {
             .onGeometryChange(for: CGPoint.self) { proxy in
                 proxy.frame(in: .global).origin
             } action: { origin in
-                reflow.spaceOrigin = origin
+                if NibGeometry.isFinite(origin) { reflow.spaceOrigin = origin }
             }
     }
 
@@ -527,7 +530,7 @@ struct NibReflowItemModifier<ID: Hashable>: ViewModifier {
             .onGeometryChange(for: CGRect.self) { proxy in
                 proxy.frame(in: NibReflowMetrics.space)
             } action: { frame in
-                reflow.frames[id] = frame
+                if NibGeometry.isUsable(frame) { reflow.frames[id] = frame }
             }
     }
 }
@@ -605,8 +608,8 @@ public struct NibReflowCarrier<ID: Hashable, Content: View>: View {
 
     public var body: some View {
         GeometryReader { proxy in
-            let global = proxy.frame(in: .global).origin
-            let local = proxy.frame(in: NibLiquid.space).origin
+            let global = NibGeometry.point(proxy.frame(in: .global).origin)
+            let local = NibGeometry.point(proxy.frame(in: NibLiquid.space).origin)
             // Global → this view, and global → the container's space (where the field works).
             let toView = { (p: CGPoint) -> CGPoint in CGPoint(x: p.x - global.x, y: p.y - global.y) }
             let toField = { (p: CGPoint) -> CGPoint in CGPoint(x: p.x - global.x + local.x, y: p.y - global.y + local.y) }
@@ -627,7 +630,7 @@ public struct NibReflowCarrier<ID: Hashable, Content: View>: View {
                         .background(CarrierDriver(reflow: reflow, id: id, toField: toField))
                 }
             }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
         }
         .allowsHitTesting(false)
         .onAppear { reflow.hasCarrier = true }

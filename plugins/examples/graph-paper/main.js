@@ -1,1 +1,2 @@
-// Scaffold placeholder, owned by F082 (Example plugins & plugin test fixtures). Replace this file.
+// Generated vector grids stay crisp at every zoom. The host resolves and embeds their specs.
+console.log("Graph Paper template pack loaded");

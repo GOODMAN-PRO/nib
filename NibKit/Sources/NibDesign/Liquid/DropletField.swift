@@ -10,6 +10,8 @@ struct DropletPresentation: Equatable {
     var revealed = true
     var contentOpacity: Double = 1
     var contentTransform: CGAffineTransform = .identity
+    var restSize: CGSize = .zero
+    var paperShare: Double = 0
     var bodySize: CGSize = .zero
     var bodyOffset: CGPoint = .zero
     var cornerRadius: CGFloat = 0
@@ -210,7 +212,17 @@ final class DropletField {
     private(set) var isThermallyThrottled = false
     /// `nibBudAnchor` frames, in `NibLiquid.space`.
     private(set) var worldAnchors: [String: CGRect] = [:]
-    var bounds: CGRect = .zero
+    private var measuredBounds: CGRect = .zero
+    var bounds: CGRect {
+        get { measuredBounds }
+        set {
+            guard NibGeometry.isUsable(newValue), newValue != measuredBounds else { return }
+            measuredBounds = newValue
+        }
+    }
+
+    /// Shared by the container's appearance and size-change callbacks.
+    func updateBounds(_ size: CGSize) { bounds = CGRect(origin: .zero, size: size) }
     var metrics: DropletMetrics = .regular
     var reduceMotion = false
     var mode: NibLiquidMode = .full
@@ -287,7 +299,7 @@ final class DropletField {
     /// new layout (FLIP), keeping any release velocity: reflow, docking and re-forming all go through here.
     func setRest(_ id: String, _ rect: CGRect, style: DropletStyle) {
         register(id, style: style)
-        guard var e = entries[id], rect.width > 0, rect.height > 0 else { return }
+        guard var e = entries[id], NibGeometry.isUsable(rect) else { return }
         if !e.hasRest {
             e.rest = rect
             e.hasRest = true
@@ -317,14 +329,17 @@ final class DropletField {
 
     /// A bud source inside a droplet; `rect` is in the owner's centred coordinates.
     func setLocalAnchor(_ id: String, owner: String, rect: CGRect) {
+        guard NibGeometry.isUsable(rect) else { return }
         anchors[id] = LocalAnchor(owner: owner, rect: rect)
     }
 
     func setWorldAnchor(_ id: String, _ rect: CGRect) {
+        guard NibGeometry.isUsable(rect) else { return }
         if worldAnchors[id] != rect { worldAnchors[id] = rect }
     }
 
     func setBackdrop(_ pages: [CGRect]) {
+        let pages = pages.filter(NibGeometry.isUsable)
         guard pages != backdrop else { return }
         backdrop = pages
         publish()
@@ -342,34 +357,34 @@ final class DropletField {
     // MARK: Geometry
 
     private func cornerTarget(_ style: DropletStyle, _ size: CGSize) -> CGFloat {
-        style.cornerRadius ?? min(size.width, size.height) / 2
+        NibGeometry.dimension(style.cornerRadius ?? min(size.width, size.height) / 2)
     }
 
     func visualCentre(_ e: Entry) -> CGPoint {
-        CGPoint(x: e.rest.midX + e.dyn.offset.x.value, y: e.rest.midY + e.dyn.offset.y.value)
+        NibGeometry.point(CGPoint(x: e.rest.midX + e.dyn.offset.x.value, y: e.rest.midY + e.dyn.offset.y.value))
     }
 
     private func liftProgress(_ e: Entry) -> CGFloat {
         let span = e.style.lift - 1
         guard span > 0.0001 else { return e.isDragging ? 1 : 0 }
-        return min(max((e.dyn.lift.value - 1) / span, 0), 1)
+        return min(max(NibGeometry.finite((e.dyn.lift.value - 1) / span), 0), 1)
     }
 
     func bodySize(_ e: Entry) -> CGSize {
         let pad = e.style.envelope * 2 * liftProgress(e)
-        return CGSize(width: max(0, e.dyn.size.x.value + pad), height: max(0, e.dyn.size.y.value + pad))
+        return CGSize(width: NibGeometry.dimension(e.dyn.size.x.value + pad), height: NibGeometry.dimension(e.dyn.size.y.value + pad))
     }
 
     func cornerRadius(_ e: Entry) -> CGFloat {
         let s = bodySize(e)
         let capsule = min(s.width, s.height) / 2
         guard e.style.cornerRadius != nil else { return capsule }
-        return min(e.dyn.corner.value + e.style.envelope * liftProgress(e), capsule)
+        return min(NibGeometry.dimension(e.dyn.corner.value + e.style.envelope * liftProgress(e)), capsule)
     }
 
     func visualBox(_ e: Entry) -> CGRect {
-        let s = bodySize(e), c = visualCentre(e), l = e.dyn.lift.value
-        return CGRect(x: c.x - s.width * l / 2, y: c.y - s.height * l / 2, width: s.width * l, height: s.height * l)
+        let s = bodySize(e), c = visualCentre(e), l = NibGeometry.dimension(e.dyn.lift.value)
+        return NibGeometry.rect(CGRect(x: c.x - s.width * l / 2, y: c.y - s.height * l / 2, width: s.width * l, height: s.height * l))
     }
 
     func visualFrame(_ id: String) -> CGRect? {
@@ -391,8 +406,8 @@ final class DropletField {
     }
 
     private func worldTransform(_ e: Entry) -> CGAffineTransform {
-        DropletPhysics.transform(offset: e.dyn.offset.value, anchor: e.dyn.anchor.value, linear: linear(e, rigidity: 1))
-            .concatenating(CGAffineTransform(translationX: e.rest.midX, y: e.rest.midY))
+        NibGeometry.transform(DropletPhysics.transform(offset: e.dyn.offset.value, anchor: e.dyn.anchor.value, linear: linear(e, rigidity: 1))
+            .concatenating(CGAffineTransform(translationX: e.rest.midX, y: e.rest.midY)))
     }
 
     /// The body outline in centred coordinates, before any transform.
@@ -425,13 +440,16 @@ final class DropletField {
     func anchorRect(_ source: String) -> CGRect? { sourceRect(source) }
 
     /// Share of a box over light paper (`nibBackdrop`).
-    private func paperShare(_ box: CGRect) -> Double {
+    private func paperShare(_ box: CGRect) -> Double { Self.paperShare(box, in: backdrop) }
+
+    static func paperShare(_ box: CGRect, in backdrop: [CGRect]) -> Double {
+        guard NibGeometry.isUsable(box) else { return 0 }
         let area = max(box.width * box.height, 1)
         let covered = backdrop.reduce(CGFloat(0)) { sum, page in
             let i = box.intersection(page)
             return sum + (i.isNull ? 0 : i.width * i.height)
         }
-        return Double(min(covered / area, 1))
+        return Double(min(max(NibGeometry.finite(covered / area), 0), 1))
     }
 
     private func recedes(_ e: Entry) -> Bool {
@@ -489,9 +507,11 @@ final class DropletField {
         p.contentOpacity = alpha
         p.contentTransform = DropletPhysics.aboutCentre(
             DropletPhysics.transform(offset: offset, anchor: anchor, linear: content), size: e.rest.size)
-        p.bodySize = CGSize(width: size.width * body.a, height: size.height * body.d)
-        p.bodyOffset = CGPoint(x: offset.x + anchor.x * (1 - body.a), y: offset.y + anchor.y * (1 - body.d))
-        p.cornerRadius = cornerRadius(e) * min(body.a, body.d)
+        p.restSize = e.rest.size
+        p.paperShare = paperShare(visualBox(e))
+        p.bodySize = NibGeometry.size(CGSize(width: size.width * body.a, height: size.height * body.d))
+        p.bodyOffset = NibGeometry.point(CGPoint(x: offset.x + anchor.x * (1 - body.a), y: offset.y + anchor.y * (1 - body.d)))
+        p.cornerRadius = NibGeometry.dimension(cornerRadius(e) * min(body.a, body.d))
         p.budLine = e.bud.map { !$0.revealed || $0.closingAt != nil } ?? false
         if size.width < e.rest.width - 0.5 || size.height < e.rest.height - 0.5 {
             // The body's own geometry (its full stretch, axis, grab origin and lift), expressed in the content's
@@ -533,19 +553,22 @@ final class DropletField {
         let renders = renderList
         let groups = WaterCluster.groups(renders.map(\.id), linked: links)
         let pad = 3 * metrics.fieldBlur
-        return groups.map { ids in
+        return groups.compactMap { ids -> WaterCluster? in
             let set = Set(ids)
             let members = renders.filter { set.contains($0.id) }
             let own = necks.filter { n in ids.contains { n.id.hasPrefix($0 + "|") || n.id.hasSuffix("|" + $0) } }
             let sats = satellites.filter { set.contains($0.target) }
             var frame = CGRect.null
-            for r in members { frame = frame.union(r.path.boundingRect) }
-            for n in own { frame = frame.union(n.path.boundingRect.insetBy(dx: -n.thickness, dy: -n.thickness)) }
-            for s in sats { frame = frame.union(s.path.boundingRect) }
+            for r in members where NibGeometry.isUsable(r.path.boundingRect) { frame = frame.union(r.path.boundingRect) }
+            for n in own where NibGeometry.isFinite(n.path.boundingRect) { frame = frame.union(n.path.boundingRect.insetBy(dx: -n.thickness, dy: -n.thickness)) }
+            for s in sats where NibGeometry.isUsable(s.path.boundingRect) { frame = frame.union(s.path.boundingRect) }
+            guard NibGeometry.isUsable(frame) else { return nil }
+            frame = frame.insetBy(dx: -pad, dy: -pad).integral
+            guard NibGeometry.isUsable(frame) else { return nil }
             let recede = ids.contains { id in entries[id].map(recedes) ?? false }
             let optics = WaterCluster.optics(members)
             return WaterCluster(id: ids[0], renders: members, necks: own, satellites: sats,
-                                frame: frame.insetBy(dx: -pad, dy: -pad).integral,
+                                frame: frame,
                                 opacity: recede ? NibLiquid.recedeOpacity : 1,
                                 rim: optics.rim, shadow: optics.shadow, shadowY: optics.shadowY)
         }
@@ -556,7 +579,7 @@ final class DropletField {
     func isDragging(_ id: String) -> Bool { entries[id]?.isDragging ?? false }
 
     func beginDrag(_ id: String, at location: CGPoint) {
-        guard var e = entries[id], e.hasRest, !isInking else { return }
+        guard var e = entries[id], e.hasRest, !isInking, NibGeometry.isFinite(location) else { return }
         let centre = visualCentre(e)
         let s = bodySize(e)
         e.isDragging = true
@@ -573,7 +596,7 @@ final class DropletField {
     }
 
     func drag(_ id: String, to location: CGPoint) {
-        guard var e = entries[id], e.isDragging else { return }
+        guard var e = entries[id], e.isDragging, NibGeometry.isFinite(location) else { return }
         var x = location.x - e.grabOffset.x
         var y = location.y - e.grabOffset.y
         if bounds.width > 0 {
@@ -623,7 +646,7 @@ final class DropletField {
     }
 
     func setDragScale(_ id: String, _ scale: CGFloat) {
-        guard var e = entries[id], e.dragScale != scale else { return }
+        guard scale.isFinite, scale > 0, var e = entries[id], e.dragScale != scale else { return }
         e.dragScale = scale
         if e.isDragging { e.dyn.lift.target = e.style.lift * scale }
         entries[id] = e
@@ -634,7 +657,7 @@ final class DropletField {
     /// the glass body never receives touches, so the system's own press response would not fire.
     func poke(_ id: String, _ amount: CGFloat? = nil) {
         guard var e = entries[id], !physicsOff, !isInking, e.style.stretchCap > 0 else { return }
-        e.dyn.stretch.velocity -= amount ?? e.style.poke
+        e.dyn.stretch.velocity -= NibGeometry.finite(amount ?? e.style.poke)
         entries[id] = e
         wake()
     }
@@ -720,7 +743,7 @@ final class DropletField {
     // MARK: Palette re-form (fix 2: gather into a bead, switch axis at the midpoint, spread; ≤ 380 ms)
 
     func beginReshape(_ id: String, towards centre: CGPoint, velocity: CGVector) {
-        guard var e = entries[id], e.hasRest else { return }
+        guard var e = entries[id], e.hasRest, NibGeometry.isFinite(centre), NibGeometry.isFinite(velocity) else { return }
         let thick = min(e.rest.width, e.rest.height)
         let target = CGPoint(x: centre.x - e.rest.midX, y: centre.y - e.rest.midY)
         e.reshapeFrom = max(e.dyn.size.x.value, e.dyn.size.y.value)
@@ -776,6 +799,7 @@ final class DropletField {
 
     /// Glides the bead to `head` (a tap), or teleports it (keyboard, Pencil double-tap or squeeze, Reduce Motion).
     func setBead(_ id: String, head: CGFloat, glide: Bool) {
+        guard head.isFinite else { return }
         var b = beads[id] ?? BeadState(head: SpringValue(head, epsilon: 0.05), tail: SpringValue(head, epsilon: 0.05))
         if !glide || physicsOff {
             b.head.snap(to: head)
@@ -790,7 +814,7 @@ final class DropletField {
     }
 
     func scrubBead(_ id: String, to along: CGFloat) {
-        guard var b = beads[id] else { return }
+        guard along.isFinite, var b = beads[id] else { return }
         b.scrubbing = true
         b.head.target = along
         b.arrived = true
@@ -823,6 +847,7 @@ final class DropletField {
 
     /// Where droplet `id`'s meniscus reaches (a dock frame), or nil to let it go.
     func setMeniscus(_ id: String, towards dock: CGRect?) {
+        if let dock, !NibGeometry.isUsable(dock) { return }
         if meniscuses[id] == nil && dock == nil { return }
         var m = meniscuses[id] ?? DockMeniscus()
         guard m.target != dock else { return }
@@ -977,7 +1002,7 @@ final class DropletField {
 
     /// The stroke's bounds as it grows: droplets within 24 pt of it recede too.
     func setStroke(_ rect: CGRect) {
-        guard rect != stroke, isFrozen else { return }
+        guard (rect.isNull || NibGeometry.isFinite(rect)), rect != stroke, isFrozen else { return }
         stroke = rect
         publish()
     }
@@ -994,13 +1019,13 @@ final class DropletField {
         driver?.start()
     }
 
-    private func tick(_ dt: CFTimeInterval) -> Bool {
-        guard !isInking else { return false }
+    func tick(_ dt: CFTimeInterval) -> Bool {
+        guard !isInking, dt.isFinite, dt > 0 else { return false }
         let step = CGFloat(dt)
         let now = CACurrentMediaTime()
         var busy = false
         for id in order {
-            guard var e = entries[id] else { continue }
+            guard var e = entries[id], e.hasRest else { continue }
             stepBud(&e, now: now)
             let moving = e.dyn.step(step, style: e.style, reduceMotion: physicsOff, calm: mode == .calm)
             stepReshape(&e)

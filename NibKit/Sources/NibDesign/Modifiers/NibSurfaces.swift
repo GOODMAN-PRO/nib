@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// A capsule when `cornerRadius` is nil, otherwise a continuous rounded rectangle clamped to a capsule.
 public struct NibDropletShape: Shape {
@@ -7,8 +8,9 @@ public struct NibDropletShape: Shape {
     public init(cornerRadius: CGFloat? = nil) { self.cornerRadius = cornerRadius }
 
     public func path(in rect: CGRect) -> Path {
+        guard NibGeometry.isUsable(rect) else { return Path() }
         let capsule = min(rect.width, rect.height) / 2
-        let r = min(cornerRadius ?? capsule, capsule)
+        let r = min(NibGeometry.dimension(cornerRadius ?? capsule), capsule)
         return Path(roundedRect: rect, cornerRadius: max(0, r), style: .continuous)
     }
 }
@@ -21,8 +23,8 @@ public enum NibGlass: Sendable {
 /// What Nib asks of the system glass on iOS 26+ (DESIGN.md §2.2). Every droplet is the Regular variant: Apple never
 /// mixes Regular and Clear in one interface, and Clear is for media-rich backdrops with a dimming layer beneath, which
 /// a page of handwriting is not. Regular already thickens itself for large surfaces (popovers, panels) and adapts its
-/// shadow and tint to what is beneath, so Deep is not tinted either: a tint means prominence, never thickness, and
-/// only the Tinted material (the one primary action) has one. `isInteractive` is set wherever the glass takes the touch.
+/// shadow and tint to what is beneath. Deep stays untinted; its dark contrast body is an underlay (§2.3), not a glass
+/// tint. Only the Tinted material (the one primary action) has an accent tint. `isInteractive` follows the controls.
 struct NibSystemGlass: Equatable {
     var tintsAccent: Bool
     var isInteractive: Bool
@@ -34,6 +36,32 @@ struct NibSystemGlass: Equatable {
     @available(iOS 26.0, *)
     var glass: Glass {
         (tintsAccent ? Glass.regular.tint(NibColor.accent) : Glass.regular).interactive(isInteractive)
+    }
+}
+
+/// Body colour is shared by frozen glass and the dark-paper contrast exception (DESIGN.md §2.3).
+/// It is always beneath the system material; no extra rim, sheen or coloured light is painted over glass.
+enum NibGlassBodyTint {
+    static func color(_ kind: NibGlass, paperShare: Double = 0) -> Color {
+        switch kind {
+        case .deep: return NibColor.deepBody
+        case .tinted: return NibColor.accent
+        case .bead: return NibColor.beadBody
+        case .clear:
+            let share = paperShare.isFinite ? min(max(paperShare, 0), 1) : 0
+            return Color(uiColor: UIColor { traits in
+                let base = NibUIColor.clearBody.resolvedColor(with: traits)
+                let paper = NibUIColor.clearBodyOnPaper.resolvedColor(with: traits)
+                return base.withAlphaComponent(base.cgColor.alpha + (paper.cgColor.alpha - base.cgColor.alpha) * CGFloat(share))
+            })
+        }
+    }
+
+    static func systemUnderlay(_ kind: NibGlass, colorScheme: ColorScheme, paperShare: Double) -> Color {
+        guard colorScheme == .dark else { return .clear }
+        if kind == .deep { return NibColor.deepBody }
+        if kind == .clear && paperShare > 0.6 { return color(.clear, paperShare: paperShare) }
+        return .clear
     }
 }
 
@@ -89,6 +117,9 @@ struct NibGlassModifier: ViewModifier {
     @Environment(\.nibLiquidMode) private var mode
     /// While the Pencil is down nothing samples the backdrop (DESIGN.md §10.8).
     @Environment(\.nibIsInking) private var frozen
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.nibBackdrop) private var backdrop
+    @State private var restFrame = CGRect.zero
 
     func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
@@ -98,6 +129,13 @@ struct NibGlassModifier: ViewModifier {
             content
                 .background { systemUnderlay }
                 .glassEffect(systemGlass, in: shape)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear
+                            .onAppear { restFrame = proxy.frame(in: NibLiquid.space) }
+                            .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in restFrame = frame }
+                    }
+                }
         } else {
             content.background { fallback }
         }
@@ -110,12 +148,12 @@ struct NibGlassModifier: ViewModifier {
     }
 
     private var tint: Color {
-        kind == .deep ? NibColor.deepBody : (kind == .tinted ? NibColor.accent : NibColor.clearBody)
+        NibGlassBodyTint.color(kind, paperShare: paperShare)
     }
 
-    /// iOS 26: nothing under system glass, except the plain body tint while frozen (`.identity` above it), the opaque
-    /// fill under Liquid Off, and a bead, which is a plain fill because it only ever sits inside glass (never glass on
-    /// glass, no rim painted over the system's).
+    private var paperShare: Double { DropletField.paperShare(restFrame, in: backdrop) }
+
+    /// The dark-paper contrast body is beneath glass, alongside the frozen, Liquid Off and bead fills.
     @available(iOS 26.0, *)
     @ViewBuilder private var systemUnderlay: some View {
         if renderer == .opaque {
@@ -124,6 +162,8 @@ struct NibGlassModifier: ViewModifier {
             shape.fill(NibColor.beadBody)
         } else if frozen {
             shape.fill(tint)
+        } else {
+            shape.fill(NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paperShare))
         }
     }
 
@@ -193,9 +233,8 @@ struct NibWaterRimLayer: View {
 }
 
 /// iOS 26: a held droplet's brighter rim (DESIGN.md §10.9, Held). Nothing is painted on the system glass at rest. The
-/// body of a droplet in a container never takes the touch, so the system cannot light it up; while it is held this
-/// adds only the difference, the key and counter rim at (strength − 1) × `waterRim`, plus-lighter onto the system's own
-/// rim. No outline, no sheen.
+/// held state follows Nib's lift spring; while it is held this adds only the difference, the key and counter rim at
+/// (strength − 1) × `waterRim`, plus-lighter onto the system's own rim. No outline, no sheen.
 struct NibLiftRim: View {
     let cornerRadius: CGFloat?
     let boost: CGFloat

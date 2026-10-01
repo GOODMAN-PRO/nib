@@ -77,7 +77,7 @@ enum NameLookupCanary {
         TapePatternDescriptor.self, ElementEntry.self, ElementCollectionDescriptor.self, BlockKindDescriptor.self, CustomItemTypeDescriptor.self,
         PencilActionDescriptor.self, ContentRegistries.self, PKBridge.self, RichTextBridge.self, CanvasInputMode.self,
         CanvasSample.self, CanvasHost.self, CanvasTool.self, CanvasAttachment.self, CanvasAttachmentDescriptor.self,
-        PencilEventHandler.self, DocumentEditing.self, ToolbarGroup.self, ToolbarItemDescriptor.self, MenuLocation.self,
+        PencilEventHandler.self, DocumentEditing.self, ToolbarGroup.self, ToolbarNavSlot.self, ToolbarItemDescriptor.self, MenuLocation.self,
         MenuContext.self, MenuItemDescriptor.self, PanelPlacement.self, PanelContext.self, PanelDescriptor.self,
         SettingsSection.self, SettingsPageDescriptor.self, InspectorContext.self, InspectorDescriptor.self, ToolMenuDescriptor.self,
         BlockViewContext.self, BlockViewDescriptor.self, PluginPanelFactory.self, CanvasToolDescriptor.self, DocumentEditorDescriptor.self,

@@ -124,7 +124,7 @@ var targets: [Target] = [
             resources: [.process("Shaders"), .process("Localizable.xcstrings")]),
     .target(name: "NibTesting", dependencies: ["NibContracts"]),
     .testTarget(name: "NibContractsTests", dependencies: ["NibContracts", "NibTesting"]),
-    .testTarget(name: "NibDesignTests", dependencies: ["NibDesign"]),
+    .testTarget(name: "NibDesignTests", dependencies: ["NibDesign", "NibContracts", "NibTesting"]),
     .testTarget(name: "ConformanceTests",
                 dependencies: ["NibContracts", "NibTesting"] + modules.map { Target.Dependency.target(name: $0.name) }),
     // Example plugins call doc.create, card.add, ink.writeText, panels and nib.ai, so they run against every module

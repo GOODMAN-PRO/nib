@@ -16,7 +16,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 - **Scaffold agent.** Create every file below at the given path, exactly as written. Then create the module stubs listed in `forge-spec.json` → `scaffold[2]` (one per feature entry type, including the second entry types of split features). Push, and do not start features until CI is green — including `NameLookupCanaryTests`, which proves no contract name clashes with an SDK type.
 - **Feature agents.** Import `NibContracts` (and `NibTesting` in tests: Harness, Fixtures, fakes) and use only the API below. If something is missing, file `docs/contract-requests/<Fxxx>-<slug>.md`; do not edit these files.
 - **Concurrency.** Everything marked `@MainActor` must be used from the main actor. Test classes that use `Harness` or `NibApp` are `@MainActor`.
-- **contracts-v2.** The sources below are contracts-v2 (plus the additive contracts-v2.1 and contracts-v2.2 follow-ups), an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
+- **contracts-v2.** The sources below are contracts-v2 (plus the additive contracts-v2.1, contracts-v2.2 and contracts-v2.3 follow-ups), an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
 
 ## contracts-v2 changelog
 
@@ -31,6 +31,8 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 - **Fonts.** The app target has the `com.apple.developer.user-fonts` entitlement (`app-usage`), for fonts installed from font provider apps (F026 T-059, P-083).
 
 Adopt: F015's ⌘Z / ⇧⌘Z keys work unchanged (their `sessionParams` name the window's document; the shell falls back to the window's UndoManager). F102 may register its block duplicate on ⌘D with `docKinds: [.textDocument]`: it then wins over F014's ⌘D in text documents only. F014 sets `docKinds: [.notebook, .whiteboard]` on its ⌘X, ⌘C, ⌘V, ⌥⇧⌘V and ⌘D keys, so they no longer run the canvas clipboard commands in study sets and text documents. F049 keeps ⇥, ⇧⇥ and ⎋ as `StudySetViewController`'s own UIKeyCommands. They must work while a card field is being edited, and they depend on the editor's read-only and focus state. As descriptors they would lose: a `.canvas` key is dropped while text is edited, and at `.document` a key without ⌘, ⌥ or ⌃ leaves Tab and Escape to the text view. Only ⌘⏎ New Card may move to a descriptor (`.document`, `docKinds: [.studySet]`, `sessionParams` naming the set), and only once its command finds the card from the session. F047 gives its new-document key a fresh id through `sessionParams`. F018 restores tabs with `addTab` and drops `SceneHooksImpl.maxRestoredTabs`. It also sets `whileTabsOpen` on its ⌘W, ⌥⌘W and ⌘1–9 keys (still `.document`), so they switch and close tabs from the library while the strip shows. F073 does the same for the ⌘1–9 keys it registers. F017 drops the `ui.activeNavigator` assignment in `DocumentContainerViewController.goToLibrary`, because the shell already made the window of the tap the active one, together with the session. It also drops the stale comment on `prefersStatusBarHidden`, because the shell now forwards it. F043 moves Show Pencil Palette off ⌥⌘P, which F052's audio key takes in notebooks, whiteboards and text documents, to a free shortcut (⌃⌘P is unused). Still deferred for the shell: the paste responder, forwarding the settings page to `settingsRoot`, the tab band layout, the open-gate result, and per-tab page memory (the shell opens a switched-to or closed-to tab at its first page; F018 keeps its page-memory workaround, contract-gaps F018).
+
+**contracts-v2.3** (additive, leading nav status slot). `ToolbarItemDescriptor` gains `navSlot: ToolbarNavSlot = .beforeTitle` and `compactStatus: (@MainActor (ChromeContext) -> AnyView?)? = nil`, both set after the existing initializer. `ToolbarNavSlot` has `.beforeTitle` and `.afterTitle`. A `.navLeading` item with `.afterTitle` and a non-nil provider renders its compact status control immediately after the document title inside the leading bar, on iPad and iPhone; `order` (then `id`) sorts within that slot. A nil provider keeps every existing icon item unchanged, including an item whose slot is `.afterTitle`; a provider returning nil hides the status. `docKinds`, `showsInCompactWidth` and `isEnabled` still apply. The status view owns live observation and its tap (a command or details popover via `ChromeContext.floatingHost`), without a separate chrome overlay or surface. Use NibDesign tokens only: a 6 pt `NibStatusDot(.connected)` (`success`), a short client label in `NibFont.caption1`, a 44 x 44 pt minimum hit target and VoiceOver "<client> connected". On compact width collapse the label to the dot while retaining its hit target and accessibility label. Command ids belong only in the details popover. F091 registers `bridgeui.status` in this slot for every document kind, reusing its details popover; its library overlay stays top trailing. F108 can adopt the same slot for presence without changing the icon toolbar contract. Tests cover the nil default and window context in NibContracts, ordering and compact-width retention in F017, and document registration versus the unchanged library overlay in F091.
 
 **Spec pass 2** (docs only: no API, constant or source change). It pins conventions the sources leave open, matching what the built features already do. `PanelContext.params` is one flat object: every key of the `panel.open` call except `id` and `edge`, with the keys of a nested `params` object merged over them. So `{id, pages}` and `{id, params: {pages}}` both reach the panel as `{pages}`, and a call that names nothing gives `[:]` (the source comment's "params minus id"). In a window with no open document, `panel.open` / `panel.close` (F017) forward to `library.setView {panel, params?, close?}` (F019, additive params). The library then presents `.sheet`, `.fullScreen` and `.floating` panels over itself with a `PanelContext` for that window, and selects `.libraryTab` panels in its sidebar; this settles the deferred F019 library-tab routing. Library menus fill `MenuContext.folder`. The pinned results (ARCHITECTURE.md §6.5) are:
 - `template.choose` → `{background, size}`, with `kind` paper | cover and an additive `doc?`;
@@ -422,6 +424,9 @@ public var sessionParams: (@MainActor (EditorSession) -> JSONValue)?
 public var sessionTitle: (@MainActor (EditorSession) -> String)?
 public var sessionIcon: (@MainActor (EditorSession) -> String)?
 public var showsInCompactWidth: Bool
+// contracts-v2.3: status views in navLeading, after the title (both default to the existing icon path)
+public var navSlot: ToolbarNavSlot                                  // .beforeTitle by default; .afterTitle for status
+public var compactStatus: (@MainActor (ChromeContext) -> AnyView?)?  // nil by default; nil result hides the status
 public func resolvedParams(for session: EditorSession) -> JSONValue
 public func resolvedTitle(for session: EditorSession) -> String
 public func resolvedIcon(for session: EditorSession) -> String
@@ -507,6 +512,8 @@ public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: U
     public enum Variant: String, CaseIterable { case light, dark, largeText }   // largeText = AX3
     public static func image<V: View>(_ view: V, size: CGSize, variant: Variant = .light, scale: CGFloat = 2) -> UIImage?
     public static func images<V: View>(_ view: V, size: CGSize, scale: CGFloat = 2) -> [Variant: UIImage]
+    // Additive: visible-window compositor snapshots, including live system glass and UIKit content.
+    public static func hostedImage<V: View>(_ view: V, size: CGSize, variant: Variant = .light, scale: CGFloat = 2) async throws -> UIImage?
     public static func fittingSize<V: View>(_ view: V, width: CGFloat, variant: Variant = .light) -> CGSize
     public static func pixel(_ image: UIImage, at point: CGPoint) -> RGBA?
 }
@@ -11287,7 +11294,12 @@ public enum ToolbarGroup: String, Codable, CaseIterable {
     case navTrailing
 }
 
-/// Every toolbar button is either a canvas tool (activated via `tool.select`) or a command. No other actions exist.
+/// contracts-v2.3: a leading nav item's position relative to the document title; `order` sorts within the slot.
+public enum ToolbarNavSlot: String, Codable, CaseIterable {
+    case beforeTitle, afterTitle
+}
+
+/// Toolbar buttons select a canvas tool or run a command; compact status views may bud their own details popover.
 public struct ToolbarItemDescriptor: Registrable {
     public var id: String
     public var title: String
@@ -11324,6 +11336,14 @@ public struct ToolbarItemDescriptor: Registrable {
     public var sessionIcon: (@MainActor (EditorSession) -> String)? = nil
     /// Also shown on compact width (iPhone); false = regular width only.
     public var showsInCompactWidth: Bool = true
+
+    /// contracts-v2.3: explicit title-relative slot for `navLeading` status items. Existing items stay unchanged.
+    public var navSlot: ToolbarNavSlot = .beforeTitle
+    /// contracts-v2.3: optional compact status control, rendered in place of the icon in `navLeading` / `afterTitle`.
+    /// nil keeps the existing icon path; a provider returning nil hides the status. The view owns its tap (a command
+    /// or details popover) and live observation. Use NibDesign's 6 pt status dot and colour tokens, caption1, a 44 pt
+    /// hit target, and "<client> connected" for VoiceOver; compact width shows only the dot. Draw no separate surface.
+    public var compactStatus: (@MainActor (ChromeContext) -> AnyView?)? = nil
 
     @MainActor
     public func resolvedParams(for session: EditorSession) -> JSONValue {
@@ -15984,7 +16004,7 @@ var targets: [Target] = [
             resources: [.process("Shaders"), .process("Localizable.xcstrings")]),
     .target(name: "NibTesting", dependencies: ["NibContracts"]),
     .testTarget(name: "NibContractsTests", dependencies: ["NibContracts", "NibTesting"]),
-    .testTarget(name: "NibDesignTests", dependencies: ["NibDesign"]),
+    .testTarget(name: "NibDesignTests", dependencies: ["NibDesign", "NibContracts", "NibTesting"]),
     .testTarget(name: "ConformanceTests",
                 dependencies: ["NibContracts", "NibTesting"] + modules.map { Target.Dependency.target(name: $0.name) }),
     // Example plugins call doc.create, card.add, ink.writeText, panels and nib.ai, so they run against every module

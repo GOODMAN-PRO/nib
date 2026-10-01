@@ -12,28 +12,35 @@ struct SpringValue: Equatable, Sendable {
     var epsilon: CGFloat
 
     init(_ value: CGFloat, epsilon: CGFloat = 0.02) {
-        self.value = value
-        self.target = value
-        self.epsilon = epsilon
+        self.value = NibGeometry.finite(value)
+        self.target = self.value
+        self.epsilon = epsilon.isFinite && epsilon > 0 ? epsilon : 0.02
     }
 
     var isResting: Bool { abs(value - target) < epsilon && abs(velocity) < epsilon * 4 }
 
     mutating func snap(to newValue: CGFloat) {
+        guard newValue.isFinite else { return }
         value = newValue
         target = newValue
         velocity = 0
     }
 
     mutating func step(_ dt: CGFloat, spring: NibSpring) {
-        guard dt > 0 else { return }
+        // Repair poisoned state before it can spread to another spring or a view. Invalid samples do not step.
+        target = NibGeometry.finite(target, fallback: NibGeometry.finite(value))
+        value = NibGeometry.finite(value, fallback: target)
+        velocity = NibGeometry.finite(velocity)
+        guard dt.isFinite, dt > 0, dt <= 1 else { return }
         let k = CGFloat(spring.stiffness)
         let c = CGFloat(spring.damping)
+        guard k.isFinite, c.isFinite, k > 0, c >= 0 else { snap(to: target); return }
         let n = max(1, Int((dt * 240).rounded(.up)))
         let h = dt / CGFloat(n)
         for _ in 0..<n {
             velocity += (-k * (value - target) - c * velocity) * h
             value += velocity * h
+            if !value.isFinite || !velocity.isFinite { snap(to: target); return }
         }
         if isResting {
             value = target
@@ -56,14 +63,15 @@ struct SpringPoint: Equatable, Sendable {
     var velocity: CGVector {
         get { CGVector(dx: x.velocity, dy: y.velocity) }
         set {
-            x.velocity = newValue.dx
-            y.velocity = newValue.dy
+            x.velocity = NibGeometry.finite(newValue.dx)
+            y.velocity = NibGeometry.finite(newValue.dy)
         }
     }
 
     var target: CGPoint {
         get { CGPoint(x: x.target, y: y.target) }
         set {
+            guard NibGeometry.isFinite(newValue) else { return }
             x.target = newValue.x
             y.target = newValue.y
         }
@@ -137,12 +145,14 @@ enum DropletPhysics {
     /// How far a held droplet trails the finger at `speed` with a critically damped follow spring: v·ζ·response/π
     /// (27 pt at 1000 pt/s with `follow`). The slight lag is the water's weight (DESIGN.md §10.1).
     static func followLag(speed: CGFloat, spring: NibSpring = NibMotion.follow) -> CGFloat {
-        speed * CGFloat(spring.dampingRatio * spring.response) / .pi
+        NibGeometry.finite(speed * CGFloat(spring.dampingRatio * spring.response) / .pi)
     }
 
     /// UIScrollView-style resistance past [lo, hi]: edge + D·(1 − 1/(0.55·e/D + 1)).
     static func rubberBand(_ v: CGFloat, lo: CGFloat, hi: CGFloat, dimension d: CGFloat = rubberDimension) -> CGFloat {
-        guard hi >= lo else { return (lo + hi) / 2 }
+        guard v.isFinite, lo.isFinite, hi.isFinite else { return NibGeometry.finite(v) }
+        guard hi >= lo else { return lo / 2 + hi / 2 }
+        guard d.isFinite, d > 0 else { return min(max(v, lo), hi) }
         if v < lo { return lo - (1 - 1 / ((lo - v) * 0.55 / d + 1)) * d }
         if v > hi { return hi + (1 - 1 / ((v - hi) * 0.55 / d + 1)) * d }
         return v
@@ -150,8 +160,9 @@ enum DropletPhysics {
 
     /// A careful release never flings: if the finger rested ≥ 70 ms the velocity is zero. Capped at 5000 pt/s.
     static func releaseVelocity(_ v: CGVector, stillFor: Double) -> CGVector {
+        guard NibGeometry.isFinite(v) else { return .zero }
         if stillFor >= carefulReleaseStill { return .zero }
-        let speed = (v.dx * v.dx + v.dy * v.dy).squareRoot()
+        let speed = hypot(v.dx, v.dy)
         guard speed > maxReleaseSpeed else { return v }
         let k = maxReleaseSpeed / speed
         return CGVector(dx: v.dx * k, dy: v.dy * k)
@@ -159,7 +170,7 @@ enum DropletPhysics {
 
     /// The landing a fling projects to: p + v·0.12 s.
     static func projectedLanding(_ p: CGPoint, velocity v: CGVector) -> CGPoint {
-        CGPoint(x: p.x + v.dx * projection, y: p.y + v.dy * projection)
+        NibGeometry.point(CGPoint(x: p.x + v.dx * projection, y: p.y + v.dy * projection))
     }
 
     /// Grid and slot snaps (DESIGN.md §10.3): only the part of the release velocity that points at the slot, capped
@@ -167,8 +178,9 @@ enum DropletPhysics {
     /// the droplet lands without overshooting and never leaves the box between where it was and where it goes.
     /// `displacement` is the droplet's offset from the slot (the slot is at zero).
     static func slotVelocity(_ v: CGVector, displacement d: CGPoint, spring: NibSpring = NibMotion.slot) -> CGVector {
-        let distance = (d.x * d.x + d.y * d.y).squareRoot()
-        guard distance > 0.001 else { return .zero }
+        guard NibGeometry.isFinite(v), NibGeometry.isFinite(d), spring.response.isFinite, spring.response > 0 else { return .zero }
+        let distance = hypot(d.x, d.y)
+        guard distance.isFinite, distance > 0.001 else { return .zero }
         let ux = -d.x / distance, uy = -d.y / distance
         let along = max(0, v.dx * ux + v.dy * uy)
         let omega = 2 * CGFloat.pi / CGFloat(spring.response)
@@ -178,28 +190,33 @@ enum DropletPhysics {
 
     /// s* = min(cap, |v| / vRef).
     static func stretchTarget(speed: CGFloat, cap: CGFloat, vRef: CGFloat) -> CGFloat {
-        min(cap, speed / max(vRef, 1))
+        guard speed.isFinite, cap.isFinite, vRef.isFinite else { return 0 }
+        return min(max(cap, 0), max(speed, 0) / max(vRef, 1))
     }
 
     /// The rendered stretch: the spring aims at s*, but what is drawn never passes the cap (and dips at most
     /// 0.4·cap below zero), so a spring's overshoot never shows as a stretch past its cap (DESIGN.md §10.2).
     static func clampStretch(_ s: CGFloat, cap: CGFloat) -> CGFloat {
-        min(max(s, -0.4 * cap), cap)
+        let cap = NibGeometry.dimension(cap)
+        return min(max(NibGeometry.finite(s), -0.4 * cap), cap)
     }
 
     /// (−π/2, π/2]: a stretch looks the same forwards and backwards.
     static func wrapHalfTurn(_ a: CGFloat) -> CGFloat {
-        a - .pi * (a / .pi).rounded()
+        guard a.isFinite else { return 0 }
+        return NibGeometry.finite(a - .pi * (a / .pi).rounded())
     }
 
     /// θ follows its target exponentially, θ += Δ·(1 − e^(−18·dt)), so it never steps.
     static func followAxis(_ theta: CGFloat, toward target: CGFloat, dt: CGFloat) -> CGFloat {
-        theta + wrapHalfTurn(target - theta) * (1 - exp(-18 * dt))
+        guard theta.isFinite, target.isFinite, dt.isFinite, dt >= 0 else { return NibGeometry.finite(theta) }
+        return NibGeometry.finite(theta + wrapHalfTurn(target - theta) * (1 - exp(-18 * dt)))
     }
 
     /// How much of the long-droplet regime applies: smoothstep(2.5, 3.5, aspect). Blended, never switched, so a
     /// palette re-forming through aspect 3 does not twist in one frame.
     static func longAxisWeight(aspect: CGFloat) -> CGFloat {
+        guard !aspect.isNaN else { return 0 }
         let t = min(max((aspect - 2.5) / 1.0, 0), 1)
         return t * t * (3 - 2 * t)
     }
@@ -207,48 +224,57 @@ enum DropletPhysics {
     /// Fix 5: a long droplet deforms on its own axes only. The signed stretch is the tensor's component on the long
     /// axis: moving along it lengthens, moving across it shortens and thickens. No shear.
     static func axisLocked(stretch s: CGFloat, velocityAngle phi: CGFloat, longAxis: CGFloat) -> CGFloat {
-        s * cos(2 * (phi - longAxis))
+        NibGeometry.finite(s * cos(2 * (phi - longAxis)))
     }
 
     /// Volume-preserving in 3D (sx·sy·sz = 1 with the depth following the cross axis): along 1 + s, across 1/√(1 + s).
     /// Area preservation reads as rubber; this reads as a drop thinning as it stretches.
     static func deformation(stretch s: CGFloat, axis theta: CGFloat, lift: CGFloat = 1) -> CGAffineTransform {
-        let along = (1 + s) * lift
-        let across = lift / (1 + s).squareRoot()
+        let scale = max(0.0001, 1 + NibGeometry.finite(s))
+        let lift = NibGeometry.finite(lift, fallback: 1)
+        let theta = NibGeometry.finite(theta)
+        let along = scale * max(0.0001, lift)
+        let across = max(0.0001, lift) / scale.squareRoot()
         let c = cos(theta), n = sin(theta)
         let a = c * c * along + n * n * across
         let b = c * n * (along - across)
         let d = n * n * along + c * c * across
-        return CGAffineTransform(a: a, b: b, c: b, d: d, tx: 0, ty: 0)
+        return NibGeometry.transform(CGAffineTransform(a: a, b: b, c: b, d: d, tx: 0, ty: 0))
     }
 
     /// Fix 6: the droplet transform about the grab point `anchor` (both in coordinates centred on the rest centre),
     /// so the part under the finger stays under the finger: p' = offset + anchor + L·(q − anchor).
     static func transform(offset: CGPoint, anchor: CGPoint, linear: CGAffineTransform) -> CGAffineTransform {
+        guard NibGeometry.isFinite(offset), NibGeometry.isFinite(anchor), NibGeometry.isFinite(linear) else { return .identity }
         let la = CGPoint(x: linear.a * anchor.x + linear.c * anchor.y, y: linear.b * anchor.x + linear.d * anchor.y)
-        return CGAffineTransform(a: linear.a, b: linear.b, c: linear.c, d: linear.d,
-                                 tx: offset.x + anchor.x - la.x, ty: offset.y + anchor.y - la.y)
+        return NibGeometry.transform(CGAffineTransform(a: linear.a, b: linear.b, c: linear.c, d: linear.d,
+                                 tx: offset.x + anchor.x - la.x, ty: offset.y + anchor.y - la.y))
     }
 
     /// Converts a centred transform to SwiftUI's `transformEffect` space (origin at the view's top-left).
     static func aboutCentre(_ t: CGAffineTransform, size: CGSize) -> CGAffineTransform {
-        CGAffineTransform(translationX: -size.width / 2, y: -size.height / 2)
+        guard NibGeometry.isFinite(size), NibGeometry.isFinite(t) else { return .identity }
+        return NibGeometry.transform(CGAffineTransform(translationX: -size.width / 2, y: -size.height / 2)
             .concatenating(t)
-            .concatenating(CGAffineTransform(translationX: size.width / 2, y: size.height / 2))
+            .concatenating(CGAffineTransform(translationX: size.width / 2, y: size.height / 2)))
     }
 
     static func neckThickness(gap: CGFloat, params: NeckParams) -> CGFloat {
-        params.t0 * pow(max(0, 1 - gap / params.off), 0.7)
+        guard gap.isFinite, params.off.isFinite, params.off > 0, params.t0.isFinite, params.t0 >= 0 else { return 0 }
+        return NibGeometry.dimension(params.t0 * pow(max(0, 1 - gap / params.off), 0.7))
     }
 
     /// Polynomial smooth-min: the union the Metal field and system glass approximate (k = merge distance).
     static func smoothMin(_ d1: CGFloat, _ d2: CGFloat, k: CGFloat) -> CGFloat {
+        guard d1.isFinite, d2.isFinite else { return min(NibGeometry.finite(d1), NibGeometry.finite(d2)) }
+        guard k.isFinite, k > 0 else { return min(d1, d2) }
         let h = min(max(0.5 + 0.5 * (d2 - d1) / k, 0), 1)
-        return d2 + (d1 - d2) * h - k * h * (1 - h)
+        return NibGeometry.finite(d2 + (d1 - d2) * h - k * h * (1 - h), fallback: min(d1, d2))
     }
 
     /// Nearest points and gap between two droplet boxes. Corner-to-corner gaps grow by 0.59·r (rounded corners).
     static func gap(_ a: CGRect, _ b: CGRect, minCorner: CGFloat) -> (gap: CGFloat, pointA: CGPoint, pointB: CGPoint) {
+        guard NibGeometry.isFinite(a), NibGeometry.isFinite(b) else { return (0, .zero, .zero) }
         let ax: CGFloat, bx: CGFloat, ay: CGFloat, by: CGFloat
         if a.maxX < b.minX {
             ax = a.maxX; bx = b.minX
@@ -264,9 +290,9 @@ enum DropletPhysics {
         } else {
             ay = (max(a.minY, b.minY) + min(a.maxY, b.maxY)) / 2; by = ay
         }
-        var g = ((bx - ax) * (bx - ax) + (by - ay) * (by - ay)).squareRoot()
-        if ax != bx && ay != by { g += minCorner * 0.59 }
-        return (g, CGPoint(x: ax, y: ay), CGPoint(x: bx, y: by))
+        var g = hypot(bx - ax, by - ay)
+        if ax != bx && ay != by { g += NibGeometry.dimension(minCorner) * 0.59 }
+        return (NibGeometry.dimension(g), NibGeometry.point(CGPoint(x: ax, y: ay)), NibGeometry.point(CGPoint(x: bx, y: by)))
     }
 
     /// The axis a docked droplet may slide along when it fuses (its dock fixes the other one).
@@ -278,6 +304,7 @@ enum DropletPhysics {
     /// edges overlap by 1 pt, and (when free to) align centres within 24 pt. With ≥ 4.5 pt content inset at each end the
     /// glyph boxes then stay ≥ 8 pt apart.
     static func fuse(_ moving: CGRect, onto fixed: CGRect, along axis: ContactAxis? = nil) -> CGRect {
+        guard NibGeometry.isFinite(moving), NibGeometry.isFinite(fixed) else { return NibGeometry.rect(moving) }
         var r = moving
         let gapX = max(fixed.minX - moving.maxX, moving.minX - fixed.maxX)
         let gapY = max(fixed.minY - moving.maxY, moving.minY - fixed.maxY)
@@ -297,6 +324,7 @@ enum DropletPhysics {
     /// dock, and only neighbours beside it on that axis count.
     static func restingRect(_ moving: CGRect, near fixed: CGRect, mergeDistance: CGFloat,
                             along axis: ContactAxis? = nil) -> CGRect {
+        guard NibGeometry.isFinite(moving), NibGeometry.isFinite(fixed) else { return NibGeometry.rect(moving) }
         if let axis {
             let across = axis == .horizontal
                 ? (moving.minY < fixed.maxY && fixed.minY < moving.maxY)
@@ -322,6 +350,7 @@ enum DropletPhysics {
     /// Fix 2: while the palette re-forms, content cross-fades over progress 0.42–0.58 and is invisible at the
     /// midpoint, where the layout switches axis. The toolbar is dark for under 100 ms.
     static func reshapeContentOpacity(progress p: CGFloat) -> CGFloat {
+        guard p.isFinite else { return 1 }
         if p <= 0.42 || p >= 0.58 { return 1 }
         return abs(p - 0.5) / 0.08
     }
@@ -346,11 +375,13 @@ enum BeadPhysics {
     static let minNeckHalfWidth: CGFloat = 0.72
 
     static func clampTail(head: CGFloat, tail: CGFloat, radius: CGFloat) -> CGFloat {
-        let m = maxSeparation * radius
+        let head = NibGeometry.finite(head), tail = NibGeometry.finite(tail, fallback: head)
+        let m = maxSeparation * NibGeometry.dimension(radius)
         return min(max(tail, head - m), head + m)
     }
 
     static func geometry(head: CGFloat, tail: CGFloat, radius r: CGFloat) -> BeadGeometry {
+        let head = NibGeometry.finite(head), r = NibGeometry.dimension(r)
         let t = clampTail(head: head, tail: tail, radius: r)
         let rt = r * tailRatio
         let separation = abs(head - t)
@@ -360,7 +391,7 @@ enum BeadPhysics {
 
     /// Passing lens: icons within 30 pt of the head magnify up to 1.13×.
     static func passingLens(distance d: CGFloat) -> CGFloat {
-        1 + 0.13 * max(0, 1 - d / 30)
+        1 + 0.13 * max(0, 1 - NibGeometry.dimension(d) / 30)
     }
 }
 
@@ -395,7 +426,7 @@ struct DropletDynamics: Equatable, Sendable {
         }
 
         let v = offset.velocity
-        let speed = (v.dx * v.dx + v.dy * v.dy).squareRoot()
+        let speed = hypot(v.dx, v.dy)
         let cap = calm ? style.stretchCap / 2 : style.stretchCap
         var target = DropletPhysics.stretchTarget(speed: speed, cap: cap, vRef: style.vRef)
         let w = max(size.x.value, 1), h = max(size.y.value, 1)

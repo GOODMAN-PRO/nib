@@ -1,1 +1,2 @@
-// Scaffold placeholder, owned by F082 (Example plugins & plugin test fixtures). Replace this file.
+// Spec templates are registered by the host; page edits use template.apply or page.add.
+console.log("Weekly Planner templates loaded");

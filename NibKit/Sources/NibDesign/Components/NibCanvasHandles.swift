@@ -2,8 +2,9 @@ import UIKit
 
 /// A selection or frame handle for UIKit canvas overlays (DESIGN.md §14.3, §10.15): a rigid 12 pt bead centred in a
 /// 44 pt hit area. Precision affordances never stretch, wobble, poke or refract, so a handle is drawn with the water
-/// tokens rather than being a droplet: `clear` (corners, the rotation bead) is the Clear body over paper with its rim,
-/// the 0.8 pt water line and the resting elevation; `tinted` (edge handles) is accent with the Tinted rim. Under
+/// tokens rather than being a droplet: `clear` is the Clear body over paper with its rim,
+/// the stronger 0.8 pt `waterLineBud` outline so it reads on light paper, and the resting elevation;
+/// `tinted` is accent with the Tinted rim. Under
 /// Reduce Transparency the Clear body is `chromeOpaque`. Colours follow the appearance and Increase Contrast.
 /// The view is not an accessibility element: the selection it belongs to carries the actions.
 public final class NibHandleView: UIView {
@@ -83,11 +84,12 @@ public final class NibHandleView: UIView {
         case .clear:
             body.fillColor = (opaque ? NibUIColor.chromeOpaque : NibUIColor.clearBodyOnPaper).resolvedColor(with: traits).cgColor
             rim.fillColor = NibUIColor.waterRim.resolvedColor(with: traits).cgColor
+            outline.strokeColor = NibUIColor.waterLineBud.resolvedColor(with: traits).cgColor
         case .tinted:
             body.fillColor = NibUIColor.accent.resolvedColor(with: traits).cgColor
             rim.fillColor = NibUIColor.tintRim.resolvedColor(with: traits).cgColor
+            outline.strokeColor = NibUIColor.waterLine.resolvedColor(with: traits).cgColor
         }
-        outline.strokeColor = NibUIColor.waterLine.resolvedColor(with: traits).cgColor
         CATransaction.commit()
         setNeedsLayout()
     }

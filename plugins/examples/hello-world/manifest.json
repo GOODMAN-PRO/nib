@@ -1,1 +1,52 @@
-{}
+{
+  "id": "dev.nib.hello",
+  "name": "Hello",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "Stamp a greeting on the current page and show a toast.",
+  "entry": "main.js",
+  "permissions": [
+    "document:read",
+    "document:write"
+  ],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "dev.nib.hello.stamp",
+        "title": "Stamp Hello",
+        "summary": "Write a greeting as a text box on the current page.",
+        "params": {
+          "type": "object",
+          "properties": {
+            "page": {
+              "type": "string",
+              "description": "Optional page ref; defaults to the current page."
+            },
+            "id": {
+              "type": "string",
+              "description": "Optional caller-chosen text item id."
+            }
+          }
+        },
+        "examples": [
+          {}
+        ],
+        "effect": "edit",
+        "target": "document"
+      }
+    ],
+    "toolbar": [
+      {
+        "id": "dev.nib.hello.button",
+        "title": "Hello",
+        "icon": "hand.wave",
+        "group": "accessories",
+        "command": "dev.nib.hello.stamp"
+      }
+    ]
+  }
+}

@@ -1,1 +1,71 @@
-{}
+{
+  "id": "dev.nib.wordcount",
+  "name": "Word Count",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "A live word count panel for recognised handwriting, typed text and PDF text.",
+  "entry": "main.js",
+  "permissions": [
+    "document:read",
+    "app"
+  ],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "dev.nib.wordcount.show",
+        "title": "Show Word Count",
+        "summary": "Open the word count panel for the current page.",
+        "params": {
+          "type": "object",
+          "properties": {}
+        },
+        "examples": [
+          {}
+        ],
+        "effect": "session",
+        "target": "app"
+      },
+      {
+        "id": "dev.nib.wordcount.count",
+        "title": "Count Words",
+        "summary": "Count recognised and typed words on the supplied or current page.",
+        "params": {
+          "type": "object",
+          "properties": {
+            "page": {
+              "type": "string",
+              "description": "Optional page ref."
+            }
+          }
+        },
+        "examples": [
+          {}
+        ],
+        "effect": "read",
+        "target": "document"
+      }
+    ],
+    "panels": [
+      {
+        "id": "dev.nib.wordcount.panel",
+        "title": "Word Count",
+        "icon": "textformat.123",
+        "entry": "panel.html",
+        "placement": "floating"
+      }
+    ],
+    "toolbar": [
+      {
+        "id": "dev.nib.wordcount.button",
+        "title": "Word Count",
+        "icon": "textformat.123",
+        "group": "accessories",
+        "command": "dev.nib.wordcount.show"
+      }
+    ]
+  }
+}

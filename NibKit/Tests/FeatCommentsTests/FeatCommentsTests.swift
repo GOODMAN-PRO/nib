@@ -1,8 +1,714 @@
 import XCTest
+import UIKit
+import SwiftUI
 import NibContracts
-import FeatComments
+import NibTesting
+@testable import FeatComments
+
+private let pageRef = "page:FIXTUREDOC01/FIXTUREPG001"
+private let threadRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECMT01"
+
+/// Stands in for the document chrome's `panel.open` (F017) and records what was opened, with the params the chrome
+/// hands the panel as `PanelContext.params` (the nested `params` object).
+private final class PanelHost {
+    var opened: [String] = []
+    var params: [JSONValue] = []
+
+    /// What the thread panel was last asked to show.
+    var target: CommentPanelTarget? { params.last.flatMap { CommentPanelTarget(params: $0) } }
+}
+
+/// Records the refs a stand-in command was called with.
+private final class Calls {
+    var refs: [String] = []
+}
+
+/// Wraps the harness store and records every page read, to prove that commits never rescan the document.
+@MainActor
+private final class CountingPersistence: DocumentPersistence {
+    let base: DocumentPersistence
+    var loads: [PageID] = []
+
+    init(_ base: DocumentPersistence) { self.base = base }
+
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        loads.append(page)
+        return try base.loadItems(doc, page: page)
+    }
+
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
+        try base.fileURL(doc, relativePath: relativePath)
+    }
+
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+}
+
+private final class FakeEditor: DocumentEditing {
+    let documentID: DocumentID = Fixtures.docID
+    let session: EditorSession
+    let canvasHost: CanvasHost?
+
+    init(session: EditorSession, host: CanvasHost) {
+        self.session = session
+        canvasHost = host
+    }
+
+    func reveal(page: PageID, rect: Rect?, animated: Bool) {}
+    func reloadAll() {}
+}
 
 @MainActor
 final class FeatCommentsTests: XCTestCase {
-    func testFeatureID() { XCTAssertFalse(FeatCommentsFeature.id.isEmpty) }
+    private func harness() -> Harness { Harness(features: [FeatCommentsFeature.self]) }
+
+    private func item(_ h: Harness, _ ref: String) throws -> Item {
+        guard case let .item(doc, page, id)? = NodeRef(ref) else { throw NibError.invalid("not an item ref") }
+        return try h.app.workspace.item(doc, page: page, id: id)
+    }
+
+    private func installPanelHost(_ h: Harness) -> PanelHost {
+        let host = PanelHost()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel", summary: "Test panel host.",
+                                                  effect: .session, target: .app)) { params, _ in
+            host.opened.append(params["id"]?.stringValue ?? "")
+            host.params.append(params["params"] ?? [:])
+            return ["id": params["id"] ?? .null, "placement": "floating"]
+        }
+        return host
+    }
+
+    /// Stands in for F014's `clipboard.copyText` and records what it was asked to copy.
+    private func installClipboard(_ h: Harness) -> Calls {
+        let copied = Calls()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.clipboardCopyText, title: "Copy Text",
+                                                  summary: "Test clipboard.", effect: .read)) { params, _ in
+            copied.refs.append(params["url"]?.stringValue ?? params["text"]?.stringValue ?? "")
+            return ["types": ["public.utf8-plain-text"]]
+        }
+        return copied
+    }
+
+    /// `test.ink`: a pen stroke on page 1, the most frequent commit there is.
+    private func registerInk(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(id: "test.ink", title: "Ink", summary: "Test.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { (tx: DocTransaction) -> Void in
+                let points = [StrokePoint(x: 10, y: 10), StrokePoint(x: 40, y: 12)]
+                try tx.put(Item.makeStroke(Stroke(style: .defaultPen, points: points)), doc: Fixtures.docID,
+                           page: Fixtures.page1)
+            }
+            return [:]
+        }
+    }
+
+    /// `test.addPage {id, text?}`: appends a page to the notebook, with a thread on it when `text` is given.
+    private func registerAddPage(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(id: "test.addPage", title: "Add Page", summary: "Test.",
+                                                  effect: .edit)) { params, ctx in
+            let page = PageID(params["id"]?.stringValue ?? "")
+            try ctx.mutate { (tx: DocTransaction) -> Void in
+                try tx.put(PageRecord(id: page, order: "", size: .a4, background: .ofTemplate("builtin.ruled")),
+                           doc: Fixtures.docID)
+                if let text = params["text"]?.stringValue {
+                    let thread = CommentItem(anchor: Point(5, 5), messages: [CommentMessage(author: "Ana", text: text)])
+                    try tx.put(Item.makeComment(thread), doc: Fixtures.docID, page: page)
+                }
+            }
+            return [:]
+        }
+    }
+
+    private func assertError(_ code: NibError.Code, file: StaticString = #filePath, line: UInt = #line,
+                             _ body: () async throws -> Void) async {
+        do {
+            try await body()
+            XCTFail("expected \(code.rawValue)", file: file, line: line)
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, code, e.message, file: file, line: line)
+        } catch {
+            XCTFail("unexpected \(error)", file: file, line: line)
+        }
+    }
+
+    func testFeatureID() {
+        XCTAssertEqual(FeatCommentsFeature.id, "comments")
+    }
+
+    func testCommandConformance() async {
+        let problems = await CommandConformance.check(features: [FeatCommentsFeature.self])
+        XCTAssertEqual(problems, [])
+    }
+
+    func testAddAtASpotCreatesAThreadThatUndoRemoves() async throws {
+        let h = harness()
+        h.app.settings.set(NibSettings.authorName, "Ana")
+        let ref = "item:FIXTUREDOC01/FIXTUREPG001/MYTHREAD01"
+        let r = try await h.run("comment.add", ["page": .string(pageRef), "at": [120, 140], "text": "  Units?  ",
+                                                "id": "MYTHREAD01"])
+        XCTAssertEqual(r["ref"]?.stringValue, ref)
+        let c = try XCTUnwrap(try item(h, ref).comment)
+        XCTAssertEqual(c.anchor, Point(120, 140))
+        XCTAssertEqual(c.messages.map(\.text), ["Units?"])
+        XCTAssertEqual(c.messages.first?.author, "Ana")
+        XCTAssertEqual(c.messages.first?.id.raw, r["message"]?.stringValue)
+        XCTAssertFalse(c.resolved)
+        XCTAssertNil(try item(h, ref).attachedTo)
+
+        await assertError(.conflict) {
+            _ = try await h.run("comment.add", ["page": .string(pageRef), "at": [10, 10], "text": "Again", "id": "MYTHREAD01"])
+        }
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertThrowsError(try item(h, ref))
+
+        // The undone thread stays a tombstone on page 1: its id is still taken on every other page (redoing or
+        // syncing it back would give two live items one id), and reusing it on its own page replaces the tombstone.
+        await assertError(.conflict) {
+            _ = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [10, 10],
+                                                "text": "Elsewhere", "id": "MYTHREAD01"])
+        }
+        try await h.run("comment.add", ["page": .string(pageRef), "at": [10, 10], "text": "Back", "id": "MYTHREAD01"])
+        XCTAssertEqual(try item(h, ref).comment?.messages.map(\.text), ["Back"])
+    }
+
+    func testAddOnAnObjectPinsTheThreadToItAndSurvivesTheObjectsDeletion() async throws {
+        let h = harness()
+        let shapeRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"
+        let r = try await h.run("comment.add", ["page": .string(pageRef), "ref": .string(shapeRef), "text": "Label this"])
+        let ref = try XCTUnwrap(r["ref"]?.stringValue)
+        let shape = try item(h, shapeRef)
+        XCTAssertEqual(try item(h, ref).attachedTo, Fixtures.shapeID)
+        XCTAssertEqual(try item(h, ref).comment?.anchor, Point(shape.bounds.maxX, shape.bounds.minY))
+        XCTAssertEqual(try item(h, ref).layer, shape.layer)
+
+        // Deleting the object (item.delete, F013) leaves the thread; later edits unpin it instead of failing.
+        h.app.commands.register(CommandDescriptor(id: "test.deleteShape", title: "Delete", summary: "Test.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(item: Fixtures.shapeID, doc: Fixtures.docID, page: Fixtures.page1) }
+            return [:]
+        }
+        try await h.run("test.deleteShape")
+        try await h.run("comment.reply", ["ref": .string(ref), "text": "Box is gone"])
+        XCTAssertNil(try item(h, ref).attachedTo)
+        XCTAssertEqual(try item(h, ref).comment?.messages.count, 2)
+
+        await assertError(.invalidParams) {
+            _ = try await h.run("comment.add", ["page": .string(pageRef), "ref": .string(threadRef), "text": "Nested"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002",
+                                            "ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Elsewhere"])
+        }
+        await assertError(.notFound) {
+            _ = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/NOSUCHPAGE01", "at": [1, 1], "text": "Lost"])
+        }
+    }
+
+    func testReplyEditResolveAndDeleteMessagesRoundTrip() async throws {
+        let h = harness()
+        try await h.run("comment.resolve", ["ref": .string(threadRef), "resolved": true])
+        XCTAssertEqual(try item(h, threadRef).comment?.resolved, true)
+
+        let reply = try await h.run("comment.reply", ["ref": .string(threadRef), "text": "Done"])
+        let replyID = try XCTUnwrap(reply["message"]?.stringValue)
+        var c = try XCTUnwrap(try item(h, threadRef).comment)
+        XCTAssertFalse(c.resolved, "a reply reopens the thread")
+        XCTAssertEqual(c.messages.map(\.text), ["Check this", "Done"])
+
+        try await h.run("comment.edit", ["ref": .string(threadRef), "message": .string(replyID), "text": "Done, see page 4"])
+        c = try XCTUnwrap(try item(h, threadRef).comment)
+        XCTAssertEqual(c.messages.last?.text, "Done, see page 4")
+        XCTAssertEqual(c.messages.last?.edited, true)
+        XCTAssertEqual(c.messages.first?.edited, false)
+        await assertError(.notFound) {
+            _ = try await h.run("comment.edit", ["ref": .string(threadRef), "message": "NOSUCHMSG", "text": "x"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("comment.edit", ["ref": .string(threadRef), "message": .string(replyID), "text": "  "])
+        }
+
+        let first = try await h.run("comment.deleteMessage", ["ref": .string(threadRef), "message": "FIXTUREMSG01"])
+        XCTAssertEqual(first["deletedThread"]?.boolValue, false)
+        let last = try await h.run("comment.deleteMessage", ["ref": .string(threadRef), "message": .string(replyID)])
+        XCTAssertEqual(last["deletedThread"]?.boolValue, true)
+        XCTAssertThrowsError(try item(h, threadRef))
+
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try item(h, threadRef).comment?.messages.map(\.id.raw), [replyID])
+    }
+
+    func testTapOpensThePinUnderTheFingerAndSkipsHiddenResolvedThreads() async throws {
+        let h = harness()
+        let panels = installPanelHost(h)
+        let tap: JSONValue = ["page": .string(pageRef), "point": [566, 404], "gesture": "tap"]
+
+        var r = try await h.run("comment.tapAt", tap)
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+        XCTAssertEqual(r["ref"]?.stringValue, threadRef)
+        XCTAssertEqual(panels.opened, [CommentPanels.thread])
+        XCTAssertEqual(panels.params.last, ["ref": .string(threadRef)], "the thread travels in panel.open's params")
+        XCTAssertEqual(panels.target, .thread(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID))
+
+        r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [300, 300], "gesture": "tap"])
+        XCTAssertEqual(r["handled"]?.boolValue, false)
+
+        // A pin on a layer hidden on this device is not drawn, so a finger tap (or the canvas's topmost-item ref)
+        // cannot open it; the Comments list still can.
+        let pinLayer = try item(h, threadRef).layer
+        h.session.hiddenLayers = [pinLayer]
+        r = try await h.run("comment.tapAt", tap)
+        XCTAssertEqual(r["handled"]?.boolValue, false, "a pin on a hidden layer cannot be tapped")
+        r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [566, 404], "gesture": "tap",
+                                              "ref": .string(threadRef)])
+        XCTAssertEqual(r["handled"]?.boolValue, false, "nor opened through the canvas's topmost-item ref")
+        r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [0, 0], "ref": .string(threadRef)])
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+        h.session.hiddenLayers = []
+
+        try await h.run("comment.resolve", ["ref": .string(threadRef), "resolved": true])
+        r = try await h.run("comment.tapAt", tap)
+        XCTAssertEqual(r["handled"]?.boolValue, false, "a hidden resolved pin cannot be tapped")
+        // The Comments list and comment links name the thread, so they open it even while resolved ones are hidden.
+        r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [0, 0], "ref": .string(threadRef)])
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+
+        h.app.settings.set(CommentSettings.showResolved, true)
+        r = try await h.run("comment.tapAt", tap)
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+    }
+
+    func testEmptyTextFromTheUIOpensADraftAndWritesNothing() async throws {
+        let h = harness()
+        let panels = installPanelHost(h)
+        let depth = h.undoDepth(Fixtures.docID)
+        let r = try await h.run("comment.add", ["page": .string(pageRef),
+                                                "ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": ""])
+        XCTAssertEqual(r["draft"]?.boolValue, true)
+        XCTAssertNil(r["ref"])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        XCTAssertEqual(panels.opened, [CommentPanels.thread])
+        guard case .draft(let draft)? = panels.target else { return XCTFail("no draft in the thread panel") }
+        XCTAssertEqual(draft.parent, Fixtures.textID)
+        XCTAssertEqual(draft.at, Point(372, 400))   // the text box's top-right corner
+        XCTAssertEqual(panels.params.last?["ref"]?.stringValue, "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01")
+
+        // Adding another comment at the same spot opens a fresh draft, so the panel leaves the thread the first
+        // draft became.
+        try await h.run("comment.add", ["page": .string(pageRef), "ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01",
+                                        "text": ""])
+        guard case .draft(let again)? = panels.target else { return XCTFail("no second draft") }
+        XCTAssertNotEqual(again.key, draft.key)
+        XCTAssertNotEqual(panels.params[0], panels.params[1])
+
+        await assertError(.invalidParams) {
+            _ = try await h.run("comment.add", ["page": .string(pageRef), "text": " "], as: .ai("chat1"))
+        }
+    }
+
+    func testPinDrawerHidesResolvedThreadsUnlessShowResolvedIsOn() throws {
+        let h = harness()
+        var comment = CommentItem(anchor: Point(16, 16), messages: [CommentMessage(author: "Ana", text: "Why?")])
+        let drawer = try XCTUnwrap(h.app.content.drawer(for: Item.makeComment(comment)))
+        func paints(_ c: CommentItem, purpose: DrawPurpose = .screen, annotations: Bool = true) -> Bool {
+            let size = 32
+            guard let cg = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: size * 4,
+                                     space: CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  let data = cg.data else { return false }
+            drawer.draw(Item.makeComment(c), in: DrawContext(cg: cg, scale: 1, doc: Fixtures.docID, page: Fixtures.page1,
+                                                             purpose: purpose, annotations: annotations))
+            let bytes = data.bindMemory(to: UInt8.self, capacity: size * size * 4)
+            return (0..<(size * size)).contains { bytes[$0 * 4 + 3] > 0 }
+        }
+        XCTAssertTrue(paints(comment))
+        XCTAssertTrue(paints(comment, purpose: .thumbnail))
+        XCTAssertTrue(paints(comment, purpose: .query))
+        // Pins are annotations: exports write comments as PDF text annotations instead, and a render that asks for no
+        // annotations gets none.
+        XCTAssertFalse(paints(comment, purpose: .export))
+        XCTAssertFalse(paints(comment, annotations: false))
+        comment.resolved = true
+        XCTAssertFalse(paints(comment))
+        h.app.settings.set(CommentSettings.showResolved, true)
+        XCTAssertTrue(paints(comment))
+        XCTAssertFalse(paints(comment, purpose: .export))
+    }
+
+    func testShowResolvedToggleRedrawsOpenCanvases() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        let editor = FakeEditor(session: h.session, host: host)
+        h.session.editor = editor
+        await FeatCommentsFeature.start(h.app)
+
+        try await h.run("settings.set", ["name": "comments.showResolved", "value": true])
+        for _ in 0..<50 where host.invalidations.isEmpty { await Task.yield() }
+        XCTAssertTrue(h.app.settings.get(CommentSettings.showResolved))
+        XCTAssertEqual(Set(host.invalidations.map { $0.page }), [Fixtures.page1, Fixtures.page2, Fixtures.pdfPage])
+        withExtendedLifetime(editor) {}
+    }
+
+    func testCommentsListGroupsThreadsByPageInReadingOrder() async throws {
+        let h = harness()
+        try await h.run("comment.add", ["page": .string(pageRef), "at": [100, 50], "text": "Top of the page"])
+        try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [10, 10], "text": "Second page"])
+        try await h.run("comment.reply", ["ref": .string(threadRef), "text": "Agreed"])
+        try await h.run("comment.resolve", ["ref": .string(threadRef), "resolved": true])
+        let content = try h.app.workspace.content(Fixtures.docID)
+        let items: (PageID) -> [Item] = { (try? h.app.workspace.items(Fixtures.docID, page: $0)) ?? [] }
+
+        let open = CommentsListModel.build(content: content, items: items, showResolved: false)
+        XCTAssertEqual(open.hidden, 1)
+        XCTAssertEqual(open.sections.map(\.title), ["Page 1", "Page 2"])
+        XCTAssertEqual(open.sections.first?.rows.map(\.text), ["Top of the page"])
+
+        let all = CommentsListModel.build(content: content, items: items, showResolved: true)
+        XCTAssertEqual(all.hidden, 0)
+        XCTAssertEqual(all.sections.first?.rows.map(\.text), ["Top of the page", "Check this"])
+        XCTAssertEqual(all.sections.first?.rows.last?.count, 2)
+        XCTAssertEqual(all.sections.first?.rows.last?.resolved, true)
+    }
+
+    func testMenusPinToTheSelectionAndHideEditsInReadOnly() {
+        let h = harness()
+        let selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.imageID],
+                                  bounds: Rect(x: 320, y: 480, width: 64, height: 64))
+        var ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1,
+                              selection: selection, itemKinds: [.image])
+        XCTAssertTrue(CommentMenus.canAddOnSelection(ctx))
+        XCTAssertEqual(CommentMenus.objectParams(ctx)["ref"]?.stringValue, "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREIMG01")
+        ctx.selection.items.append(Fixtures.textID)
+        XCTAssertNil(CommentMenus.objectParams(ctx)["ref"])
+        XCTAssertEqual(CommentMenus.objectParams(ctx)["at"], [384, 480])
+
+        let threadMenu = CommentMenus.context(app: h.app, session: h.session, ref: threadRef)
+        XCTAssertEqual(h.app.ui.menuItems(.comment, threadMenu).map(\.id),
+                       [CommentMenus.resolveID, CommentMenus.revealID, CommentMenus.deleteID])
+        h.session.readOnly = true
+        XCTAssertFalse(CommentMenus.canAddOnSelection(ctx))
+        XCTAssertEqual(h.app.ui.menuItems(.comment, threadMenu).map(\.id), [CommentMenus.revealID])
+    }
+
+    func testShowResolvedIsOneCheckedDocumentMoreEntry() async throws {
+        let h = harness()
+        let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1)
+        let entries = h.app.ui.menuItems(.documentMore, ctx).filter { $0.owner == FeatCommentsFeature.id }
+        XCTAssertEqual(entries.map(\.id), [CommentMenus.showResolvedID])
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entry.command, CommandIDs.settingsSet)
+        XCTAssertEqual(entry.isChecked?(ctx), false)
+        XCTAssertEqual(entry.params(ctx)["value"], .bool(true), "an unchecked entry turns the setting on")
+
+        try await h.run(entry.command, entry.params(ctx))
+        XCTAssertTrue(h.app.settings.get(CommentSettings.showResolved))
+        XCTAssertEqual(entry.isChecked?(ctx), true)
+        XCTAssertEqual(entry.params(ctx)["value"], .bool(false), "a checked entry turns the setting off")
+        try await h.run(entry.command, entry.params(ctx))
+        XCTAssertFalse(h.app.settings.get(CommentSettings.showResolved))
+    }
+
+    func testPanelsRenderInEveryState() throws {
+        let h = harness()
+        let list = try XCTUnwrap(h.app.ui.panels.get(CommentPanels.list))
+        let threadPanel = try XCTUnwrap(h.app.ui.panels.get(CommentPanels.thread))
+        XCTAssertEqual(list.placement, .sidebarTab)
+        XCTAssertEqual(threadPanel.placement, .floating)
+        XCTAssertTrue(threadPanel.providesHeader, "the thread draws its own NibPanelHeader with Resolve, More and Close")
+        XCTAssertFalse(list.providesHeader)
+        let targets: [CommentPanelTarget?] = [
+            nil,
+            .thread(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID),
+            .draft(CommentPanelTarget.Draft(doc: Fixtures.docID, page: Fixtures.page1, at: Point(10, 10), parent: nil,
+                                            key: "DRAFT1")),
+        ]
+        let size = CGSize(width: 344, height: 560)
+        for target in targets {
+            var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+            context.params = target?.params ?? [:]
+            context.presentation = .floating
+            for panel in [list, threadPanel] {
+                let label = "\(panel.id) \(String(describing: target))"
+                // Light, Dark and AX3 (DESIGN.md §15.7); Reduce Transparency and Increase Contrast are smoke scripts.
+                let images = NibSnapshot.images(panel.makeView(context), size: size)
+                XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases), label)
+                for (variant, image) in images {
+                    XCTAssertTrue(hasInk(image), "\(label) \(variant) draws nothing")
+                }
+                let fitting = NibSnapshot.fittingSize(panel.makeView(context), width: size.width, variant: .largeText)
+                XCTAssertGreaterThan(fitting.height, 0, label)
+            }
+        }
+    }
+
+    /// True when any pixel of `image` is not fully transparent (redrawn into RGBA so the byte order is known).
+    private func hasInk(_ image: UIImage) -> Bool {
+        guard let cg = image.cgImage else { return false }
+        let width = cg.width
+        let height = cg.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return false }
+        return stride(from: 3, to: pixels.count, by: 4).contains { pixels[$0] > 0 }
+    }
+
+    func testPanelTargetsRoundTripThroughPanelParams() {
+        let thread = CommentPanelTarget.thread(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID)
+        XCTAssertEqual(thread.params, ["ref": .string(threadRef)])
+        XCTAssertEqual(CommentPanelTarget(params: thread.params), thread)
+
+        let pinned = CommentPanelTarget.draft(CommentPanelTarget.Draft(
+            doc: Fixtures.docID, page: Fixtures.page1, at: Point(12, 34), parent: Fixtures.textID, key: "K1"))
+        XCTAssertEqual(pinned.params["ref"]?.stringValue, "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01")
+        XCTAssertEqual(CommentPanelTarget(params: pinned.params), pinned)
+        let spot = CommentPanelTarget.draft(CommentPanelTarget.Draft(
+            doc: Fixtures.docID, page: Fixtures.page2, at: Point(1, 2), parent: nil, key: "K2"))
+        XCTAssertNil(spot.params["ref"])
+        XCTAssertEqual(CommentPanelTarget(params: spot.params), spot)
+
+        // Opened without params (a plugin's panel.open {id}), or with something else: nothing to show.
+        XCTAssertNil(CommentPanelTarget(params: [:]))
+        XCTAssertNil(CommentPanelTarget(params: ["ref": .string(pageRef)]))
+        XCTAssertNil(CommentPanelTarget(params: ["draft": "K", "page": .string(pageRef), "at": [1]]))
+        XCTAssertNil(CommentPanelTarget(params: ["draft": "K", "page": .string(pageRef), "at": [1, 2],
+                                                 "ref": "item:FIXTUREDOC01/FIXTUREPG002/FIXTURETXT01"]),
+                     "a draft's object sits on the draft's page")
+    }
+
+    func testThreadPanelFollowsNewParamsFromPanelOpen() throws {
+        let h = harness()
+        let model = CommentThreadModel(app: h.app, session: h.session, target: nil)
+        XCTAssertEqual(model.content, .empty)
+        let thread = CommentPanelTarget.thread(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID)
+        model.focus(thread)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID)
+        XCTAssertEqual(model.content, .thread(doc: Fixtures.docID, page: Fixtures.page1, item: item))
+        XCTAssertEqual(model.ref, threadRef)
+        let draft = CommentPanelTarget.Draft(doc: Fixtures.docID, page: Fixtures.page2, at: Point(5, 5), parent: nil,
+                                             key: "K3")
+        model.focus(.draft(draft))
+        XCTAssertEqual(model.content, .draft(draft))
+        XCTAssertEqual(model.pageTitle, "Page 2")
+        XCTAssertNil(model.ref)
+        model.focus(.thread(doc: Fixtures.docID, page: Fixtures.page1, id: NibID("NOSUCHCMT01")))
+        XCTAssertEqual(model.content, .missing)
+    }
+
+    func testCopyLinkAndCopyTextGoThroughClipboardCopyText() async throws {
+        let h = harness()
+        let copied = installClipboard(h)
+        let link = try XCTUnwrap(CommentLink.url(ref: threadRef))
+        let linked = await CommentUI.copy(link: link, app: h.app, session: h.session)
+        XCTAssertTrue(linked)
+        let texted = await CommentUI.copy(text: "Check this", app: h.app, session: h.session)
+        XCTAssertTrue(texted)
+        XCTAssertEqual(copied.refs, ["nib://open/FIXTUREDOC01/FIXTUREPG001?comment=FIXTURECMT01", "Check this"])
+
+        // Without F014 the copy fails (and toasts) instead of writing the pasteboard behind the command bus's back.
+        h.app.commands.unregister(id: CommandIDs.clipboardCopyText)
+        let missing = await CommentUI.copy(text: "Lost", app: h.app, session: h.session)
+        XCTAssertFalse(missing)
+    }
+
+    func testCommentLinksRoundTripAndMessageLinksAreDetected() throws {
+        let url = try XCTUnwrap(CommentLink.url(doc: Fixtures.docID, page: Fixtures.page1, comment: Fixtures.commentID))
+        XCTAssertEqual(url.absoluteString, "nib://open/FIXTUREDOC01/FIXTUREPG001?comment=FIXTURECMT01")
+        let parsed = try XCTUnwrap(CommentLink.parse(url))
+        XCTAssertEqual(parsed.doc, Fixtures.docID)
+        XCTAssertEqual(parsed.page, Fixtures.page1)
+        XCTAssertEqual(parsed.comment, Fixtures.commentID)
+        XCTAssertNil(CommentLink.parse(try XCTUnwrap(URL(string: "nib://open/FIXTUREDOC01/FIXTUREPG001"))))
+        XCTAssertNil(CommentLink.parse(try XCTUnwrap(URL(string: "https://example.com/open/A/B?comment=C"))))
+
+        let text = "See \(url.absoluteString). Also https://example.com/units, thanks"
+        XCTAssertEqual(CommentText.links(in: text).map { $0.url.absoluteString },
+                       [url.absoluteString, "https://example.com/units"])
+        XCTAssertTrue(CommentText.links(in: "no links *here*").isEmpty)
+        let attributed = CommentText.attributed("Read https://example.com now")
+        XCTAssertEqual(attributed.runs.compactMap { $0.link?.absoluteString }, ["https://example.com"])
+    }
+
+    func testHitPrefersTheNearestVisiblePinAndGrowsWhenZoomedOut() {
+        let a = Item.makeComment(CommentItem(anchor: Point(100, 100), messages: []))
+        let b = Item.makeComment(CommentItem(anchor: Point(112, 100), messages: []))
+        let resolved = Item.makeComment(CommentItem(anchor: Point(108, 100), messages: [], resolved: true))
+        let items = [a, b, resolved]
+        XCTAssertEqual(CommentRules.hit(items, at: Point(109, 100), radius: 22, showResolved: false)?.id, b.id)
+        XCTAssertEqual(CommentRules.hit(items, at: Point(109, 100), radius: 22, showResolved: true)?.id, resolved.id)
+        let onLayer2 = Item.makeComment(CommentItem(anchor: Point(109, 100), messages: []), layer: 2)
+        XCTAssertEqual(CommentRules.hit(items + [onLayer2], at: Point(109, 100), radius: 22, showResolved: false)?.id,
+                       onLayer2.id)
+        XCTAssertEqual(CommentRules.hit(items + [onLayer2], at: Point(109, 100), radius: 22, showResolved: false,
+                                        hiddenLayers: [2])?.id, b.id, "pins on hidden layers are not drawn")
+        XCTAssertNil(CommentRules.hit([a], at: Point(140, 100), radius: CommentRules.hitRadius(zoom: 2), showResolved: false))
+        XCTAssertNotNil(CommentRules.hit([a], at: Point(140, 100), radius: CommentRules.hitRadius(zoom: 0.5),
+                                         showResolved: false))
+        XCTAssertEqual(CommentRules.clamp(Point(-5, 900), to: .a4), Point(0, 841.89))
+        XCTAssertEqual(CommentRules.defaultAnchor(size: .a4, visible: nil), Point(595.28 - 36, 36))
+        XCTAssertEqual(CommentRules.defaultAnchor(size: .a4, visible: Rect(x: 0, y: 100, width: 200, height: 300)),
+                       Point(100, 250))
+    }
+
+    func testThreadPanelHandsTheDraftToItsThreadAndFollowsItWithoutRescanning() async throws {
+        let h = harness()
+        registerInk(h)
+        let counting = CountingPersistence(h.persistence)
+        h.app.workspace.persistence = counting
+        let model = CommentThreadModel(app: h.app, session: h.session, target: .draft(CommentPanelTarget.Draft(
+            doc: Fixtures.docID, page: Fixtures.page1, at: Point(372, 400), parent: Fixtures.textID, key: "DRAFT1")))
+        guard case .draft = model.content else { return XCTFail("the panel does not show the draft") }
+
+        // The first message creates the thread, pinned to the text box, and the panel moves on to it.
+        let sent = await model.send("Hi")
+        XCTAssertTrue(sent)
+        guard case let .thread(_, page, id)? = model.target else {
+            return XCTFail("the panel did not move on to the new thread")
+        }
+        XCTAssertEqual(page, Fixtures.page1)
+        let created = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+        XCTAssertEqual(created.attachedTo, Fixtures.textID)
+        XCTAssertEqual(created.comment?.messages.map(\.text), ["Hi"])
+        XCTAssertEqual(model.content, .thread(doc: Fixtures.docID, page: Fixtures.page1, item: created))
+        XCTAssertEqual(model.pageTitle, "Page 1")
+
+        // A reply shows straight from the changeset.
+        let replied = await model.send("Second")
+        XCTAssertTrue(replied)
+        guard case let .thread(_, _, shown) = model.content else { return XCTFail("the thread is gone") }
+        XCTAssertEqual(shown.comment?.messages.map(\.text), ["Hi", "Second"])
+
+        // Moving the thread to another page keeps its id, and the panel follows it.
+        h.app.commands.register(CommandDescriptor(id: "test.moveThread", title: "Move", summary: "Test.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { (tx: DocTransaction) -> Void in
+                var moved = try tx.item(Fixtures.docID, page: Fixtures.page1, id: id)
+                try tx.delete(item: id, doc: Fixtures.docID, page: Fixtures.page1)
+                moved.attachedTo = nil
+                moved.z = ""
+                try tx.put(moved, doc: Fixtures.docID, page: Fixtures.page2)
+            }
+            return [:]
+        }
+        try await h.run("test.moveThread")
+        XCTAssertEqual(model.target, .thread(doc: Fixtures.docID, page: Fixtures.page2, id: id))
+        guard case let .thread(_, shownPage, _) = model.content else { return XCTFail("the moved thread is not shown") }
+        XCTAssertEqual(shownPage, Fixtures.page2)
+        XCTAssertEqual(model.pageTitle, "Page 2")
+
+        // Deleting it leaves "Comment not found" open; ink after that reads no page at all (the page holding the
+        // PDF was never loaded, and nothing may load it looking for the thread).
+        counting.loads.removeAll()
+        let movedRef = NodeRef.item(Fixtures.docID, Fixtures.page2, id).description
+        for message in shown.comment?.messages ?? [] {
+            try await h.run("comment.deleteMessage", ["ref": .string(movedRef), "message": .string(message.id.raw)])
+        }
+        XCTAssertEqual(model.content, .missing)
+        try await h.run("test.ink")
+        try await h.run("test.ink")
+        XCTAssertEqual(model.content, .missing)
+        XCTAssertEqual(counting.loads, [], "commits must not scan the document for a deleted thread")
+
+        // Undoing the deletion brings the thread back into the open panel.
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(model.content, .missing)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        guard case let .thread(_, _, restored) = model.content else { return XCTFail("undo did not bring it back") }
+        XCTAssertEqual(restored.comment?.messages.map(\.text), ["Second"])
+    }
+
+    func testACommentLinkInTheSameDocumentRevealsAndOpensItsThread() async throws {
+        let h = harness()
+        let panels = installPanelHost(h)
+        let reveals = Calls()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewReveal, title: "Reveal", summary: "Test.",
+                                                  effect: .session)) { params, _ in
+            reveals.refs.append(params["ref"]?.stringValue ?? "")
+            return [:]
+        }
+        let url = try XCTUnwrap(CommentLink.url(doc: Fixtures.docID, page: Fixtures.page1, comment: Fixtures.commentID))
+        CommentUI.follow(url, app: h.app, session: h.session)
+        for _ in 0..<200 where panels.opened.isEmpty { await Task.yield() }
+        XCTAssertEqual(reveals.refs, [threadRef])
+        XCTAssertEqual(panels.opened, [CommentPanels.thread])
+        XCTAssertEqual(panels.target, .thread(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID))
+    }
+
+    func testCommentsListKeepsAnIndexThatCommitsUpdateWithoutRereadingPages() async throws {
+        let h = harness()
+        registerInk(h)
+        registerAddPage(h)
+        let counting = CountingPersistence(h.persistence)
+        h.app.workspace.persistence = counting
+        let model = CommentsListModel(app: h.app, session: h.session)
+        await model.scan?.value
+        XCTAssertFalse(model.scanning)
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1"])
+        XCTAssertEqual(counting.loads.count, Set(counting.loads).count, "the scan reads each page once")
+
+        // Memory pressure drops the cached pages but not the index.
+        h.app.workspace.evictPages(Fixtures.docID, keeping: [Fixtures.page1])
+        counting.loads.removeAll()
+        try await h.run("test.ink")
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1"])
+
+        let added = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [10, 10],
+                                                    "text": "Second page"])
+        let addedRef = try XCTUnwrap(added["ref"]?.stringValue)
+        let addedMessage = try XCTUnwrap(added["message"]?.stringValue)
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2"])
+        XCTAssertEqual(model.sections.last?.rows.map(\.text), ["Second page"])
+
+        try await h.run("comment.resolve", ["ref": .string(threadRef), "resolved": true])
+        XCTAssertEqual(model.sections.map(\.title), ["Page 2"])
+        XCTAssertEqual(model.hiddenResolved, 1)
+
+        h.app.settings.set(CommentSettings.showResolved, true)
+        for _ in 0..<200 where !model.showResolved { await Task.yield() }
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2"])
+        XCTAssertEqual(model.sections.first?.rows.first?.resolved, true)
+        XCTAssertEqual(model.hiddenResolved, 0)
+
+        // A new page is read as it arrives (the PDF page before it has no threads, so it shows as page 4).
+        try await h.run("test.addPage", ["id": "NEWPAGE00001", "text": "New page"])
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2", "Page 4"])
+
+        try await h.run("comment.deleteMessage", ["ref": .string(addedRef), "message": .string(addedMessage)])
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 4"])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2", "Page 4"])
+
+        XCTAssertFalse(counting.loads.contains(Fixtures.page1), "page 1 stayed cached and was never re-read")
+        XCTAssertFalse(counting.loads.contains(Fixtures.pdfPage), "no commit touched the PDF page, so it was not read")
+
+        let content = try h.app.workspace.content(Fixtures.docID)
+        let oracle = CommentsListModel.build(content: content, items: {
+            (try? h.app.workspace.items(Fixtures.docID, page: $0)) ?? []
+        }, showResolved: true)
+        XCTAssertEqual(model.sections, oracle.sections)
+
+        // A long document is read a few pages per main-actor turn and ends with the same list.
+        for n in 0..<CommentsListModel.scanChunk {
+            try await h.run("test.addPage", ["id": .string("MOREPAGE\(1000 + n)")])
+        }
+        try await h.run("test.addPage", ["id": "LASTPAGE0001", "text": "At the end"])
+        let fresh = CommentsListModel(app: h.app, session: h.session)
+        XCTAssertTrue(fresh.scanning)
+        await fresh.scan?.value
+        XCTAssertFalse(fresh.scanning)
+        XCTAssertEqual(fresh.sections, model.sections)
+        XCTAssertEqual(fresh.sections.last?.rows.map(\.text), ["At the end"])
+    }
 }

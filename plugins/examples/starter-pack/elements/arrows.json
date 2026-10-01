@@ -1,1 +1,116 @@
-{}
+[
+  {
+    "id": "right",
+    "title": "Right arrow",
+    "fragment": {
+      "format": "nib-fragment/1",
+      "bounds": [
+        0,
+        0,
+        64,
+        32
+      ],
+      "assets": {},
+      "items": [
+        {
+          "id": "arrow",
+          "kind": "shape",
+          "z": "V",
+          "layer": 0,
+          "shape": {
+            "shape": "polyline",
+            "frame": {
+              "x": 0,
+              "y": 0,
+              "w": 64,
+              "h": 32
+            },
+            "points": [
+              [
+                0,
+                16
+              ],
+              [
+                64,
+                16
+              ],
+              [
+                48,
+                0
+              ],
+              [
+                64,
+                16
+              ],
+              [
+                48,
+                32
+              ]
+            ],
+            "style": {
+              "strokeColor": "#267A79FF",
+              "strokeWidth": 2
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "id": "down",
+    "title": "Down arrow",
+    "fragment": {
+      "format": "nib-fragment/1",
+      "bounds": [
+        0,
+        0,
+        32,
+        64
+      ],
+      "assets": {},
+      "items": [
+        {
+          "id": "arrow",
+          "kind": "shape",
+          "z": "V",
+          "layer": 0,
+          "shape": {
+            "shape": "polyline",
+            "frame": {
+              "x": 0,
+              "y": 0,
+              "w": 32,
+              "h": 64
+            },
+            "points": [
+              [
+                16,
+                0
+              ],
+              [
+                16,
+                64
+              ],
+              [
+                0,
+                48
+              ],
+              [
+                16,
+                64
+              ],
+              [
+                32,
+                48
+              ]
+            ],
+            "style": {
+              "strokeColor": "#267A79FF",
+              "strokeWidth": 2
+            }
+          }
+        }
+      ]
+    }
+  }
+]

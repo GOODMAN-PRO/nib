@@ -62,8 +62,8 @@ public struct DropletStyle: Equatable, Sendable {
     /// like every other droplet (Clear glass is for media and never mixes with Regular, DESIGN.md §2.2).
     public var refracts = true
     /// Touchable chrome: `Glass.interactive()` on iOS 26 wherever the glass itself takes the touch (`nibGlass`, a
-    /// droplet outside a container). Inside a container the body sits behind the content and is never hit-tested, so
-    /// the poke (§10.2) and the held rim (`liftedRim`) are the press response there.
+    /// droplet inside or outside a container). The glass is hosted by the foreground controls; the poke (§10.2) and
+    /// the held rim (`liftedRim`) also follow Nib's physics.
     public var isInteractive = true
     /// Rim strength at rest (DESIGN.md §10.9): 1. `lifted` raises it to `liftedRim`.
     public var rim: CGFloat = 1

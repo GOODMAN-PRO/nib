@@ -1,1 +1,211 @@
-{}
+{
+  "name": "Presentation and AirPlay device smoke",
+  "description": "Real AirPlay/external-display routing, mirror/presenter/full-page modes, blanking, rotation and disconnect recovery.",
+  "requires": [
+    "doc.create",
+    "doc.open",
+    "present.setMode",
+    "ink.addStrokes",
+    "render.page",
+    "library.trash",
+    "settings.get",
+    "settings.set"
+  ],
+  "steps": [
+    {
+      "name": "Remember presentation preference (including an unset default)",
+      "command": "settings.get",
+      "params": {
+        "name": "presentation.mode"
+      },
+      "save": {
+        "originalPreference": "$"
+      },
+      "expect": {
+        "json": {
+          "name": "presentation.mode"
+        }
+      }
+    },
+    {
+      "command": "doc.create",
+      "params": {
+        "kind": "notebook",
+        "title": "Presentation smoke ${run}",
+        "id": "SMKPRESENT${run}",
+        "cover": false,
+        "pages": 3
+      },
+      "name": "Create disposable smoke notebook",
+      "expect": {
+        "json": {
+          "ref": {
+            "$match": "^doc:"
+          },
+          "pages": {
+            "$len": 3
+          }
+        }
+      },
+      "save": {
+        "doc": "ref",
+        "page": "pages[0]",
+        "pages": "pages"
+      }
+    },
+    {
+      "command": "doc.open",
+      "params": {
+        "doc": "${doc}"
+      }
+    },
+    {
+      "command": "ink.addStrokes",
+      "params": {
+        "page": "${page}",
+        "strokes": [
+          {
+            "style": {
+              "tool": "pen",
+              "pen": "ball",
+              "color": "#14213D",
+              "width": 2
+            },
+            "fmt": "xy",
+            "pts": [
+              72,
+              100,
+              200,
+              100
+            ]
+          }
+        ]
+      },
+      "expect": {
+        "json": {
+          "refs": {
+            "$len": 1
+          }
+        }
+      }
+    },
+    {
+      "manual": "Connect a real AirPlay receiver; repeat later with a wired display when available. Record receiver model and connection type."
+    },
+    {
+      "command": "present.setMode",
+      "params": {
+        "mode": "mirror",
+        "blank": false
+      },
+      "expect": {
+        "json": {
+          "mode": "mirror",
+          "blank": false
+        }
+      }
+    },
+    {
+      "manual": "Does the external display mirror the editor and follow zoom, toolbar changes and page navigation without freezing?"
+    },
+    {
+      "command": "present.setMode",
+      "params": {
+        "mode": "presenter",
+        "blank": false
+      },
+      "expect": {
+        "json": {
+          "mode": "presenter",
+          "blank": false
+        }
+      }
+    },
+    {
+      "manual": "Does the receiver show just the page while the iPad retains editing controls? Zoom and draw: verify smooth ink/zoom updates and transitions, without toolbar or private panels leaking to the receiver."
+    },
+    {
+      "command": "present.setMode",
+      "params": {
+        "mode": "fullPage",
+        "blank": false
+      },
+      "expect": {
+        "json": {
+          "mode": "fullPage",
+          "blank": false
+        }
+      }
+    },
+    {
+      "manual": "Is the entire page fitted to the receiver without editor controls or zoom animation? Rotate the iPad and change pages; verify aspect ratio, full page bounds and unclipped ink."
+    },
+    {
+      "command": "present.setMode",
+      "params": {
+        "mode": "fullPage",
+        "blank": true
+      },
+      "expect": {
+        "json": {
+          "mode": "fullPage",
+          "blank": true
+        }
+      }
+    },
+    {
+      "manual": "Is the receiver blank while the iPad remains usable?"
+    },
+    {
+      "command": "present.setMode",
+      "params": {
+        "mode": "fullPage",
+        "blank": false
+      },
+      "expect": {
+        "json": {
+          "mode": "fullPage",
+          "blank": false
+        }
+      }
+    },
+    {
+      "tool": "nib_render",
+      "args": {
+        "page": "${page}",
+        "marks": true
+      },
+      "expect": {
+        "image": true
+      },
+      "saveImage": "presentation-reference.png"
+    },
+    {
+      "manual": "Disconnect/reconnect AirPlay during editing, then background/foreground Nib. Does the local canvas stay responsive and the receiver recover the current page/mode without stale content?"
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "Clear external-display blanking",
+      "command": "present.setMode",
+      "params": {
+        "mode": "mirror",
+        "blank": false
+      }
+    },
+    {
+      "name": "Restore the exact saved presentation preference",
+      "command": "settings.set",
+      "params": "${originalPreference}"
+    },
+    {
+      "command": "library.trash",
+      "params": {
+        "refs": [
+          "${doc}"
+        ]
+      },
+      "name": "Move disposable notebook to recoverable Trash"
+    }
+  ]
+}

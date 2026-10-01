@@ -304,7 +304,7 @@ public struct NibTether<Chip: View>: View {
             TetherAnchor(id: id, anchor: anchor, node: field?.node(id + ".chip"))
             chip
                 .droplet(id + ".chip", style: .chip)
-                .position(rest)
+                .position(NibGeometry.point(rest))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -314,9 +314,12 @@ public struct NibTether<Chip: View>: View {
     /// nearest to it. Every stroke's bounds count, grown by `clearance` (8 pt). All in container coordinates.
     public static func restingCentre(chip size: CGSize, line: CGFloat, page: CGRect, trailingLimit: CGFloat,
                                      ink: [CGRect], clearance: CGFloat = 8) -> CGPoint {
+        let size = NibGeometry.size(size), page = NibGeometry.rect(page)
+        let line = NibGeometry.finite(line), trailingLimit = NibGeometry.finite(trailingLimit, fallback: page.maxX)
+        let clearance = NibGeometry.dimension(clearance)
         let right = min(page.maxX - NibSpacing.s, trailingLimit)
         let x = right - size.width / 2
-        let blocked = ink.map { $0.insetBy(dx: -clearance, dy: -clearance) }
+        let blocked = ink.filter(NibGeometry.isUsable).map { $0.insetBy(dx: -clearance, dy: -clearance) }
             .filter { $0.minX < right && $0.maxX > right - size.width }
         func free(_ y: CGFloat) -> Bool {
             let top = y - size.height / 2, bottom = y + size.height / 2
@@ -326,7 +329,7 @@ public struct NibTether<Chip: View>: View {
         // The line itself and every band edge: a band exactly as tall as the chip is still found.
         let candidates = [line] + blocked.flatMap { [$0.maxY + size.height / 2, $0.minY - size.height / 2] }
         let y = candidates.filter(free).min { abs($0 - line) < abs($1 - line) } ?? line
-        return CGPoint(x: x, y: y)
+        return NibGeometry.point(CGPoint(x: x, y: y))
     }
 }
 
@@ -343,7 +346,7 @@ struct TetherAnchor: View {
             Color.clear
                 .frame(width: 26, height: 26)
                 .droplet(id + ".anchor", style: .anchor)
-                .position(anchor)
+                .position(NibGeometry.point(anchor))
                 .accessibilityHidden(true)
         }
     }

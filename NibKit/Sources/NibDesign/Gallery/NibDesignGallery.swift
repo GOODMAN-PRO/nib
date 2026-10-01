@@ -96,3 +96,72 @@ public struct NibDesignGallery: View {
         }
     }
 }
+
+/// Small, deterministic live-glass regression scenes. Foreground references retain identical layout without glass;
+/// blank-glass captures isolate glyph pixels from the material, its rim and its backdrop.
+public struct NibGlassForegroundGallery: View {
+    public enum Surface: CaseIterable { case bar, palette, library, deep }
+    let surface: Surface
+    let glass: Bool
+    let showsContent: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    public init(surface: Surface, glass: Bool = true, showsContent: Bool = true) {
+        self.surface = surface
+        self.glass = glass
+        self.showsContent = showsContent
+    }
+
+    public var body: some View {
+        ZStack {
+            // Worst cases: light chrome over black ink; dark chrome over white paper. The reference backdrop
+            // contrasts with the unglassed glyphs so the tests can locate solid cores and anti-aliased edges.
+            (surface == .library ? NibColor.background
+                : (glass ? (colorScheme == .dark ? Color.white : Color.black)
+                         : (colorScheme == .dark ? Color.black : Color.white))).ignoresSafeArea()
+            if glass {
+                NibDropletContainer {
+                    scene
+                }
+                .nibBackdrop(colorScheme == .dark ? [CGRect(x: 0, y: 0, width: 360, height: 240)] : [])
+            } else {
+                foreground.opacity(showsContent ? 1 : 0)
+            }
+        }
+        .frame(width: 360, height: 240)
+    }
+
+    @ViewBuilder private var scene: some View {
+        if surface == .library {
+            HStack(spacing: NibSpacing.l) {
+                NibBarGroup(id: "library.controls") {
+                    NibToolbarItem(.search, label: "Search") {}
+                    NibToolbarItem(.sort, label: "Sort") {}
+                    NibToolbarItem(.select, label: "Select") {}
+                }
+                NibDropletButton(id: "library.new.button", title: "New", symbol: .plus, kind: .tinted) {}
+                    .frame(width: 96)
+            }
+        } else {
+            foreground.opacity(showsContent ? 1 : 0)
+                .droplet("gallery.foreground", style: surface == .deep ? .popover : (surface == .palette ? .palette : .bar))
+        }
+    }
+
+    private var foreground: some View {
+        HStack(spacing: NibSpacing.m) {
+            Image(nib: .pen).font(NibFont.glyph(.bar))
+            Image(nib: .search).font(NibFont.glyph(.bar))
+            if surface == .palette {
+                Image(nib: .eraser).font(NibFont.glyph(.bar))
+                ForEach(NibInk.quickSlots, id: \.self) { ink in
+                    Circle().fill(ink.color).frame(width: 18, height: 18)
+                }
+            } else {
+                NibBarTitle(title: "Physics — Motion", subtitle: "Page 1 of 4")
+            }
+        }
+        .foregroundStyle(NibColor.label)
+        .frame(width: 280, height: 44)
+    }
+}

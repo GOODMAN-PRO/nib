@@ -1,1 +1,70 @@
-{}
+{
+  "id": "dev.nib.wordcomplete",
+  "name": "Word Complete",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "Bring back handwriting word completion using the user's AI provider.",
+  "entry": "main.js",
+  "permissions": [
+    "document:read",
+    "document:write",
+    "ai"
+  ],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "dev.nib.wordcomplete.suggest",
+        "title": "Complete Word",
+        "summary": "Suggest completions of the last selected handwritten word and append the chosen suffix as ink.",
+        "params": {
+          "type": "object",
+          "properties": {
+            "selection": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Selected handwritten item ref."
+              }
+            },
+            "completion": {
+              "type": "string",
+              "description": "Optional completion to choose from the AI suggestions; otherwise shows a chooser."
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "Optional caller-chosen ids for the generated ink strokes."
+              }
+            }
+          }
+        },
+        "examples": [
+          {}
+        ],
+        "effect": "edit",
+        "target": "document",
+        "aiDirect": false,
+        "longRunning": true
+      }
+    ],
+    "menus": [
+      {
+        "location": "objectMenu",
+        "command": "dev.nib.wordcomplete.suggest",
+        "title": "Complete Word",
+        "icon": "pencil.line",
+        "when": {
+          "minSelection": 1,
+          "selectionKinds": [
+            "stroke"
+          ]
+        }
+      }
+    ]
+  }
+}
