@@ -1,0 +1,113 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryGridView.swift:219-234 (LibraryCover.load)",
+      "problem": "Cover thumbnails never load. LibraryCover finds the first page through `query.get {ref, depth: 1}`. That command belongs to F003, which is not a dependency of F019, and nothing on this branch or on origin/main registers it (`git grep queryGet` finds only CommandIDs and AIService). The call throws not_found, the catch sets image = nil, and every cover shows the placeholder glyph. The spec's 'thumbnails (services.renderer.thumbnail)' and D-002 fail. Even once F003 lands, query.get on a document goes through the AI query path, and it loads the document (with page items) for each cover. contracts-v2 G10 adds `Workspace.peekContent(_:)` ('no caching, no doc.opened') for exactly this purpose, so per the review rules this workaround counts as a major.",
+      "fix": "Resolve the page with `try model.app.workspace.peekContent(row.nodeID).pages.first?.id` (G10) instead of query.get. Then call `renderer.thumbnail(doc:page:maxPixelSize:)`. Add a test that installs a stub renderer and asserts that a cover requests the first page of FIXTUREDOC01 without query.get being registered."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryRootViewController.swift:87-98, 155-169, 135-140; FeatLibraryUIFeature.swift:127; LibraryGridView.swift:90,100,110",
+      "problem": "On large libraries the library does far too much work on the main actor. (1) Every model reacts to `tx.committed`, which the bus emits on every document commit (Bus.swift:482, so every stroke). Each such event calls coverCache.removeAllObjects() and reload(). (2) reload() runs `library.list` for the folder and then a recursive `library.list` of the whole library: 5,000 documents means five pages of 1,000 rows, JSON-encoded and decoded, only to keep the folders. (3) LibrarySetView calls model.applySort() on every invocation. That re-sorts every row with localizedStandardCompare and rebuilds the snapshot on each rubber-band onChanged, search keystroke, menu open and selection toggle. (4) Each visible cell recomputes `documents.map(\\.ref)` / `visibleRows.filter{}.map` (O(n) per cell). While the user inks in a document, the still-subscribed library model therefore reloads the whole catalog on every stroke.",
+      "fix": "Drop tx.committed from the subscription. F002 already emits library.changed for committed meta changes. For a commit, invalidate only `coverCache` entries for event.doc. Fetch folders with `library.list {recursive: true, kinds: [\"folder\"]}` and skip reload while the library view is not on screen (mark the model dirty and reload in onAppear). In LibrarySetView, call applySort only when rows, sort, filter, search or the manual order changed, not for selection, menu or rename. Compute the folder and document ref arrays once per applySort, store them on the model and pass them to the cells. Add a test with 5,000 rows that times applySort plus a reorder, not only the snapshot."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryRootViewController.swift:9-25 (LibraryModels.models)",
+      "problem": "Library view models are never released. `models[session.id]` is kept forever, so a closed iPad window leaves behind its model. That model still holds its event subscription, its three NotificationCenter sinks and its own NSCache of up to 64 MB of cover images. It keeps reloading the catalog on every library.changed and tx.committed. Each new window adds another one (a leak plus repeated duplicate work).",
+      "fix": "Remove the model and cancel its subscriptions when its session is removed. Observe the sessions registry's removal or scene disconnect, or hold models weakly and let LibraryRootViewController own the strong reference, with LibraryModels falling back to creating a model for command-only access. Share one cover cache across windows. Add a test: add a session, use library.setView, remove the session, and assert that the model is gone."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryItemMenu.swift:79-83, 95-97 used inside LibraryGridView.swift:126-128 (.contextMenu)",
+      "problem": "'Move to Trash' from a cover's context menu (D-011) most likely does nothing. The trash entry is destructive, so activate() only sets `@State pending`. The `.confirmationDialog` that should show it is attached inside the `.contextMenu` content. SwiftUI turns that content into a UIMenu and ignores presentation modifiers there, and the menu's view graph is torn down when the menu closes. So no dialog appears and run() is never called. The same applies to any destructive libraryItem entry that other owners register. Also, the dialog title is hard-coded to 'Move selected items to Trash?' for every destructive entry.",
+      "fix": "Hoist the pending confirmation into LibraryViewModel (for example `@Published var confirm: (MenuItemDescriptor, MenuContext)?`, set through library.setView or directly), and present one `.confirmationDialog` from LibraryRootView. Alternatively, run destructive entries straight from context menus and confirm only in select mode (DESIGN.md §14.1: 'Delete asks with a system confirmation dialog' is the select-mode bar). Title the dialog with entry.resolvedTitle."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLibraryUI/LibrarySorting.swift:98-109, LibraryRootViewController.swift:75,138,234; Tests/FeatLibraryUITests/LibrarySortingTests.swift:54-62",
+      "problem": "The acceptance criterion 'a diffable snapshot of 5,000 nodes is built in < 300 ms (asserted)' is met only on paper. `LibraryViewModel.snapshot` is a @Published NSDiffableDataSourceSnapshot that no view reads: the grid is a SwiftUI LazyVGrid/LazyVStack over visibleRows. The asserted test times an unused function. The path that really runs over 5,000 nodes (decode library.list rows → LibrarySorting.rows → section split) is not measured. Meanwhile the dead snapshot is rebuilt and published on every applySort, which triggers extra SwiftUI invalidations.",
+      "fix": "Either drive the grid from the snapshot (UICollectionView with a UICollectionViewDiffableDataSource) or drop the dead property. Then make the timed test cover the real pipeline: 5,000 LibraryRow values through `LibrarySorting.rows(sort: .name/.manual, filter:, search:)` plus the section split the grid uses, asserted < 0.3 s."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryGridView.swift:125, 171-178, 237-252",
+      "problem": "VoiceOver loses state on library items. `.accessibilityLabel(row.name)` on the cell Button replaces the combined label that NibDocumentCard/LibraryCover build, so the Locked, Favourite, Sync error/Syncing and page-count information is never spoken. In select mode, folder tiles (a NibBadge overlay) and list rows (a plain Image) expose no `.isSelected` trait or value. A VoiceOver user doing multi-select (D-015) cannot tell what is selected. The breadcrumb separator Image(nib: .forward) is also read aloud.",
+      "fix": "Remove the label override, or build the full label (name, status) and add `.accessibilityValue` for pages/items. Add `.accessibilityAddTraits(selected ? .isSelected : [])` to folder and list cells while selecting. Mark the breadcrumb chevron `.accessibilityHidden(true)`. Add a view-model test that asserts the accessibility label/value strings for a locked, favourite or sync-error row."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/FeatLibraryUIFeature.swift:78-131 (LibrarySetView.run)",
+      "problem": "library.setView ignores ctx.dryRun. An AI or nib_run dry-run preview changes the folder, persists `libraryui.view.*` settings, opens or closes panels and edits session.openPanels.",
+      "fix": "Validate everything (folder exists, panel registered and not .sidebarTab, selection op), then `guard !ctx.dryRun else { return <would-be result> }` before mutating the model or settings. Add a dry-run test like the one for library.reorder."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/FeatLibraryUIFeature.swift:86",
+      "problem": "Opening a folder while a library tab is shown sets `model.tab = nil` but leaves the tab's id in session.openPanels. This breaks 'its id is in the window's session.openPanels while it shows'.",
+      "fix": "Call `model.closeTab()` instead of assigning nil."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/FeatLibraryUIFeature.swift:149-167, LibraryRootViewController.swift:197-205, 240-243",
+      "problem": "Reorder undo is fragile. (1) The undo replays the full previous sibling list as `refs`. If any sibling was trashed, moved or duplicated away since, `inserting` throws invalid_params, the whole Undo fails, and only a failure toast appears. (2) Undo restores the order but leaves the folder on Manual, with a `library.order.*` key it never had, instead of the sort it had before. (3) The toast's Undo runs library.reorder with recordUndo defaulting to true, so it pushes a new window undo step on top of the original one, and ⌘Z then re-applies the reorder.",
+      "fix": "Return `{previous, previousSort, hadOrder}`. On undo, filter `previous` to the current children (append new ones) instead of failing, restore the previous sort through the view key, and remove the order key if it was absent. Have the toast call manager.undo() (or pass recordUndo: false and pop the step). Test undo after trashing one sibling."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryRootViewController.swift:484-498 (LibraryDragMonitor.target), 206-225 (drop)",
+      "problem": "The drag-target state goes stale and some drops are incomplete. When a lift is cancelled (reflow.cancel calls end() without onDrop) or moves out of .dragging, target() returns before clearing dropTarget/dropFrame. The folder tile stays 'fused' (isFused) and isPaused keeps its last value until the next drag. A `.combine` drop sends only the lifted ref even when a stacked multi-selection carrier is shown. Folder and combine drops post none of the toasts with Undo that DESIGN.md §10.12 requires ('Moved to Physics 9702 · Undo').",
+      "fix": "In target(), when `lift == nil || lift.phase != .dragging`, set dropTarget = nil and dropFrame = nil. Send the selected document refs for a combine. After library.move succeeds, post the §10.12 toast through floatingAdapter."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryGridView.swift:141-162, 57-60",
+      "problem": "The pointer rubber band only works after entering select mode (`guard model.selection.isSelecting`), so a trackpad or mouse drag on empty space does nothing. In select mode the selection DragGesture runs at the same time as the ScrollView pan. scrollDisabled flips only after the gesture has started, so a vertical touch scroll also range-selects rows.",
+      "fix": "Start the marquee for indirect-pointer drags outside select mode, gated on the pointer input. For touch, begin a range selection only when the drag starts mostly horizontally on a row, and otherwise let the scroll win."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryGridView.swift:136-139, 275-297 (LibraryDrop)",
+      "problem": "This is a trust-boundary gap. `.onDrop(of: [.text])` on folders, breadcrumbs and Trash accepts any plain text from any app, and it runs library.move or library.trash for every line that parses as `doc:`/`folder:`. F019 has no drag source of its own, so this path only ever serves external input.",
+      "fix": "Accept only a private UTType (for example `app.nib.library-refs`) that the app's own drag sources write. Otherwise remove these onDrop handlers, since reflow drags already reach these targets through LibraryTargets."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryRootViewController.swift:305, 509; LibraryGridView.swift:229; LibraryRootViewController.swift:83-84",
+      "problem": "Styling and metrics are hard-coded instead of NibDesign tokens: the 900 pt inline-sidebar breakpoint, the 4° stacked-carrier fan, the 512 px thumbnail size and the cover-cache limits. Also, the select-mode bar sits at the bottom leading edge, while DESIGN.md §14.1 places it at the bottom centre.",
+      "fix": "Use or add NibMetrics tokens (e.g. `NibMetrics.inlineSidebarBreakpoint`, `NibReflowMetrics.stackFan`, `NibMetrics.coverThumbnailPixels`) and centre the selection bar."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibrarySorting.swift:79-82",
+      "problem": "Date sorting is not a strict weak ordering when some rows have a nil date and others a date of 0. `a.modified != b.modified` is true for nil vs 0, but the comparison of `?? 0` values returns false both ways, so the name/ref tie-breaker is skipped. The resulting order is unstable between reloads.",
+      "fix": "Normalise first (`let x = a.modified ?? 0, y = b.modified ?? 0; if x != y { ... }`), then fall through to the name/ref tie-breakers. Add a test with nil and 0 dates."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryGridView.swift:61; MovePicker.swift:84-85",
+      "problem": "Text fields (the folder search and the MovePicker search and new-folder name) take their value from model state but write it through `app.perform`, which is an async Task. Right after a keystroke the binding still returns the old value, so a re-render before the command lands can reset the field. That can move the cursor to the end or break IME composition.",
+      "fix": "Keep the text in local @State and send library.setView from `.onChange` (debounced), or update the model synchronously and then record the command."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryUI/LibraryRootViewController.swift:411; LibraryGridView.swift:172,180",
+      "problem": "Counts are not pluralised: '\\(n) items', '\\(n) pages' and '\\(n) items · \\(sort)' read '1 items' / '1 pages'.",
+      "fix": "Use automatic grammar agreement (`^[\\(n) item](inflect: true)`) or a stringsdict plural entry."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibStore/* (dependency copy)",
+      "problem": "The branch carries a stale copy of F001. origin/feat/F001 has cab1410 ('F001 V2ADOPT: isReadOnly, contentRevision, SyncStatusPayload, deviceHex, …'), which feat/F019 does not contain: `git diff origin/feat/F001 HEAD -- NibKit/Sources/NibStore` shows 5 files, +112/-319. If F019 lands first, main gets the pre-v2-adopt store. F002 and F004 match their branches.",
+      "fix": "Merge origin/feat/F001 (and re-check F002/F004) into feat/F019 before landing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatLibraryUITests/*",
+      "problem": "The riskiest UI logic has no tests: LibraryViewModel.drop routing (dropTarget → library.move/library.trash, `lib` → root, .combine → library.move onto doc:, optimistic .reorder application and its failure reload), the MovePicker create-folder/move flow, and the window.showLibrary override when no session is active.",
+      "fix": "Add view-model tests that drive `model.drop(...)` with a stub bus recording the commands and params, and a MovePicker test using the harness library."
+    }
+  ]
+}

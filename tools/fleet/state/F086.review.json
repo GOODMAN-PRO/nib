@@ -1,0 +1,101 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatAISettings/ProviderListView.swift:78",
+   "problem": "ProviderListView puts its Form inside its own NavigationStack. The settings host (F027 SettingsRootViewController: SettingsPageHost is a navigationDestination inside NavigationStack(path:), on both iPad and iPhone) already provides the stack and sets the page title. A NavigationStack nested inside that destination gives two navigation bars with two 'AI' titles. The editor is then pushed onto the inner stack, without the host's Done button, and the host's back button pops the whole page.",
+   "fix": "Remove the NavigationStack wrapper and return the Form directly. Keep NavigationLink { ProviderEditorView(...) }, or use NavigationLink(value: row.id) with .navigationDestination(for: UUID.self), which pushes onto the host's stack. Drop .navigationTitle(\"AI\") because the host already applies page.title."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift:27-29, 49",
+   "problem": "ai.directTools is re-declared with synced: false (the SettingKey default). Its owner F084 (NibSettings doc; origin/feat/F084 AgentTools.swift:10) declares it with synced: true. F086 registers after F084 (Nib/App/FeatureList.swift:195/197), so F086's descriptor wins and settings.set from this page writes UserDefaults. F084 reads its typed key from the library's synced backend, so the agent never sees the user's direct-tool edits. The bridge reads the name untyped (UserDefaults), so the AI and the bridge diverge. The code comment 'Identical routing and schema keep either registration order valid' is false.",
+   "fix": "Declare AISettingsKeys.directTools as SettingKey(NibSettings.aiDirectToolsName, default: NibSettings.defaultAIDirectTools, synced: true), matching the owner's routing and schema. Add a test asserting h.app.settings.descriptor(NibSettings.aiDirectToolsName)?.synced == true, and one checking that a value written through settings.set is read back by a synced typed key."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatAISettings/ProviderListView.swift:120-122, 145; FeatAISettingsFeature.swift:30-31, 50",
+   "problem": "The 'max steps' acceptance item does nothing. The value is stored under the feature-private name aisettings.maxSteps, which no feature reads; F084 takes AIRequest.maxSteps from its callers. The footer even tells the user it is ignored ('The current AI agent uses a fixed limit of 40 tool rounds...'), which is a stub shown in the UI.",
+   "fix": "Store it under a shared AI name (e.g. \"ai.maxSteps\", synced like ai.directTools, schema .int(min: 1, max: 100)) and record a contract gap for NibSettings.aiMaxSteps, so that F084's AgentService clamps request.maxSteps to the setting. Remove the footer sentence about a fixed 40-round limit, and test that the setting reaches the request once it is wired."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift:190-207",
+   "problem": "Trust boundary: an AI, plugin or bridge caller can run ai.provider.save on an existing provider that has a saved key and change baseURL (or kind) to a host it controls. The key stays in the Keychain and is sent as x-api-key or Bearer to the new host on the next request or ai.provider.test. This breaks 'keys are never readable by plugins, the AI or the bridge'. The sensitive-confirmation sheet shows only a URL, not that the user's key goes with it.",
+   "fix": "In ProviderSave.run, when !ctx.principal.isUser, an existing config has a stored key, and the new config's scheme, host, port or kind differs, do one of two things. Either throw NibError(.permissionDenied, ..., hint: \"change the endpoint of a provider with a saved key in Settings › AI\"), or save with apiKey: \"\" and set hadKey false so the key must be re-entered. Add tests with principal .ai(\"chat\") and .plugin(...)."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatAISettings/ProviderListView.swift:93-96, 155-159; ProviderEditorView.swift:227-235, 266-268",
+   "problem": "This is a workaround for something NibDesign v2 now covers. The table lists F086 among the features that should use NibBanner. Instead, the credentials-missing notice, the HTTP-key warning (a NibRow with warningTriangle), the load error with Reload, and operation errors are hand-built. Text is drawn in NibColor.warning (systemOrange) at footnote size, about 2.2:1 on light backgrounds, which fails the 4.5:1 contrast rule.",
+   "fix": "Use NibBanner(String(localized: \"credentials missing — re-enter\"), style: .warning), NibBanner(httpWarning, style: .warning), and NibBanner(error, style: .warning, action: NibAction(String(localized: \"Reload settings\")) { Task { await model.refresh() } }). Show failures as NibBanner(.warning) and success as NibColor.labelSecondary text or NibBanner(.info). Never draw text in NibColor.warning."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/ProviderListView.swift:111, 143, 153, 163-164; ProviderEditorView.swift:205, 236-237, 256, 284-285",
+   "problem": "Section headers are plain Text, which grouped Forms render uppercase by default. The Slop checklist says 'No all-caps labels', and F027's SettingsHeader uses .textCase(nil) for this reason. The headers also lack the isHeader trait. The page sets .background(NibColor.backgroundSecondary): in dark mode that is #1C1C1E, the same colour as the grouped row fill, so rows do not separate, and it differs from the host's groupedBackground.",
+   "fix": "Use headers styled like SettingsHeader: NibFont.footnoteEmphasis, NibColor.labelSecondary, .textCase(nil), .accessibilityAddTraits(.isHeader). Use NibColor.groupedBackground, or drop the scrollContentBackground/background override."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift:40-44",
+   "problem": "F086 sets the AI principal's gateway policy in start(). contracts-v2 G27 gives this to F084 ('Adopt: ... F084 its policy'), and F084 already sets it in register. F086's later start() silently replaces the owner's closure.",
+   "fix": "Remove FeatAISettingsFeature.start's setPolicy call. F086 should only edit NibSettings.aiConfirmationPolicy."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/ProviderEditorView.swift:59-62",
+   "problem": "The OpenRouter preset clears extra headers. AI.md §2.1 says the preset carries extra headers HTTP-Referer and X-Title: Nib.",
+   "fix": "In apply(.openRouter), set headers = \"HTTP-Referer: <Nib site URL>\\nX-Title: Nib\", and assert it in testPresetsAndRegistrationConformance."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/ProviderListView.swift:37-38, 124-134",
+   "problem": "The direct-tools picker runs commands.list as the user, so it offers every command, including ones not exposed to the AI. It also shows raw ids in a menu of hundreds of entries.",
+   "fix": "Filter to commands the AI may call: run commands.list with principal .ai(\"settings\"), or filter on exposure. Show the title with the id as the subtitle in both the rows and the picker."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift:130-134, 237-243",
+   "problem": "Credential status is kept twice: F086's aisettings.credentials.<id> marker and F083's ProviderStore Entry.hasKey. The two can disagree. ProviderDelete's success check cannot see F083's swallowed persist failure, so a provider reported deleted can come back after relaunch.",
+   "fix": "File a contract gap asking AIProviderStore for credentialsMissing(_:) and a throwing delete, then use them. Until then, also set hadKey true in ProviderList whenever the Keychain holds a key, so the marker repairs itself."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/ProviderListView.swift:171-174",
+   "problem": "The SettingsStore.didChange observer has no main-queue hop, even though the store is documented as thread-safe and may post from any thread. It also refreshes after any app setting change, and each refresh re-runs commands.list.",
+   "fix": "Add .receive(on: DispatchQueue.main), and filter on userInfo[\"name\"] for the AI keys (NibSettings.aiConfirmationPolicy.name, ai.directTools, max steps, the aisettings.credentials. prefix)."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift:66-73",
+   "problem": "The key-in-metadata check is unreliable. It rejects short placeholder keys (for example '1', which appears in http://localhost:1234/v1). It is also skipped when the saved key is kept, so a kept key typed into a header or the name is saved unencrypted.",
+   "fix": "Check only keys of at least 8 characters. When key is nil, compare against the stored Keychain value, read locally and never returned."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/ProviderEditorView.swift:293-298",
+   "problem": "Each field has a visible Text label and a NibField with .accessibilityLabel(title), so VoiceOver reads every label twice.",
+   "fix": "Mark the visual label .accessibilityHidden(true), or use LabeledContent."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/ProviderEditorView.swift:141-159",
+   "problem": "isPrivateHost treats Tailscale addresses (100.64.0.0/10, *.ts.net) as public. AI.md §2.1 names Tailscale as a supported http use case, so those endpoints get a false 'sent without encryption' warning.",
+   "fix": "Treat 100.64.0.0/10 and the .ts.net suffix as private, and add them to testHTTPWarningRecognisesPrivateAddresses."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift:259-261",
+   "problem": "ai.provider.test {id} with an unknown id returns unavailable with the message 'Add an AI provider before testing a connection.' That is misleading for an AI or plugin caller.",
+   "fix": "When p.id is set and not found, throw NibError(.notFound, \"AI provider not found.\", hint: \"call ai.provider.list\")."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Tests/FeatAISettingsTests/FeatAISettingsTests.swift:45-65, 189-198",
+   "problem": "The risky trust-boundary logic has no tests. Missing: a non-user principal in the staged group gets no key; a hook that rewrites params between staging and run is refused ('The provider changed before its credentials could be saved'); a non-user changes the endpoint. The snapshot test only asserts that an image is produced, and ProviderListView and iPhone width are never rendered.",
+   "fix": "Add tests for each of these paths, including one with a test hook that returns modified params. Render ProviderListView and ProviderEditorView at iPhone (375x812) and NibMetrics.settingsSheetSize in all NibSnapshot variants, and assert fittingSize, for example that nothing overflows its width at AX3."
+  }
+ ]
+}
