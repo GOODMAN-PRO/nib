@@ -8,22 +8,48 @@ struct BackupQueue: Codable, Equatable {
         var token: UUID = UUID()
         var queuedAt: Double
     }
-    var entries: [Entry] = []
+    private(set) var entries: [Entry] = []
     var lastAttempt: Double?
     var lastSuccess: Double?
+    // Derived from entries and excluded from disk state. Commits must not scan the whole queue.
+    private var indices: [DocumentID: Int] = [:]
+
+    private enum CodingKeys: String, CodingKey { case entries, lastAttempt, lastSuccess }
+
+    init() { }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try values.decode([Entry].self, forKey: .entries)
+        lastAttempt = try values.decodeIfPresent(Double.self, forKey: .lastAttempt)
+        lastSuccess = try values.decodeIfPresent(Double.self, forKey: .lastSuccess)
+        rebuildIndices()
+    }
+
+    private mutating func rebuildIndices() {
+        indices = Dictionary(entries.enumerated().map { ($0.element.document, $0.offset) },
+                             uniquingKeysWith: { first, _ in first })
+    }
+
+    func contains(_ document: DocumentID) -> Bool { indices[document] != nil }
 
     mutating func enqueue(_ document: DocumentID, at time: Double) {
-        if let i = entries.firstIndex(where: { $0.document == document }) {
+        if let i = indices[document] {
             entries[i].token = UUID()
         } else {
+            indices[document] = entries.count
             entries.append(Entry(document: document, queuedAt: time))
         }
     }
     mutating func acknowledge(_ entry: Entry) {
         entries.removeAll { $0.document == entry.document && $0.token == entry.token }
+        rebuildIndices()
     }
-    mutating func retain(_ documents: Set<DocumentID>) { entries.removeAll { !documents.contains($0.document) } }
-    mutating func clear() { entries.removeAll() }
+    mutating func retain(_ documents: Set<DocumentID>) {
+        entries.removeAll { !documents.contains($0.document) }
+        rebuildIndices()
+    }
+    mutating func clear() { entries.removeAll(); indices.removeAll() }
 
     static func interval(frequent: Bool) -> TimeInterval { frequent ? 90 : 12 * 60 * 60 }
     func isDue(at time: Double, frequent: Bool) -> Bool {

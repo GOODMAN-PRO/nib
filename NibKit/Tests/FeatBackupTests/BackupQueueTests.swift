@@ -31,6 +31,28 @@ final class BackupQueueTests: XCTestCase {
         XCTAssertFalse(queue.isDue(at: 100_000, frequent: true))
     }
 
+    func testQueueLookupSurvivesDecodingRemovalAndSnapshots() throws {
+        let documents = (0..<5).map { NibID("INDEX" + String($0)) }
+        var queue = BackupQueue()
+        for document in documents { queue.enqueue(document, at: 10) }
+        let snapshot = queue
+        queue = try JSONDecoder().decode(BackupQueue.self, from: JSONEncoder().encode(queue))
+        queue.acknowledge(queue.entries[1])
+        queue.retain(Set([documents[2], documents[4]]))
+        let token = queue.entries[1].token
+        queue.enqueue(documents[4], at: 20)
+        XCTAssertEqual(queue.entries.map(\.document), [documents[2], documents[4]])
+        XCTAssertNotEqual(queue.entries[1].token, token)
+        XCTAssertEqual(queue.entries[1].queuedAt, 10)
+        XCTAssertFalse(queue.contains(documents[1]))
+        XCTAssertTrue(queue.contains(documents[4]))
+        XCTAssertEqual(snapshot.entries.map(\.document), documents)
+        queue.clear()
+        XCTAssertFalse(queue.contains(documents[4]))
+        queue.enqueue(documents[4], at: 30)
+        XCTAssertEqual(queue.entries[0].queuedAt, 30)
+    }
+
     func testNameSubstringExclusionsAndLibraryTriggers() {
         XCTAssertTrue(BackupQueue.excluded("Prívate journal", substrings: ["PRIVATE"]))
         XCTAssertFalse(BackupQueue.excluded("Physics", substrings: ["", " ", "private"]))

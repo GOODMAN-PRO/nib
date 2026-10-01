@@ -173,7 +173,7 @@ final class BackupEngine {
         var queued = false
         for doc in documents {
             // An existing entry only needs a fresh token, protecting edits made during an in-flight export.
-            if queue.entries.contains(where: { $0.document == doc }) {
+            if queue.contains(doc) {
                 queue.enqueue(doc, at: now().timeIntervalSince1970); queued = true
                 continue
             }

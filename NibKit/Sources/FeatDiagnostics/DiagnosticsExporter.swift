@@ -122,12 +122,21 @@ struct DiagnosticsRedactor {
     init(titles: [String]) {
         let cleaned = Set(titles.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
             .filter { $0.count >= DiagnosticsRedactor.minimumLength }
-        self.titles = cleaned.sorted { $0.count != $1.count ? $0.count > $1.count : $0 < $1 }
+        // String.count walks grapheme clusters; compute it once instead of in every sort comparison.
+        var ordered: [(title: String, length: Int)] = cleaned.map { (title: $0, length: $0.count) }
+        ordered.sort { lhs, rhs in
+            if lhs.length != rhs.length { return lhs.length > rhs.length }
+            return lhs.title < rhs.title
+        }
+        self.titles = ordered.map { $0.title }
 
         // Keyed by bytes: String equality is canonical, so a Set<String> would fold the NFD spelling into the NFC one.
         var spellings: [[UInt8]: String] = [:]
         for title in cleaned {
-            for form in [title, title.precomposedStringWithCanonicalMapping, title.decomposedStringWithCanonicalMapping] {
+            // ASCII has only one canonical spelling; avoid normalizing and URL-encoding it three times.
+            let forms = title.utf8.allSatisfy { $0 < 0x80 } ? [title]
+                : [title, title.precomposedStringWithCanonicalMapping, title.decomposedStringWithCanonicalMapping]
+            for form in forms {
                 spellings[Array(form.utf8)] = form
                 if let encoded = form.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
                     spellings[Array(encoded.utf8)] = encoded
