@@ -850,9 +850,9 @@ struct ChromeRootView: View {
         if toolbar != nil, !model.snapshot.readOnly {
             // Read F016's existing setting; do not redeclare its key or depend on the feature's private runtime.
             let saved = chrome.app.settings.json("toolbar.dock")
-            let edge = saved?["edge"].stringValue.flatMap { NibDock(commandValue: $0) }
+            let edge = saved?["edge"]?.stringValue.flatMap { NibDock(commandValue: $0) }
                 ?? (layout.isCompact ? .bottom : (layout.toolbarContentSize.width > layout.toolbarContentSize.height ? .leading : .top))
-            let dock = NibPaletteDock(edge: edge, along: CGFloat(saved?["along"].doubleValue ?? 0.5))
+            let dock = NibPaletteDock(edge: edge, along: CGFloat(saved?["along"]?.doubleValue ?? 0.5))
             let dockModel = DropletDockModel(region: .zero, length: 0, thickness: 0, compact: layout.isCompact)
             let active = chrome.app.ui.toolbarItems(for: model.snapshot.kind)
                 .first { ($0.toolID ?? $0.id) == model.snapshot.tool }
