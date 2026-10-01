@@ -35,12 +35,18 @@ struct MathAssist: NibCommand {
         }
         let runtime = MathAssistWatcher.runtime(app)
         let lines = try await runtime.scan(page, force: true, context: ctx)
-        let index = p.line ?? lines.firstIndex(where: \.isQuestion) ?? -1
+        let index: Int
+        if let refs = p.refs {
+            guard let match = lines.firstIndex(where: { MathAssistWatcher.sameRefs($0.refs, refs) }) else {
+                throw NibError(.conflict, "The selected equation changed. Open Math Assist again.")
+            }
+            index = match
+        } else { index = p.line ?? lines.firstIndex(where: \.isQuestion) ?? -1 }
         guard lines.indices.contains(index), lines[index].isQuestion else {
             throw NibError.unavailable("No handwriting line ending in = was recognised")
         }
         let line = lines[index]
-        if let refs = p.refs, refs != line.refs { throw NibError(.conflict, "The selected equation changed. Open Math Assist again.") }
+        if let refs = p.refs, !MathAssistWatcher.sameRefs(refs, line.refs) { throw NibError(.conflict, "The selected equation changed. Open Math Assist again.") }
         let source = (p.latex ?? line.latex).trimmingCharacters(in: .whitespacesAndNewlines)
         guard source.hasSuffix("="), source.count <= 8192 else {
             throw NibError.invalid("Corrected LaTeX must end in = and be at most 8192 characters", path: "$.latex")
@@ -50,7 +56,8 @@ struct MathAssist: NibCommand {
             ["expression": .string((definitions + [source]).joined(separator: "\n")), "format": .string(format)])
         let answer = try result.decode(MathAnswer.self)
         guard answer.kind != "definition", !answer.answer.isEmpty else { throw NibError.unsupported("This line has no writable answer") }
-        let old = try runtime.links(doc: doc, page: pageID)[line.key]
+        let reconciled = try runtime.reconcile(runtime.links(doc: doc, page: pageID), lines: lines, doc: doc, page: pageID)
+        let old = reconciled[line.key]
         // Guard the source and any old answer before the potentially asynchronous ink writer runs.
         let sourceItems = try line.refs.map { ref -> Item in
             guard case let .item(d, pg, id)? = NodeRef(ref), d == doc, pg == pageID else { throw NibError.invalid("Invalid source ink") }
@@ -101,7 +108,8 @@ struct MathAssist: NibCommand {
                 guard var record = try tx.content(doc).livePages.first(where: { $0.id == pageID }), record == expectedPage else {
                     throw NibError(.conflict, "The page changed while writing the answer")
                 }
-                var links = try record.ext?[MathAssistWatcher.linksKey]?.decode([String: AssistAnswerLink].self) ?? [:]
+                // Re-key surviving equations and prune orphaned/non-question sources on every write.
+                var links = reconciled
                 let items = try refs.map { ref -> Item in
                     guard case let .item(d, pg, id)? = NodeRef(ref), d == doc, pg == pageID else { throw NibError.invalid("Invalid answer ref") }
                     var item = try tx.item(doc, page: pageID, id: id)
@@ -110,7 +118,7 @@ struct MathAssist: NibCommand {
                 }
                 try tx.delete(items: oldItems.map(\.id), doc: doc, page: pageID)
                 links[line.key] = AssistAnswerLink(source: line.refs, latex: source, corrected: p.latex != nil || old?.corrected == true,
-                    format: format, answer: answer.answer, refs: refs, revisions: items.map { $0.rev.description }, signatures: try items.map(MathAssistWatcher.signature))
+                    format: format, answer: answer.answer, refs: refs, revisions: items.map { $0.rev.description }, signatures: try items.map(MathAssistWatcher.signature), sourceRevisions: sourceItems.map { $0.rev.description })
                 var ext = record.ext ?? [:]
                 ext[MathAssistWatcher.linksKey] = try JSONValue.from(links)
                 record.ext = ext
@@ -158,10 +166,17 @@ struct MathAssistTapAt: NibCommand {
         }
         if let action = p.action, action != "options" { throw NibError.invalid("Use options or dismiss", path: "$.action") }
         let runtime = MathAssistWatcher.runtime(app)
-        let lines = try await runtime.scan(page, context: ctx)
+        guard app.settings.get(NibSettings.mathAssistSuggestions),
+              try app.workspace.content(doc).meta.mathAssist else { return Output(handled: false) }
+        let lines: [AssistLine]
+        if let cached = runtime.pages[page] { lines = cached }
+        else { lines = try await runtime.scan(page, context: ctx) }
+        guard lines.contains(where: \.isQuestion) else { return Output(handled: false) }
         let point = Point(p.point[0], p.point[1])
-        let tolerance = Double(NibMetrics.hitTarget) / max(ctx.session?.zoom ?? 1, 0.1) / 2
-        guard let index = lines.firstIndex(where: { $0.isQuestion && Rect(x: $0.bounds.maxX - tolerance, y: $0.bounds.midY - tolerance, width: tolerance * 2, height: tolerance * 2).contains(point) }) else {
+        guard let index = lines.firstIndex(where: {
+            $0.isQuestion && !(ctx.session?.hiddenLayers.contains($0.ink.first?.layer ?? 0) ?? false) &&
+                AssistGeometry.glowRect($0, zoom: ctx.session?.zoom ?? 1).contains(point)
+        }) else {
             return Output(handled: false)
         }
         if let floating = ctx.session?.floatingHost, ctx.principal.isUser, !ctx.dryRun {
@@ -169,5 +184,60 @@ struct MathAssistTapAt: NibCommand {
                 page: page, index: index, line: lines[index], floating: floating)))
         }
         return Output(handled: true, line: index)
+    }
+}
+
+
+/// Readable source identities let AI and plugins request an answer without guessing an index.
+struct MathAssistLines: NibCommand {
+    struct Params: Codable { var page: String }
+    struct Line: Codable {
+        var line: Int
+        var refs: [String]
+        var latex: String
+        var answer: String?
+        var failure: String?
+        var linked: Bool
+    }
+    static let descriptor = CommandDescriptor(id: "mathassist.lines", title: String(localized: "Math Assist Lines"),
+        summary: "List recognised page lines with their indices, source refs, LaTeX, suggested answers and linked-answer state.",
+        params: .obj(["page": .ref], required: ["page"]),
+        examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001"]], effect: .read)
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> [Line] {
+        let (doc, page) = try ctx.pageOrSession(p.page)
+        guard let app = ctx.app else { throw NibError.unavailable("Math Assist needs an app host") }
+        let runtime = MathAssistWatcher.runtime(app)
+        let lines = try await runtime.scan(NodeRef.page(doc, page).description, force: true, context: ctx)
+        let links = try runtime.reconcile(runtime.links(doc: doc, page: page), lines: lines, doc: doc, page: page)
+        return lines.enumerated().map { index, line in
+            Line(line: index, refs: line.refs, latex: line.latex, answer: line.answer?.answer,
+                 failure: line.failure, linked: links[line.key] != nil)
+        }
+    }
+}
+
+/// The watcher uses an edit command so pruning participates in the originating edit's undo group.
+struct MathAssistReconcileLinks: NibCommand {
+    struct Params: Codable { var page: String }
+    static let descriptor = CommandDescriptor(id: "mathassist.reconcileLinks", title: String(localized: "Refresh Math Answer Links"),
+        summary: "Reconcile linked answers with current equations and prune sources which are no longer questions.",
+        params: .obj(["page": .ref], required: ["page"]),
+        examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001"]], effect: .edit)
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Bool {
+        let (doc, page) = try ctx.pageOrSession(p.page)
+        guard let app = ctx.app, !ctx.isReadOnly(doc) else { return false }
+        let runtime = MathAssistWatcher.runtime(app)
+        let lines = try await runtime.scan(NodeRef.page(doc, page).description, context: ctx)
+        let saved = try runtime.links(doc: doc, page: page)
+        let links = try runtime.reconcile(saved, lines: lines, doc: doc, page: page)
+        guard saved != links else { return false }
+        try ctx.mutate { tx in
+            guard var record = try tx.content(doc).livePages.first(where: { $0.id == page }) else { throw NibError.notFound(p.page) }
+            var ext = record.ext ?? [:]
+            ext[MathAssistWatcher.linksKey] = try JSONValue.from(links)
+            record.ext = ext
+            try tx.put(record, doc: doc)
+        }
+        return true
     }
 }

@@ -8,6 +8,8 @@ public enum FeatMathAssistOverlayFeature: NibFeature {
     public static func register(_ app: NibApp) {
         app.commands.register(MathAssist.self)
         app.commands.register(MathAssistTapAt.self)
+        app.commands.register(MathAssistLines.self)
+        app.commands.register(MathAssistReconcileLinks.self)
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "mathassist.glow", owner: id, order: 600) { host in
             MathAssistOverlay(runtime: MathAssistWatcher.runtime(host.app))
         })

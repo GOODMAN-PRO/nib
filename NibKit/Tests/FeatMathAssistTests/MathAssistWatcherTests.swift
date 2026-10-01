@@ -4,38 +4,65 @@ import NibContracts
 import NibTesting
 @testable import FeatMathAssist
 
+@MainActor
+private final class AssistTestState {
+    var recognitionCalls: [[String]] = []
+    var queries: [JSONValue] = []
+    var failures = Set<String>()
+    var duringWrite: (() async throws -> Void)?
+}
+
 /// Dependencies run through the real registry/bus; only recognition and ink synthesis are deterministic fakes.
 @MainActor
 private enum AssistDependencies: NibFeature {
     static let id = "assistTestDependencies"
     static func register(_ app: NibApp) {
+        let state = AssistTestState()
+        app.services.set(state, for: "test.assistState")
         app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Query", summary: "Test page summaries.",
-            params: .obj(["ref": .ref], required: ["ref"]), effect: .read)) { params, ctx in
+            params: .obj(["ref": .ref, "fields": .arr(.str()), "cursor": .str()], required: ["ref"]), effect: .read)) { params, ctx in
             guard let ref = params["ref"]?.stringValue, case let .page(d, p)? = NodeRef(ref) else { throw NibError.invalid("Expected page") }
+            state.queries.append(params)
+            let fields = Set(params["fields"]?.arrayValue?.compactMap(\.stringValue) ?? [])
             let items = try ctx.workspace.items(d, page: p)
-            return ["items": .array(try items.map { item -> JSONValue in
+            return ["ref": .string(ref), "kind": "page", "index": 1, "size": [595.28, 841.89], "rotation": 0,
+                "counts": ["stroke": .number(Double(items.filter { $0.kind == .stroke }.count))], "truncated": false,
+                "items": .array(try items.map { item -> JSONValue in
                 var value: [String: JSONValue] = ["ref": .string(NodeRef.item(d, p, item.id).description),
                     "kind": .string(item.kind.rawValue), "bbox": try JSONValue.from([item.bounds.x, item.bounds.y, item.bounds.width, item.bounds.height]),
-                    "layer": .number(Double(item.layer)), "rev": .string(item.rev.description)]
-                if let stroke = item.stroke { value["tool"] = .string(stroke.style.tool.rawValue) }
-                if let math = item.math { value["latex"] = try JSONValue.from(math.latex) }
+                    "layer": .number(Double(item.layer))]
+                if fields.contains("rev") { value["rev"] = .string(item.rev.description) }
+                if let stroke = item.stroke {
+                    value["tool"] = .string(stroke.style.tool.rawValue)
+                    value["color"] = .string(stroke.style.color.hex)
+                    value["width"] = .number(stroke.style.width)
+                    value["pointCount"] = .number(Double(stroke.points.count))
+                }
+                if let math = item.math {
+                    value["text"] = .string(math.latex.joined(separator: "\n"))
+                    if fields.contains("math") { value["math"] = try JSONValue.from(math) }
+                }
                 return .object(value)
             })]
         }
         app.commands.register(CommandDescriptor(id: CommandIDs.mathRecognize, title: "Recognise", summary: "Fake OCR of stored test labels.",
             params: .obj(["refs": .arr(.ref)], required: ["refs"]), effect: .read)) { params, ctx in
             let refs = params["refs"]?.arrayValue?.compactMap(\.stringValue) ?? []
-            var labels: [String] = []
+            state.recognitionCalls.append(refs)
+            if !state.failures.isDisjoint(with: refs) { throw NibError.unavailable("Fake recognition failure") }
+            var labels: [String] = [], revisions: [String] = []
             for ref in refs {
                 guard case let .item(d, p, id)? = NodeRef(ref) else { throw NibError.invalid("Expected ink") }
                 let item = try ctx.workspace.item(d, page: p, id: id)
+                revisions.append(item.rev.description)
                 if let label = item.ext?["test.latex"]?.stringValue { labels.append(label) }
             }
-            return ["lines": .array([.string(labels.first ?? "2+3=")]), "source": "fake"]
+            return ["lines": .array([.string(labels.first ?? "2+3=")]), "source": "fake", "revs": .array(revisions.map(JSONValue.string))]
         }
         app.commands.register(CommandDescriptor(id: CommandIDs.inkWriteText, title: "Write", summary: "Fake handwriting as a stroke.",
             params: .obj(["page": .ref, "text": .str(), "at": .point, "ids": .arr(.str())], required: ["page", "text", "at"]), effect: .edit)) { params, ctx in
             let (d, p) = try ctx.pageOrSession(params["page"]?.stringValue)
+            if let duringWrite = state.duringWrite { state.duringWrite = nil; try await duringWrite() }
             let at = params["at"]?.arrayValue?.compactMap(\.doubleValue) ?? [0, 0]
             let chosen = params["ids"]?.arrayValue?.first?.stringValue
             var item = Item.makeStroke(Stroke(style: .defaultPen,
@@ -47,7 +74,9 @@ private enum AssistDependencies: NibFeature {
         }
         app.commands.register(CommandDescriptor(id: "test.assistEdit", title: "Edit", summary: "Edit test ink or enable Math Assist.", effect: .edit)) { params, ctx in
             try ctx.mutate { tx in
-                if let id = params["id"]?.stringValue {
+                if let removed = params["remove"]?.arrayValue?.compactMap(\.stringValue) {
+                    try tx.delete(items: removed.map { NibID($0) }, doc: Fixtures.docID, page: Fixtures.page2)
+                } else if let id = params["id"]?.stringValue {
                     var item = try tx.item(Fixtures.docID, page: Fixtures.page2, id: NibID(id))
                     var ext = item.ext ?? [:]; ext["test.latex"] = params["latex"] ?? .null; item.ext = ext
                     try tx.put(item, doc: Fixtures.docID, page: Fixtures.page2)
@@ -68,9 +97,9 @@ final class MathAssistWatcherTests: XCTestCase {
     private func harness() -> Harness {
         Harness(features: [AssistDependencies.self, FeatMathAssistFeature.self, FeatMathAssistOverlayFeature.self])
     }
-    private func ink(_ id: String, _ latex: String, x: Float = 72, y: Float, layer: Int = 0) -> Item {
+    private func ink(_ id: String, _ latex: String, x: Float = 72, y: Float, height: Float = 18, layer: Int = 0) -> Item {
         var item = Item.makeStroke(Stroke(style: .defaultPen,
-            points: [StrokePoint(x: x, y: y), StrokePoint(x: x + 80, y: y + 18)]), layer: layer)
+            points: [StrokePoint(x: x, y: y), StrokePoint(x: x + 80, y: y + height)]), layer: layer)
         item.id = NibID(id); item.ext = ["test.latex": .string(latex)]
         return item
     }
@@ -103,6 +132,9 @@ final class MathAssistWatcherTests: XCTestCase {
         h.app.settings.set(NibSettings.mathAssistSuggestions, false)
         let off = try await watcher.scan(page)
         XCTAssertTrue(off.isEmpty)
+        h.app.settings.set(NibSettings.mathAssistSuggestions, true)
+        let enabledAgain = try await watcher.scan(page)
+        XCTAssertEqual(enabledAgain.filter(\.isQuestion).count, 1)
     }
 
     func testDefinitionChangesReevaluateAndUpdateInsertedInk() async throws {
@@ -209,7 +241,11 @@ final class MathAssistWatcherTests: XCTestCase {
         attachment.attach(to: host)
         let glow = try XCTUnwrap(host.canvasView.layer.sublayers?.compactMap { $0 as? CAShapeLayer }.last)
         XCTAssertNotNil(glow.path)
-        XCTAssertEqual(host.canvasView.accessibilityElements?.count, 1)
+        XCTAssertNil(host.canvasView.accessibilityElements)
+        let overlay = try XCTUnwrap(host.canvasView.subviews.last)
+        XCTAssertEqual(overlay.accessibilityElements?.count, 1)
+        XCTAssertFalse(overlay.isUserInteractionEnabled)
+        XCTAssertEqual(overlay.subviews.compactMap { $0 as? UILabel }.first?.text, "5")
         XCTAssertFalse(attachment.hitTest(CGPoint(x: 150, y: 140), host: host), "finger taps route through the registered tap handler")
         h.session.inking.begin()
         XCTAssertTrue(glow.isHidden)
@@ -217,7 +253,185 @@ final class MathAssistWatcherTests: XCTestCase {
         XCTAssertFalse(glow.isHidden)
         attachment.detach(from: host)
         XCTAssertNil(glow.superlayer)
-        XCTAssertTrue(host.canvasView.accessibilityElements?.isEmpty == true)
+        XCTAssertNil(host.canvasView.accessibilityElements)
+        XCTAssertNil(overlay.superview)
+    }
+
+    private func state(_ h: Harness) -> AssistTestState {
+        h.app.services.get("test.assistState", as: AssistTestState.self)!
+    }
+
+    func testRealSummaryShapeAndUnchangedPageSkipsQueryAndRecognition() async throws {
+        let h = harness()
+        try await h.insert([ink("QUESTION", "2+3=", y: 120)], page: Fixtures.page2)
+        let summary = try await h.run(CommandIDs.queryGet, ["ref": .string(page)])
+        XCTAssertNil(summary["items"]?.arrayValue?.first?["rev"])
+        XCTAssertNil(summary["items"]?.arrayValue?.first?["latex"])
+        try await enable(h)
+        let watcher = MathAssistWatcher.runtime(h.app)
+        _ = try await watcher.scan(page)
+        XCTAssertEqual(state(h).recognitionCalls.count, 1)
+        XCTAssertEqual(Set(state(h).queries.last?["fields"]?.arrayValue?.compactMap(\.stringValue) ?? []),
+                       Set(["bbox", "layer", "tool", "rev", "math"]))
+        XCTAssertNil(state(h).queries.last?["limit"])
+        state(h).recognitionCalls = []; state(h).queries = []
+        _ = try await watcher.scan(page)
+        XCTAssertTrue(state(h).recognitionCalls.isEmpty)
+        XCTAssertTrue(state(h).queries.isEmpty)
+        _ = try await h.run(CommandIDs.mathassistTapAt, ["page": .string(page), "point": [152, 142]])
+        XCTAssertTrue(state(h).queries.isEmpty)
+        // A changed definition rescans the page, while an unchanged question still hits the line cache.
+        try await h.insert([ink("DEF", "a=7", y: 40)], page: Fixtures.page2)
+        _ = try await watcher.scan(page)
+        XCTAssertEqual(state(h).recognitionCalls, [[NodeRef.item(Fixtures.docID, Fixtures.page2, "DEF").description]])
+    }
+
+    func testTypedDefinitionsUseSummaryText() async throws {
+        let h = harness()
+        var definition = Item.makeMath(MathItem(frame: Frame(x: 20, y: 20, w: 100, h: 40), latex: ["a=7", "b=4"]))
+        definition.id = "TYPED"
+        try await h.insert([definition, ink("QUESTION", "a+b=", y: 120)], page: Fixtures.page2)
+        try await enable(h)
+        let rows = try await h.run(CommandIDs.queryGet, ["ref": .string(page)])
+        let typed = try XCTUnwrap(rows["items"]?.arrayValue?.first { $0["kind"]?.stringValue == "math" })
+        XCTAssertEqual(typed["text"]?.stringValue, "a=7\nb=4")
+        XCTAssertNil(typed["latex"])
+        let lines = try await MathAssistWatcher.runtime(h.app).scan(page)
+        XCTAssertEqual(lines.first?.answer?.answer, "11")
+    }
+
+    func testTallGlowAtZoomTwoSharesDrawingAccessibilityAndPencilTarget() async throws {
+        let h = harness()
+        h.session.page = Fixtures.page2; h.session.zoom = 2
+        try await h.insert([ink("TALL", "2+3=", y: 120, height: 60)], page: Fixtures.page2)
+        try await enable(h)
+        let watcher = MathAssistWatcher.runtime(h.app)
+        let scanned = try await watcher.scan(page)
+        let line = try XCTUnwrap(scanned.first)
+        let rect = AssistGeometry.glowRect(line, zoom: 2)
+        XCTAssertGreaterThanOrEqual(rect.width * 2, 44)
+        XCTAssertEqual(rect.height * 2, 44)
+        XCTAssertEqual(rect.midY, line.bounds.maxY + 4)
+        let hit = try await h.run(CommandIDs.mathassistTapAt,
+            ["page": .string(page), "point": [.number(rect.midX), .number(rect.midY)]])
+        XCTAssertEqual(hit["handled"]?.boolValue, true)
+        let host = FakeCanvasHost(h); host.zoomScale = 2
+        let attachment = MathAssistOverlay(runtime: watcher); attachment.attach(to: host)
+        let point = host.viewPoint(Point(rect.midX, rect.midY), page: Fixtures.page2)
+        XCTAssertTrue(attachment.hitTest(point, isPencil: true, host: host))
+        XCTAssertFalse(attachment.hitTest(point, isPencil: false, host: host))
+        let element = try XCTUnwrap(host.canvasView.subviews.last?.accessibilityElements?.first as? UIAccessibilityElement)
+        XCTAssertTrue(element.accessibilityFrameInContainerSpace.contains(point))
+        let sample = CanvasSample(page: Fixtures.page2, location: Point(rect.midX, rect.midY))
+        XCTAssertTrue(attachment.gesture(.tap, at: sample, host: host))
+        h.session.inking.begin()
+        XCTAssertTrue(host.canvasView.subviews.last?.isHidden == true)
+        h.session.inking.end()
+        attachment.detach(from: host)
+    }
+
+    func testAnswerUpdateResolvesRefsAfterEarlierRecognitionFailureShiftsIndex() async throws {
+        let h = harness()
+        try await h.insert([ink("EARLY", "1+1=", y: 20), ink("DEF", "a=2", y: 65),
+                            ink("QUESTION", "a+3=", y: 120)], page: Fixtures.page2)
+        try await enable(h)
+        _ = try await h.run(CommandIDs.mathAssist, ["page": .string(page), "line": 2, "ids": ["ANSWER"]])
+        _ = try await h.run("test.assistEdit", ["id": "DEF", "latex": "a=9"])
+        let watcher = MathAssistWatcher.runtime(h.app)
+        let previous = try await watcher.scan(page)
+        state(h).failures.insert(NodeRef.item(Fixtures.docID, Fixtures.page2, "EARLY").description)
+        _ = try await h.run("test.assistEdit", ["id": "EARLY", "latex": "unreadable"])
+        try await watcher.updateAnswers(page, lines: previous)
+        let link = try XCTUnwrap(watcher.links(doc: Fixtures.docID, page: Fixtures.page2).values.first)
+        XCTAssertEqual(link.answer, "12")
+        XCTAssertEqual(link.source, [NodeRef.item(Fixtures.docID, Fixtures.page2, "QUESTION").description])
+        let liveAnswers = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).filter { $0.ext?["test.answer"] != nil }
+        XCTAssertEqual(liveAnswers.count, 1)
+    }
+
+    func testRewrittenSourceReplacesOldAnswerAndRekeysLink() async throws {
+        let h = harness()
+        try await h.insert([ink("OLD", "2+3=", y: 120)], page: Fixtures.page2)
+        try await enable(h)
+        _ = try await h.run(CommandIDs.mathAssist, ["page": .string(page), "ids": ["ANSWER"]])
+        _ = try await h.run("test.assistEdit", ["remove": ["OLD"]])
+        try await h.insert([ink("NEW", "2+8=", y: 120)], page: Fixtures.page2)
+        let result = try await h.run(CommandIDs.mathAssist, ["page": .string(page), "ids": ["REPLACEMENT"]])
+        XCTAssertEqual(result["answer"]?.stringValue, "10")
+        let watcher = MathAssistWatcher.runtime(h.app)
+        let links = try watcher.links(doc: Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(links.count, 1)
+        XCTAssertEqual(links.keys.first, NodeRef.item(Fixtures.docID, Fixtures.page2, "NEW").description)
+        XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).contains { $0.id == "ANSWER" })
+        XCTAssertEqual(links.values.first?.signatures?.first?.count, 64)
+        _ = try await h.run("test.assistEdit", ["id": "NEW", "latex": "hello"])
+        let lines = try await watcher.scan(page)
+        try await watcher.updateAnswers(page, lines: lines)
+        XCTAssertTrue(try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).isEmpty)
+    }
+
+    func testSourceRevisionChangeInvalidatesCorrectionAndReplacesAnswer() async throws {
+        let h = harness()
+        try await h.insert([ink("QUESTION", "2+3=", y: 120)], page: Fixtures.page2)
+        try await enable(h)
+        _ = try await h.run(CommandIDs.mathAssist, ["page": .string(page), "latex": "2+8=", "ids": ["ANSWER"]])
+        _ = try await h.run("test.assistEdit", ["id": "QUESTION", "latex": "2+9="])
+        let watcher = MathAssistWatcher.runtime(h.app)
+        let lines = try await watcher.scan(page)
+        XCTAssertEqual(lines.first?.latex, "2+9=")
+        try await watcher.updateAnswers(page, lines: lines)
+        XCTAssertEqual(try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).values.first?.answer, "11")
+        XCTAssertFalse(try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).values.first?.corrected ?? true)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).filter { $0.ext?["test.answer"] != nil }.count, 1)
+    }
+
+    func testBridgeStrokeMergesBothExistingGroups() {
+        let left = AssistInk(ref: "LEFT", bounds: Rect(x: 0, y: 10, width: 20, height: 20), revision: "1", layer: 0)
+        let right = AssistInk(ref: "RIGHT", bounds: Rect(x: 120, y: 10, width: 20, height: 20), revision: "1", layer: 0)
+        let bridge = AssistInk(ref: "BRIDGE", bounds: Rect(x: 50, y: 11, width: 40, height: 20), revision: "1", layer: 0)
+        XCTAssertEqual(MathAssistWatcher.group([left, right, bridge]).count, 1)
+    }
+
+    func testDefinitionCommitDuringAnswerWriteIsRetried() async throws {
+        let h = harness()
+        try await h.insert([ink("DEF", "a=2", y: 40), ink("QUESTION", "a+3=", y: 120)], page: Fixtures.page2)
+        try await enable(h)
+        let watcher = MathAssistWatcher.runtime(h.app); watcher.start()
+        state(h).duringWrite = {
+            _ = try await h.run("test.assistEdit", ["id": "DEF", "latex": "a=9"])
+        }
+        _ = try await h.run(CommandIDs.mathAssist, ["page": .string(page), "line": 1, "ids": ["ANSWER"]])
+        let deadline = Date().addingTimeInterval(5)
+        while try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).values.first?.answer != "12", Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).values.first?.answer, "12")
+    }
+
+    func testDisabledOverlayPreservesCanvasAndExistingPageAccessibility() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        let pageView = UIView(); pageView.isAccessibilityElement = true; pageView.accessibilityLabel = "Existing page"
+        host.canvasView.addSubview(pageView)
+        let attachment = MathAssistOverlay(runtime: MathAssistWatcher.runtime(h.app))
+        attachment.attach(to: host)
+        XCTAssertNil(host.canvasView.accessibilityElements)
+        XCTAssertTrue(pageView.isAccessibilityElement)
+        XCTAssertEqual(host.canvasView.subviews.last?.accessibilityElements?.count, 0)
+        attachment.detach(from: host)
+        XCTAssertNil(host.canvasView.accessibilityElements)
+        XCTAssertEqual(host.canvasView.subviews, [pageView])
+    }
+
+    func testLinesQueryExposesSourceIdentityAndAnswer() async throws {
+        let h = harness()
+        try await h.insert([ink("QUESTION", "2+3=", y: 120)], page: Fixtures.page2)
+        let response = try await h.run("mathassist.lines", ["page": .string(page)])
+        XCTAssertEqual(response.arrayValue?.first?["line"]?.intValue, 0)
+        XCTAssertEqual(response.arrayValue?.first?["answer"]?.stringValue, "5")
+        XCTAssertEqual(response.arrayValue?.first?["linked"]?.boolValue, false)
+        XCTAssertEqual(response.arrayValue?.first?["refs"]?.arrayValue?.first?.stringValue,
+                       NodeRef.item(Fixtures.docID, Fixtures.page2, "QUESTION").description)
     }
 
     func testDryRunLeavesDocumentsAndUndoUntouched() async throws {

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NibContracts
 import os
 
@@ -33,6 +34,7 @@ struct AssistAnswerLink: Codable, Equatable {
     var refs: [String]
     var revisions: [String]
     var signatures: [String]? = nil
+    var sourceRevisions: [String]? = nil
 }
 
 @MainActor
@@ -48,6 +50,7 @@ final class MathAssistWatcher {
     private var generations: [String: Int] = [:]
     private var pending: [String: (update: Bool, group: String?)] = [:]
     private var recognitionCache: [String: (ink: [AssistInk], latex: String, warning: String?)] = [:]
+    private var pageRevisions: [String: Rev] = [:]
     private(set) var pages: [String: [AssistLine]] = [:]
     private let logger = Logger(subsystem: "app.nib", category: "mathassistoverlay")
 
@@ -82,8 +85,14 @@ final class MathAssistWatcher {
                 }
             }
             // An undo must never manufacture a new undo step or immediately reinsert a removed answer.
-            let update = ![CommandIDs.undo, CommandIDs.redo, CommandIDs.mathAssist].contains(changes.command)
-            for page in affected where !self.writing.contains(page) { self.schedule(page, updateAnswers: update, group: changes.group) }
+            let update = ![CommandIDs.undo, CommandIDs.redo, CommandIDs.mathAssist, "mathassist.reconcileLinks"].contains(changes.command)
+            for page in affected {
+                if self.writing.contains(page) {
+                    if update {
+                        self.pending[page] = (true, changes.group)
+                    }
+                } else { self.schedule(page, updateAnswers: update, group: changes.group) }
+            }
         })
         subscriptions.append(app.events.subscribe { [weak self] event in
             guard [NibEventType.pageChanged, NibEventType.sessionDocument, NibEventType.docOpened,
@@ -96,6 +105,7 @@ final class MathAssistWatcher {
                         self.pending[key] = nil; self.generations[key] = nil
                     }
                     self.recognitionCache = self.recognitionCache.filter { NodeRef($0.key)?.documentID != d }
+                    self.pageRevisions = self.pageRevisions.filter { NodeRef($0.key)?.documentID != d }
                     self.pages = self.pages.filter { NodeRef($0.key)?.documentID != d }
                     self.notify()
                 }
@@ -132,6 +142,7 @@ final class MathAssistWatcher {
         let request = (update: updateAnswers ?? pending[page]?.update ?? false,
                        group: updateAnswers != nil ? group : pending[page]?.group)
         pending[page] = request
+        if writing.contains(page) { return }
         generations[page, default: 0] += 1
         let generation = generations[page, default: 0]
         tasks[page]?.cancel()
@@ -153,6 +164,7 @@ final class MathAssistWatcher {
             catch {
                 guard let self, self.generations[page] == generation else { return }
                 self.pages[page] = []
+                self.pageRevisions[page] = nil
                 self.notify()
                 self.logger.debug("Math Assist scan failed: \(String(describing: error), privacy: .public)")
             }
@@ -161,22 +173,42 @@ final class MathAssistWatcher {
 
     /// Vertical bands join the equals sign's short strokes to the expression; layers and distant columns stay separate.
     nonisolated static func group(_ input: [AssistInk]) -> [[AssistInk]] {
-        var groups: [[AssistInk]] = []
+        // Keep union bounds once per component. The vertical sweep retires groups which cannot
+        // touch a later stroke; a bridging stroke merges every compatible active component.
+        var active: [Int: (ink: [AssistInk], bounds: Rect, layer: Int)] = [:]
+        var finished: [[AssistInk]] = []
+        var next = 0
         for item in input.sorted(by: { ($0.bounds.y, $0.bounds.x, $0.ref) < ($1.bounds.y, $1.bounds.x, $1.ref) }) {
-            let match = groups.indices.filter { i in
-                guard groups[i].first?.layer == item.layer else { return false }
-                let box = groups[i].dropFirst().reduce(groups[i][0].bounds) { $0.union($1.bounds) }
-                let overlap = min(box.maxY, item.bounds.maxY) - max(box.minY, item.bounds.minY)
-                let tolerance = max(2, min(box.height, item.bounds.height) * 0.4)
-                let gap = max(0, max(item.bounds.minX - box.maxX, box.minX - item.bounds.maxX))
-                return overlap >= -tolerance && gap <= max(40, max(box.height, item.bounds.height) * 3)
-            }.min { a, b in
-                abs(groups[a][0].bounds.midY - item.bounds.midY) < abs(groups[b][0].bounds.midY - item.bounds.midY)
+            for id in Array(active.keys) {
+                guard let group = active[id] else { continue }
+                if group.bounds.maxY + max(2, group.bounds.height * 0.4) < item.bounds.minY {
+                    finished.append(group.ink); active[id] = nil
+                }
             }
-            if let match { groups[match].append(item) } else { groups.append([item]) }
+            var joined = [item], bounds = item.bounds
+            var merged: Bool
+            repeat {
+                merged = false
+                for id in active.keys.sorted() {
+                    guard let group = active[id], group.layer == item.layer else { continue }
+                    let box = group.bounds
+                    let overlap = min(box.maxY, bounds.maxY) - max(box.minY, bounds.minY)
+                    let tolerance = max(2, min(box.height, bounds.height) * 0.4)
+                    let gap = max(0, max(bounds.minX - box.maxX, box.minX - bounds.maxX))
+                    if overlap >= -tolerance && gap <= max(40, max(box.height, bounds.height) * 3) {
+                        joined += group.ink; bounds = bounds.union(box); active[id] = nil; merged = true
+                    }
+                }
+            } while merged
+            active[next] = (joined, bounds, item.layer); next += 1
         }
-        return groups.map { $0.sorted { ($0.bounds.x, $0.ref) < ($1.bounds.x, $1.ref) } }
-            .sorted { ($0[0].bounds.y, $0[0].bounds.x) < ($1[0].bounds.y, $1[0].bounds.x) }
+        finished += active.values.map(\.ink)
+        return finished.map { $0.sorted { ($0.bounds.x, $0.ref) < ($1.bounds.x, $1.ref) } }
+            .sorted {
+                let a = $0.dropFirst().reduce($0[0].bounds) { $0.union($1.bounds) }
+                let b = $1.dropFirst().reduce($1[0].bounds) { $0.union($1.bounds) }
+                return (a.y, a.x, $0[0].ref) < (b.y, b.x, $1[0].ref)
+            }
     }
 
     func links(doc: DocumentID, page: PageID) throws -> [String: AssistAnswerLink] {
@@ -199,21 +231,30 @@ final class MathAssistWatcher {
         }
         let content = try app.workspace.content(doc)
         guard content.livePages.contains(where: { $0.id == pageID }) else { throw NibError.notFound(page) }
-        guard force || (content.meta.mathAssist && app.settings.get(NibSettings.mathAssistSuggestions)) else { return [] }
+        guard force || (content.meta.mathAssist && app.settings.get(NibSettings.mathAssistSuggestions)) else {
+            pages[page] = []; pageRevisions[page] = nil
+            return []
+        }
+        let revision = app.workspace.contentRevision(doc, page: pageID)
+        if let revision, pageRevisions[page] == revision, let cached = pages[page] { return cached }
         let links = try links(doc: doc, page: pageID)
         let generated = Set(links.values.flatMap(\.refs))
         var ink: [AssistInk] = [], cursor: String?, seen = Set<String>(), cursors = Set<String>()
         var typedDefinitions: [String] = []
         repeat {
-            var object: [String: JSONValue] = ["ref": .string(page), "limit": 200]
+            var object: [String: JSONValue] = ["ref": .string(page), "fields": ["bbox", "layer", "tool", "rev", "math"]]
             if let cursor { object["cursor"] = .string(cursor) }
             let params = JSONValue.object(object)
             let response = try await execute(CommandIDs.queryGet, params)
             guard let items = response["items"]?.arrayValue else { throw NibError.unavailable("query.get did not return page items") }
             for item in items {
                 guard let ref = item["ref"]?.stringValue, seen.insert(ref).inserted, !generated.contains(ref) else { continue }
-                if item["kind"]?.stringValue == "math", let lines = item["latex"]?.arrayValue {
-                    typedDefinitions += lines.compactMap(\.stringValue)
+                if item["kind"]?.stringValue == "math" {
+                    if let text = item["text"]?.stringValue {
+                        typedDefinitions += text.components(separatedBy: .newlines)
+                    } else if let latex = item["math"]?["latex"]?.arrayValue {
+                        typedDefinitions += latex.compactMap(\.stringValue)
+                    }
                 }
                 guard item["kind"]?.stringValue == "stroke", ["pen", "pencil"].contains(item["tool"]?.stringValue ?? ""),
                       let bbox = item["bbox"]?.arrayValue, bbox.count == 4 else { continue }
@@ -238,7 +279,7 @@ final class MathAssistWatcher {
             let key = group.map(\.ref).sorted().first ?? ""
             let latex: String, warning: String?
             var recognizedInk = group
-            if let cache = recognitionCache[key], cache.ink == group, group.allSatisfy({ !$0.revision.isEmpty }) {
+            if let cache = recognitionCache[key], Self.sameRevisions(cache.ink, group), group.allSatisfy({ !$0.revision.isEmpty }) {
                 latex = cache.latex; warning = cache.warning
             } else {
                 do {
@@ -250,15 +291,18 @@ final class MathAssistWatcher {
                     if let revs = result["revs"]?.arrayValue?.compactMap(\.stringValue), revs.count == group.count {
                         for i in recognizedInk.indices where recognizedInk[i].revision.isEmpty { recognizedInk[i].revision = revs[i] }
                     }
-                    recognitionCache[key] = (group, latex, warning)
+                    recognitionCache[key] = (recognizedInk, latex, warning)
                 } catch is CancellationError { throw CancellationError() }
                 catch { continue } // Non-mathematical writing is expected on a notebook page.
             }
-            let saved = links[key]
-            let source = saved?.corrected == true && saved?.source == group.map(\.ref) ? saved?.latex ?? latex : latex
-            lines.append(AssistLine(ink: recognizedInk, latex: source, warning: warning))
+            lines.append(AssistLine(ink: recognizedInk, latex: latex, warning: warning))
         }
-        let context = Self.definitions(lines.map(\.latex) + typedDefinitions)
+        let reconciled = try reconcile(links, lines: lines, doc: doc, page: pageID)
+        for i in lines.indices {
+            if let link = reconciled[lines[i].key], link.corrected,
+               Self.sameRefs(link.source, lines[i].refs) { lines[i].latex = link.latex }
+        }
+        let context = await Self.definitions(lines.map(\.latex) + typedDefinitions)
         for index in lines.indices { lines[index].context = context }
         for index in lines.indices where lines[index].isQuestion {
             do {
@@ -268,11 +312,63 @@ final class MathAssistWatcher {
             } catch is CancellationError { throw CancellationError() }
             catch { lines[index].failure = NibError.wrap(error).message }
         }
+        try Task.checkCancellation()
+        if revision == app.workspace.contentRevision(doc, page: pageID) {
+            pages[page] = lines
+            pageRevisions[page] = revision
+        }
         return lines
     }
 
-    nonisolated static func definitions(_ lines: [String]) -> [String] {
-        (try? MathStack.run {
+    nonisolated static func sameRefs(_ a: [String], _ b: [String]) -> Bool { Set(a) == Set(b) }
+
+    nonisolated static func sameRevisions(_ a: [AssistInk], _ b: [AssistInk]) -> Bool {
+        a.count == b.count && Dictionary(uniqueKeysWithValues: a.map { ($0.ref, $0.revision) }) ==
+            Dictionary(uniqueKeysWithValues: b.map { ($0.ref, $0.revision) })
+    }
+
+    /// Source identity can change when an equation is erased and rewritten. Prefer shared source
+    /// strokes, then the old answer's writing position. Each link belongs to at most one question.
+    func reconcile(_ saved: [String: AssistAnswerLink], lines: [AssistLine], doc: DocumentID,
+                   page: PageID) throws -> [String: AssistAnswerLink] {
+        guard let app else { return [:] }
+        var result: [String: AssistAnswerLink] = [:]
+        for key in saved.keys.sorted() {
+            guard var link = saved[key] else { continue }
+            let source = Set(link.source)
+            let anchor = link.refs.compactMap { ref -> Rect? in
+                guard case let .item(d, p, id)? = NodeRef(ref), d == doc, p == page,
+                      let item = try? app.workspace.item(d, page: p, id: id), !item.deleted else { return nil }
+                return item.bounds
+            }.first
+            let candidates = lines.filter { line in
+                if !source.isDisjoint(with: line.refs) { return true }
+                guard let anchor else { return false }
+                let box = line.bounds
+                let margin = max(12, box.height * 0.5)
+                return anchor.minY >= box.minY - margin && anchor.minY <= box.maxY + margin &&
+                    abs(anchor.minX - box.maxX) <= max(40, box.height)
+            }.sorted { a, b in
+                let ac = source.intersection(a.refs).count, bc = source.intersection(b.refs).count
+                if ac != bc { return ac > bc }
+                let ax = abs((anchor?.minX ?? a.bounds.maxX) - a.bounds.maxX)
+                let bx = abs((anchor?.minX ?? b.bounds.maxX) - b.bounds.maxX)
+                return ax == bx ? a.key < b.key : ax < bx
+            }
+            guard let line = candidates.first, line.isQuestion, result[line.key] == nil else { continue }
+            let revisions = line.ink.map(\.revision)
+            if !Self.sameRefs(link.source, line.refs) ||
+                (link.sourceRevisions != nil && link.sourceRevisions != revisions) {
+                link.corrected = false; link.latex = line.latex
+            }
+            link.source = line.refs
+            result[line.key] = link
+        }
+        return result
+    }
+
+    nonisolated static func definitions(_ lines: [String]) async -> [String] {
+        (try? await MathStack.perform {
             var engine = MathEngine(), result: [String] = []
             for line in lines where line.count <= 8192 {
                 guard let statements = try? MathParser.statements(line), statements.count == 1 else { continue }
@@ -285,11 +381,18 @@ final class MathAssistWatcher {
     static func signature(_ item: Item) throws -> String {
         var normalized = item
         normalized.rev = .zero
-        return try JSONValue.from(normalized).jsonString()
+        let json = try JSONValue.from(normalized).jsonString()
+        return SHA256.hash(data: Data(json.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     static func matches(_ item: Item, link: AssistAnswerLink, index: Int) -> Bool {
         if let signatures = link.signatures, index < signatures.count {
+            // Existing documents may contain the original full JSON signature. New writes always
+            // migrate to a fixed-size digest; revision fallback remains for links without signatures.
+            if signatures[index].hasPrefix("{") {
+                var normalized = item; normalized.rev = .zero
+                return (try? JSONValue.from(normalized).jsonString()) == signatures[index]
+            }
             return (try? signature(item)) == signatures[index]
         }
         return index < link.revisions.count && item.rev.description == link.revisions[index]
@@ -297,16 +400,17 @@ final class MathAssistWatcher {
 
     func didWrite(_ page: String) {
         writing.remove(page)
-        if !updating.contains(page) { schedule(page) }
+        pageRevisions[page] = nil
+        if !updating.contains(page) || pending[page]?.update == true { schedule(page) }
     }
 
     func updateAnswers(_ page: String, lines: [AssistLine], group: String? = nil) async throws {
         guard let app, case let .page(doc, pageID)? = NodeRef(page), !app.isReadOnly(doc) else { return }
         updating.insert(page)
         defer { updating.remove(page) }
-        let saved = try links(doc: doc, page: pageID)
+        let saved = try reconcile(links(doc: doc, page: pageID), lines: lines, doc: doc, page: pageID)
         for (index, line) in lines.enumerated() {
-            guard let link = saved[line.key], line.answer != nil, link.source == line.refs else { continue }
+            guard let link = saved[line.key], line.answer != nil, Self.sameRefs(link.source, line.refs) else { continue }
             let value = try await app.bus.execute(CommandIDs.mathEvaluate,
                 ["expression": .string((line.context + [line.latex]).joined(separator: "\n")), "format": .string(link.format)])
             let answer = try value.decode(MathAnswer.self)
@@ -319,10 +423,12 @@ final class MathAssistWatcher {
                       Self.matches(item, link: link, index: i) else { unchanged = false; break }
             }
             if unchanged {
-                _ = try await app.bus.execute(Invocation(command: CommandIDs.mathAssist,
-                    params: ["page": .string(page), "line": .number(Double(index)), "format": .string(link.format)],
-                    group: group))
+                var params: [String: JSONValue] = ["page": .string(page), "line": .number(Double(index)),
+                    "format": .string(link.format), "refs": .array(line.refs.map(JSONValue.string))]
+                if link.corrected { params["latex"] = .string(line.latex) }
+                _ = try await app.bus.execute(Invocation(command: CommandIDs.mathAssist, params: .object(params), group: group))
             }
         }
+        _ = try await app.bus.execute(Invocation(command: "mathassist.reconcileLinks", params: ["page": .string(page)], group: group))
     }
 }
