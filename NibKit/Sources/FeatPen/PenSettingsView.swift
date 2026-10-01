@@ -14,16 +14,21 @@ final class PenOptions: ObservableObject {
     private var settingsObservation: AnyCancellable?
     private var commits: EventSubscription?
 
-    init(app: NibApp, session: EditorSession, pencil: Bool) {
+    init(app: NibApp, session: EditorSession, pencil: Bool, observesWritingAids: Bool = false) {
         self.app = app; self.session = session; tool = pencil ? "pencil" : "pen"
         settingsObservation = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
             .receive(on: DispatchQueue.main).sink { [weak self] note in
                 guard let name = note.userInfo?["name"] as? String else { return }
                 MainActor.assumeIsolated { self?.values.removeValue(forKey: name); self?.objectWillChange.send() }
             }
-        commits = app.events.subscribe { [weak self] event in
-            guard event.type == NibEventType.committed else { return }
-            Task { @MainActor in await self?.loadWritingAids() }
+        if observesWritingAids {
+            commits = app.events.subscribe { [weak self] event in
+                guard event.type == NibEventType.committed else { return }
+                Task { @MainActor in
+                    guard let self, event.doc == self.session.document else { return }
+                    await self.loadWritingAids()
+                }
+            }
         }
     }
 
@@ -123,7 +128,7 @@ struct PenSettingsView: View {
 
     init(app: NibApp, session: EditorSession, pencil: Bool) {
         _session = ObservedObject(wrappedValue: session)
-        _model = StateObject(wrappedValue: PenOptions(app: app, session: session, pencil: pencil))
+        _model = StateObject(wrappedValue: PenOptions(app: app, session: session, pencil: pencil, observesWritingAids: true))
     }
 
     var body: some View {

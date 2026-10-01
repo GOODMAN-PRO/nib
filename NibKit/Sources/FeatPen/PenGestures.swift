@@ -211,8 +211,6 @@ enum LoopDetector {
         var bounds: Rect
         /// Distance between the stroke's ends.
         var gap: Double
-        /// The end of the stroke crosses its start (an overshooting circle).
-        var crossesStart: Bool
         var netTurning: Double
         var totalTurning: Double
         /// 4πA / L².
@@ -220,7 +218,8 @@ enum LoopDetector {
     }
 
     static func analyse(_ raw: [Point]) -> Analysis? {
-        let points = PenGeometry.deduplicated(raw)
+        // Bound all loop geometry, including debug builds on large captured strokes.
+        let points = PenGeometry.deduplicated(PenGeometry.thinned(raw, limit: 1_024))
         guard points.count >= 8, let bounds = Rect.bounding(points) else { return nil }
         let length = Geo.pathLength(points)
         guard length > 0, let first = points.first, let last = points.last else { return nil }
@@ -228,16 +227,17 @@ enum LoopDetector {
         let turning = PenGeometry.turning(PenGeometry.resampled(points, spacing: side / 12))
         let area = PenGeometry.area(points)
         return Analysis(pathLength: length, bounds: bounds, gap: first.distance(to: last),
-                        crossesStart: crossesStart(points), netTurning: turning.net, totalTurning: turning.total,
+                        netTurning: turning.net, totalTurning: turning.total,
                         compactness: 4 * Double.pi * area / (length * length))
     }
 
     /// True for one roughly closed loop (a circle or an oval, overshoot allowed) big enough to enclose something.
-    static func isClosedLoop(_ points: [Point], scale: Double = 1) -> Bool {
+    static func isClosedLoop(_ raw: [Point], scale: Double = 1) -> Bool {
+        let points = PenGeometry.thinned(raw, limit: 1_024)
         guard let a = analyse(points) else { return false }
         let k = max(scale, 0.01)
         let closed = a.gap * k <= PenGestureTuning.loopMaxGap || a.gap <= PenGestureTuning.loopMaxGapShare * a.pathLength
-            || a.crossesStart
+            || crossesStart(PenGeometry.resampled(points, spacing: max(min(a.bounds.width, a.bounds.height), 1e-6) / 24))
         let winding = abs(a.netTurning)
         return closed
             && min(a.bounds.width, a.bounds.height) * k >= PenGestureTuning.loopMinSize

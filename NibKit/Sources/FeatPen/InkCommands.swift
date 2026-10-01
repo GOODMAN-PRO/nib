@@ -121,7 +121,10 @@ enum InkParse {
     /// Points from the flat `pts` array in `fmt` order, or from the compact `ptsB64` form.
     static func points(fmt: JSONValue?, pts: JSONValue?, compact: JSONValue?, path: String) throws -> [StrokePoint] {
         if let c = compact, c != .null {
-            guard let s = c.stringValue, let data = Data(base64Encoded: s),
+            guard let s = c.stringValue,
+                  s.utf8.count <= InkLimits.maxPointsPerStroke * 40 * 4 / 3 + 4,
+                  let data = Data(base64Encoded: s),
+                  data.count / 40 <= InkLimits.maxPointsPerStroke,
                   data.count % (StrokePoint.fullStride * MemoryLayout<Float>.size) == 0 else {
                 throw NibError.invalid("ptsB64 must be base64 of little-endian Float32 values, 10 per point",
                                        path: path + ".ptsB64")
@@ -199,13 +202,17 @@ enum InkParse {
         }
     }
 
-    /// Negative sizes and out-of-range opacity or force become the nearest valid value.
+    /// Clamp sensor values and nib sizes to physical ranges before deriving or storing ink.
     static func sanitised(_ p: StrokePoint) -> StrokePoint {
         var q = p
-        q.width = max(q.width, 0)
-        q.height = max(q.height, 0)
+        q.width = min(max(q.width, 0), Float(InkLimits.maxWidth))
+        q.height = min(max(q.height, 0), Float(InkLimits.maxWidth))
         q.opacity = min(max(q.opacity, 0), 1)
-        q.force = max(q.force, 0)
+        q.force = min(max(q.force, 0), 8)
+        q.t = min(max(q.t, 0), 86_400)
+        q.altitude = min(max(q.altitude, 0), .pi / 2)
+        q.azimuth = min(max(q.azimuth, -2 * .pi), 2 * .pi)
+        q.roll = min(max(q.roll, -2 * .pi), 2 * .pi)
         return q
     }
 
@@ -239,10 +246,13 @@ enum InkParse {
     }
 
     /// AI/plugin points derive their nib once; captured points have already passed the canvas dynamics processor.
-    static func prepare(_ stroke: inout Stroke) {
+    static func prepare(_ stroke: inout Stroke) throws {
         let synthesized = !stroke.points.isEmpty && stroke.points.allSatisfy { $0.width <= 0 }
         InkModel.prepare(&stroke)
         if synthesized { PenDynamics.apply(&stroke.points, style: stroke.style, captured: false) }
+        guard stroke.points.allSatisfy({ $0.width.isFinite && $0.height.isFinite }) else {
+            throw NibError.invalid("prepared nib sizes must be finite", path: "$.pts")
+        }
     }
 
     /// Caller-chosen ids in stroke order (fewer ids than strokes: the rest get fresh ids).
@@ -352,7 +362,7 @@ enum InkAddStrokes {
             guard batchPoints <= InkLimits.maxBatchPoints else {
                 throw NibError.invalid("too many prepared points in one batch; split the strokes across calls", path: "$.strokes")
             }
-            InkParse.prepare(&stroke)
+            try InkParse.prepare(&stroke)
             strokes.append(stroke)
         }
         try InkParse.checkWritable(doc, ctx)
@@ -407,7 +417,7 @@ enum InkSetPoints {
         }
         try InkParse.checkWritable(doc, ctx)
         stroke.points = points
-        InkParse.prepare(&stroke)
+        try InkParse.prepare(&stroke)
         var updated = item
         updated.stroke = stroke
         try ctx.mutate { tx in try tx.put(updated, doc: doc, page: page) }
@@ -566,7 +576,12 @@ struct InkSetStyle: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let refs = ctx.refsOrSelection(p.refs)
+        let refs = ctx.refsOrSelection(p.refs).filter { ref in
+            guard p.refs == nil else { return true }
+            guard case let .item(doc, page, id)? = NodeRef(ref),
+                  let item = try? ctx.workspace.item(doc, page: page, id: id) else { return false }
+            return item.kind == .stroke && !item.locked
+        }
         guard !refs.isEmpty else {
             throw NibError(.invalidParams, "give at least one stroke ref", path: "$.refs",
                            hint: "select strokes first, or pass refs like item:D/P/I")

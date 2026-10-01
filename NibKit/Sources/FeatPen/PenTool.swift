@@ -17,7 +17,13 @@ final class PenTool: CanvasTool {
     private var preview: CAShapeLayer?
     private var holdTimer: Task<Void, Never>?
     private var holdReference: Point?
-    private var consumedPress = false
+    private struct Press {
+        let page: PageID
+        let location: Point
+        let at: TimeInterval
+        let isPencil: Bool
+    }
+    private var consumedPress: Press?
     private var hold: Hold?
 
     private final class Hold {
@@ -44,7 +50,18 @@ final class PenTool: CanvasTool {
     func deactivate(_ host: CanvasHost) { touchesCancelled(host: host); pendingLoop = nil }
 
     func strokeFinished(_ stroke: Stroke, page: PageID, host: CanvasHost) {
-        if consumedPress { consumedPress = false; return }
+        if let press = consumedPress {
+            consumedPress = nil
+            let elapsed = ProcessInfo.processInfo.systemUptime - press.at
+            if press.page == page, press.isPencil || settings.get(NibSettings.stylusMode) == .anyInput,
+               elapsed >= 0, elapsed <= 1.5,
+               LoopDetector.isDot(stroke.polyline, scale: host.zoomScale),
+               let location = stroke.points.first?.location,
+               location.distance(to: press.location) * host.zoomScale <= 16 {
+                host.cancelWetStroke()
+                return
+            }
+        }
         guard hold == nil else { return }
         pendingLoop = nil
         let outline = PenGeometry.thinned(stroke.polyline, limit: NibLimits.maxErasePathPoints)
@@ -53,8 +70,12 @@ final class PenTool: CanvasTool {
             host.cancelWetStroke()
             Task { @MainActor [weak host] in
                 do {
-                    _ = try await app.bus.execute(CommandIDs.inkScribbleErase,
+                    let result = try await app.bus.execute(CommandIDs.inkScribbleErase,
                         ["page": .string(NodeRef.page(doc, page).description), "points": try JSONValue.from(outline)], session: session)
+                    guard let removed = result["removed"]?.doubleValue else {
+                        throw NibError.invalid("scribble erase must return a removed count")
+                    }
+                    if removed == 0 { host?.commitStroke(stroke, page: page) }
                 } catch {
                     Self.report(error, command: CommandIDs.inkScribbleErase, app: app)
                     host?.commitStroke(stroke, page: page)
@@ -66,7 +87,7 @@ final class PenTool: CanvasTool {
             let id = NibID.make(), group = NibID.make().raw
             var processed = stroke
             for entry in app.content.strokeProcessors.all {
-                guard entry.processor.process(&processed, page: page, session: session) else { return }
+                guard entry.processor.process(&processed, page: page, session: session) else { host.cancelWetStroke(); return }
             }
             let saved = processed
             host.cancelWetStroke()
@@ -111,13 +132,18 @@ final class PenTool: CanvasTool {
     }
 
     func longPress(_ sample: CanvasSample, host: CanvasHost) {
-        if selectLoop(at: sample, host: host) { consumedPress = true; clearPreview() }
+        if selectLoop(at: sample, host: host) { recordPress(sample); clearPreview() }
+    }
+
+    private func recordPress(_ sample: CanvasSample) {
+        consumedPress = Press(page: sample.page, location: sample.location,
+                              at: ProcessInfo.processInfo.systemUptime, isPencil: sample.isPencil)
     }
 
     func strokeHeld(_ stroke: Stroke, page: PageID, host: CanvasHost) -> Bool {
         if LoopDetector.isDot(stroke.polyline, scale: host.zoomScale), let point = stroke.points.last?.location,
            selectLoop(at: CanvasSample(page: page, location: point), host: host) {
-            consumedPress = true; return true
+            recordPress(CanvasSample(page: page, location: point, isPencil: true)); return true
         }
         guard hold == nil, settings.get(NibSettings.drawAndHold), stroke.points.count >= 2,
               !LoopDetector.isDot(stroke.polyline, scale: host.zoomScale),
@@ -151,7 +177,7 @@ final class PenTool: CanvasTool {
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
-        consumedPress = false
+        consumedPress = nil
         guard inputMode == .samples, !sample.isPredicted else { return }
         samplePage = sample.page; sampleStyle = inkStyle(host); sampleStart = sample.timestamp
         samples = [point(sample, location: sample.location)]
@@ -159,17 +185,18 @@ final class PenTool: CanvasTool {
     }
 
     func touchesMoved(_ incoming: [CanvasSample], host: CanvasHost) {
-        if let state = hold, let sample = incoming.last(where: { !$0.isPredicted }),
-           let p = host.convert(sample.location, from: sample.page, to: state.page) {
-            state.current = p
-            if let result = state.result { drawShape(result.shape, grab: state.grab, at: p, page: state.page, host: host) }
-            else {
-                appendFallback(sample, point: p, state: state)
-                drawStroke(state.stroke, page: state.page, host: host)
+        if let state = hold {
+            for sample in incoming where !sample.isPredicted {
+                guard let p = host.convert(sample.location, from: sample.page, to: state.page) else { continue }
+                state.current = p
+                if state.result == nil { appendFallback(sample, point: p, state: state) }
             }
+            if let result = state.result {
+                drawShape(result.shape, grab: state.grab, at: state.current, page: state.page, host: host)
+            } else { drawStroke(state.stroke, page: state.page, host: host) }
             return
         }
-        guard !consumedPress, let page = samplePage else { return }
+        guard consumedPress == nil, let page = samplePage else { return }
         var moved = false
         for sample in incoming where !sample.isPredicted {
             guard let p = host.convert(sample.location, from: sample.page, to: page) else { continue }
@@ -185,11 +212,20 @@ final class PenTool: CanvasTool {
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
         holdTimer?.cancel(); holdTimer = nil
-        if consumedPress { consumedPress = false; resetSamples(); clearPreview(); return }
+        if let press = consumedPress {
+            consumedPress = nil
+            let elapsed = ProcessInfo.processInfo.systemUptime - press.at
+            if press.page == sample.page, press.isPencil == sample.isPencil,
+               elapsed >= 0, elapsed <= 1.5,
+               press.location.distance(to: sample.location) * host.zoomScale <= 16,
+               LoopDetector.isDot(samples.map(\.location) + [sample.location], scale: host.zoomScale) {
+                resetSamples(); clearPreview(); host.cancelWetStroke(); return
+            }
+        }
         if let state = hold {
             if let p = host.convert(sample.location, from: sample.page, to: state.page) {
                 state.current = p
-                if state.result == nil { appendFallback(sample, point: p, state: state) }
+                if state.result == nil, state.stroke.points.last?.location != p { appendFallback(sample, point: p, state: state) }
             }
             hold = nil
             let layer = preview; preview = nil
@@ -201,13 +237,23 @@ final class PenTool: CanvasTool {
                     do {
                         let group = NibID.make().raw
                         // Create first so a failed creation preserves both the stroke and every neighbour.
-                        _ = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
+                        let created = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
                             params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
                         if !result.mergeWith.isEmpty {
                             do {
                                 _ = try await app.bus.execute(Invocation(command: CommandIDs.itemDelete,
                                     params: ["refs": .array(result.mergeWith.map(JSONValue.string))], session: session, group: group))
-                            } catch { Self.report(error, command: CommandIDs.itemDelete, app: app) }
+                            } catch {
+                                Self.report(error, command: CommandIDs.itemDelete, app: app)
+                                if app.bus.history.entries(doc).last?.group == group {
+                                    _ = try await app.bus.execute(CommandIDs.undo,
+                                        ["doc": .string(NodeRef.document(doc).description)], session: session)
+                                } else if let ref = created.value["ref"]?.stringValue {
+                                    _ = try await app.bus.execute(CommandIDs.itemDelete,
+                                        ["refs": .array([.string(ref)])], session: session)
+                                }
+                                await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
+                            }
                         }
                     } catch {
                         Self.report(error, command: CommandIDs.shapeCreate, app: app)
@@ -234,7 +280,7 @@ final class PenTool: CanvasTool {
             state.recognition?.cancel(); hold = nil
             host.commitStroke(state.stroke, page: state.page)
         }
-        resetSamples(); consumedPress = false; clearPreview()
+        resetSamples(); consumedPress = nil; clearPreview()
     }
 
     private func point(_ sample: CanvasSample, location: Point) -> StrokePoint {
@@ -282,8 +328,13 @@ final class PenTool: CanvasTool {
         layer.lineWidth = style.width * host.zoomScale; layer.lineCap = .round; layer.lineJoin = .round
         switch style.pattern {
         case .solid: layer.lineDashPattern = nil
-        case .dashed: layer.lineDashPattern = [NSNumber(value: style.width * host.zoomScale * 4), NSNumber(value: style.width * host.zoomScale * 3)]
-        case .dotted: layer.lineDashPattern = [0, NSNumber(value: style.width * host.zoomScale * 2.5)]
+        case .dashed:
+            layer.lineCap = .butt
+            layer.lineDashPattern = [NSNumber(value: max(3 * style.width, 3) * host.zoomScale),
+                                     NSNumber(value: max(2 * style.width, 2.5) * host.zoomScale)]
+        case .dotted:
+            layer.lineDashPattern = [NSNumber(value: 0.01 * host.zoomScale),
+                                     NSNumber(value: max(2.5 * style.width, 2.5) * host.zoomScale)]
         }
         CATransaction.commit()
     }
@@ -295,12 +346,12 @@ final class PenTool: CanvasTool {
     private func appendFallback(_ sample: CanvasSample, point p: Point, state: Hold) {
         // Recognition can take longer than a frame; unmatched strokes retain their real continuation samples.
         let last = state.stroke.points.last
-        guard last?.location != p else { return }
         var fallback = point(sample, location: p)
         fallback.t = (last?.t ?? 0) + Float(max(0, sample.timestamp - (state.lastTimestamp ?? sample.timestamp)))
-        fallback.width = last?.width ?? 0; fallback.height = last?.height ?? 0
+        var segment = [fallback]
+        InkModel.fillSizes(&segment, style: state.stroke.style)
         state.lastTimestamp = sample.timestamp
-        state.stroke.points.append(fallback)
+        state.stroke.points.append(segment[0])
     }
 
     private static func preserve(_ stroke: Stroke, page: PageID, doc: DocumentID, app: NibApp,

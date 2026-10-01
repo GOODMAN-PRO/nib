@@ -5,7 +5,6 @@ import NibDesign
 
 public enum FeatPenFeature: NibFeature {
     public static let id = "pen"
-    private static var observations: [ObjectIdentifier: AnyCancellable] = [:]
 
     public static func register(_ app: NibApp) {
         InkCommands.register(app)
@@ -41,20 +40,56 @@ public enum FeatPenFeature: NibFeature {
     }
 
     public static func start(_ app: NibApp) async {
-        observations[ObjectIdentifier(app)] = NotificationCenter.default.publisher(for: SettingsStore.didChange,
-            object: app.settings).receive(on: DispatchQueue.main).sink { [weak app] note in
-                guard let name = note.userInfo?["name"] as? String,
-                      name.hasPrefix("pen.") || name == "presets.pen" || name == "presets.pencil" else { return }
-                MainActor.assumeIsolated {
-                    guard let app else { return }
-                    // The canvas refreshes its PencilKit ink and input mode when its tool descriptor changes.
-                    for tool in ["pen", "pencil"] {
-                        if let descriptor = app.ui.canvasTools.get(tool) { app.ui.canvasTools.register(descriptor) }
-                    }
-                    app.ui.setNeedsChromeUpdate()
-                }
+        app.services.set(PenToolObservation(app), for: "pen.toolObservation")
+    }
+
+    public static func stop(_ app: NibApp) {
+        app.services.set(nil, for: "pen.toolObservation")
+    }
+}
+
+/// Owned by the app's services, so subscriptions end with the app rather than a static dictionary.
+@MainActor
+private final class PenToolObservation {
+    private weak var app: NibApp?
+    private var settings: AnyCancellable?
+    private var idle: [EventSubscription] = []
+    private var pending = false
+    private static let inkKeys: Set<String> = ["pen.style", "pen.tipSharpness", "pen.pressure",
+        "pen.tipFlatness", "pen.reactToRoll", "presets.pen", "presets.pencil"]
+
+    init(_ app: NibApp) {
+        self.app = app
+        settings = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .receive(on: DispatchQueue.main).sink { [weak self] note in
+                guard let name = note.userInfo?["name"] as? String, Self.inkKeys.contains(name) else { return }
+                MainActor.assumeIsolated { self?.requestRefresh() }
             }
     }
+
+    private func requestRefresh() {
+        pending = true
+        idle.forEach { $0.cancel() }; idle = []
+        guard let app else { return }
+        for session in app.services.sessions.sessions where session.inking.isInking {
+            idle.append(session.inking.observe { [weak self] signal in
+                if !signal.isInking { self?.flush() }
+            })
+        }
+        flush()
+    }
+
+    private func flush() {
+        guard pending, let app, !app.services.sessions.sessions.contains(where: { $0.inking.isInking }) else { return }
+        pending = false
+        idle.forEach { $0.cancel() }; idle = []
+        for tool in ["pen", "pencil"] {
+            if let descriptor = app.ui.canvasTools.get(tool) { app.ui.canvasTools.register(descriptor) }
+        }
+        app.ui.setNeedsChromeUpdate()
+    }
+
+    deinit { idle.forEach { $0.cancel() } }
 }
 
 enum PenSettings {
