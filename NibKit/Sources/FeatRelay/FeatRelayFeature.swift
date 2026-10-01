@@ -16,7 +16,7 @@ public enum FeatRelayFeature: NibFeature {
             guard let runtime = ctx.services.get(RelayRuntime.serviceKey, as: RelayRuntime.self) else {
                 throw NibError.unavailable("relay")
             }
-            if !ctx.dryRun { try runtime.configure(url, credentialGroup: ctx.principal.isUser ? ctx.group : nil) }
+            if !ctx.dryRun { try await runtime.configure(url, credentialGroup: ctx.principal.isUser ? ctx.group : nil, principal: ctx.principal) }
             else { _ = try RelayEndpoint.parse(url) }
             return [:]
         }
@@ -53,15 +53,18 @@ final class RelayRuntime {
     private struct CredentialDraft { var url: URL; var token: String }
     private var credentials: [String: CredentialDraft] = [:]
     private var transport: WebSocketTransport?
+    private let socketFactory: ((URLRequest) -> RelaySocket)?
 
-    init(app: NibApp) { self.app = app }
+    init(app: NibApp, socketFactory: ((URLRequest) -> RelaySocket)? = nil) {
+        self.app = app; self.socketFactory = socketFactory
+    }
 
     func restore() {
         guard transport == nil, let app = app, let url = try? RelayEndpoint.parse(app.settings.get(Self.urlKey)) else { return }
         install(url, app: app)
     }
 
-    func configure(_ value: String, credentialGroup: String?) throws {
+    func configure(_ value: String, credentialGroup: String?, principal: Principal = .user) async throws {
         guard let app = app else { throw NibError.unavailable("relay") }
         let url = try RelayEndpoint.parse(value)
         if let group = credentialGroup, let draft = credentials.removeValue(forKey: group) {
@@ -73,7 +76,15 @@ final class RelayRuntime {
                 throw NibError(.unavailable, String(localized: "Couldn't save the relay token. Try again."))
             }
         }
-        transport?.leave()
+        // End the live relay session through F072 before retiring the retained transport. This sends the host's
+        // ended frame and clears F072's session state instead of leaving a zombie session with away participants.
+        if app.commands.descriptor(CommandIDs.collabParticipants) != nil {
+            let roster = try await app.bus.execute(Invocation(command: CommandIDs.collabParticipants, principal: principal))
+            if roster.value["active"]?.boolValue == true, roster.value["transport"]?.stringValue == "relay" {
+                _ = try await app.bus.execute(Invocation(command: CommandIDs.collabLeave, principal: principal))
+            }
+        }
+        transport?.retire()
         transport = nil
         app.services.set(nil, for: ServiceKeys.collabRelay)
         app.settings.set(Self.urlKey, url?.absoluteString ?? "")
@@ -81,9 +92,9 @@ final class RelayRuntime {
     }
 
     private func install(_ url: URL, app: NibApp) {
-        let pipe = WebSocketTransport(url: url) {
+        let pipe = WebSocketTransport(url: url, token: {
             Keychain.getString(service: Self.keychainService, account: url.absoluteString)
-        }
+        }, factory: socketFactory)
         transport = pipe
         app.services.set(pipe, for: ServiceKeys.collabRelay)
     }
@@ -102,7 +113,7 @@ final class RelayRuntime {
         }
         defer { credentials[group] = nil }
         _ = try await app.bus.execute(Invocation(command: CommandIDs.relayConfigure,
-            params: ["url": .string(url)], principal: .user, group: group, skipHooks: true))
+            params: ["url": .string(url)], principal: .user, group: group))
     }
 
     func hasToken(for value: String) -> Bool {

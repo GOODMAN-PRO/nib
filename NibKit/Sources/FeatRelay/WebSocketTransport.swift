@@ -24,11 +24,12 @@ struct RelayFrame: Codable, Equatable {
     var type: String
     var from: String
     var to: String?
+    var except: [String]?
     var data: String
 
-    init(type: String, from: String, to: String? = nil, bytes: Data) throws {
+    init(type: String, from: String, to: String? = nil, except: [String]? = nil, bytes: Data) throws {
         guard bytes.count <= Self.maxDataBytes else { throw NibError.invalid("Relay payload exceeds 64 KiB.") }
-        self.type = type; self.from = from; self.to = to; self.data = bytes.base64EncodedString()
+        self.type = type; self.from = from; self.to = to; self.except = except; self.data = bytes.base64EncodedString()
     }
 
     func payload() throws -> Data {
@@ -52,7 +53,7 @@ struct RelayFrame: Codable, Equatable {
         let frame: RelayFrame
         do { frame = try JSONDecoder().decode(Self.self, from: Data(value.utf8)) }
         catch { throw NibError.invalid("Malformed relay JSON envelope.") }
-        guard ["host", "join", "welcome", "peers", "message", "error"].contains(frame.type),
+        guard ["host", "join", "welcome", "peers", "message", "error", "bye"].contains(frame.type),
               !frame.from.isEmpty, frame.from.utf8.count <= 128,
               frame.to.map({ !$0.isEmpty && $0.utf8.count <= 128 }) ?? true else {
             throw NibError.invalid("Invalid relay envelope.")
@@ -185,6 +186,8 @@ final class WebSocketTransport: CollabTransport {
     private var hosting = false
     private var hostID: String?
     private(set) var connected = false
+    private(set) var retired = false
+    private var openedAt: Date?
     private var queue: [String] = []
     private var queuedBytes = 0
     private let log = Logger(subsystem: "app.nib", category: "relay")
@@ -209,6 +212,7 @@ final class WebSocketTransport: CollabTransport {
     }
 
     private func begin(code: String, name: String, hosting: Bool) async throws {
+        guard !retired else { throw NibError(.unavailable, String(localized: "The relay was reconfigured.")) }
         guard !code.isEmpty, code.utf8.count <= 128, name.utf8.count <= 256 else {
             throw NibError.invalid("Invalid relay room code or display name.")
         }
@@ -266,6 +270,7 @@ final class WebSocketTransport: CollabTransport {
             throw NibError.invalid("Missing relay host in welcome.")
         }
         connected = true
+        openedAt = Date()
         try roster(welcome)
     }
 
@@ -301,9 +306,9 @@ final class WebSocketTransport: CollabTransport {
                 case "error": throw try frame.decodePayload(RelayFailure.self).error
                 default: throw NibError.invalid("Unexpected relay control frame.")
                 }
-                attempt = 0
             } catch {
                 guard generation == gen, !Task.isCancelled else { return }
+                if let openedAt = openedAt, Date().timeIntervalSince(openedAt) >= 30 { attempt = 0 }
                 disconnect()
                 if let error = error as? NibError, error.code == .permissionDenied || error.code == .invalidParams {
                     log.error("Relay rejected connection or framing; reconfigure to retry.")
@@ -313,14 +318,13 @@ final class WebSocketTransport: CollabTransport {
                 while generation == gen, !Task.isCancelled {
                     do {
                         try await sleep(min(30, Self.backoff(attempt: attempt) * Double.random(in: 0.8...1.2)))
+                        attempt = min(attempt + 1, 5)
                         try await open(gen)
-                        attempt = 0
                         break
                     } catch {
                         guard generation == gen, !Task.isCancelled else { return }
                         socket?.close(); socket = nil
                         if let e = error as? NibError, e.code == .permissionDenied || e.code == .invalidParams { return }
-                        attempt = min(attempt + 1, 5)
                     }
                 }
             }
@@ -330,16 +334,21 @@ final class WebSocketTransport: CollabTransport {
     func send(_ data: Data, to targets: [CollabPeer]?) throws {
         guard connected, socket != nil else { throw NibError.unavailable("relay connection") }
         let destinations: [String?]
+        var excluded: [String]?
         if let targets = targets {
             guard targets.allSatisfy({ target in peers.contains(where: { $0.id == target.id }) }) else {
                 throw NibError.notFound("relay participant")
             }
-            destinations = Array(Set(targets.map(\.id))).sorted().map { Optional($0) }
+            let ids = Set(targets.map(\.id))
+            let others = peers.map(\.id).filter { !ids.contains($0) }.sorted()
+            if hosting, ids.count > 1, others.count < ids.count {
+                destinations = [nil]; excluded = others
+            } else { destinations = ids.sorted().map { Optional($0) } }
         } else { destinations = [nil] }
-        let frames = try destinations.map { try RelayFrame(type: "message", from: localID, to: $0, bytes: data).encoded() }
+        let frames = try destinations.map { try RelayFrame(type: "message", from: localID, to: $0, except: excluded, bytes: data).encoded() }
         let size = frames.reduce(0) { $0 + $1.utf8.count }
         guard queuedBytes + size <= 8 * 1024 * 1024 else {
-            throw NibError(.unavailable, String(localized: "The relay is busy. Try again when the connection catches up."))
+            throw NibError(.timeout, String(localized: "The relay is busy. Try again when the connection catches up."), hint: "relay-busy")
         }
         queue += frames; queuedBytes += size
         guard sender == nil else { return }
@@ -351,16 +360,23 @@ final class WebSocketTransport: CollabTransport {
     private func drain(_ gen: UUID, link: RelaySocket) async {
         defer { if generation == gen, socket === link { sender = nil } }
         while generation == gen, socket === link, connected, !Task.isCancelled, !queue.isEmpty {
-            let text = queue.removeFirst(); queuedBytes -= text.utf8.count
-            do { try await link.send(text) }
+            let text = queue.removeFirst()
+            do {
+                try await link.send(text)
+                if generation == gen, socket === link { queuedBytes -= text.utf8.count }
+            }
             catch { if generation == gen, socket === link { link.close() }; return }
         }
     }
 
     private func disconnect(flush: Bool = false) {
+        let wasConnected = connected
         connected = false
+        openedAt = nil
         let departing = socket
-        let pending = queue
+        var pending = queue
+        if flush, wasConnected, !hosting,
+           let bye = try? RelayFrame(type: "bye", from: localID, bytes: Data()).encoded() { pending.append(bye) }
         socket = nil
         sender?.cancel(); sender = nil
         queue = []; queuedBytes = 0
@@ -380,6 +396,12 @@ final class WebSocketTransport: CollabTransport {
         } else { departing?.close() }
         peers = []; hostID = nil
         onPeersChanged?(peers)
+    }
+
+    /// A CollabSession may still retain this object after it is removed from services.
+    func retire() {
+        retired = true
+        leave()
     }
 
     func leave() {

@@ -114,6 +114,112 @@ final class RelayTransportTests: XCTestCase {
         XCTAssertEqual(WebSocketTransport.backoff(attempt: 100), 30)
     }
 
+    func testFlappingWelcomesIncreaseReconnectDelays() async throws {
+        var sockets: [ScriptedRelaySocket] = [], delays: [TimeInterval] = []
+        let flapped = expectation(description: "Four reconnect attempts")
+        let transport = WebSocketTransport(url: URL(string: "wss://example.com/")!, token: { "secret" }, factory: { _ in
+            let socket = ScriptedRelaySocket()
+            socket.disconnectAfterWelcome = sockets.count < 4
+            sockets.append(socket)
+            return socket
+        }, sleep: { delay in
+            delays.append(delay)
+            if delays.count == 4 { flapped.fulfill() }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        })
+        defer { transport.leave() }
+        try await transport.host(code: "ROOM", displayName: "Host")
+        await fulfillment(of: [flapped], timeout: 3)
+        XCTAssertEqual(delays.count, 4)
+        for (index, delay) in delays.enumerated() {
+            let expected = WebSocketTransport.backoff(attempt: index)
+            XCTAssertTrue((expected * 0.8...expected * 1.2).contains(delay), "\(delays)")
+        }
+    }
+
+    func testSlowSocketDrainsTwentyMiBWithRetryableCapacityError() async throws {
+        let socket = ScriptedRelaySocket()
+        socket.sendLatency = 0.003
+        let transport = WebSocketTransport(url: URL(string: "wss://example.com/")!, token: { "secret" }, factory: { _ in socket })
+        defer { transport.leave() }
+        try await transport.host(code: "ROOM", displayName: "Host")
+        let received = expectation(description: "All 20 MiB arrives in order")
+        let count = 20 * 1024 * 1024 / RelayFrame.maxDataBytes
+        var accepted = 0, delivered = 0, busy = 0
+        socket.onSend = { frame in
+            guard frame.type == "message" else { return }
+            let expected = Data(repeating: UInt8(delivered % 251), count: RelayFrame.maxDataBytes)
+            XCTAssertEqual(try? frame.payload(), expected)
+            delivered += 1
+            if delivered == count { received.fulfill() }
+        }
+        let deadline = Date().addingTimeInterval(20)
+        while accepted < count {
+            guard Date() < deadline else { XCTFail("Queue did not drain"); return }
+            do {
+                try transport.send(Data(repeating: UInt8(accepted % 251), count: RelayFrame.maxDataBytes), to: nil)
+                accepted += 1
+            } catch {
+                // F072 must use this retry signal without advancing its blob/frame cursor (see README contract request).
+                let error = try XCTUnwrap(error as? NibError)
+                XCTAssertEqual(error.code, .timeout)
+                XCTAssertEqual(error.hint, "relay-busy")
+                busy += 1
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        await fulfillment(of: [received], timeout: 20)
+        XCTAssertGreaterThan(busy, 0)
+        XCTAssertEqual(delivered * RelayFrame.maxDataBytes, 20 * 1024 * 1024)
+    }
+
+    func testHostFanoutUsesOneEnvelopeWithExclusions() async throws {
+        let socket = ScriptedRelaySocket()
+        let transport = WebSocketTransport(url: URL(string: "wss://example.com/")!, token: { "secret" }, factory: { _ in socket })
+        defer { transport.leave() }
+        try await transport.host(code: "ROOM", displayName: "Host")
+        let registration = try RelayFrame.decode(XCTUnwrap(socket.sent.first))
+        let peers = (0..<49).map { CollabPeer(id: "p\($0)", name: "Person \($0)") }
+        let roster = expectation(description: "49 guests")
+        transport.onPeersChanged = { if $0.count == 49 { roster.fulfill() } }
+        socket.push(try RelayFrame(type: "peers", from: "relay", to: registration.from,
+            bytes: JSONEncoder().encode(RelayRoster(peers: peers, host: registration.from))).encoded())
+        await fulfillment(of: [roster], timeout: 2)
+        let sent = expectation(description: "Broadcast")
+        var frames: [RelayFrame] = []
+        socket.onSend = { if $0.type == "message" { frames.append($0); sent.fulfill() } }
+        try transport.send(Data("patch".utf8), to: Array(peers.dropFirst()))
+        await fulfillment(of: [sent], timeout: 2)
+        XCTAssertEqual(frames.count, 1)
+        XCTAssertNil(frames.first?.to)
+        XCTAssertEqual(frames.first?.except, ["p0"])
+    }
+
+    func testHostReplacementRostersTriggerGuestRejoinAndNextPatch() async throws {
+        let first = ScriptedRelaySocket(), second = ScriptedRelaySocket()
+        var calls = 0
+        let transport = WebSocketTransport(url: URL(string: "wss://example.com/")!, token: { "secret" }, factory: { _ in
+            calls += 1; return calls == 1 ? first : second
+        })
+        defer { transport.leave() }
+        try await transport.join(code: "ROOM", displayName: "Guest")
+        let registration = try RelayFrame.decode(XCTUnwrap(first.sent.first))
+        let lost = expectation(description: "Host absence is visible")
+        transport.onPeersChanged = { peers in
+            if !peers.contains(where: { $0.id == "host" }) { lost.fulfill() }
+        }
+        first.push(try RelayFrame(type: "peers", from: "relay", to: registration.from,
+            bytes: JSONEncoder().encode(RelayRoster(peers: [CollabPeer(id: "guest", name: "Guest")], host: "host"))).encoded())
+        await fulfillment(of: [lost], timeout: 2)
+        transport.onPeersChanged = nil
+        try await transport.join(code: "ROOM", displayName: "Guest")
+        let patch = expectation(description: "Patch after reconnect")
+        second.onSend = { if $0.type == "message" { XCTAssertEqual(try? $0.payload(), Data("next patch".utf8)); patch.fulfill() } }
+        try transport.send(Data("next patch".utf8), to: [CollabPeer(id: "host", name: "Host")])
+        await fulfillment(of: [patch], timeout: 2)
+        XCTAssertEqual(try RelayFrame.decode(second.sent[0]).from, registration.from)
+    }
+
     func testFullRoomMapsToFolderSyncFallback() async throws {
         let socket = ScriptedRelaySocket()
         socket.registrationError = RelayFailure(code: "full", message: "Full")
@@ -165,17 +271,21 @@ final class RelayTransportTests: XCTestCase {
 /// A controllable async pipe, not a second transport implementation: the production transport handles registration,
 /// validation, queue ordering and reconnection in these tests.
 @MainActor
-private final class ScriptedRelaySocket: RelaySocket {
+final class ScriptedRelaySocket: RelaySocket {
     var sent: [String] = []
     var closed = false
     var registrationError: RelayFailure?
     var autoWelcome = true
+    var sendLatency: TimeInterval = 0
+    var disconnectAfterWelcome = false
+    private var dropped = false
     var onSend: ((RelayFrame) -> Void)?
     private var pending: [String] = []
     private var waiter: CheckedContinuation<String, Error>?
 
     func send(_ text: String) async throws {
-        if closed { throw NibError(.unavailable, "Disconnected") }
+        if sendLatency > 0 { try await Task.sleep(nanoseconds: UInt64(sendLatency * 1_000_000_000)) }
+        if closed || dropped { throw NibError(.unavailable, "Disconnected") }
         sent.append(text)
         let frame = try RelayFrame.decode(text)
         if autoWelcome, frame.type == "host" || frame.type == "join" {
@@ -192,12 +302,22 @@ private final class ScriptedRelaySocket: RelaySocket {
     }
     func receive() async throws -> String {
         if closed { throw NibError(.unavailable, "Disconnected") }
-        if !pending.isEmpty { return pending.removeFirst() }
+        if !pending.isEmpty {
+            let next = pending.removeFirst()
+            if disconnectAfterWelcome { disconnectWithoutClose() }
+            return next
+        }
+        if dropped { throw NibError(.unavailable, "Link lost") }
         return try await withCheckedThrowingContinuation { waiter = $0 }
     }
     func push(_ value: String) {
         if let waiter = waiter { self.waiter = nil; waiter.resume(returning: value) }
         else { pending.append(value) }
+    }
+    func disconnectWithoutClose() {
+        dropped = true
+        let current = waiter; waiter = nil
+        current?.resume(throwing: NibError(.unavailable, "Link lost"))
     }
     func close() {
         closed = true

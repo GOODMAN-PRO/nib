@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 
 const MAX_DATA = 64 * 1024, MAX_WIRE = 96 * 1024, MAX_PEERS = 50;
+const HIGH_WATER = 1024 * 1024, HARD_CAP = 16 * 1024 * 1024;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 const digest = value => createHash('sha256').update(value).digest();
 const acceptKey = key => createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
@@ -47,15 +48,44 @@ class WebSocketConnection {
   constructor(socket, serverSide = true) {
     this.socket = socket; this.serverSide = serverSide; this.buffer = Buffer.alloc(0);
     this.fragments = []; this.fragmentBytes = 0; this.fragmentOpcode = 0;
+    this.blocked = new Map();
     this.closed = false; this.onText = () => {}; this.onClose = () => {}; this.onPong = () => {};
     socket.on('data', chunk => this.feed(chunk));
     socket.on('error', () => this.finish());
     socket.on('close', () => this.finish());
+    socket.on('end', () => { socket.destroy(); this.finish(); });
   }
-  finish() { if (!this.closed) { this.closed = true; this.onClose(); } }
+  finish() {
+    if (!this.closed) {
+      this.closed = true;
+      for (const release of [...this.blocked.values()]) release();
+      this.onClose();
+    }
+  }
+  // Pause both TCP ingress and parsing already-read frames until EVERY congested broadcast target drains.
+  waitForDrain(target) {
+    if (target.closed || target.socket.writableLength < HIGH_WATER || this.blocked.has(target)) return;
+    const release = () => {
+      clearTimeout(timer);
+      target.socket.off('drain', release); target.socket.off('close', release);
+      this.blocked.delete(target);
+      if (!this.closed && this.blocked.size === 0) {
+        this.feed(Buffer.alloc(0));
+        if (this.blocked.size === 0) this.socket.resume();
+      }
+    };
+    const timer = setTimeout(() => { target.socket.destroy(); release(); }, 30_000); timer.unref();
+    this.blocked.set(target, release);
+    target.socket.once('drain', release); target.socket.once('close', release);
+    this.socket.pause();
+  }
+  endSocket() {
+    this.socket.end(); this.finish();
+    const timer = setTimeout(() => this.socket.destroy(), 1000); timer.unref();
+  }
   sendFrame(bytes, opcode = 1) {
     if (this.closed || this.socket.destroyed) return;
-    if (this.socket.writableLength > 2 * 1024 * 1024) { this.socket.destroy(); return; }
+    if (this.socket.writableLength > HARD_CAP) { this.socket.destroy(); return; }
     this.socket.write(wire(bytes, opcode, !this.serverSide));
   }
   send(value) { this.sendFrame(Buffer.from(JSON.stringify(value))); }
@@ -63,14 +93,13 @@ class WebSocketConnection {
     if (this.closed) return;
     const text = Buffer.from(reason).subarray(0, 123), data = Buffer.alloc(2 + text.length);
     data.writeUInt16BE(code); text.copy(data, 2);
-    this.sendFrame(data, 8); this.socket.end(); this.finish();
-    const timer = setTimeout(() => this.socket.destroy(), 1000); timer.unref();
+    this.sendFrame(data, 8); this.endSocket();
   }
   feed(chunk) {
     if (this.closed) return;
     this.buffer = Buffer.concat([this.buffer, chunk]);
     try {
-      while (this.buffer.length >= 2 && !this.closed) {
+      while (this.buffer.length >= 2 && !this.closed && this.blocked.size === 0) {
         const b = this.buffer, fin = !!(b[0] & 0x80), opcode = b[0] & 15, masked = !!(b[1] & 0x80);
         if ((b[0] & 0x70) || masked !== this.serverSide || ![0, 1, 2, 8, 9, 10].includes(opcode)) throw new Error('protocol');
         let length = b[1] & 127, offset = 2;
@@ -99,7 +128,7 @@ class WebSocketConnection {
             if (!([1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014].includes(code) || (code >= 3000 && code <= 4999))) throw new Error('close code');
             utf8.decode(bytes.subarray(2));
           }
-          this.sendFrame(bytes, 8); this.socket.end(); this.finish(); return;
+          this.sendFrame(bytes, 8); this.endSocket(); return;
         }
         if (opcode === 9) { this.sendFrame(bytes, 10); continue; }
         if (opcode === 10) { this.onPong(); continue; }
@@ -111,6 +140,7 @@ class WebSocketConnection {
         }
         this.fragmentBytes += bytes.length;
         if (this.fragmentBytes > MAX_WIRE) { this.close(1009, 'Message too large'); return; }
+        if (this.fragments.length >= 1024) { this.close(1009, 'Too many fragments'); return; }
         this.fragments.push(bytes);
         if (fin) {
           const text = utf8.decode(Buffer.concat(this.fragments));
@@ -118,12 +148,12 @@ class WebSocketConnection {
           this.onText(text);
         }
       }
-      if (this.buffer.length > MAX_WIRE + 14) throw new Error('buffer');
+      if (this.buffer.length > 2 * MAX_WIRE + 64 * 1024) throw new Error('buffer');
     } catch (error) { this.close(error instanceof TypeError ? 1007 : 1002, 'Invalid WebSocket frame'); }
   }
 }
 
-export function createRelay({ token, host = '127.0.0.1', port = 8787, path = '/', roomGraceMs = 120_000 } = {}) {
+export function createRelay({ token, host = '127.0.0.1', port = 8787, path = '/', roomGraceMs = 120_000, maxRooms = 1000 } = {}) {
   if (typeof token !== 'string' || token.length < 16 || /[\r\n]/.test(token)) throw new Error('RELAY_TOKEN must contain at least 16 characters and no line breaks');
   const rooms = new Map(), links = new Set(), roomTimers = new Set();
   const server = http.createServer((req, res) => {
@@ -172,30 +202,41 @@ export function createRelay({ token, host = '127.0.0.1', port = 8787, path = '/'
       const room = rooms.get(link.code);
       if (!room || room.members.get(link.id) !== link) return;
       room.members.delete(link.id);
-      if (link.id !== room.host) room.secrets.delete(link.id);
+      if (link.id !== room.host) room.reservations.set(link.id, Date.now() + roomGraceMs);
       if (link.id === room.host) releaseRoom(link.code, room);
       notify(room);
     };
     link.onText = text => {
       try {
         const frame = JSON.parse(text);
-        if (!frame || !validID(frame.from) || (frame.to !== undefined && !validID(frame.to))) throw new Error('envelope');
+        if (!frame || !validID(frame.from) || (frame.to !== undefined && !validID(frame.to)) ||
+            (frame.except !== undefined && (!Array.isArray(frame.except) || frame.except.length > MAX_PEERS || !frame.except.every(validID)))) throw new Error('envelope');
         const bytes = payload(frame.data);
         if (!link.id) {
-          if (!['host', 'join'].includes(frame.type) || frame.to !== undefined) throw new Error('registration');
+          if (!['host', 'join'].includes(frame.type) || frame.to !== undefined || frame.except !== undefined) throw new Error('registration');
           const { code, name, resume } = JSON.parse(utf8.decode(bytes));
           if (typeof code !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(code) || typeof name !== 'string' || Buffer.byteLength(name) > 256 || typeof resume !== 'string' || resume.length < 32 || resume.length > 128) throw new Error('room');
           let room = rooms.get(code);
           link.id = frame.from; link.name = name;
           if (frame.type === 'host') {
             if (room && (room.host !== link.id || !timingSafeEqual(room.resume, digest(resume)))) { fail('conflict', 'That room already has a host.'); return; }
-            if (!room) { room = { host: link.id, resume: digest(resume), members: new Map(), secrets: new Map() }; rooms.set(code, room); }
+            if (!room) {
+              if (rooms.size >= maxRooms) { fail('unavailable', 'The relay has too many retained rooms. Try again later.'); return; }
+              room = { host: link.id, resume: digest(resume), members: new Map(), secrets: new Map(), reservations: new Map() }; rooms.set(code, room);
+            }
             if (room.timer) { clearTimeout(room.timer); roomTimers.delete(room.timer); room.timer = null; }
           } else if (!room || !room.members.has(room.host)) { fail('not_found', 'No live host with that code.'); return; }
+          for (const [id, expiry] of room.reservations) if (expiry <= Date.now()) {
+            room.reservations.delete(id); room.secrets.delete(id);
+          }
           const old = room.members.get(link.id);
           if (room.secrets.has(link.id) && !timingSafeEqual(room.secrets.get(link.id), digest(resume))) { fail('permission_denied', 'Invalid reconnect credentials.'); return; }
           if (!old && room.members.size >= MAX_PEERS) { fail('full', '50 participants maximum. Use folder sync for larger groups.'); return; }
-          // Same transport identity reconnecting replaces its old TCP link atomically.
+          if (!room.secrets.has(link.id) && room.secrets.size >= 1000) { fail('unavailable', 'Too many reserved identities. Try again later.'); return; }
+          // F072 unbinds guests when the host disconnects. Guests must see hostLost even when its stale link
+          // has not timed out yet, so they rejoin with their admission secret and run two-way digest sync.
+          if (old && link.id === room.host) { room.members.delete(link.id); notify(room); }
+          room.reservations.delete(link.id);
           link.code = code; room.members.set(link.id, link); room.secrets.set(link.id, digest(resume));
           old?.close(1001, 'Reconnected');
           clearTimeout(registrationTimer);
@@ -203,20 +244,27 @@ export function createRelay({ token, host = '127.0.0.1', port = 8787, path = '/'
           for (const member of room.members.values()) if (member !== link) roster(room, member);
           return;
         }
-        if (frame.type !== 'message' || frame.from !== link.id) throw new Error('sender');
+        if (!['message', 'bye'].includes(frame.type) || frame.from !== link.id) throw new Error('sender');
         const room = rooms.get(link.code);
         if (!room || room.members.get(link.id) !== link) throw new Error('room');
+        if (frame.type === 'bye') {
+          if (link.id !== room.host) { room.members.delete(link.id); room.secrets.delete(link.id); room.reservations.delete(link.id); notify(room); }
+          link.close(); return;
+        }
         // Admission and permissions belong to F072. Route guest messages only to the host, preventing guests from
         // forging host welcome/approval messages or writing directly to another guest.
         let targets;
         if (link.id !== room.host) {
-          if (frame.to !== undefined && frame.to !== room.host) throw new Error('guest target');
+          if ((frame.to !== undefined && frame.to !== room.host) || frame.except !== undefined) throw new Error('guest target');
           targets = [room.members.get(room.host)].filter(Boolean);
         } else {
-          targets = frame.to === undefined ? [...room.members.values()].filter(x => x !== link)
+          targets = frame.to === undefined ? [...room.members.values()].filter(x => x !== link && !(frame.except ?? []).includes(x.id))
             : [room.members.get(frame.to)].filter(x => x && x !== link);
         }
-        for (const target of targets) target.send(envelope('message', link.id, bytes, target.id));
+        for (const target of targets) {
+          target.send(envelope('message', link.id, bytes, target.id));
+          link.waitForDrain(target);
+        }
       } catch { fail('invalid_params', 'Invalid relay JSON frame.'); }
     };
     if (head.length) link.feed(head);
@@ -271,8 +319,8 @@ async function nextType(link, type) {
 }
 
 async function selftest() {
-  const token = base64(randomBytes(32)), relay = createRelay({ token, port: 0 }), clients = [];
-  const deadline = setTimeout(() => { console.error('Relay selftest timed out'); process.exit(1); }, 15_000);
+  const token = base64(randomBytes(32)), relay = createRelay({ token, port: 0, maxRooms: 2 }), clients = [];
+  const deadline = setTimeout(() => { console.error('Relay selftest timed out'); process.exit(1); }, 30_000);
   try {
     const port = await relay.listen();
     await assert.rejects(client(port, 'wrong-token'), /401/);
@@ -284,7 +332,7 @@ async function selftest() {
     const host = await client(port, token); clients.push(host);
     host.send(envelope('host', 'host', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Host', resume: 'host-private-resume-capability-12345' }))));
     assert.equal((await nextType(host, 'welcome')).to, 'host');
-    const guest = await client(port, token); clients.push(guest);
+    let guest = await client(port, token); clients.push(guest);
     guest.send(envelope('join', 'guest', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Guest', resume: 'guest-private-resume-capability-12345' }))));
     const joined = await nextType(guest, 'welcome');
     assert.deepEqual(JSON.parse(payload(joined.data)), { peers: [{ id: 'host', name: 'Host' }], host: 'host' });
@@ -299,6 +347,50 @@ async function selftest() {
     assert.equal(relayed.from, 'guest'); assert.equal(relayed.to, 'host'); assert.deepEqual(payload(relayed.data), data);
     host.send(envelope('message', 'host', Buffer.from('reply'), 'guest'));
     assert.equal(payload((await nextType(guest, 'message')).data).toString(), 'reply');
+    // Broadcast pauses the sender until ALL slow receivers drain, preserving the complete 8 MiB burst.
+    const slow = await client(port, token); clients.push(slow);
+    slow.send(envelope('join', 'slow', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Slow', resume: 'slow-private-resume-capability-12345' }))));
+    await nextType(slow, 'welcome'); await nextType(guest, 'peers');
+    guest.socket.pause(); slow.socket.pause();
+    for (let i = 0; i < 128; i++) host.send(envelope('message', 'host', data));
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(guest.closed, false); assert.equal(slow.closed, false);
+    guest.socket.resume();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(slow.closed, false);
+    slow.socket.resume();
+    for (let i = 0; i < 128; i++) {
+      assert.deepEqual(payload((await nextType(guest, 'message')).data), data);
+      assert.deepEqual(payload((await nextType(slow, 'message')).data), data);
+    }
+    assert.equal(guest.closed, false); assert.equal(slow.closed, false);
+    // An explicit bye frees a guest reservation immediately.
+    slow.send(envelope('bye', 'slow', Buffer.alloc(0)));
+    await nextType(guest, 'peers');
+    const freed = await client(port, token); clients.push(freed);
+    freed.send(envelope('join', 'slow', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Freed', resume: 'new-private-resume-capability-12345' }))));
+    await nextType(freed, 'welcome'); await nextType(guest, 'peers');
+    freed.send(envelope('bye', 'slow', Buffer.alloc(0))); await nextType(guest, 'peers');
+    // Replacement of a still-open host MUST publish an absent roster before the returning host roster.
+    const returnedHost = await client(port, token); clients.push(returnedHost);
+    returnedHost.send(envelope('host', 'host', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Host', resume: 'host-private-resume-capability-12345' }))));
+    await nextType(returnedHost, 'welcome');
+    assert.equal(JSON.parse(payload((await nextType(guest, 'peers')).data)).peers.some(p => p.id === 'host'), false);
+    assert.equal(JSON.parse(payload((await nextType(guest, 'peers')).data)).peers.some(p => p.id === 'host'), true);
+    // An abrupt guest disconnect reserves its capability, so another token holder cannot steal its visible id.
+    guest.socket.destroy();
+    for (;;) {
+      const roster = JSON.parse(payload((await nextType(returnedHost, 'peers')).data));
+      if (!roster.peers.some(p => p.id === 'guest')) break;
+    }
+    const guestImpostor = await client(port, token); clients.push(guestImpostor);
+    guestImpostor.send(envelope('join', 'guest', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Impostor', resume: 'wrong-private-resume-capability-12345' }))));
+    assert.equal(JSON.parse(payload((await nextType(guestImpostor, 'error')).data)).code, 'permission_denied');
+    guest = await client(port, token); clients.push(guest);
+    guest.send(envelope('join', 'guest', Buffer.from(JSON.stringify({ code: 'TEST01', name: 'Guest', resume: 'guest-private-resume-capability-12345' }))));
+    await nextType(guest, 'welcome');
+    guest.send(envelope('message', 'guest', Buffer.from('patch-after-reconnect'), 'host'));
+    assert.equal(payload((await nextType(returnedHost, 'message')).data).toString(), 'patch-after-reconnect');
     // Room isolation and host-only guest routing.
     const other = await client(port, token); clients.push(other);
     other.send(envelope('host', 'other', Buffer.from(JSON.stringify({ code: 'OTHER', name: 'Other', resume: 'other-private-resume-capability-12345' }))));
@@ -306,8 +398,9 @@ async function selftest() {
     guest.send(envelope('message', 'guest', Buffer.from('blocked'), 'other'));
     assert.equal(JSON.parse(payload((await nextType(guest, 'error')).data)).code, 'invalid_params');
     // Fill a fresh room to 50 total (host included), then ensure participant 51 sees the sync fallback.
+    const members = [];
     for (let i = 1; i < MAX_PEERS; i++) {
-      const member = await client(port, token); clients.push(member);
+      const member = await client(port, token); clients.push(member); members.push(member);
       member.send(envelope('join', `p${i}`, Buffer.from(JSON.stringify({ code: 'OTHER', name: `Person ${i}`, resume: `person-private-resume-capability-${i}` }))));
       await nextType(member, 'welcome');
     }
@@ -322,7 +415,25 @@ async function selftest() {
     const replacement = await client(port, token); clients.push(replacement);
     replacement.send(envelope('host', 'other', Buffer.from(JSON.stringify({ code: 'OTHER', name: 'Host again', resume: 'other-private-resume-capability-12345' }))));
     assert.equal(JSON.parse(payload((await nextType(replacement, 'welcome')).data)).peers.length, 49);
-    console.log('RELAY SELFTEST OK: auth, framing, routing, isolation, reconnect, 50-participant cap');
+    // Select a known room member instead of relying on pending roster order.
+    const recipient = await client(port, token); clients.push(recipient);
+    recipient.send(envelope('join', 'p1', Buffer.from(JSON.stringify({ code: 'OTHER', name: 'Person 1', resume: 'person-private-resume-capability-1' }))));
+    await nextType(recipient, 'welcome');
+    replacement.send({ ...envelope('message', 'other', Buffer.from('broadcast'), undefined), except: ['p2'] });
+    assert.equal(payload((await nextType(recipient, 'message')).data).toString(), 'broadcast');
+    replacement.send(envelope('message', 'other', Buffer.from('excluded-marker'), 'p2'));
+    assert.equal(payload((await nextType(members[1], 'message')).data).toString(), 'excluded-marker');
+    // Room retention is bounded, including rooms whose host has disconnected.
+    returnedHost.socket.destroy();
+    const churn = await client(port, token); clients.push(churn);
+    churn.send(envelope('host', 'churn', Buffer.from(JSON.stringify({ code: 'CHURN', name: 'Churn', resume: 'churn-private-resume-capability-12345' }))));
+    assert.equal(JSON.parse(payload((await nextType(churn, 'error')).data)).code, 'unavailable');
+    const fragmented = await client(port, token); clients.push(fragmented);
+    const fragmentClosed = once(fragmented.socket, 'close');
+    fragmented.socket.write(wire(Buffer.alloc(0), 1, true, false));
+    for (let i = 0; i < 1024; i++) fragmented.socket.write(wire(Buffer.alloc(0), 0, true, false));
+    await fragmentClosed; assert.equal(fragmented.closed, true);
+    console.log('RELAY SELFTEST OK: auth, framing bounds, routing, slow receiver, host replacement, identity reservations, room/participant caps');
   } finally {
     clearTimeout(deadline);
     for (const link of clients) link.socket.destroy();
