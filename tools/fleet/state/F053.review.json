@@ -1,0 +1,71 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "blocker",
+   "where": "NibKit/Sources/FeatReplay/ReplayController.swift:203-232 (ensureDisplayLink / tick / refresh) together with NibKit/Sources/FeatAudio/AudioCommands.swift:423 and Player.swift:831-837 (applyPlaybackSettings)",
+   "problem": "While a clip plays, every 30 Hz display-link tick runs `audio.setPlayback {}` through the full command bus (hooks, gateway). F052's no-param call is not a pure read. AudioSetPlayback.run always calls `audio.applyPlaybackSettings()`, which sends `objectWillChange` (the playback bar and audio panel re-render 30 times a second) and calls `engine.setRate` and `setNoiseReduction`. It then either emits `audio.playback` (a 30 Hz event storm to every subscriber, including the bridge and plugins) or, when `plan?.skipsSilence != settings.skipSilence`, calls `begin(at: position)`. `begin` calls `engine.play`, which halts the player, calls `AVAudioSession.setActive`, `queue.sync`s and reschedules buffers. `PlaybackPlan.skipsSilence` is `skipSilence && silence != nil`. So with Skip Silence on, the audio restarts 30 times a second for as long as the silence map is missing: while the first analysis of a clip runs, and indefinitely when analysis fails or the map's duration differs from the clip's by 0.5 s or more (`Player.silenceMap`). Replay is on by default (`ReplayOptions.enabled = true`), so ordinary playback in an open note triggers this. It also departs from the spec, which says playback time comes from `NibEventType.audioPlayback` events decoded as `AudioPlaybackPayload` (t, rate, at). Here events are only a fallback for a failed poll, and an event alone cannot start replay because `loadedClip` is set only by a successful poll.",
+   "fix": "Drive the 30 Hz tick from the latest AudioPlaybackPayload: time = clip.start + clamp(sample.t + (now - sample.at) * sample.rate, 0, clip.duration). Resolve `loadedClip` when a payload names a new clip. Stop the display link when the latest payload has playing == false and restart it on a playing payload. Call `audio.setPlayback {}` only to resync: in start(), when a payload names a clip that is not loaded, and from the replay commands. Never call it every frame (at most about 1 Hz for drift). In F052's AudioSetPlayback.run, return `audio.status` without calling `applyPlaybackSettings()` when speed, skipSilence and noiseReduction are all nil, as the spec requires (no params only reads it). Add an integration test with FeatAudioFeature, FeatReplayFeature and a fake PlaybackEngine. It drives N replay ticks and asserts zero extra engine.play calls and zero extra audio.playback events. Add an event-only test: a payload with no poll publishes an interpolated session.replay."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatReplay/ReplayController.swift:92-120 (ReplayReader.inks), 196-197 (receive: committed sets linksDirty), 255-259 (apply rebuilds linkedInk), 275 (linear scan per tick)",
+   "problem": "Building the follow-along linkage is O(document) with N+1 commands, and it runs again after every commit. F003's `query.find` rows (Shapes.summary: ref, kind, bbox, layer, tool, color, width, pointCount) carry no `t0`. So decodeInk returns nil for every row and ReplayReader issues one `query.get` per stroke. A 20,000-stroke notebook means 20,000 bus round trips on the main actor. Until F003 lands, the fallback calls `workspace.items` for every page, which loads the whole notebook into the page cache. With follow-along on, every `committed` event in the clip's document sets linksDirty and repeats the full scan: a stroke written while listening, an autosave, a sync merge. `polling` stays true for the whole scan, so the replay time freezes on screen. `linkedInk.last(where:)` is then a linear scan per tick per session. `replay.tapAt` without a ref repeats the same full scan on every tap.",
+   "fix": "Read ink a page at a time with `query.get {ref: page, depth: 2, fields: [\"kind\",\"stroke\",\"bbox\",\"deleted\"]}`. pick() returns ref, kind, bbox and the pointless stroke (with t0), up to 200 rows per call. Keep only strokes whose t0 is in [clip.start, clip.start + duration]. Build the set once per clip. On `committed`, re-read only the pages named in the event's change summary, and do it outside the tick path so the time keeps advancing. Keep linkedInk sorted and binary-search the time. For tapAt without a ref, read only `p.page` with a `bbox` filter around the point (query.find {in: page, kinds: [stroke], bbox}). Replace the test fake in testQueryReaderUsesRawT0AndWalksEveryCursor with F003's real row shape (no t0)."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatReplay/ReplayCommands.swift:90-103 (ReplayTapAt.run)",
+   "problem": "Tap-to-seek (S-089) works only within the clip that is loaded. In a note with several recordings, tapping handwriting linked to another clip of the same document fails `ReplayLink.contains(ink.t0, clip: loadedClip)` and returns handled:false, so the tap falls through to selection. The spec asks a tap to seek to t0 - start - 1 s of the stroke's linked clip; linkage covers every clip of the same document, as replay.seekToItem already handles via ReplayLink.clip(for:in:preferred:).",
+   "fix": "Resolve the clip with `ReplayReader.clips(doc)` + `ReplayLink.clip(for: ink.t0, in: clips, preferred: status.clip, doc: doc)`. If it is the loaded clip, call `audio.seek {t}` as now. Otherwise call `audio.play {clip, t: seekTime}`, then `audio.pause` when `status.playing` was false, so a paused replay stays paused. Add a two-clip test that taps a stroke of the clip that is not loaded."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/FeatReplayFeature.swift:15-17 and ReplayCommands.swift:103",
+   "problem": "The handler at order 50 with itemKinds [.stroke] runs before tape.tapAt (order 100), and tape is a stroke tool. During replay, tapping tape drawn while recording seeks the audio instead of revealing or hiding the tape.",
+   "fix": "In ReplayTapAt, return handled:false when the hit stroke's tool is tape. Read `tool` from the query row, or `stroke.style.tool` in the fallback."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/ReplayController.swift:196-200, 218, 226-231",
+   "problem": "The 30 Hz display link is never invalidated in two cases: when `audio.setPlayback` is not registered (FeatAudio disabled; refresh returns at the guard) and when it throws (the catch path). sessionDocument and sessionActivated events start the link even with no clip loaded. Either case leaves an endless 30 Hz wake-up that spawns a Task per frame.",
+   "fix": "Start the link only when the latest payload is playing. In refresh(), invalidate it when the command is absent, and in the catch path when `sample` is nil or `!sample.playing`."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/ReplayController.swift:275-279",
+   "problem": "Follow-along does not rewind before the first linked stroke. When the playhead moves earlier than every linked stroke (for example, a seek back to 0), no ink matches `t0 <= time` and the window stays on the later page.",
+   "fix": "When no linked ink has t0 <= time, follow `linkedInk.first?.page`. Add a page 2 -> clip start rewind test."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/ReplayController.swift:159-166, 298-343; FeatReplayFeature.swift:126-137",
+   "problem": "`optionsBySession`, `lastFollowed` and `fullScreens` are never pruned when a session or window goes away. ReplayFullScreenController holds `app` strongly (app -> service -> fullScreens -> VC -> app). If a scene closes without dismissing the full-screen controller, viewDidDisappear may never run, so the read-only replay session stays in `services.sessions` and keeps receiving `session.replay`.",
+   "fix": "Prune the three maps against `app.services.sessions.sessions` in update() (or on sessionActivated). Make the full-screen controller's `app` weak. In the dock or onClose path, remove the replay session when its source session is no longer registered."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/FeatReplayFeature.swift:27-35",
+   "problem": "'Replay Options' appears in More for every document kind, including text documents and study sets, where the panel's docKinds [.notebook, .whiteboard] rejects it. It also appears in notes without any recording. 'Replay Handwriting' appears in the object menu for every single stroke, then fails with 'No recording is linked'.",
+   "fix": "Make isVisible require the document's kind to be notebook or whiteboard and `(try? ctx.app.workspace.content(doc).liveAudio.isEmpty) == false`. For the object-menu entry, also require that the stroke's t0 falls inside one of those clips."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/FeatReplayFeature.swift:18-25 and 46-54",
+   "problem": "The mode menu entries have key commands (⌥⇧⌘1-3) but do not set the contracts-v2 `MenuItemDescriptor.shortcut`, so the menu shows no shortcut. This fails the Slop rule that every shortcut shows its KeyHint.",
+   "fix": "Set `menu.shortcut = KeyShortcut(String(index + 1), [.command, .option, .shift])` on each mode entry."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/FeatReplayFeature.swift:189-192 (ReplayFullScreenDock) and 89-94 (mode rows)",
+   "problem": "The full-screen 'Play or Pause' button always shows `.play`, and its label is not verb + object, so the playing state is not exposed visually or to VoiceOver. The mode rows announce selection through `.accessibilityValue(\"Selected\")` instead of the selected trait.",
+   "fix": "Publish `playing` from the latest AudioPlaybackPayload on the controller. Show `.pause` / 'Pause Audio' while playing and `.play` / 'Play Audio' otherwise. On the mode rows, use `.accessibilityAddTraits(options.mode == mode ? .isSelected : [])`, or a NibSegmentedControl for the three modes."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatReplay/ReplayController.swift:44-47, 67, 77, 86-89, 111-119 (ReplayReader fallback)",
+   "problem": "The direct-workspace fallback skips the lock check that query.get and query.find apply. F003 is still a stub on main, so this is the live path today: AI or plugin calls to replay.seekToItem and replay.tapAt can read a locked note's stroke and clip timings.",
+   "fix": "In each fallback branch, throw `NibError(.locked, ...)` when `app.services.lock?.isLocked(doc) == true`, matching the query path's `locked` handling."
+  }
+ ]
+}
