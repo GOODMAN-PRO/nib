@@ -1,1 +1,1137 @@
-[]
+{
+  "areas": [
+    {
+      "prefix": "T",
+      "title": "Tools, ink & objects"
+    },
+    {
+      "prefix": "D",
+      "title": "Documents, pages & library"
+    },
+    {
+      "prefix": "S",
+      "title": "Smart features, AI, audio, study & collaboration"
+    },
+    {
+      "prefix": "P",
+      "title": "Platform, sync, settings & system"
+    }
+  ],
+  "exceptions": [
+    {
+      "class": "`security` scope (user only)",
+      "covers": "Passwords (`lock.setup`), AI API keys, WebDAV and relay secrets, bridge enable/token/port/networks (`bridge.setEnabled`), confirmation policies and every `security.*` setting (read and write), plugin grants",
+      "instead": "Ask the user; open the settings page (`panel.open`, deep link)",
+      "why": "A caller must never widen its own permissions or read secrets"
+    },
+    {
+      "class": "User presence",
+      "covers": "Commands that show system UI: camera and scan, document/folder pickers (`import.pick`, `library.chooseFolder`, `backup.chooseFolder`, `template.choose`), Face ID/password (`doc.unlock`, `doc.setLocked`), print and share sheets, microphone (`audio.record`)",
+      "instead": "Call them: the UI appears on the device and the user completes it (bridge requests wait up to 120 s)",
+      "why": "iOS requires a person at the system UI"
+    },
+    {
+      "class": "Locked documents",
+      "covers": "Every command that touches a locked document; search, backup, WebDAV and collaboration skip them",
+      "instead": "Ask the user to unlock (`doc.unlock`)",
+      "why": "The password lock is an access gate"
+    },
+    {
+      "class": "Plugin management",
+      "covers": "`plugin.install`, `plugin.uninstall`, `plugin.enable` (`plugins:manage`)",
+      "instead": "AI and bridge: call them, always confirmed. Plugins: not possible",
+      "why": "Plugins must not install or enable plugins"
+    },
+    {
+      "class": "Plugin opt-outs",
+      "covers": "Plugin commands with `ai: false` / `bridge: false`",
+      "instead": "The user can expose them anyway (`security.plugins.exposeHiddenCommands`)",
+      "why": "The plugin author hid them"
+    },
+    {
+      "class": "Ask mode",
+      "covers": "Every non-`read` command while \"Create mode\" is off, including nested calls and plugin handlers",
+      "instead": "Propose the change; the user switches to Edit mode",
+      "why": "The user asked for a read-only conversation"
+    },
+    {
+      "class": "Always confirmed",
+      "covers": "`irreversible` (empty trash, purge, delete audio, overwrite a source file), `sensitive` (WebDAV/backup destinations, collaboration, relay, microphone, calendar, Photos, AI provider endpoints) and `plugins:manage` commands",
+      "instead": "Call them; the user answers Allow / Allow for this turn / Deny",
+      "why": "Cannot be undone, or data leaves the device"
+    },
+    {
+      "class": "Protected fields",
+      "covers": "`createdBy`, `rev`, `deleted`, `id` (on update), `meta.format`, `meta.locked`, `meta.trashedFrom`; read-only `managed.*` settings",
+      "instead": "Use the dedicated commands (`node.remove`, `library.trash`, `doc.setLocked`)",
+      "why": "Provenance, sync and format integrity"
+    }
+  ],
+  "format": 1,
+  "generator": "Scripts/gen_parity.py",
+  "items": [
+    {
+      "area": "T",
+      "builtBy": [
+        "F058"
+      ],
+      "feature": "Edit Handwriting (Lasso Edit Mode / reflow)",
+      "id": "T-038",
+      "note": "Reflow works for any Vision-recognised language, not only English; cursive/rotated lines still reflow poorly.",
+      "status": "partial"
+    },
+    {
+      "area": "T",
+      "builtBy": [
+        "F105"
+      ],
+      "feature": "Restyle handwriting (Smart Ink)",
+      "id": "T-039",
+      "note": "No generative handwriting model on iOS: Restyle regularises baseline/size/slant, or re-synthesises the recognised text with a skeletonised handwriting-style system font (ink.writeText).",
+      "status": "partial"
+    },
+    {
+      "area": "T",
+      "builtBy": [
+        "F060"
+      ],
+      "feature": "Convert handwritten math",
+      "id": "T-042",
+      "note": "Handwritten-math recognition uses the user's own vision-capable AI model; offline fallback handles simple arithmetic/algebra via Vision text recognition.",
+      "status": "partial"
+    },
+    {
+      "area": "T",
+      "builtBy": [
+        "F104"
+      ],
+      "feature": "Handwriting spellcheck",
+      "id": "T-043",
+      "note": "Detection via Vision + UITextChecker; corrections are synthesised ink matched to word size/slant/colour, not a personalised handwriting model.",
+      "status": "partial"
+    },
+    {
+      "area": "T",
+      "builtBy": [
+        "F082",
+        "F059"
+      ],
+      "feature": "Word Complete (discontinued)",
+      "id": "T-044",
+      "note": "Discontinued in Goodnotes; shipped as the example plugin 'word-complete' (uses the user's AI).",
+      "status": "substitute"
+    },
+    {
+      "area": "T",
+      "builtBy": [
+        "F033",
+        "F008"
+      ],
+      "feature": "Tape colors and patterns (washi)",
+      "id": "T-053",
+      "note": "Marketplace patterns replaced by built-in generated patterns, custom images and gallery content packs.",
+      "status": "partial"
+    },
+    {
+      "area": "T",
+      "builtBy": [
+        "F035"
+      ],
+      "feature": "GIPHY GIFs and animated stickers",
+      "id": "T-070",
+      "note": "GIPHY search needs the user's own GIPHY API key (Settings); GIFs from Files/URL always work.",
+      "status": "partial"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F019"
+      ],
+      "feature": "Library View navigation tabs",
+      "id": "D-001",
+      "note": "Marketplace tab replaced by the plugin/content Gallery tab; Shared lists collaboration sessions.",
+      "status": "partial"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F096",
+        "F074"
+      ],
+      "feature": "Home-screen widgets",
+      "id": "D-018",
+      "note": "QuickNote widget ships. A Favorites widget appears only when the sideloading tool provides an App Group (AltStore/SideStore can register one even for free Apple IDs; it depends on the tool); otherwise favourites are offered as dynamic Home Screen quick actions.",
+      "status": "partial"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Plan-based document limits",
+      "id": "D-022",
+      "note": "No plans: everything is unlimited and free.",
+      "status": "n/a"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F044"
+      ],
+      "feature": "Whiteboard templates",
+      "id": "D-031",
+      "note": "Built-in set of 8 frameworks plus gallery packs instead of 200+ Marketplace templates.",
+      "status": "partial"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F098",
+        "F065"
+      ],
+      "feature": "Smart Textbooks",
+      "id": "D-035",
+      "note": "Publisher DRM textbooks need Goodnotes' store. Substitutes: PDFs + outline + study sets; QR reader in Scan; audio speed in audio playback.",
+      "status": "n/a"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F075"
+      ],
+      "feature": "Calendar-integrated Planner",
+      "id": "D-036",
+      "note": "EventKit (Google/Outlook accounts added in iOS Settings) instead of Google OAuth; planner template draws events.",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F090"
+      ],
+      "feature": "External AI document creation (ChatGPT app / Claude connector)",
+      "id": "D-037",
+      "note": "Superseded by the MCP/HTTP bridge: external agents can also read and edit existing documents.",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F080",
+        "F045"
+      ],
+      "feature": "Marketplace templates, covers and planners",
+      "id": "D-050",
+      "note": "Marketplace replaced by gallery JSON indexes of free content packs (plugins contributing templates/covers/planners/elements/tape).",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Mac-specific document behaviors",
+      "id": "D-084",
+      "note": "Nib is an iPhone/iPad app (no Mac Catalyst build). Pointer, right-click and keyboard behaviours are implemented on iPad (F073).",
+      "status": "n/a"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F064",
+        "F025"
+      ],
+      "feature": "Cloud storage integration (Pro)",
+      "id": "D-093",
+      "note": "No OAuth backends: Google Drive/OneDrive/Dropbox/Box are reached through their Files providers; import-in-place keeps a bookmark so 'Save changes to source' writes the annotated PDF back.",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F064"
+      ],
+      "feature": "Email to Goodnotes",
+      "id": "D-094",
+      "note": "Needs an inbound mail server. Substitute: share PDFs from Mail/Outlook with 'Open in Nib'.",
+      "status": "n/a"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F068",
+        "F069"
+      ],
+      "feature": "Auto Backup to cloud storage",
+      "id": "D-106",
+      "note": "Targets any Files-provider folder (Google Drive, Dropbox, OneDrive, iCloud Drive) or WebDAV instead of OAuth APIs.",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F072"
+      ],
+      "feature": "Share link (public collaboration link)",
+      "id": "D-111",
+      "note": "No web backend: sharing is a live session (join code over Multipeer or a self-hosted relay) or sending the .nibnote package; no browser viewer.",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F065",
+        "F052"
+      ],
+      "feature": "Smart Textbook QR Reader and textbook audio speed",
+      "id": "D-124",
+      "note": "General QR reader in Scan; playback speed in audio.",
+      "status": "substitute"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "DRM-protected publisher and partner content",
+      "id": "D-139",
+      "note": "No publisher partnerships; Nib never blocks export of the user's own files.",
+      "status": "n/a"
+    },
+    {
+      "area": "D",
+      "builtBy": [
+        "F080"
+      ],
+      "feature": "Marketplace search and creator storefronts",
+      "id": "D-140",
+      "note": "Gallery search and author pages from index metadata.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F085",
+        "F087"
+      ],
+      "feature": "AI Image Generation plus the Modify/Insert/Discard flow",
+      "id": "S-010",
+      "note": "Needs a provider with an image endpoint or Apple Image Playground.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F085",
+        "F098"
+      ],
+      "feature": "AI Credits system",
+      "id": "S-015",
+      "note": "No credits: the user pays their own provider; the chat footer shows token usage.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "AI plan gating (Free / Special Edition / Essential / Pro / AI Pass)",
+      "id": "S-016",
+      "note": "No plans; every AI feature is available with any configured provider.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "AI regional availability",
+      "id": "S-017",
+      "note": "No geo-blocking; availability is up to the user's provider.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F086",
+        "F098"
+      ],
+      "feature": "AI privacy model",
+      "id": "S-018",
+      "note": "Data goes only to the provider the user configured (or stays local with Ollama/LM Studio).",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F090"
+      ],
+      "feature": "Goodnotes app in ChatGPT and connector in Claude",
+      "id": "S-020",
+      "note": "MCP bridge lets Claude Code / any MCP client read and edit the library.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Ask Goodnotes in publisher AI Textbooks",
+      "id": "S-021",
+      "note": "No publisher DRM content.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F061",
+        "F088"
+      ],
+      "feature": "Math Assist supported topics and limits",
+      "id": "S-024",
+      "note": "On-device evaluator covers arithmetic, algebraic equations, systems, matrices and numeric calculus; symbolic calculus/limits go to the user's AI.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F088"
+      ],
+      "feature": "Goodnotes AI for Math: Solve",
+      "id": "S-028",
+      "note": "Uses the user's AI model instead of Wolfram|Alpha; numeric answers are checked with the on-device evaluator.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F060"
+      ],
+      "feature": "Math Conversion (handwriting to typeset math and LaTeX)",
+      "id": "S-030",
+      "note": "See 'Convert handwritten math'.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F088",
+        "F099"
+      ],
+      "feature": "Interactive Exam Practice with AI Math Assistance (legacy)",
+      "id": "S-031",
+      "note": "Retired in Goodnotes; substitute: Teach Me + Study Sets + answer zones.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F104"
+      ],
+      "feature": "Handwriting Spellcheck",
+      "id": "S-032",
+      "note": "See 'Handwriting spellcheck'.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F082",
+        "F059"
+      ],
+      "feature": "Word Complete (discontinued)",
+      "id": "S-034",
+      "note": "Example plugin 'word-complete'.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F105"
+      ],
+      "feature": "Handwriting Restyle (beautification)",
+      "id": "S-038",
+      "note": "See 'Restyle handwriting (Smart Ink)'.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F055"
+      ],
+      "feature": "Handwriting search and recognition languages",
+      "id": "S-042",
+      "note": "Languages = Vision's supported recognition languages on the device.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F054",
+        "F089"
+      ],
+      "feature": "Live audio transcription (on-device vs cloud)",
+      "id": "S-049",
+      "note": "On-device = Apple Speech (languages per device); cloud = the user's Whisper-compatible endpoint.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F052"
+      ],
+      "feature": "Audio Noise Reduction",
+      "id": "S-056",
+      "note": "Playback noise gate + high-pass (AVAudioEngine); not Apple's ML voice isolation.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F075"
+      ],
+      "feature": "Calendar Connection (Google, Outlook) for meetings",
+      "id": "S-058",
+      "note": "EventKit instead of OAuth.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F075"
+      ],
+      "feature": "Goodnotes Planner with Google Calendar events",
+      "id": "S-059",
+      "note": "EventKit-backed planner template.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Smart Textbooks",
+      "id": "S-069",
+      "note": "See docs 'Smart Textbooks'.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F099",
+        "F088"
+      ],
+      "feature": "Education: teacher-approved AI hints",
+      "id": "S-070",
+      "note": "Local teacher toolkit; hints stored in answer zones.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F072"
+      ],
+      "feature": "Public share link collaboration",
+      "id": "S-074",
+      "note": "Join codes over Multipeer/relay; no public web link or browser viewer.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F072"
+      ],
+      "feature": "Private sharing with invited collaborators and access control",
+      "id": "S-075",
+      "note": "Per-session join codes with host approval and read-only/edit roles; no account-based invites.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F072"
+      ],
+      "feature": "Turbo Sync",
+      "id": "S-077",
+      "note": "No paid tiers; live sessions always stream changes immediately.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F064",
+        "F025"
+      ],
+      "feature": "Google Drive integration (Pro)",
+      "id": "S-082",
+      "note": "Files provider instead of OAuth.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F080"
+      ],
+      "feature": "Goodnotes Marketplace (browse, buy, restore)",
+      "id": "S-083",
+      "note": "Free gallery of plugins/content packs from user-added JSON indexes; no purchases.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F080"
+      ],
+      "feature": "Marketplace discovery: Saved Lists, recommendations, subscriber specials",
+      "id": "S-084",
+      "note": "Gallery search, categories and saved items; no recommendations or subscriber specials.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Marketplace offer codes (web checkout)",
+      "id": "S-085",
+      "note": "No store.",
+      "status": "n/a"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F033",
+        "F044",
+        "F080"
+      ],
+      "feature": "Marketplace tape patterns and whiteboard templates",
+      "id": "S-087",
+      "note": "Generated patterns, custom images, built-in whiteboard templates and gallery packs.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F054"
+      ],
+      "feature": "Transcription language picker and on-device model download",
+      "id": "S-091",
+      "note": "Apple Speech manages on-device models; Nib shows availability and how to download.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F109"
+      ],
+      "feature": "Education: School folder and Class Folders",
+      "id": "S-094",
+      "note": "A shared synced folder acts as the class folder; no roster server.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F109"
+      ],
+      "feature": "Education: Lessons with Prep Mode and Teach Mode",
+      "id": "S-095",
+      "note": "Prep/Present/Feedback via layers and per-student copies in a shared folder.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F109"
+      ],
+      "feature": "Education: Assignments (publish, submit, return, resubmit)",
+      "id": "S-097",
+      "note": "State flags on per-student copies in a shared folder; no Google Classroom link.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F110"
+      ],
+      "feature": "Education: Smart Clusters AI grading",
+      "id": "S-098",
+      "note": "Uses the teacher's own AI model.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F072",
+        "F092"
+      ],
+      "feature": "Real-time participant cap with sync fallback",
+      "id": "S-101",
+      "note": "Multipeer caps at 8 peers per session; the relay transport raises it to 50; beyond that, folder sync.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F108"
+      ],
+      "feature": "Collaboration activity notifications",
+      "id": "S-102",
+      "note": "Local notifications only while background audio recording keeps the app alive (iOS suspends live sessions ~30 s after backgrounding; no APNs); otherwise unseen-change badges on return, and peers auto-rejoin with the same code.",
+      "status": "partial"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F051"
+      ],
+      "feature": "Legacy Flashcards to Study Set conversion",
+      "id": "S-108",
+      "note": "No legacy decks exist; Anki/Quizlet/CSV import covers migration.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F109"
+      ],
+      "feature": "Education: Co-teaching in Class Folders",
+      "id": "S-112",
+      "note": "Co-teachers share the class folder; no role server.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F109"
+      ],
+      "feature": "Education: Class Folder archive, filters and sorting",
+      "id": "S-114",
+      "note": "Archive = move the class folder into an Archive folder; library filters/sorting apply.",
+      "status": "substitute"
+    },
+    {
+      "area": "S",
+      "builtBy": [
+        "F109"
+      ],
+      "feature": "Education: roster sync and Sample Lesson onboarding",
+      "id": "S-115",
+      "note": "Sample lesson ships; ClassLink/Eduplaces roster sync is not applicable (no backend); rosters import from CSV.",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F025",
+        "F001"
+      ],
+      "feature": "iCloud Sync (Use iCloud to Sync Documents)",
+      "id": "P-001",
+      "note": "CloudKit needs a paid entitlement. The library is a user-chosen folder (e.g. iCloud Drive via Files); per-device files merge conflict-free.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F001",
+        "F070"
+      ],
+      "feature": "Sync schema version gate and iCloud reset",
+      "id": "P-004",
+      "note": "Format-version gate opens newer documents read-only; 'reset' = library repair.",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F001",
+        "F025"
+      ],
+      "feature": "iCloud storage model (not browsable in iCloud Drive)",
+      "id": "P-005",
+      "note": "Nib's library is intentionally browsable in Files.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F025",
+        "F069"
+      ],
+      "feature": "Goodnotes Cloud (cross-platform account sync)",
+      "id": "P-006",
+      "note": "Any Files-provider folder or WebDAV; no Nib account or server.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F068",
+        "F069"
+      ],
+      "feature": "Auto Backup to third-party cloud",
+      "id": "P-007",
+      "note": "Files-provider folders and WebDAV.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Goodnotes account sign-in methods",
+      "id": "P-015",
+      "note": "No accounts.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "App Store receipt to account binding",
+      "id": "P-016",
+      "note": "Sideloaded, free.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Account screen (View Account / Account Settings)",
+      "id": "P-017",
+      "note": "Local profile (author name) + About.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Account deletion with a 21-day grace period",
+      "id": "P-018",
+      "note": "'Delete all Nib data' wipes local app data and keys.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Account session limits",
+      "id": "P-019",
+      "note": "No accounts.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F025",
+        "F098"
+      ],
+      "feature": "Multiple accounts on one device",
+      "id": "P-020",
+      "note": "Switch between known library folders (library.locations / library.switch).",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Plans, paywall and entitlement gating",
+      "id": "P-021",
+      "note": "Everything free.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Apple Family Sharing",
+      "id": "P-022",
+      "note": "No purchases.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Legacy GoodNotes 5 mode switch",
+      "id": "P-023",
+      "note": "No legacy app.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Contribute Handwriting / Contribute Math Equations",
+      "id": "P-037",
+      "note": "No model training service.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F096",
+        "F074"
+      ],
+      "feature": "Home Screen and desktop widgets",
+      "id": "P-069",
+      "note": "See 'Home-screen widgets'.",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F064",
+        "F074"
+      ],
+      "feature": "Share Sheet / 'Open in Goodnotes' import",
+      "id": "P-073",
+      "note": "'Open in Nib' for files works (document types). Images, text and URLs shared from other apps need the optional NibShare extension: it writes into an App Group inbox when the sideloading tool provides one, otherwise hands small payloads over the pasteboard (nib://import?from=pasteboard); large files go through 'Save to Files → Nib Inbox'.",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F025",
+        "F064"
+      ],
+      "feature": "Direct cloud storage integration (Integrations > Cloud Storage)",
+      "id": "P-075",
+      "note": "Files providers + import-in-place with save-back.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F064"
+      ],
+      "feature": "Email to Goodnotes",
+      "id": "P-077",
+      "note": "See docs 'Email to Goodnotes'.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F075"
+      ],
+      "feature": "Calendar integrations (Google Calendar, Outlook)",
+      "id": "P-080",
+      "note": "EventKit.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F090"
+      ],
+      "feature": "External AI integration (ChatGPT app / Claude connector)",
+      "id": "P-081",
+      "note": "MCP bridge (create, read and edit).",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F034"
+      ],
+      "feature": "Apple Intelligence Image Playground insertion",
+      "id": "P-082",
+      "note": "Only on Apple Intelligence devices (iOS 18.1+).",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Supported platforms and minimum OS",
+      "id": "P-085",
+      "note": "iPhone and iPad, iOS/iPadOS 17+. No Mac, visionOS, Android, Windows or web clients.",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Mac-specific behavior",
+      "id": "P-086",
+      "note": "No Mac build.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F095"
+      ],
+      "feature": "UI localization",
+      "id": "P-087",
+      "note": "String catalog + 15 languages generated by AI translation; right-to-left not supported (same as Goodnotes).",
+      "status": "partial"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F050",
+        "F075",
+        "F072"
+      ],
+      "feature": "Push notifications and in-app messages",
+      "id": "P-090",
+      "note": "Local notifications only (APNs needs a paid account); no marketing messages.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Right to erasure requests",
+      "id": "P-097",
+      "note": "In-app 'Delete all Nib data'.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F097"
+      ],
+      "feature": "Managed App Configuration (MDM AppConfig)",
+      "id": "P-098",
+      "note": "Managed App Configuration reaches only MDM-installed apps; a sideloaded build never receives it. A minimal read-only reader (F097) is kept for MDM-distributed builds.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F097",
+        "F098"
+      ],
+      "feature": "Enterprise identity and compliance (Intune, Managed Apple IDs)",
+      "id": "P-099",
+      "note": "Intune APP SDK and Managed Apple ID sign-in need Microsoft SDK/entitlements and accounts.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F076"
+      ],
+      "feature": "TestFlight beta and remote feature flags",
+      "id": "P-101",
+      "note": "Local 'Experimental' toggles; CI artifacts replace TestFlight.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Regional availability and store variants",
+      "id": "P-102",
+      "note": "Not distributed through the App Store.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Teams/Enterprise and Education deployment (Admin Console, SSO)",
+      "id": "P-104",
+      "note": "No admin console, SSO or licensing server.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F064",
+        "F025"
+      ],
+      "feature": "Box and Dropbox direct cloud-storage integration",
+      "id": "P-107",
+      "note": "Files providers + import-in-place save-back.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F025"
+      ],
+      "feature": "iCloud to Goodnotes Cloud migration and switch-back",
+      "id": "P-108",
+      "note": "'Move Library' copies the library to another folder (e.g. from On My iPad to iCloud Drive) and switches to it; switching back is the same command.",
+      "status": "substitute"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Free-plan caps: watermark, audio and AI usage",
+      "id": "P-109",
+      "note": "No caps, no watermark.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F097"
+      ],
+      "feature": "MDM Auto Backup reminder and WebDAV certificate policy",
+      "id": "P-110",
+      "note": "Requires MDM-distributed builds; the WebDAV untrusted-certificate option is an ordinary setting.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F098"
+      ],
+      "feature": "Business Admin Console extras",
+      "id": "P-111",
+      "note": "No admin console.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F072"
+      ],
+      "feature": "'Open Document on Web' share toggle",
+      "id": "P-112",
+      "note": "No web viewer; share a PDF export instead.",
+      "status": "n/a"
+    },
+    {
+      "area": "P",
+      "builtBy": [
+        "F034"
+      ],
+      "feature": "Send content to Image Playground (outbound)",
+      "id": "P-114",
+      "note": "Apple Intelligence devices only.",
+      "status": "partial"
+    }
+  ],
+  "source": "docs/FEATURES.md",
+  "totals": {
+    "n/a": 29,
+    "parity": 355,
+    "parity+": 36,
+    "partial": 34,
+    "substitute": 39,
+    "total": 493
+  },
+  "why": "CloudKit/iCloud sync, APNs push and Sign in with Apple need a paid Apple Developer account, and App Groups (data widgets, share-extension hand-off) are available only when the sideloading tool registers one, so Nib uses them as a progressive enhancement; Goodnotes Cloud, public web links, Email-to-Goodnotes, the Marketplace store, accounts/plans/credits, education admin/roster servers and publisher DRM need Goodnotes' servers. Nib's substitutes: a user-chosen library folder in any Files provider (iCloud Drive, OneDrive, Dropbox, Google Drive) with conflict-free per-device files, WebDAV, local-network/relay live collaboration, local notifications, a free plugin/content gallery from JSON indexes, and bring-your-own AI."
+}
