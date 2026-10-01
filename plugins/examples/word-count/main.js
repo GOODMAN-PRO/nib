@@ -21,10 +21,6 @@ let open = false;
 let pending = null;
 let generation = 0;
 let lastDocument = null;
-function isOpen(c) {
-  // contracts-v2 session state is authoritative when query.context exposes it.
-  return c.session && Array.isArray(c.session.openPanels) ? c.session.openPanels.includes(panelID) : open;
-}
 function refresh(delay = 800) {
   if (!open) return;
   const ticket = ++generation;
@@ -32,11 +28,11 @@ function refresh(delay = 800) {
   const run = async () => {
     try {
       const c = await nib.commands.execute("query.context", {});
-      if (ticket !== generation || !open || !isOpen(c)) return;
+      if (ticket !== generation || !open) return;
       lastDocument = c.document && c.document.ref ? c.document.ref.replace(/^doc:/, "") : null;
       const count = await nib.commands.execute("dev.nib.wordcount.count", {});
       const current = await nib.commands.execute("query.context", {});
-      if (ticket === generation && open && isOpen(current)) nib.ui.postToPanel(panelID, count);
+      if (ticket === generation && open && count.page === ((current.page && current.page.ref) || null)) nib.ui.postToPanel(panelID, count);
       return count;
     } catch (e) {
       if (ticket === generation && open) nib.ui.postToPanel(panelID, {error: e.message || "Unable to count this page"});

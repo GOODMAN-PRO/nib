@@ -87,6 +87,38 @@ final class PluginRuntimeTests: XCTestCase {
 
     // MARK: Acceptance
 
+    func testObjectFramesAdaptToTheRegisteredCommandSchema() async throws {
+        let s = try await start("""
+        nib.commands.register("dev.test.plugin.frames", async (_, ctx) => {
+          const frame = { x: 48, y: 48, w: 320, h: 40 };
+          const rect = await ctx.execute("test.rect", { frame, id: "CALLERID01" });
+          const array = await ctx.execute("test.rect", { frame: [1, 2, 3, 4] });
+          const model = await ctx.execute("test.model", { frame });
+          let invalid;
+          try { await ctx.execute("test.rect", { frame: { x: 1, y: 2, w: "bad", h: 4 } }); }
+          catch (e) { invalid = { code: e.code, path: e.path }; }
+          return { rect, array, model, invalid };
+        });
+        """)
+        let calls = CallRecorder()
+        for (id, schema) in [("test.rect", JSONSchema.rect), ("test.model", JSONSchema.anything())] {
+            s.h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Frame bridge fixture.",
+                                                        params: .obj(["frame": schema], required: ["frame"]),
+                                                        effect: .read, owner: "test")) { params, ctx in
+                calls.calls.append((id, params, ctx.principal))
+                return params
+            }
+        }
+        map(s, "dev.test.plugin.frames", effect: .read)
+        let result = try await run(s, "dev.test.plugin.frames").value
+        XCTAssertEqual(result["rect"], ["frame": [48, 48, 320, 40], "id": "CALLERID01"])
+        XCTAssertEqual(result["array"], ["frame": [1, 2, 3, 4]])
+        XCTAssertEqual(result["model"], ["frame": ["x": 48, "y": 48, "w": 320, "h": 40]])
+        XCTAssertEqual(result["invalid"], ["code": "invalid_params", "path": "$.frame"])
+        XCTAssertEqual(calls.calls.count, 3)
+        XCTAssertTrue(calls.calls.allSatisfy { $0.principal == .plugin(Self.pluginID) })
+    }
+
     func testFixtureCommandRunsThroughTheBusAsOneUndoStep() async throws {
         let s = try await start("""
         nib.commands.register("dev.test.plugin.stamp", async (params, ctx) => {

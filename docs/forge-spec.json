@@ -2707,10 +2707,17 @@
       "name": "Example plugins & plugin test fixtures",
       "module": "ExamplePlugins",
       "layer": "core",
-      "description": "Six example plugins under plugins/examples/ (manifest.json + main.js, panels where noted) that double as CI fixtures and documentation: hello-world (toolbar button + command + toast), flashcards-from-selection (object-menu command + AI-direct tool creating a study set), word-count (HTML panel + events), word-complete (the discontinued Goodnotes feature: suggests completions for the last handwritten word using nib.ai.complete + ink.writeText), weekly-planner (spec template with params), graph-paper (generated template pack). plus starter-pack, a content pack (cover + paper templates, an element collection, a board template). plugins/index.json is the default gallery index listing them with `base` + `files` sources and sha256 = F079's folder hash. ExamplePluginsTests (linked against every module, with FakeAIService for nib.ai) loads each via the plugin host with a real runtime (locating files with #filePath), runs its main command against the Harness fixtures and asserts results; the index sha256 equals the installer's computed hash for every example. Acceptance: all examples install, run and unload cleanly. Follow ARCHITECTURE.md §15.",
+      "description": "Six example plugins under plugins/examples/ (manifest.json + main.js, panels where noted) that double as CI fixtures and documentation: hello-world (toolbar button + command + toast), flashcards-from-selection (object-menu command + AI-direct tool creating a study set), word-count (HTML panel + events), word-complete (the discontinued Goodnotes feature: suggests completions for the last handwritten word using nib.ai.complete + ink.writeText), weekly-planner (spec template with params), graph-paper (generated template pack). plus starter-pack, a content pack (cover + paper templates, an element collection, a board template). plugins/index.json is the default gallery index listing them with `base` + `files` sources and sha256 = F079's folder hash. ExamplePluginsTests (linked against every module, with FakeAIService for nib.ai and FakeRecognizer for scripted input; production commands are observed through read-only hooks) loads each via the plugin host with a real runtime (locating files with #filePath), runs its main command against the Harness fixtures and asserts results; the index sha256 equals the installer's computed hash for every example. Acceptance: all examples install, run and unload cleanly. Follow ARCHITECTURE.md §15.",
       "complexity": "medium",
       "priority": 3,
       "dependsOn": [
+        "F002",
+        "F003",
+        "F017",
+        "F026",
+        "F049",
+        "F055",
+        "F059",
         "F078",
         "F079"
       ],

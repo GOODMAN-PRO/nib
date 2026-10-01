@@ -230,30 +230,68 @@ final class FeatSyncUITests: XCTestCase {
         XCTAssertNotNil(NibSnapshot.image(panel, size: CGSize(width: 768, height: 1024), scale: 1))
     }
 
-    func testCacheInvalidationOnlyTouchesCurrentRoot() throws {
-        let support = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: support) }
-        let root = support.appendingPathComponent("libraryA")
-        let other = support.appendingPathComponent("libraryB")
-        let currentCache = CatalogCacheRepair.cacheURL(root: root, support: support)
-        let otherCache = CatalogCacheRepair.cacheURL(root: other, support: support)
-        try FileManager.default.createDirectory(at: currentCache.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("corrupt cache".utf8).write(to: currentCache)
-        try Data("other cache".utf8).write(to: otherCache)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let original = root.appendingPathComponent("document.nibnote")
-        try Data("original".utf8).write(to: original)
-        try CatalogCacheRepair.invalidate(root: root, support: support)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: currentCache.path))
-        XCTAssertEqual(try Data(contentsOf: otherCache), Data("other cache".utf8))
-        XCTAssertEqual(try Data(contentsOf: original), Data("original".utf8))
-        try CatalogCacheRepair.invalidate(root: root, support: support)
+    func testRepairAwaitsCatalogRebuildBeforeSyncAndReportsSuccess() async throws {
+        let h = Harness(features: [FeatSyncUIFeature.self])
+        let before = try h.snapshotAll()
+        let depths = h.undoDepths()
+        var completed = false
+        var rebuilds = 0
+        let rebuild: LibraryRepair.CatalogRebuild = {
+            rebuilds += 1
+            await Task.yield()
+            completed = true
+            return true
+        }
+        h.app.services.set(rebuild as AnyObject, for: LibraryRepair.catalogRebuildKey)
+        command(h.app, CommandIDs.syncNow, effect: .session) { _, _ in
+            XCTAssertTrue(completed, "Sync must start after the catalogue is persisted")
+            return ["merged": 0, "errors": []]
+        }
+        let result = try await h.run(CommandIDs.libraryRepair)
+        XCTAssertEqual(result["catalogRebuilt"]?.boolValue, true)
+        XCTAssertEqual(rebuilds, 1)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
+    func testRepairPropagatesCatalogWriteFailureAndAllowsRetry() async throws {
+        let h = Harness(features: [FeatSyncUIFeature.self])
+        var syncs = 0
+        command(h.app, CommandIDs.syncNow, effect: .session) { _, _ in
+            syncs += 1
+            return ["merged": 0, "errors": []]
+        }
+        let failed: LibraryRepair.CatalogRebuild = { throw NibError.unavailable("catalogue storage") }
+        h.app.services.set(failed as AnyObject, for: LibraryRepair.catalogRebuildKey)
+        do {
+            _ = try await h.run(CommandIDs.libraryRepair)
+            XCTFail("A failed write must not report a successful repair")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .unavailable) }
+        XCTAssertEqual(syncs, 0)
+        XCTAssertFalse(h.app.services.get(RepairState.key, as: RepairState.self)?.running ?? true)
+        XCTAssertEqual(h.app.events.events(since: 0).last?.decode(SyncStatusPayload.self)?.state, "error")
+        let succeeded: LibraryRepair.CatalogRebuild = { true }
+        h.app.services.set(succeeded as AnyObject, for: LibraryRepair.catalogRebuildKey)
+        let result = try await h.run(CommandIDs.libraryRepair)
+        XCTAssertEqual(result["catalogRebuilt"]?.boolValue, true)
+        XCTAssertEqual(syncs, 1)
+    }
+
+    func testRepairHandlesUnsupportedCatalogRebuildService() async throws {
+        let h = Harness(features: [FeatSyncUIFeature.self])
+        sync(h.app)
+        let unsupported: LibraryRepair.CatalogRebuild = { false }
+        h.app.services.set(unsupported as AnyObject, for: LibraryRepair.catalogRebuildKey)
+        let result = try await h.run(CommandIDs.libraryRepair)
+        XCTAssertEqual(result["catalogRebuilt"]?.boolValue, false)
     }
 
     func testRepairDryRunDoesNotCallServicesOrEmitProgress() async throws {
         let h = Harness(features: [FeatSyncUIFeature.self])
         var calls = 0
         command(h.app, CommandIDs.syncNow, effect: .session) { _, _ in calls += 1; return ["merged": 1] }
+        let rebuild: LibraryRepair.CatalogRebuild = { calls += 1; return true }
+        h.app.services.set(rebuild as AnyObject, for: LibraryRepair.catalogRebuildKey)
         let seq = h.app.events.lastSeq
         let depths = h.undoDepths()
         let result = try await h.app.bus.execute(Invocation(command: CommandIDs.libraryRepair, dryRun: true))

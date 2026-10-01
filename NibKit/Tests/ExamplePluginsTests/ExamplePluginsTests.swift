@@ -59,142 +59,47 @@ private final class ExampleUI: PluginUIPresenting {
     }
 }
 
-/// Test-only adapters for the features F082's examples consume. Those feature modules are scaffold stubs in the
-/// F078/F079 dependency checkout. These adapters read actual Harness documents, use FakeRecognizer, and write
-/// through CommandContext.mutate, so the real bus enforces permissions, provenance, dry runs and undo. No adapter
-/// is shipped with the plugins. Ink is a deterministic fixture stroke, not a substitute production typesetter.
+/// Uses the production commands and observes their calls without replacing handlers or changing parameters.
+/// Script changes install a new recognizer: NibIndex caches recognition by recognizer identity and item revision.
 @MainActor
-private final class ExampleFixtureCommands {
+private final class ExampleFixtureServices {
     unowned let h: Harness
-    let recognizer = FakeRecognizer()
+    private(set) var recognizer = FakeRecognizer()
+    // Keep identities alive while the index can still hold their cached results.
+    private var scriptedRecognizers: [FakeRecognizer] = []
     var inkCalls: [JSONValue] = []
-    var openedPanels: [String] = []
     var getCalls = 0
+    var pageTextCalls = 0
 
-    init(_ h: Harness) { self.h = h; h.app.services.recognizer = recognizer; register() }
-
-    private func command(_ id: String, effect: Effect, target: CommandTarget = .document,
-                         _ handler: @escaping @MainActor (JSONValue, CommandContext) async throws -> JSONValue) {
-        guard h.app.commands.descriptor(id) == nil else { return }
-        h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Harness fixture for \(id).",
-                                                  params: .obj([:]), effect: effect, target: target,
-                                                  owner: "example-fixtures"), handler: handler)
+    init(_ h: Harness) {
+        self.h = h
+        scriptedRecognizers.append(recognizer)
+        h.app.services.recognizer = recognizer
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(
+            id: "example-fixtures.observe", owner: "example-fixtures",
+            commands: [CommandIDs.queryGet, CommandIDs.recognizePageText, CommandIDs.inkWriteText]
+        ) { [weak self] command, params, _ in
+            switch command {
+            case CommandIDs.queryGet: self?.getCalls += 1
+            case CommandIDs.recognizePageText: self?.pageTextCalls += 1
+            case CommandIDs.inkWriteText: self?.inkCalls.append(params)
+            default: break
+            }
+            return nil
+        })
     }
 
-    private func page(_ value: JSONValue?) throws -> (DocumentID, PageID) {
-        guard let raw = value?.stringValue, case let .page(d, p)? = NodeRef(raw) else { throw NibError.invalid("expected page ref") }
-        return (d, p)
-    }
-
-    private func selected(_ params: JSONValue, _ ctx: CommandContext) throws -> [(DocumentID, PageID, Item)] {
-        try (params["refs"]?.arrayValue ?? []).map { value in
-            guard let raw = value.stringValue, case let .item(d, p, i)? = NodeRef(raw) else { throw NibError.invalid("expected item ref") }
-            return (d, p, try ctx.workspace.item(d, page: p, id: i))
-        }
-    }
-
-    private func register() {
-        command("query.context", effect: .read) { [self] _, ctx in
-            let session = ctx.activeSession
-            var out: [String: JSONValue] = ["selection": ["refs": .array((session?.selection.refs ?? []).map(JSONValue.string))],
-                                           "session": ["openPanels": .array((session?.openPanels.sorted() ?? []).map(JSONValue.string))]]
-            if let d = session?.document {
-                out["document"] = ["ref": .string(NodeRef.document(d).description), "title": .string(h.library.node(d)?.title ?? "")]
-                if let p = session?.page {
-                    let pages = try ctx.workspace.content(d).livePages
-                    out["page"] = ["ref": .string(NodeRef.page(d, p).description), "index": .number(Double(pages.firstIndex { $0.id == p } ?? 0))]
-                }
-            }
-            return .object(out)
-        }
-        command("query.get", effect: .read) { [self] params, ctx in
-            getCalls += 1
-            guard let raw = params["ref"]?.stringValue, case let .item(d, p, i)? = NodeRef(raw) else { throw NibError.invalid("expected item ref") }
-            let item = try ctx.workspace.item(d, page: p, id: i)
-            // Mirror query.get's summary: points are opt-in and no hidden Item revision is returned.
-            var out: [String: JSONValue] = ["ref": .string(raw), "kind": .string(item.kind.rawValue),
-                                            "bbox": try JSONValue.from(item.bounds), "layer": .number(Double(item.layer))]
-            if let stroke = item.stroke {
-                out["tool"] = .string(stroke.style.tool.rawValue)
-                out["color"] = try JSONValue.from(stroke.style.color)
-                out["width"] = .number(stroke.style.width)
-                out["pointCount"] = .number(Double(stroke.points.count))
-                if params["points"] == true {
-                    out["stroke"] = try JSONValue.from(stroke)
-                }
-            }
-            return .object(out)
-        }
-        command("recognize.items", effect: .read) { [self] params, ctx in
-            let selected = try selected(params, ctx)
-            let ink = selected.map { $0.2 }.filter { $0.kind == .stroke }
-            let recognized = ink.isEmpty ? [] : try await recognizer.recognize(strokes: ink, language: "en")
-            let typed = selected.compactMap { $0.2.text?.text.plainText }
-            let lines: [JSONValue] = try recognized.map { line in
-                let words: [JSONValue] = try (line.words ?? []).map { word in
-                    ["text": .string(word.text), "bbox": try JSONValue.from(word.bbox),
-                     "refs": .array(word.itemIDs.map { .string(NodeRef.item(selected[0].0, selected[0].1, $0).description) })]
-                }
-                return ["text": .string(line.text), "bbox": try JSONValue.from(line.bbox), "words": .array(words)]
-            }
-            return ["text": .string((recognized.map(\.text) + typed).joined(separator: "\n")), "lines": .array(lines)]
-        }
-        command("recognize.pageText", effect: .read) { [self] params, ctx in
-            let (d, p) = try page(params["page"])
-            let items = try ctx.workspace.items(d, page: p)
-            let ink = items.filter { $0.kind == .stroke }
-            let recognized = ink.isEmpty ? [] : try await recognizer.recognize(strokes: ink, language: "en")
-            let texts = recognized.map(\.text) + items.compactMap { $0.text?.text.plainText }
-            return ["blocks": .array(texts.map { ["text": .string($0)] })]
-        }
-        command("text.createBox", effect: .edit) { [self] params, ctx in
-            let (d, p) = try page(params["page"])
-            let frame = try XCTUnwrap(params["frame"]).decode(Frame.self)
-            let item = Item(id: params["id"]?.stringValue.map { NibID($0) } ?? .make(), kind: .text,
-                            text: TextBoxItem(frame: frame, text: RichText(plain: params["text"]?.stringValue ?? "")))
-            let stored = try ctx.mutate { try $0.put(item, doc: d, page: p) }
-            return ["ref": .string(NodeRef.item(d, p, stored.id).description)]
-        }
-        command("doc.create", effect: .library, target: .library) { params, ctx in
-            let id = params["id"]?.stringValue.map { NibID($0) } ?? .make()
-            let content = DocumentContent(meta: DocumentMeta(id: id, kind: .studySet))
-            _ = try ctx.services.library?.createDocument(content, title: params["title"]?.stringValue ?? "Cards", in: nil)
-            return ["ref": .string(NodeRef.document(id).description)]
-        }
-        command("card.add", effect: .edit) { params, ctx in
-            guard let raw = params["doc"]?.stringValue, case let .document(d)? = NodeRef(raw) else { throw NibError.invalid("expected document ref") }
-            let content = try ctx.workspace.content(d)
-            let card = StudyCard(id: params["id"]?.stringValue.map { NibID($0) } ?? .make(),
-                                 front: try XCTUnwrap(params["front"]).decode(CardFace.self),
-                                 back: try XCTUnwrap(params["back"]).decode(CardFace.self),
-                                 order: FractionalIndex.between(content.liveCards.last?.order, nil))
-            let stored = try ctx.mutate { try $0.put(card, doc: d) }
-            return ["ref": .string(NodeRef.card(d, stored.id).description)]
-        }
-        command("ink.writeText", effect: .edit) { [self] params, ctx in
-            inkCalls.append(params)
-            let (d, p) = try page(params["page"])
-            let at = try XCTUnwrap(params["at"]).decode(Point.self)
-            let id = params["ids"]?.arrayValue?.first?.stringValue.map { NibID($0) } ?? .make()
-            let item = Item(id: id, kind: .stroke, stroke: Stroke(style: .defaultPen, points: [
-                StrokePoint(x: Float(at.x), y: Float(at.y)), StrokePoint(x: Float(at.x + 16), y: Float(at.y + 4))]))
-            let stored = try ctx.mutate { try $0.put(item, doc: d, page: p) }
-            return ["refs": [.string(NodeRef.item(d, p, stored.id).description)]]
-        }
-        command("panel.open", effect: .session, target: .app) { [self] params, ctx in
-            let id = try XCTUnwrap(params["id"]?.stringValue)
-            let panel = try XCTUnwrap(ctx.ui?.panels.get(id))
-            ctx.activeSession?.openPanels.insert(id)
-            openedPanels.append(id)
-            return ["id": .string(id), "placement": .string(panel.placement.rawValue)]
-        }
+    func setRecognition(_ script: [TextRecognition]) {
+        recognizer = FakeRecognizer(script)
+        scriptedRecognizers.append(recognizer)
+        h.app.services.recognizer = recognizer
     }
 
     func partialWord(_ word: String = "hel") {
         var line = TextRecognition(text: "Say \(word)", bbox: Rect(x: 72, y: 120, width: 100, height: 20),
                                    itemIDs: [Fixtures.strokeID], source: "ink")
         line.words = [TextRecognitionWord(text: word, bbox: Rect(x: 110, y: 120, width: 40, height: 20), itemIDs: [Fixtures.strokeID])]
-        recognizer.script = [line]
+        setRecognition([line])
         h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
     }
 }
@@ -202,7 +107,7 @@ private final class ExampleFixtureCommands {
 @MainActor
 private final class ExampleKit {
     let h: Harness
-    let api: ExampleFixtureCommands
+    let api: ExampleFixtureServices
     let host: PluginHost
     let runtime: PluginRuntime
     let installer: PluginInstaller
@@ -216,7 +121,7 @@ private final class ExampleKit {
                                FeatPluginInstallFeature.self, FeatQueryFeature.self, NibIndexFeature.self,
                                FeatTextBoxFeature.self, NibLibraryFeature.self, FeatStudyEditorFeature.self,
                                FeatInkSynthFeature.self, FeatDocChromeFeature.self])
-        api = ExampleFixtureCommands(h)
+        api = ExampleFixtureServices(h)
         host = try XCTUnwrap(h.app.services.get(ServiceKeys.pluginHost, as: PluginHost.self))
         runtime = try XCTUnwrap(h.app.services.get(ServiceKeys.pluginRuntime, as: PluginRuntime.self))
         installer = try XCTUnwrap(h.app.services.get(PluginInstaller.serviceKey, as: PluginInstaller.self))
@@ -245,7 +150,7 @@ private final class ExampleKit {
 
     func close() {
         for info in host.installed { host.unload(info.id) }
-        h.app.commands.unregister(owner: "example-fixtures")
+        h.app.bus.hooks.unregister(owner: "example-fixtures")
         try? FileManager.default.removeItem(at: base)
         try? FileManager.default.removeItem(at: h.persistence.root)
     }
@@ -294,10 +199,11 @@ final class ExamplePluginsTests: XCTestCase {
                 let toolbarID = try XCTUnwrap(manifest.contributes?.toolbar?.first?.id)
                 let toolbar = try XCTUnwrap(kit.h.app.ui.toolbar.get(toolbarID))
                 _ = try await kit.h.run(try XCTUnwrap(toolbar.command), ["id": "EXAMPLEHELLO"])
-                XCTAssertEqual(kit.ui.toasts.count, 1)
+                let toasted = await eventually { kit.ui.toasts.count == 1 }
+                XCTAssertTrue(toasted)
             case "flashcards-from-selection":
                 kit.h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
-                kit.api.recognizer.script = [TextRecognition(text: "Velocity — Displacement over time", bbox: .zero, source: "ink")]
+                kit.api.setRecognition([TextRecognition(text: "Velocity — Displacement over time", bbox: .zero, source: "ink")])
                 let result = try await kit.h.run("dev.nib.cards.fromSelection", ["id": "EXAMPLECARDS"])
                 XCTAssertEqual(result["cards"], 1)
             case "word-count":
@@ -342,7 +248,8 @@ final class ExamplePluginsTests: XCTestCase {
         XCTAssertEqual(item.text?.text.plainText, "Hello from a plugin 👋")
         XCTAssertEqual(item.createdBy, "plugin:dev.nib.hello")
         XCTAssertEqual(kit.h.undoDepth(Fixtures.docID), 1)
-        XCTAssertEqual(kit.ui.toasts.count, 1)
+        let toasted = await eventually { kit.ui.toasts.count == 1 }
+        XCTAssertTrue(toasted)
         XCTAssertTrue(kit.h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try kit.h.snapshot(), before)
         XCTAssertTrue(kit.h.app.bus.redo(Fixtures.docID))
@@ -357,7 +264,7 @@ final class ExamplePluginsTests: XCTestCase {
         defer { kit.close() }
         _ = try await kit.install("flashcards-from-selection")
         kit.h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
-        kit.api.recognizer.script = [TextRecognition(text: " Velocity — displacement — over time \ninvalid\n — empty\nMass — matter ", bbox: .zero, source: "ink")]
+        kit.api.setRecognition([TextRecognition(text: " Velocity — displacement — over time \ninvalid\n — empty\nMass — matter ", bbox: .zero, source: "ink")])
         let result = try await kit.h.run("dev.nib.cards.fromSelection", ["id": "NEWSTUDY01", "ids": ["NEWCARD01", "NEWCARD02"]])
         XCTAssertEqual(result["set"], "doc:NEWSTUDY01")
         XCTAssertEqual(result["cards"], 2)
@@ -387,7 +294,7 @@ final class ExamplePluginsTests: XCTestCase {
         await assertError(.invalidParams) { _ = try await kit.h.run("dev.nib.cards.fromSelection", ["separator": ""]) }
         await assertError(.invalidParams) { _ = try await kit.h.run("dev.nib.cards.fromSelection") }
         kit.h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
-        kit.api.recognizer.script = [TextRecognition(text: "a — b", bbox: .zero, source: "ink")]
+        kit.api.setRecognition([TextRecognition(text: "a — b", bbox: .zero, source: "ink")])
         await assertError(.invalidParams) { _ = try await kit.h.run("dev.nib.cards.fromSelection", ["ids": []]) }
         XCTAssertEqual(kit.h.library.allNodes().count, initial)
     }
@@ -396,11 +303,17 @@ final class ExamplePluginsTests: XCTestCase {
         let kit = try ExampleKit()
         defer { kit.close() }
         _ = try await kit.install("word-count")
-        kit.api.recognizer.script = [TextRecognition(text: "  one\n two don't — café  ", bbox: .zero, source: "ink")]
+        kit.api.setRecognition([TextRecognition(text: "  one\n two don't — café  ", bbox: .zero, source: "ink")])
         let count = try await kit.h.run("dev.nib.wordcount.show")
-        XCTAssertEqual(count["words"], 6) // Four recognised words plus the fixture's “Hello Nib”.
+        XCTAssertEqual(count["words"], 9) // Four recognised words plus “Hello Nib”, “Remember” and “Fixture box”.
         XCTAssertEqual(count["pageNumber"], 1)
-        XCTAssertEqual(kit.api.openedPanels, ["dev.nib.wordcount.panel"])
+        XCTAssertEqual(kit.h.session.openPanels, Set(["dev.nib.wordcount.panel"]))
+        let shown = await eventually {
+            kit.h.app.events.events(since: 0).contains {
+                $0.type == NibEventType.pluginMessage && $0.payload?["message"]?["words"] == 9
+            }
+        }
+        XCTAssertTrue(shown)
         let seq = kit.h.app.events.events(since: 0).last?.seq ?? 0
         for _ in 0..<8 { kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID) }
         kit.h.session.page = Fixtures.page2
@@ -422,13 +335,14 @@ final class ExamplePluginsTests: XCTestCase {
     }
 
     func testWordCountSegmentsThaiDevanagariAndCJK() async throws {
-        let kit = try ExampleKit()
-        defer { kit.close() }
-        _ = try await kit.install("word-count")
         for text in ["สวัสดี ครับ", "नमस्ते दुनिया", "你好世界"] {
-            kit.api.recognizer.script = [TextRecognition(text: text, bbox: .zero, source: "ink")]
+            // Each script describes a separate document snapshot; pageText caches unchanged pages.
+            let kit = try ExampleKit()
+            defer { kit.close() }
+            _ = try await kit.install("word-count")
+            kit.api.setRecognition([TextRecognition(text: text, bbox: .zero, source: "ink")])
             let result = try await kit.h.run("dev.nib.wordcount.count")
-            XCTAssertEqual(result["words"], 4, text) // Two segmented words plus “Hello Nib”.
+            XCTAssertEqual(result["words"], 7, text) // Two segmented words plus the five typed fixture words.
         }
     }
 
@@ -439,26 +353,43 @@ final class ExamplePluginsTests: XCTestCase {
         kit.h.app.events.emit(NibEventType.committed, doc: Fixtures.docID)
         kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
         try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(kit.api.pageTextCalls, 0)
         XCTAssertEqual(kit.api.recognizer.strokeCalls, 0)
         _ = try await kit.h.run("dev.nib.wordcount.show")
-        let before = kit.api.recognizer.strokeCalls
+        let shown = await eventually {
+            kit.h.app.events.events(since: 0).contains {
+                $0.type == NibEventType.pluginMessage && $0.payload?["message"]?["pageNumber"] == 1
+            }
+        }
+        XCTAssertTrue(shown)
+        let before = kit.api.pageTextCalls
+        let recognitionCalls = kit.api.recognizer.strokeCalls
         kit.h.app.events.emit(NibEventType.committed, doc: "OTHERDOC01")
         try await Task.sleep(nanoseconds: 1_100_000_000)
-        XCTAssertEqual(kit.api.recognizer.strokeCalls, before)
+        XCTAssertEqual(kit.api.pageTextCalls, before)
+        let seq = kit.h.app.events.lastSeq
         for _ in 0..<8 { kit.h.app.events.emit(NibEventType.committed, doc: Fixtures.docID) }
         try await Task.sleep(nanoseconds: 400_000_000)
-        XCTAssertEqual(kit.api.recognizer.strokeCalls, before)
-        let refreshed = await eventually { kit.api.recognizer.strokeCalls == before + 1 }
+        XCTAssertEqual(kit.api.pageTextCalls, before)
+        let refreshed = await eventually {
+            kit.api.pageTextCalls == before + 1 && kit.h.app.events.events(since: seq).contains {
+                $0.type == NibEventType.pluginMessage
+            }
+        }
         XCTAssertTrue(refreshed)
-        // The authoritative session state closes the panel even if its web message is lost.
-        kit.h.session.openPanels.remove("dev.nib.wordcount.panel")
-        kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
-        try await Task.sleep(nanoseconds: 1_100_000_000)
-        XCTAssertEqual(kit.api.recognizer.strokeCalls, before + 1)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, recognitionCalls) // The unchanged page is cached.
+        // Headless chrome has no web view to send pagehide; deliver the same closed message as panel.html.
+        _ = try await kit.h.run(CommandIDs.panelClose, ["id": "dev.nib.wordcount.panel"])
+        XCTAssertFalse(kit.h.session.openPanels.contains("dev.nib.wordcount.panel"))
         kit.host.handle("dev.nib.wordcount")?.postMessage(from: "dev.nib.wordcount.panel", message: ["type": "closed"])
         kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
         try await Task.sleep(nanoseconds: 1_100_000_000)
-        XCTAssertEqual(kit.api.recognizer.strokeCalls, before + 1)
+        XCTAssertEqual(kit.api.pageTextCalls, before + 1)
+        XCTAssertEqual(kit.api.recognizer.strokeCalls, recognitionCalls)
+        kit.host.handle("dev.nib.wordcount")?.postMessage(from: "dev.nib.wordcount.panel", message: ["type": "closed"])
+        kit.h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+        XCTAssertEqual(kit.api.pageTextCalls, before + 1)
     }
 
     func testWordCompleteAcceptsThaiDevanagariAndCJK() async throws {
@@ -498,9 +429,11 @@ final class ExamplePluginsTests: XCTestCase {
         XCTAssertEqual(result["completion"], "help")
         XCTAssertEqual(result["suffix"], "p")
         XCTAssertEqual(kit.ui.choices, [["help", "hello"]])
-        XCTAssertEqual(kit.api.inkCalls[0]["page"], "page:FIXTUREDOC01/FIXTUREPG001")
-        XCTAssertEqual(kit.api.inkCalls[0]["at"], [150, 120])
-        XCTAssertEqual(kit.api.inkCalls[0]["size"], 20)
+        XCTAssertEqual(kit.api.inkCalls.count, 1)
+        let inkCall = try XCTUnwrap(kit.api.inkCalls.first)
+        XCTAssertEqual(inkCall["page"], "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertEqual(inkCall["at"], [150, 120])
+        XCTAssertEqual(inkCall["size"], 20)
         XCTAssertEqual(kit.ai.requests.first?.principal, .plugin("dev.nib.wordcomplete"))
         XCTAssertEqual(kit.ai.requests.first?.tools, [])
         XCTAssertEqual(kit.ai.requests.first?.mode, .ask)

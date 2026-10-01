@@ -186,6 +186,7 @@ final class FolderLibrary: LibraryService {
     /// Bumped by every catalog change, so a background scan that raced a change is not applied over it.
     private var generation: UInt64 = 0
     private var scanning = false
+    private var rebuilding = false
     private var rescanRequested = false
     /// Background scans thrown away because the catalog changed while they ran (each is followed by a rescan).
     private(set) var discardedScans = 0
@@ -867,6 +868,7 @@ final class FolderLibrary: LibraryService {
 
     /// Reads every package head and folder record again (library repair), keeping ids with the paths that held them.
     func rebuild() {
+        cancelCacheSave()
         loaded = true
         var job = scanner(previous: catalog.byPath)
         job.reuse = false
@@ -875,10 +877,74 @@ final class FolderLibrary: LibraryService {
         postSettingsChanges(prefs.reload())
     }
 
+    /// A full disk scan with a persistence fence for repair. Old snapshots already queued on `io` finish before
+    /// this write; debounced saves are cancelled, and scans racing library changes are retried before installation.
+    func rebuildCatalog() async throws {
+        guard !rebuilding else { throw NibError.unavailable("a catalogue rebuild is already running") }
+        let root = rootURL
+        let url = cacheURL
+        rebuilding = true
+        loaded = true
+        generation &+= 1 // Invalidate launch loads and incremental scans started before this rebuild.
+        cancelCacheSave()
+        defer {
+            rebuilding = false
+            if rescanRequested && !scanning {
+                rescanRequested = false
+                refreshInBackground()
+            }
+        }
+        while true {
+            try Task.checkCancellation()
+            let gen = generation
+            var job = scanner(previous: catalog.byPath)
+            job.reuse = false
+            let scan = job
+            let result = try await Task.detached(priority: .userInitiated) {
+                // A missing/inaccessible root must not replace a valid catalogue with an empty one.
+                do {
+                    _ = try FileManager.default.contentsOfDirectory(at: scan.root, includingPropertiesForKeys: nil)
+                } catch {
+                    throw LibraryErrors.map(error, scan.root)
+                }
+                return scan.scanAll()
+            }.value
+            guard root == rootURL else {
+                throw NibError(.conflict, "the library changed during catalogue rebuilding")
+            }
+            guard generation == gen else { continue }
+            try Task.checkCancellation()
+            // Repair derives metadata only; interrupted package renames are left to ordinary refresh.
+            apply(result, recoverRenames: false)
+            // library.changed observers can switch roots synchronously while applying the scan.
+            guard root == rootURL else {
+                throw NibError(.conflict, "the library changed during catalogue rebuilding")
+            }
+            cancelCacheSave()
+            let cache = CatalogCache(version: CatalogCache.currentVersion, root: root.standardizedFileURL.path,
+                                     entries: catalog.entries)
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                io.async {
+                    do {
+                        try cache.write(to: url)
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: LibraryErrors.map(error, url))
+                    }
+                }
+            }
+            guard root == rootURL else {
+                throw NibError(.conflict, "the library changed during catalogue rebuilding")
+            }
+            postSettingsChanges(prefs.reload())
+            return
+        }
+    }
+
     /// An incremental rescan off the main actor (launch, foreground, a newly chosen folder). Applied only when no
     /// change happened meanwhile; otherwise it is thrown away and the folder is scanned again.
     func refreshInBackground(priority: TaskPriority = .utility) {
-        guard !scanning else {
+        guard !scanning, !rebuilding else {
             rescanRequested = true
             return
         }
@@ -896,14 +962,14 @@ final class FolderLibrary: LibraryService {
     private func finishBackgroundScan(_ result: CatalogScanner.Result, generation gen: UInt64, root: URL,
                                       settings names: [String]) {
         scanning = false
-        if generation == gen && root == rootURL {
+        if !rebuilding && generation == gen && root == rootURL {
             apply(result)
         } else {
             discardedScans += 1
             rescanRequested = true
         }
         postSettingsChanges(names)
-        if rescanRequested {
+        if rescanRequested && !rebuilding {
             rescanRequested = false
             refreshInBackground()
         }
@@ -918,7 +984,7 @@ final class FolderLibrary: LibraryService {
         }
     }
 
-    private func apply(_ result: CatalogScanner.Result) {
+    private func apply(_ result: CatalogScanner.Result, recoverRenames: Bool = true) {
         var entries = result.entries
         overlayLoadedDocuments(&entries)
         let before = catalog.byPath
@@ -932,7 +998,7 @@ final class FolderLibrary: LibraryService {
             scheduleCacheSave()
             events.emit(NibEventType.libraryChanged, payload: ["refresh": true, "refs": .array(refs.prefix(500).map { .string($0) })])
         }
-        recoverStranded(result.stranded)
+        if recoverRenames { recoverStranded(result.stranded) }
     }
 
     /// Open documents can hold edits the Document Store has not written yet (its writes are debounced): their nodes
@@ -1220,7 +1286,7 @@ final class FolderLibrary: LibraryService {
     }
 
     private func scheduleCacheSave() {
-        saveTask?.cancel()
+        cancelCacheSave()
         saveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             guard !Task.isCancelled else { return }
@@ -1228,8 +1294,14 @@ final class FolderLibrary: LibraryService {
         }
     }
 
+    private func cancelCacheSave() {
+        saveTask?.cancel()
+        saveTask = nil
+    }
+
     /// Writes the catalog cache (encoded on the library's I/O queue).
     func saveCacheNow() {
+        cancelCacheSave()
         guard loaded else { return }
         let cache = CatalogCache(version: CatalogCache.currentVersion, root: rootURL.standardizedFileURL.path,
                                  entries: catalog.entries)

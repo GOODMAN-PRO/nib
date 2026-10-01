@@ -1,30 +1,6 @@
 import Foundation
 import NibContracts
 
-/// The catalogue is derived data; a repair never deletes document packages or resets their revisions.
-/// Temporary F002 cache workaround pending `LibraryService.rebuildCatalog() async`.
-/// F111's repair-recreates-catalog integration scenario is the real check of this private path.
-/// The contract request belongs at docs/contract-requests/F070-library-rebuild.md; this feature's
-/// write scope excludes that path and NibContracts/F002. The API should force and await a full
-/// background rebuild without callers knowing the cache path or refresh trigger.
-struct CatalogCacheRepair {
-    static func cacheURL(root: URL, support: URL) -> URL {
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in root.standardizedFileURL.path.utf8 {
-            hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3
-        }
-        return support.appendingPathComponent("Nib/library", isDirectory: true)
-            .appendingPathComponent("catalog-" + String(format: "%016llx", hash) + ".json")
-    }
-
-    static func invalidate(root: URL, support: URL) throws {
-        let url = cacheURL(root: root, support: support)
-        if FileManager.default.fileExists(atPath: url.path) {
-            try FileManager.default.removeItem(at: url)
-        }
-    }
-}
-
 @MainActor
 final class RepairState {
     static let key = "syncui.repairState"
@@ -32,6 +8,10 @@ final class RepairState {
 }
 
 struct LibraryRepair: NibCommand {
+    /// F002's optional service (NibLibraryFeature.CatalogRebuild), resolved through NibContracts so UI modules
+    /// do not import other features. Older/custom libraries retain refresh behavior and report no disk rebuild.
+    typealias CatalogRebuild = @MainActor () async throws -> Bool
+    static let catalogRebuildKey = "library.rebuildCatalog"
     struct Params: Codable { var rebuildIndex: Bool? }
     struct Failure: Codable, Equatable { var ref: String; var message: String }
     struct Output: Codable {
@@ -79,12 +59,16 @@ struct LibraryRepair: NibCommand {
             for doc in ctx.workspace.loadedDocuments where !ctx.isReadOnly(doc) {
                 ctx.workspace.persistence.flush(doc)
             }
-            guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-                throw NibError.unavailable("the catalogue cache directory")
+            guard requestedRoot == library.rootURL else {
+                throw NibError(.conflict, String(localized: "The library changed during repair. Repair the current library again."))
             }
-            try CatalogCacheRepair.invalidate(root: library.rootURL, support: support)
-            library.refresh()
-            out.catalogRebuilt = FileManager.default.fileExists(atPath: CatalogCacheRepair.cacheURL(root: requestedRoot, support: support).path)
+            if let rebuild = ctx.services.get(catalogRebuildKey, as: CatalogRebuild.self) {
+                out.catalogRebuilt = try await rebuild()
+            }
+            if !out.catalogRebuilt { library.refresh() }
+            guard requestedRoot == library.rootURL else {
+                throw NibError(.conflict, String(localized: "The library changed during repair. Repair the current library again."))
+            }
             let root = library.rootURL
             let report = try await ctx.execute(CommandIDs.syncNow)
             guard root == library.rootURL else {

@@ -231,6 +231,7 @@ enum Scenarios {
         let id = NodeRef.documentID(from: ref)
         h.app.workspace.persistence.flush(id)
         let before = try h.snapshot(id)
+        let originalNode = try XCTUnwrap(library.node(id))
         try await wait("creation's catalog write") {
             CatalogCache.load(library.cacheURL, root: root.standardizedFileURL.path) != nil
         }
@@ -243,13 +244,22 @@ enum Scenarios {
         XCTAssertFalse(FileManager.default.fileExists(atPath: library.cacheURL.path),
                        "No pending creation save may mask a repair that does not rebuild the catalog")
         let repaired = try await h.run(CommandIDs.libraryRepair)
+        // library.repair must report that it rebuilt the deleted catalogue; the catalogue file itself may be
+        // written after the command returns, so the persisted state is awaited below.
         XCTAssertEqual(repaired["catalogRebuilt"], true)
         try await wait("repair's catalog write") {
             CatalogCache.load(library.cacheURL, root: root.standardizedFileURL.path) != nil
         }
         library.waitForIO()
         XCTAssertTrue(FileManager.default.fileExists(atPath: library.cacheURL.path))
-        XCTAssertNotNil(CatalogCache.load(library.cacheURL, root: root.standardizedFileURL.path))
+        let rebuilt = try XCTUnwrap(CatalogCache.load(library.cacheURL, root: root.standardizedFileURL.path))
+        let survivors = rebuilt.filter { $0.node.id == id }
+        XCTAssertEqual(survivors.count, 1, "Repair must persist the original document exactly once")
+        let survivor = try XCTUnwrap(survivors.first)
+        XCTAssertEqual(survivor.node.kind, .document)
+        XCTAssertEqual(survivor.node.title, originalNode.title)
+        XCTAssertEqual(survivor.node.path, originalNode.path)
+        XCTAssertFalse(survivor.inTrash)
         XCTAssertEqual(repaired["errors"]?.arrayValue?.count, 0)
         let listed = try await h.run(CommandIDs.libraryList)
         XCTAssertTrue(listed["nodes"]?.arrayValue?.contains { $0["ref"]?.stringValue == ref } == true)

@@ -20,7 +20,7 @@
         "main.js",
         "manifest.json"
       ],
-      "sha256": "369a26915d30094824318c4a143125733f0e4c0a677cbd756c42a49e2653b7b3"
+      "sha256": "87ef991121b5eb5bc0a6c9ced7235174694170356e745973f11afd45dd0eaa16"
     },
     {
       "id": "dev.nib.cards",
@@ -62,7 +62,7 @@
         "manifest.json",
         "panel.html"
       ],
-      "sha256": "b61cce532b4b537f2487394a462fd4b1b69dadb35a0fb832bb46e011ca1345cb"
+      "sha256": "046ddb654f214be8e698aea4991d382748b5fcfbff1921be3b73c7ab47914132"
     },
     {
       "id": "dev.nib.wordcomplete",

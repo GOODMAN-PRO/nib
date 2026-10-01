@@ -1123,6 +1123,105 @@ final class NibLibraryTests: XCTestCase {
                         "the catalog is written again")
     }
 
+    func testPublicRebuildPersistsDeletedCatalogAndCancelsPendingSaves() async throws {
+        let lib = try await makeLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.library.cacheURL) }
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Survivor"]))
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        try FileManager.default.removeItem(at: lib.library.cacheURL)
+        // Leave a creation save debounced when repair starts, as in the integration race.
+        let folder = try lib.library.createFolder(title: "Pending", in: nil, style: nil)
+        let pkg = try XCTUnwrap(lib.url(d))
+        let headURL = pkg.appendingPathComponent(LibraryLayout.headFileName(lib.device))
+        let before = try Data(contentsOf: headURL)
+        let depth = lib.h.undoDepth(d)
+        let rebuild = try XCTUnwrap(lib.h.app.services.get(NibLibraryFeature.catalogRebuildKey,
+                                                         as: NibLibraryFeature.CatalogRebuild.self))
+        let didRebuild = try await rebuild()
+        XCTAssertTrue(didRebuild)
+        let entries = try XCTUnwrap(CatalogCache.load(lib.library.cacheURL, root: lib.root.standardizedFileURL.path))
+        XCTAssertEqual(entries.filter { $0.node.id == d }.count, 1)
+        XCTAssertEqual(entries.first { $0.node.id == d }?.node.path, "Survivor.nibnote")
+        XCTAssertNotNil(entries.first { $0.node.id == folder })
+        XCTAssertEqual(lib.h.app.services.packages.url(d), pkg)
+        XCTAssertEqual(try Data(contentsOf: headURL), before)
+        XCTAssertEqual(lib.h.undoDepth(d), depth)
+        // A cancelled save must not recreate the catalogue after the completed rebuild.
+        try FileManager.default.removeItem(at: lib.library.cacheURL)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        lib.library.waitForIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lib.library.cacheURL.path))
+        XCTAssertEqual(try Data(contentsOf: headURL), before)
+    }
+
+    func testPublicRebuildReadsAllHeadsWithExistingCacheAndQueuedWrites() async throws {
+        let lib = try await makeLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.library.cacheURL) }
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Fresh metadata"]))
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        let pkg = try XCTUnwrap(lib.url(d))
+        let stamp = try pkg.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        var theirs = try XCTUnwrap(lib.head(d))
+        theirs.meta.favorite = true
+        theirs.meta.rev = Rev(wallMs: theirs.meta.rev.wallMs + 1, counter: 0, device: 11)
+        let foreignURL = pkg.appendingPathComponent("doc.0000000b.json")
+        let bytes = try PackageIO.encoder().encode(theirs)
+        try bytes.write(to: foreignURL)
+        if let stamp { try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: pkg.path) }
+        // Queue an old snapshot and an incremental scan; neither may overwrite the full rebuild's metadata.
+        lib.library.saveCacheNow()
+        lib.library.refreshInBackground()
+        let didRebuild = try await NibLibraryFeature.rebuildCatalog(lib.h.app)
+        XCTAssertTrue(didRebuild)
+        XCTAssertEqual(lib.library.node(d)?.favorite, true)
+        XCTAssertEqual(CatalogCache.load(lib.library.cacheURL, root: lib.root.standardizedFileURL.path)?
+            .first { $0.node.id == d }?.node.favorite, true)
+        await lib.library.waitForScans()
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        lib.library.waitForIO()
+        XCTAssertEqual(CatalogCache.load(lib.library.cacheURL, root: lib.root.standardizedFileURL.path)?
+            .first { $0.node.id == d }?.node.favorite, true)
+        XCTAssertEqual(try Data(contentsOf: foreignURL), bytes, "Rebuilding must not rewrite package heads")
+    }
+
+    func testPublicRebuildReportsCacheWriteFailureAndCanRetry() async throws {
+        let lib = try await makeLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.library.cacheURL) }
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Preserved"]))
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        try FileManager.default.removeItem(at: lib.library.cacheURL)
+        // An existing directory at the cache file path makes the atomic write fail deterministically.
+        try FileManager.default.createDirectory(at: lib.library.cacheURL, withIntermediateDirectories: true)
+        do {
+            _ = try await NibLibraryFeature.rebuildCatalog(lib.h.app)
+            XCTFail("The public API must propagate persistence errors")
+        } catch { XCTAssertNotNil(error as? NibError) }
+        XCTAssertEqual(lib.library.node(d)?.title, "Preserved")
+        try FileManager.default.removeItem(at: lib.library.cacheURL)
+        let didRebuild = try await NibLibraryFeature.rebuildCatalog(lib.h.app)
+        XCTAssertTrue(didRebuild)
+        XCTAssertNotNil(CatalogCache.load(lib.library.cacheURL, root: lib.root.standardizedFileURL.path))
+    }
+
+    func testPublicRebuildRejectsMissingRootWithoutReplacingCatalog() async throws {
+        let lib = try await makeLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.library.cacheURL) }
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Unavailable root"]))
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        let before = try Data(contentsOf: lib.library.cacheURL)
+        try FileManager.default.removeItem(at: lib.root)
+        do {
+            _ = try await NibLibraryFeature.rebuildCatalog(lib.h.app)
+            XCTFail("An unreachable library cannot be rebuilt successfully")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .notFound) }
+        XCTAssertEqual(lib.library.node(d)?.title, "Unavailable root")
+        XCTAssertEqual(try Data(contentsOf: lib.library.cacheURL), before)
+    }
+
     func testSwitchingLibrariesAlwaysAnnouncesTheChange() async throws {
         let lib = try await makeLibrary()
         try await lib.run("doc.create", ["kind": "notebook", "title": "Here"])

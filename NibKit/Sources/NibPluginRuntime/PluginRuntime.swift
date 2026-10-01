@@ -243,7 +243,7 @@ final class PluginInstance: PluginRuntimeHandle {
         let limit: TimeInterval
         var deadline: Date
         var continuation: CheckedContinuation<JSONValue, Error>?
-        var timer: Task<Void, Never>?
+        var timer: DispatchSourceTimer?
 
         init(kind: Kind, group: String, depth: Int = 0, readOnly: Bool = false, dryRun: Bool = false,
              inheritedPolicy: ConfirmationPolicy? = nil, session: EditorSession? = nil,
@@ -305,7 +305,7 @@ final class PluginInstance: PluginRuntimeHandle {
     private var recentSeqSet = Set<UInt64>()
     private var windowEnds: [CoalesceKey: Date] = [:]
     private var pendingEvents: [CoalesceKey: PendingDelivery] = [:]
-    private var flushTask: Task<Void, Never>?
+    private var flushTimer: DispatchSourceTimer?
     private var dialogs = 0
     /// Undo groups this plugin was handed: the groups of its entries (a handler's `ctx.group`) and the groups its own
     /// calls returned (`nib.ai.complete`, `nib.commands.execute`). `nib.commands.execute {group}` joins these as they
@@ -504,29 +504,31 @@ final class PluginInstance: PluginRuntimeHandle {
         entries[entry.token] = entry
         remember(group: entry.group)
         updateBusyLimit()
-        entry.timer = Task { @MainActor [weak self, weak entry] in
-            while !Task.isCancelled {
-                guard let entry = entry else { return }
-                let wait = entry.deadline.timeIntervalSinceNow
-                if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000) + 1_000_000) }
-                if Task.isCancelled { return }
-                guard let self = self else { return }
+        // Finishing an entry cancels its deadline routinely. A dispatch timer avoids throwing a
+        // CancellationError from a sleeping Swift task each time a command or event completes.
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        entry.timer = timer
+        timer.schedule(deadline: .now() + max(0.001, entry.deadline.timeIntervalSinceNow))
+        timer.setEventHandler { [weak self, weak entry] in
+            MainActor.assumeIsolated {
+                guard let self = self, let entry = entry, self.entries[entry.token] === entry else { return }
                 if self.dialogs > 0 {
                     // Time the user spends answering a dialog does not count (the deadline moves when it closes).
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    continue
-                }
-                if entry.deadline.timeIntervalSinceNow <= 0 {
+                    entry.timer?.schedule(deadline: .now() + 0.25)
+                } else if entry.deadline.timeIntervalSinceNow > 0 {
+                    entry.timer?.schedule(deadline: .now() + entry.deadline.timeIntervalSinceNow)
+                } else {
                     self.timeOut(entry)
-                    return
                 }
             }
         }
+        timer.resume()
     }
 
     private func finishEntry(_ token: String, ok: Bool, json: String) {
         guard let entry = entries.removeValue(forKey: token) else { return }
         entry.timer?.cancel()
+        entry.timer = nil
         updateBusyLimit()
         if ok {
             entry.continuation?.resume(returning: (try? JSONValue.parse(json)) ?? .null)
@@ -549,6 +551,8 @@ final class PluginInstance: PluginRuntimeHandle {
             return
         }
         entries[entry.token] = nil
+        entry.timer?.cancel()
+        entry.timer = nil
         updateBusyLimit()
         var hint = "make the handler finish sooner, or split the work"
         if case .command = entry.kind, entry.limit < limits.longRunningTimeout {
@@ -583,6 +587,7 @@ final class PluginInstance: PluginRuntimeHandle {
         entries.removeAll()
         for entry in pending {
             entry.timer?.cancel()
+            entry.timer = nil
             entry.continuation?.resume(throwing: error)
             entry.continuation = nil
         }
@@ -592,8 +597,8 @@ final class PluginInstance: PluginRuntimeHandle {
         }
         eventSubscription?.cancel()
         eventSubscription = nil
-        flushTask?.cancel()
-        flushTask = nil
+        flushTimer?.cancel()
+        flushTimer = nil
         pendingEvents.removeAll()
         bridge.shutdown()
     }
@@ -666,15 +671,21 @@ final class PluginInstance: PluginRuntimeHandle {
     }
 
     private func scheduleFlush() {
-        guard flushTask == nil else { return }
+        guard flushTimer == nil else { return }
         let earliest = pendingEvents.keys.compactMap { windowEnds[$0] }.min() ?? Date()
         let wait = max(0, earliest.timeIntervalSinceNow)
-        flushTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000) + 1_000_000)
-            guard !Task.isCancelled, let self = self else { return }
-            self.flushTask = nil
-            self.flush()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        flushTimer = timer
+        timer.schedule(deadline: .now() + wait + 0.001)
+        timer.setEventHandler { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                self.flushTimer?.cancel()
+                self.flushTimer = nil
+                self.flush()
+            }
         }
+        timer.resume()
     }
 
     private func flush() {
@@ -757,7 +768,7 @@ final class PluginInstance: PluginRuntimeHandle {
         guard let command = args["command"]?.stringValue, !command.isEmpty else {
             throw NibError.invalid("missing command id", path: "$.command")
         }
-        let params = args["params"] ?? [:]
+        let params = commandParams(args["params"] ?? [:], command: command, app: app)
         let dryRun = args["dryRun"]?.boolValue ?? false
         if !token.isEmpty {
             guard let entry = entry else {
@@ -781,6 +792,19 @@ final class PluginInstance: PluginRuntimeHandle {
             group = pluginGroup(g)
         }
         return try await executeAmbient(command, params, dryRun: dryRun, group: group)
+    }
+
+    /// The plugin API's object Frame is model JSON, while built-in command rects are arrays.
+    /// Adapt only when the registered command actually asks for an array; plugin-defined and
+    /// model-object schemas keep their original value, and the bus still validates every call.
+    private func commandParams(_ params: JSONValue, command: String, app: NibApp) -> JSONValue {
+        guard case .object(var fields) = params,
+              let value = fields["frame"], case .object = value,
+              case let .object(properties, _, _)? = app.commands.descriptor(command)?.params,
+              case .array? = properties["frame"],
+              let frame = try? value.decode(Frame.self) else { return params }
+        fields["frame"] = .array(frame.array.map(JSONValue.number))
+        return .object(fields)
     }
 
     private func executeAmbient(_ command: String, _ params: JSONValue, dryRun: Bool = false, group: String? = nil) async throws -> JSONValue {
