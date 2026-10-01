@@ -27,7 +27,9 @@ enum BuiltinActions {
             action("translateReplace", "Translate and replace", "character.bubble", .selection, .edit,
                    "Ask for a target language if missing. Translate faithfully. Replace ONLY selected typed text with text.setText, selected blocks with block.update, or selected handwriting with handwriting.toText using translated text and replace true. Preserve layout and formatting; never delete unrelated content."),
             action("translateInsert", "Insert translation", "text.badge.plus", .page, .edit,
-                   "Ask for a target language if missing. Translate this page and add text.createBox in unused space; preserve the source. For text documents insert translated blocks with block.insert.", kinds: writingKinds),
+                   "Ask for a target language if missing. Translate this page and add text.createBox in unused space; preserve the source.", kinds: canvasKinds),
+            action("translateInsertBlocks", "Insert translation", "text.badge.plus", .document, .edit,
+                   "Ask for a target language if missing. Translate this document faithfully and insert translated blocks with block.insert, preserving the source.", kinds: [.textDocument]),
             action("mindMap", "Generate mind map", "brain", .page, .edit,
                    "Generate a mind map from these notes using diagram.create with layout mindmap. Use succinct node labels and meaningful relationships.", kinds: canvasKinds),
             action("flowchart", "Generate flowchart", "arrow.triangle.branch", .page, .edit,
@@ -55,7 +57,7 @@ enum BuiltinActions {
             action("outline", "Generate outline", "list.bullet", .document, .edit,
                    "Call outline.generate with doc and preview true, show the proposed entries and ask whether to insert. After approval call outline.generate with those entries using the entries parameter.", kinds: [.notebook]),
             action("image", "Generate image", "photo.badge.plus", .page, .edit,
-                   "Use the chat image-generation workflow to generate an image from the user's description, then offer Modify, Insert and Discard before any insertion. If provider image generation is unavailable, use image.pick with source playground, page and selected refs to open Apple Image Playground. Never insert without the user's choice.", kinds: canvasKinds)
+                   "Call ai.generateImage with the user's prompt, page and selected refs. For the returned tmp: url offer Modify (call ai.generateImage again), Insert (image.insert) and Discard before insertion. The command opens Image Playground when provider image generation is unavailable; its picker requires the user's choice.", kinds: canvasKinds)
         ]
     }
 
@@ -94,7 +96,8 @@ final class UserActions {
 
     init(app: NibApp) {
         self.app = app
-        token = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings, queue: .main) { [weak self] _ in
+        token = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings, queue: .main) { [weak self] note in
+            if let name = note.userInfo?["name"] as? String, !name.hasPrefix(UserActions.prefix) { return }
             // Settings notifications may originate in sync; registry changes belong to the main actor.
             Task { @MainActor [weak self] in self?.refresh() }
         }

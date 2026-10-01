@@ -19,6 +19,7 @@ enum OutlineBuilder {
             throw NibError(.invalidParams, "Outline must contain at most 500 entries", path: "$.entries", hint: "retry with fewer pages")
         }
         let allowed = Set(pages)
+        var depths: [Int] = []
         return try rows.enumerated().map { index, row in
             guard let title = row["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !title.isEmpty, title.count <= 200, !title.contains("\n"), !title.contains("\r"),
@@ -32,6 +33,11 @@ enum OutlineBuilder {
                 }
                 parent = p
             }
+            let depth = parent.map { depths[$0] + 1 } ?? 0
+            guard depth <= 3 else {
+                throw NibError(.invalidParams, "Outline depth must not exceed 3", path: "$.entries[\(index)].parent")
+            }
+            depths.append(depth)
             return OutlineProposal(title: title, page: page, parent: parent)
         }
     }
@@ -58,8 +64,8 @@ struct OutlineGenerate: NibCommand {
         _ = try AIActionCommands.provider(ctx)
         let doc = try AIActionCommands.document(p.doc)
         try AIActionCommands.checkLock(doc, ctx: ctx)
-        let root = try await ActionSource.node(NodeRef.document(doc).description, ctx: ctx)
-        guard ActionSource.documentKind(root) == "notebook" else {
+        if ctx.isReadOnly(doc) { throw NibError(.permissionDenied, "The document is read-only") }
+        guard try ctx.workspace.content(doc).meta.kind == .notebook else {
             throw AIActionCommands.invalid("Outlines require a notebook", path: "$.doc")
         }
         let pages = try await ActionSource.pages(doc, selected: p.pages, ctx: ctx)

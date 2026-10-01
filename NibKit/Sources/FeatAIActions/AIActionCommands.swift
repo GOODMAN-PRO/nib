@@ -7,6 +7,7 @@ enum AIActionCommands {
         registry.register(OutlineGenerate.self)
         registry.register(SuggestTitle.self)
         registry.register(AIQuiz.self)
+        registry.register(AIGenerateImage.self)
     }
 
     static func provider(_ ctx: CommandContext) throws -> AIService {
@@ -60,6 +61,7 @@ enum ActionJSON {
 
     static func text(_ value: JSONValue) -> String {
         if let text = value.stringValue { return text }
+        if let plain = value["plainText"]?.stringValue { return plain }
         if let content = value["text"] {
             let result = text(content)
             if !result.isEmpty { return result }
@@ -95,20 +97,8 @@ enum ActionSource {
 
     static func pages(_ doc: DocumentID, selected: [String]? = nil, ctx: CommandContext) async throws -> [String] {
         try AIActionCommands.checkLock(doc, ctx: ctx)
-        let node = try await node(NodeRef.document(doc).description, ctx: ctx)
-        let rows = node["pages"]?.arrayValue ?? node["content"]?["pages"]?.arrayValue ?? []
-        var refs: [String] = []
-        for row in rows where row["deleted"]?.boolValue != true {
-            let raw = row.stringValue ?? row["ref"]?.stringValue ?? row["id"]?.stringValue ?? ""
-            let ref: String
-            if case .page(let d, let p)? = NodeRef(raw), d == doc { ref = NodeRef.page(d, p).description }
-            else if NibID.isValid(raw) { ref = NodeRef.page(doc, NibID(raw)).description }
-            else { throw NibError(.invariantViolation, "query.get returned an invalid page ref") }
-            if !refs.contains(ref) { refs.append(ref) }
-        }
-        if node["truncated"]?.boolValue == true {
-            throw NibError(.unsupported, "The document query was truncated", hint: "request specific pages")
-        }
+        // Live workspace lists are complete and retain the model's reading order.
+        let refs = try ctx.workspace.content(doc).livePages.map { NodeRef.page(doc, $0.id).description }
         guard let selected = selected else { return refs }
         var selection = Set<String>()
         for raw in selected {
@@ -121,33 +111,47 @@ enum ActionSource {
     }
 
     static func pageText(_ ref: String, ctx: CommandContext) async throws -> String {
-        let value = try await ctx.execute(CommandIDs.recognizePageText, ["page": .string(ref)])
-        return ActionJSON.text(value).trimmingCharacters(in: .whitespacesAndNewlines)
+        var params: [String: JSONValue] = ["page": .string(ref)]
+        var texts: [String] = []
+        var cursors = Set<String>()
+        while true {
+            try Task.checkCancellation()
+            let value = try await ctx.execute(CommandIDs.recognizePageText, .object(params))
+            texts.append(ActionJSON.text(value))
+            let text = try ActionJSON.bounded(texts.joined(separator: "\n"))
+            guard value["truncated"]?.boolValue == true else {
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let cursor = value["cursor"]?.stringValue, !cursor.isEmpty, cursors.insert(cursor).inserted else {
+                throw NibError(.invariantViolation, "recognize.pageText returned no advancing cursor")
+            }
+            params["cursor"] = .string(cursor)
+        }
     }
 
     static func documentText(_ doc: DocumentID, ctx: CommandContext) async throws -> String {
         try AIActionCommands.checkLock(doc, ctx: ctx)
-        let root = try await node(NodeRef.document(doc).description, ctx: ctx)
-        let kind = documentKind(root)
-        if kind == "textDocument" || kind == "studySet" {
-            var result: [String] = []
-            let rows = root[kind == "textDocument" ? "blocks" : "cards"]?.arrayValue ?? []
-            for row in rows where row["deleted"]?.boolValue != true {
-                let raw = row.stringValue ?? row["ref"]?.stringValue ?? row["id"]?.stringValue
-                let value: JSONValue
-                if let raw = raw {
-                    let ref = NibID.isValid(raw) ? (kind == "textDocument" ? NodeRef.block(doc, NibID(raw)) : NodeRef.card(doc, NibID(raw))).description : raw
-                    value = try await node(ref, ctx: ctx)
-                } else { value = row }
-                result.append(ActionJSON.text(value))
-                if kind == "studySet" { result.append(ActionJSON.text(value["front"] ?? .null)); result.append(ActionJSON.text(value["back"] ?? .null)) }
+        let content = try ctx.workspace.content(doc)
+        if content.meta.kind == .textDocument {
+            var texts: [String] = []
+            for block in content.liveBlocks {
+                texts.append(ActionJSON.text(try JSONValue.from(block)))
+                _ = try ActionJSON.bounded(texts.joined(separator: "\n"))
             }
-            guard root["truncated"]?.boolValue != true else { throw NibError.unsupported("Truncated document context; choose a block") }
-            return try ActionJSON.bounded(result.joined(separator: "\n"))
+            return texts.joined(separator: "\n")
+        }
+        if content.meta.kind == .studySet {
+            var texts: [String] = []
+            for card in content.liveCards {
+                texts.append(card.front.text?.plainText ?? "")
+                texts.append(card.back.text?.plainText ?? "")
+                _ = try ActionJSON.bounded(texts.joined(separator: "\n"))
+            }
+            return texts.joined(separator: "\n")
         }
         var texts: [String] = []
-        for page in try await pages(doc, ctx: ctx) {
-            texts.append(try await pageText(page, ctx: ctx))
+        for page in content.livePages {
+            texts.append(try await pageText(NodeRef.page(doc, page.id).description, ctx: ctx))
             _ = try ActionJSON.bounded(texts.joined(separator: "\n"))
         }
         return texts.joined(separator: "\n")
@@ -213,7 +217,11 @@ enum ActionSource {
             return try ActionJSON.bounded(ActionJSON.text(value))
         case .block:
             var texts: [String] = []
-            for ref in scope.refs { texts.append(ActionJSON.text(try await node(ref, ctx: ctx))) }
+            for ref in scope.refs {
+                let value = try await ctx.execute(CommandIDs.queryGet, ["ref": .string(ref), "depth": 2])
+                texts.append(ActionJSON.text(value))
+                _ = try ActionJSON.bounded(texts.joined(separator: "\n"))
+            }
             return try ActionJSON.bounded(texts.joined(separator: "\n"))
         case .library: throw AIActionCommands.invalid("Choose document content for a quiz", path: "$.scope")
         }
@@ -250,7 +258,7 @@ enum QuizBuilder {
 @MainActor
 struct AIQuiz: NibCommand {
     struct Params: Codable { var scope: JSONValue; var count: Int?; var toStudySet: JSONValue?; var id: String? }
-    struct Output: Codable { var questions: [QuizQuestion]; var chatID: String?; var ref: String?; var cards: [String] }
+    struct Output: Codable { var questions: [QuizQuestion]; var ref: String?; var cards: [String] }
     static let descriptor = CommandDescriptor(id: "ai.quiz", title: String(localized: "Quiz me"),
         summary: "Generate grounded quiz questions in chat, or create/add flashcards in a study set.",
         params: .obj(["scope": .anything("scope kind, document/page/item/block ref, or AIScope object"),
@@ -281,24 +289,92 @@ struct AIQuiz: NibCommand {
         let response = try await AIActionCommands.complete(QuizBuilder.prompt(source: source, count: count), scope: scope, ctx: ctx)
         let questions = try QuizBuilder.parse(response.text, count: count)
         var ref = destination.stringValue.map { NodeRef.document(NodeRef.documentID(from: $0)).description }
-        if destination.boolValue == true {
-            // Verify downstream commands before creating a library entry.
-            guard ctx.bus.registry.descriptor(CommandIDs.cardAdd) != nil else { throw NibError.unavailable("Study card editor") }
-            var params: [String: JSONValue] = ["kind": "studySet", "title": "Quiz"]
-            if let id = p.id { params["id"] = .string(id) }
-            let created = try await ctx.execute(CommandIDs.docCreate, .object(params))
-            guard let createdRef = created["ref"]?.stringValue else { throw NibError(.invariantViolation, "doc.create returned no document ref") }
-            ref = createdRef
-        }
+        try Task.checkCancellation()
         var cards: [String] = []
-        if let ref = ref {
-            for question in questions {
-                let back = question.answer + (question.explanation.map { "\n\n" + $0 } ?? "")
-                let result = try await ctx.execute(CommandIDs.cardAdd, ["doc": .string(ref), "front": .string(question.question), "back": .string(back)])
-                if let card = result["ref"]?.stringValue { cards.append(card) }
+        var createdSet: DocumentID?
+        do {
+            if destination.boolValue == true {
+                // Verify downstream commands before creating a library entry.
+                guard ctx.bus.registry.descriptor(CommandIDs.cardAdd) != nil else { throw NibError.unavailable("Study card editor") }
+                var params: [String: JSONValue] = ["kind": "studySet", "title": "Quiz"]
+                if let id = p.id { params["id"] = .string(id) }
+                let created = try await ctx.execute(CommandIDs.docCreate, .object(params))
+                guard let createdRef = created["ref"]?.stringValue else { throw NibError(.invariantViolation, "doc.create returned no document ref") }
+                ref = createdRef
+                createdSet = NodeRef.documentID(from: createdRef)
             }
-            ctx.linkUndoAcrossDocuments()
+            if let ref = ref {
+                for question in questions {
+                    try Task.checkCancellation()
+                    let back = question.answer + (question.explanation.map { "\n\n" + $0 } ?? "")
+                    let result = try await ctx.execute(CommandIDs.cardAdd, ["doc": .string(ref), "front": .string(question.question), "back": .string(back)])
+                    if let card = result["ref"]?.stringValue { cards.append(card) }
+                }
+                ctx.linkUndoAcrossDocuments()
+            }
+        } catch {
+            if let ref = ref {
+                _ = ctx.bus.revert(group: ctx.group, doc: NodeRef.documentID(from: ref), principal: ctx.principal)
+            }
+            if let createdSet = createdSet {
+                // A cancelled parent task must still finish cleaning up the library entry.
+                let cleanup = Task { @MainActor in
+                    _ = try await ctx.execute(CommandIDs.libraryTrash, ["refs": [.string(NodeRef.document(createdSet).description)]])
+                }
+                _ = try? await cleanup.value
+            }
+            throw error
         }
-        return Output(questions: questions, chatID: response.chatID, ref: ref, cards: cards)
+        return Output(questions: questions, ref: ref, cards: cards)
+    }
+}
+
+/// Returns a temporary preview asset; insertion belongs to the chat's explicit Insert choice.
+@MainActor
+struct AIGenerateImage: NibCommand {
+    struct Params: Codable { var prompt: String; var page: String?; var point: Point?; var refs: [String]? }
+    typealias Output = JSONValue
+    // Contract gap: add this executable command to the shared CommandIDs/catalogue (outside F087 ownership).
+    static let descriptor = CommandDescriptor(id: "ai.generateImage", title: String(localized: "Generate image"),
+        summary: "Generate a PNG preview as a tmp: url for Modify/Insert/Discard, or open Image Playground when generation is unavailable.",
+        params: .obj(["prompt": .str(), "page": .ref, "point": .arr(.num()), "refs": .arr(.ref)], required: ["prompt"]),
+        examples: [["prompt": "An illustration of the water cycle", "page": "page:FIXTUREDOC01/FIXTUREPG001"]],
+        effect: .edit, sensitive: true)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> JSONValue {
+        let prompt = p.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { throw AIActionCommands.invalid("Describe the image", path: "$.prompt") }
+        _ = try ActionJSON.bounded(prompt)
+        let page = p.page ?? ctx.activeSession.flatMap { session in
+            guard let doc = session.document, let page = session.page else { return nil as String? }
+            return NodeRef.page(doc, page).description
+        }
+        if let page = page {
+            guard case .page(let doc, let id)? = NodeRef(page) else {
+                throw AIActionCommands.invalid("Invalid page ref", path: "$.page")
+            }
+            try AIActionCommands.checkLock(doc, ctx: ctx)
+            guard try ctx.workspace.content(doc).page(id) != nil else { throw NibError.notFound(page) }
+        }
+        for raw in p.refs ?? [] {
+            guard let doc = NodeRef(raw)?.documentID else { throw AIActionCommands.invalid("Invalid source ref", path: "$.refs") }
+            try AIActionCommands.checkLock(doc, ctx: ctx)
+        }
+        try Task.checkCancellation()
+        let png: Data
+        do {
+            png = try await AIActionCommands.provider(ctx).generateImage(prompt: prompt)
+        } catch let error as NibError where error.code == .unsupported || error.code == .unavailable {
+            var params: [String: JSONValue] = ["source": "playground", "refs": .array((p.refs ?? []).map(JSONValue.string))]
+            if let page = page { params["page"] = .string(page) }
+            if let point = p.point { params["point"] = try JSONValue.from(point) }
+            return try await ctx.execute(CommandIDs.imagePick, .object(params))
+        }
+        try Task.checkCancellation()
+        let uploaded = try await ctx.execute(CommandIDs.assetUpload, ["base64": .string(png.base64EncodedString()), "ext": "png"])
+        guard let url = uploaded["url"]?.stringValue, url.hasPrefix("tmp:") else {
+            throw NibError(.invariantViolation, "asset.upload returned no temporary asset url")
+        }
+        return ["url": .string(url)]
     }
 }

@@ -36,8 +36,8 @@ struct SuggestTitle: NibCommand {
         let doc = try AIActionCommands.document(p.doc)
         try AIActionCommands.checkLock(doc, ctx: ctx)
         let source: String
-        do { let root = try await ActionSource.node(NodeRef.document(doc).description, ctx: ctx)
-            if ActionSource.documentKind(root) == "textDocument" || ActionSource.documentKind(root) == "studySet" {
+        do { let kind = try ctx.workspace.content(doc).meta.kind
+            if kind == .textDocument || kind == .studySet {
                 source = try await ActionSource.documentText(doc, ctx: ctx)
             } else {
                 var firstReadable = ""
@@ -57,7 +57,13 @@ struct SuggestTitle: NibCommand {
         }
         guard let firstLine = TitleBuilder.normalize(source) else { return ["title": .null] }
         guard ctx.services.ai?.isConfigured == true else { return ["title": .string(firstLine)] }
-        let response = try await AIActionCommands.complete(TitleBuilder.prompt(source: source), scope: AIScope(kind: .document, doc: doc), ctx: ctx)
-        return ["title": .string(try TitleBuilder.parse(response.text) ?? firstLine)]
+        do {
+            let response = try await AIActionCommands.complete(TitleBuilder.prompt(source: source), scope: AIScope(kind: .document, doc: doc), ctx: ctx)
+            return ["title": .string(try TitleBuilder.parse(response.text) ?? firstLine)]
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return ["title": .string(firstLine)]
+        }
     }
 }
