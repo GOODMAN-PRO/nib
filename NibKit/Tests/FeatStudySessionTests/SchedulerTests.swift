@@ -43,7 +43,11 @@ final class SchedulerTests: XCTestCase {
         let cards = [card("future", 101), card("tieB", 20, order: "b"), card("new", nil),
                      card("tieA", 20), card("deleted", -5, deleted: true), card("overdue", -1)]
         XCTAssertEqual(Scheduler.due(cards, now: 100).map(\.id.raw), ["overdue", "new", "tieA", "tieB"])
-        XCTAssertEqual(Scheduler.nextReview(cards), -1)
-        XCTAssertNil(Scheduler.nextReview([]))
+        XCTAssertEqual(Scheduler.nextReview(cards, now: 100), 100)
+        XCTAssertNil(Scheduler.nextReview([], now: 100))
+        XCTAssertEqual(Scheduler.nextReminder(cards, now: 100), 101)
+        XCTAssertNil(Scheduler.nextReminder(cards, now: 101))
+        XCTAssertNil(Scheduler.nextReminder([], now: 100))
+        XCTAssertEqual(Scheduler.nextReview([card("future", 101)], now: 100), 101)
     }
 }

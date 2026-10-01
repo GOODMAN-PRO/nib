@@ -11,6 +11,7 @@ final class MemoryReminders: ReminderScheduling {
     var authorized = true
     var dates: [DocumentID: Date] = [:]
     var checks = 0
+    var cancellations: [DocumentID] = []
     func checkAuthorization() async throws {
         checks += 1
         if !authorized { throw NibError(.unavailable, "Notifications not authorised.") }
@@ -20,7 +21,8 @@ final class MemoryReminders: ReminderScheduling {
         try await checkAuthorization()
         dates[doc] = date
     }
-    func cancel(doc: DocumentID) async throws { dates[doc] = nil }
+    func cancel(doc: DocumentID) async throws { cancellations.append(doc); dates[doc] = nil }
+    func pendingDocuments() async -> Set<DocumentID> { Set(dates.keys) }
 }
 
 @MainActor
@@ -93,22 +95,19 @@ final class FeatStudySessionTests: XCTestCase {
         runtime.start(h.app)
         try await h.run(CommandIDs.studySetReminders, ["doc": .string(docRef), "paused": false])
         await runtime.drainReminders()
-        XCTAssertNotNil(reminders.dates[doc])
+        XCTAssertEqual(reminders.dates[doc]?.timeIntervalSince1970, 1_700_086_400)
         try await h.run(CommandIDs.studyGrade, ["card": .string(cardRef), "knewIt": true])
         await runtime.drainReminders()
-        let expected = Scheduler.nextReview(try h.app.workspace.content(doc).liveCards)
+        let expected = Scheduler.nextReminder(try h.app.workspace.content(doc).cards, now: runtime.now())
         XCTAssertEqual(reminders.dates[doc]?.timeIntervalSince1970, expected)
         try await h.run(CommandIDs.studySetReminders, ["doc": .string(docRef), "paused": true])
         await runtime.drainReminders()
         XCTAssertNil(reminders.dates[doc])
         h.app.bus.undo(doc)
-        // Commit observers query on the next main-actor turn, then serially reconcile the OS request.
-        for _ in 0..<10 { await Task.yield() }
         await runtime.drainReminders()
         XCTAssertNotNil(reminders.dates[doc])
         XCTAssertFalse(StudyPreferences.paused(try h.app.workspace.content(doc).meta))
         h.app.bus.redo(doc)
-        for _ in 0..<10 { await Task.yield() }
         await runtime.drainReminders()
         XCTAssertNil(reminders.dates[doc])
     }
@@ -134,6 +133,7 @@ final class FeatStudySessionTests: XCTestCase {
         let (h, runtime, _) = harness()
         let model = runtime.model(app: h.app, doc: doc, session: h.session)
         let speech = MemorySpeech(); model.speaker = speech
+        model.voiceLanguages = ["en-US", "en-GB", "zh-CN"]
         try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": "practice"])
         let first = try XCTUnwrap(model.current)
         XCTAssertFalse(model.flipped)
@@ -267,6 +267,136 @@ final class FeatStudySessionTests: XCTestCase {
         try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "end"])
         XCTAssertFalse(model.started)
         XCTAssertFalse(runtime.model(app: h.app, doc: doc, session: h.session) === model)
+    }
+
+    /// Apply the same tombstone/SRS writes used by card.delete and sync without a cross-feature dependency.
+    private func putCards(_ cards: [StudyCard], in h: Harness) async throws {
+        let id = "testing.studyCards"
+        h.app.commands.register(CommandDescriptor(id: id, title: "Write test cards", summary: "Test fixture mutation.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in _ = try tx.put(cards, doc: Fixtures.studySetID) }
+            return .null
+        }
+        defer { h.app.commands.unregister(id: id) }
+        try await h.run(id)
+    }
+
+    func testGradingOneOfTwoDueCardsSchedulesInTheFuture() async throws {
+        let (h, runtime, reminders) = harness()
+        runtime.start(h.app)
+        var cards = try h.app.workspace.content(doc).liveCards
+        cards[1].srs?.due = runtime.now() - 1
+        try await putCards(cards, in: h)
+        try await h.run(CommandIDs.studySetReminders, ["doc": .string(docRef), "paused": false])
+        await runtime.drainReminders()
+        XCTAssertNil(reminders.dates[doc], "Two due cards have no future reminder yet")
+        try await h.run(CommandIDs.studyGrade, ["card": .string(cardRef), "knewIt": true])
+        await runtime.drainReminders()
+        XCTAssertGreaterThan(try XCTUnwrap(reminders.dates[doc]).timeIntervalSince1970, runtime.now())
+        XCTAssertEqual(Scheduler.due(try h.app.workspace.content(doc).cards, now: runtime.now()).count, 1)
+        XCTAssertEqual(Scheduler.nextReview(try h.app.workspace.content(doc).cards, now: runtime.now()), runtime.now())
+    }
+
+    func testLibraryTrashRestoreDuplicateAndDeleteReconcileReminders() async throws {
+        let (h, runtime, reminders) = harness()
+        runtime.start(h.app)
+        try await h.run(CommandIDs.studySetReminders, ["doc": .string(docRef), "paused": false])
+        await runtime.drainReminders()
+        XCTAssertNotNil(reminders.dates[doc])
+        try h.library.trash(doc)
+        h.app.events.emit(NibEventType.libraryChanged)
+        await runtime.drainReminders()
+        XCTAssertNil(reminders.dates[doc])
+        try h.library.restore(doc, to: nil)
+        h.app.events.emit(NibEventType.libraryChanged)
+        await runtime.drainReminders()
+        XCTAssertEqual(reminders.dates[doc]?.timeIntervalSince1970, 1_700_086_400)
+        let copy = try h.library.duplicate(doc)
+        h.app.events.emit(NibEventType.libraryChanged)
+        await runtime.drainReminders()
+        XCTAssertEqual(reminders.dates[copy]?.timeIntervalSince1970, 1_700_086_400)
+        try h.library.deletePermanently(doc)
+        h.app.events.emit(NibEventType.libraryChanged)
+        await runtime.drainReminders()
+        XCTAssertNil(reminders.dates[doc])
+        XCTAssertNotNil(reminders.dates[copy])
+    }
+
+    func testLaunchPeeksWithoutOpeningPausedSetsAndCancelsOnlyPendingOrphans() async throws {
+        let (h, runtime, reminders) = harness()
+        let orphan: DocumentID = "MISSINGSET01"
+        reminders.dates[orphan] = Date(timeIntervalSince1970: runtime.now() + 100)
+        reminders.dates[Fixtures.docID] = Date(timeIntervalSince1970: runtime.now() + 100)
+        let sequence = h.app.events.lastSeq
+        runtime.start(h.app)
+        await runtime.drainReminders()
+        XCTAssertTrue(reminders.dates.isEmpty)
+        XCTAssertEqual(Set(reminders.cancellations), [orphan, Fixtures.docID])
+        XCTAssertFalse(h.app.events.events(since: sequence).contains { $0.type == NibEventType.docOpened })
+        _ = try h.app.workspace.content(doc)
+        XCTAssertEqual(h.app.events.events(since: sequence).filter { $0.type == NibEventType.docOpened && $0.doc == doc }.count, 1,
+                       "The first user read still opens the set after the uncached launch scan")
+    }
+
+    func testDeletingRevealedCardOrMovingItToFutureResetsRevealAndSpeech() async throws {
+        for delete in [true, false] {
+            let (h, runtime, _) = harness()
+            runtime.start(h.app)
+            // Make both cards due so there is a replacement question in Smart Learn.
+            var cards = try h.app.workspace.content(doc).liveCards
+            cards[1].srs?.due = runtime.now() - 1
+            try await putCards(cards, in: h)
+            try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": "smartLearn"])
+            let model = try XCTUnwrap(runtime.existingModel(doc: doc, session: h.session))
+            let speech = MemorySpeech(); model.speaker = speech
+            let oldID = try XCTUnwrap(model.current?.id)
+            try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "flip"])
+            XCTAssertTrue(model.flipped)
+            let stops = speech.stops
+            var card = try XCTUnwrap(model.current)
+            if delete { card.deleted = true }
+            else { card.srs = SRSState(due: runtime.now() + Scheduler.day) }
+            try await putCards([card], in: h)
+            XCTAssertNotNil(model.current)
+            XCTAssertNotEqual(model.current?.id, oldID)
+            XCTAssertFalse(model.flipped)
+            XCTAssertTrue(model.instantFlip)
+            XCTAssertGreaterThan(speech.stops, stops)
+            await runtime.drainReminders()
+        }
+    }
+
+    func testShortcutsOutsideSessionDoNotAllocateModelsAndInvalidModeFails() async throws {
+        let (h, runtime, _) = harness()
+        for action in ["flip", "next", "previous", "grade", "end"] {
+            let result = try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": .string(action)])
+            XCTAssertEqual(result["total"]?.doubleValue, 0)
+            XCTAssertNil(runtime.existingModel(doc: doc, session: h.session))
+        }
+        do {
+            try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": "bogus"])
+            XCTFail("User invocations must validate the mode")
+        } catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
+        XCTAssertNil(runtime.existingModel(doc: doc, session: h.session))
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        try await model.reload()
+        XCTAssertThrowsError(try model.act("start", mode: "bogus", language: nil, instant: false))
+        XCTAssertFalse(model.started)
+        model.busy = true
+        var closed = false
+        model.end { closed = true }
+        XCTAssertTrue(closed, "Close is immediate even while busy")
+    }
+
+    func testVoiceLanguageMappingUsesInstalledLanguages() {
+        let installed = ["en-US", "en-GB", "zh-CN", "zh-TW", "zh-HK", "vi-VN", "fr-FR"]
+        for (requested, expected) in [("zh-Hans", "zh-CN"), ("zh-Hans-CN", "zh-CN"),
+                                      ("zh-Hant", "zh-TW"), ("yue", "zh-HK"), ("yue-Hans", "zh-HK"),
+                                      ("vi-VT", "vi-VN"), ("en-AU", "en-US"), ("en-GB", "en-GB")] {
+            XCTAssertEqual(StudyVoiceLanguages.resolve(requested, installed: installed), expected)
+        }
+        XCTAssertEqual(StudyVoiceLanguages.resolve("zh-Hans", installed: ["zh-Hans", "zh-CN"]), "zh-Hans", "Exact match wins")
+        XCTAssertEqual(StudyVoiceLanguages.resolve("zh-Hant", installed: ["zh-HK"]), "zh-HK", "Language fallback follows the region map")
+        XCTAssertNil(StudyVoiceLanguages.resolve("de-DE", installed: installed))
     }
 
 }

@@ -68,7 +68,7 @@ struct StudyGrade: NibCommand {
             runtime.recordGrade(content: content, card: id, rating: rating)
             runtime.enqueue(content)
         }
-        return Output(srs: state, nextReview: Scheduler.nextReview(content.liveCards))
+        return Output(srs: state, nextReview: Scheduler.nextReview(content.cards, now: runtime.now()))
     }
 }
 
@@ -142,20 +142,6 @@ struct StudySetTheme: NibCommand {
     }
 }
 
-/// A feature-local query keeps the study panels usable even in hosts that have not installed F003's query API.
-struct StudyQuery: NibCommand {
-    static let id = "study.query"
-    struct Params: Codable { var doc: String }
-    static let descriptor = CommandDescriptor(id: id, title: String(localized: "Read Study Set"),
-        summary: "Read a study set's metadata, live cards and stored Smart Learn schedules for practice and review.",
-        params: .obj(["doc": .ref], required: ["doc"]), examples: [["doc": "doc:FIXTUREDOC03"]], effect: .read)
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> DocumentContent {
-        let content = try StudyAccess.content(try ctx.documentOrSession(p.doc), ctx)
-        // Tombstones are not part of a user's study session.
-        return DocumentContent(meta: content.meta, cards: content.liveCards)
-    }
-}
-
 struct StudySessionAction: NibCommand {
     static let id = "study.session"
     struct Params: Codable { var doc: String; var action: String; var mode: String?; var language: String?; var instant: Bool?; var rating: StudyRating? }
@@ -169,7 +155,21 @@ struct StudySessionAction: NibCommand {
         let doc = try ctx.documentOrSession(p.doc)
         let content = try StudyAccess.content(doc, ctx)
         guard let app = ctx.app else { throw NibError(.unavailable, "Study sessions need an app host.") }
-        let model = try StudyAccess.runtime(ctx).model(app: app, doc: doc, session: ctx.activeSession)
+        let runtime = try StudyAccess.runtime(ctx)
+        guard !ctx.dryRun else {
+            return Output(card: nil, flipped: false, reviewed: 0, total: 0, nextReview: nil)
+        }
+        let model: StudySessionModel
+        if p.action == "start" {
+            guard p.mode == nil || p.mode == "practice" || p.mode == "smartLearn" else {
+                throw NibError.invalid("Choose practice or smartLearn.", path: "$.mode")
+            }
+            model = runtime.model(app: app, doc: doc, session: ctx.activeSession)
+        } else if let existing = runtime.existingModel(doc: doc, session: ctx.activeSession) {
+            model = existing
+        } else {
+            return Output(card: nil, flipped: false, reviewed: 0, total: 0, nextReview: nil)
+        }
         if !ctx.dryRun {
             model.accept(content)
             if p.action == "grade" {

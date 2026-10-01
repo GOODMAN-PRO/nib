@@ -11,7 +11,8 @@ public enum FeatStudySessionFeature: NibFeature {
         app.commands.register(StudyResetProgress.self)
         app.commands.register(StudySetReminders.self)
         app.commands.register(StudySetTheme.self)
-        app.commands.register(StudyQuery.self)
+        // Contract request: add study.session (session controls/shortcuts) and study.requestReminders
+        // (userPresence permission flow) to CONTRACTS §6.5 and the F050 forge-spec command rows.
         app.commands.register(StudySessionAction.self)
         app.commands.register(StudyRequestReminders.self)
         for (panel, learn) in [(PanelIDs.studyPractice, false), (PanelIDs.studySmartLearn, true)] {

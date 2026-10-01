@@ -11,11 +11,12 @@ struct SmartLearnView: View {
 struct StudySummaryView: View {
     @ObservedObject var model: StudySessionModel
     let smartLearn: Bool
+    let close: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
-            Text(model.content?.liveCards.isEmpty == true ? String(localized: "No cards yet") : String(localized: "Review complete"))
+            Text(model.liveCards.isEmpty ? String(localized: "No cards yet") : String(localized: "Review complete"))
                 .font(NibFont.emptyTitle)
-            if model.content?.liveCards.isEmpty == true {
+            if model.liveCards.isEmpty {
                 Text(String(localized: "Add cards in the study set editor to begin."))
             } else if smartLearn {
                 Text(String(localized: "Reviewed: \(model.reviewed.count)"))
@@ -26,13 +27,13 @@ struct StudySummaryView: View {
                 if !model.hardest.isEmpty {
                     Text(String(localized: "Hardest cards")).font(NibFont.headline)
                     ForEach(model.hardest, id: \.self) { id in
-                        if let card = model.content?.liveCards.first(where: { $0.id == id }) {
+                        if let card = model.cardsByID[id] {
                             Text(card.front.text?.plainText ?? String(localized: "Handwritten or image card"))
                         }
                     }
                 }
             }
-            NibButton(String(localized: "Return to Study Set"), symbol: .back, kind: .plain) { model.action("end") }
+            NibButton(String(localized: "Return to Study Set"), symbol: .back, kind: .plain) { model.end(close: close) }
         }
         .font(NibFont.body)
         .frame(maxWidth: NibMetrics.studyCardSize.width, alignment: .leading)
@@ -43,9 +44,9 @@ struct StudySummaryView: View {
         let today = calendar.startOfDay(for: Date(timeIntervalSince1970: model.runtime.now()))
         guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: today),
               let end = calendar.date(byAdding: .day, value: 1, to: tomorrow) else { return 0 }
-        return model.content?.liveCards.filter {
+        return model.liveCards.filter {
             let due = Scheduler.dueDate($0)
             return due >= tomorrow.timeIntervalSince1970 && due < end.timeIntervalSince1970
-        }.count ?? 0
+        }.count
     }
 }

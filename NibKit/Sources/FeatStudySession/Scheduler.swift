@@ -53,7 +53,14 @@ enum Scheduler {
         return due
     }
 
-    static func nextReview(_ cards: [StudyCard]) -> Double? {
-        cards.filter { !$0.deleted }.map(dueDate).min()
+    static func nextReview(_ cards: [StudyCard], now: Double) -> Double? {
+        cards.lazy.filter { !$0.deleted }.map { max(now, dueDate($0)) }.min()
+    }
+
+    static func nextReminder(_ cards: [StudyCard], now: Double) -> Double? {
+        cards.lazy.filter { !$0.deleted }.compactMap { card -> Double? in
+            guard let due = card.srs?.due, due.isFinite, due > now else { return nil }
+            return due
+        }.min()
     }
 }

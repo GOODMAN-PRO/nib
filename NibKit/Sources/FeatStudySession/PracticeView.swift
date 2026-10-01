@@ -12,15 +12,34 @@ protocol StudySpeaking: AnyObject {
     func stop()
 }
 
+enum StudyVoiceLanguages {
+    static func resolve(_ language: String, installed: [String]) -> String? {
+        func canonical(_ code: String) -> String { code.replacingOccurrences(of: "_", with: "-").lowercased() }
+        let requested = canonical(language)
+        if let exact = installed.first(where: { canonical($0) == requested }) { return exact }
+        let mapped: String?
+        if requested.hasPrefix("zh-hans") { mapped = "zh-cn" }
+        else if requested.hasPrefix("zh-hant") { mapped = "zh-tw" }
+        else if requested == "yue" || requested.hasPrefix("yue-") { mapped = "zh-hk" }
+        else if requested == "vi-vt" { mapped = "vi-vn" }
+        else { mapped = nil }
+        if let mapped, let match = installed.first(where: { canonical($0) == mapped }) { return match }
+        let code = requested.split(separator: "-").first
+        return installed.first { canonical($0).split(separator: "-").first == code }
+    }
+}
+
 @MainActor
 final class StudySpeech: StudySpeaking {
+    static let installedLanguages = Array(Set(AVSpeechSynthesisVoice.speechVoices().map(\.language))).sorted()
     private var synthesizer: AVSpeechSynthesizer?
     func speak(_ text: String, language: String) throws {
         guard !NibApp.isHostlessTest else { throw NibError(.unavailable, "Speech is unavailable in hostless tests.") }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NibError(.unavailable, String(localized: "This side has no text to read aloud."))
         }
-        guard let voice = AVSpeechSynthesisVoice(language: language) else {
+        guard let resolved = StudyVoiceLanguages.resolve(language, installed: Self.installedLanguages),
+              let voice = AVSpeechSynthesisVoice(language: resolved) else {
             throw NibError(.unavailable, String(localized: "A voice for this language is not installed."))
         }
         let synthesizer = self.synthesizer ?? AVSpeechSynthesizer()
@@ -54,18 +73,23 @@ final class StudySessionModel: ObservableObject {
     @Published private(set) var instantFlip = false
     @Published private(set) var scratchPresented = false
     var speaker: StudySpeaking = StudySpeech()
+    var voiceLanguages: [String] = []
+    private(set) var liveCards: [StudyCard] = []
+    private(set) var cardsByID: [NibID: StudyCard] = [:]
     private let pictures = NSCache<NSString, UIImage>()
     var onEnd: (() -> Void)?
 
     init(app: NibApp, doc: DocumentID, session: EditorSession?, runtime: StudyRuntime) {
         self.app = app; self.doc = doc; self.session = session; self.runtime = runtime
         self.reminderError = runtime.reminderErrors[doc]
+        // Installed voice discovery requires the speech service, which a hostless harness cannot provide.
+        if !NibApp.isHostlessTest { voiceLanguages = StudySpeech.installedLanguages }
         pictures.totalCostLimit = 24 << 20
     }
     var docRef: String { NodeRef.document(doc).description }
     var current: StudyCard? {
         guard queue.indices.contains(index) else { return nil }
-        return content?.liveCards.first { $0.id == queue[index] }
+        return cardsByID[queue[index]]
     }
     var theme: StudyTheme { content.map { StudyPreferences.theme($0.meta) } ?? StudyTheme() }
     var cardPaper: NibPaper { NibPaper(rawValue: theme.card) ?? .white }
@@ -82,28 +106,37 @@ final class StudySessionModel: ObservableObject {
     }
     var paused: Bool { content.map { StudyPreferences.paused($0.meta) } ?? true }
     var readOnly: Bool { app.isReadOnly(doc) || session?.readOnly == true }
-    var nextReview: Double? { content.flatMap { Scheduler.nextReview($0.liveCards) } }
+    var nextReview: Double? { Scheduler.nextReview(liveCards, now: runtime.now()) }
 
     func accept(_ content: DocumentContent) {
+        let oldID = current?.id
         self.content = content
-        if !started { language = content.meta.language }
+        liveCards = content.liveCards
+        cardsByID = Dictionary(uniqueKeysWithValues: liveCards.map { ($0.id, $0) })
+        if !started { language = StudyVoiceLanguages.resolve(content.meta.language, installed: voiceLanguages) ?? content.meta.language }
         if started {
-            let live = Set(content.liveCards.map(\.id))
-            let oldID = current?.id
-            queue.removeAll { !live.contains($0) }
+            queue.removeAll { cardsByID[$0] == nil }
             if mode == "practice" { index = oldID.flatMap { queue.firstIndex(of: $0) } ?? min(index, max(0, queue.count - 1)) }
             else { moveToDueCard() }
+        }
+        if oldID != current?.id {
+            flipped = false
+            instantFlip = true
+            speaker.stop()
         }
     }
 
     func act(_ action: String, mode: String?, language: String?, instant: Bool) throws {
         switch action {
         case "start":
+            guard mode == nil || mode == "practice" || mode == "smartLearn" else {
+                throw NibError.invalid("Choose practice or smartLearn.", path: "$.mode")
+            }
             guard let content else { throw NibError.notFound("study set") }
             self.mode = mode ?? "practice"
-            queue = (self.mode == "smartLearn" ? Scheduler.due(content.liveCards, now: runtime.now()) : content.liveCards).map(\.id)
+            queue = (self.mode == "smartLearn" ? Scheduler.due(liveCards, now: runtime.now()) : liveCards).map(\.id)
             index = 0; reviewed = []; hardest = []; instantFlip = true; flipped = false; started = true
-            self.language = content.meta.language
+            self.language = StudyVoiceLanguages.resolve(content.meta.language, installed: voiceLanguages) ?? content.meta.language
             speaker.stop()
         case "flip":
             guard current != nil else { return }
@@ -118,7 +151,7 @@ final class StudySessionModel: ObservableObject {
             index = min(max(index + (action == "next" ? 1 : -1), 0), queue.count - 1)
             flipped = false; speaker.stop()
         case "language":
-            guard let language, Locale.availableIdentifiers.contains(where: { $0.replacingOccurrences(of: "_", with: "-").lowercased() == language.lowercased() }) else {
+            guard let language, voiceLanguages.contains(language) else {
                 throw NibError(.invalidParams, "Use an installed language code.", path: "$.language", hint: "pass a BCP-47 locale such as en-GB or th-TH")
             }
             self.language = language; speaker.stop()
@@ -150,7 +183,7 @@ final class StudySessionModel: ObservableObject {
 
     private func moveToDueCard() {
         index = queue.firstIndex { id in
-            !reviewed.contains(id) && content?.liveCards.contains { $0.id == id && Scheduler.dueDate($0) <= runtime.now() } == true
+            !reviewed.contains(id) && cardsByID[id].map { Scheduler.dueDate($0) <= runtime.now() } == true
         } ?? queue.count
     }
 
@@ -162,7 +195,7 @@ final class StudySessionModel: ObservableObject {
             do {
                 _ = try await app.bus.execute(Invocation(command: command, params: params, session: session))
                 error = nil
-                try await reload()
+                if command != StudySessionAction.id { try await reload() }
             } catch { self.error = NibError.wrap(error).message }
         }
     }
@@ -171,14 +204,19 @@ final class StudySessionModel: ObservableObject {
         if let language { params["language"] = .string(language) }
         send(StudySessionAction.id, .object(params))
     }
+    func end(close: () -> Void) {
+        // Closing remains available while a grade or OS permission request is in flight.
+        onEnd = nil
+        app.perform(StudySessionAction.id, ["doc": .string(docRef), "action": "end"], session: session)
+        close()
+    }
     func grade(_ rating: StudyRating) {
         guard let card = current, flipped, !readOnly else { return }
         send(CommandIDs.studyGrade, ["card": .string(NodeRef.card(doc, card.id).description),
                                     "knewIt": .bool(rating.knewIt), "rating": .string(rating.rawValue)])
     }
     func reload() async throws {
-        let result = try await app.bus.execute(Invocation(command: StudyQuery.id, params: ["doc": .string(docRef)], session: session))
-        accept(try result.value.decode(DocumentContent.self))
+        accept(try app.workspace.content(doc))
     }
     func begin(_ mode: String) async {
         do {
@@ -264,7 +302,7 @@ struct StudySessionView: View {
     private var header: some View {
         NibPanelHeader(title: smartLearn ? String(localized: "Smart Learn") : String(localized: "Practice"),
                        symbol: .studySets, onClose: {
-                           if model.content == nil { close() } else { model.action("end") }
+                           model.end(close: close)
                        })
     }
 
@@ -279,7 +317,7 @@ struct StudySessionView: View {
                 if smartLearn { grading } else { navigation }
                 controls
             } else if model.started {
-                StudySummaryView(model: model, smartLearn: smartLearn)
+                StudySummaryView(model: model, smartLearn: smartLearn, close: close)
                 controls
             }
         }
@@ -299,15 +337,8 @@ struct StudySessionView: View {
         VStack(spacing: NibSpacing.s) {
             Text(String(localized: "\(min(model.index + 1, model.queue.count)) of \(model.queue.count)"))
                 .font(NibFont.hud)
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    Rectangle().fill(NibColor.fill1)
-                    Rectangle().fill(NibColor.label).frame(width: geometry.size.width * progressValue)
-                }
-            }
-            .frame(height: NibStroke.thick)
-            .accessibilityLabel(String(localized: "Study progress"))
-            .accessibilityValue(Text(progressValue, format: .percent))
+            NibProgressBar(value: progressValue)
+                .accessibilityLabel(String(localized: "Study progress"))
         }
         .frame(maxWidth: NibMetrics.studyCardSize.width)
     }
@@ -416,7 +447,7 @@ struct StudySessionView: View {
                 HStack(spacing: NibSpacing.m) { speech; language; scratch }
                 VStack(alignment: .leading, spacing: NibSpacing.s) { speech; language; scratch }
             }
-            DisclosureGroup(String(localized: "Appearance and reminders")) {
+            DisclosureGroup {
                 VStack(alignment: .leading, spacing: NibSpacing.l) {
                     paperPicker(card: true)
                     paperPicker(card: false)
@@ -441,6 +472,9 @@ struct StudySessionView: View {
                         NibButton(String(localized: "Reset Progress"), kind: .destructivePlain) { resetConfirmed = true }
                     }
                 }.padding(.top, NibSpacing.l).disabled(model.readOnly || model.busy)
+            } label: {
+                Text(String(localized: "Appearance and reminders"))
+                    .frame(minHeight: NibMetrics.hitTarget)
             }
         }
         .font(NibFont.body)
@@ -452,7 +486,7 @@ struct StudySessionView: View {
     }
     private var language: some View {
         Picker(String(localized: "Voice language"), selection: Binding(get: { model.language }, set: { model.action("language", language: $0) })) {
-            ForEach(Array(Set([model.language, "en-GB", "en-US", "th-TH", "de-DE", "fr-FR", "es-ES", "ja-JP", "zh-CN"])).sorted(), id: \.self) { code in
+            ForEach(model.voiceLanguages, id: \.self) { code in
                 Text(Locale.current.localizedString(forIdentifier: code) ?? code).tag(code)
             }
         }.pickerStyle(.menu).frame(minHeight: NibMetrics.hitTarget).disabled(model.busy)
@@ -463,19 +497,34 @@ struct StudySessionView: View {
         }.disabled(model.busy || model.app.ui.panels.get("studyeditor.scratch") == nil)
     }
     private func paperPicker(card: Bool) -> some View {
-        Picker(card ? String(localized: "Card colour") : String(localized: "Background colour"), selection: Binding(get: {
-            card ? model.theme.card : model.theme.background ?? "desk"
-        }, set: { colour in
-            model.send(CommandIDs.studySetTheme, ["doc": .string(model.docRef), card ? "card" : "background": .string(colour)])
-        })) {
-            if !card { Text(String(localized: "Desk")).tag("desk") }
-            let selected = card ? model.theme.card : model.theme.background ?? "desk"
-            if NibPaper(rawValue: selected) == nil && selected != "desk" {
-                Text(String(localized: "Custom colour")).tag(selected)
+        let selected = card ? model.theme.card : model.theme.background ?? "desk"
+        return VStack(alignment: .leading, spacing: NibSpacing.s) {
+            Text(card ? String(localized: "Card colour") : String(localized: "Background colour"))
+                .font(NibFont.headline)
+            ScrollView(.horizontal) {
+                HStack(spacing: NibSpacing.m) {
+                    if !card {
+                        paperTile(name: String(localized: "Desk"), colour: NibColor.desk, value: "desk", selected: selected, card: false)
+                    }
+                    if NibPaper(rawValue: selected) == nil && selected != "desk" {
+                        paperTile(name: String(localized: "Custom colour"), colour: card ? model.cardFill : model.desk,
+                                  value: selected, selected: selected, card: card)
+                    }
+                    ForEach(NibPaper.allCases, id: \.self) { paper in
+                        paperTile(name: paper.name, colour: paper.color, value: paper.rawValue, selected: selected, card: card)
+                    }
+                }.padding(NibSpacing.xs)
             }
-            ForEach(NibPaper.allCases, id: \.self) { paper in Text(paper.name).tag(paper.rawValue) }
-        }.pickerStyle(.menu).frame(minHeight: NibMetrics.hitTarget)
+        }
     }
+    private func paperTile(name: String, colour: Color, value: String, selected: String, card: Bool) -> some View {
+        NibPaperTile(name: name, isSelected: selected == value, size: NibMetrics.coverStripSize, action: {
+            model.send(CommandIDs.studySetTheme, ["doc": .string(model.docRef), card ? "card" : "background": .string(value)])
+        }) {
+            colour
+        }
+    }
+
 }
 
 struct StudyFaceView: View {
