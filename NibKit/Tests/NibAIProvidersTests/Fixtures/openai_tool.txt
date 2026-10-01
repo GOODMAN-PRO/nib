@@ -1,0 +1,24 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Adding a "},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"page — then I’ll check."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_A","type":"function","function":{"name":"nib_run","arguments":""}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"page.a"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_B","type":"function","function":{"name":"nib_context","arguments":""}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"dd\",\"params\":{\"doc\":\"doc:FIXTUREDOC01\",\"position\":\"end\",\"id\":\"NEWPAGE00001\"}}"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{}"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-FIXTURE","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":85,"total_tokens":1285}}
+
+data: [DONE]
+
