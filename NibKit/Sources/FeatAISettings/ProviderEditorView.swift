@@ -58,7 +58,8 @@ struct ProviderDraft {
     }
     mutating func apply(_ preset: ProviderPreset) {
         name = preset.title; kind = preset.kind; baseURL = preset.baseURL; model = ""
-        transcriptionModel = ""; imageModel = ""; headers = ""
+        transcriptionModel = ""; imageModel = ""
+        headers = preset == .openRouter ? "HTTP-Referer: https://github.com/GOODMAN-PRO/nib\nX-Title: Nib" : ""
     }
     func config() throws -> AIProviderConfig {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
@@ -123,6 +124,16 @@ enum ProviderValidation {
         c.extraHeaders = headers
         return c
     }
+    static func rejectKeyInMetadata(_ config: AIProviderConfig, key: String?) throws {
+        guard let key = key?.trimmingCharacters(in: .whitespacesAndNewlines), key.count >= 8 else { return }
+        let metadata = [config.name, config.baseURL.absoluteString, config.model,
+                        config.transcriptionModel ?? "", config.imageModel ?? ""]
+                       + Array(config.extraHeaders.keys) + Array(config.extraHeaders.values)
+        if metadata.contains(where: { $0.contains(key) }) {
+            throw NibError(.invalidParams, "The API key must not appear in provider metadata.",
+                           hint: "remove it from the URL, model, name and extra headers")
+        }
+    }
     static func headers(_ text: String) throws -> [String: String] {
         var out: [String: String] = [:]
         var names = Set<String>()
@@ -140,12 +151,12 @@ enum ProviderValidation {
     /// No DNS lookup: an unrecognised host is conservatively treated as public.
     static func isPrivateHost(_ raw: String) -> Bool {
         let host = raw.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") { return true }
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") || host.hasSuffix(".ts.net") { return true }
         var ipv4 = in_addr()
         if inet_pton(AF_INET, host, &ipv4) == 1 {
             let n = UInt32(bigEndian: ipv4.s_addr)
             let a = n >> 24, b = (n >> 16) & 255
-            return a == 10 || a == 127 || (a == 172 && (16...31).contains(b)) || (a == 192 && b == 168) || (a == 169 && b == 254)
+            return a == 10 || a == 127 || (a == 100 && (64...127).contains(b)) || (a == 172 && (16...31).contains(b)) || (a == 192 && b == 168) || (a == 169 && b == 254)
         }
         var ipv6 = in6_addr()
         guard inet_pton(AF_INET6, host, &ipv6) == 1 else { return false }
@@ -202,7 +213,7 @@ struct ProviderEditorView: View {
                     .onChange(of: preset) { _, value in draft.apply(value); models = [] }
                 }
             }
-            Section(String(localized: "Provider")) {
+            Section {
                 field(String(localized: "Name"), text: $draft.name)
                 Picker(String(localized: "Protocol"), selection: $draft.kind) {
                     Text("Anthropic").tag(AIProviderKind.anthropic)
@@ -214,7 +225,7 @@ struct ProviderEditorView: View {
                     Text(String(localized: "For a server on another device, replace localhost with its private address or local hostname."))
                         .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                 }
-            }
+            } header: { AISettingsHeader(String(localized: "Provider")) }
             Section {
                 NibSecureField(text: $key, prompt: String(localized: "API key"))
                     .accessibilityLabel(String(localized: "API key, stored only in Keychain"))
@@ -225,16 +236,13 @@ struct ProviderEditorView: View {
                         .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                 }
                 if credentialsMissing {
-                    Text(String(localized: "credentials missing — re-enter"))
-                        .font(NibFont.footnote).foregroundStyle(NibColor.warning)
+                    NibBanner(String(localized: "credentials missing — re-enter"), style: .warning)
                 }
                 if warning {
-                    NibRow(String(localized: "This key will be sent without encryption."),
-                           subtitle: String(localized: "The HTTP address is not recognised as private. Use HTTPS to protect your credentials."),
-                           icon: .warningTriangle)
+                    NibBanner(String(localized: "This key will be sent without encryption. The HTTP address is not recognised as private. Use HTTPS to protect your credentials."), style: .warning)
                 }
-            } header: { Text(String(localized: "Credentials")) }
-            Section(String(localized: "Models")) {
+            } header: { AISettingsHeader(String(localized: "Credentials")) }
+            Section {
                 field(String(localized: "Chat model"), text: $draft.model)
                 if !models.isEmpty {
                     Picker(String(localized: "Available models"), selection: $draft.model) {
@@ -248,12 +256,12 @@ struct ProviderEditorView: View {
                 field(String(localized: "Maximum output tokens"), text: $draft.maxOutputTokens, keyboard: .numberPad)
                 NibToggle(String(localized: "Accepts images"), isOn: $draft.supportsVision)
                 NibToggle(String(localized: "Supports tools"), isOn: $draft.supportsTools)
-            }
+            } header: { AISettingsHeader(String(localized: "Models")) }
             Section {
                 NibField(text: $draft.headers, prompt: String(localized: "Name: value"), lines: 3...8)
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     .accessibilityLabel(String(localized: "Extra headers, one name and value per line"))
-            } header: { Text(String(localized: "Extra headers")) }
+            } header: { AISettingsHeader(String(localized: "Extra headers")) }
               footer: { Text(String(localized: "Use non-secret headers only. Credentials always belong in the API key field.")) }
             Section {
                 NibButton(String(localized: "Save provider"), symbol: .checkmark, kind: .primary,
@@ -264,7 +272,8 @@ struct ProviderEditorView: View {
                     .disabled(busy || !clean || savedConfig == nil)
                 if busy { ProgressView().accessibilityLabel(String(localized: "Contacting provider")) }
                 if let message {
-                    Text(message).font(NibFont.footnote).foregroundStyle(failed ? NibColor.warning : NibColor.labelSecondary)
+                    if failed { NibBanner(message, style: .warning) }
+                    else { Text(message).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary) }
 
                 }
             } footer: { Text(String(localized: "Save changes before loading models or testing. A test sends only a tiny completion, without notes or tools.")) }
@@ -282,7 +291,7 @@ struct ProviderEditorView: View {
         }
         .font(NibFont.body)
         .scrollContentBackground(.hidden)
-        .background(NibColor.backgroundSecondary)
+        .background(NibColor.groupedBackground)
         .navigationTitle(savedConfig?.name ?? String(localized: "Add provider"))
         .onChange(of: message) { _, value in
             if let value, UIAccessibility.isVoiceOverRunning { UIAccessibility.post(notification: .announcement, argument: value) }
@@ -292,7 +301,7 @@ struct ProviderEditorView: View {
     }
     private func field(_ title: String, text: Binding<String>, keyboard: UIKeyboardType = .default) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
-            Text(title).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+            Text(title).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
             NibField(text: text, prompt: title).keyboardType(keyboard)
                 .textInputAutocapitalization(.never).autocorrectionDisabled().accessibilityLabel(title)
         }

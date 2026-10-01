@@ -27,7 +27,7 @@ public enum FeatAISettingsFeature: NibFeature {
         // F084 also declares this shared name. Identical routing and schema keep either registration order valid.
         app.settings.declare(AISettingsKeys.directTools, summary: "Command ids offered directly to the AI model.",
                              owner: id, schema: .arr(.str()))
-        app.settings.declare(AISettingsKeys.maxSteps, summary: "Maximum tool rounds in an AI turn on this device.",
+        app.settings.declare(AISettingsKeys.maxSteps, summary: "Maximum tool rounds in an AI turn.",
                              owner: id, schema: .int(min: 1, max: 100))
         var page = SettingsPageDescriptor(id: "settings.ai", title: String(localized: "AI"),
                                           icon: NibSymbol.assistant.name, section: .ai, order: 0, owner: id) {
@@ -36,18 +36,14 @@ public enum FeatAISettingsFeature: NibFeature {
         page.keywords = ["AI", "providers", "privacy", "API key", "Ollama", "LM Studio", "models"]
         app.ui.settingsPages.register(page)
     }
-
-    public static func start(_ app: NibApp) async {
-        app.gateway.setPolicy(forPrincipalKind: "ai") { [weak app] _ in
-            app?.settings.get(NibSettings.aiConfirmationPolicy) ?? .destructive
-        }
-    }
 }
 
 enum AISettingsKeys {
     static let credentialPrefix = "aisettings.credentials."
-    static let directTools = SettingKey(NibSettings.aiDirectToolsName, default: NibSettings.defaultAIDirectTools)
-    static let maxSteps = SettingKey("aisettings.maxSteps", default: 40)
+    static let directTools = SettingKey(NibSettings.aiDirectToolsName, default: NibSettings.defaultAIDirectTools, synced: true)
+    // Contract gap: NibSettings.aiMaxSteps should own this synced key and F084 AgentService
+    // should clamp AIRequest.maxSteps to it. F086 cannot change either owner.
+    static let maxSteps = SettingKey("ai.maxSteps", default: 40, synced: true)
     static func hadKey(_ id: UUID) -> SettingKey<Bool> {
         SettingKey(credentialPrefix + id.uuidString, default: false)
     }
@@ -63,14 +59,8 @@ final class ProviderSettingsRuntime {
 
     func saveFromSettings(_ config: AIProviderConfig, key: String?, app: NibApp) async throws {
         let config = try ProviderValidation.validate(config)
-        let metadata = [config.name, config.baseURL.absoluteString, config.model,
-                        config.transcriptionModel ?? "", config.imageModel ?? ""]
-                       + Array(config.extraHeaders.keys) + Array(config.extraHeaders.values)
-        if let key, !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           metadata.contains(where: { $0.contains(key.trimmingCharacters(in: .whitespacesAndNewlines)) }) {
-            throw NibError(.invalidParams, "The API key must not appear in provider metadata.",
-                           hint: "remove it from the URL, model, name and extra headers")
-        }
+        try ProviderValidation.rejectKeyInMetadata(config, key: key ?? Keychain.getString(
+            service: AIProviderConfig.keychainService, account: config.keychainAccount))
         let group = UUID().uuidString
         if let key { pending[group] = Pending(config: config, key: key) }
         defer { pending[group] = nil }
@@ -129,6 +119,11 @@ struct ProviderList: NibCommand {
         for config in configs.dropFirst(start) {
             let hasKey = !(Keychain.getString(service: AIProviderConfig.keychainService,
                                              account: config.keychainAccount) ?? "").isEmpty
+            // Contract gap: AIProviderStore.credentialsMissing(_:) should expose its persisted
+            // hasKey marker. Repair our device marker whenever credentials are available.
+            if !ctx.dryRun && hasKey && !ctx.services.settings.get(AISettingsKeys.hadKey(config.id)) {
+                ctx.services.settings.set(AISettingsKeys.hadKey(config.id), true)
+            }
             let row = ProviderRow(config: config,
                                   credentialsMissing: ctx.services.settings.get(AISettingsKeys.hadKey(config.id)) && !hasKey,
                                   hasCredentials: hasKey)
@@ -194,6 +189,15 @@ struct ProviderSave: NibCommand {
         let config = try p.config(existing: existing)
         let runtime = ctx.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self)
         let key = try runtime?.key(for: ctx, config: config)
+        let savedKey = Keychain.getString(service: AIProviderConfig.keychainService, account: config.keychainAccount)
+        if !ctx.principal.isUser, let existing, savedKey?.isEmpty == false,
+           existing.kind != config.kind || existing.baseURL.scheme?.lowercased() != config.baseURL.scheme?.lowercased()
+            || existing.baseURL.host?.lowercased() != config.baseURL.host?.lowercased()
+            || existing.baseURL.port != config.baseURL.port {
+            throw NibError(.permissionDenied, "A provider with a saved key cannot be redirected by this caller.",
+                           hint: "change the endpoint of a provider with a saved key in Settings › AI")
+        }
+        try ProviderValidation.rejectKeyInMetadata(config, key: key ?? savedKey)
         if !ctx.dryRun {
             try store.save(config, apiKey: key)
             if let key {
@@ -235,6 +239,8 @@ struct ProviderDelete: NibCommand {
         let store = try providerStore(ctx), id = try providerID(p.id)
         guard store.configs.contains(where: { $0.id == id }) else { throw NibError(.notFound, "AI provider not found.", hint: "call ai.provider.list") }
         if !ctx.dryRun {
+            // Contract gap: AIProviderStore.delete must throw on persistence failure; its
+            // current nonthrowing contract cannot guarantee deletion survives relaunch.
             store.delete(id)
             guard !store.configs.contains(where: { $0.id == id }) else { throw NibError.unavailable("The provider could not be deleted. Try again.") }
             guard Keychain.get(service: AIProviderConfig.keychainService, account: id.uuidString) == nil else {
@@ -257,6 +263,7 @@ struct ProviderTest: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let store = try providerStore(ctx)
         guard let provider = store.provider(try p.id.map(providerID)) else {
+            if p.id != nil { throw NibError(.notFound, "AI provider not found.", hint: "call ai.provider.list") }
             throw NibError.unavailable("Add an AI provider before testing a connection.")
         }
         if ctx.dryRun { return Output(ok: true, models: nil) }
