@@ -171,7 +171,7 @@ final class FeatLibraryUITests: XCTestCase {
                                     ids: ["library.controls", "library.new.button", popover],
                                     anchors: ["library.new", "library.sort"]) { capturedField = $0 })
                             })
-                        _ = try await hostlessLayoutImage(LibraryRootView(model: model), size: size,
+                        _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad), size: size,
                                                           variant: variant, settlePasses: mode == .full ? 60 : 10) {
                             guard let field = capturedField else { return }
                             anchorFrames = field.worldAnchors
@@ -245,7 +245,7 @@ final class FeatLibraryUITests: XCTestCase {
             for variant in [NibSnapshot.Variant.light, .dark] {
                 let size = CGSize(width: compact ? 390 : 1024, height: compact ? 844 : 768)
                 let image = try await hostlessLayoutImage(
-                    LibraryRootView(model: model), size: size, variant: variant)
+                    LibraryRootView(model: model, idiom: compact ? .phone : .pad), size: size, variant: variant)
                 XCTAssertEqual(image.size, size)
                 let background = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 2, y: size.height / 2)))
                 XCTAssertGreaterThan(background.a, 250, "The root must render an opaque library surface")

@@ -398,12 +398,14 @@ enum LibraryPresentation {
 
 struct LibraryRootView: View {
     @ObservedObject var model: LibraryViewModel
+    // Keep the device input explicit so previews and layout checks use their intended idiom.
+    var idiom: UIUserInterfaceIdiom = UIDevice.current.userInterfaceIdiom
     @State private var targets: [String: CGRect] = [:]
     @State private var chromeFrames: [String: CGRect] = [:]
     @State private var searchText = ""
     var body: some View {
         GeometryReader { geometry in
-            let compact = LibraryPresentation.isCompact(size: geometry.size, idiom: UIDevice.current.userInterfaceIdiom)
+            let compact = LibraryPresentation.isCompact(size: geometry.size, idiom: idiom)
             let inlineSidebar = !compact && geometry.size.width >= NibMetrics.librarySidebarBreakpoint
             ZStack {
                 let context = model.chromeContext(isCompact: compact)
