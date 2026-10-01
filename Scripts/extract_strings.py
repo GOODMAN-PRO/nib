@@ -33,7 +33,9 @@ Translations (15 locales: en + TARGET_LOCALES) are produced by AI translation an
   * `--import FILE.json` merges translations ({locale: {key: value | {one, few, many, other}}}); every value must use
     the same format specifiers as its key, or it is rejected.
 `--check` validates the committed catalog (valid JSON, every translatable key translated into every locale, format
-specifiers match, plural forms complete) and exits 1 on problems; CI can run it.
+specifiers match, plural forms complete) and exits 1 on problems. `--check --sources` also re-extracts live source
+keys and fails on missing/stale or untranslated entries. Pass `--stringsdata DIR` after merges to use compiler keys.
+`--stats` lists unresolved interpolation types; heuristic fallback keys need compiler regeneration.
 
 Unmerged feature branches: `--git-refs 'origin/feat/*'` also reads, for every feature branch not yet merged into
 HEAD, that feature's own source files (docs/forge-spec.json `files`) from the branch, so their strings are translated
@@ -453,8 +455,11 @@ def type_specifier(t):
     return "%@"
 
 
+UNRESOLVED_INTERPOLATIONS = set()
+
+
 def infer_specifier(code, rel, types):
-    """The format specifier Swift emits for `\\(code)` (best effort without type checking)."""
+    """Best-effort Swift format specifier, or None when the type cannot be resolved."""
     c = code.strip()
     m = re.search(r",\s*specifier:\s*\"([^\"]+)\"\s*$", c)
     if m:
@@ -482,11 +487,11 @@ def infer_specifier(code, rel, types):
         if "." in num:
             return "%lf"
         other = infer_specifier(m.group(1) if m.group(1) is not num else m.group(3), rel, types)
-        return other if other in ("%lf", "%f", "%llu", "%d") else "%lld"
+        return other if other in ("%lf", "%f", "%llu", "%d", "%lld") else None
     m = re.match(r"(?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)\s*\((.*)\)$", c)
     if m and not re.match(r"(Int|Double|Float|CGFloat|String)\b", c):
         t = types.returns(rel, m.group(1))
-        return type_specifier(t) if t else "%@"
+        return type_specifier(t) if t else None
     if re.search(r"\.count\b|\bcount\s*$|Count\s*$|\.(firstIndex|lastIndex)\(", c):
         return "%lld"
     m = re.match(r"(?:[A-Za-z_]\w*\??\.)*([A-Za-z_]\w*)$", c.replace("self.", ""))
@@ -497,7 +502,7 @@ def infer_specifier(code, rel, types):
             return type_specifier(t)
         if re.search(r"(Count|Index|Number|Total)$", name) or name in ("n", "i", "j", "k"):
             return "%lld"
-    return "%@"
+    return None
 
 
 def normalise(key):
@@ -542,7 +547,10 @@ def build_key(tok, rel, types, oracle, interpolated_escapes=True):
     pieces = raw.split("\x02")
     out = pieces[0]
     for code, piece in zip(codes, pieces[1:]):
-        out += infer_specifier(code, rel, types) + piece
+        specifier = infer_specifier(code, rel, types)
+        if specifier is None:
+            UNRESOLVED_INTERPOLATIONS.add((rel, tok.line, code))
+        out += (specifier or "%@") + piece
     return out, probe, codes
 
 
@@ -975,6 +983,7 @@ def translate(catalog, locales, model, batch=60):
 # ---------------------------------------------------------------------------------------------------------------------
 
 def collect(args):
+    UNRESOLVED_INTERPOLATIONS.clear()
     files = working_tree_sources()
     refs = branch_sources(args.git_refs, files) if args.git_refs else []
     types = TypeIndex()
@@ -1011,6 +1020,13 @@ def module_catalogs(found, app):
         print("extract_strings: %s (%d keys)" % (os.path.relpath(path, ROOT), len(cat["strings"])))
 
 
+def report_unresolved():
+    print("extract_strings: %d unresolved interpolation type(s); regenerate with --stringsdata after merges"
+          % len(UNRESOLVED_INTERPOLATIONS))
+    for rel, line, code in sorted(UNRESOLVED_INTERPOLATIONS):
+        print("  unresolved: %s:%d: %s (temporary %%@ fallback)" % (rel, line, code))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--catalog", default=APP_CATALOG, help="the app catalog (default Nib/Resources/Localizable.xcstrings)")
@@ -1028,8 +1044,11 @@ def main(argv=None):
     ap.add_argument("--translate", action="store_true", help="translate what is missing with an AI model")
     ap.add_argument("--model", help="model name for --translate")
     ap.add_argument("--locales", help="comma-separated subset of locales for --translate / --export-missing")
+    ap.add_argument("--sources", action="store_true", help="with --check: re-extract and validate live source keys")
     ap.add_argument("--check", action="store_true", help="validate the catalog; exit 1 on problems")
     args = ap.parse_args(argv)
+    if args.sources and not args.check:
+        ap.error("--sources requires --check")
     locales = args.locales.split(",") if args.locales else TARGET_LOCALES
     for l in locales:
         if l not in TARGET_LOCALES:
@@ -1039,6 +1058,14 @@ def main(argv=None):
     rel_catalog = os.path.relpath(args.catalog, ROOT)
     if args.check:
         problems = check_catalog(catalog, locales)
+        if args.sources:
+            found, _, _ = collect(args)
+            for key in sorted({f.key for f in found}):
+                entry = catalog["strings"].get(key)
+                if entry is None or entry.get("extractionState") == "stale":
+                    problems.append("live source key %r is missing or stale" % key)
+            if args.stats:
+                report_unresolved()
         for p in problems[:200]:
             print("error: %s: %s" % (rel_catalog, p))
         live = sum(1 for e in catalog["strings"].values() if e.get("extractionState") != "stale")
@@ -1078,6 +1105,7 @@ def main(argv=None):
     print("extract_strings: %d uses, %d keys (%d new, %d newly stale) in %s"
           % (len(found), len(keys), added, stale, rel_catalog))
     if args.stats:
+        report_unresolved()
         per = {}
         for f in found:
             per.setdefault(f.module, set()).add(f.key)

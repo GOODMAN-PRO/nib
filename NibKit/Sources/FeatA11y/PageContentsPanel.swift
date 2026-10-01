@@ -205,13 +205,12 @@ final class PageContentsModel: ObservableObject {
         loadTask = Task { [weak self] in
             do {
                 var result = try await app.bus.run(A11yDescribePage.self, .init(page: ref, cursor: nil), session: session)
-                var guardCount = 0
-                while result.truncated, let next = result.cursor, guardCount < 50 {
+                while result.truncated, let next = result.cursor {
+                    guard !Task.isCancelled, self?.generation == gen else { return }
                     let more = try await app.bus.run(A11yDescribePage.self, .init(page: ref, cursor: next), session: session)
                     result.items += more.items
                     result.truncated = more.truncated
                     result.cursor = more.cursor
-                    guardCount += 1
                 }
                 guard let self, gen == self.generation, !Task.isCancelled else { return }
                 self.state = .loaded(result)
@@ -219,6 +218,10 @@ final class PageContentsModel: ObservableObject {
             } catch {
                 guard let self, gen == self.generation, !Task.isCancelled else { return }
                 let e = NibError.wrap(error)
+                if e.code == .invalidParams {
+                    self.scheduleRefresh()
+                    return
+                }
                 self.state = e.code == .locked ? .locked : .failed(e.message)
                 self.shownRef = ref
             }
@@ -431,6 +434,7 @@ struct PageEntryRow: View {
     let isSelected: Bool
     let perform: (EntryAction) -> Void
     @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric(relativeTo: .body) private var glyphWidth = NibSpacing.xxl
 
     private var available: [EntryAction] { entry.actions.filter { $0.available } }
     private var primary: EntryAction? { available.first { $0.id == "goTo" } }
@@ -457,7 +461,7 @@ struct PageEntryRow: View {
                     Image(nib: PageEntryRow.symbol(entry.kind))
                         .font(NibFont.glyph(.panel))
                         .foregroundStyle(NibColor.labelSecondary)
-                        .frame(width: 24)
+                        .frame(width: glyphWidth)
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                         Text(headline)

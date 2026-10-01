@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Accessibility lint for Nib's Swift UI code (F095, P-088; DESIGN_SYSTEM.md §4). Reports warnings; CI runs it as a
-warning step, so it never fails a build unless `--strict` is given.
+"""Accessibility lint for Nib's Swift UI code (F095, P-088; DESIGN_SYSTEM.md §4). Reports warnings and GitHub annotations.
+Exits zero unless `--strict` is given; CI integration is requested from the workflow owner.
 
 Every control VoiceOver cannot name is a warning:
   * a SwiftUI `Button` whose label is only an `Image` (no `Text`/`Label`) and that has no `.accessibilityLabel(`;
@@ -73,7 +73,8 @@ def names_in(toks):
     out = set()
     for t in toks:
         if t.kind == "id":
-            out.add(t.text)
+            if t.text != "accessibilityHidden":
+                out.add(t.text)
         elif t.kind == "str" and t.interps:
             for sub in t.interps:
                 out |= names_in(sub)
@@ -98,7 +99,23 @@ def view_calls(toks):
 def icon_only(toks):
     """True when a view is built only from images and shapes (and layout around them), with no text."""
     calls = view_calls(toks)
-    return bool(calls & ICON_VIEWS) and calls <= (ICON_VIEWS | LAYOUT_VIEWS) and not any(t.kind == "str" for t in toks)
+    # Symbol and asset names are strings, but Image's arguments are not spoken text.
+    outside_images = []
+    i = 0
+    while i < len(toks):
+        if is_id(toks[i], "Image") and i + 1 < len(toks) and is_punct(toks[i + 1], "("):
+            i = matching(toks, i + 1) + 1
+        else:
+            outside_images.append(toks[i])
+            i += 1
+    return bool(calls & ICON_VIEWS) and calls <= (ICON_VIEWS | LAYOUT_VIEWS) \
+        and not any(t.kind == "str" for t in outside_images)
+
+
+def hidden_true(toks):
+    return any(is_id(t, "accessibilityHidden") and i + 3 < len(toks)
+               and is_punct(toks[i + 1], "(") and is_id(toks[i + 2], "true")
+               and is_punct(toks[i + 3], ")") for i, t in enumerate(toks))
 
 
 def modifier_chain(toks, j):
@@ -106,7 +123,9 @@ def modifier_chain(toks, j):
     names = []
     n = len(toks)
     while j + 1 < n and is_punct(toks[j], ".") and is_id(toks[j + 1]):
-        names.append(toks[j + 1].text)
+        name = toks[j + 1].text
+        if name != "accessibilityHidden" or hidden_true(toks[j + 1:j + 5]):
+            names.append(name)
         j += 2
         while j < n and (is_punct(toks[j], "(") or is_punct(toks[j], "{")):
             j = matching(toks, j) + 1
@@ -144,7 +163,7 @@ def expression_start(toks, i):
 
 
 def closure_label(toks, i):
-    """Tokens of a Button's label (None when its title is a string or the label cannot be found)."""
+    """Tokens of a control's label (None when its title is a string or the label cannot be found)."""
     n = len(toks)
     j = i + 1
     label = None
@@ -180,7 +199,7 @@ def lint_swiftui(toks, rel, report):
             continue
         prev_dot = i > 0 and is_punct(toks[i - 1], ".")
         # Button whose label is only an image.
-        if t.text == "Button" and not prev_dot and i + 1 < n and (is_punct(toks[i + 1], "(") or is_punct(toks[i + 1], "{")):
+        if t.text in {"Button", "Menu", "Link", "ShareLink", "Toggle"} and not prev_dot and i + 1 < n and (is_punct(toks[i + 1], "(") or is_punct(toks[i + 1], "{")):
             found = closure_label(toks, i)
             if found is None:
                 continue
@@ -188,10 +207,10 @@ def lint_swiftui(toks, rel, report):
             if not label:
                 continue
             names = names_in(label)
-            if icon_only(label) and not (names & TEXTUAL) and not (names & LABEL_MODIFIERS):
+            if icon_only(label) and not (names & TEXTUAL) and not (names & LABEL_MODIFIERS) and not hidden_true(label):
                 chain, _ = modifier_chain(toks, end)
                 if not (set(chain) & LABEL_MODIFIERS):
-                    report.warn(rel, t.line, "Button with only an Image as its label needs .accessibilityLabel(…)")
+                    report.warn(rel, t.line, "%s with only an Image as its label needs .accessibilityLabel(…)" % t.text)
         # NibIconButton / NibDropletButton(symbol:) with an empty or English-only label.
         if t.text in ("NibIconButton", "NibDropletButton", "NibWidthPresetButton") and not prev_dot \
                 and i + 1 < n and is_punct(toks[i + 1], "("):
@@ -215,7 +234,7 @@ def lint_swiftui(toks, rel, report):
             # the caller's to label, and a feature's own panel type carries its text in its own file.
             container = "accessibilityElement" in chain or "accessibilityElement" in names
             if icon_only(base) and not (names & TEXTUAL) and not container and not (set(chain) & LABEL_MODIFIERS) \
-                    and not (names & LABEL_MODIFIERS):
+                    and not (names & LABEL_MODIFIERS) and not hidden_true(base):
                 report.warn(rel, t.line, ".droplet(…) around a view without text needs .accessibilityLabel(…)")
         # Tappable images.
         if t.text == "Image" and not prev_dot and i + 1 < n and is_punct(toks[i + 1], "("):
@@ -328,12 +347,45 @@ def default_files(feature=None):
     return sorted(files)
 
 
+# Regression fixtures: (Swift source, expected warnings). Run without needing the app or Swift compiler.
+PROBE_FIXTURES = [
+    ('Menu { Text("Action") } label: { Image(nib: .more) }', 1),
+    ('Link(destination: url) { Image(nib: .more) }', 1),
+    ('ShareLink(item: url) { Image(nib: .more) }', 1),
+    ('Toggle(isOn: $enabled) { Image(nib: .more) }', 1),
+    ('Button { } label: { Image(systemName: "plus") }', 1),
+    ('Button { } label: { Image("asset") }.accessibilityHidden(false)', 1),
+    ('Button { } label: { Image("asset").accessibilityHidden(false) }', 1),
+    ('Button { } label: { Image("asset") }.accessibilityHidden(true)', 0),
+    ('Button { } label: { Image("asset").accessibilityHidden(true) }', 0),
+    ('Button { } label: { Image("asset") }.accessibilityLabel("Add")', 0),
+    ('Menu("Actions") { Image(systemName: "plus") }', 0),
+    ('Button { } label: { Label("Add", systemImage: "plus") }', 0),
+]
+
+
+def self_test():
+    failures = []
+    for source, expected in PROBE_FIXTURES:
+        report = Report()
+        lint_swiftui(lex(source), "probe.swift", report)
+        if len(report.items) != expected:
+            failures.append((source, expected, report.items))
+    for failure in failures:
+        print("error: a11y_lint fixture: %r" % (failure,))
+    print("a11y_lint: %d fixtures, %d failures" % (len(PROBE_FIXTURES), len(failures)))
+    return 1 if failures else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Accessibility lint (warnings).")
     ap.add_argument("paths", nargs="*", help="Swift files or folders (default: the whole app)")
     ap.add_argument("--feature", help="only this feature's module and files")
+    ap.add_argument("--self-test", action="store_true", help="run the embedded regression fixtures")
     ap.add_argument("--strict", action="store_true", help="exit 1 when there are warnings")
     args = ap.parse_args(argv)
+    if args.self_test:
+        return self_test()
     files = []
     for p in args.paths:
         if os.path.isdir(p):

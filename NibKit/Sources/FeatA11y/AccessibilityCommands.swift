@@ -37,14 +37,41 @@ struct A11yDescribePage: NibCommand {
         let items = try ctx.workspace.items(doc, page: page)
         let pageRef = NodeRef.page(doc, page).description
 
-        let recognition = await recognise(pageRef: pageRef, record: record, items: items, doc: doc,
-                                          language: content.meta.language, ctx: ctx)
-        let links = pdfLinks(record: record, doc: doc, ctx: ctx)
         let hidden = hiddenLayers(for: doc, ctx: ctx)
         let customTitles = Dictionary(ctx.content.customItemTypes.all.map { ($0.id, $0) },
                                       uniquingKeysWith: { a, _ in a })
         let available = Set(PageDescriber.commands.filter { ctx.app?.commands.entry($0) != nil })
+        let snapshot = DescriptionCache.Snapshot(page: pageRef, content: content,
+            revisions: items.map { "\($0.id):\($0.rev)" }, hiddenLayers: hidden,
+            commands: available, customTypes: customTitles.values.map { "\($0.id):\($0.title):\($0.textPath ?? "")" }.sorted())
+        let cache: DescriptionCache
+        if let existing: DescriptionCache = ctx.services.get(DescriptionCache.serviceKey) {
+            cache = existing
+        } else {
+            cache = DescriptionCache()
+            ctx.services.set(cache, for: DescriptionCache.serviceKey)
+        }
+        if let cursor = p.cursor {
+            guard cache.snapshot == snapshot, cursor.hasPrefix(cache.version + ":"), let result = cache.result else {
+                throw NibError(.invalidParams, "page changed since the previous result", path: "$.cursor",
+                               hint: "restart with no cursor")
+            }
+            return try resultPage(result, entries: cache.entries, cursor: cursor, version: cache.version)
+        }
+        if cache.snapshot == snapshot, let result = cache.result {
+            return try resultPage(result, entries: cache.entries, cursor: nil, version: cache.version)
+        }
 
+        let recognition = await recognise(pageRef: pageRef, record: record, items: items, doc: doc,
+                                          language: content.meta.language, ctx: ctx)
+        let links = pdfLinks(record: record, doc: doc, ctx: ctx)
+        try Task.checkCancellation()
+        // Recognition can suspend while a commit lands. Never publish that obsolete snapshot.
+        guard try ctx.workspace.content(doc) == content,
+              try ctx.workspace.items(doc, page: page).map({ "\($0.id):\($0.rev)" }) == snapshot.revisions,
+              hiddenLayers(for: doc, ctx: ctx) == hidden else {
+            throw NibError(.invalidParams, "page changed during recognition", hint: "restart with no cursor")
+        }
         let input = PageDescriber.Input(doc: doc, page: page, items: items, blocks: recognition.blocks,
                                         pdfLinks: links, hiddenLayers: hidden, customTypes: customTitles,
                                         availableCommands: available)
@@ -52,12 +79,45 @@ struct A11yDescribePage: NibCommand {
         let live = content.livePages
         let index = live.firstIndex { $0.id == page }.map { $0 + 1 }
         let title = PageDescriber.title(record: record, index: index, count: live.count)
-        let paged = try PageDescriber.page(entries, cursor: p.cursor)
-        return PageDescription(
+        let result = PageDescription(
             page: pageRef, index: index, pageCount: live.count, title: title,
             summary: PageDescriber.summary(title: title, entries: entries), language: content.meta.language,
-            recognition: recognition.status.rawValue, counts: PageDescriber.counts(entries), items: paged.items,
-            total: entries.count, truncated: paged.next != nil, cursor: paged.next)
+            recognition: recognition.status.rawValue, counts: PageDescriber.counts(entries), items: [],
+            total: entries.count, truncated: false, cursor: nil)
+        cache.snapshot = snapshot
+        cache.entries = entries
+        cache.result = result
+        cache.version = UUID().uuidString
+        return try resultPage(result, entries: entries, cursor: nil, version: cache.version)
+    }
+
+    private static func resultPage(_ result: PageDescription, entries: [PageEntry], cursor: String?,
+                                   version: String) throws -> PageDescription {
+        let paged = try PageDescriber.page(entries, cursor: cursor, version: version)
+        var output = result
+        output.items = paged.items
+        output.truncated = paged.next != nil
+        output.cursor = paged.next
+        return output
+    }
+
+    /// App-scoped, bounded to the most recently described page. Snapshot checks include the head, item revisions
+    /// and window visibility, so edits, undo, remote merges and a different window cannot reuse stale entries.
+    @MainActor
+    private final class DescriptionCache {
+        static let serviceKey = "a11y.descriptionCache"
+        struct Snapshot: Equatable {
+            var page: String
+            var content: DocumentContent
+            var revisions: [String]
+            var hiddenLayers: Set<Int>
+            var commands: Set<String>
+            var customTypes: [String]
+        }
+        var snapshot: Snapshot?
+        var version = ""
+        var entries: [PageEntry] = []
+        var result: PageDescription?
     }
 
     // MARK: Recognition
@@ -75,6 +135,7 @@ struct A11yDescribePage: NibCommand {
             var blocks: [TextRecognition] = []
             var cursor: String?
             for _ in 0..<PageDescriber.maxRecognitionPages {
+                if Task.isCancelled { return Recognition(blocks: [], status: .unavailable) }
                 var params: [String: JSONValue] = ["page": .string(pageRef)]
                 if let c = cursor { params["cursor"] = .string(c) }
                 let value = try await ctx.execute(CommandIDs.recognizePageText, .object(params))
@@ -164,7 +225,7 @@ struct PageDescription: Codable, Equatable {
     var summary: String
     var language: String
     var recognition: String
-    /// Entries per kind (all entries, not only this page of the result).
+    /// Entries per kind on visible layers (not only this page of the result).
     var counts: [String: Int]
     var items: [PageEntry]
     var total: Int
@@ -185,6 +246,8 @@ struct PageEntry: Codable, Equatable, Identifiable {
     var text: String?
     /// The items this entry stands for (empty for PDF text and links).
     var refs: [String]
+    /// Total group size, including refs omitted to keep tool results bounded.
+    var refCount: Int = 0
     var bbox: Rect
     var layer: Int?
     /// On a layer the invoking window hides.
@@ -255,7 +318,7 @@ enum EntryKind: String, Codable, CaseIterable {
 
 /// Turns a page's items and recognised text into entries. Pure, so it is unit-tested without a recogniser.
 enum PageDescriber {
-    static let maxEntries = 400
+    static let maxRefs = 64
     static let maxTextLength = 600
     static let maxRecognitionPages = 20
     /// Strokes closer than this (page points) form one drawing or highlight.
@@ -264,7 +327,7 @@ enum PageDescriber {
     static let resultBudget = 18_000
 
     /// Commands entries may offer (the panel shows an action only when its command is installed).
-    static let commands = [CommandIDs.selectionSet, CommandIDs.viewReveal, CommandIDs.viewGoToPage, CommandIDs.linkFollow,
+    static let commands = [CommandIDs.selectionSet, CommandIDs.selectionFromRect, CommandIDs.viewReveal, CommandIDs.viewGoToPage, CommandIDs.linkFollow,
                            CommandIDs.tapeSetRevealed, CommandIDs.commentTapAt]
 
     struct Input {
@@ -333,8 +396,14 @@ enum PageDescriber {
         let highlights = input.items.filter { $0.stroke?.style.tool == .highlighter }
         for group in clusters(highlights) {
             let area = bounds(group)
-            let written = entries.filter { $0.kind == .handwriting && overlaps($0.bbox, area) }.compactMap { $0.text }
-            let typed = input.items.filter { $0.kind == .text && overlaps($0.bounds, area) }
+            let written = entries.filter { e in
+                e.kind == .handwriting && overlaps(e.bbox, area)
+                    && !hiddenTape.contains { $0.bounds.insetBy(-2).contains(e.bbox.center) }
+            }.compactMap { $0.text }
+            let typed = input.items.filter { item in
+                item.kind == .text && overlaps(item.bounds, area)
+                    && !hiddenTape.contains { $0.bounds.insetBy(-2).contains(item.bounds.center) }
+            }
                 .compactMap { $0.text?.text.plainText }
             let text = clean((written + typed).joined(separator: " "))
             entries.append(entry(kind: .highlight, text: text.isEmpty ? nil : text, refs: group.map { ref($0.id) },
@@ -412,7 +481,7 @@ enum PageDescriber {
 
         // Hidden tape withholds what it covers.
         if !hiddenTape.isEmpty {
-            for i in entries.indices where entries[i].kind != .tape && entries[i].kind != .highlight {
+            for i in entries.indices where entries[i].kind != .tape {
                 let tapes = hiddenTape.filter { $0.bounds.insetBy(-2).contains(entries[i].bbox.center) }
                 guard !tapes.isEmpty else { continue }
                 entries[i].coveredByTape = true
@@ -422,25 +491,46 @@ enum PageDescriber {
                 entries[i].actions.removeAll { $0.id == "openLink" }
             }
         }
-        return Array(ReadingOrder.sorted(entries).prefix(maxEntries))
+        var usedIDs = Set<String>()
+        for i in entries.indices {
+            let base = entries[i].id
+            var suffix = 1
+            while !usedIDs.insert(entries[i].id).inserted {
+                entries[i].id = base + "#\(suffix)"
+                suffix += 1
+            }
+        }
+        return ReadingOrder.sorted(entries)
     }
 
     static func entry(kind: EntryKind, text: String?, refs: [String], bbox: Rect, layer: Int?, input: Input,
                       pageRef: String, title: String? = nil) -> PageEntry {
         let name = title ?? kind.title
+        // Long caller-supplied node IDs also need a byte bound, not just a reference count.
+        var refsBytes = 0
+        let boundedRefs = Array(refs.prefix(maxRefs).prefix { ref in
+            refsBytes += ref.utf8.count + 3
+            return refsBytes <= 4_000
+        })
         var actions: [EntryAction] = []
         if let first = refs.first {
             actions.append(action("goTo", String(localized: "Show on Page"), CommandIDs.viewReveal,
                                   ["ref": .string(first)], input))
-            actions.append(action("select", String(localized: "Select"), CommandIDs.selectionSet,
-                                  ["refs": .array(refs.map { .string($0) })], input))
+            if refs.count > boundedRefs.count {
+                actions.append(action("select", String(localized: "Select"), CommandIDs.selectionFromRect,
+                                      ["page": .string(pageRef), "rect": (try? JSONValue.from(bbox)) ?? .null], input))
+            } else {
+                actions.append(action("select", String(localized: "Select"), CommandIDs.selectionSet,
+                                      ["refs": .array(refs.map { .string($0) })], input))
+            }
         } else {
             actions.append(action("goTo", String(localized: "Show on Page"), CommandIDs.viewGoToPage,
                                   ["page": .string(pageRef)], input))
         }
         let hidden = layer.map { input.hiddenLayers.contains($0) } ?? false
         return PageEntry(id: refs.first ?? pageRef, kind: kind, title: name, label: label(kind: kind, title: name, text: text),
-                         text: text, refs: refs, bbox: bbox, layer: layer, hidden: hidden ? true : nil,
+                         text: text, refs: boundedRefs, refCount: refs.count, bbox: bbox, layer: layer,
+                         hidden: hidden ? true : nil,
                          coveredByTape: nil, revealed: nil, actions: actions)
     }
 
@@ -606,23 +696,24 @@ enum PageDescriber {
 
     static func counts(_ entries: [PageEntry]) -> [String: Int] {
         var out: [String: Int] = [:]
-        for e in entries { out[e.kind.rawValue, default: 0] += 1 }
+        for e in entries where e.hidden != true { out[e.kind.rawValue, default: 0] += 1 }
         return out
     }
 
     /// "Page 3 of 12" and, on the next line, what the page holds in reading-list order of kinds.
     static func summary(title: String, entries: [PageEntry]) -> String {
-        guard !entries.isEmpty else { return title + "\n" + String(localized: "Nothing on this page yet.") }
         let counts = counts(entries)
+        guard !counts.isEmpty else { return title + "\n" + String(localized: "Nothing on this page yet.") }
         let parts = EntryKind.allCases.compactMap { kind in counts[kind.rawValue].map { kind.count($0) } }
         let list = ListFormatter.localizedString(byJoining: parts)
         return title + "\n" + String(localized: "This page has \(list).")
     }
 
-    static func page(_ entries: [PageEntry], cursor: String?) throws -> (items: [PageEntry], next: String?) {
+    static func page(_ entries: [PageEntry], cursor: String?, version: String = "test") throws -> (items: [PageEntry], next: String?) {
         var start = 0
         if let c = cursor, !c.isEmpty {
-            guard let n = Int(c), n >= 0, n <= entries.count else {
+            let parts = c.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2, parts[0] == version, let n = Int(parts[1]), n >= 0, n <= entries.count else {
                 throw NibError(.invalidParams, "invalid cursor '\(c)'", path: "$.cursor",
                                hint: "pass the cursor of the previous result unchanged")
             }
@@ -636,13 +727,12 @@ enum PageDescriber {
             used += size
             end += 1
         }
-        return (Array(entries[start..<end]), end < entries.count ? String(end) : nil)
+        return (Array(entries[start..<end]), end < entries.count ? "\(version):\(end)" : nil)
     }
 
-    /// Approximate JSON size of an entry (text, label, refs and actions dominate).
+    /// Count encoded bytes, including escaping and field names, with room for the result envelope.
     static func entrySize(_ e: PageEntry) -> Int {
-        (e.text?.utf8.count ?? 0) + e.label.utf8.count + e.refs.reduce(0) { $0 + $1.utf8.count + 3 }
-            + e.actions.reduce(0) { $0 + $1.title.utf8.count + $1.params.jsonString().utf8.count + 80 } + 160
+        ((try? JSONEncoder().encode(e).count) ?? resultBudget) + 1
     }
 }
 

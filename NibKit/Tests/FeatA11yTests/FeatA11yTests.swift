@@ -148,8 +148,15 @@ final class FeatA11yTests: XCTestCase {
     func testTapeOffersRevealAndHidesWhatItCovers() async throws {
         let h = harness(recognizer: handwritingRecognizer())
         // A text box whose centre (150, 600) lies under the fixture tape (80…260 at y 600, 18 pt wide).
-        try await h.insert([Item.makeText(TextBoxItem(frame: Frame(x: 100, y: 590, w: 100, h: 20),
-                                                      text: RichText(plain: "The answer is 42")))])
+        var answer = Item.makeText(TextBoxItem(frame: Frame(x: 100, y: 590, w: 100, h: 20),
+                                               text: RichText(plain: "The answer is 42")))
+        answer.id = "A11YANSWER01"
+        var highlight = Item.makeStroke(Stroke(style: .defaultHighlighter, points: [
+            StrokePoint(x: 100, y: 600, width: 20, height: 20),
+            StrokePoint(x: 200, y: 600, width: 20, height: 20),
+        ]))
+        highlight.id = "A11YHILITE01"
+        try await h.insert([answer, highlight])
         let d = try await describe(h)
         let tape = try XCTUnwrap(d.items.first { $0.kind == .tape })
         XCTAssertEqual(tape.revealed, false)
@@ -159,12 +166,13 @@ final class FeatA11yTests: XCTestCase {
         XCTAssertEqual(reveal.params["refs"], [.string(ref(Fixtures.tapeID))])
         XCTAssertEqual(reveal.params["revealed"], true)
 
-        let covered = try XCTUnwrap(d.items.first { $0.coveredByTape == true })
+        let covered = try XCTUnwrap(d.items.first { $0.kind == .text && $0.coveredByTape == true })
         XCTAssertEqual(covered.kind, .text)
         XCTAssertNil(covered.text, "hidden tape keeps its answer hidden from VoiceOver too")
         XCTAssertFalse(covered.label.contains("42"))
         XCTAssertEqual(covered.actions.first?.id, "revealTape")
-        XCTAssertFalse(String(describing: try JSONValue.from(d)).contains("The answer is 42"))
+        XCTAssertEqual(d.items.first { $0.kind == .highlight }?.coveredByTape, true)
+        XCTAssertFalse(try JSONValue.from(d).jsonString().contains("42"))
     }
 
     func testRevealedTapeOffersHideAndCoversNothing() async throws {
@@ -252,9 +260,155 @@ final class FeatA11yTests: XCTestCase {
         h.session.hiddenLayers = [0]
         let d = try await describe(h)
         XCTAssertTrue(d.items.allSatisfy { $0.hidden == true })
+        XCTAssertTrue(d.counts.isEmpty)
+        XCTAssertFalse(d.summary.contains("This page has"))
         h.session.hiddenLayers = []
         let shown = try await describe(h)
         XCTAssertTrue(shown.items.allSatisfy { $0.hidden == nil })
+    }
+
+    func testLargeClusterUsesRectangleSelectionWithinToolBudget() async throws {
+        let h = harness()
+        let strokes = (0..<500).map { i in
+            Item.makeStroke(Stroke(style: .defaultPen, points: [
+                StrokePoint(x: Float(i), y: 1000), StrokePoint(x: Float(i + 2), y: 1002),
+            ]))
+        }
+        try await h.insert(strokes)
+        var cursor: String?
+        var entries: [PageEntry] = []
+        repeat {
+            var params: [String: JSONValue] = ["page": .string(page1Ref)]
+            if let cursor { params["cursor"] = .string(cursor) }
+            let value = try await h.run(CommandIDs.a11yDescribePage, .object(params), as: .ai("budget"))
+            XCTAssertLessThan(value.jsonString().utf8.count, NibLimits.aiToolResultBytes)
+            let result = try value.decode(PageDescription.self)
+            entries += result.items
+            cursor = result.cursor
+        } while cursor != nil
+        let cluster = try XCTUnwrap(entries.first { $0.refCount == 500 })
+        XCTAssertEqual(cluster.refs.count, PageDescriber.maxRefs)
+        let select = try XCTUnwrap(cluster.actions.first { $0.id == "select" })
+        XCTAssertEqual(select.command, CommandIDs.selectionFromRect)
+        XCTAssertEqual(select.params["page"]?.stringValue, page1Ref)
+        XCTAssertEqual(try select.params["rect"]?.decode(Rect.self), cluster.bbox)
+        XCTAssertNil(select.params["refs"])
+        XCTAssertEqual(cluster.actions.first { $0.id == "goTo" }?.params["ref"]?.stringValue, cluster.refs.first)
+    }
+
+    func testCursorReusesRecognitionRejectsEditsAndRetainsMoreThan400Entries() async throws {
+        let recognizer = handwritingRecognizer()
+        let h = harness(recognizer: recognizer)
+        try await h.insert((0..<450).map { i in
+            Item.makeText(TextBoxItem(frame: Frame(x: 72, y: Double(i) * 30 + 1100, w: 200, h: 20),
+                                      text: RichText(plain: "Line \(i)")))
+        })
+        let first = try await describe(h)
+        let oldCursor = try XCTUnwrap(first.cursor)
+        XCTAssertTrue(oldCursor.contains(":"))
+        var all = first.items
+        var cursor = first.cursor
+        while let next = cursor {
+            let more = try await describe(h, ["page": .string(page1Ref), "cursor": .string(next)])
+            XCTAssertLessThan(try JSONEncoder().encode(more).count, NibLimits.aiToolResultBytes)
+            all += more.items
+            cursor = more.cursor
+        }
+        XCTAssertEqual(all.count, 460)
+        XCTAssertEqual(first.total, 460)
+        XCTAssertEqual(Set(all.map { $0.id }).count, all.count)
+        XCTAssertEqual(recognizer.strokeCalls, 1, "one recognition for all cursor pages")
+        _ = try await describe(h)
+        XCTAssertEqual(recognizer.strokeCalls, 1, "a reload of the same version reuses recognition")
+        try await h.insert([Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 50, h: 20),
+                                                     text: RichText(plain: "Changed")))])
+        await assertError(.invalidParams) {
+            _ = try await self.describe(h, ["page": .string(self.page1Ref), "cursor": .string(oldCursor)])
+        }
+        let refreshed = try await describe(h)
+        XCTAssertEqual(refreshed.total, 461)
+        XCTAssertEqual(recognizer.strokeCalls, 2)
+        await assertError(.invalidParams) {
+            _ = try await self.describe(h, ["page": .string(self.page1Ref), "cursor": .string(oldCursor)])
+        }
+    }
+
+    func testIndexCursorPagesJoinImageOCRAndHaveUniqueInkIDs() async throws {
+        let recognizer = handwritingRecognizer()
+        let h = harness(recognizer: recognizer)
+        var image = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        image.image?.altText = nil
+        try await h.insert([image])
+        var cursors: [String?] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizePageText, title: "Page Text",
+                                                  summary: "Scripted index", params: .obj([
+                                                    "page": .ref, "cursor": .str()], required: ["page"]), effect: .read)) { p, _ in
+            let cursor = p["cursor"]?.stringValue
+            cursors.append(cursor)
+            let blocks: [TextRecognition]
+            if cursor == nil {
+                blocks = [TextRecognition(text: "First ink line", bbox: .zero,
+                                          itemIDs: [Fixtures.strokeID], source: "ink"),
+                          TextRecognition(text: "First OCR line", bbox: .zero,
+                                          itemIDs: [Fixtures.imageID], source: "image")]
+            } else {
+                XCTAssertEqual(cursor, "second")
+                blocks = [TextRecognition(text: "Second ink line", bbox: .zero,
+                                          itemIDs: [Fixtures.strokeID], source: "ink"),
+                          TextRecognition(text: "Unassigned ink A", bbox: .zero, source: "ink"),
+                          TextRecognition(text: "Unassigned ink B", bbox: .zero, source: "ink"),
+                          TextRecognition(text: "Second OCR line", bbox: .zero,
+                                          itemIDs: [Fixtures.imageID], source: "image")]
+            }
+            return ["blocks": try JSONValue.from(blocks), "truncated": .bool(cursor == nil),
+                    "cursor": cursor == nil ? "second" : .null]
+        }
+        let d = try await describe(h)
+        XCTAssertEqual(cursors.count, 2)
+        XCTAssertNil(cursors[0])
+        XCTAssertEqual(cursors[1], "second")
+        XCTAssertEqual(recognizer.strokeCalls, 0)
+        XCTAssertEqual(d.items.first { $0.kind == .image }?.text, "First OCR line Second OCR line")
+        XCTAssertEqual(d.items.filter { $0.kind == .handwriting }.count, 4)
+        XCTAssertEqual(Set(d.items.map { $0.id }).count, d.items.count)
+    }
+
+    func testIndexErrorsFallBackToRecognizer() async throws {
+        for code: NibError.Code in [.unavailable, .internalError] {
+            let recognizer = handwritingRecognizer()
+            let h = harness(recognizer: recognizer)
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizePageText, title: "Page Text",
+                                                      summary: "Failing index", effect: .read)) { _, _ in
+                throw NibError(code, "index unavailable")
+            }
+            let d = try await describe(h)
+            XCTAssertEqual(recognizer.strokeCalls, 1)
+            XCTAssertEqual(d.items.first { $0.kind == .handwriting }?.text, "Kinematics SUVAT")
+        }
+    }
+
+    func testPDFBackgroundTextAndLinksUseBackgroundTransform() async throws {
+        let h = harness()
+        var content = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        let i = try XCTUnwrap(content.pages.firstIndex { $0.id == Fixtures.pdfPage })
+        content.pages[i].rotation = 90
+        content.pages[i].size = PageSize(400, 600)
+        h.persistence.heads[Fixtures.docID] = content
+        let pdf = FakePDFService()
+        pdf.texts[Fixtures.pdfAsset.name] = "PDF background text"
+        let rect = Rect(x: 80, y: 150, width: 100, height: 30)
+        pdf.linkMap[Fixtures.pdfAsset.name] = [PDFLinkInfo(rect: rect, url: "https://example.com/pdf")]
+        h.app.services.pdf = pdf
+        let d = try await describe(h, ["page": .string(NodeRef.page(Fixtures.docID, Fixtures.pdfPage).description)])
+        let transform = content.pages[i].backgroundTransform(sourceSize: .a4)
+        let text = try XCTUnwrap(d.items.first { $0.kind == .pdf })
+        XCTAssertEqual(text.text, "PDF background text")
+        XCTAssertEqual(text.bbox, PageDescriber.apply(transform, to: Rect(x: 72, y: 72, width: 400, height: 20)))
+        let link = try XCTUnwrap(d.items.first { $0.kind == .link })
+        XCTAssertEqual(link.bbox, PageDescriber.apply(transform, to: rect))
+        XCTAssertNotEqual(link.bbox, rect)
+        XCTAssertEqual(link.actions.first?.command, CommandIDs.linkFollow)
+        XCTAssertEqual(link.actions.first?.params["url"]?.stringValue, "https://example.com/pdf")
     }
 
     // MARK: Pure logic
@@ -308,7 +462,8 @@ final class FeatA11yTests: XCTestCase {
         XCTAssertGreaterThan(pages, 1)
         XCTAssertEqual(seen, entries.map { $0.id })
         XCTAssertThrowsError(try PageDescriber.page(entries, cursor: "banana"))
-        XCTAssertThrowsError(try PageDescriber.page(entries, cursor: "999"))
+        XCTAssertThrowsError(try PageDescriber.page(entries, cursor: "test:999"))
+        XCTAssertThrowsError(try PageDescriber.page(entries, cursor: "old:1", version: "new"))
     }
 
     func testTextIsCleanedAndClipped() {
@@ -358,6 +513,32 @@ final class FeatA11yTests: XCTestCase {
 
         h.session.document = nil
         XCTAssertEqual(model.state, .noPage)
+    }
+
+    func testSupersededPanelLoadStopsRecognitionCursorLoop() async throws {
+        let h = harness()
+        var firstPageCalls = 0
+        var enteredRecognition = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizePageText, title: "Page Text",
+                                                  summary: "Delayed index", effect: .read)) { p, _ in
+            guard p["page"]?.stringValue == self.page1Ref else {
+                return ["blocks": [], "truncated": false]
+            }
+            firstPageCalls += 1
+            enteredRecognition = true
+            // Deliberately ignore cancellation, like an already-running system recognizer.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            return ["blocks": [], "truncated": true, "cursor": "next"]
+        }
+        let model = PageContentsModel(app: h.app, session: h.session)
+        for _ in 0..<200 where !enteredRecognition { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(enteredRecognition)
+        h.session.page = Fixtures.page2
+        let page2Ref = NodeRef.page(Fixtures.docID, Fixtures.page2).description
+        let result = try await waitForLoad(model, page: page2Ref)
+        XCTAssertTrue(result.items.isEmpty)
+        XCTAssertEqual(firstPageCalls, 1, "a cancelled load must not ask for the next recognition page")
+        XCTAssertEqual(model.shownRef, page2Ref)
     }
 
     func testPanelShowsLockedDocuments() async throws {
