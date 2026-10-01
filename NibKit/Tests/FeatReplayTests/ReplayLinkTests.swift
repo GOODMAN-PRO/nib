@@ -1,1 +1,150 @@
-// Scaffold placeholder, owned by F053 (Note replay). Replace this file.
+import XCTest
+import NibContracts
+import NibTesting
+@testable import FeatReplay
+
+final class ReplayLinkTests: XCTestCase {
+    func testInclusiveClipBoundariesAndSeparateClips() {
+        let first = AudioClip(id: "REPLAYCLIP01", name: "First", file: "audio/first.caf", start: 100, duration: 20)
+        let second = AudioClip(id: "REPLAYCLIP02", name: "Second", file: "audio/second.caf", start: 200, duration: 30)
+        XCTAssertTrue(ReplayLink.contains(100, clip: first))
+        XCTAssertTrue(ReplayLink.contains(120, clip: first))
+        XCTAssertFalse(ReplayLink.contains(99.99, clip: first))
+        XCTAssertFalse(ReplayLink.contains(120.01, clip: first))
+        XCTAssertEqual(ReplayLink.clip(for: 205, in: [first, second], preferred: nil, doc: Fixtures.docID)?.id, second.id)
+        XCTAssertNil(ReplayLink.clip(for: 150, in: [first, second], preferred: nil, doc: Fixtures.docID))
+        XCTAssertEqual(ReplayLink.seekTime(100, clip: first), 0)
+        XCTAssertEqual(ReplayLink.seekTime(110, clip: first), 9)
+    }
+
+    func testInvalidAndDeletedClipsCannotLink() {
+        var clip = AudioClip(name: "Clip", file: "audio/clip.caf", start: 100, duration: 20)
+        XCTAssertFalse(ReplayLink.contains(.nan, clip: clip))
+        XCTAssertFalse(ReplayLink.contains(.infinity, clip: clip))
+        clip.deleted = true
+        XCTAssertFalse(ReplayLink.contains(110, clip: clip))
+        clip.deleted = false; clip.duration = -1
+        XCTAssertFalse(ReplayLink.contains(100, clip: clip))
+    }
+
+    func testOverlapsPreferLoadedClipOnlyInSameDocument() {
+        let first = AudioClip(id: "REPLAYCLIP01", name: "First", file: "first.caf", start: 100, duration: 20)
+        let second = AudioClip(id: "REPLAYCLIP02", name: "Second", file: "second.caf", start: 105, duration: 20)
+        let ref = NodeRef.audio(Fixtures.docID, second.id).description
+        XCTAssertEqual(ReplayLink.clip(for: 110, in: [second, first], preferred: ref, doc: Fixtures.docID)?.id, second.id)
+        XCTAssertEqual(ReplayLink.clip(for: 110, in: [second, first], preferred: ref, doc: Fixtures.whiteboardID)?.id, first.id)
+    }
+}
+
+@MainActor
+final class ReplayPageLinkTests: XCTestCase {
+    func testRecordingLinksAcrossPagesAndCopyWithNewT0DoesNotLink() async throws {
+        let h = Harness(features: [FeatReplayFeature.self])
+        var original = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        let clip = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).liveAudio.first)
+        original.id = "REPLAYCOPY01"
+        original.stroke?.t0 = clip.start + 250
+        var copy = original
+        copy.id = "REPLAYCOPY02"
+        copy.stroke?.t0 = clip.start + clip.duration + 5
+        try await h.insert([original, copy], page: Fixtures.page2)
+        let query: ReplayReader.Query = { _, _ in XCTFail("Fallback must not invoke an absent query feature"); return .null }
+        let links = try await ReplayReader.inks(Fixtures.docID, app: h.app, query: query)
+            .filter { ReplayLink.contains($0.t0, clip: clip) }
+        XCTAssertTrue(links.contains { $0.page == Fixtures.page1 && $0.ref.hasSuffix(Fixtures.strokeID.raw) })
+        XCTAssertTrue(links.contains { $0.page == Fixtures.page2 && $0.ref.hasSuffix(original.id.raw) })
+        XCTAssertFalse(links.contains { $0.ref.hasSuffix(copy.id.raw) })
+        XCTAssertFalse(links.contains { NodeRef($0.ref)?.documentID == Fixtures.whiteboardID })
+    }
+
+    func testQueryReaderUsesRawT0AndWalksEveryCursor() async throws {
+        let h = Harness(features: [FeatReplayFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Get", summary: "Test query", effect: .read)) { _, _ in .null }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryFind, title: "Find", summary: "Test query", effect: .read)) { _, _ in .null }
+        var calls: [(String, String?)] = []
+        let query: ReplayReader.Query = { command, params in
+            XCTAssertEqual(command, CommandIDs.queryGet, "Do not resolve every query.find summary with query.get")
+            let ref = params["ref"]?.stringValue ?? ""
+            calls.append((ref, params["cursor"]?.stringValue))
+            if ref == "doc:FIXTUREDOC01" {
+                return ["pages": [["ref": "page:FIXTUREDOC01/FIXTUREPG001"], ["ref": "page:FIXTUREDOC01/FIXTUREPG002"]]]
+            }
+            XCTAssertEqual(params["depth"], 2)
+            XCTAssertEqual(params["fields"], ["kind", "stroke", "bbox", "deleted"])
+            XCTAssertNil(params["points"])
+            // Real F003 summary shape has tool/bbox but no t0. Page depth 2 expands stroke (without points).
+            if ref == "page:FIXTUREDOC01/FIXTUREPG001", params["cursor"] == nil {
+                return ["items": [["ref": "item:FIXTUREDOC01/FIXTUREPG001/REPLAYINK001", "kind": "stroke",
+                                   "tool": "pen", "bbox": [1, 2, 3, 4], "stroke": ["t0": 100, "style": ["tool": "pen"]]]], "cursor": "next"]
+            }
+            if ref == "page:FIXTUREDOC01/FIXTUREPG001" { return ["items": []] }
+            return ["items": [["ref": "item:FIXTUREDOC01/FIXTUREPG002/REPLAYINK002", "kind": "stroke",
+                               "bbox": [5, 6, 7, 8], "stroke": ["t0": 120, "style": ["tool": "tape"]]]]]
+        }
+        let inks = try await ReplayReader.inks(Fixtures.docID, app: h.app, query: query)
+        XCTAssertEqual(calls.count, 4)
+        XCTAssertEqual(calls[2].1, "next")
+        XCTAssertEqual(inks.map(\.t0), [100, 120])
+        XCTAssertEqual(inks.map(\.page), [Fixtures.page1, Fixtures.page2])
+        XCTAssertEqual(inks.map(\.isTape), [false, true])
+    }
+
+    func testTapQueryUsesPageAndFindSummariesWithoutT0() async throws {
+        let h = Harness(features: [FeatReplayFeature.self])
+        for command in [CommandIDs.queryGet, CommandIDs.queryFind] {
+            h.app.commands.register(CommandDescriptor(id: command, title: "Query", summary: "Test query", effect: .read)) { _, _ in .null }
+        }
+        var calls: [String] = []
+        let query: ReplayReader.Query = { command, params in
+            calls.append(command)
+            if command == CommandIDs.queryFind {
+                XCTAssertEqual(params["in"], "page:FIXTUREDOC01/FIXTUREPG001")
+                XCTAssertEqual(params["kinds"], ["stroke"])
+                XCTAssertEqual(params["bbox"], [79.5, 121.5, 1, 1])
+                return ["items": [["ref": "item:FIXTUREDOC01/FIXTUREPG001/REPLAYINK001", "kind": "stroke",
+                                   "tool": "pen", "bbox": [70, 110, 30, 30], "pointCount": 10, "layer": 0]]]
+            }
+            return ["kind": "stroke", "bbox": [70, 110, 30, 30], "stroke": ["t0": 100]]
+        }
+        let ink = try await ReplayReader.hit(Fixtures.docID, page: Fixtures.page1, point: Point(80, 122), app: h.app, query: query)
+        XCTAssertEqual(ink?.t0, 100)
+        XCTAssertEqual(calls, [CommandIDs.queryFind, CommandIDs.queryGet])
+    }
+
+    func testWorkspaceFallbackRejectsLockedDocumentReads() async throws {
+        let h = Harness(features: [FeatReplayFeature.self])
+        h.app.services.lock = FakeLockService(locked: [Fixtures.docID])
+        let query: ReplayReader.Query = { _, _ in XCTFail("No query feature installed"); return .null }
+        let reads: [() async throws -> Void] = [
+            { _ = try await ReplayReader.clip("audio:FIXTUREDOC01/FIXTUREAUD01", app: h.app, query: query) },
+            { _ = try await ReplayReader.clips(Fixtures.docID, app: h.app, query: query) },
+            { _ = try await ReplayReader.kind(Fixtures.docID, app: h.app, query: query) },
+            { _ = try await ReplayReader.ink("item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", app: h.app, query: query) },
+            { _ = try await ReplayReader.inks(Fixtures.docID, app: h.app, query: query) }
+        ]
+        for read in reads {
+            do { try await read(); XCTFail("Locked replay data must not be readable") }
+            catch let error as NibError { XCTAssertEqual(error.code, .locked) }
+        }
+    }
+
+    func testAudioQueryWalksDocumentChildrenBeforeExactClipRecords() async throws {
+        let h = Harness(features: [FeatReplayFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Get", summary: "Test query", effect: .read)) { _, _ in .null }
+        let clip = AudioClip(id: Fixtures.audioID, name: "Clip", file: "audio/clip.caf", start: 100.123456, duration: 20)
+        var calls = 0
+        let query: ReplayReader.Query = { _, params in
+            calls += 1
+            XCTAssertEqual(params["depth"], 2)
+            XCTAssertNil(params["fields"])
+            if calls == 1 { return ["pages": [], "cursor": "outline"] }
+            if calls == 2 { return ["outline": [], "cursor": "audio"] }
+            return ["audio": .array([try JSONValue.from(clip)])]
+        }
+        let clips = try await ReplayReader.clips(Fixtures.docID, app: h.app, query: query)
+        XCTAssertEqual(calls, 3)
+        XCTAssertEqual(clips.map(\.id), [Fixtures.audioID])
+        XCTAssertEqual(clips.first?.start, 100.123456)
+    }
+
+}
