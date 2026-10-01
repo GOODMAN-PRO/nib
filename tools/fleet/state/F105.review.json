@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatInkSynth/Restyler.swift:80-89 (Restyler.neaten)",
+      "problem": "Neaten changes pen weight per word. Stroke.transformed(by:) multiplies every point's width/height and style.width by sqrt(det) = scale, and scale is clamped to 0.75...1.33. After neatening, words written with the same pen end up with nib widths up to 1.78x apart, and each word's InkStyle.width is rewritten. The test only checks colour, t and point count, so it misses this.",
+      "fix": "After `stroke.transformed(by: transform).transformed(by: toPage)`, put the nib back: for every point divide width and height by `scale` and set `style.width` to the original stroke's style.width. A shear does not change det, so k == scale. In testNeatenReducesBaselineSizeAndSlantVarianceKeepsInkAndUndoRedo, assert that style.width and points.map{$0.width} equal the originals."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatInkSynth/Restyler.swift:78-84 (Restyler.neaten)",
+      "problem": "Each word is scaled about its own left edge and sheared about its baseline, and nothing is re-spaced afterwards. A word scaled up (up to 4/3) grows right by (scale-1)*width. That is often more than the gap between words: InkLayout splits words at gaps > 0.6 x-height. So neighbouring words overlap or touch, and the next handwriting.words call merges them into one word. The synthetic test words sit 60 pt apart, so this is never exercised.",
+      "fix": "In line-local coordinates, sort `measured` by box.minX and keep a running x offset. For each word, compute its transformed local bbox (scale plus shear). Then translate it by max(0, prevNewMaxX + originalGap - newMinX), where originalGap = word.box.minX - previous.box.maxX, and carry that shift forward. Fold the shift into `transform.tx` before applying toPage. Add a test with three adjacent words 4-6 pt apart and heights 18/22/26. Assert that the neatened word bboxes do not intersect and that left-to-right order is kept."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Restyler.swift:59-73; Restyler.Line (lines 11-14)",
+      "problem": "When handwriting.words has no recognised text for a word (no recognizer, unsupported language, nothing recognised), the code sets baseline = box.maxY and size = full bbox height. Words with descenders (g, p, y) are then lifted onto the median and x-height-only words are scaled up to 4/3, so neaten makes those lines worse. The per-line `baseline` points and `xHeight` that handwriting.words returns are never decoded. Every test word has text == nil, but the strokes are straight lines with no descenders, so this is not caught.",
+      "fix": "Decode `baseline: [Point]` and `xHeight` in Restyler.Line. For a word without text, take its baseline from the lower envelope rather than bbox.maxY: the median of stroke bottoms that lie within ~0.3 xHeight of the line's fitted baseline at that x. Use scale 1 (baseline and lean correction only) instead of normalising the bbox height. Add a test with a text-less descender word."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Restyler.swift:117-128; NibKit/Sources/FeatInkSynth/RestyleCommands.swift:125-132",
+      "problem": "Font restyle throws away more of the originals than position and colour. It uses the first stroke's style for the whole word, so a mixed-colour word is recoloured. It writes new items with Item.makeStroke, which drops `attachedTo`, `ext` and the z position: the restyled words jump to the top of the page, and ink attached to an image or sticky stops following it. Comments and connectors attached to the deleted strokes are left pointing at tombstones, because DocTransaction.validate only checks mutated items.",
+      "fix": "When every original in a replacement shares `attachedTo`, copy it onto the new items. Give the new items z keys from FractionalIndex.balanced(count:after:before:), placed between the original min z and the next item above it. Split a replacement into colour runs, or refuse a mixed-colour group with .unsupported. Before deleting, refuse with .conflict and a 'use Neaten Handwriting' hint when any live item on the page has attachedTo, or a connector end, that names a replaced stroke."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Restyler.swift:165-178 (fit)",
+      "problem": "fit scales x and y independently, so a synthesised word is stretched or squashed to the handwritten word's aspect ratio. The letterforms distort, and the nib width becomes sqrt(sx*sy) times the pen width. The acceptance criterion only asks that the output stays within the bbox ±20%; it does not ask for an exact fill.",
+      "fix": "Cap the anisotropy. Use sy for height and clamp sx to sy*[0.8, 1.25], then centre or left-align in the box. Afterwards reset style.width and the point widths to the original pen's values, as in the neaten fix."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/WritingAidsPage.swift:105-116",
+      "problem": "The page reloads on every SettingsStore.didChange, whatever the key and whatever the thread. SettingsStore posts on the caller's thread, so the @MainActor model.refresh() can be entered off the main thread. Every synced dictionary word, or any unrelated setting change, triggers a full reload of 3 bus commands, so a sync burst of N words means N reloads. On appear, `.task` and `.task(id: prefix)` also both load, so the first load runs twice.",
+      "fix": "Filter the publisher on userInfo[\"name\"]: keep only NibSettings.spellcheckNewDocuments.name, InkSynthSettings.font.name and names with the NibSettings.dictionaryPrefix prefix. Then debounce or receive on RunLoop.main (around 150 ms). Drop the plain `.task { reload }` and let `.task(id: prefix)` skip its sleep on the first run."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/WritingAidsPage.swift:22-30, 85, 91, 96",
+      "problem": "Design and UX gaps on the page: (a) The spellcheck switch and font picker bindings are not optimistic. `get` keeps returning the old value until settings.set and the reload finish, so the switch snaps back and then flips again. (b) The 'Personal Dictionary' header in a grouped Form renders uppercased on iOS 17/18, which fails the Slop checklist's no-all-caps rule. (c) The busy ProgressView is inserted as its own Form row, so the list shifts on every change. (d) The 'Try Again' button is not verb + object.",
+      "fix": "(a) Set model.spellcheck / model.font in the binding setter before dispatching, and revert on error. (b) Add .textCase(nil) to the header Text. (c) Show progress in the section footer, or in an overlay that does not change row layout. (d) Rename the button to 'Reload Writing Aids'."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/WritingAidsPage.swift:19-46 (P-038)",
+      "problem": "The Writing Aids page has no default for the other writing aid, NibSettings.mathAssistSuggestions (\"writing.mathAssist\", synced). doc.setWritingAids carries mathAssist, and no other feature exposes it: the F106 spec has no settings page and F027 has no row. So P-038 'Writing Aids settings' parity is missing its Math Assist switch.",
+      "fix": "Add a NibRow + NibToggle 'Math Assist', read and written through settings.get / settings.set with NibSettings.mathAssistSuggestions.name. Cover it in testWritingAidsUsesSettingsAndDictionaryCommands."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/FeatRestyleFeature.swift:18-20",
+      "problem": "The object-menu visibility only checks for an all-stroke selection and a read-only window. Restyle still shows for a read-only document (ctx.isReadOnly) and for highlighter strokes, and the command always rejects both.",
+      "fix": "In `visible`, also return false when the session's document is read-only (app.isReadOnly(session.document)). If MenuContext exposes the tool, also hide the entry when the selected strokes are not pen or pencil."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatInkSynthTests/RestylerTests.swift:34-40, 105-108, 214-233",
+      "problem": "Several risky paths are untested. geometry() always produces angle 0 and text nil, so the rotation into and out of line coordinates and the ascender/descender profile path never run. The paging test splits the line into three one-word lines and checks no variance, so it would pass even if neaten did nothing. The font bbox checks test centre and size separately, which lets an edge drift by up to 30%. Nib width is never asserted. Cancellation is only tested before the detached worker starts.",
+      "fix": "Add a neaten case on an 8-degree line with text ('big', 'ace', 'jog') and assert baseline variance in line-local coordinates. Page whole lines in testNeatenPagesThroughAllLinesBeforeItsOneCommit and assert the ≥50% reduction. Assert minX/maxX/minY/maxY directly against the original bbox ±20%. Assert style.width is unchanged. Add a test that cancels during the worker, for example a query handler that cancels after returning, and check that nothing commits."
+    }
+  ]
+}

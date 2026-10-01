@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "tools/relay/relay.mjs:195-203 with NibKit/Sources/FeatRelay/WebSocketTransport.swift:305-307 (and FeatCollab/CollabSession.swift:2049-2066, 1467)",
+      "problem": "Host reconnect splits the session (split brain). When the host's link drops silently (Wi-Fi to cellular, a dead NAT path, iOS suspend), the relay keeps the old link until its 25-50 s heartbeat fails. The host's transport reconnects after about 1 s with the same id and resume secret. The relay swaps in the new link atomically: old.onClose returns early, and guests only get a roster that still lists the host. On the host side, WebSocketTransport.disconnect() already sent onPeersChanged([]), so F072 unbound every guest (participantOf cleared, state .away). Guests never see the host disappear, so they don't rejoin or send hello. From then on the host silently drops every guest patch (hostHandle: guard participantOf[peer.id] fails), and host patches only go to .active participants, so nobody gets them. Both sides keep editing and drift apart with no warning. This also breaks F072's acceptance that the host catches up after a suspend when the session runs over the relay.",
+      "fix": "Make guests notice that the host's link was replaced. In relay.mjs registration, when `old` exists and link.id === room.host, first do room.members.delete(link.id) and notify(room) (guests get a roster without the host). Then set the new link and notify again. Guests then run F072 hostLost → rejoin → hello with the admission secret → two-way digest sync. Add a selftest assertion that guests receive a host-absent `peers` roster when the host reconnects over a still-open link. Also add a FeatCollab test with a relay-like transport where the host reconnects and the guest's next patch is applied."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatRelay/WebSocketTransport.swift:341-344 (with FeatCollab/CollabSession.swift streamBlob/deliver ~2266-2330, sendSnapshot ~1918)",
+      "problem": "The 8 MiB send-queue cap has no backpressure. Large snapshots and files fail over the relay. URLSessionWebSocketTask.send completes only as fast as the network takes the data (measured: against a peer that stops reading, 11 of 1000 80 KiB sends completed in 4 s). F072 streams the zipped package snapshot and asset files in 32-frame batches (about 2.6 MiB of wire each after base64) and never waits for the transport to drain. After about 3 batches queuedBytes + size > 8 MiB, send throws 'The relay is busy', and streamBlob returns false → snapshotFailed('The connection dropped'). A joiner without the document therefore can't receive any notebook whose package is larger than about 6 MB unless the uplink keeps up with disk reads. Messages split into many frames above about 6 MB (a content snapshot or syncReply) fail every time, because all their frames are queued synchronously before the drain runs. Host broadcasts to N targets multiply the queued bytes N times, so they hit the cap sooner.",
+      "fix": "Make 'busy' a distinct error (for example NibError(.timeout, …, hint: \"relay-busy\")). In F072 (same branch), have streamBlob/deliver retry the frames that weren't accepted after a short await (100-250 ms, bounded overall, only while the route is unchanged and the session is open) instead of failing the transfer. Count only frames actually accepted. Alternatively, file a contract request for a CollabTransport backpressure hook (bufferedBytes / waitForCapacity, defaulting to no-op) and await it between blob batches. Add a test with a ScriptedRelaySocket whose send completes slowly and a 20 MB blob that must arrive complete."
+    },
+    {
+      "severity": "major",
+      "where": "tools/relay/relay.mjs:58 (sendFrame)",
+      "problem": "The relay disconnects slower receivers instead of applying flow control. sendFrame destroys the receiving socket once socket.writableLength exceeds 2 MiB, and it never pauses reading from the sender. Whenever the relay's egress to a guest is slower than the host's ingress (guest on LTE or weak Wi-Fi, or a home relay behind asymmetric upload, which is the README's Tailscale setup), a snapshot or file burst over about 2 MiB plus kernel buffers disconnects that guest mid-transfer. The guest reconnects, F072 rejoins and asks for the snapshot again, gets cut off again, and so on, so the guest can never join a document of realistic size.",
+      "fix": "Apply backpressure. When a target's writableLength passes a high-water mark (for example 1 MiB), call sender.socket.pause() and resume it on the target socket's 'drain' (for a broadcast, once all targets have drained). Destroy a receiver only if it stays above the mark without draining for a bounded time (for example 30 s) or passes a much larger hard cap. Extend --selftest with a guest that pauses reading while the host sends 8 MiB: the guest must stay connected and receive everything once it resumes."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatRelay/FeatRelayFeature.swift:76-80 (RelayRuntime.configure)",
+      "problem": "Changing or clearing the relay URL doesn't actually end live sessions on the old relay, even though the README says it 'disconnects the current relay'. configure only calls leave() on the old WebSocketTransport and removes it from services, but the live F072 CollabSession keeps its own reference. For a guest, leave() → onPeersChanged([]) → hostLost → scheduleRejoin → s.transport.join(...) runs at once on the retired object, which reconnects to the old endpoint with that endpoint's Keychain token. So 'leave the URL empty to disable' (or rotating a leaked endpoint) keeps the guest's session flowing over the disabled relay. For a host, the session stays open in a zombie state: every guest .away, nothing sent or received, no error shown.",
+      "fix": "Retire transports explicitly. Give WebSocketTransport a `retired` flag set by configure, so host/join throw NibError(.unavailable, \"The relay was reconfigured\"). The guest's F072 rejoin then fails fast and ends the session through the folder-sync fallback. Before replacing the transport, if collab.participants reports a live session with transport == \"relay\", run collab.leave through the bus so the host ends cleanly. Add a test: configure(\"\") during a guest session must not reopen a socket."
+    },
+    {
+      "severity": "minor",
+      "where": "tools/relay/relay.mjs:175, 196",
+      "problem": "When a guest's connection closes, the relay deletes its resume digest. Any other token holder can read that guest's transport id from the roster and register with it (any resume secret). When the real guest reconnects with its secret, it gets permission_denied, the Swift transport stops retrying for good, and F072 rejoin keeps failing until the session ends. One token holder can lock other participants out.",
+      "fix": "Keep guest resume digests for a grace window (for example the same 120 s as roomGraceMs, cleared on explicit bye/leave or when the room is deleted), and require the matching secret to reclaim an id during that window."
+    },
+    {
+      "severity": "minor",
+      "where": "tools/relay/relay.mjs:102, 112-114, 192",
+      "problem": "Resource bounds in the relay leak. (a) Unlimited zero-length non-final continuation frames grow `fragments` forever, since fragmentBytes stays 0. (b) The close-echo path (opcode 8) calls socket.end() and finish() with no destroy timer, so a peer that keeps its half of the connection open leaves a socket that no longer counts against the 1000-link cap. (c) Every room survives 120 s after its host disconnects, and nothing caps the number of rooms, so register/disconnect churn piles up rooms and timers. All of this needs the token, but it is still unbounded.",
+      "fix": "(a) Cap the fragment count (for example 1024 per message) or reject empty non-final continuations. (b) Arm the same 1 s destroy timer on the close-echo path that close() uses. (c) Cap retained rooms (for example 1000) and reject new hosts with 'unavailable' once the cap is reached."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRelay/WebSocketTransport.swift:304, 317",
+      "problem": "The reconnect backoff resets to attempt 0 after every successful welcome. A relay or proxy that accepts the registration and then drops the connection right away (an overloaded proxy, an idle-timeout mismatch) gets a reconnect about once per second forever, never the documented 30 s cap. Each cycle also sends onPeersChanged([]) to F072, which churns the session.",
+      "fix": "Reset `attempt` only after the connection has stayed up for a minimum time (for example 30 s since open succeeded); otherwise keep raising it. Add a test where every welcome is followed by an immediate close and assert that the delays grow."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRelay/WebSocketTransport.swift:333-339",
+      "problem": "Fan-out to 50 participants is quadratic on the host's uplink. F072 sends patches and presence to 'everyone except the author' as an explicit target list, and the relay transport turns that into one full base64 frame per target. With 50 participants every guest edit or cursor update costs about 48 copies of the uplink and 48 times its size in the 8 MiB queue, so large rooms run into 'relay is busy' and lag.",
+      "fix": "When targets cover every peer but a few, send one broadcast envelope with an optional `except: [ids]` field (relay.mjs routes to members not in the list; old relays that ignore the field just send the author an echo, which F072 already drops as its own session/from). Or allow `to` to be an array of up to 50 ids, validated server-side."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRelay/FeatRelayFeature.swift:104-105",
+      "problem": "The Settings save runs relay.configure with skipHooks: true, so plugin command hooks (audit or policy plugins) never see a user's endpoint change made from Settings, though they see the same command from every other caller. Hooks never receive the token: the token is in a private slot bound to group + URL + user principal, and a hook that rewrites the url is already rejected by the url == draft.url check. So skipping hooks buys no security and breaks the extensibility guarantee.",
+      "fix": "Drop skipHooks: true (keep principal .user and the private group). Add a test that a registered hook observes the Settings-originated relay.configure and that the token appears nowhere in the hook's params."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatRelayTests/RelayFramingTests.swift (RelayTransportTests) and tools/relay/relay.mjs selftest",
+      "problem": "The tests skip the risky paths. Nothing covers: a host reconnect followed by F072 resync, large or slow transfers (queue cap and relay slow-receiver cutoff), reconfiguring mid-session, or backoff under flapping. Every scripted socket completes sends instantly, so backpressure bugs can't show up. (Manual check during this review: URLSessionWebSocketTask works with relay.mjs, and the selftest passes locally.)",
+      "fix": "Add the tests named in the fixes above. Give ScriptedRelaySocket a configurable send latency and a way to disconnect without close, and add a selftest case for a paused receiver and for host link replacement."
+    }
+  ]
+}
