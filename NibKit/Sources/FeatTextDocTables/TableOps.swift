@@ -137,6 +137,18 @@ enum TableOps {
             kept.append(m)
         }
         t.merges = sortedMerges(kept)
+        for m in t.merges {
+            let range = CellRange(m)
+            for p in range.positions where p != range.origin {
+                let text = t.rows[p.row][p.column].text
+                if !text.isEmpty {
+                    let anchor = t.rows[m.row][m.column].text
+                    t.rows[m.row][m.column].text = RichText(paragraphs:
+                        (anchor.isEmpty ? [] : anchor.paragraphs) + text.paragraphs)
+                }
+                t.rows[p.row][p.column] = TableCell()
+            }
+        }
         return t
     }
 
@@ -168,6 +180,10 @@ enum TableOps {
                   m.rowSpan <= t.rows.count - m.row, m.columnSpan <= cols - m.column else { return false }
             let r = CellRange(m)
             guard !seen.contains(where: { $0.intersects(r) }) else { return false }
+            for p in r.positions where p != r.origin {
+                guard t.rows[p.row][p.column].text.isEmpty,
+                      t.rows[p.row][p.column].background == nil else { return false }
+            }
             seen.append(r)
         }
         return true
@@ -309,7 +325,7 @@ enum TableOps {
     /// Sets (or clears, with nil) the background of every cell in `r`, merged cells that reach into it included.
     static func setBackground(_ t: inout TableData, _ r: CellRange, color: RGBA?) throws {
         try check(r, in: t)
-        for p in expanded(r, in: t).positions { t.rows[p.row][p.column].background = color }
+        for p in expanded(r, in: t).positions where !isCovered(p, in: t) { t.rows[p.row][p.column].background = color }
     }
 
     static func setBorders(_ t: inout TableData, _ on: Bool) {
@@ -584,7 +600,7 @@ enum TableOps {
 
     /// The table as CSV (RFC 4180): comma separated, CRLF line ends, fields with a comma, quote, line break or
     /// outer spaces quoted with doubled quotes. A merged cell's text appears once, in its top-left field.
-    /// ponytail: no spreadsheet-formula escaping (a leading "=" or "-" stays), so numbers and text round-trip.
+    /// Spreadsheet formula prefixes are escaped; ordinary negative numbers retain their numeric representation.
     static func csv(_ table: TableData) -> String {
         let t = normalized(table)
         let visible = Set(visibleCells(t))
@@ -599,10 +615,15 @@ enum TableOps {
     }
 
     static func csvField(_ s: String) -> String {
-        let needsQuotes = s.contains { $0 == "," || $0 == "\"" || $0.isNewline }
+        let first = s.first
+        let second = s.dropFirst().first
+        let formula = first == "=" || first == "+" || first == "@" || first == "\t" || first == "\r"
+            || (first == "-" && !(second?.isASCII == true && second?.isNumber == true) && second != ".")
+        let value = formula ? "'" + s : s
+        let needsQuotes = formula || s.contains { $0 == "," || $0 == "\"" || $0.isNewline }
             || s.first?.isWhitespace == true || s.last?.isWhitespace == true
         guard needsQuotes else { return s }
-        return "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
     /// Tab-separated rows for the pasteboard (Numbers, Pages and spreadsheets paste it as cells); tabs and line breaks

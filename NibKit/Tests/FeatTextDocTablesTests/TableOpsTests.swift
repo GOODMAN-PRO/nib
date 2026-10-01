@@ -124,6 +124,41 @@ final class TableOpsTests: XCTestCase {
         try TableOps.merge(&t, CellRange(row: 0, column: 0, toColumn: 1))
         XCTAssertEqual(TableOps.csv(t), "\"a,b\n\"\"quoted\"\"\",\r\n\"ไทย\nline\",\" spaced \"\r\n")
         XCTAssertEqual(TableOps.columnName(26), "AA")
+        XCTAssertEqual(TableOps.csvField("=1+1"), "\"'=1+1\"")
+        XCTAssertEqual(TableOps.csvField("@x"), "\"'@x\"")
+        XCTAssertEqual(TableOps.csvField("+cmd|x"), "\"'+cmd|x\"")
+        XCTAssertEqual(TableOps.csvField("-5"), "-5")
+        XCTAssertEqual(TableOps.csvField("-.5"), "-.5")
+        XCTAssertEqual(TableOps.csvField("-x"), "\"'-x\"")
+        XCTAssertEqual(TableOps.csvField("a\rb"), "\"a\rb\"")
+        XCTAssertEqual(TableOps.csvField("\r"), "\"'\r\"")
+        XCTAssertEqual(TableOps.csvField("\t=x"), "\"'\t=x\"")
+    }
+
+    func testMergedBackgroundStaysOnlyOnAnchorAfterSplit() throws {
+        var t = filled(rows: 1, columns: 2)
+        try TableOps.merge(&t, CellRange(row: 0, column: 0, toColumn: 1))
+        let red = RGBA(1, 0, 0, 1)
+        try TableOps.setBackground(&t, CellRange(row: 0, column: 1), color: red)
+        XCTAssertTrue(TableOps.isConsistent(t))
+        try TableOps.split(&t, at: CellPosition(row: 0, column: 0))
+        XCTAssertEqual(t.rows[0][0].background, red)
+        XCTAssertNil(t.rows[0][1].background)
+    }
+
+    func testNormalizationRecoversCoveredTextExactlyOnceAndClearsBackground() throws {
+        var t = filled(rows: 1, columns: 3)
+        t.merges = [TableMerge(row: 0, column: 0, rowSpan: 1, columnSpan: 2)]
+        t.rows[0][1].background = RGBA(1, 0, 0, 1)
+        XCTAssertFalse(TableOps.isConsistent(t))
+        t = TableOps.normalized(t)
+        XCTAssertEqual(t.rows[0][0].text.plainText, "0,0\n0,1")
+        XCTAssertTrue(t.rows[0][1].text.isEmpty)
+        XCTAssertNil(t.rows[0][1].background)
+        XCTAssertTrue(TableOps.isConsistent(t))
+        XCTAssertEqual(TableOps.normalized(t), t)
+        try TableOps.merge(&t, CellRange(row: 0, column: 0, toColumn: 2))
+        XCTAssertEqual(t.rows[0][0].text.plainText, "0,0\n0,1\n0,2")
     }
 
     func testInvalidOperationsLeaveTableUnchanged() {

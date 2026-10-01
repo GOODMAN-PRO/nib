@@ -26,6 +26,220 @@ final class FeatTextDocTablesTests: XCTestCase {
                                                        block: b, heightChanged: heightChanged))
     }
 
+    /// Keep a real enclosing viewport and window alive so commit/scroll/lifecycle observation is exercised.
+    private func mount(_ v: TableBlockView) -> (UIWindow, UIScrollView) {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 600))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.frame = window.bounds
+        window.addSubview(controller.view)
+        let scroll = UIScrollView(frame: window.bounds)
+        controller.view.addSubview(scroll)
+        v.frame = CGRect(x: 0, y: 0, width: 600, height: v.reportedHeight)
+        scroll.addSubview(v)
+        XCTAssertNotNil(v.window)
+        v.layoutIfNeeded()
+        v.frame.size.height = v.reportedHeight
+        scroll.contentSize = v.frame.size
+        return (window, scroll)
+    }
+
+    private func type(_ text: String, into v: TableBlockView) {
+        v.editor.attributedText = TableCellStyle().attributed(RichText(plain: text))
+        v.editor.selectedRange = NSRange(location: v.editor.textStorage.length, length: 0)
+        v.textViewDidChange(v.editor)
+    }
+
+    func testForeignRowInsertionRemapsDebouncedTypingAndKeepsCaret() async throws {
+        let h = harness(), v = try view(h)
+        let mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 1, column: 0))
+        type("A2x", into: v)
+        let caret = v.editor.selectedRange
+        try await h.run("table.edit", ["ref": .string(ref), "op": "insertRowBefore", "row": 0])
+        XCTAssertEqual(v.editing, CellPosition(row: 2, column: 0))
+        XCTAssertEqual(v.editor.selectedRange, caret)
+        await v.flushEdits()
+        XCTAssertEqual(try table(h).rows[2][0].text.plainText, "A2x")
+        XCTAssertEqual(try table(h).rows[1][0].text.plainText, "A1")
+    }
+
+    func testForeignColumnInsertionAndRowMoveCarryPendingText() async throws {
+        for params: JSONValue in [
+            ["ref": .string(ref), "op": "insertColumnBefore", "column": 0],
+            ["ref": .string(ref), "op": "moveRow", "row": 1, "to": 0],
+            ["ref": .string(ref), "op": "moveColumn", "column": 0, "to": 1]
+        ] {
+            let h = harness(), v = try view(h)
+            let mounted = mount(v)
+            defer { withExtendedLifetime(mounted) {} }
+            v.beginEditing(at: CellPosition(row: 1, column: 0))
+            type("A2x", into: v)
+            try await h.run("table.edit", params)
+            await v.flushEdits()
+            let destination = params["op"]?.stringValue == "moveRow"
+                ? CellPosition(row: 0, column: 0) : CellPosition(row: 1, column: 1)
+            XCTAssertEqual(v.editing, destination)
+            XCTAssertEqual(try table(h).rows[destination.row][destination.column].text.plainText, "A2x")
+        }
+    }
+
+    func testForeignMergeDropsCoveredPendingTextWithoutOverwritingAnchor() async throws {
+        let h = harness(), v = try view(h)
+        let mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 0, column: 1))
+        type("B1x", into: v)
+        try await h.run("table.edit", ["ref": .string(ref), "op": "merge", "row": 0, "column": 0, "toColumn": 1])
+        let merged = try table(h)
+        XCTAssertNil(v.editing)
+        await v.flushEdits()
+        XCTAssertEqual(try table(h), merged)
+        XCTAssertEqual(merged.rows[0][0].text.plainText, "A1\nB1")
+        XCTAssertEqual(h.undoDepth(doc), 1)
+    }
+
+    func testForeignUndoCancelsPendingWriteAndPreservesRedo() async throws {
+        let h = harness()
+        try await h.run("table.edit", ["ref": .string(ref), "op": "setCell", "row": 0, "column": 0, "text": "Changed"])
+        let v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("Changedx", into: v)
+        var writes = 0
+        let subscription = h.app.bus.observeCommits { if $0.command == "table.edit" { writes += 1 } }
+        defer { subscription.cancel() }
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(v.editor.text, "A1")
+        await v.flushEdits()
+        XCTAssertEqual(writes, 0)
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "A1")
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(v.editor.text, "Changed")
+    }
+
+    func testUndoAlsoCancelsAnAlreadyEnqueuedTypingWrite() async throws {
+        let h = harness()
+        try await h.run("table.edit", ["ref": .string(ref), "op": "setCell", "row": 0, "column": 0, "text": "Changed"])
+        let v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("Changedx", into: v)
+        v.flushTyping()
+        XCTAssertTrue(h.app.bus.undo(doc))
+        await v.flushEdits()
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "A1")
+        XCTAssertTrue(h.app.bus.history.canRedo(doc))
+    }
+
+    func testForeignDeletionDropsPendingTextWithoutWritingToNeighbour() async throws {
+        let h = harness(), v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("A1x", into: v)
+        try await h.run("table.edit", ["ref": .string(ref), "op": "deleteRow", "row": 0])
+        XCTAssertNil(v.editing)
+        await v.flushEdits()
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "A2")
+        XCTAssertEqual(h.undoDepth(doc), 1)
+    }
+
+    func testForeignCellReplacementReloadsEditorAndClampsCaret() async throws {
+        let h = harness(), v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        type("A1 local", into: v)
+        try await h.run("table.edit", ["ref": .string(ref), "op": "setCell", "row": 0, "column": 0, "text": "X"])
+        await v.flushEdits()
+        XCTAssertEqual(v.editor.text, "X")
+        XCTAssertEqual(v.editor.selectedRange, NSRange(location: 1, length: 0))
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "X")
+    }
+
+    func testMultipleRowInsertDeleteUndoAndViewRemapping() async throws {
+        let h = harness()
+        let original = try table(h)
+        try await h.run("table.edit", ["ref": .string(ref), "op": "insertRowBefore", "row": 0, "count": 2])
+        XCTAssertEqual(try table(h).rows.count, 4)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try table(h), original)
+        try await h.run("table.edit", ["ref": .string(ref), "op": "insertRowBefore", "row": 0])
+        let threeRows = try table(h)
+        let v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 2, column: 0))
+        try await h.run("table.edit", ["ref": .string(ref), "op": "deleteRow", "row": 0, "count": 2])
+        XCTAssertEqual(try table(h).rows.count, 1)
+        XCTAssertEqual(v.editing, CellPosition(row: 0, column: 0))
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try table(h), threeRows)
+        v.select(.rows(0...2))
+        try await h.run("table.edit", ["ref": .string(ref), "op": "deleteRow", "row": 1, "count": 2])
+        XCTAssertEqual(v.selection, .rows(0...0))
+    }
+
+    func testLifecycleNotificationsFlushTyping() async throws {
+        for name in [UIApplication.willResignActiveNotification, UIScene.willDeactivateNotification] {
+            let h = harness(), v = try view(h), mounted = mount(v)
+            defer { withExtendedLifetime(mounted) {} }
+            v.beginEditing(at: CellPosition(row: 0, column: 0))
+            type("Saved", into: v)
+            NotificationCenter.default.post(name: name, object: nil)
+            // Wait for the already enqueued write, without calling the flushing helper first.
+            for _ in 0..<10 { await Task.yield() }
+            XCTAssertEqual(try table(h).rows[0][0].text.plainText, "Saved")
+            await v.flushEdits()
+        }
+    }
+
+    func testLargeTableTypingBudgetAndViewportRecycling() async throws {
+        let h = harness()
+        h.app.commands.register(TableFixtureWrite.self)
+        try await h.run("test.tableFixture", [:])
+        let v = try view(h), mounted = mount(v)
+        defer { withExtendedLifetime(mounted) {} }
+        v.beginEditing(at: CellPosition(row: 0, column: 0))
+        let start = Date.timeIntervalSinceReferenceDate
+        for i in 1...20 { type("0,0" + String(repeating: "x", count: i), into: v) }
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
+        let budget = 20.0 * 0.016 // One 60 Hz frame per character, CI gets the architecture's 4× allowance.
+        XCTAssertLessThan(elapsed, budget * 4)
+        XCTAssertLessThan(v.cellViews.count, 1_500)
+        let offscreen = try XCTUnwrap(v.grid.accessibilityDataTableCellElement(forRow: 249, column: 29))
+        XCTAssertEqual(offscreen.accessibilityRowRange(), NSRange(location: 249, length: 1))
+        XCTAssertEqual((offscreen as? UIAccessibilityElement)?.accessibilityLabel, "249,29")
+        mounted.1.contentOffset.y = v.reportedHeight - 600
+        XCTAssertNotNil(v.cellViews[CellPosition(row: 249, column: 29)])
+        XCTAssertNil(v.cellViews[CellPosition(row: 0, column: 0)])
+        XCTAssertLessThan(v.cellViews.count, 1_500)
+        await v.flushEdits()
+        XCTAssertEqual(try table(h).rows[0][0].text.plainText, "0,0" + String(repeating: "x", count: 20))
+    }
+
+    func testReorderResizeGeometryAndMergeSplitReadOnlyMenus() throws {
+        XCTAssertEqual(TableLayout.moveDestination(source: 2, boundary: 4), 3)
+        XCTAssertEqual(TableLayout.nearestBoundary(5, offsets: [0, 10, 20]), 0)
+        XCTAssertEqual(TableLayout.nearestBoundary(5.1, offsets: [0, 10, 20]), 1)
+        XCTAssertEqual(TableLayout.nearestBoundary(15, offsets: [0, 10, 20]), 1)
+        let layout = TableGridLayout(columnWidths: [44, 44, 44], rowHeights: [44])
+        XCTAssertEqual(layout.divider(near: 70, slop: 30), 1)
+        XCTAssertEqual(layout.divider(near: 45, slop: 3), 0)
+        XCTAssertNil(layout.divider(near: 50, slop: 3))
+        var t = TableOps.empty(rows: 2, columns: 2)
+        let target = TableMenuTarget.cells(CellRange(row: 0, column: 0, toRow: 1, toColumn: 1))
+        XCTAssertTrue(TableMenus.sections(for: target, in: t, readOnly: false).flatMap(\.items).contains { $0.id == "merge" })
+        try TableOps.merge(&t, target.range(in: t)!)
+        let items = TableMenus.sections(for: target, in: t, readOnly: false).flatMap(\.items)
+        XCTAssertTrue(items.contains { $0.id == "split" })
+        XCTAssertFalse(items.contains { $0.id == "merge" })
+        for target: TableMenuTarget in [target, .rows(0...0), .columns(0...0), .table] {
+            let sections = TableMenus.sections(for: target, in: t, readOnly: true)
+            XCTAssertFalse(sections.contains { $0.id == "insert" || $0.id == "delete" || $0.id == "add" })
+            XCTAssertFalse(sections.flatMap(\.items).contains { $0.id == "merge" || $0.id == "split" })
+        }
+    }
+
     func testConformanceAndRegistryIntegration() async throws {
         let problems = await CommandConformance.check(features: [FeatTextDocTablesFeature.self])
         XCTAssertEqual(problems, [])
@@ -240,5 +454,21 @@ private struct TableExporterProbe: NibCommand {
     static func run(_ params: Params, _ ctx: CommandContext) async throws -> [String] {
         let exporter = try XCTUnwrap(ctx.content.exporters.get(TableExport.exporterID))
         return try await exporter.handler(ExportRequest(documents: [Fixtures.textDocID], fileName: "Chosen/Name"), ctx).map { $0.path }
+    }
+}
+
+private struct TableFixtureWrite: NibCommand {
+    struct Params: Codable {}
+    static let descriptor = CommandDescriptor(id: "test.tableFixture", title: "Fill Table", summary: "Large table fixture",
+                                              params: .obj([:]), examples: [[:]], effect: .edit)
+    static func run(_ params: Params, _ ctx: CommandContext) async throws -> NoResult {
+        try ctx.mutate { tx in
+            var block = try XCTUnwrap(tx.content(Fixtures.textDocID).liveBlocks.first { $0.id == Fixtures.tableBlockID })
+            block.table = TableData(rows: (0..<250).map { r in (0..<30).map { c in
+                TableCell(text: RichText(plain: "\(r),\(c)"))
+            } })
+            try tx.put(block, doc: Fixtures.textDocID)
+        }
+        return NoResult()
     }
 }

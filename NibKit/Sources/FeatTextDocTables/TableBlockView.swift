@@ -775,9 +775,14 @@ final class TableBlockView: UIView {
     let tableHandle = TableHandleButton(kind: .table)
     private let scroller = UIScrollView()
     private let borderLayer = CAShapeLayer()
+    private var borderLayout: TableGridLayout?
+    private var borderMerges: [TableMerge] = []
     private let selectionLayer = CAShapeLayer()
     private let dropLine = UIView()
     private(set) var cellViews: [CellPosition: TableCellView] = [:]
+    private var cellPool: [TableCellView] = []
+    private var scrollObservation: NSKeyValueObservation?
+    private var measuredHeights: [CellPosition: CGFloat] = [:]
     private var visible: [CellPosition] = []
     private var spans: [CellPosition: CellRange] = [:]
     private var lastWidth: CGFloat = 0
@@ -791,6 +796,8 @@ final class TableBlockView: UIView {
     private var commitTask: Task<Void, Never>?
     private var inFlight = 0
     private var typingGroup = NibID.make().raw
+    private var issuedGroups = Set<String>()
+    private var queuedText: [UUID: (cell: CellPosition, text: RichText)] = [:]
     private var typingCell: CellPosition?
     private var lastGroupUse = Date.distantPast
     let undoProxy = TableUndoManager()
@@ -966,6 +973,8 @@ final class TableBlockView: UIView {
         } else {
             attributedCache.removeAll()
         }
+        for view in cellViews.values { view.invalidateShown() }
+        for view in cellPool { view.invalidateShown() }
         relayout(width: bounds.width > 0 ? bounds.width : lastWidth, report: true)
     }
 
@@ -979,6 +988,14 @@ final class TableBlockView: UIView {
         session.$readOnly.dropFirst().removeDuplicates().sink { [weak self] _ in
             self?.readOnlyChanged()
         }.store(in: &cancellables)
+        for name in [UIApplication.willResignActiveNotification, UIScene.willDeactivateNotification] {
+            NotificationCenter.default.publisher(for: name)
+                .sink { [weak self] _ in self?.flushTyping() }
+                .store(in: &cancellables)
+        }
+        scrollObservation = enclosingScrollView()?.observe(\.contentOffset, options: [.new]) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.placeViews() }
+        }
         NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.scrollEditingIntoView() }
@@ -989,15 +1006,103 @@ final class TableBlockView: UIView {
         subscription?.cancel()
         subscription = nil
         cancellables.removeAll()
+        scrollObservation = nil
     }
 
     private func commitsArrived(_ changeset: Changeset) {
-        var latest: TextBlock?
-        for m in changeset.mutations {
-            if case let .block(d, _, after) = m, d == doc, after.id == blockID { latest = after }
+        for mutation in changeset.mutations {
+            guard case let .block(d, before, after) = mutation, d == doc, after.id == blockID else { continue }
+            let history = changeset.command == CommandIDs.undo || changeset.command == CommandIDs.redo
+            if history || !issuedGroups.contains(changeset.group) {
+                reconcileForeign(before: before?.table, after: after.table, history: history)
+            }
+            if after.deleted || after.kind != .table {
+                cancelTyping()
+                endEditing()
+            }
+            modelChanged(after)
         }
-        guard let block = latest else { return }
-        modelChanged(block)
+    }
+
+    /// Match an inserted/deleted band by its unchanged prefix/suffix, and a moved band by its other cells.
+    private func remappedIndex(_ index: Int, before: [[TableCell]], after: [[TableCell]], other: Int) -> Int? {
+        guard before.indices.contains(index) else { return nil }
+        var prefix = 0
+        while prefix < min(before.count, after.count), before[prefix] == after[prefix] { prefix += 1 }
+        var suffix = 0
+        while suffix < min(before.count, after.count) - prefix,
+              before[before.count - suffix - 1] == after[after.count - suffix - 1] { suffix += 1 }
+        if index < prefix { return index }
+        if index >= before.count - suffix { return index + after.count - before.count }
+        let matches = after.indices.filter { candidate in
+            let old = before[index], new = after[candidate]
+            return old == new || (old.count == new.count && old.count > 1 && old.indices.allSatisfy {
+                $0 == other || old[$0] == new[$0]
+            })
+        }
+        if matches.count == 1 { return matches[0] }
+        // Equal-size replacement is a text/background edit, unless the rows are a recognisable permutation.
+        if before.count == after.count {
+            let reordered = before.allSatisfy { after.contains($0) }
+            return reordered ? nil : index
+        }
+        return nil
+    }
+
+    private func reconcileForeign(before source: TableData?, after destination: TableData?, history: Bool) {
+        guard let e = editing else {
+            if history { cancelTyping() }
+            return
+        }
+        guard let source, let destination else {
+            cancelTyping()
+            endEditing()
+            return
+        }
+        let old = TableOps.normalized(source), next = TableOps.normalized(destination)
+        if old.rows.count != next.rows.count && TableOps.columnCount(old) != TableOps.columnCount(next) {
+            // Without stable cell ids, a replacement of both axes has no safe positional correspondence.
+            cancelTyping(); endEditing(); return
+        }
+        var mapped = e
+        if TableOps.columnCount(old) == TableOps.columnCount(next) {
+            guard let row = remappedIndex(e.row, before: old.rows, after: next.rows, other: e.column) else {
+                cancelTyping(); endEditing(); return
+            }
+            mapped.row = row
+        }
+        if old.rows.count == next.rows.count {
+            let oldColumns = (0..<TableOps.columnCount(old)).map { c in old.rows.map { $0[c] } }
+            let newColumns = (0..<TableOps.columnCount(next)).map { c in next.rows.map { $0[c] } }
+            guard let column = remappedIndex(e.column, before: oldColumns, after: newColumns, other: e.row) else {
+                cancelTyping(); endEditing(); return
+            }
+            mapped.column = column
+        }
+        guard next.rows.indices.contains(mapped.row), next.rows[mapped.row].indices.contains(mapped.column),
+              !TableOps.isCovered(mapped, in: next) else {
+            cancelTyping(); endEditing(); return
+        }
+        mapped = TableOps.anchor(of: mapped, in: next)
+        if history || old.rows[e.row][e.column].text != next.rows[mapped.row][mapped.column].text {
+            cancelTyping()
+            let selected = editor.selectedRange
+            editor.attributedText = style.attributed(next.rows[mapped.row][mapped.column].text)
+            editor.selectedRange = clamp(selected, to: editor.textStorage.length)
+        }
+        editing = mapped
+        editor.cell = mapped
+        if pendingText != nil { pendingText?.cell = mapped }
+        for id in Array(queuedText.keys) where queuedText[id]?.cell == e { queuedText[id]?.cell = mapped }
+        if typingCell == e { typingCell = mapped }
+    }
+
+    private func cancelTyping() {
+        commitTask?.cancel()
+        commitTask = nil
+        pendingText = nil
+        queuedText.removeAll()
+        newTypingGroup()
     }
 
     func reloadFromModel() {
@@ -1013,9 +1118,9 @@ final class TableBlockView: UIView {
         }
         var next = TableOps.normalized(block.table)
         // Keystrokes still on their way keep the edited cell's local text.
-        if let e = editing, inFlight > 0 || pendingText != nil, next.rows.indices.contains(e.row),
+        if let e = editing, !queuedText.isEmpty || pendingText != nil, next.rows.indices.contains(e.row),
            next.rows[e.row].indices.contains(e.column), !TableOps.isCovered(e, in: next) {
-            next.rows[e.row][e.column].text = cellText(e)
+            next.rows[e.row][e.column].text = pendingText?.text ?? style.richText(from: editor.attributedText)
         }
         apply(next)
     }
@@ -1079,18 +1184,25 @@ final class TableBlockView: UIView {
                                               minimumAuto: TableMetrics.minAutoWidth)
         if let o = widthOverride, widths.indices.contains(o.column) { widths[o.column] = o.width }
         let xs = TableLayout.offsets(widths)
+        measuredHeights.removeAll(keepingCapacity: true)
         var measured: [TableLayout.Measured] = []
         measured.reserveCapacity(visible.count)
         for p in visible {
             let span = spans[p] ?? CellRange(p)
             guard span.right + 1 < xs.count else { continue }
             let textWidth = max(xs[span.right + 1] - xs[span.left] - inset.left - inset.right, 1)
-            measured.append(TableLayout.Measured(range: span, height: textHeight(p, width: textWidth) + inset.top + inset.bottom))
+            let height = textHeight(p, width: textWidth) + inset.top + inset.bottom
+            measuredHeights[p] = height
+            measured.append(TableLayout.Measured(range: span, height: height))
         }
         layout = TableGridLayout(columnWidths: widths,
                                  rowHeights: TableLayout.rowHeights(count: table.rows.count, cells: measured,
                                                                     minimum: TableMetrics.minRowHeight))
         placeViews()
+        reportHeight(report: report)
+    }
+
+    private func reportHeight(report: Bool) {
         let total = (TableMetrics.gutter + layout.height + TableMetrics.edge + TableMetrics.bottomInset).rounded(.up)
         if abs(total - reportedHeight) > 0.5 {
             reportedHeight = total
@@ -1120,7 +1232,29 @@ final class TableBlockView: UIView {
         return value
     }
 
-    private func placeViews() {
+    private func renderedCells() -> [CellPosition] {
+        let viewport: CGRect
+        if let outer = enclosingScrollView() {
+            viewport = grid.convert(outer.bounds, from: outer)
+        } else {
+            viewport = CGRect(x: 0, y: 0, width: bounds.width, height: bounds.height > 0 ? min(bounds.height, 600) : 600)
+        }
+        let rect = viewport.insetBy(dx: 0, dy: -viewport.height)
+        guard rect.maxY >= gridOrigin.y, rect.minY <= gridOrigin.y + layout.height else { return [] }
+        let top = max(0, layout.row(at: max(rect.minY - gridOrigin.y, 0)) ?? 0)
+        let bottom = min(table.rows.count - 1,
+                         layout.row(at: min(max(rect.maxY - gridOrigin.y, 0), max(layout.height - 1, 0))) ?? 0)
+        guard bottom >= top else { return [] }
+        var cells = Set<CellPosition>()
+        for row in top...bottom {
+            for column in 0..<columnCount {
+                cells.insert(TableOps.anchor(of: CellPosition(row: row, column: column), in: table))
+            }
+        }
+        return cells.sorted { ($0.row, $0.column) < ($1.row, $1.column) }
+    }
+
+    private func placeViews(framesOnly: Bool = false) {
         let size = CGSize(width: layout.width + 2 * TableMetrics.edge,
                           height: gridOrigin.y + layout.height + TableMetrics.edge)
         let left = TableMetrics.gutter - TableMetrics.edge
@@ -1128,15 +1262,21 @@ final class TableBlockView: UIView {
         scroller.contentSize = size
         grid.frame = CGRect(origin: .zero, size: size)
 
-        let inset = TableMetrics.cellInset
-        var seen = Set<CellPosition>()
-        for p in visible {
-            seen.insert(p)
+        let rendered = renderedCells()
+        let seen = Set(rendered)
+        for (p, v) in Array(cellViews) where !seen.contains(p) {
+            v.removeFromSuperview()
+            cellViews[p] = nil
+            cellPool.append(v)
+        }
+        let emptyLabel = String(localized: "Empty")
+        let hint = isReadOnly ? String(localized: "Select cell text") : String(localized: "Edit cell")
+        for p in rendered {
             let view: TableCellView
             if let existing = cellViews[p] {
                 view = existing
             } else {
-                view = TableCellView()
+                view = cellPool.popLast() ?? TableCellView()
                 view.owner = self
                 grid.insertSubview(view, at: 0)
                 cellViews[p] = view
@@ -1146,19 +1286,19 @@ final class TableBlockView: UIView {
             view.frame = frame
             view.position = p
             view.span = span
-            let textWidth = max(frame.width - inset.left - inset.right, 1)
-            view.show(attributed(p), textHeight: textHeight(p, width: textWidth),
-                      background: table.rows[p.row][p.column].background?.uiColor)
+            let cell = table.rows[p.row][p.column]
+            if !view.isShowing(cell.text, background: cell.background) {
+                view.show(attributed(p), key: cell.text, background: cell.background)
+                view.accessibilityLabel = cell.text.isEmpty ? emptyLabel : cell.text.plainText
+            }
             view.showsText = !(p == editing && !editor.isHidden)
-            view.accessibilityLabel = cellText(p).isEmpty ? String(localized: "Empty") : cellText(p).plainText
-            view.accessibilityHint = isReadOnly ? String(localized: "Select cell text") : String(localized: "Edit cell")
+            view.accessibilityHint = hint
         }
-        for (p, v) in Array(cellViews) where !seen.contains(p) {
-            v.removeFromSuperview()
-            cellViews[p] = nil
-        }
+        // Retain at most the current viewport's worth of spare views.
+        if cellPool.count > rendered.count { cellPool.removeLast(cellPool.count - rendered.count) }
+        attributedCache = attributedCache.filter { seen.contains($0.key) }
         if let e = editing, !editor.isHidden { editor.frame = cellFrame(e) }
-        drawBorders()
+        if !framesOnly { drawBorders() }
         drawSelection()
         placeHandles()
         updateAccessibility()
@@ -1166,19 +1306,23 @@ final class TableBlockView: UIView {
     }
 
     private func drawBorders() {
-        let path = UIBezierPath()
-        for p in visible {
-            let f = cellFrame(p)
-            path.move(to: CGPoint(x: f.minX, y: f.maxY))
-            path.addLine(to: CGPoint(x: f.minX, y: f.minY))
-            path.addLine(to: CGPoint(x: f.maxX, y: f.minY))
+        if borderLayout != layout || borderMerges != table.merges {
+            let path = UIBezierPath()
+            for p in visible {
+                let f = cellFrame(p)
+                path.move(to: CGPoint(x: f.minX, y: f.maxY))
+                path.addLine(to: CGPoint(x: f.minX, y: f.minY))
+                path.addLine(to: CGPoint(x: f.maxX, y: f.minY))
+            }
+            let all = layout.frame(of: CellRange(row: 0, column: 0, toRow: table.rows.count - 1, toColumn: columnCount - 1))
+                .offsetBy(dx: gridOrigin.x, dy: gridOrigin.y)
+            path.move(to: CGPoint(x: all.maxX, y: all.minY))
+            path.addLine(to: CGPoint(x: all.maxX, y: all.maxY))
+            path.addLine(to: CGPoint(x: all.minX, y: all.maxY))
+            borderLayer.path = path.cgPath
+            borderLayout = layout
+            borderMerges = table.merges
         }
-        let all = layout.frame(of: CellRange(row: 0, column: 0, toRow: table.rows.count - 1, toColumn: columnCount - 1))
-            .offsetBy(dx: gridOrigin.x, dy: gridOrigin.y)
-        path.move(to: CGPoint(x: all.maxX, y: all.minY))
-        path.addLine(to: CGPoint(x: all.maxX, y: all.maxY))
-        path.addLine(to: CGPoint(x: all.minX, y: all.maxY))
-        borderLayer.path = path.cgPath
         let active = editing != nil || selection != .none
         borderLayer.isHidden = !table.borders && !active
         borderLayer.lineWidth = NibStroke.hairline
@@ -1261,7 +1405,7 @@ final class TableBlockView: UIView {
     }
 
     private func updateAccessibility() {
-        grid.accessibilityElements = visible.compactMap { p -> Any? in
+        grid.accessibilityElements = cellViews.keys.sorted { ($0.row, $0.column) < ($1.row, $1.column) }.compactMap { p -> Any? in
             p == editing && !editor.isHidden ? editor : cellViews[p]
         }
         grid.accessibilityLabel = String(localized: "Table, \(table.rows.count) rows, \(columnCount) columns")
@@ -1403,7 +1547,24 @@ final class TableBlockView: UIView {
         table.rows[cell.row][cell.column].text = text
         pendingText = (cell, text)
         scheduleCommit()
-        relayout(width: lastWidth, report: true)
+        let span = spans[cell] ?? CellRange(cell)
+        let inset = TableMetrics.cellInset
+        let frame = cellFrame(cell)
+        let height = textHeight(cell, width: max(frame.width - inset.left - inset.right, 1)) + inset.top + inset.bottom
+        let previous = measuredHeights[cell]
+        measuredHeights[cell] = height
+        if previous != height {
+            let heights = TableLayout.rowHeights(count: table.rows.count, cells: measuredHeights.map {
+                TableLayout.Measured(range: spans[$0.key] ?? CellRange($0.key), height: $0.value)
+            }, minimum: TableMetrics.minRowHeight)
+            if heights != layout.rowHeights {
+                layout = TableGridLayout(columnWidths: layout.columnWidths, rowHeights: heights)
+                placeViews(framesOnly: true)
+                drawBorders()
+                reportHeight(report: true)
+            }
+        }
+        editor.frame = rangeFrame(span)
         scrollEditingIntoView()
     }
 
@@ -1429,12 +1590,24 @@ final class TableBlockView: UIView {
         typingCell = pending.cell
         lastGroupUse = now
         let group = typingGroup
-        let params = TableEdit.Params(ref: ref, op: .setCell, row: pending.cell.row, column: pending.cell.column,
-                                      text: pending.text)
+        let id = UUID()
+        queuedText[id] = pending
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        if !NibApp.isHostlessTest {
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Table typing")
+        }
         inFlight += 1
         // Keep the view alive until its last keystrokes reach the command bus, even when its block leaves screen.
         enqueue { [self] in
-            let ok = await self.execute(params, group: group) != nil
+            defer {
+                if backgroundTask != .invalid { UIApplication.shared.endBackgroundTask(backgroundTask) }
+            }
+            var ok = false
+            if let write = self.queuedText.removeValue(forKey: id) {
+                let params = TableEdit.Params(ref: self.ref, op: .setCell, row: write.cell.row,
+                                              column: write.cell.column, text: write.text)
+                ok = await self.execute(params, group: group) != nil
+            }
             self.inFlight -= 1
             // A refused write (a locked or read-only document, the block went): show the model again.
             if !ok, self.inFlight == 0, self.pendingText == nil { self.reloadFromModel() }
@@ -1465,6 +1638,7 @@ final class TableBlockView: UIView {
 
     @discardableResult
     private func execute(_ params: TableEdit.Params, group: String?) async -> TableEdit.Output? {
+        if let group { issuedGroups.insert(group) }
         do {
             return try await app.bus.run(TableEdit.self, params, session: session, group: group)
         } catch {
@@ -1475,6 +1649,7 @@ final class TableBlockView: UIView {
 
     @discardableResult
     private func execute(_ command: String, _ params: JSONValue, group: String? = nil) async -> JSONValue? {
+        if let group { issuedGroups.insert(group) }
         do {
             let inv = Invocation(command: command, params: params, principal: .user, session: session, group: group)
             return try await app.bus.execute(inv).value
@@ -2458,12 +2633,54 @@ final class TableGridView: UIView, UIAccessibilityContainerDataTable {
         guard let owner = owner else { return nil }
         let p = TableOps.anchor(of: CellPosition(row: row, column: column), in: owner.table)
         if p == owner.editing, !owner.editor.isHidden { return owner.editor }
-        return owner.cellViews[p]
+        guard owner.table.rows.indices.contains(row), (0..<owner.columnCount).contains(column) else { return nil }
+        return owner.cellViews[p] ?? TableAccessibleCell(owner: owner, position: p)
     }
 
     func accessibilityRowCount() -> Int { owner?.table.rows.count ?? 0 }
 
     func accessibilityColumnCount() -> Int { owner?.columnCount ?? 0 }
+}
+
+/// Offscreen cells answer VoiceOver's data-table queries directly from the model without allocating labels.
+private final class TableAccessibleCell: UIAccessibilityElement, UIAccessibilityContainerDataTableCell {
+    weak var owner: TableBlockView?
+    let position: CellPosition
+
+    init(owner: TableBlockView, position: CellPosition) {
+        self.owner = owner
+        self.position = position
+        super.init(accessibilityContainer: owner.grid)
+        accessibilityTraits = .button
+    }
+
+    override var accessibilityLabel: String? {
+        get {
+            guard let text = owner?.cellText(position) else { return nil }
+            return text.isEmpty ? String(localized: "Empty") : text.plainText
+        }
+        set {}
+    }
+
+    override var accessibilityFrameInContainerSpace: CGRect {
+        get { owner?.cellFrame(position) ?? .zero }
+        set {}
+    }
+
+    func accessibilityRowRange() -> NSRange {
+        let span = owner.map { TableOps.span(of: position, in: $0.table) } ?? CellRange(position)
+        return NSRange(location: span.top, length: span.rowCount)
+    }
+
+    func accessibilityColumnRange() -> NSRange {
+        let span = owner.map { TableOps.span(of: position, in: $0.table) } ?? CellRange(position)
+        return NSRange(location: span.left, length: span.columnCount)
+    }
+
+    override func accessibilityActivate() -> Bool {
+        owner?.beginEditing(at: position)
+        return owner != nil
+    }
 }
 
 /// One visible cell at rest: its background and a top-aligned label.
@@ -2472,7 +2689,13 @@ final class TableCellView: UIButton, UIAccessibilityContainerDataTableCell {
     var position = CellPosition(row: 0, column: 0)
     var span = CellRange(CellPosition(row: 0, column: 0))
     let label = UILabel()
-    private var textHeight: CGFloat = 0
+    private(set) var shown: (RichText, RGBA?)?
+
+    func invalidateShown() { shown = nil }
+
+    func isShowing(_ text: RichText, background: RGBA?) -> Bool {
+        shown?.0 == text && shown?.1 == background
+    }
 
     var showsText = true {
         didSet { label.isHidden = !showsText }
@@ -2492,18 +2715,20 @@ final class TableCellView: UIButton, UIAccessibilityContainerDataTableCell {
 
     required init?(coder: NSCoder) { return nil }
 
-    func show(_ text: NSAttributedString, textHeight: CGFloat, background: UIColor?) {
+    func show(_ text: NSAttributedString, key: RichText, background: RGBA?) {
+        shown = (key, background)
         if label.attributedText != text { label.attributedText = text }
-        self.textHeight = textHeight
-        backgroundColor = background
+        backgroundColor = background?.uiColor
         setNeedsLayout()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         let inset = TableMetrics.cellInset
-        label.frame = CGRect(x: inset.left, y: inset.top, width: max(bounds.width - inset.left - inset.right, 0),
-                             height: min(textHeight, max(bounds.height - inset.top - inset.bottom, 0)))
+        let width = max(bounds.width - inset.left - inset.right, 0)
+        let height = label.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        label.frame = CGRect(x: inset.left, y: inset.top, width: width,
+                             height: min(height, max(bounds.height - inset.top - inset.bottom, 0)))
     }
 
     func accessibilityRowRange() -> NSRange { NSRange(location: span.top, length: span.rowCount) }
