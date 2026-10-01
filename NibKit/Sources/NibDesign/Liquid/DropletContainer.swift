@@ -80,14 +80,12 @@ public struct NibDropletContainer<Content: View>: View {
                         }
                     }
                     .environment(\.colorScheme, colorScheme)
-                    .backgroundPreferenceValue(NibStaticGlassBackdropKey.self) { backdrops in
-                        ZStack {
-                            NativeGlassBackdropLayer(field: field, backdrop: backdrop)
-                            NativeStaticGlassBackdropLayer(backdrops: backdrops)
-                        }
-                        .environment(\.nibChromeAppearance, NibChromeAppearance(environment))
+                    .backgroundPreferenceValue(NibGlassBackdropKey.self) { backdrops in
+                        NativeGlassBackdropLayer(backdrops: backdrops)
+                            .environment(\.nibChromeAppearance, NibChromeAppearance(environment))
+                            .environment(\.colorScheme, colorScheme)
                     }
-                    .transformPreference(NibStaticGlassBackdropKey.self) { $0 = [] }
+                    .transformPreference(NibGlassBackdropKey.self) { $0 = [] }
                 }
             } else {
                 fallback
@@ -110,79 +108,68 @@ public struct NibDropletContainer<Content: View>: View {
     }
 }
 
-/// A static nibGlass surface has no field entry. Carry its bounds and neutral body out of the native container
-/// with an anchor preference so it follows the same backdrop ordering as registered droplets.
-struct NibStaticGlassBackdrop {
+/// The actual native host bounds, captured before its outer translation and reciprocal padding. Resolving
+/// this anchor outside GlassEffectContainer includes layout, safe-area placement and presentation transforms.
+/// Never reconstruct a second silhouette from the physics field: that path uses the fallback affine geometry.
+struct NibGlassBackdrop {
     let bounds: Anchor<CGRect>
     let shape: NibDropletShape
-    let tint: Color
+    let kind: NibGlass
+    var frozen = false
+    var recedes = false
 }
 
-struct NibStaticGlassBackdropKey: PreferenceKey {
-    static let defaultValue: [NibStaticGlassBackdrop] = []
-    static func reduce(value: inout [NibStaticGlassBackdrop], nextValue: () -> [NibStaticGlassBackdrop]) {
+struct NibGlassBackdropKey: PreferenceKey {
+    static let defaultValue: [NibGlassBackdrop] = []
+    static func reduce(value: inout [NibGlassBackdrop], nextValue: () -> [NibGlassBackdrop]) {
         value += nextValue()
     }
 }
 
-struct NativeStaticGlassBackdropLayer: View {
-    let backdrops: [NibStaticGlassBackdrop]
+/// Shared by both static nibGlass and physics droplets. Only the container paints this body, below the native
+/// effect. The anchor must be attached at the glass boundary, not at the restored rest-layout boundary.
+struct NibGlassBackdropModifier: ViewModifier {
+    let kind: NibGlass
+    let shape: NibDropletShape
+    var frozen = false
+    var recedes = false
+
+    func body(content: Content) -> some View {
+        content.anchorPreference(key: NibGlassBackdropKey.self, value: .bounds) {
+            [NibGlassBackdrop(bounds: $0, shape: shape, kind: kind, frozen: frozen, recedes: recedes)]
+        }
+    }
+}
+
+/// One neutral underlay per native host, with no stroke, shader, sheen or shadow. Both its material and its
+/// foreground resolve from the container's captured app appearance, even when glass adapts to white paper.
+struct NativeGlassBackdropLayer: View {
+    let backdrops: [NibGlassBackdrop]
+    @Environment(\.self) private var environment
+    @Environment(\.nibBackdrop) private var paper
 
     var body: some View {
+        let appearance = environment.nibChromeAppearance ?? NibChromeAppearance(environment)
         GeometryReader { proxy in
-            Canvas { context, _ in
-                for backdrop in backdrops {
-                    context.fill(backdrop.shape.path(in: proxy[backdrop.bounds]), with: .color(backdrop.tint))
+            let origin = proxy.frame(in: NibLiquid.space).origin
+            ForEach(Array(backdrops.enumerated()), id: \.offset) { _, backdrop in
+                let rect = proxy[backdrop.bounds]
+                if NibGeometry.isUsable(rect) {
+                    let worldRect = rect.offsetBy(dx: origin.x, dy: origin.y)
+                    let share = DropletField.paperShare(worldRect, in: paper)
+                    let tint = backdrop.frozen
+                        ? NibGlassBodyTint.color(backdrop.kind, paperShare: share, colorScheme: appearance.colorScheme)
+                        : NibGlassBodyTint.systemUnderlay(backdrop.kind, colorScheme: appearance.colorScheme, paperShare: share)
+                    backdrop.shape.fill(tint)
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                        .opacity(backdrop.recedes ? NibLiquid.recedeOpacity : 1)
+                        .animation(backdrop.recedes ? NibMotion.recede : NibMotion.enter, value: backdrop.recedes)
                 }
             }
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-    }
-}
-
-/// System glass in a container is rendered behind the container's content. Neutral contrast protection must
-/// therefore be outside that container, underneath the combined effect, rather than a droplet's background.
-/// The existing field supplies the exact silhouettes, visibility, paper overlap and Pencil recede opacity.
-struct NativeGlassBackdropLayer: View {
-    let field: DropletField
-    /// The live page geometry arrives before the field's onChange/publish cycle. Use it immediately,
-    /// including for styles that disable refraction (whose render.paper is deliberately zero).
-    var backdrop: [CGRect]? = nil
-    @Environment(\.self) private var environment
-
-    var body: some View {
-        let appearance = environment.nibChromeAppearance ?? NibChromeAppearance(environment)
-        let colorScheme = appearance.colorScheme
-        ClusterLayer(field: field) { cluster in
-            let offset = CGAffineTransform(translationX: -cluster.frame.minX, y: -cluster.frame.minY)
-            let fills = cluster.renders.map { render in
-                let kind: NibGlass = render.material == .deep ? .deep : (render.material == .tinted ? .tinted : .clear)
-                // Paper-resident styles can disable refraction; they still need contrast protection.
-                let paper = backdrop.map { DropletField.paperShare(render.path.boundingRect, in: $0) }
-                    ?? field.node(render.id).presentation.paperShare
-                let tint = field.isFrozen
-                    ? NibGlassBodyTint.color(kind, paperShare: paper, colorScheme: colorScheme)
-                    : NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paper)
-                return NativeGlassBackdropCanvas.Fill(path: render.path.applying(offset), tint: tint)
-            }
-            return NativeGlassBackdropCanvas(fills: fills).equatable()
-        }
-    }
-}
-
-/// A moving cluster must not redraw the neutral body of every resting cluster.
-struct NativeGlassBackdropCanvas: View, Equatable {
-    struct Fill: Equatable {
-        let path: Path
-        let tint: Color
-    }
-    let fills: [Fill]
-
-    var body: some View {
-        Canvas { context, _ in
-            for fill in fills { context.fill(fill.path, with: .color(fill.tint)) }
-        }
     }
 }
 

@@ -8,24 +8,96 @@ struct LibrarySearchView: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
-    @State private var searchPresented = true
     var body: some View {
-        NavigationStack {
+        PhoneSearchContent(app: app, session: session, state: state,
+            prompt: String(localized: "Search your notes"))
+    }
+}
+
+/// A system field and its native Cancel action stay above the dry, full-screen phone list.
+/// Keeping them out of a navigation toolbar avoids iOS 26's floating toolbar capsules.
+@MainActor
+struct PhoneSearchContent: View {
+    let app: NibApp
+    let session: EditorSession
+    @ObservedObject var state: SearchState
+    let prompt: String
+
+    var body: some View {
+        VStack(spacing: 0) {
+            SystemSearchField(text: searchBinding(app: app, session: session, state: state),
+                prompt: prompt, focusGeneration: state.focusGeneration, onSubmit: {
+                    app.perform(CommandIDs.searchStep, ["direction": "next"], session: session)
+                }, onClose: {
+                    app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
+                })
+                .frame(minHeight: NibMetrics.barHeight)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, NibSpacing.s)
+                .padding(.top, NibSpacing.s)
             SearchResults(app: app, session: session, state: state)
-                .background(NibColor.background)
-                .navigationTitle(String(localized: "Search"))
-                .navigationBarTitleDisplayMode(.inline)
-                .searchable(text: searchBinding(app: app, session: session, state: state),
-                    isPresented: $searchPresented,
-                    placement: .navigationBarDrawer(displayMode: .always), prompt: String(localized: "Search your notes"))
-                .onChange(of: state.focusGeneration) { _, _ in searchPresented = true }
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button(String(localized: "Close search")) {
-                            app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
-                        }
-                    }
-                }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(NibColor.background.ignoresSafeArea())
+    }
+}
+
+@MainActor
+struct SystemSearchField: UIViewRepresentable {
+    @Binding var text: String
+    let prompt: String
+    let focusGeneration: Int
+    let onSubmit: () -> Void
+    let onClose: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeUIView(context: Context) -> Bar {
+        let bar = Bar()
+        bar.searchBarStyle = .minimal
+        bar.showsCancelButton = true
+        bar.tintColor = NibUIColor.accent
+        bar.searchTextField.font = UIFont.preferredFont(forTextStyle: .body)
+        bar.searchTextField.adjustsFontForContentSizeCategory = true
+        bar.autocapitalizationType = .none
+        bar.autocorrectionType = .no
+        bar.returnKeyType = .search
+        bar.delegate = context.coordinator
+        return bar
+    }
+    func updateUIView(_ bar: Bar, context: Context) {
+        context.coordinator.parent = self
+        if bar.text != text { bar.text = text }
+        bar.placeholder = prompt
+        bar.searchTextField.accessibilityLabel = prompt
+        bar.requestedFocus = focusGeneration
+        bar.focusIfNeeded()
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: Bar, context: Context) -> CGSize? {
+        uiView.sizeThatFits(CGSize(width: proposal.width ?? NibMetrics.searchWidth,
+            height: .greatestFiniteMagnitude))
+    }
+
+    final class Bar: UISearchBar {
+        var requestedFocus = 0
+        private var appliedFocus: Int?
+        override func didMoveToWindow() { super.didMoveToWindow(); focusIfNeeded() }
+        func focusIfNeeded() {
+            guard window != nil, appliedFocus != requestedFocus else { return }
+            appliedFocus = requestedFocus
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window != nil else { return }
+                self.becomeFirstResponder()
+            }
+        }
+    }
+    final class Coordinator: NSObject, UISearchBarDelegate {
+        var parent: SystemSearchField
+        init(_ parent: SystemSearchField) { self.parent = parent }
+        func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) { parent.text = searchText }
+        func searchBarSearchButtonClicked(_ searchBar: UISearchBar) { parent.onSubmit() }
+        func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+            searchBar.resignFirstResponder()
+            parent.onClose()
         }
     }
 }
@@ -51,13 +123,14 @@ struct LibrarySearchFloatingContent: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var viewport: SearchViewport?
+    var belowBars = false
 
     var body: some View {
         GeometryReader { geometry in
             let bounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
             let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
                 windowSize: viewport?.windowSize ?? geometry.size)
-            let top = NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
+            let top = belowBars ? 0 : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
             let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,
                 (viewport?.availableHeight ?? geometry.size.height) - bounds.minY) - top, reservesNavigation: false)
             ZStack(alignment: .top) {
@@ -75,10 +148,10 @@ struct LibrarySearchFloatingContent: View {
                     .frame(width: width)
                     .nibChromeTypeCap()
                     .droplet("searchui.libraryField", style: .bar)
-                    .budsFrom("library.search", isPresented: presentationBinding, instant: state.instant)
+                    .budsFrom("library.controls", isPresented: presentationBinding, instant: state.instant)
                     SearchResults(app: app, session: session, state: state)
                         .frame(width: width)
-                        .frame(height: height)
+                        .frame(height: height, alignment: .top)
                         .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                         .droplet("searchui.libraryResults", style: .panel)
                         .budsFrom("searchui.libraryField", isPresented: presentationBinding, instant: state.instant)
@@ -138,68 +211,58 @@ struct SearchResults: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: NibSpacing.l) {
-                    if !state.query.isEmpty {
-                        ScrollView(.horizontal) {
-                            HStack(spacing: NibSpacing.s) {
-                                ForEach(SearchFilter.allCases) { filter in
-                                    NibChip(filter.title, style: .filter(isSelected: state.filter == filter), action: {
-                                        app.perform(CommandIDs.searchOpen,
-                                            ["scope": .string(state.scope), "filter": .string(filter.rawValue)], session: session)
-                                    })
+        VStack(spacing: 0) {
+            if !state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                SearchFilterHeader(app: app, session: session, state: state)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(1)
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: NibSpacing.l) {
+                        if let error = state.error {
+                            NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again")) {
+                                app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "refresh": true], session: session)
+                            })
+                        } else if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            if state.scope == "lib" {
+                                Text(String(localized: "Recently opened")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
+                                if state.recentRows.isEmpty {
+                                    NibEmptyState(symbol: .recents, title: String(localized: "No recently opened documents"),
+                                        message: String(localized: "Open a notebook, then find it here."))
                                 }
-                            }.padding(.vertical, NibSpacing.s)
-                        }.scrollIndicators(.hidden)
-                    }
-                    if state.remainingPages > 0 {
-                        NibBanner(String(localized: "Indexing ^[\(state.remainingPages) page](inflect: true)…"), style: .info, symbol: .search)
-                    }
-                    if let error = state.error {
-                        NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again")) {
-                            app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "refresh": true], session: session)
-                        })
-                    } else if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        if state.scope == "lib" {
-                            Text(String(localized: "Recently opened")).font(NibFont.headline).accessibilityAddTraits(.isHeader)
-                            if state.recentRows.isEmpty {
-                                NibEmptyState(symbol: .recents, title: String(localized: "No recently opened documents"),
-                                    message: String(localized: "Open a notebook, then find it here."))
-                            }
-                            ForEach(state.recentRows) { row in
-                                Button {
-                                    app.perform(CommandIDs.docOpen, ["doc": .string(row.ref)], session: session)
-                                    app.perform(CommandIDs.searchOpen, ["scope": "lib", "close": true], session: session)
-                                } label: {
-                                    HStack(spacing: NibSpacing.m) {
-                                        Image(nib: .recents).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
-                                        Text(row.title).font(NibFont.body).foregroundStyle(NibColor.label)
-                                        Spacer(minLength: NibSpacing.s)
+                                ForEach(state.recentRows) { row in
+                                    Button {
+                                        app.perform(CommandIDs.docOpen, ["doc": .string(row.ref)], session: session)
+                                        app.perform(CommandIDs.searchOpen, ["scope": "lib", "close": true], session: session)
+                                    } label: {
+                                        HStack(spacing: NibSpacing.m) {
+                                            Image(nib: .recents).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
+                                            Text(row.title).font(NibFont.body).foregroundStyle(NibColor.label)
+                                            Spacer(minLength: NibSpacing.s)
+                                        }
+                                        .padding(.vertical, NibSpacing.s)
+                                        .frame(minHeight: NibMetrics.hitTarget)
                                     }
-                                    .padding(.vertical, NibSpacing.s)
-                                    .frame(minHeight: NibMetrics.hitTarget)
+                                    .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
                                 }
-                                .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
+                            } else {
+                                NibEmptyState(symbol: .search, title: state.scope.hasPrefix("folder:")
+                                    ? String(localized: "Find in this folder") : String(localized: "Find in this document"),
+                                    message: String(localized: "Search handwriting, typed notes and PDF text."))
                             }
+                        } else if let empty = state.emptyPresentation {
+                            NibEmptyState(symbol: .search, title: empty.title, message: empty.message)
+                                .frame(maxWidth: .infinity)
                         } else {
-                            NibEmptyState(symbol: .search, title: state.scope.hasPrefix("folder:")
-                                ? String(localized: "Find in this folder") : String(localized: "Find in this document"),
-                                message: String(localized: "Search handwriting, typed notes and PDF text."))
-                        }
-                    } else if state.visibleMatches.isEmpty && !state.loading {
-                        NibEmptyState(symbol: .search, title: String(localized: "No results for “\(state.query)”"),
-                            message: state.isIndexing
-                                ? String(localized: "Handwriting search needs recognition to finish: ^[\(state.remainingPages) page](inflect: true) left.")
-                                : String(localized: "Try fewer words or choose All to search every source."))
-                    } else {
-                        ForEach(SearchGroup.allCases) { group in
-                            let hits = state.visibleMatches.filter { $0.group == group }
-                            if !hits.isEmpty {
-                                Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
-                                ForEach(hits) { hit in
-                                    SearchResultRow(app: app, session: session, state: state, hit: hit)
-                                        .id(hit.id)
+                            ForEach(SearchGroup.allCases) { group in
+                                let hits = state.visibleMatches.filter { $0.group == group }
+                                if !hits.isEmpty {
+                                    Text(group.title).font(NibFont.headline).accessibilityAddTraits(.isHeader)
+                                    ForEach(hits) { hit in
+                                        SearchResultRow(app: app, session: session, state: state, hit: hit)
+                                            .id(hit.id)
+                                    }
                                 }
                             }
                         }
@@ -210,19 +273,53 @@ struct SearchResults: View {
                             .id(cursor)
                             .onAppear { loadMore() }
                         }
+                        if let indexing = state.indexingMessage {
+                            Text(indexing)
+                                .font(NibFont.footnote)
+                                .foregroundStyle(NibColor.labelSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .foregroundStyle(NibColor.label)
+                    .padding(NibSpacing.l)
                 }
-                .foregroundStyle(NibColor.label)
-                .padding(NibSpacing.l)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .onChange(of: state.selectedID) { _, id in
-                if let id { proxy.scrollTo(id, anchor: .center) }
+                .scrollBounceBehavior(.basedOnSize)
+                .onChange(of: state.selectedID) { _, id in
+                    if let id { proxy.scrollTo(id, anchor: .center) }
+                }
             }
         }
     }
     private func loadMore() {
         app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "more": true], session: session)
+    }
+}
+
+/// Filters never participate in result scrolling or scroll-to-selection. The complete hit
+/// targets, including chip padding, remain inside the panel's inset header.
+@MainActor
+struct SearchFilterHeader: View {
+    let app: NibApp
+    let session: EditorSession
+    @ObservedObject var state: SearchState
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: NibSpacing.s) {
+                ForEach(SearchFilter.allCases) { filter in
+                    NibChip(filter.title, style: .filter(isSelected: state.filter == filter), action: {
+                        app.perform(CommandIDs.searchOpen,
+                            ["scope": .string(state.scope), "filter": .string(filter.rawValue)], session: session)
+                    })
+                }
+            }
+            .frame(minHeight: NibMetrics.hitTarget)
+            .padding(.horizontal, NibSpacing.l)
+            .padding(.vertical, NibSpacing.s)
+        }
+        .scrollIndicators(.hidden)
+        .padding(.top, NibSpacing.s)
+        .accessibilityIdentifier("searchui.filters")
     }
 }
 

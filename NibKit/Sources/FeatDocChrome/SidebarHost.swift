@@ -4,7 +4,8 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
 /// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
-/// Panels providing their own header keep it; the assistant is a standalone panel without navigation tabs.
+/// Panels providing their own header own its actions too; never prepend a second, untitled More row.
+/// The assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
     let side: SidebarSide
@@ -19,13 +20,6 @@ struct SidebarPanelView: View {
         VStack(spacing: 0) {
             if chrome.drawsHeader(selected) {
                 header
-            } else if selected.id != PanelIDs.assistant {
-                HStack {
-                    Spacer(minLength: 0)
-                    PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
-                                       mode: showsModeToggle ? mode : nil,
-                                       additionalPanels: SidebarNavigation.additional(tabs))
-                }
             }
             if selected.id != PanelIDs.assistant { tabStrip }
             Rectangle()

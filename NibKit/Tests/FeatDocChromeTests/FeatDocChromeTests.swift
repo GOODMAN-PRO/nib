@@ -19,6 +19,59 @@ final class FeatDocChromeTests: XCTestCase {
 
     // MARK: Layout view model
 
+    func testPortraitNavigatorMovesSidePaletteAndCompleteOptionsAboveTheWritingArea() throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366)] {
+            for side in SidebarSide.allCases {
+                for edge in [NibDock.leading, .trailing] {
+                    for thickness in [NibMetrics.paletteThickness, NibMetrics.paletteThicknessMax] {
+                        var layout = ChromeLayout(size: size,
+                            safeArea: UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0),
+                            left: side == .left ? NibMetrics.navigatorWidth : nil,
+                            right: side == .right ? NibMetrics.navigatorWidth : nil, mode: .sidebar)
+                        let dock = try XCTUnwrap(ChromePalettePolicy.navigatorDockCorrection(
+                            NibPaletteDock(edge: edge, along: 0.8), layout: layout))
+                        XCTAssertEqual(dock, NibPaletteDock(edge: .top, along: 0.5))
+                        let options = CGSize(width: 320, height: NibMetrics.barHeight)
+                        layout.avoidPalette(dock, thickness: thickness, optionsSize: options)
+                        XCTAssertEqual(layout.editor, CGRect(origin: .zero, size: size))
+                        XCTAssertEqual(layout.editorInsets.left + layout.editorInsets.right, 0)
+                        XCTAssertEqual(layout.editorInsets.top,
+                            layout.bar.maxY + NibSpacing.l + thickness + options.height - 1 + NibSpacing.l)
+                        XCTAssertGreaterThanOrEqual(layout.overlayRegion.minY, layout.editorInsets.top)
+                        XCTAssertGreaterThanOrEqual(layout.floatingRegion.minY, layout.editorInsets.top)
+                        XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(dock, layout: layout),
+                                     "The applied correction must settle without another command.")
+                    }
+                }
+            }
+        }
+    }
+
+    func testNavigatorDockCorrectionPreservesHorizontalDocksAndOtherPresentations() {
+        let portrait = CGSize(width: 834, height: 1194)
+        let open = ChromeLayout(size: portrait, safeArea: .zero, left: NibMetrics.navigatorWidth,
+                                right: nil, mode: .sidebar)
+        for edge in [NibDock.top, .bottom] {
+            XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(NibPaletteDock(edge: edge), layout: open))
+        }
+        let unaffected = [
+            ChromeLayout(size: portrait, safeArea: .zero, left: nil, right: nil, mode: .sidebar),
+            ChromeLayout(size: CGSize(width: 1194, height: 834), safeArea: .zero,
+                         left: NibMetrics.navigatorWidth, right: nil, mode: .sidebar),
+            ChromeLayout(size: portrait, safeArea: .zero, left: NibMetrics.navigatorWidth,
+                         right: nil, mode: .window),
+            ChromeLayout(size: CGSize(width: 393, height: 852), safeArea: .zero,
+                         left: NibMetrics.navigatorWidth, right: nil, mode: .sidebar, idiom: .phone),
+            ChromeLayout(size: portrait, safeArea: .zero, left: nil,
+                         right: NibMetrics.panelWidth, mode: .sidebar, assistantTrailing: true)
+        ]
+        for layout in unaffected {
+            for edge in [NibDock.leading, .trailing] {
+                XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(NibPaletteDock(edge: edge), layout: layout))
+            }
+        }
+    }
+
     func testPortraitSearchSpansBelowBarsRegardlessOfPaletteDockOptionsOrSidebar() throws {
         let safe = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366),
@@ -926,6 +979,31 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertNil(window.assistantPanel(kind: .notebook))
         h.app.ui.panels.register(panel(PanelIDs.assistant, .floating))
         XCTAssertEqual(window.assistantPanel(kind: .notebook)?.id, PanelIDs.assistant)
+    }
+
+    func testSelfHeadedSidebarDoesNotAddAnEmptyPlacementMenuRow() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let heading = NibPanelHeader(title: "Outline", symbol: .outline, onClose: {}) {
+            NibIconButton(.more, label: "Outline Options", size: .round) {}
+        }
+        var selected = PanelDescriptor(id: "outline.tab", title: "Outline", icon: NibSymbol.outline.name,
+                                       placement: .sidebarTab, order: 0, owner: "tests") { _ in AnyView(heading) }
+        selected.providesHeader = true
+        for scheme in [ColorScheme.light, .dark] {
+            let headerHost = UIHostingController(rootView: heading.environment(\.colorScheme, scheme))
+            let sidebarHost = UIHostingController(rootView:
+                SidebarPanelView(chrome: chrome, side: .left, tabs: [selected], selected: selected,
+                                 mode: .sidebar, presentation: .sidebar)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .environment(\.colorScheme, scheme))
+            let proposal = CGSize(width: NibMetrics.navigatorWidth, height: 0)
+            let headerHeight = headerHost.sizeThatFits(in: proposal).height
+            XCTAssertGreaterThan(headerHeight, 0)
+            XCTAssertEqual(sidebarHost.sizeThatFits(in: proposal).height,
+                           headerHeight + NibStroke.hairline, accuracy: 1,
+                           "A self-headed panel contributes its own More and Close; chrome adds no blank row.")
+        }
     }
 
     func testSidebarToggleShowsHidesAndSwitchesMode() async throws {

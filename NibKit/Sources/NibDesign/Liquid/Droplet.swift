@@ -221,6 +221,8 @@ struct DropletBodyModifier: ViewModifier {
                     .padding(.vertical, dy)
             }
             .modifier(GlassIDModifier(id: id, namespace: namespace))
+            .modifier(NibGlassBackdropModifier(kind: style.glassKind, shape: shape, frozen: field.isFrozen,
+                                               recedes: presentation.recedes))
             // The container draws the contrast/frozen body behind GlassEffectContainer. A background
             // here belongs to that container's content, above its combined native backdrop effect.
             .overlay {

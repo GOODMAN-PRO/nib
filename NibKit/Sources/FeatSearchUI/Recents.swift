@@ -131,6 +131,26 @@ struct SearchSnippet {
     var scale: Double
 }
 
+/// A query with no visible matches always explains whether work is pending or complete.
+enum SearchEmptyPresentation: Equatable {
+    case searching, indexing, noResults(String)
+
+    var title: String {
+        switch self {
+        case .searching: return String(localized: "Searching your notes…")
+        case .indexing: return String(localized: "Handwriting is still being indexed.")
+        case .noResults(let query): return String(localized: "No results for “\(query)”")
+        }
+    }
+    var message: String {
+        switch self {
+        case .searching: return String(localized: "Results will appear here as the search finishes.")
+        case .indexing: return String(localized: "Try typed text or check again when recognition finishes.")
+        case .noResults: return String(localized: "Try fewer words or choose All to search every source.")
+        }
+    }
+}
+
 @MainActor
 final class SearchState: ObservableObject {
     @Published var scope = "lib"
@@ -158,6 +178,20 @@ final class SearchState: ObservableObject {
     var isLibraryScope: Bool { scope == "lib" || scope.hasPrefix("folder:") }
     var remainingPages: Int { max(0, progress?.pending ?? 0) }
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
+    var emptyPresentation: SearchEmptyPresentation? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, error == nil, visibleMatches.isEmpty else { return nil }
+        if loading { return .searching }
+        if isIndexing { return .indexing }
+        return .noResults(trimmed)
+    }
+    var indexingMessage: String? {
+        guard isIndexing else { return nil }
+        if remainingPages > 0 {
+            return String(localized: "Handwriting in ^[\(remainingPages) page](inflect: true) is still being indexed.")
+        }
+        return String(localized: "Handwriting is still being indexed.")
+    }
     /// Document navigation always has an active hit as soon as results arrive. Library search
     /// keeps its unselected count until a row is opened. Preserve selection across refreshes.
     func reconcileSelection() {
@@ -203,10 +237,10 @@ final class SearchRuntime {
         let state = SearchState()
         state.progress = progress
         states[session.id] = state
-        var wasOpen = session.openPanels.contains(SearchOpen.documentPanel)
+        var wasOpen = session.openPanels.contains(SearchOpen.documentPanel) || session.openPanels.contains(SearchOpen.libraryPanel)
         panelSubscriptions[session.id] = session.$openPanels.sink { [weak self, weak state, weak session] panels in
-            let open = panels.contains(SearchOpen.documentPanel)
-            if wasOpen && !open, let state, !state.isLibraryScope {
+            let open = panels.contains(SearchOpen.documentPanel) || panels.contains(SearchOpen.libraryPanel)
+            if wasOpen && !open, let state {
                 state.isPresented = false
                 state.generation += 1
                 state.loading = false

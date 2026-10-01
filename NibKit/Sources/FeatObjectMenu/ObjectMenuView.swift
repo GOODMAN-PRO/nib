@@ -164,6 +164,25 @@ enum ObjectMenuPlacement {
     /// Below it: past the bottom handles' hit areas.
     static let gapBelow = NibMetrics.hitTarget / 2 + NibSpacing.xs
 
+    /// The canvas already receives the chrome's reserved insets, including a docked palette and its options.
+    @MainActor
+    static func viewport(in view: UIView) -> CGRect {
+        // Scroll content insets also contain page-centring space; that is usable for the menu. The safe area
+        // carries EditorHost's additional chrome insets without excluding those blank page margins.
+        return view.bounds.inset(by: view.safeAreaInsets)
+    }
+
+    static func availableBounds(container: CGRect, viewport: CGRect?) -> CGRect {
+        guard let viewport else { return container }
+        return container.intersection(viewport)
+    }
+
+    /// Overflow stays in More, preserving 44 pt actions even in a narrow canvas beside an open panel.
+    static func quickLimit(width: CGFloat, compact: Bool) -> Int {
+        let slots = Int(max(0, width - NibMetrics.chromeInset * 2 - NibSpacing.xs * 2) / NibMetrics.hitTarget)
+        return min(compact ? ObjectMenuComposer.compactQuick : ObjectMenuComposer.regularQuick, max(0, slots - 1))
+    }
+
     /// `top` / `bottom`: what the chrome and safe area keep clear at the container's top and bottom.
     static func place(bar: CGSize, selection: CGRect, in bounds: CGRect, top: CGFloat, bottom: CGFloat) -> Result? {
         guard !selection.isNull, !selection.isInfinite, !bounds.isEmpty,
@@ -281,6 +300,7 @@ final class ObjectMenuModel: ObservableObject {
     @Published private(set) var header: String?
     /// The selection in the floating host's container coordinates (`.null` = none).
     @Published private(set) var anchor: CGRect = .null
+    @Published private(set) var viewport: CGRect?
     @Published var isShown = false
     @Published var colourOpen = false {
         didSet {
@@ -373,11 +393,16 @@ final class ObjectMenuModel: ObservableObject {
         colourOpen = false
         styleOpen = false
         anchor = .null
+        viewport = nil
         lastApplied = nil
     }
 
     func setAnchor(_ rect: CGRect) {
         if anchor != rect { anchor = rect }
+    }
+
+    func setViewport(_ rect: CGRect?) {
+        if viewport != rect { viewport = rect }
     }
 
     func nodes(_ entries: [ObjectMenuEntry]) -> [ObjectMenuNode] { ObjectMenuComposer.group(entries) }
@@ -477,13 +502,18 @@ struct ObjectMenuOverlay: View {
             // Only the final position is translated back to the overlay's local coordinates.
             let bounds = proxy.frame(in: NibLiquid.space)
             let origin = bounds.origin
-            let top = ObjectMenuPlacement.topReserve(safeTop: proxy.safeAreaInsets.top)
-            let placement = ObjectMenuPlacement.place(bar: barSize, selection: model.anchor, in: bounds, top: top,
-                                                      bottom: proxy.safeAreaInsets.bottom + NibMetrics.chromeInset)
+            let available = ObjectMenuPlacement.availableBounds(container: bounds, viewport: model.viewport)
+            let top = max(NibMetrics.chromeInset,
+                          bounds.minY + ObjectMenuPlacement.topReserve(safeTop: proxy.safeAreaInsets.top) - available.minY)
+            let bottom = max(NibMetrics.chromeInset,
+                             available.maxY - bounds.maxY + proxy.safeAreaInsets.bottom + NibMetrics.chromeInset)
+            let placement = ObjectMenuPlacement.place(bar: barSize, selection: model.anchor, in: available,
+                                                      top: top, bottom: bottom)
             ZStack(alignment: .topLeading) {
                 if model.isShown, model.hasEntries, let placement {
                     ObjectMenuBar(model: model,
-                                  maxQuick: sizeClass == .compact ? ObjectMenuComposer.compactQuick : ObjectMenuComposer.regularQuick)
+                                  maxQuick: ObjectMenuPlacement.quickLimit(width: available.width,
+                                                                          compact: sizeClass == .compact))
                         .fixedSize()
                         .onGeometryChange(for: CGSize.self) { $0.size } action: { barSize = $0 }
                         .droplet(ObjectMenuIDs.bar, style: ObjectMenuStyle.capsule)
@@ -497,7 +527,7 @@ struct ObjectMenuOverlay: View {
             .onChange(of: placement, initial: true) { _, p in
                 guard let p else { return }
                 let room = p.centre.y - barSize.height / 2 - ObjectMenuPlacement.colourPopoverHeight - NibMetrics.popoverGap
-                let above = p.above && room >= bounds.minY + top
+                let above = p.above && room >= available.minY + top
                 if model.colourAbove != above { model.colourAbove = above }
             }
         }

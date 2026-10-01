@@ -360,7 +360,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             return
         }
         // Both this comparison and the overlay's bounds use NibLiquid.space. Canvas coordinates alone miss a
-        // sidebar / safe-area change, while exact equality can keep postponing reshow for subpixel layout noise.
+        // sidebar / safe-area change. Ignore subpixel noise when deciding whether to close secondary popovers.
         let tolerance = 1 / max(host.canvasView.traitCollection.displayScale, 1)
         let moved = !contentChanged && lastContainerRect.map {
             abs($0.minX - rect.minX) > tolerance || abs($0.minY - rect.minY) > tolerance
@@ -368,19 +368,20 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         } == true
         if contentChanged || moved || lastContainerRect == nil { lastContainerRect = rect }
         model.setAnchor(rect)
-        if contentChanged {
-            reshow?.cancel()
-            reshow = nil
-        }
+        // The canvas's safe area reserves the bars, palette and docked panels. Convert that viewport into
+        // the same space as the selection rather than clamping against the whole window behind its chrome.
+        let viewport = ObjectMenuPlacement.viewport(in: host.canvasView)
+        model.setViewport(target.containerRect(viewport, from: host.canvasView))
         if moved {
-            // Scrolling or zooming: out of the way until the page settles (like the system edit menu).
-            model.isShown = false
+            // Close secondary popovers as their source moves, but keep selection actions attached to the ink.
             model.colourOpen = false
             model.styleOpen = false
-            scheduleReshow(restart: true)
-        } else if reshow == nil {
-            show()
         }
+        // A valid anchor is sufficient to show the menu. Layout callbacks must not keep postponing its reveal;
+        // retries are only for missing geometry or a floating host that has not joined the window yet.
+        reshow?.cancel()
+        reshow = nil
+        show()
     }
 
     private func show() {
@@ -401,9 +402,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         reshow = nil
     }
 
-    private func scheduleReshow(restart: Bool = false) {
-        guard restart || reshow == nil else { return }
-        reshow?.cancel()
+    private func scheduleReshow() {
+        guard reshow == nil else { return }
         reshow = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }

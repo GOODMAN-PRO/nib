@@ -3,6 +3,14 @@ import XCTest
 /// Cross-feature acceptance belongs here, with scenario names visible in CI's XCTest report.
 @MainActor
 final class IntegrationTests: XCTestCase {
+    func testLibraryCaptureRecipeDismissesSearchBeforeListAndFolderStates() async throws {
+        try await Scenarios.libraryCaptureStates()
+    }
+
+    func testLassoCaptureRecipeRevealsShapeAndReportsSelectionBeforeObjectMenu() async throws {
+        try await Scenarios.lassoCaptureState()
+    }
+
     func testCanvasPencilKitHandoffCommitsInkAndUndoRedo() async throws {
         try await Scenarios.canvasToInk()
     }

@@ -447,23 +447,36 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
-    func testCompactHeightPresentsFoldersBesideCompleteDocumentCards() async throws {
+    func testCompactHeightPresentsFoldersAboveThreeCompleteDocumentColumns() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         let folder = LibraryRow(ref: "folder:LANDSCAPE01", kind: "folder", title: "Semester Notes")
-        let document = LibraryRow(ref: "doc:LANDSCAPE02", kind: "notebook", title: "Physics", pages: 12)
-        model.rows = [folder, document]
+        let documents = (0..<3).map {
+            LibraryRow(ref: "doc:LANDSCAPE0\($0 + 2)", kind: "notebook", title: "Physics \($0)", pages: 12)
+        }
+        model.rows = [folder] + documents
         model.applySort()
         for width: CGFloat in [520, 656] {
-            var frames: [String: CGRect] = [:]
-            let view = LibraryGridView(model: model, compactHeight: true)
-                .environment(\.horizontalSizeClass, .compact)
-                .onPreferenceChange(LibraryFrames.self) { frames = $0 }
-            _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 250), variant: .light)
-            let folderFrame = try XCTUnwrap(frames[folder.ref])
-            let documentFrame = try XCTUnwrap(frames[document.ref])
-            XCTAssertGreaterThanOrEqual(documentFrame.minX, folderFrame.maxX + NibSpacing.l - 0.5)
-            XCTAssertLessThanOrEqual(documentFrame.maxY, 250, "The cover, title and metadata must fit initially")
-            XCTAssertLessThanOrEqual(documentFrame.maxX, width)
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                let view = LibraryGridView(model: model, compactHeight: true)
+                    .environment(\.horizontalSizeClass, .compact)
+                    .onPreferenceChange(LibraryFrames.self) { frames = $0 }
+                _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 393), variant: variant)
+                let folderFrame = try XCTUnwrap(frames[folder.ref])
+                let documentFrames = try documents.map { try XCTUnwrap(frames[$0.ref]) }.sorted { $0.minX < $1.minX }
+                for frame in documentFrames {
+                    XCTAssertGreaterThanOrEqual(frame.minY, folderFrame.maxY + NibSpacing.s)
+                    XCTAssertEqual(frame.minY, documentFrames[0].minY, accuracy: 0.5, "All three covers must share the first document row")
+                    XCTAssertEqual(frame.width, NibMetrics.coverSizeCompact.width, accuracy: 0.5)
+                    XCTAssertGreaterThan(frame.height, NibMetrics.coverSizeCompact.height, "Keep title and metadata below the complete cover")
+                    XCTAssertLessThanOrEqual(frame.maxY, 393, "The cover, title and metadata must fit initially")
+                    XCTAssertLessThanOrEqual(frame.maxX, width)
+                }
+                XCTAssertEqual(documentFrames[0].minX, folderFrame.minX, accuracy: 0.5)
+                for index in 1..<documentFrames.count {
+                    XCTAssertEqual(documentFrames[index].minX - documentFrames[index - 1].maxX, NibSpacing.l, accuracy: 0.5)
+                }
+            }
         }
     }
 
@@ -474,12 +487,121 @@ final class FeatLibraryUITests: XCTestCase {
         for folder in [nil, model.allFolders.first?.nodeID] {
             model.folder = folder
             var targets: [String: CGRect] = [:]
+            var chrome: [String: CGRect] = [:]
             let view = LibraryRootView(model: model, idiom: .pad)
                 .onPreferenceChange(LibraryTargets.self) { targets = $0 }
+                .onPreferenceChange(LibraryChromeFrames.self) { chrome = $0 }
             _ = try await hostlessLayoutImage(view, size: CGSize(width: 834, height: 1194), variant: .light)
             XCTAssertEqual(targets["breadcrumb:lib"] != nil, folder != nil)
+            if folder != nil {
+                let back = try XCTUnwrap(chrome["parent.navigation"])
+                let heading = try XCTUnwrap(chrome["title"])
+                let metadata = try XCTUnwrap(chrome["metadata"])
+                XCTAssertEqual(back.midY, heading.midY, accuracy: 0.5)
+                XCTAssertLessThanOrEqual(back.maxX, heading.minX)
+                XCTAssertLessThanOrEqual(back.maxY, metadata.minY)
+            }
         }
         XCTAssertFalse(model.allFolders.isEmpty, "The ancestor check requires a folder fixture")
+    }
+
+    func testNestedFolderBackControlReturnsToImmediateParent() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.allFolders = [
+            LibraryRow(ref: "folder:PARENTFOLD01", kind: "folder", title: "Semester"),
+            LibraryRow(ref: "folder:CHILDFOLD001", kind: "folder", title: "Physics", parent: "folder:PARENTFOLD01")
+        ]
+        model.folder = NibID("CHILDFOLD001")
+        XCTAssertEqual(model.parentNavigation?.title, "Semester")
+        XCTAssertEqual(model.parentNavigation?.ref, "folder:PARENTFOLD01")
+        model.folder = NibID("PARENTFOLD01")
+        XCTAssertEqual(model.parentNavigation?.ref, "lib")
+        model.folder = nil
+        XCTAssertNil(model.parentNavigation)
+    }
+
+    func testCompactStorageNoticeFitsTwoCalloutLinesWithInlineAction() async throws {
+        for width: CGFloat in [343, 361, 520] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                let view = LibraryStorageNotice {}.coordinateSpace(name: "library.chrome")
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 }
+                _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 100), variant: variant)
+                let message = try XCTUnwrap(frames["storage.message"])
+                let action = try XCTUnwrap(frames["storage.action"])
+                XCTAssertLessThanOrEqual(message.height, 2 * NibUIFont.callout.lineHeight + 1)
+                XCTAssertGreaterThanOrEqual(action.minX, message.maxX + NibSpacing.s - 0.5)
+                XCTAssertEqual(action.midY, message.midY, accuracy: 0.5)
+                XCTAssertGreaterThanOrEqual(action.height, NibMetrics.hitTarget)
+                XCTAssertLessThanOrEqual(action.maxX, width)
+            }
+        }
+    }
+
+    func testStorageActionOpensDestinationWithFullWarningAndRecoveryChoices() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.ui.panels.register(PanelDescriptor(id: PanelIDs.cloudBackup, title: "Cloud & Backup", icon: NibSymbol.folder.name,
+            placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        model.openStorageDetails()
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(model.modal?.id, PanelIDs.cloudBackup)
+        XCTAssertEqual(model.modal?.presentation, .sheet)
+        XCTAssertTrue(h.session.openPanels.contains(PanelIDs.cloudBackup))
+    }
+
+    func testSidebarDestinationsCountsAndCollectionNavigation() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        for (id, title, symbol) in [(PanelIDs.gallery, "Gallery", NibSymbol.gallery),
+                                     (PanelIDs.trash, "Trash", .trash),
+                                     ("collabpresence.shared", "Shared", .shared),
+                                     (PanelIDs.favourites, "Favourites", .favorites)] {
+            h.app.ui.panels.register(PanelDescriptor(id: id, title: title, icon: symbol.name,
+                placement: .libraryTab, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        }
+        h.app.settings.declarePrefix("searchui.recent.", synced: false, summary: "Test recent documents", owner: "test")
+        h.app.settings.setJSON("searchui.recent." + Fixtures.docID.raw, .number(200))
+        h.app.settings.setJSON("searchui.recent." + Fixtures.studySetID.raw, .number(100))
+        h.app.settings.setJSON("searchui.recent.MISSINGDOC01", .number(300))
+        try h.library.move(Fixtures.studySetID, to: Fixtures.folderID)
+        await model.appear()
+        XCTAssertEqual(model.sidebarPlaces.map(\.id), ["documents", PanelIDs.favourites, "collabpresence.shared", "recents", "studySets", PanelIDs.gallery, PanelIDs.trash])
+        XCTAssertEqual(model.sidebarCounts["documents"], h.library.allNodes().filter { $0.kind == .document }.count)
+        XCTAssertEqual(model.sidebarCounts["recents"], 2, "Stale recent records must not inflate the count")
+        XCTAssertEqual(model.sidebarCounts["studySets"], 1)
+        XCTAssertEqual(model.sidebarCounts["folder:" + Fixtures.folderID.raw], h.library.children(of: Fixtures.folderID).count)
+        XCTAssertEqual(model.sidebarCounts[PanelIDs.trash], h.library.trashedNodes().count)
+
+        let result = try await h.app.bus.execute(CommandIDs.librarySetView, ["collection": "recents", "sidebar": false], session: h.session)
+        XCTAssertEqual(result["collection"], "recents")
+        XCTAssertEqual(model.title, "Recents")
+        XCTAssertEqual(model.documentRefs, [NodeRef.document(Fixtures.docID).description, NodeRef.document(Fixtures.studySetID).description])
+        XCTAssertTrue(model.folderRows.isEmpty)
+        XCTAssertFalse(model.sidebarVisible)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["collection": "studySets"], session: h.session)
+        XCTAssertEqual(model.documentRefs, [NodeRef.document(Fixtures.studySetID).description], "Study Sets must include nested documents")
+        XCTAssertEqual(model.title, "Study Sets")
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": .string("folder:" + Fixtures.folderID.raw)], session: h.session)
+        XCTAssertEqual(model.collection, .documents)
+        XCTAssertEqual(model.parentNavigation?.ref, "lib")
+        XCTAssertEqual(model.sidebarCounts["recents"], 2, "Counts must remain library-wide inside a folder")
+        try h.library.trash(Fixtures.studySetID)
+        await model.reload()
+        XCTAssertEqual(model.sidebarCounts["studySets"], 0)
+        XCTAssertEqual(model.sidebarCounts["recents"], 1)
+        XCTAssertEqual(model.sidebarCounts[PanelIDs.trash], h.library.trashedNodes().count)
+    }
+
+    func testCollectionDryRunDoesNotChangeFolderOrSelection() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": .string("folder:" + Fixtures.folderID.raw)], session: h.session)
+        model.selection.isSelecting = true
+        model.selection.refs = [NodeRef.document(Fixtures.docID).description]
+        let result = try await h.app.bus.execute(Invocation(command: CommandIDs.librarySetView, params: ["collection": "studySets"], session: h.session, dryRun: true))
+        XCTAssertEqual(result.value["collection"], "studySets")
+        XCTAssertEqual(model.collection, .documents)
+        XCTAssertEqual(model.folder, Fixtures.folderID)
+        XCTAssertTrue(model.selection.isSelecting)
+        XCTAssertEqual(model.selection.refs, [NodeRef.document(Fixtures.docID).description])
     }
 
     func testFolderColumnsPreserveOrdinaryNamesBeforeAddingColumns() {

@@ -674,6 +674,101 @@ final class FeatWindowsTests: XCTestCase {
         withExtendedLifetime(roots) {}
     }
 
+    func testTabsMenuDoesNotRequireAFloatingPresentationAndFollowsVisibilityPolicy() async throws {
+        let (h, scenes, hooks) = try windows()
+        let navigator = window(h, scenes)
+        let descriptor = try XCTUnwrap(h.app.ui.toolbar.get("windows.tabs.menu"))
+        let provider = try XCTUnwrap(descriptor.compactStatus)
+        XCTAssertTrue(descriptor.showsInCompactWidth)
+        XCTAssertFalse(descriptor.hideable)
+        h.app.settings.set(WindowSettings.showTabs, true)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        for compact in [true, false] {
+            let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                        kind: .notebook, isCompact: compact)
+            XCTAssertNil(provider(context), "A single document needs no switcher")
+        }
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        XCTAssertNil(navigator.rootViewController)
+        XCTAssertNil(navigator.floatingHost)
+        for compact in [true, false] {
+            let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                        kind: .whiteboard, isCompact: compact)
+            XCTAssertNotNil(provider(context), "Tabs must be reachable before makeTabBar attaches a presentation")
+            XCTAssertNotNil(hooks.makeTabBar(navigator)) // legacy host, still no document presentation
+            XCTAssertNotNil(provider(context))
+            h.app.settings.set(WindowSettings.showTabs, false)
+            XCTAssertNil(provider(context))
+            h.app.settings.set(WindowSettings.showTabs, true)
+            XCTAssertNotNil(provider(context))
+        }
+        navigator.closeDocument(notebook)
+        let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                    kind: .whiteboard, isCompact: true)
+        XCTAssertNil(provider(context), "Closing the other document removes the switcher")
+        navigator.addTab(notebook)
+        XCTAssertNotNil(provider(context))
+        navigator.showLibrary(folder: nil)
+        XCTAssertNil(provider(context), "The document switcher does not belong on the library bar")
+    }
+
+    func testPhoneTabsOverflowHasAVisibleHitTargetInBothOrientationsAndAppearances() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        h.app.settings.set(WindowSettings.showTabs, true)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let descriptor = try XCTUnwrap(h.app.ui.toolbar.get("windows.tabs.menu"))
+        let provider = try XCTUnwrap(descriptor.compactStatus)
+        let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                    kind: .whiteboard, isCompact: true)
+
+        // Phone landscape also uses compact chrome. Exercise the actual registered menu without a capsule host.
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 852, height: 393)] {
+            for appearance in [ColorScheme.light, .dark] {
+                let menu = try XCTUnwrap(provider(context))
+                var menuFrame = CGRect.zero
+                let root = NibDropletContainer {
+                    HStack(spacing: NibSpacing.l) {
+                        NibBarGroup(id: "test.leading") {
+                            NibToolbarItem(.back, label: "Library") {}
+                            NibBarTitle(title: "A long document title that must truncate")
+                            menu
+                                .fixedSize(horizontal: true, vertical: false)
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                                    menuFrame = $0
+                                }
+                        }
+                        NibBarGroup(id: "test.trailing") {
+                            NibToolbarItem(.undo, label: "Undo") {}
+                            NibToolbarItem(.assistant, label: "Assistant") {}
+                            NibToolbarItem(.more, label: "More") {}
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .padding(.horizontal, NibMetrics.chromeInset)
+                }
+                .environment(\.colorScheme, appearance)
+                let hosting = UIHostingController(rootView: root)
+                hosting.safeAreaRegions = []
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = hosting
+                window.isHidden = false
+                defer {
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                hosting.view.layoutIfNeeded()
+                try await waitUntil { menuFrame.width >= NibMetrics.hitTarget }
+                XCTAssertGreaterThanOrEqual(menuFrame.height, NibMetrics.hitTarget)
+                XCTAssertGreaterThanOrEqual(menuFrame.minX, NibMetrics.chromeInset)
+                XCTAssertLessThanOrEqual(menuFrame.maxX, size.width - NibMetrics.chromeInset)
+                XCTAssertGreaterThanOrEqual(menuFrame.minY, 0)
+                XCTAssertLessThanOrEqual(menuFrame.maxY, size.height)
+            }
+        }
+    }
+
     func testDocumentTabsUseTheExistingFloatingHostWithoutMovingTheBars() async throws {
         let (h, scenes, hooks) = try windows()
         h.app.settings.set(WindowSettings.showTabs, true)

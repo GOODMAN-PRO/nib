@@ -115,7 +115,7 @@ struct DocumentSearchPanel: View {
             VStack(spacing: NibMetrics.minimumRestingGap) {
                 DocumentSearchField(app: app, session: session, state: state)
                 SearchResults(app: app, session: session, state: state)
-                    .frame(height: height)
+                    .frame(height: height, alignment: .top)
                     .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                     .droplet("searchui.documentResults", style: .panel)
                     .budsFrom("searchui.documentField", isPresented: presentationBinding, instant: state.instant)
@@ -145,29 +145,9 @@ struct DocumentSearchSheet: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
-    @State private var searchPresented = true
-
     var body: some View {
-        NavigationStack {
-            SearchResults(app: app, session: session, state: state)
-                .background(NibColor.background)
-                .navigationTitle(String(localized: "Search"))
-                .navigationBarTitleDisplayMode(.inline)
-                .searchable(text: searchBinding(app: app, session: session, state: state),
-                    isPresented: $searchPresented,
-                    placement: .navigationBarDrawer(displayMode: .always), prompt: String(localized: "Find in this document"))
-                .onSubmit(of: .search) {
-                    app.perform(CommandIDs.searchStep, ["direction": "next"], session: session)
-                }
-                .onChange(of: state.focusGeneration) { _, _ in searchPresented = true }
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button(String(localized: "Close search")) {
-                            app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
-                        }
-                    }
-                }
-        }
+        PhoneSearchContent(app: app, session: session, state: state,
+            prompt: String(localized: "Find in this document"))
         .onAppear {
             if !state.isPresented || state.isLibraryScope {
                 app.perform(CommandIDs.searchOpen, ["scope": "document", "instant": true], session: session)

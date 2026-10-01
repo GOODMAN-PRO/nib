@@ -269,6 +269,77 @@ final class FeatCanvasTests: XCTestCase {
         }
     }
 
+    func testLandscapeOpeningTextClearsBottomOptionsAndLassoChevron() async throws {
+        let size = CGSize(width: 874, height: 402)
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            for settingsOnly in [false, true] {
+                let h = Harness(features: [FeatCanvasFeature.self])
+                h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+                h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+                h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                    id: "test.openingTool", title: "Opening Tool", icon: "", group: .lasso, order: 0,
+                    owner: "test", toolID: h.session.tool,
+                    activeToolMenu: settingsOnly ? nil : { _ in AnyView(EmptyView()) },
+                    settings: { _ in AnyView(EmptyView()) }))
+                // The heading and two-line opening paragraph have enough blank header to recover useful height.
+                let title = Item(kind: .text, text: TextBoxItem(
+                    frame: Frame(x: 72, y: 72, w: 400, h: 32), text: RichText(plain: "Motion & forces")))
+                let body = Item(kind: .text, text: TextBoxItem(
+                    frame: Frame(x: 72, y: 128, w: 440, h: 40),
+                    text: RichText(plain: "Understanding how objects move\nVelocity, acceleration and Newton's laws")))
+                _ = try await h.insert([title, body], page: Fixtures.page2)
+                let vc = try makeCanvas(h, page: Fixtures.page2, size: size)
+                defer { vc.closeCanvas() }
+                vc.traitOverrides.horizontalSizeClass = .compact
+                vc.overrideUserInterfaceStyle = appearance
+                vc.view.setNeedsLayout()
+                vc.view.layoutIfNeeded()
+                let region = DropletDockModel.region(size: size, safeArea: EdgeInsets(), compact: true)
+                XCTAssertGreaterThanOrEqual(vc.scrollView.chromeInsets.bottom,
+                    size.height - region.maxY + NibMetrics.paletteThickness + NibMetrics.barHeight + NibSpacing.l,
+                    "both a full options bar and a settings-only chevron reserve the entire arm before measurement")
+                // Apply EditorHost's measured landscape geometry directly so this regression is independent of
+                // the test runner's physical device/orientation. Hosted automatic refits are tested below.
+                let bottomExtra = NibMetrics.barHeight - 1
+                for tabs in [CGFloat.zero, NibMetrics.tabCapsuleHeight, 0] {
+                    vc.scrollView.chromeInsets = CanvasChromeInsets.resolve(
+                        safeArea: UIEdgeInsets(top: tabs, left: 62, bottom: 21 + bottomExtra, right: 62),
+                        additional: UIEdgeInsets(top: tabs, left: 0, bottom: bottomExtra, right: 0),
+                        compact: true, topDocked: false, fallbackTop: nil)
+                    vc.reloadAll()
+                    vc.setZoom(vc.fitZoom, anchor: nil, centreFit: true)
+                    let clearance = unobscured(vc)
+                    let transform = try XCTUnwrap(vc.host.pageTransform(Fixtures.page2))
+                    let headingRect = h.app.content.paintBounds(for: title).cg.applying(transform)
+                    let bodyRect = h.app.content.paintBounds(for: body).cg.applying(transform)
+                    XCTAssertGreaterThanOrEqual(headingRect.minY, clearance.minY)
+                    XCTAssertLessThanOrEqual(bodyRect.maxY, clearance.maxY,
+                                             "the full paragraph clears the options lens, including with tabs")
+                    XCTAssertEqual(vc.scrollView.chromeInsets.bottom,
+                                   21 + bottomExtra + NibMetrics.canvasBottomInsetCompact)
+                    XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
+                    XCTAssertEqual(h.session.page, Fixtures.page2)
+                    let position = windowPoint(vc, Point(72, 128), Fixtures.page2)
+                    vc.reloadAll()
+                    XCTAssertEqual(windowPoint(vc, Point(72, 128), Fixtures.page2).y, position.y, accuracy: 0.5)
+                }
+                vc.scrollBy(dx: 0, dy: 24, windowFractions: false, animated: false)
+                let manualPosition = windowPoint(vc, Point(72, 128), Fixtures.page2)
+                vc.scrollView.chromeInsets.bottom += NibSpacing.m
+                vc.reloadAll()
+                XCTAssertEqual(windowPoint(vc, Point(72, 128), Fixtures.page2).y, manualPosition.y, accuracy: 0.5,
+                               "a later options measurement does not move a manually chosen reading position")
+                // Explicit fit uses the opening content again; a blank page still starts at its top edge.
+                vc.setZoom(vc.fitZoom, anchor: nil, centreFit: true)
+                let titleBounds = h.app.content.paintBounds(for: title)
+                XCTAssertEqual(windowPoint(vc, Point(titleBounds.x, titleBounds.y), Fixtures.page2).y,
+                               vc.scrollView.chromeInsets.top + NibSpacing.m, accuracy: 0.5)
+                vc.goToPage(Fixtures.pdfPage, animated: false)
+                XCTAssertEqual(windowPoint(vc, .zero, Fixtures.pdfPage).y, vc.scrollView.chromeInsets.top, accuracy: 0.5)
+            }
+        }
+    }
+
     func testMeasuredChromeAndTabsRefitUntouchedPagesAndPreserveManualAnchors() throws {
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834),
                      CGSize(width: 844, height: 390)] {

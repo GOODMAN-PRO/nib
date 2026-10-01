@@ -509,7 +509,8 @@ private struct TabStripDocumentView: View {
 /// a long title, Dynamic Type, Split View or Stage Manager leaves no room for a separate tab capsule.
 struct DocumentTabsMenu: View {
     @ObservedObject var model: TabStripModel
-    let placement: TabStripDocumentPresentation
+    // A compact window needs the menu even before the optional floating capsules can be attached.
+    let placement: TabStripDocumentPresentation?
     let compact: Bool
     @Environment(\.layoutDirection) private var layoutDirection
 
@@ -541,18 +542,23 @@ struct DocumentTabsMenu: View {
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .accessibilityLabel(String(localized: "Tabs"))
         .accessibilityValue(String(localized: "\(model.tabs.count) open documents"))
+        .accessibilityIdentifier("windows.tabs.menu")
         .background {
             GeometryReader { proxy in
                 let frame = proxy.frame(in: NibLiquid.space)
                 Color.clear
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { frame in
-                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                    }
+                    .onChange(of: placement.map { ObjectIdentifier($0) }) { _, _ in
+                        // Attaching the capsule host need not move the already-visible menu.
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
                     }
                     .onChange(of: compact) { _, compact in
-                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
                     }
                     .onChange(of: layoutDirection) { _, direction in
-                        placement.updateAnchor(frame, compact: compact, rightToLeft: direction == .rightToLeft)
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: direction == .rightToLeft)
                     }
             }
             .allowsHitTesting(false)

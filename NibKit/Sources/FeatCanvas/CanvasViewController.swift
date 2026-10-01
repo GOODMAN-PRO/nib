@@ -260,7 +260,10 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         inkingObservation = session.inking.observe { [weak self] signal in self?.inkingChanged(signal) }
         // @Published emits before the value changes: read the session on the next turn.
         let main = DispatchQueue.main
-        session.$tool.dropFirst().receive(on: main).sink { [weak self] _ in self?.host.syncActiveTool() }
+        session.$tool.dropFirst().receive(on: main).sink { [weak self] _ in
+            self?.host.syncActiveTool()
+            self?.view.setNeedsLayout()
+        }
             .store(in: &subscriptions)
         session.$selection.dropFirst().receive(on: main).sink { [weak self] _ in self?.canvasDidChange() }
             .store(in: &subscriptions)
@@ -329,18 +332,20 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // MARK: Layout
 
-    /// Room for the chrome (bars at the top; on iPhone the palette at the bottom, DESIGN.md §14.2) so a page at fit
-    /// starts below the bars and its last line scrolls above the palette.
+    /// Room for the complete chrome footprint (bars, palette and options, DESIGN.md §14.2), so opening content
+    /// and the last line can clear every docked control.
     private func updateChromeInsets() {
         let safe = view.safeAreaInsets
         var fallbackTop: CGFloat?
+        var fallbackBottom: CGFloat?
         var topDocked = false
         if app.ui.screens.toolbarView != nil, !session.readOnly {
             let savedName = app.settings.json(CommandIDs.toolbarDock)?["edge"]?.stringValue
             let savedEdge = savedName.flatMap { NibDock(commandValue: $0) }
             let defaultEdge: NibDock = isCompact ? .bottom : (view.bounds.width > view.bounds.height ? .leading : .top)
-            if (savedEdge ?? defaultEdge) == .top {
-                topDocked = true
+            let edge = savedEdge ?? defaultEdge
+            topDocked = edge == .top
+            if edge == .top || edge == .bottom {
                 // EditorHost passes the chrome's occupied bounds through additionalSafeAreaInsets,
                 // less the canvas baseline. Never feed that clearance back into the dock geometry.
                 let region = DropletDockModel.region(
@@ -354,12 +359,22 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
                     UIFontMetrics(forTextStyle: .body)
                         .scaledValue(for: NibMetrics.paletteThickness, compatibleWith: traitCollection)))
                 // Standalone editors have no measured chrome; use the shared dock metrics as a fallback.
-                fallbackTop = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+                if topDocked {
+                    fallbackTop = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+                } else {
+                    let active = app.ui.toolbarItems(for: kind).first { ($0.toolID ?? $0.id) == session.tool }
+                    let hasOptions = app.ui.toolMenus.get(session.tool) != nil
+                        || active?.activeToolMenu != nil || active?.settings != nil
+                    // Settings-only tools (including lasso) still have an options chevron above the palette.
+                    // Reserve the complete arm, plus paper clearance; measured host bounds take precedence.
+                    fallbackBottom = view.bounds.height - region.maxY + thickness
+                        + (hasOptions ? NibMetrics.barHeight : 0) + NibSpacing.l
+                }
             }
         }
         scrollView.chromeInsets = CanvasChromeInsets.resolve(safeArea: safe, additional: additionalSafeAreaInsets,
                                                             compact: isCompact, topDocked: topDocked,
-                                                            fallbackTop: fallbackTop)
+                                                            fallbackTop: fallbackTop, fallbackBottom: fallbackBottom)
     }
 
     /// Lays the pages out for the current mode and window, then zooms and scrolls: to the current page at fit the first
@@ -663,10 +678,26 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             setOffset(CGPoint(x: x, y: y), animated: animated)
         case .stack:
             let x = rect.width <= bounds.width ? scrollView.contentOffset.x : max(scrollView.contentOffset.x, rect.minX)
-            setOffset(CGPoint(x: x, y: rect.minY - insets.top), animated: animated)
+            setOffset(CGPoint(x: x, y: rect.minY - insets.top + openingMarginOffset(page)), animated: animated)
         case .world:
             break
         }
+    }
+
+    /// A short landscape window should open on the writing, rather than spending its usable height on the
+    /// page's blank header. Keep fit width and a token-sized margin above the first painted item. Only explicit
+    /// page navigation / fit and untouched fitted relayouts use this; a manual reading anchor is never moved.
+    private func openingMarginOffset(_ page: PageID) -> CGFloat {
+        let size = scrollView.bounds.size
+        guard isCompact, size.width > size.height, size.height < NibMetrics.compactBreakpoint,
+              let pageSize = shown[page]?.size else { return 0 }
+        let firstInk = ((try? app.workspace.items(documentID, page: page)) ?? [])
+            .filter { !$0.deleted && host.visibleLayers.contains($0.layer) }
+            .compactMap { Self.contentBounds($0, app.content) }
+            .filter { $0.maxY > 0 && $0.y < pageSize.height }
+            .map(\.y).min()
+        guard let firstInk else { return 0 }
+        return max(0, CGFloat(firstInk) * scrollView.zoomScale - NibSpacing.m)
     }
 
     func reveal(page: PageID, rect: Rect?, animated: Bool) {

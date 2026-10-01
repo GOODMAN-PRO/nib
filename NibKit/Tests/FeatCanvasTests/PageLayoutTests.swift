@@ -52,6 +52,33 @@ final class PageLayoutTests: XCTestCase {
                        "the host's measured panel clearance uses the same baseline as EditorHost")
     }
 
+    func testBottomPaletteIncludesOptionsAndUsesMeasuredFootprintOnlyOnce() {
+        for thickness in [NibMetrics.paletteThickness, NibMetrics.paletteThicknessMax] {
+            for optionsHeight in [CGFloat.zero, NibMetrics.barHeight] {
+                let systemBottom: CGFloat = 21
+                let footprint = systemBottom + NibSpacing.s + thickness + optionsHeight + NibSpacing.l
+                let fallback = CanvasChromeInsets.resolve(
+                    safeArea: UIEdgeInsets(top: 0, left: 62, bottom: systemBottom, right: 62),
+                    additional: .zero, compact: true, topDocked: false, fallbackTop: nil,
+                    fallbackBottom: footprint)
+                XCTAssertEqual(fallback.bottom, footprint)
+                // Actual bounds include the 1 pt fusion, or a taller measured options arm. The host subtracts
+                // the 80 pt baseline before forwarding; the fallback must not add the arm a second time.
+                for measured in [footprint - 1, footprint + NibSpacing.xl] {
+                    let extra = max(0, measured - systemBottom - NibMetrics.canvasBottomInsetCompact)
+                    guard extra > 0 else { continue }
+                    let result = CanvasChromeInsets.resolve(
+                        safeArea: UIEdgeInsets(top: 0, left: 62, bottom: systemBottom + extra, right: 62),
+                        additional: UIEdgeInsets(top: 0, left: 0, bottom: extra, right: 0),
+                        compact: true, topDocked: false, fallbackTop: nil, fallbackBottom: footprint)
+                    XCTAssertEqual(result.bottom, measured, accuracy: 1e-9)
+                    XCTAssertEqual(result.left, 62)
+                    XCTAssertEqual(result.right, 62)
+                }
+            }
+        }
+    }
+
     // MARK: Vertical
 
     func testVerticalLayoutStacksPagesInSlotsCentredOnTheWidestPage() {

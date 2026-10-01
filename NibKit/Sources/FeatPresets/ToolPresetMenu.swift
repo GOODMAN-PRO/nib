@@ -21,11 +21,6 @@ enum WidthScale {
         let w = range.lowerBound * pow(range.upperBound / range.lowerBound, t)
         return min(max((w * 100).rounded() / 100, range.lowerBound), range.upperBound)
     }
-
-    /// The line weight a thickness slot draws with: 1.5…10 pt along the tool's own scale.
-    static func slotLineWidth(_ width: Double, tool: String) -> CGFloat {
-        CGFloat(1.5 + 8.5 * position(width, range: PresetRules.widthRange(tool)))
-    }
 }
 
 enum PresetText {
@@ -413,12 +408,12 @@ struct ToolPresetMenu: View {
         HStack(spacing: 0) {
             ForEach(0..<PresetRules.widthSlots, id: \.self) { i in
                 let selected = i == presets.selectedWidth
-                LineSampleButton(lineWidth: WidthScale.slotLineWidth(presets.widths[i], tool: tool), pattern: presets.patterns[i],
-                                 isSelected: selected, label: String(localized: "Thickness \(i + 1)"),
-                                 value: PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]),
-                                 hint: selected ? String(localized: "Double-tap to adjust.") : nil) {
+                NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(i), isSelected: selected,
+                                     label: String(localized: "Thickness \(i + 1)")) {
                     model.tapWidth(i)
                 }
+                .accessibilityValue(PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]))
+                .accessibilityHint(selected ? String(localized: "Double-tap to adjust.") : "")
                 .presetPopoverSource(tool, model.shown == .width(i))
             }
             NibBarSeparator()
@@ -589,7 +584,7 @@ struct WidthEditor: View {
 
 // MARK: - Slots
 
-/// A short line drawn with a thickness and a pattern: the thickness slots and the pattern choices.
+/// A short line for the width editor's pattern choices. Thickness slots use `NibWidthPresetButton`.
 struct LineSampleButton: View {
     let lineWidth: CGFloat
     let pattern: StrokePattern

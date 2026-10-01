@@ -534,6 +534,34 @@ final class FeatOutlineTests: XCTestCase {
 
     // MARK: Panel layout
 
+    func testOutlineCellEmphasizesOnlyTheCurrentPageAndClearsEmphasisOnReuse() throws {
+        func titleLabel(in view: UIView, title: String) -> UILabel? {
+            if let label = view as? UILabel, label.text == title { return label }
+            return view.subviews.lazy.compactMap { titleLabel(in: $0, title: title) }.first
+        }
+
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            let cell = OutlineCell(style: .default, reuseIdentifier: OutlineCell.reuseID)
+            cell.overrideUserInterfaceStyle = appearance
+            for kind in [OutlineSectionKind.custom, .pdf] {
+                var row = OutlineRow(id: "weight-regression", kind: kind, entry: nil,
+                                     title: "Outline title", depth: 1, page: Fixtures.pdfPage,
+                                     pageNumber: 3, hasChildren: false, isExpanded: false, isCurrent: false)
+                // Reconfigure the same cell to catch selection emphasis leaking into a reused row.
+                for isCurrent in [false, true, false] {
+                    row.isCurrent = isCurrent
+                    cell.configure(row, showsThumbnail: false, image: nil, aspect: 1)
+                    let label = try XCTUnwrap(titleLabel(in: cell.contentView, title: row.title))
+                    XCTAssertEqual(label.font, isCurrent ? NibUIFont.bodyEmphasis : NibUIFont.body,
+                                   "Only the current page is emphasized, for both custom and PDF entries")
+                    XCTAssertTrue(label.adjustsFontForContentSizeCategory)
+                    XCTAssertEqual(cell.backgroundView != nil, isCurrent,
+                                   "Title emphasis follows the row's selection highlight")
+                }
+            }
+        }
+    }
+
     func testNavigatorHeadingKeepsItsTitleReadableAndReflowsAccessories() {
         let h = harness()
         let model = OutlinePanelModel(app: h.app, session: h.session)

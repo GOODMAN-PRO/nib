@@ -61,6 +61,18 @@ public enum FeatSearchUIFeature: NibFeature {
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "searchui.highlights", owner: id) { host in
             SearchHighlights(state: SearchRuntime.from(host.app).state(host.session))
         })
+        // A window can receive search.open before its transient floating host attaches.
+        // Keep the iPad library visible in that case too; never fall back to a full-screen cover.
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.libraryFallback", owner: id, placement: .top,
+            surface: .none, isVisible: { context in
+                let state = SearchRuntime.from(context.app).state(context.session)
+                return !SearchOpen.usesDocumentSheet && state.isLibraryScope && state.isPresented
+                    && context.floatingHost?.isPresenting(SearchOpen.libraryOverlay) != true
+            }, makeView: { context in
+                AnyView(LibrarySearchFloatingContent(app: context.app, session: context.session,
+                    state: SearchRuntime.from(context.app).state(context.session), belowBars: true)
+                    .frame(idealHeight: SearchViewport.idealHeight, maxHeight: SearchViewport.idealHeight))
+            }))
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.document", owner: id, placement: .top,
             surface: .none, isVisible: { context in
                 let state = SearchRuntime.from(context.app).state(context.session)
@@ -161,13 +173,15 @@ struct SearchOpen: NibCommand {
                 if !host.isPresenting(libraryOverlay) {
                     host.present(libraryOverlay) { LibrarySearchOverlay(app: app, session: session, state: state) }
                 }
-            } else if state.isLibraryScope || usesDocumentSheet {
+            } else if usesDocumentSheet {
                 let panel = state.isLibraryScope ? libraryPanel : documentPanel
                 if !session.openPanels.contains(panel) {
                     _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(panel), "instant": .bool(state.instant)])
                 }
             }
         }
+        // Reveal the fixed header and pending-state copy before the index query suspends.
+        app.ui.setNeedsChromeUpdate(session)
         let requestedQuery = state.query
         if changed || scopeChanged || state.matches.isEmpty || p.refresh == true || (p.match == nil && p.filter == nil) {
             try await runtime.load(state, context: ctx)

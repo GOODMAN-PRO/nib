@@ -14,6 +14,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         try assertHostlessForegroundGuarantees()
         guard NibSnapshot.supportsHostedImages else { return }
         try await assertLiveAppearanceChangesOverWhitePaper()
+        try await assertPortraitNativeSurfacesHaveOneEdgeAndAClearCore()
         for variant in [NibSnapshot.Variant.light, .dark] {
             for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep, .hud, .standaloneHUD] {
                 let reference = try await capture(surface, glass: false, variant: variant)
@@ -121,13 +122,8 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             (.chip, CGRect(x: 40, y: 100, width: 180, height: 44))
         ]
         for (style, frame) in surfaces {
-            let field = DropletField()
-            field.usesSystemGlass = true
-            field.setBackdrop([paper])
-            field.setRest("surface", frame, style: style)
-            defer { field.unregister("surface") }
             for variant in [NibSnapshot.Variant.light, .dark] {
-                let underlay = NativeGlassBackdropLayer(field: field).background(Color.white)
+                let underlay = backdropProbe(frame: frame, style: style, paper: [paper]).background(Color.white)
                 let image = try XCTUnwrap(NibSnapshot.image(underlay, size: canvas, variant: variant))
                 let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)))
                 if variant == .dark {
@@ -139,10 +135,9 @@ final class GlassForegroundSnapshotTests: XCTestCase {
                 XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 2, y: 2)), RGBA.white,
                                "The underlay must not tint the page outside the droplet")
             }
-            // Backdrop changes publish even while the field is idle, with no display-link tick.
-            field.setBackdrop([])
+            // Leaving paper removes the exception without a display-link tick.
             if style.material == .clear {
-                let image = try XCTUnwrap(NibSnapshot.image(NativeGlassBackdropLayer(field: field).background(Color.white),
+                let image = try XCTUnwrap(NibSnapshot.image(backdropProbe(frame: frame, style: style, paper: []).background(Color.white),
                                                            size: canvas, variant: .dark))
                 XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)), RGBA.white)
             }
@@ -177,9 +172,10 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             field.setRest("live", frame, style: style)
             defer { field.unregister("live") }
             XCTAssertEqual(field.node("live").presentation.paperShare, 0)
-            // The page registration changes in SwiftUI before the field's onChange publishes.
+            // The physics field still has stale paper coverage; the actual native host anchor must win.
             // Simulate native glass adapting the local environment to light at that same moment.
-            let live = NativeGlassBackdropLayer(field: field, backdrop: [paper])
+            let live = backdropProbe(frame: frame, style: style, paper: [paper])
+                .environment(field)
                 .environment(\.nibChromeAppearance, NibChromeAppearance(app))
                 .environment(\.colorScheme, .light)
                 .background(Color.white)
@@ -191,7 +187,8 @@ final class GlassForegroundSnapshotTests: XCTestCase {
 
             // And the inverse: leaving white paper removes the exception without waiting for physics.
             field.setBackdrop([paper])
-            let removed = NativeGlassBackdropLayer(field: field, backdrop: [])
+            let removed = backdropProbe(frame: frame, style: style, paper: [])
+                .environment(field)
                 .environment(\.nibChromeAppearance, NibChromeAppearance(app))
                 .background(Color.white)
             let cleared = try XCTUnwrap(NibSnapshot.image(removed, size: size, variant: .dark))
@@ -252,6 +249,72 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         }
     }
 
+    /// Exercise the native compositor at the sizes where a small HUD snapshot cannot reveal panel facets.
+    private func assertPortraitNativeSurfacesHaveOneEdgeAndAClearCore() async throws {
+        for canvas in [CGSize(width: 393, height: 852), CGSize(width: 834, height: 1194)] {
+            let frames: [(DropletStyle, CGRect)] = [
+                (.palette, CGRect(x: 40, y: 100, width: 56, height: 480)),
+                (.palette, CGRect(x: 32, y: 100, width: canvas.width - 64, height: 56)),
+                (.panel, CGRect(x: 32, y: 100, width: canvas.width - 64, height: canvas.height - 220))
+            ]
+            for (style, frame) in frames {
+                for standalone in [false, true] {
+                    let probe = PortraitGlassProbe(canvas: canvas, frame: frame, style: style, standalone: standalone)
+                    let rendered = try await NibSnapshot.hostedImage(probe, size: canvas, variant: .dark)
+                    let image = try XCTUnwrap(rendered)
+                    attach(image, name: "portrait-optics-\(Int(canvas.width))-\(style.glassKind)-\(standalone)-\(Int(frame.height))")
+                    let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)))
+                    XCTAssertGreaterThanOrEqual(contrast(.white, centre), 4.5)
+                    // A neutral underlay protruding by the reported 8 pt is much darker than a soft shadow.
+                    for x in [frame.minX - 6, frame.maxX + 6] {
+                        let outside = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: frame.midY)))
+                        XCTAssertGreaterThan(min(outside.r, outside.g, outside.b), 160, "No second silhouette")
+                    }
+                    if style.material == .deep {
+                        // Exclude rounded corners, but sample the whole remaining core to catch diagonal wedges.
+                        for y in stride(from: frame.minY + 40, through: frame.maxY - 40, by: 32) {
+                            for x in stride(from: frame.minX + 40, through: frame.maxX - 40, by: 32) {
+                                let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: y)))
+                                let delta = max(abs(Int(pixel.r) - Int(centre.r)), abs(Int(pixel.g) - Int(centre.g)),
+                                                abs(Int(pixel.b) - Int(centre.b)))
+                                XCTAssertLessThanOrEqual(delta, 12, "Deep's core must have no optical facets or inner rim")
+                                XCTAssertGreaterThanOrEqual(contrast(.white, pixel), 4.5)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private struct PortraitGlassProbe: View {
+        let canvas: CGSize
+        let frame: CGRect
+        let style: DropletStyle
+        let standalone: Bool
+
+        var body: some View {
+            ZStack {
+                Color.white
+                NibDropletContainer {
+                    surface.position(x: frame.midX, y: frame.midY)
+                }
+                .nibBackdrop([CGRect(origin: .zero, size: canvas)])
+            }
+            .frame(width: canvas.width, height: canvas.height)
+        }
+
+        @ViewBuilder private var surface: some View {
+            if standalone {
+                Color.clear.frame(width: frame.width, height: frame.height)
+                    .nibGlass(style.glassKind, cornerRadius: style.cornerRadius, interactive: style.isInteractive)
+            } else {
+                Color.clear.frame(width: frame.width, height: frame.height)
+                    .droplet("portrait.optics", style: style)
+            }
+        }
+    }
+
     private struct AppearanceProbe: View {
         let surface: NibGlassForegroundGallery.Surface
         let scheme: ColorScheme
@@ -277,17 +340,16 @@ final class GlassForegroundSnapshotTests: XCTestCase {
     func testStaticGlassCanCarryItsUnderlayOutsideAContainerWithoutTintingPaper() throws {
         let shape = NibDropletShape()
         for variant in [NibSnapshot.Variant.light, .dark] {
-            let tint = NibGlassBodyTint.systemUnderlay(.clear, colorScheme: variant.colorScheme, paperShare: 1)
             // Exercise the same anchor transport without a UIKit-backed glass host, so this runs hostless too.
             let view = Color.clear
                 .frame(width: 180, height: 44)
-                .anchorPreference(key: NibStaticGlassBackdropKey.self, value: .bounds) {
-                    [NibStaticGlassBackdrop(bounds: $0, shape: shape, tint: tint)]
-                }
+                .modifier(NibGlassBackdropModifier(kind: .clear, shape: shape))
                 .frame(width: 360, height: 240)
-                .backgroundPreferenceValue(NibStaticGlassBackdropKey.self) {
-                    NativeStaticGlassBackdropLayer(backdrops: $0)
+                .backgroundPreferenceValue(NibGlassBackdropKey.self) {
+                    NativeGlassBackdropLayer(backdrops: $0)
                 }
+                .coordinateSpace(NibLiquid.space)
+                .nibBackdrop([CGRect(origin: .zero, size: size)])
                 .background(Color.white)
             let image = try XCTUnwrap(NibSnapshot.image(view, size: size, variant: variant))
             let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 180, y: 120)))
@@ -298,6 +360,101 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             }
             XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 20, y: 20)), RGBA.white)
         }
+    }
+
+    /// The same anchor modifier used by the live native host, without the UIKit material so geometry and
+    /// contrast remain testable in the hostless package suite. Placement includes a nonzero ancestor origin.
+    private func backdropProbe(frame: CGRect, style: DropletStyle, paper: [CGRect],
+                               offset: CGPoint = .zero, growth: CGSize = .zero,
+                               frozen: Bool = false, recedes: Bool = false) -> some View {
+        Color.clear
+            .frame(width: frame.width, height: frame.height)
+            .padding(.horizontal, growth.width / 2)
+            .padding(.vertical, growth.height / 2)
+            .modifier(NibGlassBackdropModifier(kind: style.glassKind,
+                shape: NibDropletShape(cornerRadius: style.cornerRadius), frozen: frozen, recedes: recedes))
+            .offset(x: offset.x, y: offset.y)
+            .padding(.vertical, -growth.height / 2)
+            .padding(.horizontal, -growth.width / 2)
+            .position(x: frame.midX, y: frame.midY)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .backgroundPreferenceValue(NibGlassBackdropKey.self) { NativeGlassBackdropLayer(backdrops: $0) }
+            .coordinateSpace(NibLiquid.space)
+            .nibBackdrop(paper)
+    }
+
+    func testNativeUnderlayFollowsPresentedBoundsWithoutAnOffsetSilhouette() throws {
+        let canvas = CGSize(width: 400, height: 700)
+        let paper = CGRect(origin: .zero, size: canvas)
+        for style in [DropletStyle.palette, .hud, .popover, .panel] {
+            let frame = CGRect(x: 45, y: 110, width: 250, height: style.material == .deep ? 420 : 56)
+            for offset in [CGPoint.zero, CGPoint(x: 28, y: -36), CGPoint(x: -18, y: 40)] {
+                for growth in [CGSize.zero, CGSize(width: 22, height: 14), CGSize(width: -30, height: -18)] {
+                    let rect = frame.insetBy(dx: -growth.width / 2, dy: -growth.height / 2)
+                        .offsetBy(dx: offset.x, dy: offset.y)
+                    let view = backdropProbe(frame: frame, style: style, paper: [paper], offset: offset, growth: growth)
+                        .background(Color.white)
+                    let image = try XCTUnwrap(NibSnapshot.image(view, size: canvas, variant: .dark))
+                    // Across both axes there must be exactly one filled interval, matching the glass host.
+                    for x in stride(from: 2.0, to: canvas.width - 2, by: 2) {
+                        let point = CGPoint(x: x, y: rect.midY)
+                        let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: point))
+                        if x < rect.minX - 2 || x > rect.maxX + 2 {
+                            XCTAssertEqual(pixel, .white, "No protruding body at \(point), \(rect)")
+                        } else if x > rect.minX + 2 && x < rect.maxX - 2 {
+                            XCTAssertGreaterThanOrEqual(contrast(.white, pixel), 4.5)
+                        }
+                    }
+                    for y in stride(from: 2.0, to: canvas.height - 2, by: 2) {
+                        let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: rect.midX, y: y)))
+                        if y < rect.minY - 2 || y > rect.maxY + 2 { XCTAssertEqual(pixel, .white) }
+                        else if y > rect.minY + 2 && y < rect.maxY - 2 {
+                            XCTAssertGreaterThanOrEqual(contrast(.white, pixel), 4.5)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testDeepUnderlayCoreIsUniformAndFrozenBodyKeepsItsBounds() throws {
+        let canvas = CGSize(width: 834, height: 1194)
+        let frame = CGRect(x: 24, y: 130, width: 786, height: 760)
+        for frozen in [false, true] {
+            let view = backdropProbe(frame: frame, style: .panel, paper: [CGRect(origin: .zero, size: canvas)],
+                                     frozen: frozen).background(Color.white)
+            let image = try XCTUnwrap(NibSnapshot.image(view, size: canvas, variant: .dark))
+            let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)))
+            XCTAssertGreaterThanOrEqual(contrast(.white, centre), 4.5)
+            // A lattice across the panel catches triangular shading and inner rims, not only its centre pixel.
+            for y in stride(from: frame.minY + 40, through: frame.maxY - 40, by: 40) {
+                for x in stride(from: frame.minX + 40, through: frame.maxX - 40, by: 40) {
+                    XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: x, y: y)), centre)
+                }
+            }
+            XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: frame.minX - 3, y: frame.midY)), .white)
+            XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: frame.maxX + 3, y: frame.midY)), .white)
+        }
+    }
+
+    func testPaperCoverageUsesTheContainerSpaceForAnInsetBackdropLayer() throws {
+        let canvas = CGSize(width: 834, height: 1194)
+        let frame = CGRect(x: 420, y: 600, width: 180, height: 44)
+        let view = Color.clear
+            .frame(width: frame.width, height: frame.height)
+            .modifier(NibGlassBackdropModifier(kind: .clear, shape: NibDropletShape()))
+            // The backdrop reader itself is inset, unlike a full-window field canvas.
+            .backgroundPreferenceValue(NibGlassBackdropKey.self) { NativeGlassBackdropLayer(backdrops: $0) }
+            .position(x: frame.midX, y: frame.midY)
+            .frame(width: canvas.width, height: canvas.height)
+            .coordinateSpace(NibLiquid.space)
+            .nibBackdrop([frame])
+            .background(Color.white)
+        let image = try XCTUnwrap(NibSnapshot.image(view, size: canvas, variant: .dark))
+        let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)))
+        XCTAssertLessThan(max(centre.r, centre.g, centre.b), 85, "Full paper coverage must use the 80% body")
+        XCTAssertGreaterThanOrEqual(contrast(.white, centre), 4.5)
+        XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: frame.minX - 3, y: frame.midY)), .white)
     }
 
     func testSharedChromeComponentsKeepTheirGlyphsWhenGlassChangesLocalAppearance() throws {
@@ -345,6 +502,9 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             let structure = String(reflecting: type(of: host.body))
             XCTAssertTrue(structure.contains("Text"), structure)
             XCTAssertTrue(structure.localizedCaseInsensitiveContains("glass"), structure)
+            XCTAssertTrue(structure.contains("RoundedRectangle"), "Panels must use native optical geometry")
+            XCTAssertTrue(structure.contains("Capsule"), "Bars must use native optical geometry")
+            XCTAssertFalse(structure.contains("NibDropletShape"), "Do not infer a glass mesh from a custom path")
             for forbidden in ["ZStack", "Overlay", "Background", "TupleView"] {
                 XCTAssertFalse(structure.contains(forbidden), "Glass must wrap its foreground directly: \(structure)")
             }

@@ -64,6 +64,12 @@ struct LibraryGridView: View {
     var body: some View {
         Group {
             if model.isLoading && model.rows.isEmpty { ProgressView(String(localized: "Loading library")) }
+            else if model.rows.isEmpty && model.error == nil && model.collection != .documents {
+                NibEmptyState(symbol: model.collection.symbol,
+                    title: model.collection == .recents ? String(localized: "No recent documents") : String(localized: "No study sets yet"),
+                    message: model.collection == .recents ? String(localized: "Documents you open appear here.") : String(localized: "Create a study set from the New menu."),
+                    primary: NibAction(String(localized: "Show Documents")) { model.setView(["collection": "documents"]) })
+            }
             else if model.rows.isEmpty && model.error == nil {
                 NibEmptyState(symbol: .notebook, title: String(localized: "No notebooks yet"), message: String(localized: "Write something, or bring in a PDF."),
                     primary: NibAction(String(localized: "New Notebook")) { model.setView(["menu": "new"]) },
@@ -132,25 +138,16 @@ struct LibraryGridView: View {
         return Array(repeating: GridItem(.fixed(width), spacing: gutter, alignment: .top), count: count)
     }
     @ViewBuilder private var grid: some View {
-        if compactHeight && !folders.isEmpty && !documents.isEmpty && !dynamicTypeSize.isAccessibilitySize {
-            HStack(alignment: .top, spacing: gutter) {
-                VStack(alignment: .leading, spacing: NibSpacing.s) { folderSection }
-                    .frame(width: min(contentWidth / 2, NibMetrics.folderTileMinWidth * 2))
-                VStack(alignment: .leading, spacing: NibSpacing.s) { documentSection }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        } else {
-            folderSection
-            documentSection
-        }
+        folderSection
+        documentSection
     }
+
     @ViewBuilder private var folderSection: some View {
         if !folders.isEmpty {
             Text(String(localized: "Folders")).font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: compactHeight ? [GridItem(.flexible())] : folderColumns, alignment: .leading, spacing: gutter) {
+            LazyVGrid(columns: folderColumns, alignment: .leading, spacing: gutter) {
                 ForEach(folders) { row in
                     cell(row)
-                        .nibReflowDraggable(row.ref, in: model.folderReflow, order: model.folderRefs) { model.drop($0) }
                 }
             }
         }
@@ -159,10 +156,9 @@ struct LibraryGridView: View {
         if !documents.isEmpty {
             Text(documents.allSatisfy { $0.kind == "notebook" } ? String(localized: "Notebooks") : String(localized: "Documents"))
                 .font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: compactHeight ? [GridItem(.adaptive(minimum: coverWidth), spacing: gutter, alignment: .top)] : coverColumns, alignment: .leading, spacing: gutter) {
+            LazyVGrid(columns: coverColumns, alignment: .leading, spacing: gutter) {
                 ForEach(documents) { row in
                     cell(row)
-                        .nibReflowDraggable(row.ref, in: model.reflow, order: model.documentRefs) { model.drop($0) }
                 }
             }
         }
@@ -171,12 +167,18 @@ struct LibraryGridView: View {
         LazyVStack(spacing: NibSpacing.xs) {
             ForEach(model.visibleRows) { row in
                 cell(row, list: true)
-                    .nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow, order: row.isFolder ? model.folderRefs : model.documentRefs) { model.drop($0) }
             }
         }
     }
-    private func cell(_ row: LibraryRow, list: Bool = false) -> some View {
-        LibraryCell(row: row, model: model, list: list)
+    @ViewBuilder private func cell(_ row: LibraryRow, list: Bool = false) -> some View {
+        if model.collection == .documents {
+            LibraryCell(row: row, model: model, list: list)
+                .nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
+                                   order: row.isFolder ? model.folderRefs : model.documentRefs) { model.drop($0) }
+        } else {
+            // Collections contain documents from different parents, so sibling reordering does not apply.
+            LibraryCell(row: row, model: model, list: list)
+        }
     }
     private var selectionGesture: some Gesture {
         DragGesture(minimumDistance: NibSpacing.xs + NibSpacing.xxs, coordinateSpace: .named("library.selection"))

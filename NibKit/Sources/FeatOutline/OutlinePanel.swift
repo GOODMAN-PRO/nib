@@ -119,7 +119,7 @@ struct OutlineSection: Equatable {
     var rows: [OutlineRow]
 }
 
-/// Builds the Outline tab: "From the PDF" then "Yours" (bold), each honouring its toggle and the collapsed rows.
+/// Builds the Outline tab: "From the PDF" then "Yours", each honouring its toggle and the collapsed rows.
 enum OutlineRowBuilder {
     static func customID(_ id: NibID) -> String { "c:" + id.raw }
 
@@ -994,8 +994,8 @@ struct OutlineDragItem {
 }
 
 /// One outline row: disclosure, optional thumbnail (`NibPageThumbnailView`, `NibMetrics.rowThumbnailWidth`), title
-/// (your entries in `bodyEmphasis`), page number in `hud`, indented `NibMetrics.outlineIndent` per level. It stays a
-/// UIKit cell for the drag table (`NibOutlineRow` is its SwiftUI twin). The current page's rows sit on the row
+/// (body, with `bodyEmphasis` only for the current page), page number in `hud`, indented `NibMetrics.outlineIndent`
+/// per level. It stays a UIKit cell for the drag table (`NibOutlineRow` is its SwiftUI twin). The current page's rows sit on the row
 /// highlight, carry the accent number and ring their thumbnail, so the state is never colour alone.
 final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
     static let reuseID = "outline.row"
@@ -1099,7 +1099,7 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         disclosure.isUserInteractionEnabled = row.hasChildren
 
         titleLabel.text = row.title
-        titleLabel.font = row.kind == .custom ? NibUIFont.bodyEmphasis : NibUIFont.body
+        titleLabel.font = row.isCurrent ? NibUIFont.bodyEmphasis : NibUIFont.body
         titleLabel.numberOfLines = traitCollection.preferredContentSizeCategory.isAccessibilityCategory ? 0 : 2
         pageLabel.text = row.pageNumber.map { String($0) }
         pageLabel.textColor = row.isCurrent ? NibUIColor.accent : NibUIColor.labelSecondary

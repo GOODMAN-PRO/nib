@@ -45,8 +45,13 @@ final class SceneHooksImpl: SceneHooks {
     // MARK: SceneHooks
 
     func documentTabsMenu(_ context: ChromeContext) -> AnyView? {
-        guard let presentation = tabPresentations[context.session.id], let model = presentation.model,
-              model.isVisible else { return nil }
+        // The switcher is essential on iPhone, where no capsule may fit. Chrome can ask for it before
+        // the shell has attached the floating host, so its visibility must not depend on that host.
+        guard let app, let navigator = context.navigator, context.session.document != nil,
+              TabStripLayout.showsStrip(tabCount: navigator.openDocuments.count,
+                                       enabled: app.settings.get(WindowSettings.showTabs)) else { return nil }
+        let presentation = tabPresentations[context.session.id]
+        let model = presentation?.model ?? TabStripModel(app: app, navigator: navigator, scenes: scenes)
         return AnyView(DocumentTabsMenu(model: model, placement: presentation, compact: context.isCompact))
     }
 

@@ -1408,6 +1408,109 @@ final class FeatCreateTests: XCTestCase {
 
     // MARK: - Screens render (Light, Dark, AX3)
 
+    func testPaperChooserKeepsRailAndFourColumnsInIPadSheetRegardlessOfSizeClass() async throws {
+        // Portrait/landscape sheet bodies, the exact rail-fit boundary, and narrow phone/Split View widths.
+        for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),
+                     CGSize(width: 668, height: 520), CGSize(width: 667, height: 520),
+                     CGSize(width: 402, height: 720), CGSize(width: 320, height: 520)] {
+            for variant in NibSnapshot.Variant.allCases {
+                var railFrame = CGRect.zero
+                var chipsFrame = CGRect.zero
+                var tileFrames: [Int: CGRect] = [:]
+                let chooser = NewNotebookPaperChooser(availableWidth: size.width - NibSpacing.xl * 2) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(["Basic", "Lined", "Grid", "Planners", "Music", "From plugins"], id: \.self) { group in
+                            Text(group).font(NibFont.body)
+                                .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                        }
+                    }
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { railFrame = $0 }
+                } chips: {
+                    Text("Basic").font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { chipsFrame = $0 }
+                } papers: {
+                    ForEach(0..<24) { index in
+                        NibPaperTile(name: "Paper \(index)", isSelected: index == 0, action: {}) {
+                            NibPaper.white.color
+                        }
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                            tileFrames[index] = $0
+                        }
+                    }
+                }
+                let view = NewNotebookFormViewport(contentInset: NibSpacing.xl) {
+                    EmptyView()
+                } paper: {
+                    chooser
+                }
+                .background(NibColor.backgroundSecondary)
+                .ignoresSafeArea()
+                // A compact trait on a form sheet must not replace a rail that fits with chips.
+                .environment(\.horizontalSizeClass, .compact)
+                .environment(\.colorScheme, variant.colorScheme)
+                .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+                let host = UIHostingController(rootView: view)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+
+                let expectsRail = size.width >= 668
+                let columns = expectsRail ? 4 : (size.width == 320 ? 2 : 3)
+                XCTAssertEqual(chooser.showsGroupRail, expectsRail)
+                let first = try XCTUnwrap(tileFrames[0])
+                if expectsRail {
+                    XCTAssertEqual(railFrame.width, 150, accuracy: 0.5)
+                    XCTAssertEqual(railFrame.minX, NibSpacing.xl, accuracy: 0.5)
+                    XCTAssertEqual(first.minX - railFrame.maxX,
+                                   NibSpacing.l + NibStroke.ring + NibStroke.ringOutset, accuracy: 0.5)
+                    XCTAssertEqual(first.minY - railFrame.minY,
+                                   NibStroke.ring + NibStroke.ringOutset, accuracy: 0.5)
+                    XCTAssertEqual(chipsFrame, .zero, "The iPad rail must replace the chip row")
+                } else {
+                    XCTAssertEqual(railFrame, .zero)
+                    XCTAssertGreaterThan(chipsFrame.height, 0)
+                    XCTAssertGreaterThan(first.minY, chipsFrame.maxY)
+                }
+                for index in 0..<columns {
+                    let tile = try XCTUnwrap(tileFrames[index])
+                    XCTAssertEqual(tile.width, 104, accuracy: 0.5)
+                    XCTAssertGreaterThanOrEqual(tile.height, 135)
+                    XCTAssertEqual(tile.minY, first.minY, accuracy: 0.5)
+                    XCTAssertEqual(tile.minX - first.minX, CGFloat(index) * (104 + NibSpacing.m), accuracy: 0.5)
+                    XCTAssertLessThanOrEqual(tile.maxX + NibStroke.ringOutset, size.width - NibSpacing.xl)
+                }
+                let nextRow = try XCTUnwrap(tileFrames[columns])
+                XCTAssertEqual(nextRow.minX, first.minX, accuracy: 0.5)
+                XCTAssertGreaterThan(nextRow.minY, first.maxY)
+
+                func scrollViews(in view: UIView) -> [UIScrollView] {
+                    (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
+                }
+                let regions = scrollViews(in: host.view)
+                XCTAssertEqual(regions.count, 1, "Paper stays in the form scroll with its existing bottom fade")
+                let region = try XCTUnwrap(regions.first)
+                XCTAssertGreaterThan(region.contentSize.height, region.bounds.height)
+                XCTAssertLessThanOrEqual(region.contentSize.width, region.bounds.width + 1)
+                region.setContentOffset(CGPoint(x: region.contentOffset.x, y: 100), animated: false)
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let scrolledRow = try XCTUnwrap(tileFrames[columns])
+                XCTAssertEqual(nextRow.minY - scrolledRow.minY, 100, accuracy: 1,
+                               "The paper grid must scroll to expose templates below the first row")
+            }
+        }
+    }
+
     func testFormViewportShowsPreviewThenCoverChoicesBeforePaper() async throws {
         for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),
                      CGSize(width: 402, height: 720), CGSize(width: 320, height: 520)] {

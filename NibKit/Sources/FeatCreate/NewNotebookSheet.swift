@@ -847,6 +847,52 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
     }
 }
 
+/// Paper layout follows the space inside the sheet, independently of the presenting window's size class.
+/// It stays in the form's vertical scroll view, whose bottom fade also covers the scrolling paper rows.
+struct NewNotebookPaperChooser<Groups: View, Chips: View, Papers: View>: View {
+    let availableWidth: CGFloat
+    @ViewBuilder var groups: Groups
+    @ViewBuilder var chips: Chips
+    @ViewBuilder var papers: Papers
+
+    // DESIGN.md §14.6's fixed rail metric; shared tile, gutter and ring metrics come from NibDesign.
+    static var groupRailWidth: CGFloat { 150 }
+    private var ringPadding: CGFloat { NibStroke.ring + NibStroke.ringOutset }
+    private var fourColumnWidth: CGFloat { NibMetrics.paperTileSize.width * 4 + NibSpacing.m * 3 }
+    var showsGroupRail: Bool {
+        availableWidth >= Self.groupRailWidth + NibSpacing.l + fourColumnWidth + ringPadding * 2
+    }
+    private var columnCount: Int {
+        if showsGroupRail { return 4 }
+        // Three columns on a phone, with fewer only when full-size thumbnails and their rings cannot fit.
+        return min(3, max(1, Int((availableWidth - ringPadding * 2 + NibSpacing.m)
+                                / (NibMetrics.paperTileSize.width + NibSpacing.m))))
+    }
+
+    var body: some View {
+        if showsGroupRail {
+            HStack(alignment: .top, spacing: NibSpacing.l) {
+                groups.frame(width: Self.groupRailWidth, alignment: .leading)
+                grid
+            }
+        } else {
+            VStack(alignment: .leading, spacing: NibSpacing.m) {
+                chips
+                grid
+            }
+        }
+    }
+
+    private var grid: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(NibMetrics.paperTileSize.width), spacing: NibSpacing.m),
+                                 count: columnCount), alignment: .leading, spacing: NibSpacing.l) {
+            papers
+        }
+        .padding(ringPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 /// New Notebook (DESIGN.md §14.6): an opaque sheet, Cancel · title · Create (the one Tinted action). Type, title with
 /// the live cover preview, the cover strip, the paper grid with its groups, then size, orientation and paper colour.
 /// iPhone stacks the same order and pins Create at the bottom.
@@ -1031,16 +1077,15 @@ struct NewNotebookSheet: View {
     private var paperSection: some View {
         NibInspectorSection(String(localized: "Paper"), value: draft.custom == nil ? nil : String(localized: "Custom"),
                             action: model.canChooseMore ? moreTemplates : nil) {
-            if compact {
-                VStack(alignment: .leading, spacing: NibSpacing.m) {
-                    groupChips
-                    paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
-                }
-            } else {
-                HStack(alignment: .top, spacing: NibSpacing.l) {
-                    groupList
-                    paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
-                }
+            // Clamp to the window while the first layout is being measured: the grid's minimum width must not
+            // enlarge that measurement and keep a narrow sheet in the rail layout.
+            NewNotebookPaperChooser(availableWidth: min(measuredWidth, windowSize?.width ?? measuredWidth)
+                                    - contentInset * 2) {
+                groupList
+            } chips: {
+                groupChips
+            } papers: {
+                paperTiles
             }
         }
     }
@@ -1048,9 +1093,6 @@ struct NewNotebookSheet: View {
     private var moreTemplates: NibAction {
         NibAction(String(localized: "More Templates…"), handler: { Task { @MainActor in await model.chooseMore() } })
     }
-
-    /// The group list beside the grid (DESIGN.md §14.6 asks for about 150 pt; kept on the 4 pt grid).
-    static let groupListWidth = NibMetrics.paperTileSize.width + NibSpacing.x5
 
     private var groupList: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1064,16 +1106,16 @@ struct NewNotebookSheet: View {
                         .foregroundStyle(NibColor.label)
                         .lineLimit(2)
                         .padding(.horizontal, NibSpacing.m)
-                        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                        .frame(maxWidth: .infinity, minHeight: NibSpacing.x3, alignment: .leading)
                         .background(selected ? NibColor.fill3 : Color.clear,
                                     in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
+                        .frame(minHeight: NibMetrics.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous)))
                 .accessibilityAddTraits(selected ? .isSelected : [])
             }
         }
-        .frame(width: NewNotebookSheet.groupListWidth)
     }
 
     private var groupChips: some View {
@@ -1086,16 +1128,13 @@ struct NewNotebookSheet: View {
         }
     }
 
-    private var paperGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.paperTileSize.width), spacing: NibSpacing.m)],
-                  alignment: .leading, spacing: NibSpacing.l) {
-            ForEach(model.papersInGroup) { option in
-                NibPaperTile(name: option.title, isSelected: draft.custom == nil && draft.paper.id == option.id,
-                             action: { model.selectPaper(option) }) {
-                    TemplatePreview(definition: option.definition,
-                                    params: draft.paperRef(option.definition).params,
-                                    page: draft.pageSize, paper: draft.paperColour ?? .white)
-                }
+    private var paperTiles: some View {
+        ForEach(model.papersInGroup) { option in
+            NibPaperTile(name: option.title, isSelected: draft.custom == nil && draft.paper.id == option.id,
+                         action: { model.selectPaper(option) }) {
+                TemplatePreview(definition: option.definition,
+                                params: draft.paperRef(option.definition).params,
+                                page: draft.pageSize, paper: draft.paperColour ?? .white)
             }
         }
     }

@@ -2,6 +2,7 @@ import XCTest
 import UIKit
 import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatObjectMenu
 
@@ -752,6 +753,62 @@ final class FeatObjectMenuTests: XCTestCase {
                                                in: bounds, top: 60, bottom: 16))
     }
 
+    func testMenuViewportReservesChromeWithoutExcludingPageCentringSpace() {
+        final class Canvas: UIScrollView {
+            override var safeAreaInsets: UIEdgeInsets {
+                UIEdgeInsets(top: 100, left: 80, bottom: 96, right: 24)
+            }
+        }
+        let canvas = Canvas(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        canvas.contentInsetAdjustmentBehavior = .never
+        canvas.contentInset = UIEdgeInsets(top: 240, left: 160, bottom: 240, right: 160)
+        canvas.bounds.origin = CGPoint(x: 32, y: 180)
+        XCTAssertEqual(ObjectMenuPlacement.viewport(in: canvas),
+                       CGRect(x: 112, y: 280, width: 730, height: 998))
+    }
+
+    func testCapsuleFitsTheUnobscuredCanvasInBothOrientationsAndAppearances() throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            let container = CGRect(origin: .zero, size: size)
+            // Leave a leading palette, a trailing panel and the bottom controls outside the usable canvas.
+            let viewport = container.inset(by: UIEdgeInsets(top: 160, left: 96, bottom: 96, right: 344))
+            let available = ObjectMenuPlacement.availableBounds(container: container, viewport: viewport)
+            XCTAssertEqual(available, viewport)
+            for x in [viewport.minX, viewport.midX, viewport.maxX - 40] {
+                let selection = CGRect(x: x, y: 400, width: 40, height: 100)
+                select(h, [Fixtures.shapeID], bounds: Rect(x: Double(x), y: 400, width: 40, height: 100))
+                let limit = ObjectMenuPlacement.quickLimit(width: available.width, compact: false)
+                let split = ObjectMenuComposer.split(attachment.model.entries, maxQuick: limit)
+                XCTAssertEqual(Set((split.quick + split.more).map(\.id)), Set(attachment.model.entries.map(\.id)),
+                               "Overflow must preserve every registered action")
+                let bar = ObjectMenuBar(model: attachment.model, maxQuick: limit)
+                for variant in NibSnapshot.Variant.allCases {
+                    let measured = NibSnapshot.fittingSize(bar, width: available.width, variant: variant)
+                    let placed = try XCTUnwrap(ObjectMenuPlacement.place(bar: measured, selection: selection,
+                                                                         in: available, top: 16, bottom: 16))
+                    let frame = CGRect(x: placed.centre.x - measured.width / 2,
+                                       y: placed.centre.y - measured.height / 2,
+                                       width: measured.width, height: measured.height)
+                    XCTAssertTrue(placed.above, "\(size), \(variant)")
+                    XCTAssertTrue(available.insetBy(dx: 16, dy: 16).contains(frame), "\(frame), \(variant)")
+                    XCTAssertLessThanOrEqual(frame.maxY, selection.minY - ObjectMenuPlacement.gapAbove)
+                    XCTAssertGreaterThanOrEqual(measured.height, NibMetrics.hitTarget)
+                }
+            }
+        }
+        XCTAssertEqual(ObjectMenuPlacement.quickLimit(width: 140, compact: false), 1)
+        XCTAssertEqual(ObjectMenuPlacement.quickLimit(width: 84, compact: true), 0)
+        XCTAssertFalse(ObjectMenuStyle.capsule.refracts)
+    }
+
     func testProvenanceHeader() {
         var made = Item(kind: .stroke, stroke: Stroke(style: .defaultPen, points: []))
         made.createdBy = "ai:chat1"
@@ -964,7 +1021,7 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertLessThan(best, budget * 4, "the cold menu took \(Int(best * 1000)) ms")
     }
 
-    func testTheMenuStepsAsideWhileThePageMoves() async throws {
+    func testTheMenuStaysVisibleWhileThePageMoves() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)
         let floating = FakeFloatingHost()
@@ -976,10 +1033,55 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertTrue(attachment.model.isShown)
         host.zoomScale = 2
         attachment.canvasDidChange(host)
-        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertTrue(attachment.model.isShown, "A valid selection must not wait for a scroll-settling timer")
         XCTAssertEqual(attachment.model.anchor, CGRect(x: 640, y: 960, width: 128, height: 128))
         try await Task.sleep(nanoseconds: 900_000_000)
         XCTAssertTrue(attachment.model.isShown)
+    }
+
+    func testRepeatedLayoutUpdatesCannotStarveSelectionActions() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 320, y: 400, width: 160, height: 90))
+        let rebuilds = attachment.rebuilds
+        for step in 1...12 {
+            // Repeated layout events arrive faster than the former delayed reveal, for longer than its interval.
+            floating.containerOffset = CGPoint(x: CGFloat(step * 2), y: CGFloat(step))
+            attachment.canvasDidChange(host)
+            XCTAssertTrue(attachment.model.isShown)
+            XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
+            XCTAssertEqual(attachment.model.anchor,
+                           CGRect(x: CGFloat(320 + step * 2), y: CGFloat(400 + step), width: 160, height: 90))
+            XCTAssertEqual(attachment.model.viewport,
+                           host.canvasView.bounds.offsetBy(dx: CGFloat(step * 2), dy: CGFloat(step)))
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(attachment.rebuilds, rebuilds)
+        h.session.selection = Selection()
+        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertNil(attachment.model.viewport)
+    }
+
+    func testValidGeometryShowsImmediatelyEvenWithARecoveryPending() {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        floating.conversionAvailable = false
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID])
+        XCTAssertFalse(attachment.model.isShown)
+        floating.conversionAvailable = true
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.model.isShown, "A pending retry must not gate presentation after geometry is ready")
+        XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
     }
 
     func testMenuRetriesUntilTheFloatingLayerCanConvertTheSelection() async throws {
@@ -1116,7 +1218,7 @@ final class FeatObjectMenuTests: XCTestCase {
         }
     }
 
-    func testMenuRecoversWhenGeometryDisappearsDuringReshow() async throws {
+    func testMenuRecoversWhenGeometryDisappearsDuringMovement() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)
         let floating = FakeFloatingHost()
@@ -1127,15 +1229,17 @@ final class FeatObjectMenuTests: XCTestCase {
         select(h, [Fixtures.shapeID])
         host.zoomScale = 2
         attachment.canvasDidChange(host)
-        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertTrue(attachment.model.isShown)
         floating.conversionAvailable = false
+        attachment.canvasDidChange(host)
+        XCTAssertFalse(attachment.model.isShown)
         let attempts = floating.conversionAttempts
         try await waitUntil({ floating.conversionAttempts > attempts })
         floating.conversionAvailable = true
         try await waitUntil({ attachment.model.isShown })
     }
 
-    func testContainerMovementReshowsWithoutRebuildingAndIgnoresSubpixelNoise() async throws {
+    func testContainerMovementKeepsActionsVisibleWithoutRebuilding() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)
         let floating = FakeFloatingHost()
@@ -1147,8 +1251,8 @@ final class FeatObjectMenuTests: XCTestCase {
         let rebuilds = attachment.rebuilds
         floating.containerOffset = CGPoint(x: 80, y: 24)
         attachment.canvasDidChange(host)
-        XCTAssertFalse(attachment.model.isShown, "Container movement matters even if the canvas rect is unchanged")
-        try await waitUntil({ attachment.model.isShown })
+        XCTAssertTrue(attachment.model.isShown, "Container movement must reposition actions without hiding them")
+        XCTAssertEqual(attachment.model.anchor, CGRect(x: 180, y: 224, width: 160, height: 90))
         let noise = 0.25 / max(host.canvasView.traitCollection.displayScale, 1)
         for i in 0..<4 {
             floating.containerOffset.x = 80 + (i.isMultiple(of: 2) ? noise : -noise)

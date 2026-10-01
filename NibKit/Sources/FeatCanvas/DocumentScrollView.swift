@@ -25,13 +25,14 @@ enum CanvasMode: Equatable {
 /// clearance once: the safe area already includes the host's additional insets (including document tabs).
 enum CanvasChromeInsets {
     static func resolve(safeArea: UIEdgeInsets, additional: UIEdgeInsets, compact: Bool,
-                        topDocked: Bool, fallbackTop: CGFloat?) -> UIEdgeInsets {
+                        topDocked: Bool, fallbackTop: CGFloat?, fallbackBottom: CGFloat? = nil) -> UIEdgeInsets {
         var top = safeArea.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
         if additional.top == 0, let fallbackTop { top = max(top, fallbackTop) }
         // EditorHost subtracts this baseline when forwarding occupied bounds. Keep it when there is a
         // measured bottom obstruction, but release the phone's empty bottom rail when its palette is on top.
         let bottomBaseline = compact ? NibMetrics.canvasBottomInsetCompact : NibSpacing.l
-        let bottom = safeArea.bottom + (topDocked && additional.bottom == 0 ? NibSpacing.l : bottomBaseline)
+        var bottom = safeArea.bottom + (topDocked && additional.bottom == 0 ? NibSpacing.l : bottomBaseline)
+        if additional.bottom == 0, let fallbackBottom { bottom = max(bottom, fallbackBottom) }
         return UIEdgeInsets(top: top, left: safeArea.left, bottom: bottom, right: safeArea.right)
     }
 }

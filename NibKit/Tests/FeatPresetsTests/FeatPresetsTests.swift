@@ -562,7 +562,61 @@ final class FeatPresetsTests: XCTestCase {
             }
             XCTAssertEqual(WidthScale.width(at: -1, range: range), range.lowerBound)
             XCTAssertEqual(WidthScale.width(at: 2, range: range), range.upperBound)
-            XCTAssertLessThan(WidthScale.slotLineWidth(range.lowerBound, tool: tool), WidthScale.slotLineWidth(range.upperBound, tool: tool))
+            XCTAssertLessThan(WidthScale.position(range.lowerBound, range: range),
+                              WidthScale.position(range.upperBound, range: range))
+        }
+    }
+
+    /// Exercise the actual options row, so replacing its shared width buttons with stroke samples regresses here.
+    func testOptionsWidthsUseDistinctDotsAndRoundedSelectedCellsForEveryTool() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let size = CGSize(width: 600, height: 44)
+        for tool in NibSettings.presetTools {
+            for selected in 0..<3 {
+                var saved = ToolPresets.defaults(for: tool)
+                // Equal saved widths must still produce the three distinct slot dots, even for patterned pens.
+                saved.widths = Array(repeating: saved.widths[1], count: 3)
+                if PresetRules.patternTools.contains(tool) { saved.patterns = [.solid, .dashed, .dotted] }
+                saved.selectedWidth = selected
+                h.app.settings.set(NibSettings.presets(tool), saved)
+                let model = PresetMenuModel(app: h.app, session: h.session, tool: tool)
+                for sizeClass in [UserInterfaceSizeClass.compact, .regular] {
+                    let row = ToolPresetMenu(model: model)
+                        .environment(\.horizontalSizeClass, sizeClass)
+                        .fixedSize()
+                        .frame(width: size.width, height: size.height, alignment: .leading)
+                    for variant in NibSnapshot.Variant.allCases {
+                        let image = try XCTUnwrap(NibSnapshot.image(row, size: size, variant: variant))
+                        let context = "\(tool), selected \(selected), \(sizeClass), \(variant)"
+                        func alpha(_ x: CGFloat, _ y: CGFloat) throws -> UInt8 {
+                            try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: y))).a
+                        }
+                        for (index, diameter) in [CGFloat(5), 8, 12].enumerated() {
+                            let origin = CGFloat(index) * 44
+                            if index == selected {
+                                XCTAssertGreaterThan(try alpha(origin + 22, 4), 0, context)
+                                XCTAssertGreaterThan(try alpha(origin + 22, 40), 0, context)
+                                XCTAssertEqual(try alpha(origin + 22, 1), 0, context)
+                                XCTAssertEqual(try alpha(origin + 22, 43), 0, context)
+                                // Inside the radius-12 rectangle, outside the old circular selection.
+                                XCTAssertGreaterThan(try alpha(origin + 3, 10), 0, context)
+                                XCTAssertEqual(try alpha(origin + 1, 3), 0, context)
+                            } else {
+                                var horizontal: [CGFloat] = [], vertical: [CGFloat] = []
+                                for offset in stride(from: CGFloat(0), to: 44, by: 0.5) {
+                                    if try alpha(origin + offset, 22) > 127 { horizontal.append(offset) }
+                                    if try alpha(origin + 22, offset) > 127 { vertical.append(offset) }
+                                }
+                                let width = try XCTUnwrap(horizontal.last) - XCTUnwrap(horizontal.first) + 0.5
+                                let height = try XCTUnwrap(vertical.last) - XCTUnwrap(vertical.first) + 0.5
+                                XCTAssertEqual(width, diameter, accuracy: 0.5, context)
+                                XCTAssertEqual(height, diameter, accuracy: 0.5, "Dots, never dashes: \(context)")
+                                XCTAssertEqual(try alpha(origin + 3, 10), 0, context)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

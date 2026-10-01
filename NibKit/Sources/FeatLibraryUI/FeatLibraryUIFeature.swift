@@ -47,6 +47,7 @@ public enum FeatLibraryUIFeature: NibFeature {
 
 struct LibrarySetView: NibCommand {
     struct Params: Codable {
+        var collection: LibraryCollection?
         var folder: String?
         var layout: LibraryLayout?
         var sort: LibrarySort?
@@ -66,7 +67,8 @@ struct LibrarySetView: NibCommand {
     typealias Output = JSONValue
     static let descriptor = CommandDescriptor(id: "library.setView", title: "Set Library View",
         summary: "Set this window's folder, layout, sort, filter or selection; present or close a registered library panel with params.",
-        params: .obj(["folder": .str("folder:<id>, or lib for root"), "layout": .str(choices: LibraryLayout.allCases.map(\.rawValue)),
+        params: .obj(["collection": .str(choices: LibraryCollection.allCases.map(\.rawValue)),
+            "folder": .str("folder:<id>, or lib for root"), "layout": .str(choices: LibraryLayout.allCases.map(\.rawValue)),
             "sort": .str(choices: LibrarySort.allCases.map(\.rawValue)), "filter": .str(choices: LibraryFilter.allCases.map(\.rawValue)),
             "panel": .str("registered panel id, or documents"), "params": .anything("panel parameters"), "close": .bool(),
             "selection": .str(choices: ["all", "clear", "begin", "toggle", "replace"]), "refs": .arr(.ref),
@@ -88,11 +90,13 @@ struct LibrarySetView: NibCommand {
             throw NibError.invalid("Unknown selection operation", path: "$.selection")
         }
         let existing = LibraryModels.get(app).models[session.id]
-        let targetFolder = p.folder != nil ? folder ?? nil : existing?.folder
+        let targetFolder = p.folder != nil ? folder ?? nil : p.collection != nil ? nil : existing?.folder
         let saved = app.settings.json(LibraryOrder.viewKey(targetFolder))
-        let targetLayout = p.layout ?? (p.folder == nil ? existing?.layout : nil) ?? LibraryLayout(rawValue: saved?["layout"]?.stringValue ?? "") ?? .grid
-        let targetSort = p.sort ?? (p.folder == nil ? existing?.sort : nil) ?? LibrarySort(rawValue: saved?["sort"]?.stringValue ?? "") ?? .modified
-        let targetFilter = p.filter ?? (p.folder == nil ? existing?.filter : nil) ?? LibraryFilter(rawValue: saved?["filter"]?.stringValue ?? "") ?? .all
+        let navigates = p.folder != nil || p.collection != nil || p.panel == "documents"
+        let targetCollection = p.folder != nil || p.panel == "documents" ? LibraryCollection.documents : p.collection ?? existing?.collection ?? .documents
+        let targetLayout = p.layout ?? (!navigates ? existing?.layout : nil) ?? LibraryLayout(rawValue: saved?["layout"]?.stringValue ?? "") ?? .grid
+        let targetSort = p.sort ?? (!navigates ? existing?.sort : nil) ?? (targetCollection != .documents ? .modified : LibrarySort(rawValue: saved?["sort"]?.stringValue ?? "") ?? .modified)
+        let targetFilter = p.filter ?? (!navigates ? existing?.filter : nil) ?? (targetCollection != .documents ? .documents : LibraryFilter(rawValue: saved?["filter"]?.stringValue ?? "") ?? .all)
         let result: JSONValue
         if let panel = p.panel, panel != "documents" {
             if p.close == true {
@@ -102,25 +106,31 @@ struct LibrarySetView: NibCommand {
                 result = ["panel": .string(panel), "placement": .string(descriptor?.placement == .floating ? "sheet" : descriptor!.placement.rawValue)]
             }
         } else {
-            result = ["folder": .string(targetFolder.map { NodeRef.folder($0).description } ?? "lib"),
+            result = ["collection": .string(targetCollection.rawValue), "folder": .string(targetFolder.map { NodeRef.folder($0).description } ?? "lib"),
                       "layout": .string(targetLayout.rawValue), "sort": .string(targetSort.rawValue), "filter": .string(targetFilter.rawValue)]
         }
         guard !ctx.dryRun else { return result }
         let model = existing ?? LibraryModels.get(app).model(session)
+        if let collection = p.collection {
+            model.collection = collection; model.folder = nil; model.closeTab()
+            model.selection.clear(); model.search = ""
+            model.layout = targetLayout; model.sort = targetSort; model.filter = targetFilter
+        }
         if p.folder != nil {
+            model.collection = .documents
             model.folder = targetFolder; model.restoreView(); model.closeTab(); model.selection.clear()
         }
         if let panel = p.panel {
-            if panel == "documents" { model.closeTab() }
+            if panel == "documents" { model.closeTab(); model.collection = .documents }
             else {
                 if p.close == true { model.closePanel(panel) }
                 else if let descriptor { model.openPanel(descriptor, params: p.params ?? [:]) }
-                if p.folder != nil { await model.markDirty() }
+                if navigates { await model.markDirty() }
                 return result
             }
         }
         model.layout = targetLayout; model.sort = targetSort; model.filter = targetFilter
-        if p.layout != nil || p.sort != nil || p.filter != nil {
+        if model.collection == .documents && (p.layout != nil || p.sort != nil || p.filter != nil) {
             app.settings.setJSON(LibraryOrder.viewKey(model.folder), ["layout": .string(model.layout.rawValue), "sort": .string(model.sort.rawValue), "filter": .string(model.filter.rawValue)])
         }
         if let selection = p.selection {
@@ -139,7 +149,7 @@ struct LibrarySetView: NibCommand {
         if let search = p.search { model.search = search }
         if let sidebar = p.sidebar { model.sidebarVisible = sidebar }
         if p.sort != nil || p.filter != nil || p.search != nil { model.applySort() }
-        if p.folder != nil { await model.markDirty() }
+        if navigates { await model.markDirty() }
         return result
     }
 }
