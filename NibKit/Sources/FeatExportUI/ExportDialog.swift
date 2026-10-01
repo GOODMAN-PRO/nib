@@ -40,7 +40,8 @@ struct ExportSelection {
     var currentPage: String?
     var formats: [ExporterDescriptor]
     var folderExport: Bool
-    var title: String { documents.count == 1 ? documents[0].title : String(localized: "\(documents.count) documents") }
+    var folderTitle: String? = nil
+    var title: String { folderTitle ?? (documents.count == 1 ? documents[0].title : String(localized: "\(documents.count) documents")) }
     var isBoard: Bool { documents.count == 1 && documents[0].kind == .whiteboard }
     var pageScopes: [ExportPageScope] {
         var scopes: [ExportPageScope] = []
@@ -74,21 +75,24 @@ struct ExportSelection {
             case .document(let doc):
                 try requireUnlocked(doc, ctx)
                 documentRefs.append(ref.description)
-            case .folder, .library:
+            case .folder(let folder):
                 folderExport = true
-                var cursor: String?
-                var seen = Set<String>()
-                repeat {
-                    var params: JSONValue = ["root": .string(ref.description)]
-                    if let cursor { params.set("cursor", .string(cursor)) }
-                    let result = try await ctx.execute(CommandIDs.queryTree, params)
-                    for row in result["nodes"]?.arrayValue ?? [] where row["kind"]?.stringValue == "document" {
-                        if row["locked"]?.boolValue == true { throw NibError(.locked, String(localized: "Unlock every document in this folder to export it.")) }
-                        if let doc = row["ref"]?.stringValue { documentRefs.append(doc) }
+                guard let library = ctx.services.library else { throw NibError.unavailable("the library") }
+                var queue = [folder]
+                var visited = Set<FolderID>()
+                while let next = queue.popLast() {
+                    guard visited.insert(next).inserted else { continue }
+                    for node in library.children(of: next) {
+                        switch node.kind {
+                        case .document: documentRefs.append(NodeRef.document(node.id).description)
+                        case .folder: queue.append(node.id)
+                        }
                     }
-                    cursor = result["cursor"]?.stringValue
-                    if let cursor, !seen.insert(cursor).inserted { throw NibError(.internalError, "The library query repeated its cursor.") }
-                } while cursor != nil
+                }
+            case .library:
+                folderExport = true
+                guard let library = ctx.services.library else { throw NibError.unavailable("the library") }
+                documentRefs += library.allNodes().filter { $0.kind == .document }.map { NodeRef.document($0.id).description }
             default: throw NibError.invalid("Expected a document or folder ref.", path: "$.docs")
             }
         }
@@ -99,36 +103,17 @@ struct ExportSelection {
         for ref in documentRefs {
             let doc = NodeRef.documentID(from: ref)
             try requireUnlocked(doc, ctx)
-            var cursor: String?
-            var seen = Set<String>()
-            var record: ExportDocument?
-            var pageRefs = Set<String>()
-            repeat {
-                var params: JSONValue = ["ref": .string(ref), "depth": 1]
-                if let cursor { params.set("cursor", .string(cursor)) }
-                let result = try await ctx.execute(CommandIDs.queryGet, params)
-                if result["locked"]?.boolValue == true { throw NibError(.locked, String(localized: "Unlock to export")) }
-                if record == nil {
-                    guard let raw = result["documentKind"]?.stringValue ?? result["meta"]?["kind"]?.stringValue,
-                          let kind = DocumentKind(rawValue: raw) else { throw NibError(.internalError, "The document query omitted its kind.") }
-                    // The source capability is intentionally not part of the public query JSON.
-                    let bookmark = try ctx.workspace.peekContent(doc).meta.sourceBookmark
-                    let sourceName: String?
-                    if let bookmark { sourceName = try? await ExportFiles.work { try SourceOverwrite.resolve(bookmark).lastPathComponent } }
-                    else { sourceName = nil }
-                    record = ExportDocument(ref: ref, title: result["title"]?.stringValue ?? String(localized: "Untitled"),
-                                            kind: kind, pages: [], hasSource: bookmark != nil, sourceName: sourceName)
-                }
-                for row in result["pages"]?.arrayValue ?? [] {
-                    guard let page = row["ref"]?.stringValue, case .page(let d, _)? = NodeRef(page), d == doc,
-                          pageRefs.insert(page).inserted else { continue }
-                    let index = row["index"]?.intValue ?? record?.pages.count ?? 0
-                    record?.pages.append(ExportPage(ref: page, title: row["title"]?.stringValue ?? String(localized: "Page \(index + 1)"), index: index))
-                }
-                cursor = result["cursor"]?.stringValue
-                if let cursor, !seen.insert(cursor).inserted { throw NibError(.internalError, "The document query repeated its cursor.") }
-            } while cursor != nil
-            if var record { record.pages.sort { $0.index < $1.index }; documents.append(record) }
+            let content = try ctx.workspace.peekContent(doc)
+            let bookmark = content.meta.sourceBookmark
+            let sourceName: String?
+            if let bookmark { sourceName = try? await ExportFiles.work { try SourceOverwrite.resolve(bookmark).lastPathComponent } }
+            else { sourceName = nil }
+            let pages = content.livePages.enumerated().map { index, page in
+                ExportPage(ref: NodeRef.page(doc, page.id).description,
+                           title: page.title ?? String(localized: "Page \(index + 1)"), index: index)
+            }
+            documents.append(ExportDocument(ref: ref, title: ctx.services.library?.node(doc)?.title ?? String(localized: "Untitled"),
+                                            kind: content.meta.kind, pages: pages, hasSource: bookmark != nil, sourceName: sourceName))
         }
         let allPages = Set(documents.flatMap { $0.pages.map(\.ref) })
         let selected = pages ?? []
@@ -140,13 +125,31 @@ struct ExportSelection {
             return allPages.contains(ref) ? ref : nil
         }
         let kinds = Set(documents.map(\.kind))
-        let formats = ctx.content.exporters.all.filter { exporter in
-            exporter.docKinds.map { kinds.isSubset(of: $0) } ?? true
+        let exporters = ctx.content.exporters.all
+        var formats: [ExporterDescriptor] = []
+        var seenFormats = Set<String>()
+        for exporter in exporters {
+            // Package and folder archive are distinct choices even though both are ZIP containers.
+            let candidate = ["nibnote", "zip"].contains(exporter.id) ? exporter.id : exporter.fileExtension.lowercased()
+            guard seenFormats.insert(candidate).inserted else { continue }
+            guard kinds.allSatisfy({ kind in
+                exporters.contains { e in
+                    (e.id.lowercased() == candidate || e.fileExtension.lowercased() == candidate) &&
+                    (e.docKinds?.contains(kind) ?? true)
+                }
+            }) else { continue }
+            var format = exporters.first { $0.id == candidate } ?? exporter
+            format.id = candidate
+            formats.append(format)
         }
         guard !formats.isEmpty else { throw NibError.unavailable("an exporter for this document kind") }
         var normalizedUsed = Set<String>()
         return ExportSelection(refs: normalized.filter { normalizedUsed.insert($0).inserted }, documents: documents,
-                               selectedPages: selected, currentPage: current, formats: formats, folderExport: folderExport)
+                               selectedPages: selected, currentPage: current, formats: formats, folderExport: folderExport,
+                               folderTitle: normalized.count == 1 ? NodeRef(normalized[0]).flatMap { ref in
+                                   if case .folder(let id) = ref { return ctx.services.library?.node(id)?.title }
+                                   return nil
+                               } : nil)
     }
 }
 
@@ -163,7 +166,7 @@ struct ExportDraft {
         format = (selection.folderExport ? selection.formats.first(where: { $0.id == "zip" }) : nil)?.id ?? selection.formats[0].id
         name = selection.title
         selectedPages = Set(selection.selectedPages)
-        options = [ExportOptionKeys.visibleLayersOnly: false, ExportOptionKeys.annotations: true,
+        options = [ExportOptionKeys.annotations: true,
                    ExportOptionKeys.background: true, "mode": "flattened", "audio": true, "board": "single"]
     }
     func runParams(selection: ExportSelection) throws -> JSONValue {
@@ -190,6 +193,29 @@ struct ExportDraft {
         }
         return result
     }
+    func printParams(selection: ExportSelection, ready: Bool) throws -> JSONValue {
+        guard selection.documents.count == 1 else { throw NibError.invalid("Choose one document to print.") }
+        let run = try runParams(selection: selection)
+        let document = selection.documents[0]
+        if ready && !document.pages.isEmpty {
+            _ = try PrintPageSelection.resolve(pages: run["pages"]?.arrayValue?.compactMap(\.stringValue),
+                range: printRange, exclusions: printExclusions, document: document)
+        }
+        var params: JSONValue = ["doc": .string(document.ref), "options": options,
+                                 "range": .string(printRange), "exclude": .string(printExclusions)]
+        if ready { params.set("ready", true) }
+        params.set("pages", run["pages"])
+        return params
+    }
+    func submitParams(destination: String, selection: ExportSelection) throws -> JSONValue {
+        if destination == "print" { return try printParams(selection: selection, ready: true) }
+        var params = try runParams(selection: selection)
+        // The current page was captured when the dialog opened. Keep that explicit selection.
+        params.set("scope", .string(scope == .current ? "selected" : scope.rawValue))
+        params.set("destination", .string(destination))
+        return params
+    }
+
 }
 
 @MainActor
@@ -208,14 +234,15 @@ struct ExportDialog: View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             if !printing {
                 NibInspectorSection(String(localized: "Format")) {
-                    if selection.formats.count <= 4 && !typeSize.isAccessibilitySize {
-                        NibSegmentedControl(selection: $draft.format, options: selection.formats.map(\.id)) { id in
-                            selection.formats.first(where: { $0.id == id })?.title ?? id
-                        }
+                    if formatGroups.count <= 4 && !typeSize.isAccessibilitySize {
+                        NibSegmentedControl(selection: formatGroup, options: formatGroups) { formatTitle($0) }
                     } else {
-                        Picker(String(localized: "Format"), selection: $draft.format) {
-                            ForEach(selection.formats, id: \.id) { format in Text(format.title).tag(format.id) }
+                        Picker(String(localized: "Format"), selection: formatGroup) {
+                            ForEach(formatGroups, id: \.self) { id in Text(formatTitle(id)).tag(id) }
                         }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
+                    }
+                    if formatGroup.wrappedValue == "images" {
+                        NibSegmentedControl(selection: $draft.format, options: imageFormats.map(\.id)) { $0.uppercased() }
                     }
                 }
                 field(String(localized: "File name"), text: $draft.name)
@@ -234,10 +261,12 @@ struct ExportDialog: View {
             if draft.scope == .selected {
                 ForEach(selection.documents, id: \.ref) { doc in
                     NibInspectorSection(doc.title) {
-                        ForEach(doc.pages) { page in
-                            NibToggle(page.title, isOn: Binding(get: { draft.selectedPages.contains(page.ref) }, set: { on in
-                                if on { draft.selectedPages.insert(page.ref) } else { draft.selectedPages.remove(page.ref) }
-                            }))
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 80))], spacing: NibSpacing.m) {
+                            ForEach(doc.pages) { page in
+                                ExportPageChoice(page: page, app: app, selected: draft.selectedPages.contains(page.ref)) {
+                                    if !draft.selectedPages.insert(page.ref).inserted { draft.selectedPages.remove(page.ref) }
+                                }
+                            }
                         }
                     }
                 }
@@ -249,7 +278,28 @@ struct ExportDialog: View {
             NibToggle(String(localized: "Include page backgrounds"), isOn: option(ExportOptionKeys.background))
             NibToggle(String(localized: "Include annotations"), isOn: option(ExportOptionKeys.annotations))
             NibToggle(String(localized: "Visible layers only"), isOn: option(ExportOptionKeys.visibleLayersOnly))
-            if !printing && selection.formats.first(where: { $0.id == draft.format })?.fileExtension == "pdf" {
+            if printing || fileExtension == "pdf" {
+                NibInspectorSection(String(localized: "Sticky notes")) {
+                    NibSegmentedControl(selection: stringOption("stickyNotes", fallback: "asIs"), options: ["asIs", "expanded", "icon"]) {
+                        switch $0 {
+                        case "expanded": return String(localized: "Expanded")
+                        case "icon": return String(localized: "Icon")
+                        default: return String(localized: "As on page")
+                        }
+                    }
+                }
+                NibToggle(String(localized: "Include comments"), isOn: option("comments"))
+                if printing || draft.options["mode"]?.stringValue == "flattened" {
+                    NibToggle(String(localized: "Searchable text"), isOn: option("searchableText"))
+                }
+            }
+            if !printing && ["png", "jpg", "jpeg"].contains(fileExtension) {
+                NibInspectorSection(String(localized: "Image scale")) {
+                    NibSegmentedControl(selection: Binding(get: { draft.options["scale"]?.intValue ?? 2 },
+                        set: { draft.options.set("scale", .number(Double($0))) }), options: [2, 3]) { "\($0)x" }
+                }
+            }
+            if !printing && fileExtension == "pdf" {
                 NibToggle(String(localized: "Flatten"), isOn: Binding(get: { draft.options["mode"]?.stringValue == "flattened" },
                     set: { draft.options.set("mode", .string($0 ? "flattened" : "editable")) }))
             }
@@ -261,7 +311,7 @@ struct ExportDialog: View {
                     set: { draft.options.set("board", .string($0 ? "tiled" : "single")) }))
             }
             if let error { NibBanner(error, style: .warning) }
-            if working { NibTraceRow(String(localized: "Preparing export…"), phase: .running) }
+            if working { ExportProgress() }
             if printing {
                 NibButton(String(localized: "Print…"), symbol: .print, kind: .primary, expands: true, shortcut: .defaultAction) { submit("print") }
             } else {
@@ -293,41 +343,47 @@ struct ExportDialog: View {
     private func field(_ label: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
             Text(label).font(NibFont.footnoteEmphasis).foregroundStyle(NibColor.labelSecondary)
-            TextField(label, text: text).font(NibFont.body)
+            NibField(text: text, prompt: label)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
-                .padding(.horizontal, NibSpacing.m).frame(minHeight: NibMetrics.hitTarget)
-                .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field))
                 .accessibilityLabel(label)
         }
+    }
+    private var fileExtension: String { selection.formats.first { $0.id == draft.format }?.fileExtension.lowercased() ?? "" }
+    private var imageFormats: [ExporterDescriptor] { selection.formats.filter { ["png", "jpg", "jpeg"].contains($0.fileExtension.lowercased()) } }
+    private var formatGroups: [String] {
+        var seen = Set<String>()
+        return selection.formats.map { ["png", "jpg", "jpeg"].contains($0.fileExtension.lowercased()) ? "images" : $0.id }
+            .filter { seen.insert($0).inserted }
+    }
+    private var formatGroup: Binding<String> {
+        Binding(get: { imageFormats.contains { $0.id == draft.format } ? "images" : draft.format }, set: { value in
+            draft.format = value == "images" ? (imageFormats.first?.id ?? draft.format) : value
+        })
+    }
+    private func formatTitle(_ id: String) -> String {
+        switch id {
+        case "images": return String(localized: "Images")
+        case "pdf": return "PDF"
+        case "nibnote": return String(localized: "Nib file")
+        default: return selection.formats.first { $0.id == id }?.title ?? id
+        }
+    }
+    private func stringOption(_ key: String, fallback: String) -> Binding<String> {
+        Binding(get: { draft.options[key]?.stringValue ?? fallback }, set: { draft.options.set(key, .string($0)) })
     }
     private func option(_ key: String) -> Binding<Bool> {
         Binding(get: { draft.options[key]?.boolValue ?? true }, set: { draft.options.set(key, .bool($0)) })
     }
     private func openPrint() {
         do {
-            let run = try draft.runParams(selection: selection)
-            var params: JSONValue = ["doc": .string(selection.documents[0].ref)]
-            params.set("pages", run["pages"])
+            let params = try draft.printParams(selection: selection, ready: false)
             app.perform(CommandIDs.printPresent, params, session: session)
         } catch { self.error = NibError.wrap(error).message }
     }
     private func submit(_ destination: String) {
         do {
-            let run = try draft.runParams(selection: selection)
-            var params = run
-            let command: String
-            if destination == "print" {
-                command = CommandIDs.printPresent
-                params = ["doc": .string(selection.documents[0].ref), "ready": true, "options": draft.options,
-                          "range": .string(draft.printRange), "exclude": .string(draft.printExclusions)]
-                params.set("pages", run["pages"])
-                _ = try PrintPageSelection.resolve(pages: run["pages"]?.arrayValue?.compactMap(\.stringValue),
-                    range: draft.printRange, exclusions: draft.printExclusions, document: selection.documents[0])
-            } else {
-                command = CommandIDs.exportPresent
-                params.set("scope", .string(draft.scope.rawValue))
-                params.set("destination", .string(destination))
-            }
+            let params = try draft.submitParams(destination: destination, selection: selection)
+            let command = destination == "print" ? CommandIDs.printPresent : CommandIDs.exportPresent
             working = true
             error = nil
             Task { @MainActor in
@@ -341,6 +397,58 @@ struct ExportDialog: View {
                 }
             }
         } catch { self.error = NibError.wrap(error).message }
+    }
+}
+
+@MainActor
+private struct ExportPageChoice: View {
+    let page: ExportPage
+    let app: NibApp
+    let selected: Bool
+    let action: () -> Void
+    @State private var thumbnail: CGImage?
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: NibSpacing.xs) {
+                NibMiniPageThumbnail(width: 64) {
+                    if let thumbnail { Image(decorative: thumbnail, scale: 1).resizable().scaledToFit() }
+                    else { NibColor.background }
+                }
+                .overlay(alignment: .topTrailing) {
+                    Image(nib: selected ? .checkCircleFill : .circle)
+                        .foregroundStyle(selected ? NibColor.accent : NibColor.labelSecondary)
+                        .background(NibColor.background, in: Circle())
+                }
+                Text(page.title).font(NibFont.caption1).lineLimit(2)
+            }.frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(page.title)
+        .accessibilityValue(selected ? String(localized: "Selected") : String(localized: "Not selected"))
+        .task(id: page.ref) {
+            guard case let .page(doc, id)? = NodeRef(page.ref) else { return }
+            thumbnail = await app.services.renderer?.thumbnail(doc: doc, page: id, maxPixelSize: 192)
+        }
+    }
+}
+
+private struct ExportProgress: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var moving = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            Text(String(localized: "Preparing export…")).font(NibFont.caption1)
+            GeometryReader { proxy in
+                NibProgressBar(value: 0.3)
+                    .offset(x: reduceMotion ? 0 : (moving ? proxy.size.width : -proxy.size.width * 0.3))
+            }.frame(height: NibStroke.thick).clipped()
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(String(localized: "Preparing export…"))
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(NibMotion.glide.animation.speed(0.2).repeatForever(autoreverses: false)) { moving = true }
+        }
     }
 }
 

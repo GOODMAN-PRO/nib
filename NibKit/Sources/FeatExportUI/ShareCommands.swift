@@ -68,7 +68,10 @@ struct PresentExport: NibCommand {
         defer { files.remove() }
         try selection.requireUnlocked(ctx)
         let completed = try await presenter.deliver(files.urls, destination: destination, ctx: ctx)
-        if completed { ctx.activeSession?.floatingHost?.postToast(String(localized: "Export complete")) }
+        if completed {
+            let count = params["pages"]?.arrayValue?.count ?? selection.documents.reduce(0) { $0 + $1.pages.count }
+            ctx.activeSession?.floatingHost?.postToast(count > 0 ? String(localized: "Exported \(count) pages") : String(localized: "Exported \(selection.documents.count) documents"))
+        }
         return ["completed": .bool(completed), "files": result["files"] ?? .array([])]
     }
 }
@@ -97,6 +100,7 @@ struct SaveToSource: NibCommand {
         guard let exporter = exporters.first else {
             throw NibError(.unsupported, String(localized: "The source format cannot preserve this document."), hint: "use export.present to save a copy")
         }
+        if ctx.dryRun { return ["wouldReplace": .string(source.lastPathComponent)] }
         // Gateway already confirms non-user callers. The user path also needs an explicit overwrite confirmation.
         if ctx.principal.isUser {
             guard let confirmer = ctx.app?.gateway.confirmationPresenter(for: ctx.principal) else {
@@ -108,11 +112,10 @@ struct SaveToSource: NibCommand {
                                               params: ["doc": .string(NodeRef.document(doc).description)])
             guard await confirmer.confirm(request) != .deny else { throw NibError(.userDenied, String(localized: "Source file was not replaced.")) }
         }
-        if ctx.dryRun { return ["wouldReplace": .string(source.lastPathComponent)] }
         try ExportSelection.requireUnlocked(doc, ctx)
         let result = try await ctx.execute(CommandIDs.exportRun, [
             "docs": .array([.string(NodeRef.document(doc).description)]), "format": .string(exporter.id),
-            "options": ["mode": "editable", ExportOptionKeys.background: true, ExportOptionKeys.annotations: true, "audio": true]
+            "options": ["mode": "editable", ExportOptionKeys.visibleLayersOnly: false, ExportOptionKeys.background: true, ExportOptionKeys.annotations: true, "audio": true]
         ])
         let files = try await ExportFiles.materialize(result, ctx: ctx)
         defer { files.remove() }
@@ -187,8 +190,15 @@ enum SourceOverwrite {
     static func resolve(_ data: Data) throws -> URL {
         var stale = false
         let url = try URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
-        guard !stale else { throw NibError(.conflict, String(localized: "The source file has moved. Reopen it from Files before saving changes.")) }
         guard url.isFileURL else { throw NibError.invalid("The source bookmark is not a file URL.") }
+        return try validateResolvedURL(url, stale: stale)
+    }
+    static func validateResolvedURL(_ url: URL, stale: Bool) throws -> URL {
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        guard try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+            throw NibError(.conflict, String(localized: "The source file is unavailable. Reopen it from Files before saving changes."))
+        }
         return url
     }
     static func replace(source: URL, exported: URL) throws {
@@ -202,8 +212,15 @@ enum SourceOverwrite {
                 guard values.isRegularFile == true, values.isWritable != false else {
                     throw NibError(.permissionDenied, String(localized: "The source file cannot be replaced."))
                 }
-                // Atomic write inside file coordination preserves the previous file when writing fails.
-                try Data(contentsOf: exported, options: .mappedIfSafe).write(to: target, options: .atomic)
+                let data = try Data(contentsOf: exported, options: .mappedIfSafe)
+                do { try data.write(to: target, options: .atomic) }
+                catch {
+                    let error = error as NSError
+                    guard (error.domain == NSCocoaErrorDomain && error.code == NSFileWriteNoPermissionError) ||
+                          (error.domain == NSPOSIXErrorDomain && [Int(EACCES), Int(EPERM)].contains(error.code)) else { throw error }
+                    do { _ = try FileManager.default.replaceItemAt(target, withItemAt: exported) }
+                    catch { try data.write(to: target) }
+                }
             } catch { writeError = error }
         }
         if let error = coordinationError ?? writeError as NSError? { throw NibError.wrap(error) }
@@ -237,11 +254,15 @@ enum ExportPresentation {
         while let presented = top.presentedViewController, !presented.isBeingDismissed { top = presented }
         return top
     }
+    static let anchorID = "exportui.source"
+    static func anchorRect(in parent: UIViewController) -> CGRect {
+        CGRect(x: parent.view.bounds.maxX - NibMetrics.hitTarget - NibMetrics.chromeInset,
+               y: parent.view.safeAreaInsets.top, width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+    }
     static func anchor(_ controller: UIViewController, in parent: UIViewController) {
         guard let popover = controller.popoverPresentationController else { return }
         popover.sourceView = parent.view
-        popover.sourceRect = CGRect(x: parent.view.bounds.midX, y: parent.view.safeAreaInsets.top,
-                                    width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+        popover.sourceRect = anchorRect(in: parent)
         popover.permittedArrowDirections = [.up]
     }
 }
@@ -256,15 +277,12 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
         let session = ctx.activeSession
         let isCompact = parent.traitCollection.horizontalSizeClass == .compact
         if !isCompact, let host = session?.floatingHost ?? ctx.navigator?.floatingHost {
-            // The host owns the only droplet container in the window. Its anchor is the Share control's anchor
-            // when supplied by chrome; the fallback stays at the Share end of the top bar.
-            let source = "exportui.source"
-            let rect = CGRect(x: parent.view.bounds.maxX - NibMetrics.hitTarget - NibMetrics.chromeInset,
-                              y: parent.view.safeAreaInsets.top, width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            let source = ExportPresentation.anchorID
+            let rect = ExportPresentation.anchorRect(in: parent)
             guard host.setAnchor(source, rect: rect, in: parent.view) else { throw NibError.unavailable("the export anchor") }
             host.present("exportui.dialog", content: AnyView(ExportPopover(selection: selection, draft: draft,
                 printing: printing, app: app, session: session, host: host,
-                source: session?.document != nil ? "chrome.anchor.share" : source, instant: instant)))
+                source: source, instant: instant)))
         } else {
             let controller = UIHostingController(rootView: ExportSheet(selection: selection, draft: draft, printing: printing,
                                                                         app: app, session: session))
@@ -293,19 +311,31 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
         if destination == "files" {
             let picker = UIDocumentPickerViewController(forExporting: urls, asCopy: true)
             picker.delegate = self
+            ExportPresentation.anchor(picker, in: parent)
+            guard fileCompletion == nil else { throw NibError.unavailable("a free file picker") }
             return try await withCheckedThrowingContinuation { continuation in
                 fileCompletion = continuation
                 parent.present(picker, animated: !UIAccessibility.isReduceMotionEnabled)
+                if picker.presentingViewController == nil { finishFiles(false) }
             }
         }
         let activity = UIActivityViewController(activityItems: urls, applicationActivities: nil)
         ExportPresentation.anchor(activity, in: parent)
         return try await withCheckedThrowingContinuation { continuation in
-            activity.completionWithItemsHandler = { _, complete, _, error in
+            var resumed = false
+            activity.completionWithItemsHandler = { [weak activity] _, complete, _, error in
+                guard !resumed else { return }
+                resumed = true
+                activity?.completionWithItemsHandler = nil
                 if let error { continuation.resume(throwing: NibError.wrap(error)) }
                 else { continuation.resume(returning: complete) }
             }
             parent.present(activity, animated: !UIAccessibility.isReduceMotionEnabled)
+            if activity.presentingViewController == nil && !resumed {
+                resumed = true
+                activity.completionWithItemsHandler = nil
+                continuation.resume(returning: false)
+            }
         }
     }
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finishFiles(false) }

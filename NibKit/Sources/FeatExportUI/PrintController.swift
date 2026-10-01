@@ -119,17 +119,24 @@ final class MixedPageRenderer: UIPrintPageRenderer {
     override var numberOfPages: Int { document.pageCount }
     override func drawPage(at pageIndex: Int, in printableRect: CGRect) {
         guard let page = document.page(at: pageIndex), let context = UIGraphicsGetCurrentContext() else { return }
-        let bounds = page.bounds(for: .mediaBox)
+        guard let pdfPage = page.pageRef else { return }
+        let bounds = pdfPage.getBoxRect(.mediaBox)
         guard bounds.width > 0, bounds.height > 0 else { return }
+        let quarterTurn = abs(page.rotation / 90) % 2 == 1
+        let size = quarterTurn ? CGSize(width: bounds.height, height: bounds.width) : bounds.size
+        let fitRotation = (size.width > size.height) != (printableRect.width > printableRect.height) ? 90 : 0
+        // Draw the raw PDF with an explicit transform so PDFKit rotation edits and intrinsic rotations agree.
+        let angle = -CGFloat(page.rotation + fitRotation) * .pi / 180
+        let rotation = CGAffineTransform(rotationAngle: angle)
+        let rotatedBounds = bounds.applying(rotation)
+        let scale = min(printableRect.width / rotatedBounds.width, printableRect.height / rotatedBounds.height)
         context.saveGState()
         defer { context.restoreGState() }
-        let scale = min(printableRect.width / bounds.width, printableRect.height / bounds.height)
-        let x = printableRect.midX - bounds.width * scale / 2
-        let y = printableRect.midY + bounds.height * scale / 2
-        context.translateBy(x: x, y: y)
+        context.translateBy(x: printableRect.midX, y: printableRect.midY)
         context.scaleBy(x: scale, y: -scale)
-        context.translateBy(x: -bounds.minX, y: -bounds.minY)
-        page.draw(with: .mediaBox, to: context)
+        context.translateBy(x: -rotatedBounds.midX, y: -rotatedBounds.midY)
+        context.concatenate(rotation)
+        context.drawPDFPage(pdfPage)
     }
 }
 
@@ -163,7 +170,10 @@ final class PrintController: NSObject, UIPrintInteractionControllerDelegate {
         printer.delegate = delegate
         defer { printer.delegate = nil; printer.printPageRenderer = nil }
         return try await withCheckedThrowingContinuation { continuation in
+            var resumed = false
             let handler: UIPrintInteractionController.CompletionHandler = { _, completed, error in
+                guard !resumed else { return }
+                resumed = true
                 // Retain the paper delegate until the system finishes or cancels the job.
                 _ = delegate
                 if let error { continuation.resume(throwing: NibError.wrap(error)) }
@@ -171,13 +181,15 @@ final class PrintController: NSObject, UIPrintInteractionControllerDelegate {
             }
             let shown: Bool
             if parent.traitCollection.userInterfaceIdiom == .pad {
-                shown = printer.present(from: CGRect(x: parent.view.bounds.midX, y: parent.view.safeAreaInsets.top,
-                                             width: NibMetrics.hitTarget, height: NibMetrics.hitTarget),
+                shown = printer.present(from: ExportPresentation.anchorRect(in: parent),
                                 in: parent.view, animated: !UIAccessibility.isReduceMotionEnabled, completionHandler: handler)
             } else {
                 shown = printer.present(animated: !UIAccessibility.isReduceMotionEnabled, completionHandler: handler)
             }
-            if !shown { continuation.resume(throwing: NibError.unavailable("the print preview")) }
+            if !shown && !resumed {
+                resumed = true
+                continuation.resume(throwing: NibError.unavailable("the print preview"))
+            }
         }
     }
 }

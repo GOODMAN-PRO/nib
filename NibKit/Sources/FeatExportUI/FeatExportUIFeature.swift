@@ -8,7 +8,7 @@ public enum FeatExportUIFeature: NibFeature {
         app.commands.register(PresentExport.self)
         app.commands.register(PresentPrint.self)
         app.commands.register(SaveToSource.self)
-        for location in [MenuLocation.shareExport, .libraryItem, .librarySelection, .sidebarPage, .sidebarSelection, .board] {
+        for location in [MenuLocation.libraryItem, .librarySelection, .sidebarPage, .sidebarSelection, .board] {
             app.ui.menus.register(MenuItemDescriptor(
                 id: "exportui.export." + location.rawValue, title: String(localized: "Export…"), icon: NibSymbol.share.name,
                 location: location, order: 100, owner: id, command: CommandIDs.exportPresent,
@@ -36,7 +36,7 @@ public enum FeatExportUIFeature: NibFeature {
                 owner: id, command: CommandIDs.printPresent,
                 params: { context in ExportMenus.printParams(context, location: location) }, isVisible: { $0.doc != nil }))
         }
-        app.ui.menus.register(MenuItemDescriptor(id: "exportui.saveSource", title: String(localized: "Save changes to source…"),
+        var saveSource = MenuItemDescriptor(id: "exportui.saveSource", title: String(localized: "Save changes to source…"),
             icon: NibSymbol.saveToFiles.name, location: .shareExport, order: 300, owner: id,
             command: CommandIDs.exportSaveToSource, params: { context in
                 context.doc.map { ["doc": .string(NodeRef.document($0).description)] } ?? [:]
@@ -44,7 +44,14 @@ public enum FeatExportUIFeature: NibFeature {
                 guard let doc = context.doc, context.app.services.lock?.isLocked(doc) != true else { return false }
                 // Only this private capability bypasses query.get, which deliberately removes bookmarks.
                 return (try? context.app.workspace.peekContent(doc).meta.sourceBookmark) != nil
-            }))
+            })
+        saveSource.contextTitle = { context in
+            guard let doc = context.doc,
+                  let bookmark = try? context.app.workspace.peekContent(doc).meta.sourceBookmark,
+                  let url = try? SourceOverwrite.resolve(bookmark) else { return String(localized: "Save changes to source…") }
+            return String(localized: "Save changes to \(url.lastPathComponent)…")
+        }
+        app.ui.menus.register(saveSource)
         app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".exportKey", title: String(localized: "Share & Export"),
             shortcut: KeyShortcut("e", [.command, .shift]), command: CommandIDs.exportPresent,
             params: ["instant": true], scope: .document, owner: id))
@@ -81,6 +88,7 @@ enum ExportMenus {
     static func printParams(_ context: MenuContext, location: MenuLocation) -> JSONValue {
         var params: JSONValue = context.doc.map { ["doc": .string(NodeRef.document($0).description)] } ?? [:]
         params.set("pages", Self.params(context, location: location)["pages"])
+        if location == .sidebarSelection { params.set("ready", true) }
         return params
     }
 }
