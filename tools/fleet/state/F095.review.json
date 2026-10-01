@@ -1,0 +1,77 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": ".github/workflows/ios.yml, Scripts/lint.py (not invoked); Scripts/a11y_lint.py:2-3 docstring",
+      "problem": "One acceptance criterion is 'lint runs in CI', and it is not met. Neither ios.yml nor Scripts/lint.py runs Scripts/a11y_lint.py, and neither runs `extract_strings.py --check`. A grep of .github finds no reference to either script. The a11y_lint docstring says 'CI runs it as a warning step', which is not true.",
+      "fix": "Add non-blocking CI steps. In the feature job: `python3 Scripts/a11y_lint.py --feature ${{ steps.feat.outputs.id }}`, which already emits ::warning annotations and exits 0 without --strict. In the main job: the full `python3 Scripts/a11y_lint.py` and `python3 Scripts/extract_strings.py --check`. ios.yml is not an F095 file, so land this through a spec amendment that adds .github/workflows/ios.yml to F095's files, or through the CI owner (ARCHITECTURE §15.11). Do not edit ios.yml on this branch as things stand."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatA11y/PageContentsPanel.swift:197-226 (PageContentsModel.load); AccessibilityCommands.swift:30-61",
+      "problem": "The panel reads every cursor page by re-running the whole a11y.describePage. Each run repeats recognition (without F055, a full Vision recognizer pass over all the page's ink), PDF text and link extraction, clustering and reading-order sorting, all on the MainActor. A 30-line handwritten page is about 5 cursor pages, so about 5 full recognitions per reload. This happens after every commit to the page (350 ms debounce), including while the user is writing. The while loop never checks Task.isCancelled, so a superseded load keeps running its remaining pages. The cursor is a bare index into a recomputed list: if an edit lands or the index finishes between calls, the concatenated list duplicates or skips entries.",
+      "fix": "Compute entries once per page version. In A11yDescribePage, cache the last (pageRef, content version or head) → [PageEntry] result so that cursor calls only slice it. Encode the version in the cursor (\"<version>:<offset>\") and throw invalidParams on a mismatch, which makes the panel restart. In PageContentsModel.load, check `Task.isCancelled` and the generation inside the while loop before each further bus.run."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatA11y/AccessibilityCommands.swift:328-342, 428-445, 622-640",
+      "problem": "An entry's refs are unbounded. Drawing and highlight clusters and ink blocks put every stroke ref in `refs` and again in the Select action's params. page() always emits at least one entry. A connected 500-stroke diagram (clusterGap merges transitively) is therefore one entry of about 48 KB: about 45 bytes per ref × 500, twice. That breaks the documented 'Result pages stay under the 20 KB tool-result cap' (NibLimits.aiToolResultBytes) for the AI, plugins and the bridge, and it bloats the panel. testPagingStaysUnderTheResultBudget only uses entries with one ref.",
+      "fix": "Cap refs per entry (for example 64) and add `refCount`. When a group is over the cap, make Select use `selection.fromRect {page, rect: bbox}` (CommandIDs.selectionFromRect) instead of `selection.set {refs}`, and keep goTo on view.reveal of the first ref. Add a test: insert about 500 touching pen strokes with no recognizer, then assert that every cursor page's JSON is under NibLimits.aiToolResultBytes."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatA11y/AccessibilityCommands.swift:333-342 and 413-424",
+      "problem": "Hidden tape leaks through highlights. A highlight's text is built from the handwriting and typed text under it, but the loop that withholds text under hidden tape skips `.highlight` entries (`entries[i].kind != .highlight`). If an answer is both highlighted and covered by hidden tape, its text reaches VoiceOver and the AI. This breaks the feature's own invariant ('hidden tape keeps its answer hidden from VoiceOver too').",
+      "fix": "Include .highlight in the covering loop. Alternatively, build highlight text only from entries whose bbox centre is not under hidden tape. Extend testTapeOffersRevealAndHidesWhatItCovers: add a highlighter stroke over the 'The answer is 42' text box and assert that the JSON of the result does not contain '42'."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibDesign/Localizable.xcstrings (0 of 157 keys translated)",
+      "problem": "P-087: NibDesign looks its strings up in its own module catalog (bundle: .module), for example 'Close %@', 'Collapse %@', 'Remove %@' and the swatch and paper names. That catalog has no localizations, so NibDesign component labels and VoiceOver labels stay English in all 14 target locales. The extractor's `--module-catalogs` would copy the translations it already holds, but it was not run because the file belongs to another owner.",
+      "fix": "Raise a contract request (ARCHITECTURE §15.11) asking the NibDesign owner to run `python3 Scripts/extract_strings.py --module-catalogs` and commit NibKit/Sources/NibDesign/Localizable.xcstrings. List the gap in the F095 summary."
+    },
+    {
+      "severity": "minor",
+      "where": "Scripts/extract_strings.py:444-500 (infer_specifier); Nib/Resources/Localizable.xcstrings",
+      "problem": "Keys harvested from unmerged branches with --git-refs use heuristic interpolation types, and unknown types default to %@. Some keys therefore differ from what Swift emits and will never match at runtime. Two examples: '%@ pages indexed on this device' (NibIndexFeature, where `pages` is an Int, so Swift emits %lld) and 'Synced %@ file change(s)' (FeatWebDAV, where `copied` is an Int sum). `--check` never re-extracts, so nothing flags this.",
+      "fix": "Make infer_specifier report unresolved-type interpolations (print them under --stats) instead of silently defaulting to %@. After merges, regenerate with `--stringsdata <DerivedData>` so the keys come from the compiler. Add a sync mode, for example `--check --sources`, that exits 1 when live keys are missing or untranslated, and run it in CI with the lint step."
+    },
+    {
+      "severity": "minor",
+      "where": "Scripts/a11y_lint.py:30-36, 101, 155",
+      "problem": "The lint misses some icon-only controls (confirmed with probe files). `Menu { … } label: { Image(nib: .more) }`, `Link(destination:) { Image(nib:) }`, `ShareLink { Image(nib:) }` and `Toggle { Image(nib:) }` with no label produce no warning. `Button { } label: { Image(systemName: \"plus\") }` is missed because the string argument counts as text. `.accessibilityHidden(false)` suppresses the warning.",
+      "fix": "Check the label closures of Menu, Link, ShareLink and Toggle the same way as Button's. Ignore string tokens inside Image(...) when deciding whether a label is textual. Count accessibilityHidden only when it is `true`. Add these probes as fixtures for the script."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatA11y/AccessibilityCommands.swift:425",
+      "problem": "`prefix(maxEntries)` (400) is applied after reading-order sorting. On busy boards or PDF pages it silently drops the bottom of the page, and `total`, `truncated` and `counts` do not show it, even though cursor paging already limits result size.",
+      "fix": "Remove the 400 cap, since paging bounds each result. If a cap is kept, set a `capped: true` field and add 'and N more' to the summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatA11y/AccessibilityCommands.swift:307-311, 442",
+      "problem": "Entry ids can collide. An ink block with no itemIDs gets id = pageRef, and two recognised lines that share their first stroke get the same `item:` id. Those ids feed ForEach and accessibilityRotorEntry, so rows and rotor targets become ambiguous.",
+      "fix": "Make ids unique at the end of entries(). For example, suffix \"#<n>\" on a repeated id, or use \"ink:<n>\" for handwriting blocks with no refs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatA11y/PageContentsPanel.swift:353-357; AccessibilityCommands.swift:614-620",
+      "problem": "The summary and counts include entries on layers that the window hides, but the panel filters those entries out. VoiceOver's header ('This page has 3 images') can disagree with the rows listed.",
+      "fix": "Leave hidden-layer entries out of the summary and counts (keep them in items with hidden: true), or add a hidden count to the summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatA11yTests/FeatA11yTests.swift",
+      "problem": "Several risky paths have no tests: the F055 path (recognize.pageText installed: the multi-page cursor loop, falling back on unavailable or other errors, and image OCR blocks joined into image alt text), PDF background text and links with backgroundTransform, a highlight under tape, and a single huge cluster against the result cap.",
+      "fix": "Register a fake recognize.pageText command on the Harness bus that returns two truncated pages, and a variant that throws .unavailable. Use NibTesting's fake PDF service with a PDF-background page to assert transformed bboxes and link entries. Add the tape and cluster tests described above."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatA11y/PageContentsPanel.swift:460",
+      "problem": "The row's glyph column is a literal `.frame(width: 24)`. NibFont.glyph(.panel) grows with Dynamic Type, so at AX sizes the glyph overflows the fixed column toward the text.",
+      "fix": "Use `@ScaledMetric(relativeTo: .body) private var glyphWidth = NibSpacing.xxl` and apply `.frame(width: glyphWidth)`."
+    }
+  ]
+}
