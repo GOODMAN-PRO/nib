@@ -50,6 +50,37 @@ const run = async (prompt, opts) => {
   return r
 }
 
+// Codex offload (args.codex): implement / CI / fix / V2ADOPT jobs run in Codex CLI through a thin Claude forwarder
+// (args.codexTool = nib-codex.sh); reviews stay on Claude, so every feature still gets a cross-model review.
+// If Codex is unavailable (quota, auth, crash) the job falls back to Claude with the same prompt.
+const CODEX = !!A.codex
+const CODEX_TOOL = A.codexTool || ''
+const CODEX_PROMPTS = A.codexPrompts || ''
+const CODEX_NOTE = `You are running as Codex CLI (non-interactive, full access) on the user's Mac, doing one job of the Nib agent fleet. Long commands (the local build helper, gh run watch, CI queues) can take 10-60 min: give them a long timeout (e.g. timeout_ms 3600000) or start them in the background and poll their .exit / .log files; never give up while a CI run is queued or in progress. Ignore any mention of "Bash timeout" in the text below (that is Claude Code's tool). Work autonomously to completion, then answer with the JSON object the output schema asks for.`
+const viaCodex = async (kind, f, prompt, schemaKey, effort, opts) => {
+  if (!CODEX) return run(prompt, opts)
+  if (halted) return null
+  const name = `${kind}-${f.id}`
+  const pfile = `${CODEX_PROMPTS}/${name}.md`
+  const wrapper = `You are a thin forwarder that hands ONE job to Codex CLI and returns its result. Do NOT read the repository, investigate, or do the job yourself.
+1. Write everything under "TASK:" below, verbatim and complete, to ${pfile} with ONE Bash call using a quoted heredoc (cat > ${pfile} <<'NIB_TASK_EOF' ... NIB_TASK_EOF).
+2. Run: ${CODEX_TOOL} run ${name} ${WT}${SEP}${f.id} ${pfile} ${schemaKey} ${effort}   (Bash timeout 600000)
+3. While its output starts with "RUNNING", run: ${CODEX_TOOL} wait ${name}   (Bash timeout 600000). Keep repeating; hours is normal.
+4. When the output starts with "RESULT ", return that JSON's fields exactly as your structured output.
+5. If it starts with "CODEX_FAILED", return status "${schemaKey === 'impl' ? 'failed' : 'blocked'}", rounds 0, empty arrays, and notes "CODEX_UNAVAILABLE: <the reason it printed>".
+
+TASK:
+${CODEX_NOTE}
+
+${prompt}`
+  const r = await agent(wrapper, { ...opts, label: `cx-${opts.label}`, effort: 'low' })
+  if (!r || /CODEX_UNAVAILABLE/.test(r.notes || '')) {
+    log(`${opts.label}: Codex unavailable (${r ? (r.notes || '').slice(0, 140) : 'no result'}) - falling back to Claude`)
+    return run(prompt, opts)
+  }
+  return r
+}
+
 const CI_RESULT = {
   type: 'object',
   properties: {
@@ -277,8 +308,15 @@ ${prelude(f, dir)}
 const MAX_IMPL = A.maxImpl || 5
 let implActive = 0
 const implQueue = []
-const acquireImpl = () => { if (implActive < MAX_IMPL) { implActive++; return Promise.resolve() } return new Promise((r) => implQueue.push(r)) }
-const releaseImpl = () => { const next = implQueue.shift(); if (next) next(); else implActive-- }
+// Critical path first: a waiting implementer with more transitive dependents gets the next slot.
+const dependents = {}
+FEATURES.forEach((f) => { dependents[f.id] = 0 })
+FEATURES.forEach((f) => { for (const d of depClosure(f)) dependents[d] = (dependents[d] || 0) + 1 })
+const acquireImpl = (id) => {
+  if (implActive < MAX_IMPL) { implActive++; return Promise.resolve() }
+  return new Promise((r) => { implQueue.push({ r, rank: dependents[id] || 0 }); implQueue.sort((a, b) => b.rank - a.rank) })
+}
+const releaseImpl = () => { const next = implQueue.shift(); if (next) next.r(); else implActive-- }
 
 const done = async (r) => {
   finished++
@@ -300,12 +338,12 @@ const buildOne = async (f) => {
   try {
     if (!impl) {
       if (!builtBefore) await specReady // unbuilt features wait for spec pass 2
-      await acquireImpl()
-      try { impl = await run(implementPrompt(f, depInfo, forceImpl || st.wip), { label: `impl:${f.id}`, phase: 'Build', model: M, schema: IMPL_RESULT }) } finally { releaseImpl() }
+      await acquireImpl(f.id)
+      try { impl = await viaCodex('impl', f, implementPrompt(f, depInfo, forceImpl || st.wip), 'impl', 'high', { label: `impl:${f.id}`, phase: 'Build', model: M, schema: IMPL_RESULT }) } finally { releaseImpl() }
     }
     if (impl && !ci) {
-      ci = await run(`${ciLoop(`${WT}${SEP}${f.id}`, `feat/${f.id}`,
-        `Only edit files feature ${f.id} owns: ${owned(f)}. If an error is in a dependency's file or a shared contract, work around it inside your own files where possible and report it under contractGaps.`, 8, LOCAL_BUILD(`${WT}${SEP}${f.id}`, 'feature', f.id))}\n${prelude(f, `${WT}${SEP}${f.id}`)}`,
+      ci = await viaCodex('ci', f, `${ciLoop(`${WT}${SEP}${f.id}`, `feat/${f.id}`,
+        `Only edit files feature ${f.id} owns: ${owned(f)}. If an error is in a dependency's file or a shared contract, work around it inside your own files where possible and report it under contractGaps.`, 8, LOCAL_BUILD(`${WT}${SEP}${f.id}`, 'feature', f.id))}\n${prelude(f, `${WT}${SEP}${f.id}`)}`, 'ci', 'medium',
         { label: `ci:${f.id}`, phase: 'Build', model: M, schema: CI_RESULT })
     }
   } finally {
@@ -323,7 +361,7 @@ const buildOne = async (f) => {
     if (!review) return done({ id: f.id, impl, ci, review: null, final: halted ? 'halted' : 'unreviewed' })
     const serious = (review.issues || []).filter((i) => i.severity !== 'minor')
     if (review.verdict === 'needs-fix' || serious.length) {
-      finalCi = await run(fixPrompt(f, review.issues), { label: `fix:${f.id}`, phase: 'Build', model: M, schema: CI_RESULT })
+      finalCi = await viaCodex('fix', f, fixPrompt(f, review.issues), 'ci', 'high', { label: `fix:${f.id}`, phase: 'Build', model: M, schema: CI_RESULT })
       if (!finalCi) return done({ id: f.id, impl, ci, review, final: halted ? 'halted' : 'unfixed' })
       if (finalCi.status !== 'green') return done({ id: f.id, impl, ci, review, final: finalCi.status })
     }
@@ -336,7 +374,7 @@ const buildOne = async (f) => {
   const wantAdopt = resume === 'v2adopt' || (A.v2adopt && builtBefore && !st.v2)
   if (wantAdopt && finalCi && finalCi.status === 'green') {
     await Promise.all([mainV2Ready, specReady])
-    adopt = await run(v2adoptPrompt(f), { label: `v2adopt:${f.id}`, phase: 'Build', model: M, schema: CI_RESULT })
+    adopt = await viaCodex('v2adopt', f, v2adoptPrompt(f), 'ci', 'high', { label: `v2adopt:${f.id}`, phase: 'Build', model: M, schema: CI_RESULT })
     if (!adopt) return done({ id: f.id, impl, ci, review, adopt, final: halted ? 'halted' : 'unadopted' })
     finalCi = adopt
   }
@@ -346,7 +384,7 @@ const buildOne = async (f) => {
 const todo = FEATURES.filter((f) => !ONLY || ONLY.has(f.id))
 const results = (await parallel(todo.map((f) => () => buildOne(f)))).map((r, i) => r || { id: todo[i].id, final: 'crashed' })
 const mainside = { contracts2: await c2Promise, spec2: await specPromise, shell: await shellPromise }
-if (!halted) await commitState('batch complete')
+if (!halted && commitEvery) await commitState('batch complete')
 
 const summary = {
   total: todo.length,

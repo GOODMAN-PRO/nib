@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibPluginRuntime/PluginRuntime.swift:706-713 (PluginInstance.execute, the opts.group branch) + Resources/prelude.js:105",
+      "problem": "`nib.commands.execute(cmd, params, {group})` passes any plugin-chosen group id straight into the Invocation, so a plugin can join another principal's undo group. Groups are easy to learn: `ai.turn.finished` carries payload.group (PLUGIN_API §6), and `nib.ai.complete` returns group. Gateway.authorize skips confirmation for any group in `allowedGroups`, a set that is never pruned and not keyed by principal. So once the user has answered \"allow rest of group\" for an AI or bridge turn, a plugin holding `destructive` can replay that group id and run irreversible or destructive commands with no prompt. That breaks the PLUGIN_API §3 promise that irreversible commands always ask, even when a plugin holds destructive. The plugin's writes also land in the AI turn's undo step, so reverting the turn reverts them too.",
+      "fix": "In execute(_:token:entry:), stop using `args.group` verbatim. Accept it unchanged only when it is in a small bounded set of groups this instance was given: the `group` of its own entries, plus the groups returned by its own `nib.ai.complete` and `nib.commands.execute` results. Otherwise rewrite it to `\"plugin.\" + manifest.id + \":\" + g`, which keeps the documented \"same group = one undo step\" behaviour for the plugin's own groups. Add a test: set `gateway.setPolicy(forPrincipalKind: \"plugin\") { _ in .always }` with a recording presenter, have the presenter answer allowRestOfGroup for an `.ai` invocation in group G, then check that the plugin calling `nib.commands.execute('test.addText', {}, {group: G})` is still sent to the presenter. Separately, raise a §16 contract request to key `Gateway.allowedGroups` by principal."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibPluginRuntime/NibPluginRuntimeFeature.swift:201-228 (PluginStorage.refresh) and 230-244 (write)",
+      "problem": "Data-loss risk at the file boundary. refresh() rebuilds `merged` only from the files it can read right now (`merged = result`). A file that fails `Data(contentsOf:)` or decode is logged and skipped, and that includes this device's own storage.<dev>.json. Because every device writes the full merged state it knows, the next nib.storage.set/remove, or the conflict-copy merge path, rewrites storage.<dev>.json without the skipped keys. Those keys are then gone for good, and the loss syncs to every device. ARCHITECTURE §21 names file-provider eviction (OneDrive, Dropbox) as a top risk, and this is the realistic trigger: a dataless or evicted own file read while offline fails, so plugin data is silently wiped. The same happens with an iCloud `.storage.<dev>.json.icloud` placeholder, which isStorageFile does not match, so the own file looks absent.",
+      "fix": "(1) Merge the files you re-read into the existing in-memory `merged` using PluginStorage.merge, instead of replacing it. Merge is last-writer-wins per key with tombstones, so it is monotonic, and a transient read failure can never drop a key already known. (2) When this device's own file is listed but unreadable (an I/O error, as opposed to a decode error), or a `.storage.<dev>.json.icloud` placeholder exists, call `FileManager.startDownloadingUbiquitousItem(at:)` where it applies. Then make set/remove throw `NibError(.unavailable, \"the plugin's storage is still downloading\")` rather than write. (3) When the own file exists but fails to decode, move it aside to `storage.<dev>.corrupt-<ms>.json` before the first rewrite. (4) Add a unit test: set keys a and b, overwrite the own file with bytes that cannot be read or decoded (or chmod 000), then call set(\"c\"). Either the call throws, or a, b and c all survive a fresh PluginStorage reading the folder."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginRuntime/PluginRuntime.swift:697-704 (execute, the path where ctx.principal differs from the plugin's principal); NibKit/Tests/NibPluginRuntimeTests/PluginRuntimeTests.swift:269-279",
+      "problem": "When the user, the AI or the bridge invokes a plugin command, the handler's ctx.execute calls run as `app.bus.execute(Invocation(principal: .plugin(id), ...))`. Their `changes` are never merged into the invoking CommandContext's summary, which is `private(set)`. So InvocationResult.changes for plugin commands is empty. AI tool results, bridge results and dry runs all report no changes, even though PLUGIN_API §7 says dry runs report changes and §9 says to iterate with dryRun. testDryRunsReachNestedCalls passes only because it never asserts r.changes.",
+      "fix": "Raise a §16 contract request for a CommandContext API that records nested changes, e.g. `public func record(_ changes: ChangeSummary)` or `execute(_ inv: Invocation)` that keeps the Invocation's principal. Until it lands, report the gap in the feature summary. Once it exists, merge `r.changes` into entry.commandContext in execute(), and add `XCTAssertEqual(r.changes.created.count, 1)` to testDryRunsReachNestedCalls and to the acceptance test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginRuntime/PluginRuntime.swift:579-599 (enqueue) and 625-630 (dispatch)",
+      "problem": "Main-actor cost on large notebooks and sync bursts. Each coalesced event calls ChangeSummary.merge, which rebuilds `Set(all)` from the whole accumulated summary every time. That is O(N²) in refs per 100 ms window, per subscribed plugin. The merged summary is also unbounded when it is JSON-encoded on main and sent to JS. A sync merge or bulk import emitting thousands of tx.committed events can block main well past the 16 ms rule.",
+      "fix": "Keep a per-CoalesceKey `Set<String>` of refs already pending and append only new refs, which is O(new). Cap each delivery at, say, 2,000 refs; beyond that, send `changes` with a `truncated: true` flag so plugins re-query. Add a unit test that coalesces 5,000 events with 10 refs each within `XCTAssertLessThan(elapsed, budget × 4)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginRuntime/NibPluginRuntimeFeature.swift:139-168, 239 (PluginStorage ops) and PluginRuntime.swift:269-274 (one PluginStorage per instance)",
+      "problem": "Every storage get and keys call lists and stats the Files-provider folder. Every set and remove re-encodes the whole store (up to 5 MB) and atomically rewrites it, which triggers an upload on a synced folder each time. A plugin that writes in a loop thrashes disk and sync. Also, reload creates a second PluginStorage with its own queue for the same file, so writes still pending on the old instance's queue can race with the new instance's writes, and the last writer wins.",
+      "fix": "Have PluginRuntime own one PluginStorage per plugin id, reused across reloads, so a single queue serialises all writes. Throttle refresh() to at most once a second, or only when an NSFilePresenter or the directory signature signals a change. Debounce writes by about 250 ms and flush on stop()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginRuntime/PluginRuntime.swift:128-135 (LogRing.append); NibKit/Sources/NibPluginRuntime/NibPluginRuntimeFeature.swift:307-318 (PluginFetcher.fetch)",
+      "problem": "Two memory limits that plugins can bypass. The console ring caps the number of lines (1,000) but not their length, so `console.log(hugeObject)` in a loop keeps up to 1,000 lines of arbitrary size in memory. nib.net.fetch also buffers the entire response with `session.data(for:)` before it checks the 20 MB `fetchBytes` cap, so the cap never bounds memory.",
+      "fix": "Truncate each line to about 8 KB in LogRing.append and mark it with \"… (truncated)\". In PluginFetcher, use `session.bytes(for:)`, or a URLSessionDataDelegate, and cancel with `invalid_params` as soon as expectedContentLength or the bytes received so far exceed maxBytes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginRuntime/PluginRuntime.swift:793-803 (openPanel)",
+      "problem": "nib.ui.openPanel runs `panel.open` as `.user` with `readOnly: false`. A plugin handler running in ask mode, or inside a read-declared command, can therefore still run a non-read command. Other plugins' command hooks also see the call as a user action. This undermines the spec's promise that ask mode and read-declared commands stay read-only inside plugins.",
+      "fix": "Keep the fixed `{id}` params, which avoids needing the \"app\" scope for the plugin's own panels. Pass `readOnly: ambient().readOnly` and `dryRun: ambient().dryRun` in the Invocation so ask mode and dry runs refuse or skip the open. Add a case to testReadDeclaredCommandsAndAskModeStayReadOnly."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibPluginRuntimeTests/PluginRuntimeTests.swift",
+      "problem": "Two behaviours the spec names have no tests. (1) Nothing shows `inheritedPolicy` reaching ctx.execute, e.g. the AI running a plugin command under a stricter policy. (2) The `nib.canvas.decorate` sugar is untested: its params `{page, id, display, ttl}`, the default ttl 5, the returned id, and clear() removing only the plugin's own decorations. The prelude sugar that maps nib.query and nib.assets onto command params is also untested.",
+      "fix": "Add two tests. (a) In the Harness, register a fake `canvas.decorate` / `canvas.clearDecorations` (effect .session) that records params. Check that the decorate params arrive as {page, id, display, ttl: 5}, that the call resolves to the id, and that `nib.canvas.clear()` sends only the plugin's own ids. (b) Set `gateway.setPolicy(forPrincipalKind: \"ai\") { _ in .always }` with a recording presenter for \"plugin\". Run the mapped plugin command as `.ai(\"chat\")`, and check that the handler's `ctx.execute('test.addText')` reaches the presenter, and that it is denied with user_denied when the presenter answers .deny."
+    }
+  ]
+}
