@@ -1,0 +1,107 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonSetState.mode (L364-388); FeatTeacherLessonsFeature.swift mode menus (L29-38)",
+      "problem": "Entering Present again rebuilds the private document from the source and keeps only old items whose layer == presentLayer (L380). Anything else the teacher wrote in Present is deleted without a warning. Present is offered for every document kind (no kind check in the menu isVisible or in mode()), so in a text document or study set all Present edits (blocks or cards) are lost on the next Present. In a notebook, any ink or item written after switching the private copy to another layer is also lost.",
+      "fix": "Allow Prep, Present and Feedback only for notebooks (and whiteboards if wanted): check meta.kind in mode() and throw NibError(.unsupported), and filter by kind in the menu isVisible. On refresh, carry over every old private item and page whose id is not in the fresh source capture, not just presentLayer items (or keep the private copy's other layers read-only). Add a test that writes on layer 0 and in a text document while in Present, enters Present again, and checks that nothing was lost."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonCreate.copyInputs (L247-274), transfer (L276-293); also used by Present (L374-377)",
+      "problem": "copyInputs reads every asset of the source (PDF backgrounds, images) and every audio and transcript file into one in-memory dictionary, then writes the copies. A lesson built on a large PDF, or one with recorded audio, holds hundreds of MB in memory at once. A jetsam kill during transfer leaves blank student documents in the shared class folder, because createDocument (L196) runs before transfer and the rollback in the catch block never runs. Each copy also round-trips the whole snapshot through JSONValue to remap assets.",
+      "fix": "Stream the copy instead. For each asset, load it, put it into every destination copy, then release it, so peak memory is one asset; or copy by URL with FileManager.copyItem from assets.url(ref, doc: source). Copy audio and transcript files with FileManager.copyItem (an APFS clone) instead of Data. Compute the asset name map once, not per copy (asset names are content-addressed, so they are the same for every destination). Then create the library documents only after the payload is ready, or record the created ids before writing so the next launch can roll them back."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherLessonsFeature.swift LessonPanel body (L152-157, L212-219, L260-265)",
+      "problem": "The panel hand-builds things NibDesign v2 already covers. Errors are a Text coloured NibColor.warning, a stand-in for NibBanner (the v2 notice row for inline errors). Receipts are plain Text with .updatesFrequently, so VoiceOver never announces them. The Filter and Sort pickers are raw SwiftUI Pickers without the 44 pt minimum. Section headers are a hand-made title3 Text instead of the panel section component.",
+      "fix": "Show errors with NibBanner(error, style: .warning) and receipts with NibBanner(receipt, style: .info), and post AccessibilityNotification.Announcement for both. Use NibSegmentedControl(selection:options:title:) for Sort, and NibSegmentedControl or a menu picker with .frame(minHeight: NibMetrics.hitTarget) for Filter. Use NibInspectorSection (or the documented panel section component) for the section headings."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonSetState.run (L320-349)",
+      "problem": "Read-modify-write across awaits. meta is read at L320, then the command awaits snapshot encoding and assets.put in detached tasks, then writes the stale meta with tx.putMeta. putMeta stamps a fresh revision with no revision check, so any meta change that lands during the await is reverted: a remote sync or collab patch, a layer rename, or another feature's ext key.",
+      "fix": "After the awaits, read ctx.workspace.content(doc).meta again, decode the assignment again and check the transition again (throw .conflict if it changed). Then set only ext[nib.lesson] on the fresh meta and write that."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonSetState.mode prep (L390-399); FeatTeacherLessonsFeature.swift L179",
+      "problem": "Prep is only a layer selection on the source document. Prep edits made after a lesson is published never reach the student copies, so the 'shared layer' of the spec (Prep (shared layer)) is shared only at creation time. The panel copy 'Prep edits the shared lesson' says otherwise, and the source does not even have to be in the class folder.",
+      "fix": "Either propagate Prep: when Prep mode is left, or on an explicit lesson.create re-publish of an existing source, put and delete the source's item ids into each copy whose nib.lesson.source == source, touching only ids from the source set and leaving student and Feedback items alone. Or change the panel copy and the S-095 note to say that Prep applies before publishing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonRuntime.record / LessonCommandUndo.register (L38-83); LessonCreate action param (L91-143)",
+      "problem": "The window undo step registers its inverse before the replayed command runs. That command is a fire-and-forget app.perform, so a replay that fails (runtime.busy, permission, lock) still moves the undo/redo stack, and the next redo acts on state that never changed. AI and plugin calls also register steps on the user's window UndoManager, and undoSteps grows without bound. To support this, lesson.create gains an undeclared action: trash|restore that duplicates F002's library.trash and trash.recover. The batch rollback also untrashes documents that were already in Trash. A roster replacement lands on two undo stacks at once (the document history and the window manager).",
+      "fix": "Replay with try await app.bus.execute and register the inverse only after it succeeds. Record only when ctx.principal.isUser. Undo copies with CommandIDs.libraryTrash and trashRecover; the managed-document guard can be a CommandHookDescriptor.guarding hook if it is still needed. Then drop the action param from lesson.create and mark doc and folder required in its schema (the catalogue lists doc, students, folder). Record a roster replacement either in the document history or as a window step, not both."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift mode present (L387-399) vs FeatCollab/FeatCollabPresenceFeature.swift presenceSession (L563-573)",
+      "problem": "During a Quick Lesson with Follow Me on, switching to Present moves the teacher's window to the PRESENT_ document. F108 shares only a session whose document == sharedDoc, so the teacher's viewport and Follow Me broadcasts stop, and students stop following exactly while the teacher presents.",
+      "fix": "In F108's presence hooks, treat a session whose document's ext nib.lesson.privateSource equals sharedDoc as showing the shared document (page ids are stable, so remotePageRef(page) still resolves). Or have mode(present) throw a clear .conflict while this device leads Follow Me. Add a presence test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherLessonsFeature.swift L48-50 and LessonPanel.liveButtons (L283-286)",
+      "problem": "'Start Follow Me' duplicates F108's own Follow Me menu entry. F108's entry is a checked toggle in documentTitle, visible only in a live session. This one is in documentMore, always visible, always sends on: true and uses a different glyph (.profile instead of .present). Outside a live session it just fails. The panel's Start and Stop Follow Me buttons are always enabled.",
+      "fix": "Remove the teacherlessons.followMe menu item (F108 already covers it), or give it F108's isVisible and isChecked. Enable the panel's buttons only when collab.participants shows a live hosted session, and use NibSymbol.present."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherLessonsFeature.swift L51-53",
+      "problem": "The toolkit key ⇧⌘L (scope .global) clashes with F013's Unlock Selection ⇧⌘L (FeatObjectMenuFeature.unlockShortcut). KeyCommandRouting picks the narrower scope, so the toolkit key does nothing in documents.",
+      "fix": "Pick an unused shortcut (check the DESIGN.md keyboard table and the other features' key registrations), or register no key and give the menu item a display-only shortcut."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherLessonsFeature.swift register (menus)",
+      "problem": "S-097 includes student submit and resubmit, but a student can submit only by opening the Teacher Toolkit, choosing the class folder, loading the class and finding their own row. No document entry point exists.",
+      "fix": "Register documentMore and documentTitle menu items 'Submit Assignment' (published or resubmit) and 'Return Assignment' / 'Request Resubmission' (submitted or returned). Make them visible from the document's nib.lesson state and have them call lesson.setState {doc, state}."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonImportRoster (L462-473), LessonCreate.studentList (L223-229)",
+      "problem": "The roster, including every student's email, is written as an ordinary synced notebook into the class folder. Every student who can open the folder can read and edit it, and lesson.create with students omitted trusts whatever it contains.",
+      "fix": "Keep only id and name in the shared roster and store emails device-local (or leave them out). Say in the panel that the roster is visible to everyone with folder access. Also ignore a roster document that is in Trash."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/RosterImport.swift parse/records (L18-108); LessonCommands.swift L443",
+      "problem": "Rosters from common exports fail. The file must be UTF-8: Excel's Windows-1252 and UTF-16 'Unicode text' are rejected. Semicolon- and tab-delimited CSV (European Excel locales) fails at the header with 'Add a name column'. A space before an opening quote or after a closing quote throws (Sam, \"O'Brien, J\").",
+      "fix": "Detect the delimiter (, ; tab) from the header line. Fall back to UTF-16 when a BOM is present, and to Windows-1252 when UTF-8 decoding fails. Allow whitespace around quoted fields. Add tests for each case."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift LessonSetState returned (L334-344); FeatTeacherLessonsFeature.swift assignmentRow (L300)",
+      "problem": "A return snapshot stores the document records only. Package-relative transcript and audio files are not captured, and transcripts can still be edited after a return. Nothing can open or view a saved snapshot; the panel only shows a count.",
+      "fix": "Copy the clip and transcript files into the snapshot, either as assets referenced from the snapshot JSON or under returns/<attempt>/. Add an 'Open Returned Version' action that opens the snapshot read-only, for example as a managed document."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherLessonsFeature.swift loadFolders/loadClass (L347-381), body (L169-172, L224)",
+      "problem": "One document with an assignment record that will not decode stops the whole class from loading (the try at L375). Loading runs one query.get per document, one after another. The query.tree cursor is ignored, so libraries with more than 500 nodes are silently cut short. Up to 1,000 roster rows and assignment rows render in a non-lazy VStack, and each ViewThatFits builds both of its layouts.",
+      "fix": "Decode each entry with try? (show 'Unreadable' for that row). Follow the cursor. Use LazyVStack for the roster and assignment lists, and collapse the roster behind a count."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherLessonsFeature.swift privateSharing guard (L56-74)",
+      "problem": "The guard lists string literals, including 'doc.duplicate', which is not a catalogue id. implicitPrivate checks only doc, ref and refs, but export.run takes docs, so exporting any other document from a Present window is refused.",
+      "fix": "Use the CommandIDs constants (collabHost, exportRun, exportPresent, libraryDuplicate, libraryMove) and drop doc.duplicate. Add docs to the explicit-target check."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/LessonCommands.swift L194 and L371-373",
+      "problem": "Present moves every source item to layer 0 and clears hidden layers, so the lesson's layer structure is lost in the presentation. Feedback renames layer 1 of every copy to 'Feedback', overwriting the source's own layer name, and writes feedback on a layer that may already hold lesson content.",
+      "fix": "Keep source item layers in the private copy; only items on presentLayer need relocating or refusing. For Feedback, use a layer the source leaves unused and empty, and keep a layer name the source has already set."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTeacherTests/LessonManagerTests.swift",
+      "problem": "Several risky paths have no test: Feedback mode on a student copy, entering Present again after writing on another layer or in another document kind, the Quick Lesson batch menu params (collab.host + panel.open), the setState return path with a meta change arriving during the await, and window-undo replay when the command fails.",
+      "fix": "Add Harness tests for each path, using a FakeCanvasHost or session assertions for Feedback and the menu's params closure for Quick Lesson."
+    }
+  ]
+}

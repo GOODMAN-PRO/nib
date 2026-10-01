@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudySession/StudyReminders.swift StudyRuntime.enqueue (lines 117-121), LocalReviewReminders.schedule (line 47); Scheduler.swift nextReview (lines 56-58)",
+      "problem": "Review reminders fire about 1 second after scheduling. The bug: `Scheduler.nextReview` takes the minimum `dueDate` over live cards, and an unstudied card (`srs == nil`) has dueDate 0, the same as any overdue card. `schedule` then gets a date in the past and uses `max(1, date.timeIntervalSinceNow)`, which is 1 s. Example: turn on reminders for a new set, or leave a Smart Learn session with due cards left. \"Time to review\" arrives at once. With reminders on, every grade that leaves due cards behind reschedules the reminder to +1 s. The fixture shows it: FIXTURECRD01 has no SRS state, so testReminderScheduleTracksGradePauseAndUndo schedules for epoch 0 and only asserts non-nil. `study.grade` also returns `nextReview: 0` while unstudied cards remain.",
+      "fix": "Add `Scheduler.nextReminder(_ cards: [StudyCard], now: Double) -> Double?`. It returns the earliest `srs.due` that is greater than `now`, over live cards with `srs != nil`. The reconciliation worker schedules at that date and calls cancel when it is nil. Keep `nextReview` for the summary, clamped to `now` as it is today. Add tests: (a) enabling reminders on the fixture schedules at 1_700_086_400 (FIXTURECRD02), not at 0; (b) after grading one of two due cards, the scheduled date is greater than `runtime.now()`."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudySession/StudyReminders.swift StudyRuntime.start (lines 85-108)",
+      "problem": "Trashing, permanently deleting, restoring or duplicating a study set never reconciles its reminder. These are library operations: they emit `library.changed`, not commits, and the runtime only observes commits. Launch reconciliation walks `library.allNodes()`, which excludes trashed nodes. Example: a trashed or deleted set with reminders on keeps its pending `studysession.review.<doc>` request forever, and it fires with a deep link to a missing document. A restored or duplicated set (its ext copies `study.remindersPaused=false`) gets no request until its next edit.",
+      "fix": "In `start`, subscribe to `NibEventType.libraryChanged` with `app.events`. On each event, and once at launch, list the pending ids through a new `ReminderScheduling.pendingDocuments() async -> Set<DocumentID>` (`pendingNotificationRequests()` filtered by the `studysession.review.` prefix; the fake returns `dates.keys`). Cancel every id that is not a live, non-trashed study set, and enqueue study sets that are live but have no request. Add a Harness test: enable reminders, call `library.trash(doc)`, emit `library.changed`, drain, then assert `reminders.dates[doc] == nil`."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudySession/StudyCommands.swift StudyQuery (lines 145-157); PracticeView.swift StudySessionModel.send/reload (lines 157-182); StudyReminders.swift commit observer (lines 87-100)",
+      "problem": "The whole study set is serialised through JSON on the main actor on every interaction. `send` calls `reload()` after every command, including flip, next, previous, language and speak. `reload` runs `study.query`, which returns the full `DocumentContent`. The bus encodes it to `JSONValue` and the model decodes it again. The commit observer does the same for every document in every commit, including every ink stroke in any notebook, where it fails the kind check after a bus round trip. Example: a set of 1,000 cards with Freeform faces (Stroke arrays) re-encodes several MB per card flip, and taps made while `busy` are dropped. `study.query` is also an extra command id (not in §6.5 for F050) and an unpaged read whose result exceeds 20 KB (§6.1, G21). `liveCards` (filter plus sort) is recomputed many times per render, via `current`, `nextReview` and `interval(_:)` ×4.",
+      "fix": "Delete `StudyQuery`. `StudySessionModel.reload()` and `StudyRuntime` read `app.workspace.content(doc)` directly (in-process, no JSON). Skip `reload()` after `study.session` actions, because `StudySessionAction.run` already calls `model.accept(content)`. In the commit observer, keep only `change.documents` whose `app.services.library?.node(doc)?.documentKind == .studySet` before reading. In `accept`, cache `liveCards` plus an id→card dictionary, and have `current`, `nextReview` and `moveToDueCard` use the cache."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudySession/StudyReminders.swift StudyRuntime.start (lines 101-107)",
+      "problem": "The work that contracts-v2 G10 `Workspace.peekContent` covers is done by hand here. At launch, every study set in the library is loaded with `workspace.content(doc)`, through `study.query`. That call caches each head permanently and emits `doc.opened` for each one, even though reminders are off by default. Example: a library with hundreds of large study sets loads and keeps all their cards in memory at every launch, sends hundreds of false `doc.opened` events, and calls `UNUserNotificationCenter` cancel once per set.",
+      "fix": "Reconcile with `app.workspace.peekContent(doc)` (no caching, no `doc.opened`). Only enqueue sets where `StudyPreferences.paused(meta) == false`. Cancel orphaned requests in a single pass from the pending-request list (see the deletion fix) instead of one cancel per paused set. Spread the per-set loads across `Task.yield()` calls so launch does not stall."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudySession/PracticeView.swift StudySessionView.progress (lines 302-310)",
+      "problem": "The session progress line is drawn by hand: a GeometryReader with two square `Rectangle`s, `NibColor.fill1`/`label`, and height `NibStroke.thick`. NibDesign already ships `NibProgressBar`, which DESIGN.md §13.4 calls \"the only determinate progress (export, import, study sessions)\", with capsule ends and its own accessibility value. The DESIGN_SYSTEM rule allows feature UI to compose only Nib* components, so this copy breaks it and also has the wrong shape (square ends instead of capsule).",
+      "fix": "Replace the GeometryReader/ZStack with `NibProgressBar(value: progressValue)` and keep `.accessibilityLabel(String(localized: \"Study progress\"))` on it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/PracticeView.swift StudySessionModel.act \"language\" (lines 120-124), StudySpeech.speak (line 23), language picker (lines 453-458)",
+      "problem": "Read-aloud fails for Chinese and for some languages that F049 offers. The picker offers \"zh-CN\", but `Locale.availableIdentifiers` has no zh_CN (checked: zh-CN false, zh-Hans true), so choosing it gives the error \"Use an installed language code.\". The set language comes from F049's Vision list (`zh-Hans`, `zh-Hant`, `yue-Hans`, `vi-VT`), and `AVSpeechSynthesisVoice(language:)` returns nil for these, so the user sees \"A voice for this language is not installed\".",
+      "fix": "Validate `language` against `AVSpeechSynthesisVoice.speechVoices().map(\\.language)`. Resolve the set language to a voice: exact match first, then a script/region map (zh-Hans→zh-CN, zh-Hant→zh-TW, yue→zh-HK, vi-VT→vi-VN), then the first voice with the same language code. Build the picker from the installed voices' languages. Add a unit test for the mapping."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/PracticeView.swift StudySessionModel.accept (lines 87-96)",
+      "problem": "`accept` can change the current card without resetting `flipped` or stopping speech. Example: card A is revealed in Smart Learn, and A is then deleted (in another window, or by sync or the AI), or synced with a future due date. `moveToDueCard` moves to card B with `flipped == true`, so B's answer shows and B can be graded without its question being seen.",
+      "fix": "Record `current?.id` before you update the queue and index. If it is different afterwards, set `flipped = false`, `instantFlip = true` and call `speaker.stop()`. Add a test that reveals a card, deletes it with card.delete, and asserts that `model.flipped == false`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/FeatStudySessionFeature.swift (lines 14-16), StudyCommands.swift StudySessionAction / StudyRequestReminders",
+      "problem": "F050 registers `study.query`, `study.session` and `study.requestReminders`, but §6.5 lists only study.grade/resetProgress/setReminders/setTheme for it (§6.1: \"exactly the ids listed\", §15.3). lint.py misses this because the ids come from `static let id` (its warnings are false positives about `studysession.key.`).",
+      "fix": "Remove `study.query` (see the perf finding). Keep `study.session`, which the ←/→/Space/1–4 key commands need, and `study.requestReminders`, the userPresence permission prompt. Report both in the feature summary or a contract request so the spec owner adds their §6.5 and forge-spec rows."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/StudyCommands.swift StudySessionAction.run (line 172); StudyReminders.swift StudyRuntime.model (lines 77-83)",
+      "problem": "The ←/→/Space/1–4 key commands are live in every study-set window. Each press outside a session (for example in the editor) creates and keeps a `StudySessionModel` in `runtime.models`. Models are only released by \"end\", so they pile up for every session/document pair.",
+      "fix": "Add `StudyRuntime.existingModel(doc:session:)`. In `StudySessionAction.run`, create a model only for \"start\". For other actions with no existing model, return `Output(card: nil, flipped: false, reviewed: 0, total: 0, nextReview: nil)` without allocating one."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/PracticeView.swift StudySessionModel.send (line 158), header onClose (line 267), StudySummaryView Return button",
+      "problem": "`send` silently drops any action while `busy`, Close and \"Return to Study Set\" (\"end\") included. Tapping Close while a grade or reminder permission request is in flight does nothing.",
+      "fix": "Let \"end\" skip the busy guard: call `app.perform(StudySessionAction.id, [doc, action: end])` and `close()` directly from the header and summary buttons. Alternatively, queue the latest action and run it once the current one finishes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/StudyReminders.swift LocalReviewReminders.cancel (lines 51-55)",
+      "problem": "`cancel` calls `UNUserNotificationCenter` without checking `authorizationStatus` first, which §15.13 requires. It runs for every paused set at launch and on every commit, even for users who never enabled notifications.",
+      "fix": "Read `notificationSettings()` first and return early when the status is `.notDetermined` or `.denied`, since nothing can be pending then. Otherwise remove the request as now."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/StudyCommands.swift StudySessionAction.run (lines 173-183); PracticeView.swift act \"start\" (line 103)",
+      "problem": "`mode` is never validated in `run`, and the bus skips schema validation for user calls (`app.perform`). `start` with mode \"bogus\" succeeds with an all-cards queue, but previous and next then refuse to move because `mode != \"practice\"`.",
+      "fix": "In `act(\"start\")`, throw `NibError.invalid(\"Choose practice or smartLearn.\", path: \"$.mode\")` unless mode is nil, \"practice\" or \"smartLearn\"."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudySession/PracticeView.swift paperPicker (lines 465-478)",
+      "problem": "Card and background colours are chosen from text-only menu Pickers, so users pick a paper by name without seeing it. NibDesign v2 adds `NibPaperTile` + `.nibSelectionRing` for this (listed for unbuilt F050). The \"Appearance and reminders\" DisclosureGroup label is also shorter than the 44 pt hit target.",
+      "fix": "Render the papers as a horizontal row of `NibPaperTile(name:isSelected:size:action:)` swatches that send `study.setTheme`, with \"Desk\" as the first tile for the background. Give the disclosure label `.frame(minHeight: NibMetrics.hitTarget)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatStudySessionTests/FeatStudySessionTests.swift",
+      "problem": "The riskiest logic has no test that would catch the bugs above. No test checks that the scheduled reminder date is in the future (the current test accepts epoch 0). None covers trash or delete cancellation, deleting a revealed card during a session, language-to-voice mapping, or invalid `mode`. testReminderScheduleTracksGradePauseAndUndo waits on `for _ in 0..<10 { await Task.yield() }`, so its timing is not guaranteed.",
+      "fix": "Add the tests named in the fixes above. Replace the yield loops with a deterministic wait, for example an internal `StudyRuntime.reconcile(doc:) async` the observer calls and the test awaits, or polling until `pending` is empty and the worker is nil."
+    }
+  ]
+}

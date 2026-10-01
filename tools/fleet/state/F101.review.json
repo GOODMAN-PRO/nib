@@ -1,0 +1,59 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "blocker",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:398-412 (begin: capture appended to surface.captures), 585-612 (process: pairs drawing[entries.count] with captures.first), 617-626 (removeReady: guard surface.captures.isEmpty), 309-314 (pruneSurfaces); TouchTap.swift:111-115 (off-page sample fallback)",
+   "problem": "Wet strokes are matched to captures by position: every .pencilKit .tool touch appends a Capture to surface.captures, and process() pairs the next PKStroke in the drawing with captures.first. Some captures never get a PKStroke. Example: a Pencil stroke that starts off the paper (desk margin, or the gap between pages). TouchTap.sample falls back to session.page, so the touch gets a sample and a .tool route, and begin() adds a Capture to the page's surface. The PKCanvasView frame only covers the page, so PencilKit never sees the touch and no stroke is made. That ended capture D then stays at the head of surface.captures. (1) The next real stroke S is delivered with D's style, tool and rolls. If the user changed pen colour or width between the two, the wrong ink is committed through ink.addStrokes (corrupted data), and every later stroke is shifted onto the previous capture. (2) surface.captures is never empty again, so removeReady never removes a wet stroke and pruneSurfaces never drops the surface. Wet copies pile up over the dry tiles: highlighter is multiplied twice, and undone or erased strokes still show. The PKDrawing grows without limit, and the ghost surface stays laid out over the page after the user leaves it, until the canvas closes. The same desync happens when a capture is made for a touch PencilKit does not draw: a second contact in anyInput mode, or a drawing recogniser that prevents() blocked.",
+   "fix": "Register a .pencilKit capture on a surface only for a touch PencilKit actually received. Record the touches InputInkCanvas.acceptsContact returned true for (a Set<ObjectIdentifier> on the Surface), and also require surface.region to contain the sample. Otherwise create the capture without a surface: no wet ink, no strokeFinished, and endInking on lift. Pair strokes by identity instead of by index: feed a per-surface queue from canvasViewDidBeginUsingTool, which fires only when PencilKit starts a stroke, or match PKStroke.path.creationDate to the capture's start time. In canvasViewDidEndUsingTool, drop ended captures that produced no stroke, so removeReady and pruneSurfaces can never get stuck. Move the ledger (captures, entries, ready, cancel) into a pure type and unit-test: an off-page capture followed by a stroke with a new style commits the new style; the wet entry retires after the fence and the surface prunes; cancelling live vs. ended captures; the strokeHeld hand-off."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:360-379 (prevents), 387-397 (navigation switch); NibKit/Sources/FeatCanvas/TouchTap.swift:64, 90-98",
+   "problem": "TouchTap recognises on the first touchesBegan, and canPrevent / shouldRecognizeSimultaneously decide for whole recognisers using whatever tracks exist at that moment. (a) Finger drawing (stylusMode anyInput, T-079/P-026): the first finger gets a .tool route, so prevents(pan/pinch) is true when TouchTap begins, and UIKit fails the scroll view's pan (minimumNumberOfTouches 2) and pinch for the rest of the sequence. When the second finger lands in a later event, navigating = true comes too late: two-finger scroll and zoom only work when both fingers land in the same touchesBegan, which is rarely how people place them. Codex's independent pass reached the same conclusion. (b) Palm resting, then Pencil (P-027/T-080): a rejected palm track makes prevents(drawingGestureRecognizer) true and shouldRecognizeSimultaneously false. When the Pencil lands, PencilKit's drawing recogniser is prevented by the already-recognised TouchTap, unless PencilKit's private delegate allows simultaneous recognition. The core palm-rest writing case then produces no ink, and begin() still makes a capture for it, which triggers the desync above. This is likely; it needs device verification.",
+   "fix": "Stop failing pan, pinch or the drawing recogniser from TouchTap for .tool and .rejected routes. Make prevents() true only for .attachment routes, and only while TouchTap is entering .began for that touch. Gate per touch instead. Panning already needs 2 touches in anyInput mode (applyStylusMode). In pencilOnly mode set panGestureRecognizer.allowedTouchTypes to [direct, indirectPointer] so the Pencil never scrolls. Palms are already kept out of PencilKit by InputInkCanvas.acceptsContact and by cancel() when the rejection comes later. A rejected palm should not start a pan: count only non-rejected touches in DocumentScrollView.gestureRecognizerShouldBegin. Add a tools/smoke (F111) bridge script: in anyInput mode, one finger down then a second 50 ms later must pan and zoom; in pencilOnly mode, a palm resting before the Pencil must still ink."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Tests/FeatCanvasTests/CanvasInputTests.swift (whole file)",
+   "problem": "The tests cover GestureRouter in isolation, WetStrokeHandoff with a fake host, PalmRejection and StrokeStillness. Nothing exercises WetInkController's state machine, which holds the risky logic: capture-to-PKStroke pairing, process/removeReady/prune, cancel of live vs. delivered strokes, two-finger navigation cancelling finger ink, gesturePending dots, tap/double-tap queueing and zoomToggle, hold to strokeHeld hand-off, and the session.inking begin/update/end balance. The blocker above would have failed any test that ends a capture without a PencilKit stroke. The production commit path (process -> deliver -> tool.strokeFinished -> CanvasHostImpl.commitStroke -> ink.addStrokes) is also never run end to end.",
+   "fix": "Move the touch and ledger logic behind the UIKit edges, for example a WetInkModel that takes (touchID, sample, route) events and 'PencilKit appended stroke N' events and emits deliver/retire/inking calls. Unit-test it: an off-page capture; two overlapping captures; a second finger cancelling ink and ending inking; a handled finger tap discarding its dot; a double-tap within 0.3 s and 24 pt; hold for 0.5 s calling strokeHeld once and handing off touchesMoved/Ended; cancelWetStroke from strokeFinished being idempotent; beginInking/endInking balanced on every path. Add one integration test that drives process() on an installed controller with a stand-in ink.addStrokes, and assert that the committed style matches the capture's."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:691-709 (canvasActivePageDidChange / canvasActiveToolDidChange / canvasReadOnlyDidChange -> resetTouches), 525-566 (queueTap / dispatchGesture)",
+   "problem": "resetTouches does not clear pendingTap, tapTask or gestureTasks. A finger tap followed within 300 ms by a tool change, page change or read-only toggle still flushes the old tap. GestureRouter.gesture then reads the new activeTool(), so for example a text box is placed by the newly chosen tool at a stale point, or an attachment that no longer applies gets the tap.",
+   "fix": "In resetTouches (or in the three lifecycle hooks), cancel tapTask, set pendingTap = nil, and cancel and clear gestureTasks. Alternatively, capture the tool identity/generation when the tap is queued and drop the tap in dispatchGesture if it changed."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:388-396 (navigation cancel), 514-515 (handled long-press cancel), 694-698 (canvasCancelWetStroke)",
+   "problem": "session.inking (G12) is unbalanced on some paths. When a second finger turns finger ink into navigation, or a long-press handler consumes the touch, the capture is cancelled without endInking, so the chrome stays receded through the whole two-finger pan. In the other direction, a tool that calls the 'harmless' cancelWetStroke again during its Draw-and-Hold preview (after strokeHeld returned true) reaches host.endInking() unconditionally and brings the chrome back mid-gesture.",
+   "fix": "After any cancel(capture), call endInking when no live, non-cancelled capture and no handed-off capture remains. In canvasCancelWetStroke, return early without endInking when no capture was actually live (count the captures cancel() really changed), and keep handed-off captures inking until their touch ends."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:386 and 466 vs 472-479; GestureRouter.swift:48, 68",
+   "problem": "In anyInput mode a .samples tool (eraser, lasso) receives touchesBegan/touchesEnded for a finger tap before the tap is offered to content.tapHandlers. A finger tap on a link with the eraser selected therefore erases under the finger and also runs link.tapAt. The spec order is tap handlers before the active tool. The .pencilKit path already defers its dot with gesturePending.",
+   "fix": "For finger touches on a .samples route, buffer touchesBegan and the first samples until the touch moves more than 8 pt or the 0.5 s hold fires. On lift without movement, route the tap first and replay the buffered began/ended to the tool only if no handler handled it."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:350-358 (rejectsPalm), 429-430 (move), 341-342 (decision)",
+   "problem": "Every touch move event reads palmSensitivity, writingPosture and reduceLatency through SettingsStore.get. Each read is a UserDefaults string read, a JSONValue parse, a Codable decode and two locks, so there are three on every Pencil event at 120-240 Hz, even for Pencil touches that PalmRejection ignores.",
+   "fix": "Cache stylusMode, palmSensitivity, writingPosture and reduceLatency in the controller (and the PalmRejection value), refreshing them in settingsChanged, which already observes SettingsStore.didChange. Skip rejectsPalm for touch.type == .pencil."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/WetInkController.swift:220-248, 250-292, 317-329",
+   "problem": "Surfaces are thrown away and rebuilt instead of reused. Each time the current page changes during a continuous scroll, and each time a whiteboard pan leaves the 256 pt capture margin, two new PKCanvasViews are created and the old ones are destroyed. PKCanvasView is expensive to create, so fast scrolling through a large notebook or panning a board stutters.",
+   "fix": "Keep one normal and one highlighter surface per controller and reposition them (frame, region, zoomScale) when there are no entries or captures. Make a new pair only while the old pair still holds unretired wet strokes."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/GestureRouter.swift:136-138",
+   "problem": "The spec asks F101 to file the two deferred canvas gaps it owns (a partial-stroke ink preview API, and a per-page spatial index for items-in-rect) as contract requests. They exist only as a code comment, so the fleet's contract-gaps tracking will not pick them up.",
+   "fix": "Write them as a 'ponytail:' comment naming both requests, and list them in the F101 fixed/state notes so the fleet can add them to tools/fleet/contract-gaps.md. That file and docs/contract-requests are not F101-owned paths, so do not add them to this branch."
+  }
+ ]
+}
