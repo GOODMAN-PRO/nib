@@ -27,7 +27,13 @@ public enum FeatConvertTextFeature: NibFeature {
             command: CommandIDs.panelOpen, params: { context in
                 ["id": .string(ConvertPanels.preview), "refs": .array(context.selection.refs.map(JSONValue.string))]
             }, isVisible: { context in
-                context.itemKinds == [.stroke] && !context.selection.refs.isEmpty && context.session?.readOnly != true
+                guard context.itemKinds == [.stroke], !context.selection.refs.isEmpty,
+                      context.session?.readOnly != true else { return false }
+                return context.selection.refs.allSatisfy { ref in
+                    guard case let .item(doc, page, id)? = NodeRef(ref),
+                          let item = try? context.app.workspace.item(doc, page: page, id: id) else { return false }
+                    return Conversion.isHandwriting(item)
+                }
             }, submenu: String(localized: "Convert")))
         app.ui.menus.register(MenuItemDescriptor(id: "convert.language", title: String(localized: "Recognition Language"),
             icon: NibSymbol.language.name, location: .documentTitle, order: 57, owner: id,
@@ -37,19 +43,7 @@ public enum FeatConvertTextFeature: NibFeature {
                 return .object(params)
             }, isVisible: { $0.doc != nil || $0.session?.document != nil }))
 
-        var key = KeyCommandDescriptor(id: ConvertPanels.preview, title: String(localized: "Convert Handwriting to Text"),
-            shortcut: KeyShortcut("t", [.command, .shift]), command: CommandIDs.panelOpen,
-            params: ["id": .string(ConvertPanels.preview)], scope: .canvas, owner: id)
-        key.docKinds = [.notebook, .whiteboard]
-        key.sessionParams = { session in ["refs": .array(session.selection.refs.map(JSONValue.string))] }
-        app.content.keyCommands.register(key)
 
-        var settings = SettingsPageDescriptor(id: "convert.language", title: String(localized: "Recognition Language"),
-            icon: NibSymbol.language.name, section: .writing, order: 57, owner: id) { app in
-                AnyView(RecognitionLanguageSettings(app: app))
-            }
-        settings.keywords = ["handwriting", "recognition", "document language"]
-        app.ui.settingsPages.register(settings)
     }
 }
 

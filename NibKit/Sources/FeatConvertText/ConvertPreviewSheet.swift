@@ -1,5 +1,4 @@
 import SwiftUI
-import UIKit
 import Observation
 import NibContracts
 import NibDesign
@@ -19,7 +18,7 @@ final class ConvertPreviewModel {
     var revisions: [String]?
     var stale = false
     @ObservationIgnored private var commits: EventSubscription?
-    @ObservationIgnored private var conversionGroup: String?
+    @ObservationIgnored private(set) var conversionGroup: String?
 
     init(app: NibApp, session: EditorSession?, refs: [String]) {
         self.app = app
@@ -104,7 +103,7 @@ final class ConvertPreviewModel {
         error = nil
         let group = NibID.make().raw
         conversionGroup = group
-        defer { busy = false; conversionGroup = nil }
+        defer { busy = false }
         do {
             var params: [String: JSONValue] = ["refs": .array(refs.map(JSONValue.string)), "replace": true, "text": .string(text)]
             if let revisions { params["revisions"] = .array(revisions.map(JSONValue.string)) }
@@ -112,7 +111,20 @@ final class ConvertPreviewModel {
                 params: .object(params), session: session, group: group)).value
             createdRef = result["ref"]?.stringValue
             receipt = String(localized: "Handwriting converted to text.")
-        } catch { self.error = NibError.wrap(error).message }
+        } catch {
+            conversionGroup = nil
+            self.error = NibError.wrap(error).message
+        }
+    }
+
+    var undoParams: JSONValue? {
+        guard let conversionGroup, let createdRef, case let .item(doc, _, _)? = NodeRef(createdRef) else { return nil }
+        return ["doc": .string(NodeRef.document(doc).description), "group": .string(conversionGroup)]
+    }
+
+    func undoConversion() async throws {
+        guard let undoParams else { return }
+        _ = try await app.bus.execute(CommandIDs.revertGroup, undoParams, session: session)
     }
 
     func copy() async {
@@ -145,7 +157,15 @@ struct ConvertPreviewSheet: View {
                 cancelTitle: model.createdRef == nil ? String(localized: "Cancel") : String(localized: "Done"),
                 primaryTitle: model.createdRef == nil ? String(localized: "Convert") : nil,
                 isPrimaryEnabled: model.canConvert, onCancel: close,
-                onPrimary: { Task { await model.convert() } })
+                onPrimary: { Task {
+                    await model.convert()
+                    if model.createdRef != nil, let host = context.session?.floatingHost, let params = model.undoParams {
+                        close()
+                        host.postToast(String(localized: "Handwriting converted to text."), actionTitle: String(localized: "Undo"), action: {
+                            context.app.perform(CommandIDs.revertGroup, params, session: context.session)
+                        })
+                    }
+                } })
             ScrollView {
                 VStack(alignment: .leading, spacing: NibSpacing.l) {
                     if model.loading {
@@ -173,12 +193,12 @@ struct ConvertPreviewSheet: View {
                             NibButton(model.stale ? String(localized: "Reload Preview") : String(localized: "Retry Recognition"), symbol: .recognisedText) { Task { await model.load() } }
                         }
                     }
-                    if let receipt = model.receipt {
+                    if let receipt = model.receipt, context.session?.floatingHost == nil {
                         Text(receipt).font(NibFont.bodyEmphasis).foregroundStyle(NibColor.label)
-                        if let ref = model.createdRef, case let .item(doc, _, _)? = NodeRef(ref) {
+                        if let params = model.undoParams {
                             NibButton(String(localized: "Undo Conversion"), symbol: .undo,
                                       shortcut: KeyboardShortcut("z", modifiers: .command)) {
-                                context.app.perform(CommandIDs.undo, ["doc": .string(NodeRef.document(doc).description)], session: context.session)
+                                context.app.perform(CommandIDs.revertGroup, params, session: context.session)
                                 close()
                             }
                         }
@@ -193,12 +213,11 @@ struct ConvertPreviewSheet: View {
         .onDisappear { model.stopObserving() }
         .interactiveDismissDisabled(model.busy)
         .onChange(of: model.receipt) { _, value in
-            if let value { UIAccessibility.post(notification: .announcement, argument: value) }
+            if model.createdRef == nil, let value, let host = context.session?.floatingHost { host.postToast(value) }
         }
     }
 
     private func close() {
-        context.app.perform(CommandIDs.panelClose, ["id": .string(ConvertPanels.preview)], session: context.session)
         context.dismiss()
     }
 }
@@ -216,6 +235,8 @@ final class RecognitionLanguageModel {
     var receipt: String?
     var retryLanguage: String?
 
+    var canChoose: Bool { !busy && !loading && selected != nil }
+
     init(app: NibApp, session: EditorSession?, doc: DocumentID?) {
         self.app = app
         self.session = session
@@ -228,10 +249,8 @@ final class RecognitionLanguageModel {
         defer { loading = false }
         do {
             guard let doc else { throw NibError.invalid(String(localized: "Open a document to choose its recognition language.")) }
-            languages = try RecognitionLanguages.supported()
-            let result = try await app.bus.execute(CommandIDs.queryGet, ["ref": .string(NodeRef.document(doc).description)], session: session)
-            selected = result["language"]?.stringValue ?? result["meta"]?["language"]?.stringValue
-            guard selected != nil else { throw NibError.unavailable(String(localized: "Document recognition language")) }
+            languages = try await RecognitionLanguages.supported()
+            selected = try app.workspace.content(doc).meta.language
         } catch { self.error = NibError.wrap(error).message }
     }
 
@@ -246,8 +265,11 @@ final class RecognitionLanguageModel {
                 ["doc": .string(NodeRef.document(doc).description), "language": .string(language)], session: session)
             selected = result["language"]?.stringValue
             error = result["warning"]?.stringValue
-            retryLanguage = result["indexed"]?.boolValue == false ? language : nil
-            if error == nil { receipt = String(localized: "Recognition language updated. Search rebuilt.") }
+            let scheduled = result["scheduled"]?.boolValue == true
+            retryLanguage = result["indexed"]?.boolValue == false && !scheduled ? language : nil
+            if error == nil {
+                receipt = scheduled ? String(localized: "Recognition language updated. Search rebuild scheduled.") : String(localized: "Recognition language updated. Search rebuilt.")
+            }
         } catch { self.error = NibError.wrap(error).message }
     }
 }
@@ -267,7 +289,7 @@ struct RecognitionLanguageSheet: View {
         VStack(spacing: NibSpacing.l) {
             NibSheetHeader(String(localized: "Recognition Language"), cancelTitle: String(localized: "Done"), onCancel: close)
             if model.loading || model.busy {
-                ProgressView(model.loading ? String(localized: "Loading languages…") : String(localized: "Rebuilding search…"))
+                ProgressView(model.loading ? String(localized: "Loading languages…") : String(localized: "Saving language…"))
                     .font(NibFont.body)
             }
             if let error = model.error {
@@ -291,7 +313,7 @@ struct RecognitionLanguageSheet: View {
                         .buttonStyle(.plain)
                         .accessibilityValue(model.selected == language ? String(localized: "Selected") : "")
                         .accessibilityAddTraits(model.selected == language ? .isSelected : [])
-                        .disabled(model.busy || model.loading || model.selected == nil)
+                        .disabled(!model.canChoose)
                         .hoverEffect(.highlight)
                     }
                 } footer: {
@@ -305,26 +327,11 @@ struct RecognitionLanguageSheet: View {
         .task { await model.load() }
         .interactiveDismissDisabled(model.busy)
         .onChange(of: model.receipt) { _, value in
-            if let value { UIAccessibility.post(notification: .announcement, argument: value) }
+            if let value { context.session?.floatingHost?.postToast(value) }
         }
     }
 
     private func close() {
-        context.app.perform(CommandIDs.panelClose, ["id": .string(ConvertPanels.language)], session: context.session)
         context.dismiss()
-    }
-}
-
-@MainActor
-struct RecognitionLanguageSettings: View {
-    let app: NibApp
-    var body: some View {
-        VStack(alignment: .leading, spacing: NibSpacing.l) {
-            Text(String(localized: "Choose the handwriting recognition language for the open document."))
-                .font(NibFont.body).foregroundStyle(NibColor.labelSecondary)
-            NibButton(String(localized: "Recognition Language"), symbol: .language) {
-                app.perform(CommandIDs.panelOpen, ["id": .string(ConvertPanels.language)])
-            }
-        }.padding(NibSpacing.xl)
     }
 }
