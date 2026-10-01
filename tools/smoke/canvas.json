@@ -1,1 +1,166 @@
-{}
+{
+  "name": "Canvas device smoke",
+  "description": "Drawing latency, palm rejection, sustained 60 fps scrolling, rotation and live accessibility appearance. Device observations stay manual in the run report until verified by a person.",
+  "requires": [
+    "doc.create",
+    "doc.open",
+    "view.goToPage",
+    "view.zoom",
+    "view.scrollBy",
+    "ink.addStrokes",
+    "render.page",
+    "query.context",
+    "library.trash"
+  ],
+  "steps": [
+    {
+      "command": "doc.create",
+      "params": {
+        "kind": "notebook",
+        "title": "Canvas smoke ${run}",
+        "id": "SMKCANVAS${run}",
+        "cover": false,
+        "pages": 32
+      },
+      "name": "Create disposable smoke notebook",
+      "expect": {
+        "json": {
+          "ref": {
+            "$match": "^doc:"
+          },
+          "pages": {
+            "$len": 32
+          }
+        }
+      },
+      "save": {
+        "doc": "ref",
+        "page": "pages[0]",
+        "pages": "pages"
+      }
+    },
+    {
+      "command": "doc.open",
+      "params": {
+        "doc": "${doc}"
+      }
+    },
+    {
+      "command": "view.goToPage",
+      "params": {
+        "page": "${page}"
+      }
+    },
+    {
+      "command": "ink.addStrokes",
+      "params": {
+        "page": "${page}",
+        "strokes": [
+          {
+            "style": {
+              "tool": "pen",
+              "pen": "ball",
+              "color": "#14213D",
+              "width": 2
+            },
+            "fmt": "xy",
+            "pts": [
+              72,
+              100,
+              200,
+              100
+            ]
+          }
+        ]
+      },
+      "expect": {
+        "json": {
+          "refs": {
+            "$len": 1
+          }
+        }
+      }
+    },
+    {
+      "tool": "nib_context",
+      "args": {},
+      "expect": {
+        "json": {
+          "document": {
+            "ref": "${doc}"
+          },
+          "page": {
+            "ref": "${page}"
+          }
+        }
+      }
+    },
+    {
+      "manual": "With Pencil draw fast loops, slow diagonals and short dots for 20 seconds at 100% and 400% zoom. Does wet ink follow the tip without a visible gap, and does every finished stroke stay visible without jumping or flickering? Record device/Pencil model and high-speed video latency as evidence."
+    },
+    {
+      "command": "view.zoom",
+      "params": {
+        "scale": 4
+      }
+    },
+    {
+      "manual": "Rest your palm and the side of your hand on the page while writing with Pencil, then lift/reposition the palm. Is there no stray ink, unintended tap, scroll or pinch? Lift Pencil and confirm intentional two-finger zoom/scroll still works."
+    },
+    {
+      "command": "view.zoom",
+      "params": {
+        "scale": 1
+      }
+    },
+    {
+      "command": "view.scrollBy",
+      "params": {
+        "dy": 600,
+        "dx": 0
+      }
+    },
+    {
+      "manual": "Scroll the 32-page notebook continuously for 30 seconds with tiles filling the screen. Using an Instruments frame-rate trace or device FPS capture, is scrolling sustained at least 60 fps without blank tiles or visible stutter? Record the trace; bridge request time does not measure frame rate."
+    },
+    {
+      "command": "view.goToPage",
+      "params": {
+        "page": "${page}"
+      }
+    },
+    {
+      "manual": "Rotate portrait to landscape and back while zoomed, then during a Pencil stroke. Does the visible page anchor stay stable, do ink and hit testing align, and are the toolbar and selection controls usable in both orientations?"
+    },
+    {
+      "tool": "nib_render",
+      "args": {
+        "page": "${page}",
+        "marks": true
+      },
+      "expect": {
+        "image": true,
+        "json": {
+          "marks": {
+            "$minLen": 1
+          }
+        }
+      },
+      "saveImage": "canvas-after-rotation.png"
+    },
+    {
+      "manual": "Enable Reduce Transparency, then Increase Contrast in iOS Settings. Return to Nib in light and dark mode: are live glass toolbar/panels legible and opaque when requested, without hiding paper or controls? Restore settings afterward."
+    }
+  ],
+  "cleanup": [
+    {
+      "command": "library.trash",
+      "params": {
+        "refs": [
+          "${doc}"
+        ]
+      },
+      "name": "Move disposable notebook to recoverable Trash"
+    }
+  ]
+}

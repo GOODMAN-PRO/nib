@@ -1,1 +1,223 @@
-{}
+{
+  "name": "Ink device smoke",
+  "description": "Real ink commit, multiply highlighter compositing, undo/redo and PencilKit Draw-and-Hold cancellation; annotated renders are saved as evidence.",
+  "requires": [
+    "doc.create",
+    "doc.open",
+    "ink.addStrokes",
+    "edit.undo",
+    "edit.redo",
+    "query.find",
+    "recognize.pageText",
+    "render.page",
+    "library.trash"
+  ],
+  "steps": [
+    {
+      "command": "doc.create",
+      "params": {
+        "kind": "notebook",
+        "title": "Ink smoke ${run}",
+        "id": "SMKINK${run}",
+        "cover": false,
+        "pages": 1
+      },
+      "name": "Create disposable smoke notebook",
+      "expect": {
+        "json": {
+          "ref": {
+            "$match": "^doc:"
+          },
+          "pages": {
+            "$len": 1
+          }
+        }
+      },
+      "save": {
+        "doc": "ref",
+        "page": "pages[0]",
+        "pages": "pages"
+      }
+    },
+    {
+      "command": "doc.open",
+      "params": {
+        "doc": "${doc}"
+      }
+    },
+    {
+      "command": "ink.addStrokes",
+      "params": {
+        "page": "${page}",
+        "strokes": [
+          {
+            "style": {
+              "tool": "pen",
+              "pen": "ball",
+              "color": "#14213D",
+              "width": 2
+            },
+            "fmt": "xy",
+            "pts": [
+              72,
+              120,
+              280,
+              120
+            ]
+          },
+          {
+            "style": {
+              "tool": "highlighter",
+              "color": "#FFFF0080",
+              "width": 24
+            },
+            "fmt": "xy",
+            "pts": [
+              72,
+              120,
+              280,
+              120
+            ]
+          },
+          {
+            "style": {
+              "tool": "highlighter",
+              "color": "#FF880080",
+              "width": 24
+            },
+            "fmt": "xy",
+            "pts": [
+              170,
+              70,
+              170,
+              190
+            ]
+          }
+        ],
+        "ids": [
+          "BASE${run}",
+          "YELLOW${run}",
+          "ORANGE${run}"
+        ]
+      },
+      "expect": {
+        "json": {
+          "refs": {
+            "$len": 3
+          }
+        }
+      }
+    },
+    {
+      "tool": "nib_find",
+      "args": {
+        "in": "${page}"
+      },
+      "expect": {
+        "json": {
+          "items": {
+            "$len": 3
+          }
+        }
+      }
+    },
+    {
+      "tool": "nib_render",
+      "args": {
+        "page": "${page}",
+        "marks": true
+      },
+      "expect": {
+        "image": true,
+        "json": {
+          "marks": {
+            "$len": 3
+          }
+        }
+      },
+      "saveImage": "ink-multiply.png"
+    },
+    {
+      "manual": "Inspect the saved render and live canvas: yellow and orange highlighter cross over a dark pen line. Is the pen readable through both, with a darker multiply intersection instead of an opaque patch? Does the live canvas match the render?"
+    },
+    {
+      "command": "edit.undo",
+      "params": {
+        "doc": "${doc}"
+      }
+    },
+    {
+      "tool": "nib_find",
+      "args": {
+        "in": "${page}"
+      },
+      "expect": {
+        "json": {
+          "items": {
+            "$len": 0
+          }
+        }
+      }
+    },
+    {
+      "command": "edit.redo",
+      "params": {
+        "doc": "${doc}"
+      }
+    },
+    {
+      "tool": "nib_find",
+      "args": {
+        "in": "${page}"
+      },
+      "expect": {
+        "json": {
+          "items": {
+            "$len": 3
+          }
+        }
+      }
+    },
+    {
+      "manual": "Select Pen and enable Draw-and-Hold. Draw and hold a line and a circle until each snaps; release, undo once and redo once. Is there exactly one final shape per gesture with no duplicate raw PencilKit stroke or wet-ink ghost? Repeat a hold then interrupt by scrolling/tool switching; the next normal stroke must still commit."
+    },
+    {
+      "manual": "On a clear area write Nib smoke with Pencil and wait for handwriting recognition. Verify the next bridge call contains those words with boxes aligned to the ink."
+    },
+    {
+      "tool": "nib_page_text",
+      "args": {
+        "page": "${page}"
+      },
+      "expect": {
+        "json": {
+          "blocks": {
+            "$type": "array"
+          }
+        }
+      }
+    },
+    {
+      "tool": "nib_render",
+      "args": {
+        "page": "${page}",
+        "marks": true
+      },
+      "expect": {
+        "image": true
+      },
+      "saveImage": "ink-after-hold.png"
+    }
+  ],
+  "cleanup": [
+    {
+      "command": "library.trash",
+      "params": {
+        "refs": [
+          "${doc}"
+        ]
+      },
+      "name": "Move disposable notebook to recoverable Trash"
+    }
+  ]
+}

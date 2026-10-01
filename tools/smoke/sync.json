@@ -1,1 +1,143 @@
-{}
+{
+  "name": "Files-provider sync device smoke",
+  "description": "Two devices sharing a Files-provider library: remote ink arrival, provider downloads and library repair while retaining originals.",
+  "requires": [
+    "library.locations",
+    "doc.create",
+    "doc.open",
+    "sync.now",
+    "query.find",
+    "render.page",
+    "library.repair",
+    "library.trash"
+  ],
+  "steps": [
+    {
+      "command": "library.locations",
+      "params": {},
+      "name": "Record provider locations",
+      "save": {
+        "locations": "$"
+      }
+    },
+    {
+      "manual": "Confirm the active library is in the intended shared Files-provider folder outside the app container. On a second device open the same folder and keep Nib foregrounded. Record provider, both device models and network."
+    },
+    {
+      "command": "doc.create",
+      "params": {
+        "kind": "notebook",
+        "title": "Provider sync smoke ${run}",
+        "id": "SMKSYNC${run}",
+        "cover": false,
+        "pages": 1
+      },
+      "name": "Create disposable smoke notebook",
+      "expect": {
+        "json": {
+          "ref": {
+            "$match": "^doc:"
+          },
+          "pages": {
+            "$len": 1
+          }
+        }
+      },
+      "save": {
+        "doc": "ref",
+        "page": "pages[0]",
+        "pages": "pages"
+      }
+    },
+    {
+      "command": "doc.open",
+      "params": {
+        "doc": "${doc}"
+      }
+    },
+    {
+      "command": "sync.now",
+      "params": {}
+    },
+    {
+      "manual": "On the second device run Sync Now, open this run's new Provider sync smoke notebook and draw one line on the first page. Wait for upload. Did the notebook arrive with the same title and document id?"
+    },
+    {
+      "command": "sync.now",
+      "params": {},
+      "name": "Merge remote provider changes"
+    },
+    {
+      "tool": "nib_find",
+      "args": {
+        "in": "${page}"
+      },
+      "expect": {
+        "json": {
+          "items": {
+            "$type": "array"
+          }
+        }
+      }
+    },
+    {
+      "tool": "nib_render",
+      "args": {
+        "page": "${page}",
+        "marks": true
+      },
+      "expect": {
+        "image": true
+      },
+      "saveImage": "sync-remote-ink.png"
+    },
+    {
+      "manual": "Do the query and saved render show the second device's line exactly once, and does the live page update without reopening? If person steps were skipped, leave this check manual; an empty array does not prove sync."
+    },
+    {
+      "manual": "Using Files provider controls, evict then download the disposable package and open it in Nib. Is download progress visible, does opening wait, and does its ink remain? Temporarily lose/recover network; verify recovery without losing originals."
+    },
+    {
+      "command": "sync.now",
+      "params": {}
+    },
+    {
+      "command": "library.repair",
+      "params": {
+        "rebuildIndex": false
+      },
+      "expect": {
+        "json": {
+          "errors": {
+            "$len": 0
+          }
+        }
+      }
+    },
+    {
+      "tool": "nib_render",
+      "args": {
+        "page": "${page}",
+        "marks": true
+      },
+      "expect": {
+        "image": true
+      },
+      "saveImage": "sync-after-repair.png"
+    },
+    {
+      "manual": "After Repair Library does this notebook retain the same id, pages and remote ink on both devices? Confirm existing library notebooks remain and no duplicates appear."
+    }
+  ],
+  "cleanup": [
+    {
+      "command": "library.trash",
+      "params": {
+        "refs": [
+          "${doc}"
+        ]
+      },
+      "name": "Move disposable notebook to recoverable Trash"
+    }
+  ]
+}
