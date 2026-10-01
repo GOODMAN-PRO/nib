@@ -339,7 +339,7 @@ final class FeatSearchUITests: XCTestCase {
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertEqual(calls, 1)
         XCTAssertEqual(state.matches.count, 1)
-        try await h.run(CommandIDs.searchOpen, ["scope": "document", "match": 0])
+        XCTAssertEqual(state.selectedID, first.id)
         try await h.run(CommandIDs.searchStep, ["direction": "next"])
         XCTAssertEqual(calls, 2)
         XCTAssertEqual(state.matches.count, 2)
@@ -535,8 +535,12 @@ final class FeatSearchUITests: XCTestCase {
         try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertEqual(state.matches, [first, second])
+        XCTAssertEqual(state.selectedID, first.id)
         try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(state.selectedID, second.id)
         try await h.run(CommandIDs.searchStep, ["direction": "next"])
+        XCTAssertEqual(state.selectedID, first.id)
+        try await h.run(CommandIDs.searchStep, ["direction": "previous"])
         XCTAssertEqual(state.selectedID, second.id)
     }
 
