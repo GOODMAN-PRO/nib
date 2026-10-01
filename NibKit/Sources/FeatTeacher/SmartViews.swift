@@ -44,6 +44,7 @@ struct InsightEntry: Codable, Identifiable {
 
 struct InsightCollection: Codable {
     var source: String
+    var folder: String? = nil
     var page: String?
     var zone: String?
     var pages: [InsightPage]
@@ -54,6 +55,7 @@ struct InsightCollection: Codable {
     var clusters: [InsightCluster]
     var modelAnswer: String?
     var missing: [InsightMissing]
+    var staleMembers: [String] = []
 
     var revisions: [String: Rev] {
         var result = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0.revision) })
@@ -75,14 +77,17 @@ enum SmartViews {
         return text.isEmpty ? nil : text
     }
 
-    static func collect(doc raw: String, zone zoneRef: String?, page pageRef: String?, ctx: CommandContext) throws -> InsightCollection {
+    static func collect(doc raw: String, zone zoneRef: String?, page pageRef: String?, folder folderRef: String? = nil, ctx: CommandContext) throws -> InsightCollection {
         let requested = try LessonManager.document(raw)
         try unlocked(requested, ctx)
         let requestedMeta = try ctx.workspace.content(requested).meta
         let assignment = try LessonManager.assignment(requestedMeta)
         let source = assignment?.source ?? requestedMeta.ext?[LessonManager.privateSourceKey]?.stringValue.map { NibID($0) } ?? requested
         try unlocked(source, ctx)
-        let snapshot = try LessonManager.capture(source, workspace: ctx.workspace)
+        let library = try ctx.services.require(ctx.services.library, "library")
+        let folder = try folderRef.map { try LessonManager.folder($0, library: library) } ?? assignment?.folder
+        let snapshot = try ctx.services.get(InsightRuntime.key, as: InsightRuntime.self)?.snapshot(source, workspace: ctx.workspace)
+            ?? LessonManager.capture(source, workspace: ctx.workspace)
         guard snapshot.content.meta.kind == .notebook || snapshot.content.meta.kind == .whiteboard else {
             throw NibError(.unsupported, "Smart Views require a notebook or whiteboard lesson.")
         }
@@ -116,13 +121,20 @@ enum SmartViews {
                   livePages.contains(where: { $0.id == p }) else { throw invalid("The page must belong to this lesson.", path: "$.page") }
             selectedPage = p
         }
-        let library = try ctx.services.require(ctx.services.library, "library")
         var copies: [InsightCopy] = [], entries: [InsightEntry] = [], missing: [InsightMissing] = []
         for node in library.allNodes().filter({ $0.kind == .document && $0.trashedAt == nil && $0.id != source && !LessonManager.isPrivate($0.id) }).sorted(by: { $0.id < $1.id }) {
             // Heads are small. Inspect only assignment metadata, then load the selected page of matching copies.
-            guard let meta = try? ctx.workspace.content(node.id).meta,
-                  let record = try LessonManager.assignment(meta), record.source == source, let student = record.student else { continue }
-            if let folder = assignment?.folder, record.folder != folder { continue }
+            guard let meta = try? ctx.workspace.peekContent(node.id).meta, meta.ext?[LessonManager.assignmentKey] != nil else { continue }
+            let record: LessonAssignment
+            do {
+                guard let decoded = try LessonManager.assignment(meta) else { continue }
+                record = decoded
+            } catch {
+                missing.append(InsightMissing(id: NodeRef.document(node.id).description, reason: NibError.wrap(error).message))
+                continue
+            }
+            guard record.source == source, let student = record.student else { continue }
+            if let folder, record.folder != folder { continue }
             guard copies.count < RosterImport.maxStudents else { throw NibError(.unsupported, "Collect at most 1,000 student copies at a time.") }
             let copy = InsightCopy(id: NodeRef.document(node.id).description, student: student.name, state: record.state.rawValue)
             copies.append(copy)
@@ -141,15 +153,27 @@ enum SmartViews {
         var record: InsightClusterRecord?
         if let selectedPage {
             model = try entry(doc: source, page: selectedPage, zone: zoneID, student: String(localized: "Model answer"), ctx: ctx)
-            if let zoneID, let value = snapshot.items[selectedPage]?.first(where: { $0.id == zoneID })?.custom?.data[ClusterEngine.recordKey] {
-                do { record = try value.decode(InsightClusterRecord.self) }
-                catch { throw NibError(.unsupported, "This question's saved clusters are unreadable. Update Nib before changing them.") }
+            if let zoneID {
+                let scopes = snapshot.content.meta.ext?[LessonManager.rosterKey]?[ClusterEngine.recordKey]?[NodeRef.item(source, selectedPage, zoneID).description]
+                let value = scopes?[folder.map { NodeRef.folder($0).description } ?? "*"] ?? scopes?["*"]
+                    ?? snapshot.items[selectedPage]?.first(where: { $0.id == zoneID })?.custom?.data[ClusterEngine.recordKey]
+                if let value {
+                    do { record = try value.decode(InsightClusterRecord.self) }
+                    catch { throw NibError(.unsupported, "This question's saved clusters are unreadable. Update Nib before changing them.") }
+                }
             }
         }
-        return InsightCollection(source: NodeRef.document(source).description,
+        let available = Set(entries.map(\.id))
+        let stale = Array(Set((record?.clusters ?? []).flatMap(\.members)).subtracting(available)).sorted()
+        let pruned = (record?.clusters ?? []).map { cluster in
+            var cluster = cluster
+            cluster.members.removeAll { !available.contains($0) }
+            return cluster
+        }
+        return InsightCollection(source: NodeRef.document(source).description, folder: folder.map { NodeRef.folder($0).description },
                                  page: selectedPage.map { NodeRef.page(source, $0).description }, zone: model?.zone,
                                  pages: pages, questions: questions, copies: copies, entries: entries, model: model,
-                                 clusters: record?.clusters ?? [], modelAnswer: record?.modelAnswer, missing: missing)
+                                 clusters: pruned, modelAnswer: record?.modelAnswer, missing: missing, staleMembers: stale)
     }
 
     static func unlocked(_ doc: DocumentID, _ ctx: CommandContext) throws {
@@ -186,8 +210,8 @@ enum SmartViews {
         }.joined(separator: "\n")
         let zoneRecord = item.flatMap(AnswerZone.decode)
         let ref = zone.map { NodeRef.item(doc, page, $0).description }
-        let revisions: [Rev] = [content.meta.rev, record.rev] + items.map(\.rev)
-        let revision: Rev = revisions.max() ?? .zero
+        let pageRevision = try ctx.workspace.contentRevision(doc, page: page) ?? ctx.workspace.allItems(doc, page: page).map(\.rev).max() ?? .zero
+        let revision = max(content.meta.rev, record.rev, pageRevision)
         let hasInk = answerItems.contains { $0.kind == .stroke || $0.kind == .image || $0.kind == .custom }
         return InsightEntry(id: ref ?? NodeRef.page(doc, page).description, doc: NodeRef.document(doc).description,
                             page: NodeRef.page(doc, page).description, zone: ref, student: student, region: bounds,
@@ -221,6 +245,7 @@ struct SmartViewsPanel: View {
     @State private var newGroup = ""
     @State private var clusters: [InsightCluster] = []
     @State private var scoreText: [String: String] = [:]
+    @State private var savedClusters: [InsightCluster] = []
     @State private var proposed = false
     @State private var revisions: [String: Rev]?
     @State private var busy = false
@@ -237,6 +262,7 @@ struct SmartViewsPanel: View {
         _selectedZone = State(initialValue: initialCollection?.zone ?? "")
         _modelAnswer = State(initialValue: initialCollection?.modelAnswer ?? "")
         _clusters = State(initialValue: initialCollection?.clusters ?? [])
+        _savedClusters = State(initialValue: initialCollection?.clusters ?? [])
         _revisions = State(initialValue: initialCollection?.revisions)
     }
 
@@ -257,18 +283,27 @@ struct SmartViewsPanel: View {
     var reviewContent: some View {
             VStack(alignment: .leading, spacing: NibSpacing.xl) {
                 if let error { NibBanner(error, style: .warning) }
-                if let receipt { NibBanner(receipt, style: .info) }
+                if let receipt {
+                    NibBanner(receipt, style: .info)
+                    NibButton(String(localized: "Undo Saved Clusters"), symbol: .undo, kind: .plain) {
+                        guard let source else { return }
+                        run(CommandIDs.undo, ["doc": .string(source)]) { _ in self.receipt = nil; collect() }
+                    }.disabled(busy)
+                }
                 if busy { NibTraceRow(String(localized: "Collecting class answers"), phase: .running) }
                 if let collection {
                     ClassNavigatorView(navigator: ClassNavigator(copies: collection.copies, current: currentCopy), busy: busy,
                                        open: openCopy, mode: teachingMode)
                     Divider()
                     viewControls(collection)
-                    if !collection.missing.isEmpty {
+                    if !collection.missing.isEmpty || !collection.staleMembers.isEmpty {
                         VStack(alignment: .leading, spacing: NibSpacing.s) {
                             Text(String(localized: "Unavailable copies")).font(NibFont.headline)
                             ForEach(collection.missing) { copy in
                                 Text(copy.reason).font(NibFont.callout).foregroundStyle(NibColor.warning)
+                            }
+                            ForEach(collection.staleMembers, id: \.self) { ref in
+                                Text(String(localized: "Unavailable answer: \(ref)")).font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
                             }
                         }
                     }
@@ -292,7 +327,7 @@ struct SmartViewsPanel: View {
                                   message: String(localized: "Open a lesson or student copy, then choose Review Class Answers."))
                 }
                 NibButton(String(localized: "Collect Current Answers"), symbol: .retry, kind: .plain) { collect() }
-                    .disabled(busy || source == nil).keyboardShortcut("r", modifiers: .command)
+                    .disabled(busy || source == nil).nibShortcut(KeyboardShortcut("r", modifiers: .command))
             }.padding(NibSpacing.l)
         .background(NibColor.background)
     }
@@ -337,26 +372,34 @@ struct SmartViewsPanel: View {
         NibField(text: $modelAnswer, prompt: String(localized: "Enter a model answer, or use the source question below"), lines: 2...5)
             .accessibilityLabel(String(localized: "Model answer"))
         if let model = collection.model {
-            InsightThumbnail(entry: model, app: context.app, session: context.session)
+            InsightThumbnail(entry: model, app: context.app, session: context.session, isModel: true)
         }
         Text(String(localized: "Your connected model suggests groups. Review every answer before saving or applying scores."))
             .font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
         if widthClass == .compact || typeSize.isAccessibilitySize {
             VStack(alignment: .leading, spacing: NibSpacing.s) { clusterActions }
         } else { HStack(spacing: NibSpacing.s) { clusterActions } }
-        HStack(spacing: NibSpacing.s) {
+        if widthClass == .compact || typeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: NibSpacing.s) { addCluster }
+        } else { HStack(spacing: NibSpacing.s) { addCluster } }
+        if proposed {
+            NibBanner(String(localized: "These are suggestions. No scores have changed."), style: .info)
+            NibButton(String(localized: "Save Reviewed Clusters"), symbol: .checkmark) { save(clusters) }.disabled(busy)
+            NibButton(String(localized: "Discard Suggestions"), kind: .plain) {
+                clusters = savedClusters; proposed = false; scoreText = [:]
+            }.disabled(busy)
+        }
+    }
+
+    private var addCluster: some View {
+        Group {
             NibField(text: $newGroup, prompt: String(localized: "Name a manual cluster"))
                 .accessibilityLabel(String(localized: "New cluster name"))
             NibButton(String(localized: "Add Cluster"), symbol: .plus, kind: .plain) {
                 var next = clusters
                 next.append(InsightCluster(id: NibID.make().raw, label: newGroup, members: []))
-                save(next)
-                newGroup = ""
-            }.disabled(newGroup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy)
-        }
-        if proposed {
-            NibBanner(String(localized: "These are suggestions. No scores have changed."), style: .info)
-            NibButton(String(localized: "Save Reviewed Clusters"), symbol: .checkmark) { save(clusters) }.disabled(busy)
+                save(next); newGroup = ""
+            }.disabled(newGroup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || proposed)
         }
     }
 
@@ -364,7 +407,7 @@ struct SmartViewsPanel: View {
         Group {
             NibButton(String(localized: "Compare Answers"), symbol: .assistant, kind: .plain) { suggest(.modelAnswer) }
             NibButton(String(localized: "Group Similar Answers"), symbol: .assistant, kind: .plain) { suggest(.similarity) }
-            NibButton(String(localized: "Save Model Answer"), kind: .plain) { save(clusters) }
+            NibButton(String(localized: "Save Model Answer"), kind: .plain) { save(savedClusters) }.disabled(proposed)
         }.disabled(busy)
     }
 
@@ -376,9 +419,12 @@ struct SmartViewsPanel: View {
                 NibField(text: Binding(get: { cluster.label }, set: { label in
                     if let index = clusters.firstIndex(where: { $0.id == cluster.id }) { clusters[index].label = label }
                 }), prompt: String(localized: "Cluster name"))
-                .accessibilityLabel(String(localized: "Rename cluster"))
-                NibButton(String(localized: "Save Cluster Name"), kind: .plain) { save(clusters) }.disabled(busy)
-                let entries = collection.entries.filter { cluster.members.contains($0.id) }
+                .accessibilityLabel(String(localized: "Rename \(cluster.label)"))
+                .disabled(proposed)
+                NibButton(String(localized: "Save Cluster Name"), kind: .plain) { save(clusters) }.disabled(busy || proposed)
+                    .accessibilityLabel(String(localized: "Save name for \(cluster.label)"))
+                let members = Set(cluster.members)
+                let entries = collection.entries.filter { members.contains($0.id) }
                 answerGrid(entries, collection: collection)
                 VStack(alignment: .leading, spacing: NibSpacing.s) {
                     NibField(text: Binding(get: { scoreText[cluster.id] ?? cluster.score.map(AnswerZoneFormat.number) ?? "" },
@@ -393,10 +439,12 @@ struct SmartViewsPanel: View {
                         // Only the chosen group is graded, even if other groups have saved score proposals.
                         for index in next.indices { next[index].score = next[index].id == cluster.id ? value : nil }
                         save(next, scores: true)
-                    }.disabled(busy || entries.isEmpty)
+                    }.disabled(busy || proposed || entries.isEmpty)
+                    .accessibilityLabel(String(localized: "Score all answers in \(cluster.label)"))
                     NibButton(String(localized: "Remove Cluster"), kind: .destructivePlain) {
                         save(clusters.filter { $0.id != cluster.id })
-                    }.disabled(busy)
+                    }.disabled(busy || proposed)
+                    .accessibilityLabel(String(localized: "Remove \(cluster.label)"))
                 }
                 Divider()
             }
@@ -404,7 +452,8 @@ struct SmartViewsPanel: View {
     }
 
     private func answerGrid(_ entries: [InsightEntry], collection: InsightCollection) -> some View {
-        LazyVGrid(columns: columns, alignment: .leading, spacing: NibSpacing.xl) {
+        let membership = Dictionary(clusters.flatMap { cluster in cluster.members.map { ($0, cluster.id) } }, uniquingKeysWith: { first, _ in first })
+        return LazyVGrid(columns: columns, alignment: .leading, spacing: NibSpacing.xl) {
             ForEach(entries) { entry in
                 VStack(alignment: .leading, spacing: NibSpacing.s) {
                     InsightThumbnail(entry: entry, app: context.app, session: context.session)
@@ -416,9 +465,10 @@ struct SmartViewsPanel: View {
                     NibButton(String(localized: "Open Copy"), kind: .plain) {
                         if let copy = collection.copies.first(where: { $0.id == entry.doc }) { openCopy(copy) }
                     }.disabled(busy)
+                    .accessibilityLabel(String(localized: "Open \(entry.student)'s copy"))
                     if view == "question" {
                         Picker(String(localized: "Move answer to cluster"), selection: Binding(get: {
-                            clusters.first { $0.members.contains(entry.id) }?.id ?? ""
+                            membership[entry.id] ?? ""
                         }, set: { group in
                             var next = clusters
                             for index in next.indices {
@@ -429,7 +479,7 @@ struct SmartViewsPanel: View {
                         })) {
                             Text(String(localized: "Unassigned")).tag("")
                             ForEach(clusters) { Text($0.label).tag($0.id) }
-                        }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget).disabled(busy)
+                        }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget).disabled(busy || proposed)
                         .accessibilityLabel(String(localized: "Cluster for \(entry.student)"))
                     }
                 }.accessibilityElement(children: .contain)
@@ -446,6 +496,7 @@ struct SmartViewsPanel: View {
     private func collect() {
         guard let source, !busy else { return }
         var params: [String: JSONValue] = ["doc": .string(source), "renders": false]
+        if let folder = collection?.folder { params["folder"] = .string(folder) }
         if view == "question", !selectedZone.isEmpty { params["zone"] = .string(selectedZone) }
         else if !selectedPage.isEmpty { params["page"] = .string(selectedPage) }
         run(CommandIDs.lessonCollect, .object(params)) { value in
@@ -454,7 +505,7 @@ struct SmartViewsPanel: View {
                 collection = loaded
                 selectedPage = loaded.page ?? ""
                 if view == "question" { selectedZone = loaded.zone ?? "" }
-                clusters = loaded.clusters
+                clusters = loaded.clusters; savedClusters = loaded.clusters
                 modelAnswer = loaded.modelAnswer ?? ""
                 proposed = false; revisions = loaded.revisions; scoreText = [:]
                 if currentCopy == nil {
@@ -468,6 +519,7 @@ struct SmartViewsPanel: View {
     private func suggest(_ mode: InsightClusterMode) {
         guard !selectedZone.isEmpty else { return }
         var params: [String: JSONValue] = ["zone": .string(selectedZone), "mode": .string(mode.rawValue)]
+        if let folder = collection?.folder { params["folder"] = .string(folder) }
         if !modelAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { params["modelAnswer"] = .string(modelAnswer) }
         run(CommandIDs.lessonCluster, .object(params)) { value in
             do {
@@ -482,6 +534,7 @@ struct SmartViewsPanel: View {
         do {
             var params: [String: JSONValue] = ["zone": .string(selectedZone), "clusters": try JSONValue.from(next),
                                                "modelAnswer": .string(modelAnswer), "applyScores": .bool(scores)]
+            if let folder = collection?.folder { params["folder"] = .string(folder) }
             if let revisions { params["revisions"] = try JSONValue.from(revisions) }
             run(CommandIDs.lessonSetClusters, .object(params)) { _ in
                 receipt = scores ? String(localized: "Cluster scores saved. Undo restores every student copy together.") : String(localized: "Clusters saved.")
@@ -527,6 +580,7 @@ private struct InsightThumbnail: View {
     let entry: InsightEntry
     let app: NibApp
     let session: EditorSession?
+    var isModel = false
     @State private var image: UIImage?
     @State private var error: String?
     @State private var retry = 0
@@ -537,10 +591,11 @@ private struct InsightThumbnail: View {
                 if let image { Image(uiImage: image).resizable().scaledToFit() }
                 else if error != nil { Image(nib: .warningTriangle).foregroundStyle(NibColor.warning) }
                 else { ProgressView().accessibilityLabel(String(localized: "Rendering answer")) }
-            }.accessibilityLabel(entry.student == String(localized: "Model answer") ? entry.student : String(localized: "Answer by \(entry.student)"))
+            }.accessibilityLabel(isModel ? String(localized: "Model answer") : String(localized: "Answer by \(entry.student)"))
             if let error {
                 Text(error).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                 NibButton(String(localized: "Render Again"), kind: .plain) { retry += 1 }
+                    .accessibilityLabel(isModel ? String(localized: "Render model answer again") : String(localized: "Render \(entry.student)'s answer again"))
             }
         }.task(id: entry.id + entry.revision.description + String(retry)) { await load() }
     }

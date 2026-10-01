@@ -29,7 +29,17 @@ public enum FeatTeacherInsightsFeature: NibFeature {
                 command: CommandIDs.panelOpen, params: { context in
                     guard let doc = context.doc else { return ["id": .string(panelID)] }
                     return ["id": .string(panelID), "doc": .string(NodeRef.document(doc).description)]
-                }, isVisible: { $0.doc != nil }))
+                }, isVisible: { context in
+                    guard let doc = context.doc, let meta = try? app.workspace.peekContent(doc).meta,
+                          meta.kind == .notebook || meta.kind == .whiteboard else { return false }
+                    if meta.ext?[LessonManager.assignmentKey] != nil || meta.ext?[LessonManager.privateSourceKey] != nil { return true }
+                    return app.services.library?.allNodes().contains { node in
+                        guard node.kind == .document, node.trashedAt == nil,
+                              let head = try? app.workspace.peekContent(node.id).meta,
+                              let record = try? LessonManager.assignment(head) else { return false }
+                        return record.source == doc
+                    } == true
+                }))
         }
         var key = KeyCommandDescriptor(id: shortcutID, title: String(localized: "Review Class Answers"),
                                        shortcut: KeyShortcut("i", [.command, .option]), command: CommandIDs.panelOpen,

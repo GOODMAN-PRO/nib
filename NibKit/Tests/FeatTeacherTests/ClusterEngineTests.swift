@@ -79,7 +79,7 @@ final class ClusterEngineTests: XCTestCase {
         XCTAssertEqual(try copies.map { try h.snapshot($0) }, before)
         XCTAssertEqual(ai.requests.first?.mode, .ask)
         XCTAssertEqual(ai.requests.first?.tools, [])
-        XCTAssertEqual(ai.requests.first?.messages.first?.images?.count, 2)
+        XCTAssertNil(ai.requests.first?.messages.first?.images, "Typed answers never send images, even to a vision provider")
         var clusters = suggested.clusters
         clusters[0].score = 5; clusters[3].score = 0
         let sourceBefore = try h.snapshot(source)
@@ -105,7 +105,6 @@ final class ClusterEngineTests: XCTestCase {
             [.init(id: "working", label: "A", members: [member(0), member(0)])],
             [.init(id: "working", label: "A", members: [member(0)])],
             [.init(id: "working", label: "A", members: [member(0), "item:OTHER/P/I"])],
-            [.init(id: "working", label: "A", members: [member(0), member(1)], score: 6)],
             [.init(id: "working", label: "A", members: [member(0)]), .init(id: "working", label: "B", members: [member(1)])]
         ]
         for clusters in bad {
@@ -200,6 +199,169 @@ final class ClusterEngineTests: XCTestCase {
         XCTAssertNil(runtime.navigator(h.session))
     }
 
+    func testLargeLibraryScanDoesNotOpenUnrelatedHeadsAndReportsMalformedAssignment() async throws {
+        let (h, _) = try await harness()
+        var unrelated = Set<DocumentID>()
+        for index in 0..<200 {
+            let doc = NibID("UNRELATED\(index)")
+            _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .textDocument)), title: "Notes", in: Fixtures.folderID)
+            unrelated.insert(doc)
+        }
+        let malformed: DocumentID = "MALFORMEDLESSON"
+        var meta = DocumentMeta(id: malformed, kind: .notebook)
+        meta.ext = [LessonManager.assignmentKey: ["version": 999]]
+        _ = try h.library.createDocument(DocumentContent(meta: meta), title: "Newer lesson", in: Fixtures.folderID)
+        let loaded = Set(h.app.workspace.loadedDocuments)
+        var opened: [DocumentID] = []
+        let subscription = h.app.events.subscribe { event in
+            if event.type == NibEventType.docOpened, let doc = event.doc { opened.append(doc) }
+        }
+        defer { subscription.cancel() }
+        let result = try await collect(h)
+        XCTAssertEqual(result.entries.count, 2)
+        XCTAssertTrue(result.missing.contains { $0.id == NodeRef.document(malformed).description })
+        XCTAssertTrue(Set(h.app.workspace.loadedDocuments).subtracting(loaded).intersection(unrelated).isEmpty)
+        XCTAssertTrue(Set(opened).intersection(unrelated.union([malformed])).isEmpty)
+    }
+
+    func testTeacherRecordIsExcludedFromLateStudentPublication() async throws {
+        let (h, _) = try await harness()
+        let groups = [InsightCluster(id: "all", label: "All", members: [member(0), member(1)])]
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": try JSONValue.from(groups), "modelAnswer": "Secret answer key"])
+        let late: DocumentID = "LATEINSIGHTCOPY"
+        try await h.run(CommandIDs.lessonCreate, ["doc": .string(source.raw), "folder": "folder:FIXTUREFLD01", "students": ["Late student"], "ids": [.string(late.raw)]])
+        XCTAssertNil(try h.app.workspace.item(late, page: page, id: zone).custom?.data[ClusterEngine.recordKey])
+        XCTAssertNil(try h.app.workspace.content(late).meta.ext?[LessonManager.rosterKey])
+        XCTAssertFalse(try h.snapshot(late).jsonString().contains("Secret answer key"))
+    }
+
+    func testLegacyZoneRecordsAreRetainedAndMigratedOutOfPublishedItems() async throws {
+        let (h, _) = try await harness()
+        let secondZone: ElementID = "SECONDINSIGHTZONE"
+        let legacy = InsightClusterRecord(clusters: [InsightCluster(id: "old", label: "Earlier review", members: [member(0)])], modelAnswer: "Earlier model")
+        var original = try h.app.workspace.item(source, page: page, id: zone)
+        var data = original.custom?.data.objectValue ?? [:]
+        data[ClusterEngine.recordKey] = try JSONValue.from(legacy)
+        original.custom?.data = .object(data)
+        var other = original; other.id = secondZone
+        try await h.insert([original, other], page: page, doc: source)
+        let previous = try await collect(h)
+        XCTAssertEqual(previous.clusters, legacy.clusters)
+        XCTAssertEqual(previous.modelAnswer, legacy.modelAnswer)
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": try JSONValue.from(previous.clusters)])
+        XCTAssertNil(try h.app.workspace.item(source, page: page, id: zone).custom?.data[ClusterEngine.recordKey])
+        XCTAssertNil(try h.app.workspace.item(source, page: page, id: secondZone).custom?.data[ClusterEngine.recordKey])
+        let retained = try await collect(h)
+        XCTAssertEqual(retained.modelAnswer, legacy.modelAnswer)
+        XCTAssertNotNil(try h.app.workspace.content(source).meta.ext?[LessonManager.rosterKey]?[ClusterEngine.recordKey]?[NodeRef.item(source, page, secondZone).description])
+    }
+
+    func testUnavailableSavedMembersArePrunedAndClusterEditsRemainPossible() async throws {
+        let (h, _) = try await harness()
+        let groups = [InsightCluster(id: "all", label: "All", members: [member(0), member(1)])]
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": try JSONValue.from(groups)])
+        h.app.services.lock = FakeLockService(locked: [copies[0]])
+        try h.library.trash(copies[1])
+        let unavailable = try await collect(h)
+        XCTAssertEqual(unavailable.staleMembers, [member(0), member(1)].sorted())
+        XCTAssertEqual(unavailable.missing.count, 1)
+        XCTAssertEqual(unavailable.clusters.first?.members, [])
+        var renamed = unavailable.clusters
+        renamed[0].label = "Renamed"
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": try JSONValue.from(renamed)])
+        let saved = try await collect(h)
+        XCTAssertEqual(saved.clusters.first?.label, "Renamed")
+        XCTAssertTrue(saved.staleMembers.isEmpty)
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": []])
+        let removed = try await collect(h)
+        XCTAssertTrue(removed.clusters.isEmpty)
+    }
+
+    func testTwoClassFoldersKeepScopeDuringAIAndBulkScoringAndSaveSeparateRecords() async throws {
+        let (h, _) = try await harness()
+        let secondFolder = try h.library.createFolder(title: "Period two", in: nil, style: nil)
+        let other: DocumentID = "OTHERCLASSCOPY"
+        try await h.run(CommandIDs.lessonCreate, ["doc": .string(source.raw), "folder": .string(NodeRef.folder(secondFolder).description), "students": ["Other student"], "ids": [.string(other.raw)]])
+        let otherBefore = try h.snapshot(other)
+        let scoped = try await h.run(CommandIDs.lessonCollect, ["doc": .string(copies[0].raw), "zone": .string(member(0)), "renders": false]).decode(InsightCollection.self)
+        XCTAssertEqual(scoped.folder, "folder:FIXTUREFLD01")
+        XCTAssertEqual(Set(scoped.entries.map(\.id)), Set([member(0), member(1)]))
+        let groups = [InsightCluster(id: "all", label: "Period one", members: [member(0), member(1)])]
+        h.app.services.ai = FakeAIService(responses: [.init(text: try JSONValue.from(["clusters": groups]).jsonString())])
+        let proposal = try await h.run(CommandIDs.lessonCluster, ["zone": .string(member(0)), "mode": "similarity"]).decode(LessonCluster.Output.self)
+        XCTAssertEqual(proposal.folder, scoped.folder)
+        var scored = proposal.clusters; scored[0].score = 4
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(proposal.zone), "folder": .string(try XCTUnwrap(proposal.folder)), "clusters": try JSONValue.from(scored), "revisions": try JSONValue.from(proposal.revisions), "applyScores": true])
+        XCTAssertEqual(try h.snapshot(other), otherBefore)
+        let otherGroups = [InsightCluster(id: "other", label: "Period two", members: [NodeRef.item(other, page, zone).description])]
+        try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(NodeRef.item(other, page, zone).description), "clusters": try JSONValue.from(otherGroups)])
+        let periodOne = try await h.run(CommandIDs.lessonCollect, ["doc": .string(source.raw), "zone": .string(zoneRef), "folder": .string(try XCTUnwrap(scoped.folder)), "renders": false]).decode(InsightCollection.self)
+        XCTAssertEqual(periodOne.clusters, scored)
+        let periodTwo = try await h.run(CommandIDs.lessonCollect, ["doc": .string(other.raw), "zone": .string(NodeRef.item(other, page, zone).description), "renders": false]).decode(InsightCollection.self)
+        XCTAssertEqual(periodTwo.clusters, otherGroups)
+    }
+
+    func testDeletingNonLatestAnswerInvalidatesOldGradingPreview() async throws {
+        let (h, _) = try await harness()
+        try await h.insert([Item(kind: .text, z: "z", text: TextBoxItem(frame: Frame(x: 60, y: 280, w: 100, h: 20), text: RichText(plain: "Latest")))], page: page, doc: copies[0])
+        let preview = try await collect(h)
+        h.app.commands.register(CommandDescriptor(id: "test.deleteAnswer", title: "Delete", summary: "Delete an older answer.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(item: "ANSWER00", doc: self.copies[0], page: self.page) }
+            return .null
+        }
+        try await h.run("test.deleteAnswer")
+        let before = try copies.map { try h.snapshot($0) }
+        let groups = [InsightCluster(id: "all", label: "All", members: [member(0), member(1)], score: 3)]
+        do {
+            try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": try JSONValue.from(groups), "revisions": try JSONValue.from(preview.revisions), "applyScores": true])
+            XCTFail("A tombstone must invalidate the preview")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .conflict) }
+        XCTAssertEqual(try copies.map { try h.snapshot($0) }, before)
+    }
+
+    func testSecondScoreHookFailureRollsBackCopiesAndSource() async throws {
+        let (h, _) = try await harness()
+        let before = try (copies + [source]).map { try h.snapshot($0) }
+        var calls = 0
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "test.rejectSecondScore", owner: "tests", commands: [CommandIDs.answerZoneScore]) { _, _, _ in
+            calls += 1
+            if calls == 2 { throw NibError(.conflict, "Second score rejected") }
+            return nil
+        })
+        let groups = [InsightCluster(id: "all", label: "All", members: [member(0), member(1)], score: 3)]
+        do {
+            try await h.run(CommandIDs.lessonSetClusters, ["zone": .string(zoneRef), "clusters": try JSONValue.from(groups), "applyScores": true])
+            XCTFail("The second hook must fail")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .conflict) }
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(try (copies + [source]).map { try h.snapshot($0) }, before)
+    }
+
+    func testProviderScoresAreDiscardedAndUnsafeSimilarityIDsAreReassigned() async throws {
+        let (h, _) = try await harness()
+        let entries = try await collect(h).entries
+        let scored = InsightCluster(id: "group 1", label: "Reasoning", members: [member(0), member(1)], score: 999)
+        let parsed = try ClusterEngine.parse(try JSONValue.from(["clusters": [scored]]).jsonString(), entries: entries, mode: .similarity)
+        XCTAssertNil(parsed.first?.score)
+        XCTAssertTrue(NibID.isValid(try XCTUnwrap(parsed.first?.id)))
+        XCTAssertEqual(parsed.first?.members, scored.members)
+    }
+
+    func testTypedSourceModelAnswerWorksWithoutVisionAndAICollectDoesNotChangeNavigator() async throws {
+        let (h, renderer) = try await harness()
+        try await h.insert([Item(kind: .text, z: "k", text: TextBoxItem(frame: Frame(x: 60, y: 260, w: 300, h: 100), text: RichText(plain: "6 m/s")))], page: page, doc: source)
+        let groups = [InsightCluster(id: "exact", label: "Exact", members: [member(0), member(1)])]
+        let ai = FakeAIService(responses: [.init(text: try JSONValue.from(["clusters": groups]).jsonString())])
+        ai.supportsVision = false; h.app.services.ai = ai
+        try await h.run(CommandIDs.lessonCluster, ["zone": .string(zoneRef), "mode": "modelAnswer"])
+        XCTAssertNil(ai.requests.first?.messages.first?.images)
+        XCTAssertTrue(renderer.requests.isEmpty)
+        h.session.document = copies[0]
+        try await h.run(CommandIDs.lessonCollect, ["doc": .string(copies[0].raw), "renders": false], as: .ai("review"))
+        let runtime = try XCTUnwrap(h.app.services.get(InsightRuntime.key, as: InsightRuntime.self))
+        XCTAssertNil(runtime.navigator(h.session))
+    }
+
     func testReviewLayoutSnapshotsForLightDarkOpaqueContrastAndAccessibility() async throws {
         let (h, _) = try await harness()
         var collected = try await collect(h)
@@ -217,6 +379,7 @@ final class ClusterEngineTests: XCTestCase {
             let screen = SmartViewsPanel(context: context, initialCollection: collected, initialView: "question").reviewContent
                 .fixedSize(horizontal: false, vertical: true)
                 .environment(\.colorScheme, scheme).environment(\.dynamicTypeSize, type)
+                .environment(\.horizontalSizeClass, name == "AX3Compact" ? .compact : .regular)
                 .nibLiquidMode(opaque ? .off : .full)
                 .frame(width: name == "AX3Compact" ? 390 : NibMetrics.settingsSheetSize.width,
                        height: NibMetrics.settingsSheetSize.height, alignment: .top)

@@ -58,10 +58,10 @@ struct ClassNavigatorView: View {
         Group {
             NibButton(String(localized: "Previous Student"), symbol: .back, kind: .plain) {
                 if let copy = navigator.previous { open(copy) }
-            }.disabled(navigator.previous == nil).keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+            }.disabled(navigator.previous == nil).nibShortcut(KeyboardShortcut(.leftArrow, modifiers: [.command, .option]))
             NibButton(String(localized: "Next Student"), symbol: .forward, kind: .plain) {
                 if let copy = navigator.next { open(copy) }
-            }.disabled(navigator.next == nil).keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+            }.disabled(navigator.next == nil).nibShortcut(KeyboardShortcut(.rightArrow, modifiers: [.command, .option]))
         }
     }
     private var modes: some View {
@@ -88,6 +88,23 @@ final class InsightRuntime {
             self.session = session; source = collection.source; copies = collection.copies
             page = collection.page.flatMap { NodeRef($0)?.pageID }
         }
+    }
+    private struct SourceCache {
+        var snapshot: LessonSnapshot
+        var revisions: [Rev]
+    }
+    private var sources: [DocumentID: SourceCache] = [:]
+    func snapshot(_ doc: DocumentID, workspace: Workspace) throws -> LessonSnapshot {
+        let content = try workspace.content(doc)
+        let revisions = content.livePages.compactMap { workspace.contentRevision(doc, page: $0.id) }
+        let known = revisions.count == content.livePages.count
+        if known, let cached = sources[doc], cached.snapshot.content == content, cached.revisions == revisions { return cached.snapshot }
+        let snapshot = try LessonManager.capture(doc, workspace: workspace)
+        if known {
+            if sources.count >= 4 { sources.removeAll() }
+            sources[doc] = SourceCache(snapshot: snapshot, revisions: revisions)
+        }
+        return snapshot
     }
     private var windows: [String: Window] = [:]
     func update(_ collection: InsightCollection, session: EditorSession) {
