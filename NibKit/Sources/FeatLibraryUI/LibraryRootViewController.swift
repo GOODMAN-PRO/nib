@@ -301,6 +301,8 @@ final class LibraryViewModel: ObservableObject {
         }
     }
     func openPanel(_ descriptor: PanelDescriptor, params: JSONValue) {
+        menu = nil
+        renaming = nil
         let presentation: PanelPresentation = descriptor.placement == .libraryTab ? .libraryTab : descriptor.placement == .fullScreen ? .fullScreen : .sheet
         let panel = LibraryPanel(id: descriptor.id, params: params, presentation: presentation)
         if presentation == .libraryTab {
@@ -451,6 +453,12 @@ final class LibraryRootViewController: UIViewController {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
     }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // A full-screen sheet may have hidden the controller without recreating
+        // SwiftUI's task. Resume catalog observation when that sheet returns.
+        Task { @MainActor [weak self] in await self?.model.appear() }
+    }
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         model.isVisible = false
@@ -482,7 +490,8 @@ struct LibraryRootView: View {
         GeometryReader { geometry in
             // Keyboard avoidance changes the available content height, not the window's
             // navigation mode. Switching stacks here destroys a focused inline editor.
-            let windowSize = model.controller?.viewIfLoaded?.bounds.size ?? geometry.size
+            let windowSize = model.controller?.viewIfLoaded?.window?.bounds.size
+                ?? model.controller?.viewIfLoaded?.bounds.size ?? geometry.size
             let compact = LibraryPresentation.isCompact(size: windowSize, idiom: idiom)
             let short = LibraryPresentation.isCompactHeight(size: geometry.size)
             let inlineSidebar = !compact && geometry.size.width >= NibMetrics.librarySidebarBreakpoint

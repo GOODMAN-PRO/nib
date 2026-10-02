@@ -432,6 +432,10 @@ struct NibSheetChrome: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
             chrome(content)
+                // Lists have no intrinsic height. Supply an ideal form height for the sizing
+                // pass; fixed-height content still keeps its own dimensions, and the system
+                // can propose a smaller viewport when the keyboard or a compact window needs it.
+                .frame(idealHeight: NibMetrics.newDocumentSheetSize.height)
                 .presentationSizing(.form.fitted(horizontal: true, vertical: true))
         } else {
             chrome(content)

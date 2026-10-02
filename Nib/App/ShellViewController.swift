@@ -213,6 +213,11 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             return
         }
         activeDocument = nil
+        // Closing a tab behind the library must not replace the library (or detach its active modal).
+        guard session.document != nil else {
+            refreshTabBar()
+            return
+        }
         if let next = openDocuments.last {
             openDocument(next, page: nil, mode: .replace)
         } else {

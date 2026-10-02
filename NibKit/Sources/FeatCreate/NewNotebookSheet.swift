@@ -173,6 +173,7 @@ struct NotebookDraft: Equatable {
     var board: TemplateRef
     /// A custom paper (an imported PDF page or image) picked with `template.choose`; replaces `paper`.
     var custom: Background?
+    var distribution: PaperDistribution = .allPages
 
     static let paperColours: [NibPaper] = [.white, .ivory, .legal, .grey, .slate, .night]
     static let boardColours: [NibPaper] = [.white, .ivory, .grey, .board, .slate, .night]
@@ -301,6 +302,50 @@ struct NotebookDraft: Equatable {
                              hasCover: settings.get(NibSettings.coverByDefault), cover: coverBase, cloth: cloth,
                              size: size, orientation: orientation, board: TemplateRef(TemplateIDs.whiteboardDots),
                              custom: nil)
+    }
+}
+
+/// Stored on the notebook, so adding pages after reopening keeps the chosen distribution.
+enum PaperDistribution: String, CaseIterable {
+    case allPages, everyOther
+    var title: String {
+        switch self {
+        case .allPages: return String(localized: "All pages")
+        case .everyOther: return String(localized: "Every other")
+        }
+    }
+}
+
+struct ApplyCreationPaper: NibCommand {
+    struct Params: Codable { var doc: String; var pattern: String }
+    static let descriptor = CommandDescriptor(
+        id: "create.applyPattern", title: "Set Paper Distribution",
+        summary: "Remember whether new notebook pages use its paper on all pages or alternate with plain paper.",
+        params: .obj(["doc": .ref, "pattern": .str("Distribution", choices: PaperDistribution.allCases.map(\.rawValue))],
+                     required: ["doc", "pattern"]),
+        examples: [["doc": "doc:FIXTUREDOC01", "pattern": "everyOther"]], effect: .edit)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+        guard let pattern = PaperDistribution(rawValue: p.pattern) else {
+            throw NibError.invalid("Unknown paper distribution", path: "$.pattern")
+        }
+        let doc = NodeRef.documentID(from: p.doc)
+        try ctx.mutate { tx in
+            let content = try tx.content(doc)
+            guard content.meta.kind == .notebook else {
+                throw NibError.invalid("Paper distribution requires a notebook", path: "$.doc")
+            }
+            guard let paper = content.livePages.first(where: {
+                !($0.background.template.map { ctx.content.templates.get($0.id)?.isCover ?? $0.id.hasPrefix("cover.") } ?? false)
+            }) else { return }
+            var meta = content.meta
+            var ext = meta.ext ?? [:]
+            ext["create.paperDistribution"] = ["pattern": .string(pattern.rawValue),
+                                               "background": try JSONValue.from(paper.background)]
+            meta.ext = ext
+            try tx.putMeta(meta)
+        }
+        return NoResult()
     }
 }
 
@@ -590,6 +635,7 @@ final class NewNotebookModel: ObservableObject {
     let folder: FolderID?
     let session: EditorSession?
     let navigator: SceneNavigator?
+    weak var presentationController: UIViewController?
     let papers: [TemplateOption]
     let covers: [TemplateOption]
     let boards: [TemplateOption]
@@ -603,7 +649,7 @@ final class NewNotebookModel: ObservableObject {
         var draft = NotebookDraft.initial(settings: app.settings, kind: kind)
         let all = app.content.templates.all
         func option(_ d: TemplateDefinition) -> TemplateOption {
-            TemplateOption(id: d.id, title: d.title, category: d.category, definition: d)
+            TemplateOption(id: d.id, title: d.title, category: Self.paperGroup(d), definition: d)
         }
         let isBoard: (TemplateDefinition) -> Bool = { d in
             d.category == NewNotebookModel.whiteboardCategory
@@ -629,8 +675,7 @@ final class NewNotebookModel: ObservableObject {
         if !boards.contains(where: { $0.id == draft.board.id }), let first = boards.first {
             draft.board = TemplateRef(first.id)
         }
-        var groups: [String] = []
-        for p in papers where !groups.contains(p.category) { groups.append(p.category) }
+        let groups = Self.paperGroups
         self.papers = papers
         self.covers = covers
         self.boards = boards
@@ -642,6 +687,21 @@ final class NewNotebookModel: ObservableObject {
     }
 
     static let whiteboardCategory = "Whiteboard"
+    static let paperGroups = [String(localized: "Basic"), String(localized: "Lined"), String(localized: "Grid"),
+                              String(localized: "Planners"), String(localized: "Music"), String(localized: "From plugins")]
+
+    static func paperGroup(_ template: TemplateDefinition) -> String {
+        guard template.id.hasPrefix("builtin.") else { return paperGroups[5] }
+        if [TemplateIDs.dots, TemplateIDs.grid, TemplateIDs.graph, TemplateIDs.isometric].contains(template.id) {
+            return paperGroups[2]
+        }
+        switch template.category {
+        case "Writing", "Lined": return paperGroups[1]
+        case "Planners": return paperGroups[3]
+        case "Music": return paperGroups[4]
+        default: return paperGroups[0]
+        }
+    }
 
     var papersInGroup: [TemplateOption] { papers.filter { $0.category == group } }
     var canChooseMore: Bool { app.commands.entry(CreateIDs.templateChoose) != nil }
@@ -661,7 +721,20 @@ final class NewNotebookModel: ObservableObject {
             return
         }
         draft.hasCover = true
-        if option.id != draft.cover.id { draft.cover = TemplateRef(option.id) }
+        if option.id != draft.cover.id {
+            draft.cover = TemplateRef(option.id)
+            draft.cloth = nil
+        }
+    }
+
+    func selectCloth(_ cloth: NibCoverCloth?) {
+        // A named cloth and its cover tile are the same choice, including its persisted template identity.
+        let ids = ["cover.solid", "cover.band", "cover.dots", "cover.kraft", "cover.stripes", "cover.frame", "cover.grid", "cover.split"]
+        if let cloth, let index = NibCoverCloth.allCases.firstIndex(of: cloth),
+           let option = covers.first(where: { $0.id == ids[index] }) {
+            selectCover(option)
+        }
+        draft.cloth = cloth
     }
 
     /// The size picker: a preset name, or `nil` for Custom.
@@ -724,8 +797,17 @@ final class NewNotebookModel: ObservableObject {
     }
 
     /// Remembers the choices, creates the document and opens it. True when the sheet can close.
-    func create() async -> Bool {
+    func create(beforeOpen: @MainActor () async -> Void = {}) async -> Bool {
         guard !isWorking else { return false }
+        // The preview may clamp while the user edits, but creation must validate the entered
+        // dimensions, not silently create a different page from a zero/negative value.
+        if draft.kind == .notebook && draft.size.isCustom {
+            let dimensions = [customWidth, customHeight].map(PageSizeChoice.points)
+            guard dimensions.allSatisfy({ $0.isFinite && PageSizeChoice.customRange.contains($0) }) else {
+                message = String(localized: "Enter a width and height between 25.4 and 5080 millimetres.")
+                return false
+            }
+        }
         isWorking = true
         message = nil
         defer { isWorking = false }
@@ -751,6 +833,17 @@ final class NewNotebookModel: ObservableObject {
             let title = app.services.library?.node(id)?.title ?? request.title
             await PendingCreations.mark(id, PendingCreation(kind: .untitled, title: title), runner: runner)
         }
+        if draft.kind == .notebook {
+            do {
+                _ = try await runner.run(ApplyCreationPaper.descriptor.id,
+                                         ["doc": .string(NodeRef.document(id).description),
+                                          "pattern": .string(draft.distribution.rawValue)])
+            } catch {
+                CreateLog.log.error("Paper distribution: \(NibError.wrap(error).message, privacy: .public)")
+            }
+        }
+        // The presenting library/editor must remain attached until UIKit finishes dismissing its sheet.
+        await beforeOpen()
         await DocumentOpener.open(id, runner: runner, navigator: navigator ?? app.ui.activeNavigator)
         for warning in warnings {
             NotificationCenter.default.post(name: .nibCommandFailed, object: app,
@@ -759,6 +852,13 @@ final class NewNotebookModel: ObservableObject {
         }
         NibHaptics.play(.success)
         return true
+    }
+
+    func dismissPresentation() async {
+        guard let controller = presentationController, controller.presentingViewController != nil else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            controller.dismiss(animated: true) { continuation.resume() }
+        }
     }
 
     /// Writes the remembered notebook choices that changed (`settings.set`, so it is a command like everything else).
@@ -977,7 +1077,7 @@ struct NewNotebookSheet: View {
         // nibSheet fits its content; idealWidth alone lets the system keep its narrower default form size.
         .frame(width: compact ? nil : sheetSize.width, height: compact ? nil : sheetSize.height)
         .background {
-            NewNotebookWindowReader { windowSize = $0 }
+            NewNotebookWindowReader(onController: { model.presentationController = $0 }, onChange: { windowSize = $0 })
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
         }
@@ -987,7 +1087,10 @@ struct NewNotebookSheet: View {
 
     private func create() {
         Task { @MainActor in
-            if await model.create() { onDone() }
+            _ = await model.create {
+                await model.dismissPresentation()
+                onDone()
+            }
         }
     }
 
@@ -1066,7 +1169,7 @@ struct NewNotebookSheet: View {
             if draft.hasCover && model.coverTakesColour {
                 NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
                               selection: Binding(get: { model.draft.cloth?.rawValue },
-                                                 set: { model.draft.cloth = $0.flatMap(NibCoverCloth.init(rawValue:)) }),
+                                                 set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
                               columns: swatchColumns(count: NibCoverCloth.allCases.count + 1),
                               noneLabel: String(localized: "Cover's own colour"))
             }
@@ -1129,7 +1232,13 @@ struct NewNotebookSheet: View {
         }
     }
 
+    @ViewBuilder
     private var paperTiles: some View {
+        if model.papersInGroup.isEmpty {
+            Text(String(localized: "Install a template plugin to add paper here."))
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+        }
         ForEach(model.papersInGroup) { option in
             NibPaperTile(name: option.title, isSelected: draft.custom == nil && draft.paper.id == option.id,
                          action: { model.selectPaper(option) }) {
@@ -1147,6 +1256,10 @@ struct NewNotebookSheet: View {
         let layout = compact || measuredWidth < NibMetrics.newDocumentSheetSize.width || typeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: NibSpacing.xl))
             : AnyLayout(HStackLayout(alignment: .top, spacing: NibSpacing.xl))
+        NibInspectorSection(String(localized: "Apply to")) {
+            NibSegmentedControl(selection: $model.draft.distribution, options: PaperDistribution.allCases,
+                                title: { $0.title })
+        }
         layout {
             NibInspectorSection(String(localized: "Size")) {
                 Picker(String(localized: "Size"), selection: Binding(get: { model.sizeSelection },
@@ -1241,6 +1354,7 @@ struct NewNotebookSheet: View {
 
 /// Reads the hosting window, including Split View and Stage Manager resizes, without relying on sheet size classes.
 private struct NewNotebookWindowReader: UIViewRepresentable {
+    var onController: ((UIViewController) -> Void)? = nil
     let onChange: (CGSize) -> Void
 
     func makeUIView(context: Context) -> WindowView {
@@ -1250,12 +1364,14 @@ private struct NewNotebookWindowReader: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WindowView, context: Context) {
+        uiView.onController = onController
         uiView.onChange = onChange
         uiView.reportSize()
     }
 
     final class WindowView: UIView {
         var onChange: ((CGSize) -> Void)?
+        var onController: ((UIViewController) -> Void)?
         private var reportedSize: CGSize?
 
         override func didMoveToWindow() {
@@ -1269,6 +1385,15 @@ private struct NewNotebookWindowReader: UIViewRepresentable {
         }
 
         func reportSize() {
+            var responder: UIResponder? = self
+            while let current = responder {
+                if var controller = current as? UIViewController {
+                    while controller.presentingViewController == nil, let parent = controller.parent { controller = parent }
+                    if controller.presentingViewController != nil { onController?(controller) }
+                    break
+                }
+                responder = current.next
+            }
             guard let size = window?.bounds.size, size.width > 0, size.height > 0, size != reportedSize else { return }
             reportedSize = size
             DispatchQueue.main.async { [weak self] in self?.onChange?(size) }

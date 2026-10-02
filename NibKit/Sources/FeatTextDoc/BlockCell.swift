@@ -229,14 +229,18 @@ final class BlockTextView: UITextView {
     var alwaysShowsPlaceholder = false {
         didSet { updatePlaceholder() }
     }
-    /// The traits UIKit gives an editable text view; headings add `.header` on top.
-    private(set) var baseTraits: UIAccessibilityTraits = []
+    /// Decorate UIKit's live traits, which change with editing/focus and read-only state.
+    /// Assigning a snapshot taken at init masks those later native accessibility updates.
+    var isAccessibilityHeading = false
+    override var accessibilityTraits: UIAccessibilityTraits {
+        get { isAccessibilityHeading ? super.accessibilityTraits.union(.header) : super.accessibilityTraits }
+        set { super.accessibilityTraits = newValue }
+    }
     private let placeholderLabel = UILabel()
     private var handledPresses = Set<UIPress>()
 
     init() {
         super.init(frame: .zero, textContainer: nil)
-        baseTraits = accessibilityTraits
         isScrollEnabled = false
         backgroundColor = .clear
         textContainerInset = .zero
@@ -687,8 +691,7 @@ final class BlockCell: UICollectionViewCell {
             }
             textView.layer.cornerRadius = block.kind == .code ? NibRadius.field : CGFloat()
             textView.accessibilityLabel = accessibilityName(block, style: style, marker: env.marker)
-            textView.accessibilityTraits = BlockRules.isHeading(block.kind)
-                ? textView.baseTraits.union(.header) : textView.baseTraits
+            textView.isAccessibilityHeading = BlockRules.isHeading(block.kind)
         }
         aiCenterY.constant = isText ? textView.textContainerInset.top + style.lineHeight / 2 : NibMetrics.hitTarget / 2
 

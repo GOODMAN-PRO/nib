@@ -7,6 +7,39 @@ import NibTesting
 
 @MainActor
 final class FeatTextDocTests: XCTestCase {
+    func testHeadingKeepsNativeTextInputTraitsAcrossFocusAndReadOnlyChanges() async throws {
+        let controller = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 800))
+        window.rootViewController = controller
+        let native = UITextView(frame: CGRect(x: 20, y: 20, width: 300, height: 80))
+        let cell = BlockCell(frame: CGRect(x: 20, y: 120, width: 600, height: 100))
+        let heading = TextBlock(id: "TRAITSHEAD01", kind: .heading1, text: .empty, order: "a")
+        controller.view.addSubview(native)
+        controller.view.addSubview(cell)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+
+        for readOnly in [false, true, false] {
+            var env = environment(.heading1)
+            env.readOnly = readOnly
+            cell.configure(heading, environment: env)
+            native.isEditable = !readOnly
+            for focused in [false, true, false] {
+                if focused && !readOnly { XCTAssertTrue(native.becomeFirstResponder()) }
+                else { native.resignFirstResponder() }
+                await mainQueueTurn()
+                let nativeTraits = native.accessibilityTraits
+                native.resignFirstResponder()
+                if focused && !readOnly { XCTAssertTrue(cell.textView.becomeFirstResponder()) }
+                else { cell.textView.resignFirstResponder() }
+                await mainQueueTurn()
+                XCTAssertEqual(cell.textView.accessibilityTraits, nativeTraits.union(.header),
+                               "Headings must preserve UIKit's current text-input and focus traits")
+                cell.textView.resignFirstResponder()
+            }
+        }
+    }
+
     private let doc = Fixtures.textDocID
     private let heading = "block:FIXTUREDOC02/FIXTUREBLK01"
     private let paragraph = "block:FIXTUREDOC02/FIXTUREBLK02"

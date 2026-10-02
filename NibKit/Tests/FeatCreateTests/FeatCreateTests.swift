@@ -46,6 +46,37 @@ private final class FakeNavigator: SceneNavigator {
 
 @MainActor
 final class FeatCreateTests: XCTestCase {
+    func testInvalidCustomDimensionsDoNotCreateOrRememberClampedPages() async throws {
+        let h = harness()
+        let before = h.library.children(of: Fixtures.folderID).map(\.id)
+        let defaultSize = h.app.settings.get(NibSettings.defaultPageSize)
+        let model = NewNotebookModel(app: h.app, folder: Fixtures.folderID, kind: .notebook,
+                                     session: h.session, navigator: nil)
+        model.sizeSelection = nil
+        for (width, height) in [(0.0, 150.0), (100, 0), (-10, 150), (100, 6000), (.nan, 150), (100, .infinity)] {
+            model.customWidth = width
+            model.customHeight = height
+            model.applyCustomSize()
+            let created = await model.create()
+            XCTAssertFalse(created)
+            XCTAssertNotNil(model.message)
+            XCTAssertFalse(model.isWorking)
+            XCTAssertEqual(h.library.children(of: Fixtures.folderID).map(\.id), before)
+            XCTAssertEqual(h.app.settings.get(NibSettings.defaultPageSize), defaultSize)
+        }
+        model.customWidth = 100
+        model.customHeight = 150
+        model.applyCustomSize()
+        model.draft.hasCover = false
+        let created = await model.create()
+        XCTAssertTrue(created, "Correcting the dimensions must let the same draft create normally")
+        let node = try XCTUnwrap(h.library.children(of: Fixtures.folderID).first { !before.contains($0.id) })
+        let page = try XCTUnwrap(h.app.workspace.content(node.id).livePages.first)
+        let size = try XCTUnwrap(page.size)
+        XCTAssertEqual(size.width, 100 * 72 / 25.4, accuracy: 0.001)
+        XCTAssertEqual(size.height, 150 * 72 / 25.4, accuracy: 0.001)
+    }
+
     private func harness() -> Harness { Harness(features: [FeatCreateFeature.self]) }
 
     /// Registers a stand-in for another feature's command.
@@ -397,7 +428,7 @@ final class FeatCreateTests: XCTestCase {
         h.app.content.templates.register(Self.solidCover())
         let model = NewNotebookModel(app: h.app, folder: Fixtures.folderID, kind: .notebook, session: h.session,
                                      navigator: nil)
-        XCTAssertEqual(Set(model.groups), ["Writing", "Essentials"])
+        XCTAssertEqual(model.groups, ["Basic", "Lined", "Grid", "Planners", "Music", "From plugins"])
         XCTAssertEqual(model.covers.map(\.id), ["cover.solid"])
         let dots = try XCTUnwrap(model.papers.first { $0.id == TemplateIDs.dots })
         model.selectPaper(dots)
@@ -430,6 +461,103 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertTrue(titledDone)
         let kinematics = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Kinematics" })
         XCTAssertNil(PendingCreations.get(kinematics.id, h.app.settings))
+    }
+
+    func testCreationGroupsSeparateBuiltinsAndPluginsEvenWithMatchingCategories() {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        h.app.content.templates.register(Self.dots())
+        var plugin = Self.ruled(owner: "plugin.example")
+        plugin.id = "plugin.example.paper"
+        h.app.content.templates.register(plugin)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.group = "Lined"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [TemplateIDs.ruled])
+        model.group = "Grid"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [TemplateIDs.dots])
+        model.group = "From plugins"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [plugin.id])
+    }
+
+    func testCarbonSwatchSelectsCarbonCoverAndReopensFromDefaults() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.solidCover())
+        var carbon = Self.solidCover()
+        carbon.id = "cover.band"
+        carbon.title = "Carbon"
+        h.app.content.templates.register(carbon)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Carbon notebook"
+        model.selectCloth(.carbon)
+        XCTAssertEqual(model.draft.cover.id, "cover.band")
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Carbon notebook" })
+        XCTAssertEqual(try h.app.workspace.content(node.id).livePages.first?.background.template?.id, "cover.band")
+        let reopened = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        XCTAssertEqual(reopened.draft.cover.id, "cover.band")
+        XCTAssertEqual(reopened.draft.cloth, .carbon)
+        reopened.selectCover(reopened.covers.first { $0.id == "cover.solid" })
+        XCTAssertNil(reopened.draft.cloth, "A different tile must restore its own cloth instead of inheriting Carbon")
+    }
+
+    func testCreationWaitsForDismissalBeforeOpeningEveryDocumentKind() async throws {
+        for kind in NewDocumentKind.allCases {
+            let h = harness()
+            let log = CallLog()
+            var dismissed = false
+            stub(h, CommandIDs.docOpen, effect: .session, log: log) { _ in
+                XCTAssertTrue(dismissed, "Opening must not detach a still-presented creation sheet")
+                return [:]
+            }
+            let model = NewNotebookModel(app: h.app, folder: nil, kind: kind, session: h.session, navigator: nil)
+            model.draft.title = "Dismiss before opening"
+            let created = await model.create {
+                XCTAssertEqual(log.count(CommandIDs.docOpen), 0)
+                await Task.yield()
+                dismissed = true
+            }
+            XCTAssertTrue(created)
+            XCTAssertEqual(log.count(CommandIDs.docOpen), 1)
+        }
+    }
+
+    func testCreationDismissalWaitsForUIKitToRemoveTheModal() async {
+        let h = harness()
+        let presenter = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = presenter
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        let sheet = UIViewController()
+        sheet.modalPresentationStyle = .formSheet
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            presenter.present(sheet, animated: false) { continuation.resume() }
+        }
+        XCTAssertNotNil(presenter.presentedViewController)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.presentationController = sheet
+        await model.dismissPresentation()
+        XCTAssertNil(presenter.presentedViewController, "Creation can now safely replace the presenting library")
+    }
+
+    func testDistributionPersistsWithTheNotebookAndIsUndoable() async throws {
+        let h = harness()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Alternating paper"
+        model.draft.distribution = .everyOther
+        model.draft.hasCover = true
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Alternating paper" })
+        let distribution = try XCTUnwrap(h.persistence.heads[node.id]?.meta.ext?["create.paperDistribution"])
+        XCTAssertEqual(distribution["pattern"], "everyOther")
+        let background = try XCTUnwrap(distribution["background"]).decode(Background.self)
+        XCTAssertEqual(background.template?.id, model.draft.paper.id, "The cover must not become repeating paper")
+        _ = try await h.run("create.applyPattern", ["doc": .string(NodeRef.document(node.id).description), "pattern": "allPages"])
+        XCTAssertEqual(try h.app.workspace.content(node.id).meta.ext?["create.paperDistribution"]?["pattern"], "allPages")
+        XCTAssertTrue(h.app.bus.undo(node.id))
+        XCTAssertEqual(try h.app.workspace.content(node.id).meta.ext?["create.paperDistribution"]?["pattern"], "everyOther")
     }
 
     func testTemplateChoiceBecomesThePaper() {

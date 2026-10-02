@@ -660,6 +660,16 @@ private struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
     }
 }
 
+/// A slow move after the pickup hold is still a drag, even before it crosses
+/// the six-point pickup slop. Only a stationary hold yields to the item menu.
+enum ReflowLiftIntent {
+    static let menuDelay = NibReflowMetrics.liftDelay + 0.35
+    static func yieldsToMenu(distance: CGFloat) -> Bool { distance < 1 }
+    static func protectsLift(elapsed: TimeInterval, distance: CGFloat) -> Bool {
+        elapsed >= NibReflowMetrics.liftDelay && !yieldsToMenu(distance: distance)
+    }
+}
+
 private final class LiftRecognizer: UIGestureRecognizer {
     private(set) var start = CGPoint.zero
     private(set) var point = CGPoint.zero
@@ -674,13 +684,14 @@ private final class LiftRecognizer: UIGestureRecognizer {
         beganAt = touch.timestamp; sampledAt = beganAt
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.state == .possible else { return }
+            guard ReflowLiftIntent.yieldsToMenu(distance: hypot(self.point.x - self.start.x, self.point.y - self.start.y)) else { return }
             #if DEBUG
             NSLog("%@", "[Reflow diagnostic] stationary timeout")
             #endif
             self.state = .failed
         }
         holdTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + ReflowLiftIntent.menuDelay, execute: timeout)
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = touches.first else { return }
@@ -703,8 +714,9 @@ private final class LiftRecognizer: UIGestureRecognizer {
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
         // Once held, the scroll view must not win the first movement before this
         // recognizer receives it. A normal immediate swipe fails us above.
-        if preventingGestureRecognizer is UIPanGestureRecognizer,
-           beganAt > 0, CACurrentMediaTime() - beganAt >= NibReflowMetrics.liftDelay { return false }
+        if beganAt > 0,
+           ReflowLiftIntent.protectsLift(elapsed: CACurrentMediaTime() - beganAt,
+                distance: hypot(point.x - start.x, point.y - start.y)) { return false }
         #if DEBUG
         if beganAt > 0 {
             NSLog("%@", "[Reflow diagnostic] prevention by \(type(of: preventingGestureRecognizer)) at \(CACurrentMediaTime() - beganAt)")

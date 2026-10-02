@@ -8,6 +8,32 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testFormSheetLeavesAUsableViewportForANativeList() async throws {
+        // Package tests have no UIWindowScene to present a modal. Exercise the same ideal
+        // size query used by presentationSizing, with a real hosted native list instead.
+        let content = SheetViewportFixture().modifier(NibSheetChrome())
+            .fixedSize(horizontal: false, vertical: true)
+        let host = UIHostingController(rootView: content)
+        let size = host.sizeThatFits(in: CGSize(width: 720, height: 1366))
+        host.view.frame = CGRect(origin: .zero, size: size)
+        host.view.layoutIfNeeded()
+        func list(in view: UIView) -> UICollectionView? {
+            if let list = view as? UICollectionView { return list }
+            return view.subviews.lazy.compactMap { list(in: $0) }.first
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let visible = try XCTUnwrap(list(in: host.view), "The form must contain the native list")
+        XCTAssertGreaterThan(visible.bounds.height, 300,
+                             "Intrinsic-height fitting must not collapse a planner form to one row")
+        XCTAssertEqual(size.height, NibMetrics.newDocumentSheetSize.height, accuracy: 1)
+        // Existing explicitly sized and small intrinsic sheets remain backward compatible.
+        for height in [CGFloat(160), 640] {
+            let fixed = Color.clear.frame(width: 720, height: height).modifier(NibSheetChrome())
+                .fixedSize(horizontal: false, vertical: true)
+            XCTAssertEqual(NibSnapshot.fittingSize(fixed, width: 720).height, height, accuracy: 1)
+        }
+    }
+
     func testClosedPopoverDisablesItsNativeScrollHitTargetAndReopens() async throws {
         func panel(_ presented: Bool) -> some View {
             NibPopoverPanel(title: "Menu") { Button("Action") {} }
@@ -267,6 +293,21 @@ final class SharedChromeRegressionTests: XCTestCase {
             let measured = NibSnapshot.fittingSize(on, width: 44, variant: variant)
             XCTAssertGreaterThanOrEqual(measured.width, 44)
             XCTAssertGreaterThanOrEqual(measured.height, 44)
+        }
+    }
+}
+
+private struct SheetViewportFixture: View {
+    var body: some View {
+        VStack(spacing: 0) {
+            NibSheetHeader("New Event Planner", onCancel: {})
+            List {
+                Text("Layout")
+                Text("Week starts on")
+                DatePicker("Starts", selection: .constant(Date()), displayedComponents: .date)
+                Text("7 days")
+            }
+            .listStyle(.insetGrouped)
         }
     }
 }

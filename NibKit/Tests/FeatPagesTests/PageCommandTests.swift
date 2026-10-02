@@ -68,6 +68,34 @@ final class PageCommandTests: XCTestCase {
 
     // MARK: page.add
 
+    func testCreationDistributionSurvivesAlternatingPagesAndBatchAdds() async throws {
+        for pattern in ["allPages", "everyOther"] {
+            let h = harness()
+            let doc: DocumentID = "DISTRIBUTION"
+            let paper = Background(kind: .template, template: TemplateRef(TemplateIDs.graph, params: ["paper": "#FBF8F1FF"]))
+            var meta = DocumentMeta(id: doc, kind: .notebook)
+            meta.ext = ["create.paperDistribution": ["pattern": .string(pattern), "background": try JSONValue.from(paper)]]
+            _ = try h.library.createDocument(DocumentContent(meta: meta, pages: [
+                PageRecord(order: "A", background: .ofTemplate("cover.band")),
+                PageRecord(order: "B", background: paper)
+            ]), title: "Distribution", in: nil)
+            // First a single page, then a batch whose reference page is the plain side of the alternation.
+            _ = try await h.run("page.add", ["doc": "doc:DISTRIBUTION", "position": "end"])
+            _ = try await h.run("page.add", ["doc": "doc:DISTRIBUTION", "position": "end", "count": 2])
+            let pages = try h.app.workspace.content(doc).livePages
+            XCTAssertEqual(pages.map { $0.background.template?.id }, pattern == "allPages"
+                ? ["cover.band", TemplateIDs.graph, TemplateIDs.graph, TemplateIDs.graph, TemplateIDs.graph]
+                : ["cover.band", TemplateIDs.graph, TemplateIDs.blank, TemplateIDs.graph, TemplateIDs.blank])
+            XCTAssertEqual(pages.last?.background.template?.params["paper"], "#FBF8F1FF")
+            XCTAssertTrue(h.app.bus.undo(doc))
+            XCTAssertEqual(try h.app.workspace.content(doc).livePages.count, 3)
+            // An explicit source is a deliberate override of the notebook's repeating default.
+            let explicit = try await h.run("page.add", ["doc": "doc:DISTRIBUTION", "position": "end",
+                                                       "source": "template", "template": .string(TemplateIDs.ruled)])
+            XCTAssertEqual(try pageRecord(h, refs(explicit)[0]).background.template?.id, TemplateIDs.ruled)
+        }
+    }
+
     func testAddWithOnlyAnIDLandsAfterTheOpenPageAndUndoes() async throws {
         let h = harness()
         // The AI's shortest form: no doc, no position. The open page (FIXTUREPG001) is the anchor.

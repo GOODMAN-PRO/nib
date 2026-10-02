@@ -716,6 +716,22 @@ final class CreateUITests: XCTestCase {
 
     private func scrollTo(_ element: XCUIElement, name: String = "creation control") throws {
         for _ in 0..<12 {
+            // isHittable also admits a field with only a few pixels above the clipping edge.
+            // Reveal the actual editing area before tapping; a clipped border cannot take focus.
+            if element.exists, element.elementType == .textField,
+               let form = ui.app.scrollViews.allElementsBoundByIndex.last(where: {
+                   $0.isHittable && $0.frame.height > 200
+               }) {
+                let visible = form.frame.insetBy(dx: 0, dy: 16)
+                if element.frame.maxY > visible.maxY {
+                    form.swipeUp(velocity: .slow)
+                    continue
+                }
+                if element.frame.minY < visible.minY {
+                    form.swipeDown(velocity: .slow)
+                    continue
+                }
+            }
             if element.exists && element.isHittable {
                 if name == "Title", let form = ui.app.scrollViews.allElementsBoundByIndex.last(where: {
                     $0.isHittable && $0.frame.height > 200
@@ -754,7 +770,7 @@ final class CreateUITests: XCTestCase {
 
     private func replace(_ field: XCUIElement, with text: String) throws {
         try require(field, "Missing editable field: \(field)")
-        if !field.isHittable { try scrollTo(field, name: field.label) }
+        try scrollTo(field, name: field.label)
         field.tap()
         field.typeKey("a", modifierFlags: [.command])
         field.typeText(text)

@@ -261,7 +261,7 @@ final class WindowScenes {
         }
         let wasCurrent = navigator.activeDocument == doc
         navigator.closeDocument(doc)
-        if shown == nil, wasCurrent, next != nil {
+        if shown == nil, wasCurrent, next != nil, navigator.session.document != nil {
             // The shell opens another tab when the current one closes; the library stays on screen instead. This
             // window's navigator, not `window.showLibrary`, which acts on the active window: a tab dragged out of a
             // window closes here while the new window is the active one.

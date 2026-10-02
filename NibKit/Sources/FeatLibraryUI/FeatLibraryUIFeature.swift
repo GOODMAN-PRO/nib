@@ -104,7 +104,7 @@ struct LibrarySetView: NibCommand {
             throw NibError.invalid("Unknown selection operation", path: "$.selection")
         }
         let existing = LibraryModels.get(app).models[session.id]
-        let targetFolder = p.folder != nil ? folder ?? nil : p.collection != nil ? nil : existing?.folder
+        let targetFolder = p.folder != nil ? folder ?? nil : p.collection != nil || p.panel == "documents" ? nil : existing?.folder
         let saved = app.settings.json(LibraryOrder.viewKey(targetFolder))
         let navigates = p.folder != nil || p.collection != nil || p.panel == "documents"
         let targetCollection = p.folder != nil || p.panel == "documents" ? LibraryCollection.documents : p.collection ?? existing?.collection ?? .documents
@@ -125,6 +125,11 @@ struct LibrarySetView: NibCommand {
         }
         guard !ctx.dryRun else { return result }
         let model = existing ?? LibraryModels.get(app).model(session)
+        if navigates {
+            model.menu = nil
+            model.renaming = nil
+            model.search = ""
+        }
         if let collection = p.collection {
             model.collection = collection; model.folder = nil; model.closeTab()
             model.selection.clear(); model.search = ""
@@ -135,7 +140,10 @@ struct LibrarySetView: NibCommand {
             model.folder = targetFolder; model.restoreView(); model.closeTab(); model.selection.clear()
         }
         if let panel = p.panel {
-            if panel == "documents" { model.closeTab(); model.collection = .documents }
+            if panel == "documents" {
+                model.closeTab(); model.collection = .documents
+                model.folder = nil; model.selection.clear()
+            }
             else {
                 if p.close == true { model.closePanel(panel) }
                 else if let descriptor {
@@ -167,7 +175,10 @@ struct LibrarySetView: NibCommand {
             #endif
             model.menu = menu == "none" ? nil : menu
         }
-        if let rename = p.rename { model.renaming = rename.isEmpty ? nil : rename }
+        if let rename = p.rename {
+            model.menu = nil
+            model.renaming = rename.isEmpty ? nil : rename
+        }
         if p.renameSelected == true, model.selection.refs.count == 1 { model.renaming = model.selection.refs.first }
         if p.openSelected == true, model.selection.refs.count == 1, let ref = model.selection.refs.first {
             if case .folder? = NodeRef(ref) {

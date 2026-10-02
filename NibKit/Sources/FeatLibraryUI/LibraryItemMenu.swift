@@ -3,6 +3,28 @@ import UIKit
 import NibContracts
 import NibDesign
 
+extension LibraryViewModel {
+    func setMenuPresented(_ presented: Bool, menu source: String) {
+        // A retracting bud can deliver its dismissal after another menu opened.
+        guard presented || menu == source else { return }
+        setView(["menu": presented ? .string(source) : "none"])
+    }
+
+    func activateMenu(command: String, params: JSONValue) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                // Finish the menu command before presenting a sheet or inline editor.
+                _ = try await app.bus.execute(CommandIDs.librarySetView, ["menu": "none"], session: session)
+                _ = try await app.bus.execute(command, params, session: session)
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                    userInfo: ["command": command, "error": NibError.wrap(error)])
+            }
+        }
+    }
+}
+
 @MainActor
 enum LibraryMenus {
     static func register(_ app: NibApp) {
@@ -97,8 +119,7 @@ struct LibraryMenuEntries: View {
         } else { run(entry, context) }
     }
     private func run(_ entry: MenuItemDescriptor, _ context: MenuContext) {
-        model.perform(entry.command, entry.params(context))
-        model.setView(["menu": "none"])
+        model.activateMenu(command: entry.command, params: entry.params(context))
     }
 }
 
@@ -160,7 +181,7 @@ struct LibraryBuds: View {
     }
     private func binding(_ menu: String) -> Binding<Bool> {
         Binding(get: { isPresented(menu) },
-                set: { model.setView(["menu": $0 ? .string(menu) : "none"]) })
+                set: { model.setMenuPresented($0, menu: menu) })
     }
 }
 
@@ -200,6 +221,7 @@ struct LibraryNewMenuPopover: View {
                         LibraryMenuEntries(model: model, location: .libraryNew, rowHeight: rowHeight)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .background(LibraryMenuScrollInteraction(isPresented: isPresented))
                     .scrollTargetLayout()
                     .background {
                         GeometryReader { content in
@@ -231,6 +253,37 @@ struct LibraryNewMenuPopover: View {
         }
         .allowsHitTesting(isPresented)
         .accessibilityHidden(!isPresented)
+    }
+}
+
+/// The New menu retains its scroll view during retraction. SwiftUI's hit-testing
+/// flag alone does not disable that native scroll view on every OS version.
+struct LibraryMenuScrollInteraction: UIViewRepresentable {
+    let isPresented: Bool
+    func makeUIView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.isUserInteractionEnabled = false
+        return probe
+    }
+    func updateUIView(_ probe: Probe, context: Context) {
+        probe.isPresented = isPresented
+        probe.updateScrollView()
+    }
+    final class Probe: UIView {
+        var isPresented = false
+        override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
+        override func didMoveToSuperview() { super.didMoveToSuperview(); updateScrollView() }
+        func updateScrollView() {
+            var ancestor = superview
+            while let view = ancestor {
+                if let scroll = view as? UIScrollView {
+                    scroll.isUserInteractionEnabled = isPresented
+                    scroll.accessibilityElementsHidden = !isPresented
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
     }
 }
 

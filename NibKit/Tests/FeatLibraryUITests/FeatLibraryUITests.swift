@@ -25,6 +25,92 @@ final class FeatLibraryUITests: XCTestCase {
             return ["nodes": try JSONValue.from(rows.map(LibraryRow.from)), "total": .number(Double(rows.count))]
         }
     }
+
+    func testNewMenuNativeScrollStopsInterceptingAfterDismissalAndReattaches() {
+        let scroll = UIScrollView()
+        let content = UIView()
+        let probe = LibraryMenuScrollInteraction.Probe()
+        scroll.addSubview(content)
+        content.addSubview(probe)
+        probe.isPresented = true
+        probe.updateScrollView()
+        XCTAssertTrue(scroll.isUserInteractionEnabled)
+        XCTAssertFalse(scroll.accessibilityElementsHidden)
+        probe.isPresented = false
+        probe.updateScrollView()
+        XCTAssertFalse(scroll.isUserInteractionEnabled)
+        XCTAssertTrue(scroll.accessibilityElementsHidden)
+        probe.removeFromSuperview()
+        content.addSubview(probe)
+        XCTAssertFalse(scroll.isUserInteractionEnabled)
+        probe.isPresented = true
+        probe.updateScrollView()
+        XCTAssertTrue(scroll.isUserInteractionEnabled)
+    }
+
+    func testOutgoingMenuCannotDismissNewerAppMenu() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": "app"], session: h.session)
+        model.setMenuPresented(false, menu: "new")
+        model.setMenuPresented(false, menu: "sort")
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(model.menu, "app")
+        model.setMenuPresented(false, menu: "app")
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertNil(model.menu)
+    }
+
+    func testMenuActivationClosesBudBeforeOpeningInlineRename() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.menu = "new"
+        var menuAtActivation: String?
+        var called = false
+        h.app.commands.register(CommandDescriptor(id: "test.menuAction", title: "Action", summary: "Record presentation state", effect: .session, target: .app)) { _, _ in
+            called = true; menuAtActivation = model.menu
+            return [:]
+        }
+        model.activateMenu(command: "test.menuAction", params: [:])
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertTrue(called)
+        XCTAssertNil(menuAtActivation)
+        model.menu = "app"
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["rename": "doc:FIXTUREDOC01"], session: h.session)
+        XCTAssertNil(model.menu)
+        XCTAssertEqual(model.renaming, "doc:FIXTUREDOC01")
+    }
+
+    func testDocumentsNavigationClearsTabFolderSearchAndStaleEditors() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        h.app.ui.panels.register(PanelDescriptor(id: "test.tab", title: "Trash", icon: "trash", placement: .libraryTab, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        for destination in [["collection": "documents"], ["panel": "documents"]] as [JSONValue] {
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "folder:FIXTUREFLD01"], session: h.session)
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "test.tab"], session: h.session)
+            model.menu = "app"; model.search = "missing"; model.renaming = "folder:FIXTUREFLD01"
+            model.selection.selectAll(["folder:FIXTUREFLD01"])
+            let result = try await h.app.bus.execute(CommandIDs.librarySetView, destination, session: h.session)
+            XCTAssertEqual(result["folder"], "lib")
+            XCTAssertNil(model.tab); XCTAssertNil(model.folder); XCTAssertNil(model.menu); XCTAssertNil(model.renaming)
+            XCTAssertEqual(model.search, "")
+            XCTAssertFalse(model.selection.isSelecting)
+            XCTAssertFalse(h.session.openPanels.contains("test.tab"))
+            XCTAssertTrue(model.documentRefs.contains("doc:FIXTUREDOC01"))
+        }
+    }
+
+    func testPresentingCreationOrStyleSheetClosesUnderlyingMenu() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        for id in ["create.newNotebook", "organize.folder.new", "test.style"] {
+            h.app.ui.panels.register(PanelDescriptor(id: id, title: "Create", icon: "folder", placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+            model.menu = "new"
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": .string(id)], session: h.session)
+            XCTAssertNil(model.menu)
+            XCTAssertEqual(model.modal?.id, id)
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": .string(id), "close": true], session: h.session)
+            XCTAssertNil(model.modal)
+            XCTAssertNil(model.menu, "Dismissing a sheet must leave its source controls available")
+        }
+    }
     func testReturnOpensSelectedFolderAndDocumentThroughCommands() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         await model.appear()
