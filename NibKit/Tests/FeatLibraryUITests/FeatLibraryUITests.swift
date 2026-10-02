@@ -25,6 +25,64 @@ final class FeatLibraryUITests: XCTestCase {
             return ["nodes": try JSONValue.from(rows.map(LibraryRow.from)), "total": .number(Double(rows.count))]
         }
     }
+    func testReturnOpensSelectedFolderAndDocumentThroughCommands() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "replace", "refs": ["folder:FIXTUREFLD01"]], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["openSelected": true], session: h.session)
+        XCTAssertEqual(model.folder, Fixtures.folderID)
+        XCTAssertFalse(model.selection.isSelecting)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "lib"], session: h.session)
+        let ref = try XCTUnwrap(model.documentRefs.first)
+        var opened: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Record opening", effect: .session, target: .app)) { params, _ in
+            opened = params; return [:]
+        }
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "replace", "refs": [.string(ref)]], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["openSelected": true], session: h.session)
+        XCTAssertEqual(opened?["doc"], .string(ref))
+        XCTAssertFalse(model.selection.isSelecting)
+    }
+
+    func testNewFolderPanelDefaultsToVisibleParentButPreservesExplicitParent() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.ui.panels.register(PanelDescriptor(id: "organize.folder.new", title: "New Folder", icon: "folder", placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "folder:FIXTUREFLD01"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "organize.folder.new"], session: h.session)
+        XCTAssertEqual(model.modal?.params["folder"], "folder:FIXTUREFLD01")
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["panel": "organize.folder.new", "params": ["folder": "lib"]], session: h.session)
+        XCTAssertEqual(model.modal?.params["folder"], "lib")
+    }
+
+    func testAccessibilityReflowStepUsesSameDropAndHonoursBothBoundaries() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        let refs = model.documentRefs
+        var drops: [NibReflowDrop<String>] = []
+        model.reflow.step(refs[0], by: -1, order: refs) { drops.append($0) }
+        model.reflow.step(refs.last!, by: 1, order: refs) { drops.append($0) }
+        XCTAssertTrue(drops.isEmpty)
+        model.reflow.step(refs[1], by: -1, order: refs) { drops.append($0) }
+        XCTAssertEqual(drops, [.reorder(NibReflowMove(id: refs[1], from: 1, to: 0, in: refs))])
+    }
+
+
+    func testExternalImportUsesVisibleFolderAndPreservesExplicitDestination() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.windowShowLibrary, title: "Library", summary: "Show library", effect: .session, target: .app)) { _, _ in [:] }
+        var imported: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.importFiles, title: "Import", summary: "Record destination", effect: .library, target: .library)) { params, _ in imported = params; return [:] }
+        await FeatLibraryUIFeature.start(h.app)
+        model.folder = Fixtures.folderID
+        _ = try await h.app.bus.execute(CommandIDs.importFiles, ["urls": ["tmp:fixture.pdf"]], session: h.session)
+        XCTAssertEqual(imported?["folder"], "folder:FIXTUREFLD01")
+        _ = try await h.app.bus.execute(CommandIDs.importFiles, ["urls": ["tmp:fixture.pdf"], "folder": "lib"], session: h.session)
+        XCTAssertEqual(imported?["folder"], "lib")
+        _ = try await h.app.bus.execute(CommandIDs.importFiles, ["urls": ["tmp:fixture.pdf"], "doc": "doc:FIXTUREDOC01"], session: h.session)
+        XCTAssertNil(imported?["folder"])
+        XCTAssertEqual(imported?["doc"], "doc:FIXTUREDOC01")
+    }
+
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatLibraryUIFeature.self])
         XCTAssertEqual(problems, [])
@@ -1208,8 +1266,13 @@ final class FeatLibraryUITests: XCTestCase {
             model.reflow.cancel()
         }
         model.selection.refs = Set(refs.prefix(2))
+        let commandCount = commands.count
         model.drop(.combine(refs[0], into: refs[2]))
         for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(commands.count, commandCount, "Combine must wait for explicit confirmation")
+        let confirmation = try XCTUnwrap(model.confirmation)
+        XCTAssertEqual(confirmation.title, "Combine")
+        _ = try await h.app.bus.execute(confirmation.command, confirmation.params, session: h.session)
         XCTAssertEqual(commands.last?.1["refs"], .array(refs.prefix(2).map(JSONValue.string)))
         XCTAssertEqual(commands.last?.1["folder"], .string(refs[2]))
     }

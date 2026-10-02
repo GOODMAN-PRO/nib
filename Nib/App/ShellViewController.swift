@@ -5,7 +5,7 @@ import NibContracts
 /// Root of every window. Owns the tab model and implements `SceneNavigator`; everything visible is provided by
 /// features through `app.ui.screens` (library, document chrome, settings, onboarding) with minimal fallbacks.
 @MainActor
-final class ShellViewController: UIViewController, SceneNavigator {
+final class ShellViewController: UIViewController, SceneNavigator, UIGestureRecognizerDelegate {
     let app: NibApp
     let session: EditorSession
     private(set) var openDocuments: [DocumentID] = []
@@ -34,6 +34,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        let focusTap = UITapGestureRecognizer(target: self, action: #selector(reclaimLibraryKeyFocusAfterTap))
+        focusTap.cancelsTouchesInView = false
+        focusTap.delaysTouchesBegan = false
+        focusTap.delaysTouchesEnded = false
+        focusTap.delegate = self
+        view.addGestureRecognizer(focusTap)
         view.backgroundColor = .systemBackground
         if NibUITestMode.isEnabled {
             let probe = QAStateProbe(shell: self)
@@ -231,6 +237,13 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    #if DEBUG
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        NSLog("%@", "[Library key diagnostic] presses \(presses.compactMap { $0.key?.charactersIgnoringModifiers }) first responder \(String(describing: ShellFocus.firstResponder()))")
+        super.pressesBegan(presses, with: event)
+    }
+    #endif
+
     /// What decides which key commands are live in this window: the document kind it shows, whether text has the
     /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
     /// so typing in a search field or a rename alert never switches tools), and whether it has tabs (the tab keys stay
@@ -260,6 +273,9 @@ final class ShellViewController: UIViewController, SceneNavigator {
     }
 
     @objc private func runKeyCommand(_ sender: UIKeyCommand) {
+        #if DEBUG
+        NSLog("%@", "[Library key diagnostic] command \(String(describing: sender.propertyList)) typing \(keyCommandContext.isEditingText)")
+        #endif
         guard let d = liveKeyCommand(sender) else { return }
         activateWindow()
         let params = d.resolvedParams(for: session)
@@ -277,7 +293,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
     /// while the document's history or the window's UndoManager has a step. A disabled key falls through to the system.
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         guard action == #selector(runKeyCommand(_:)) else { return super.canPerformAction(action, withSender: sender) }
-        guard let command = sender as? UIKeyCommand, let d = liveKeyCommand(command) else { return false }
+        // UIKit also probes a selector with a nil/non-command sender when building
+        // the hardware-key routing table. Rejecting that probe disables every shortcut.
+        guard let command = sender as? UIKeyCommand else {
+            return !KeyCommandRouting.active(app.content.keyCommands.all, in: keyCommandContext).isEmpty
+        }
+        guard let d = liveKeyCommand(command) else { return false }
         return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
     }
 
@@ -320,11 +341,27 @@ final class ShellViewController: UIViewController, SceneNavigator {
         }
     }
 
-    /// Takes keyboard focus back when nothing in this window has it (the responder that had it left with the screen it
-    /// belonged to), so the key commands keep working. Never takes it from a responder in this window.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
+
+    @objc private func reclaimLibraryKeyFocusAfterTap() {
+        guard !showsDocument else { return }
+        // SwiftUI finishes updating button/scroll focus after delivering the tap.
+        DispatchQueue.main.async { [weak self] in self?.reclaimKeyFocusIfNeeded() }
+    }
+
+    /// Library controls can take non-text focus without providing the shell's registered keys.
+    /// Keep the shell focused there; a text input, sheet, or document editor keeps its own responder.
     private func reclaimKeyFocusIfNeeded() {
-        guard let window = viewIfLoaded?.window, window.isKeyWindow, !isFirstResponder,
-              !ShellFocus.hasFocus(in: window) else { return }
+        guard let window = viewIfLoaded?.window, window.isKeyWindow, !isFirstResponder else { return }
+        if showsDocument {
+            guard !ShellFocus.hasFocus(in: window) else { return }
+        } else {
+            guard presentedViewController == nil, !ShellFocus.isEditingText(in: window) else { return }
+        }
+        #if DEBUG
+        NSLog("%@", "[Library key diagnostic] reclaim from \(String(describing: ShellFocus.firstResponder()))")
+        #endif
         becomeFirstResponder()
     }
 
@@ -472,7 +509,9 @@ enum ShellFocus {
         guard let window, let responder = firstResponder(), self.window(of: responder) === window else { return false }
         if let textView = responder as? UITextView { return textView.isEditable }
         if let field = responder as? UITextField { return field.isEnabled }
-        return responder is UIKeyInput
+        // Hosting/keyboard responders can implement UIKeyInput just to receive keys.
+        // Only an actual text input should suppress library focus reclamation.
+        return responder is UITextInput
     }
 
     private static func window(of responder: UIResponder) -> UIWindow? {

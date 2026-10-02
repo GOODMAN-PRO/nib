@@ -115,8 +115,10 @@ enum LibraryShortcut {
 
 struct LibraryBuds: View {
     @ObservedObject var model: LibraryViewModel
+    @State private var mountedMenus: Set<String> = []
     var body: some View {
         ZStack {
+<<<<<<< HEAD
             LibraryNewMenuPopover(model: model, isPresented: binding("new"))
                 .allowsHitTesting(isPresented("new"))
                 .accessibilityHidden(!isPresented("new"))
@@ -140,12 +142,40 @@ struct LibraryBuds: View {
                     ForEach(LibraryFilter.allCases, id: \.self) { filter in
                         NibButton(filter.title, symbol: model.filter == filter ? .checkmark : nil, kind: .plain) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
                         .accessibilityIdentifier("cmd.library.setView")
+=======
+            if model.menu == "new" || mountedMenus.contains("new") {
+                LibraryNewMenuPopover(model: model, isPresented: binding("new"))
+            }
+            if model.menu == "app" || mountedMenus.contains("app") {
+                NibBudPopover(id: "library.app.menu", source: "library.app", isPresented: binding("app"), title: String(localized: "Nib")) {
+                    LibraryMenuEntries(model: model, location: .appMenu)
+                }
+            }
+            if model.menu == "sort" || mountedMenus.contains("sort") {
+                NibBudPopover(id: "library.sort.menu", source: "library.sort", isPresented: binding("sort"), title: String(localized: "Sort and View")) {
+                    VStack(alignment: .leading, spacing: NibSpacing.s) {
+                        NibSegmentedControl(selection: Binding(get: { model.layout }, set: {
+                            model.setView(["layout": .string($0.rawValue)])
+                        }), options: LibraryLayout.allCases) {
+                            $0 == .grid ? String(localized: "Grid") : String(localized: "List")
+                        }
+                        ForEach(LibrarySort.allCases, id: \.self) { sort in
+                            NibButton(sort.title, symbol: model.sort == sort ? .checkmark : nil, kind: .plain) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
+                            .accessibilityIdentifier("cmd.library.setView")
+                        }
+                        Divider()
+                        ForEach(LibraryFilter.allCases, id: \.self) { filter in
+                            NibButton(filter.title, symbol: model.filter == filter ? .checkmark : nil, kind: .plain) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
+                            .accessibilityIdentifier("cmd.library.setView")
+                        }
+>>>>>>> qa-fix
                     }
                 }
             }
             .allowsHitTesting(isPresented("sort"))
             .accessibilityHidden(!isPresented("sort"))
         }
+<<<<<<< HEAD
         // The full-window host is also an overlay. Keep it out of hit testing and
         // accessibility while no menu is open, including during scene/size changes.
         // Leave its children mounted so an outgoing bud can finish retracting.
@@ -157,6 +187,18 @@ struct LibraryBuds: View {
     // host, not just the animated droplet: a closed menu must not cover library cards.
     private func isPresented(_ menu: String) -> Bool {
         model.menu == menu && model.menuAnchors["library." + menu] != nil
+=======
+        .onChange(of: model.menu, initial: true) { previous, current in
+            if let current { mountedMenus.insert(current) }
+            guard let previous else { return }
+            Task { @MainActor in
+                // Preserve the droplet's retraction, then remove its native scroll
+                // view completely. Closed menus must not remain accessibility targets.
+                try? await Task.sleep(for: .seconds(NibMotion.retract.response * 3))
+                if model.menu != previous { mountedMenus.remove(previous) }
+            }
+        }
+>>>>>>> qa-fix
     }
     private func binding(_ menu: String) -> Binding<Bool> {
         Binding(get: { isPresented(menu) },
@@ -229,6 +271,8 @@ struct LibraryNewMenuPopover: View {
             .position(x: min(max(anchor.midX, inset + width / 2), proxy.size.width - inset - width / 2),
                       y: y + layout.height / 2)
         }
+        .allowsHitTesting(isPresented)
+        .accessibilityHidden(!isPresented)
     }
 }
 

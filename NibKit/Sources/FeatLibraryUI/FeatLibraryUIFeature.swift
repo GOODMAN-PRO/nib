@@ -18,6 +18,19 @@ public enum FeatLibraryUIFeature: NibFeature {
             _ = try await context.execute(CommandIDs.librarySetView, ["folder": params["folder"]?.stringValue.map(JSONValue.string) ?? "lib", "sidebar": false])
             return result
         }
+        // Window-level external drops enter import.files without a destination. The
+        // browser owns the current folder; preserve explicit picker/canvas destinations.
+        if let importer = app.commands.entry(CommandIDs.importFiles) {
+            app.commands.register(importer.descriptor) { params, context in
+                var routed = params
+                if params["folder"] == nil, params["doc"] == nil,
+                   let app = context.app, let session = context.activeSession, session.document == nil,
+                   let model = LibraryModels.get(app).models[session.id] {
+                    routed = params.merging(["folder": model.folderRef])
+                }
+                return try await importer.handler(routed, context)
+            }
+        }
     }
     public static func register(_ app: NibApp) {
         app.commands.register(LibrarySetView.self)
@@ -35,9 +48,9 @@ public enum FeatLibraryUIFeature: NibFeature {
         app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".endSelection", title: String(localized: "Deselect All"),
             shortcut: KeyShortcut("escape"), command: CommandIDs.librarySetView,
             params: ["selection": "clear", "menu": "none"], scope: .library, owner: id))
-        app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".rename", title: String(localized: "Rename"),
+        app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".openSelection", title: String(localized: "Open"),
             shortcut: KeyShortcut("return"), command: CommandIDs.librarySetView,
-            params: ["renameSelected": true], scope: .library, owner: id))
+            params: ["openSelected": true], scope: .library, owner: id))
         app.ui.panels.register(PanelDescriptor(id: "libraryui.move", title: String(localized: "Move Items"), icon: NibSymbol.folder.name,
             placement: .sheet, order: 0, owner: id) { context in
                 AnyMovePicker.make(context)
@@ -61,6 +74,7 @@ struct LibrarySetView: NibCommand {
         var menu: String?
         var rename: String?
         var renameSelected: Bool?
+        var openSelected: Bool?
         var search: String?
         var sidebar: Bool?
     }
@@ -72,7 +86,7 @@ struct LibrarySetView: NibCommand {
             "sort": .str(choices: LibrarySort.allCases.map(\.rawValue)), "filter": .str(choices: LibraryFilter.allCases.map(\.rawValue)),
             "panel": .str("registered panel id, or documents"), "params": .anything("panel parameters"), "close": .bool(),
             "selection": .str(choices: ["all", "clear", "begin", "toggle", "replace"]), "refs": .arr(.ref),
-            "menu": .str(choices: ["new", "app", "sort", "none"]), "rename": .ref, "renameSelected": .bool(),
+            "menu": .str(choices: ["new", "app", "sort", "none"]), "rename": .ref, "renameSelected": .bool(), "openSelected": .bool(),
             "search": .str(), "sidebar": .bool()]),
         examples: [["layout": "list", "sort": "created"], ["folder": "lib", "filter": "folders"]],
         effect: .session, target: .app)
@@ -124,7 +138,11 @@ struct LibrarySetView: NibCommand {
             if panel == "documents" { model.closeTab(); model.collection = .documents }
             else {
                 if p.close == true { model.closePanel(panel) }
-                else if let descriptor { model.openPanel(descriptor, params: p.params ?? [:]) }
+                else if let descriptor {
+                    var params = p.params ?? [:]
+                    if panel == "organize.folder.new", params["folder"] == nil { params = params.merging(["folder": model.folderRef]) }
+                    model.openPanel(descriptor, params: params)
+                }
                 if navigates { await model.markDirty() }
                 return result
             }
@@ -143,9 +161,21 @@ struct LibrarySetView: NibCommand {
             default: break
             }
         }
-        if let menu = p.menu { model.menu = menu == "none" ? nil : menu }
+        if let menu = p.menu {
+            #if DEBUG
+            NSLog("%@", "[Library menu diagnostic] \(menu) \(model.menuAnchors)")
+            #endif
+            model.menu = menu == "none" ? nil : menu
+        }
         if let rename = p.rename { model.renaming = rename.isEmpty ? nil : rename }
         if p.renameSelected == true, model.selection.refs.count == 1 { model.renaming = model.selection.refs.first }
+        if p.openSelected == true, model.selection.refs.count == 1, let ref = model.selection.refs.first {
+            if case .folder? = NodeRef(ref) {
+                return try await ctx.execute(CommandIDs.librarySetView, ["folder": .string(ref), "sidebar": false])
+            }
+            model.selection.clear()
+            return try await ctx.execute(CommandIDs.docOpen, ["doc": .string(ref)])
+        }
         if let search = p.search { model.search = search }
         if let sidebar = p.sidebar { model.sidebarVisible = sidebar }
         if p.sort != nil || p.filter != nil || p.search != nil { model.applySort() }

@@ -159,6 +159,16 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertNotEqual(library, libraryWithTabs, "opening or closing the last tab rebuilds the window's keys")
     }
 
+    func testSelectAllBelongsToFocusedLibraryTextFields() {
+        let selectAll = key("library.selectAll", KeyShortcut("a", [.command]), scope: .library)
+        XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(selectAll, in: library))
+        let editing = KeyCommandContext(docKind: nil, isEditingText: true)
+        XCTAssertFalse(KeyCommandRouting.overridesSystemKeys(selectAll, in: editing),
+                       "Command-A must select the name or hex text before replacement, not the library behind the sheet")
+        let find = key("library.find", KeyShortcut("f", [.command]), scope: .library)
+        XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(find, in: editing))
+    }
+
     func testSessionParamsMergeOverStaticParamsWhenTheKeyRuns() {
         let h = Harness()
         var d = KeyCommandDescriptor(id: "k", title: "K", shortcut: KeyShortcut("b", [.command]), command: CommandIDs.batch,

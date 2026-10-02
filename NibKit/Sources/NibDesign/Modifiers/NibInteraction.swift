@@ -36,6 +36,7 @@ struct NibPressBody: View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(NibMotion.tap.animation, value: configuration.isPressed)
+            .contentShape(.interaction, shape)
             .contentShape(.hoverEffect, shape)
             .hoverEffect(.highlight)
             .overlay {

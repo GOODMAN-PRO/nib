@@ -8,6 +8,51 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testClosedPopoverDisablesItsNativeScrollHitTargetAndReopens() async throws {
+        func panel(_ presented: Bool) -> some View {
+            NibPopoverPanel(title: "Menu") { Button("Action") {} }
+                .budsFrom("source", isPresented: .constant(presented))
+        }
+        let host = UIHostingController(rootView: panel(false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrollView(_ view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { scrollView($0) }.first
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let scroll = try XCTUnwrap(scrollView(host.view))
+        XCTAssertFalse(scroll.isUserInteractionEnabled, "A hidden menu must not consume taps on Library or sidebar buttons")
+        XCTAssertTrue(scroll.accessibilityElementsHidden)
+        host.rootView = panel(true)
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(scroll.isUserInteractionEnabled, "The same retained popover must become interactive when reopened")
+        XCTAssertFalse(scroll.accessibilityElementsHidden)
+    }
+
+    func testToastDoesNotCaptureOutsideTapsOrPopoverDismissal() {
+        let field = DropletField()
+        field.reduceMotion = true
+        field.setWorldAnchor("source", CGRect(x: 300, y: 700, width: 1, height: 1))
+        field.setRest("toast", CGRect(x: 100, y: 620, width: 400, height: 48), style: .toast)
+        var toastDismissed = false
+        field.setBud("toast", source: "source", presented: true, instant: true) { toastDismissed = true }
+        XCTAssertTrue(field.node("toast").presentation.isDrawn)
+        XCTAssertFalse(field.hasOpenBud, "A toast must leave navigation and library cells interactive")
+
+        field.setRest("menu", CGRect(x: 100, y: 200, width: 300, height: 200), style: .popover)
+        var menuDismissed = false
+        field.setBud("menu", source: "source", presented: true, instant: true) { menuDismissed = true }
+        XCTAssertTrue(field.hasOpenBud)
+        field.dismissBuds()
+        XCTAssertTrue(menuDismissed)
+        XCTAssertFalse(toastDismissed, "Outside dismissal belongs to the menu, not the Undo notification")
+        field.unregister("menu")
+        field.unregister("toast")
+    }
+
     func testReducedMotionBudsStayAtTheirFinalMeasuredPosition() {
         for mode in [NibLiquidMode.full, .off] {
             let field = DropletField()

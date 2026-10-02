@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Popover content chrome on Deep water: title (headline) and optional subtitle, 16 pt insets, scrolls past 520 pt.
 /// Put it in a droplet: `.droplet(id, style: .popover).budsFrom(source, isPresented:)`, or use `NibBudPopover`.
@@ -12,6 +13,7 @@ public struct NibPopoverPanel<Content: View>: View {
     let maxHeight: CGFloat
     @State private var contentHeight: CGFloat = NibMetrics.popoverMaxHeight
     @Environment(DropletField.self) private var field: DropletField?
+    @Environment(\.nibBud) private var bud
 
     public init(title: String, subtitle: String? = nil, width: CGFloat = NibMetrics.popoverWidth,
                 maxHeight: CGFloat = NibMetrics.popoverMaxHeight, @ViewBuilder content: () -> Content) {
@@ -40,6 +42,7 @@ public struct NibPopoverPanel<Content: View>: View {
             }
             .padding(NibSpacing.l)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            .background(PopoverScrollInteraction(isPresented: bud?.isPresented.wrappedValue ?? true))
         }
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
@@ -54,6 +57,36 @@ public struct NibPopoverPanel<Content: View>: View {
         }
         return CGSize(width: max(0, bounds.width - 2 * NibMetrics.chromeInset),
                       height: max(0, bounds.height - 2 * NibMetrics.chromeInset))
+    }
+}
+
+/// SwiftUI can keep a hidden popover's native scroll view above neighbouring controls.
+/// Disable that UIKit hit target as well as the droplet's SwiftUI gestures, retaining its closing animation.
+private struct PopoverScrollInteraction: UIViewRepresentable {
+    let isPresented: Bool
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+    func updateUIView(_ view: Probe, context: Context) {
+        view.isPresented = isPresented
+        view.updateScrollView()
+    }
+    final class Probe: UIView {
+        var isPresented = true
+        override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
+        func updateScrollView() {
+            var ancestor = superview
+            while let view = ancestor {
+                if let scroll = view as? UIScrollView {
+                    scroll.isUserInteractionEnabled = isPresented
+                    scroll.accessibilityElementsHidden = !isPresented
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
     }
 }
 
@@ -179,6 +212,8 @@ public struct NibBudPopover<Content: View>: View {
                 .budsFrom(source, isPresented: $isPresented)
                 .position(x: centre.x - frame.minX, y: centre.y - frame.minY)
         }
+        .allowsHitTesting(isPresented)
+        .accessibilityHidden(!isPresented)
     }
 }
 

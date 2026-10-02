@@ -279,7 +279,8 @@ struct FolderStyleSheet: View {
     }
 
     private var canSave: Bool {
-        !isSaving && draft.titleProblem == nil && (mode.isCreate || draft != original)
+        !isSaving && draft.titleProblem == nil && FolderDraft.parseHex(hexText) != nil
+            && (mode.isCreate || draft != original)
     }
 
     private var isEmojiIcon: Bool { draft.icon.map { FolderDraft.isSingleEmoji($0) } ?? false }
@@ -324,6 +325,9 @@ struct FolderStyleSheet: View {
             .listStyle(.insetGrouped)
             .scrollDismissesKeyboard(.interactively)
         }
+        // A List has no useful intrinsic height. Give the fitted iPad sheet an
+        // ideal viewport instead of collapsing it to a single partially visible row.
+        .frame(idealHeight: 640)
         .background(NibColor.groupedBackground)
         .onAppear { if mode.isCreate { nameFocused = true } }
         .nibSheet(isPresented: $choosingLocation) {
@@ -535,9 +539,10 @@ struct FolderStyleSheet: View {
     }
 
     private func save() {
-        guard canSave else { return }
+        guard canSave, let color = FolderDraft.parseHex(hexText) else { return }
         isSaving = true
-        let draft = self.draft
+        var draft = self.draft
+        draft.color = color
         let original = self.original
         let mode = self.mode
         let window = self.window

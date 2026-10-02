@@ -209,7 +209,7 @@ public struct NibToast: View {
         .padding(.trailing, NibSpacing.xs)
         .frame(minHeight: 48)
         .frame(maxWidth: 480)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 
