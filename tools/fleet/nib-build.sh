@@ -9,6 +9,7 @@
 #   nib-build.sh full    <worktree>               lint + xcodegen + every package test (NibKit-Package) + app build
 #   nib-build.sh app     <worktree>               xcodegen + app build only (Debug, generic iOS, unsigned)
 #   nib-build.sh archive <worktree>               xcodegen + Release archive + unsigned IPA into <worktree>/build
+#   nib-build.sh uitest  <worktree> ["<NibUITests/Class ...>"]  XCUITest run on a dedicated iPad simulator (one UI run at a time; log local-<wt>-uitest-<class|all>.log, bundle ui-<class|all>.xcresult)
 #
 # The full log goes to ~/Projects/Nib-ci-logs/local-<worktree-name>-<mode>.log; its exit code to the matching .exit file.
 # If your Bash call times out, the build keeps running: wait for the .exit file (e.g. `until [ -f X.exit ]; do sleep 20; done`).
@@ -19,7 +20,19 @@ BASE="$HOME/Projects"
 LOCKS="$BASE/Nib-locks"; LOGS="$BASE/Nib-ci-logs"; SLOTS="${NIB_SLOTS:-2}"
 mkdir -p "$LOCKS" "$LOGS"
 NAME="$(basename "$WTREE")"
-LOG="$LOGS/local-$NAME-$MODE.log"; EXITF="${LOG%.log}.exit"
+UITAG=""
+if [ "$MODE" = uitest ]; then
+  UITAG="$(echo "${ARG:-all}" | sed -E 's#NibUITests/##g; s#[^A-Za-z0-9]+#-#g; s#-$##')"; UITAG="${UITAG:0:60}"
+  # Hard per-job budget (set by the orchestrator through nib-codex.sh): a Codex job may start at most NIB_UI_MAX UI runs.
+  if [ -n "${NIB_JOB:-}" ] && [ -n "${NIB_UI_MAX:-}" ]; then
+    cf="$LOGS/uiruns-$NIB_JOB"; n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
+    if [ "$n" -gt "$NIB_UI_MAX" ]; then
+      echo "UI RUN BUDGET EXHAUSTED: job $NIB_JOB already used its $NIB_UI_MAX UI runs. Do not run UI tests again; finish now and answer with the results you have (unverified test-side fixes go in notes)."; exit 3
+    fi
+    echo "$n" > "$cf"
+  fi
+fi
+LOG="$LOGS/local-$NAME-$MODE${UITAG:+-$UITAG}.log"; EXITF="${LOG%.log}.exit"
 rm -f "$EXITF"
 : > "$LOG"
 say() { echo "$*" | tee -a "$LOG"; }
@@ -39,8 +52,16 @@ acquire() {
     sleep 15
   done
 }
-release() { [ -n "$SLOT" ] && rm -rf "$LOCKS/slot$SLOT"; }
+UILOCK=""
+release() { [ -n "$SLOT" ] && rm -rf "$LOCKS/slot$SLOT"; [ -n "$UILOCK" ] && [ "$(cat "$UILOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$UILOCK"; }
 trap 'release' EXIT INT TERM
+if [ "$MODE" = uitest ]; then
+  # One UI run machine-wide. Take the UI lock BEFORE a build slot so queued UI runs never hold slots other jobs need.
+  say "== waiting for the UI simulator lane"
+  UILOCK="$LOCKS/ui"
+  until mkdir "$UILOCK" 2>/dev/null; do p=$(cat "$UILOCK/pid" 2>/dev/null); [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null && rm -rf "$UILOCK"; sleep 15; done
+  echo $$ > "$UILOCK/pid"
+fi
 say "== waiting for a build slot ($SLOTS max)"
 acquire
 echo "$SLOT" > "$LOCKS/affinity-$NAME"
@@ -143,6 +164,26 @@ archive_app() {
     (cd build && rm -f Nib-unsigned.ipa && zip -qry Nib-unsigned.ipa Payload) ) >> "$LOG" 2>&1
 }
 
+ui_tests() { # $1 = optional space-separated -only-testing identifiers (e.g. "NibUITests/PenUITests")
+  local name="Nib-ui-ipad" udid
+  udid="$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next((x['udid'] for v in d.values() for x in v if x['name']=='$name'),''))")"
+  if [ -z "$udid" ]; then
+    local rt; rt="$(xcrun simctl list runtimes -j | python3 -c "import json,sys;r=[x for x in json.load(sys.stdin)['runtimes'] if x['isAvailable'] and x['platform']=='iOS'];print(sorted(r,key=lambda x:x['version'])[-1]['identifier'])")"
+    local dt; dt="$(xcrun simctl list devicetypes -j | python3 -c "import json,sys;print(next(x['identifier'] for x in json.load(sys.stdin)['devicetypes'] if x['name'].startswith('iPad Pro 13')))")"
+    udid="$(xcrun simctl create "$name" "$dt" "$rt")"
+  fi
+  local only=""; for t in $1; do only="$only -only-testing:$t"; done
+  local RB="$LOGS/ui-$UITAG.xcresult"; rm -rf "$RB" "$LOGS/ui-latest.xcresult"
+  echo "== result bundle $RB" >> "$LOG"
+  gen_project && ( cd "$WTREE" && xcodebuild test -project Nib.xcodeproj -scheme NibUITests -destination "id=$udid" \
+      -derivedDataPath "$DD" -clonedSourcePackagesDirPath "$SPM" -skipPackagePluginValidation $only \
+      -resultBundlePath "$RB" CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO ) >> "$LOG" 2>&1
+  local rc=$?
+  ln -sfn "$RB" "$LOGS/ui-latest.xcresult"
+  xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true
+  return $rc
+}
+
 rc=0
 cd "$WTREE"
 case "$MODE" in
@@ -161,6 +202,7 @@ case "$MODE" in
     [ $rc -eq 0 ] && { build_app || rc=$?; } ;;
   app) build_app || rc=$? ;;
   archive) archive_app || rc=$? ;;
+  uitest) say "== UI tests [${ARG:-all}] (log $LOG, result bundle $LOGS/ui-$UITAG.xcresult)"; ui_tests "$ARG" || rc=$? ;;
   *) echo "unknown mode $MODE"; rc=2 ;;
 esac
 
@@ -169,7 +211,7 @@ if [ $rc -eq 0 ]; then
   echo "LOCAL BUILD OK ($MODE $NAME, slot $SLOT). Log: $LOG"
 else
   echo "LOCAL BUILD FAILED rc=$rc ($MODE $NAME). Log: $LOG"
-  grep -nE "error:|\*\* BUILD FAILED|\*\* TEST FAILED|failed \(|fatal|Testing failed|XCTAssert|lint:|FAIL" "$LOG" | grep -v '^.*warning:' | head -60
+  grep -nE "error:|\*\* BUILD FAILED|\*\* TEST FAILED|failed \(|fatal|Testing failed|XCTAssert|lint:|FAIL|Test Case .* failed" "$LOG" | grep -v '^.*warning:' | head -60
   echo "---- tail"; tail -25 "$LOG"
 fi
 exit $rc

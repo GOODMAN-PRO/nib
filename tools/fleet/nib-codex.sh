@@ -25,7 +25,7 @@ if [ "$MODE" = run ]; then
           sleep 10
         done
         echo "$BASE" > "$L/base"; trap 'rm -rf "$L"' EXIT; fi
-      cd "$WT" && codex exec --ignore-user-config -m "${NIB_CODEX_MODEL:-gpt-6.1-sol}" -c "model_reasoning_effort=\"$EFFORT\"" \
+      export NIB_JOB="$NAME"; cd "$WT" && codex exec --ignore-user-config -m "${NIB_CODEX_MODEL:-gpt-6-astra}" -c "model_reasoning_effort=\"$EFFORT\"" \
         --dangerously-bypass-approvals-and-sandbox -C "$WT" --output-schema "$SCHEMA" -o "$BASE.json" - < "$PROMPT" > "$BASE.log" 2>&1
       echo $? > "$BASE.exit" ) &
     echo $! > "$BASE.pid"; date +%s > "$BASE.start"
