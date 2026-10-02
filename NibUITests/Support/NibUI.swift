@@ -142,14 +142,15 @@ final class NibUI {
     }
 
     func openDocument(_ title: String) throws {
-        let document = app.descendants(matching: .any).matching(identifier: "cmd.doc.open")
+        _ = try waitForState { $0.screen == "library" }
+        let document = app.buttons.matching(identifier: "cmd.doc.open")
             .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
         guard document.waitForExistence(timeout: 15) else { throw Failure.message("Document missing: \(title); state: \(String(describing: probe.value))\n\(app.debugDescription)") }
-        let button = document.buttons.firstMatch
-        let target = button.exists ? button : document
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true AND enabled == true"), object: target)
+        // The card's decorative accessibility group can also have a button trait.
+        // Only the command-bearing outer button owns document navigation.
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true AND enabled == true"), object: document)
         guard XCTWaiter.wait(for: [ready], timeout: 15) == .completed else { throw Failure.message("Document is not hittable: \(title)") }
-        target.tap()
+        document.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 

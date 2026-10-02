@@ -91,8 +91,18 @@ final class InsertUITests: XCTestCase {
     private func control(_ name: String, _ type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
         let q = query(name, type)
         for attempt in 0..<(scroll ? 7 : 2) {
-            let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let found = candidates.first(where: { [.button, .textField, .textView, .switch, .slider].contains($0.elementType) }) ?? candidates.first { return found }
+            // The accessibility contract identifies controls, not an ordinal in a mixed
+            // container/control query. Native menus can expose both under the same label.
+            let types: [XCUIElement.ElementType] = type == .any
+                ? [.button, .textField, .secureTextField, .textView, .switch, .slider,
+                   .other, .staticText, .cell, .image]
+                : [type]
+            for kind in types {
+                let matches = query(name, kind)
+                if let found = matches.allElementsBoundByIndex.first(where: {
+                    !$0.frame.isEmpty && $0.isEnabled && $0.isHittable
+                }) { return found }
+            }
             if attempt == 0 { _ = q.firstMatch.waitForExistence(timeout: 3) }
             if scroll, let panel = (ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex).first(where: {
                 $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.height > 150 && $0.frame.width > 200
@@ -143,6 +153,9 @@ final class InsertUITests: XCTestCase {
             if visible("cmd.panel.close") { try tap("cmd.panel.close") }
             try ui.tapCommand("sidebar.toggle")
         }
+        // F052 exposes Audio as a sidebar tab. On whiteboards it is a primary
+        // tab, so opening Panel Options would obscure it rather than list it.
+        if query(name, .button).allElementsBoundByIndex.contains(where: { $0.isHittable }) { try tap(name); return }
         try tap("Panel Options"); try tap(name)
     }
     private func selectedBounds() throws -> CGRect {
@@ -217,11 +230,11 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(try ui.state().redoAvailable)
         try ui.tapCommand("edit.redo"); try counts(after)
     }
-    private func beginText(_ text: String) throws {
+    private func beginText(_ text: String, visibleText: String? = nil) throws {
         try ui.selectTool("text"); ui.coordinate(point).tap()
         let editor = try control("Text box", .textView)
         editor.typeText(text)
-        try wait("Typed text must reach the editable text box") { (editor.value as? String)?.contains(text) == true }
+        try wait("Typed text must reach the editable text box") { (editor.value as? String)?.contains(visibleText ?? text) == true }
     }
     private func shape(_ title: String = "Rectangle") throws {
         let before = try ui.state().itemCountOnPage
@@ -314,13 +327,15 @@ final class InsertUITests: XCTestCase {
         }
     }
     func testAutomaticListsContinueNestOutdentAndExit() throws {
-        try beginText("- first\n")
+        // F026 consumes the typed list marker when it creates the bullet paragraph.
+        try beginText("- first\n", visibleText: "first")
         key(XCUIKeyboardKey.tab.rawValue, [])
         try control("Text box", .textView).typeText("nested\n")
         key(XCUIKeyboardKey.tab.rawValue, .shift)
         try control("Text box", .textView).typeText("last\n\nplain")
         try finish()
         let ps = try paragraphs(snapshot("text"))
+        XCTAssertEqual((ps.first?["runs"] as? [JSON])?.compactMap { $0["text"] as? String }.joined(), "first")
         XCTAssertEqual(ps.first?["list"] as? String, "bullet")
         XCTAssertTrue(ps.contains { ($0["indent"] as? Int ?? 0) > 0 }, "Tab nests a list paragraph")
         XCTAssertEqual(ps.last?["list"] as? String, "plain", "Return on an empty item exits the list")
@@ -409,13 +424,23 @@ final class InsertUITests: XCTestCase {
         try counts(5, strokes: 1)
     }
     func testPageTypingUsesMarginsAndReusesItsBoxWithPresets() throws {
+        func pageText() throws -> JSON {
+            try all()
+            // F028 inserts full-page text at bottomZ; the last text item is the fixture box.
+            let boxes = try items().compactMap { $0["text"] as? JSON }.filter {
+                ($0["style"] as? JSON)?["fullPage"] as? Bool == true
+            }
+            XCTAssertEqual(boxes.count, 1, "Only one full-page text box may exist on the page")
+            return try XCTUnwrap(boxes.first)
+        }
         try pageMenu(); try tap("Start Typing")
         let editor = try control("Page text", .textView)
         editor.typeText("Full page report")
         try tap("Text Style"); try tap("Heading")
         XCTAssertEqual(try control("Text Style").value as? String, "Heading")
         try finish(); try counts(5)
-        let original = try snapshot("text"), frame = try XCTUnwrap(original["frame"] as? JSON)
+        let original = try pageText(), frame = try XCTUnwrap(original["frame"] as? JSON)
+        XCTAssertEqual(try plain(original), "Full page report")
         XCTAssertGreaterThan((frame["x"] as? Double) ?? 0, 0)
         XCTAssertGreaterThan((frame["y"] as? Double) ?? 0, 0)
         XCTAssertLessThan((frame["w"] as? Double) ?? 595, 595)
@@ -423,7 +448,7 @@ final class InsertUITests: XCTestCase {
         let reopened = try control("Page text", .textView)
         XCTAssertTrue((reopened.value as? String)?.contains("Full page report") == true)
         try tap("Text Style"); try tap("Caption"); try finish(); try counts(5)
-        XCTAssertEqual(json(try snapshot("text")["frame"]), json(original["frame"]))
+        XCTAssertEqual(json(try pageText()["frame"]), json(original["frame"]))
     }
 
     // MARK: shapes, connectors and diagrams

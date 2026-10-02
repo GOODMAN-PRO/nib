@@ -25,6 +25,7 @@ public struct NibPopoverPanel<Content: View>: View {
     }
 
     public var body: some View {
+        let isPresented = bud?.isPresented.wrappedValue ?? true
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.m) {
                 HStack(alignment: .firstTextBaseline) {
@@ -42,13 +43,20 @@ public struct NibPopoverPanel<Content: View>: View {
             }
             .padding(NibSpacing.l)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
-            .background(PopoverScrollInteraction(isPresented: bud?.isPresented.wrappedValue ?? true))
+            .background(PopoverScrollInteraction(isPresented: isPresented))
         }
+        // Gate the native scroll host at its source, not only the animated droplet around it.
+        // UIKit can rebuild/re-enable that host during a glass or layout update. A closed
+        // menu must immediately stop intercepting Library, width slots and other menus,
+        // even while its retained content is still animating out.
+        .scrollDisabled(!isPresented)
+        .allowsHitTesting(isPresented)
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
         .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
+        .accessibilityHidden(!isPresented)
     }
 
     private var viewport: CGSize {

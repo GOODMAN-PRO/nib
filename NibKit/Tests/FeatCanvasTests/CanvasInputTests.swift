@@ -377,6 +377,36 @@ final class CanvasInputTests: XCTestCase {
         let input = try XCTUnwrap(editor.host.inputController as? WetInkController)
         return (harness, editor, input)
     }
+    func testWetInkHasNoNativeUndoAndKeepsPageCoordinatesThroughLayout() async throws {
+        let tool = Tool(); tool.inputMode = .pencilKit
+        let (_, editor, input) = try installed(tool)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = editor
+        window.isHidden = false
+        defer { editor.closeCanvas(); window.isHidden = true }
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1032),
+                     CGSize(width: 1376, height: 1032)] {
+            editor.view.frame = CGRect(origin: .zero, size: size)
+            editor.view.setNeedsLayout()
+            editor.view.layoutIfNeeded()
+            input.canvasDidChange(editor.host)
+            await Task.yield()
+            let nativeCanvases = canvases(editor.host.wetInkContainer)
+            XCTAssertEqual(nativeCanvases.count, 2)
+            for canvas in nativeCanvases {
+                XCTAssertNil(canvas.undoManager, "Transient PencilKit drawing must never enter the window undo stack")
+                XCTAssertEqual(canvas.contentOffset, .zero, "Native capture origin must remain the page origin")
+                XCTAssertEqual(canvas.adjustedContentInset, .zero, "Native capture must not inherit chrome clearance")
+                let point = Point(200, 320)
+                let wet = canvas.convert(CGPoint(x: point.x * Double(canvas.zoomScale),
+                                                 y: point.y * Double(canvas.zoomScale)), to: editor.host.canvasView)
+                let dry = editor.host.viewPoint(point, page: Fixtures.page1)
+                XCTAssertEqual(wet.x, dry.x, accuracy: 0.5, "Wet and committed ink must share page coordinates")
+                XCTAssertEqual(wet.y, dry.y, accuracy: 0.5, "A sidebar round trip must not displace surviving ink")
+            }
+        }
+    }
+
     private func event(_ host: CanvasHostImpl, id: Int, pencil: Bool = true, point: Point = Point(140, 220),
                        timestamp: Double = ProcessInfo.processInfo.systemUptime) -> CanvasSample {
         CanvasSample(page: host.session.page ?? Fixtures.page1, location: point, timestamp: timestamp, isPencil: pencil, touchID: id)

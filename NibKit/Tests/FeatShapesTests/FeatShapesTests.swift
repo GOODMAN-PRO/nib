@@ -276,6 +276,19 @@ final class FeatShapesTests: XCTestCase {
 
     // MARK: Drawer
 
+    func testHeldPenShapesPaintInTheirPageRegion() throws {
+        let origin = Point(160, 400)
+        for kind in [ShapeKind.line, .arrow, .arc, .curve, .rectangle, .ellipse, .triangle, .polygon] {
+            let shape = try ShapeGeometry.make(kind, frame: Frame(x: origin.x + 20, y: origin.y + 20, w: 120, h: 80),
+                points: nil, style: ShapeItemStyle(strokeWidth: 1.2, cornerRadius: 0, drawnWith: .pen))
+            let pixels = inkedPixels { cg in
+                cg.translateBy(x: -origin.x, y: -origin.y)
+                ShapeRenderer.draw(shape, in: cg, scale: 1, darkPaper: false)
+            }
+            XCTAssertGreaterThan(pixels, 60, "Held \(kind) must paint where it was drawn")
+        }
+    }
+
     func testDrawerPaintsEveryKind() throws {
         let drawer = ShapeDrawer()
         for kind in ShapeKind.allCases {

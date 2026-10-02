@@ -135,11 +135,21 @@ final class ToolbarModel: ObservableObject {
     /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): the options bar's chevron opens it.
     /// One popover at a time: opening it closes the options bar's own popover.
     @Published var settingsOpen = false {
-        didSet { if settingsOpen && !oldValue { closeOptionsPopovers() } }
+        didSet {
+            if settingsOpen && !oldValue {
+                moreOpen = false
+                closeOptionsPopovers()
+            }
+        }
     }
     /// The palette's More grid (`NibToolPalette(morePresented:)`); it too closes the options bar's popover.
     @Published var moreOpen = false {
-        didSet { if moreOpen && !oldValue { closeOptionsPopovers() } }
+        didSet {
+            if moreOpen && !oldValue {
+                settingsOpen = false
+                closeOptionsPopovers()
+            }
+        }
     }
 
     private var descriptors: [String: ToolbarItemDescriptor] = [:]
@@ -341,6 +351,7 @@ final class ToolbarModel: ObservableObject {
     private func toolDidChange(_ t: String) {
         tool = t
         settingsOpen = false
+        moreOpen = false
         expandOptions()
         if Self.inkTools.contains(t), t != inkTool {
             inkTool = t

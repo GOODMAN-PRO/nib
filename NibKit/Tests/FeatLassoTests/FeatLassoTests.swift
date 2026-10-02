@@ -462,7 +462,7 @@ final class FeatLassoTests: XCTestCase {
         host.canvasView.frame.origin = CGPoint(x: 80, y: 114)
         host.canvasView.bounds.origin = CGPoint(x: -35, y: 60)
         let box = try XCTUnwrap(overlay.view.content?.box)
-        let expected = UIAccessibility.convertToScreenCoordinates(box, in: overlay.view)
+        let expected = window.convert(overlay.view.convert(box, to: window), to: window.screen.coordinateSpace)
         XCTAssertNotEqual(before, expected)
         XCTAssertEqual(overlay.view.accessibilityFrame, expected)
         XCTAssertNil(overlay.view.hitTest(CGPoint(x: box.midX, y: box.midY), with: nil),

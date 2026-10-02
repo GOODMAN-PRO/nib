@@ -13,13 +13,19 @@ final class PenOptions: ObservableObject {
     @Published private(set) var writingAidsError: String?
     private var settingsObservation: AnyCancellable?
     private var commits: EventSubscription?
+    private var pendingWrites: [String: UUID] = [:]
+    private var lastWrite: Task<Void, Never>?
 
     init(app: NibApp, session: EditorSession, pencil: Bool, observesWritingAids: Bool = false) {
         self.app = app; self.session = session; tool = pencil ? "pencil" : "pen"
         settingsObservation = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
             .receive(on: DispatchQueue.main).sink { [weak self] note in
                 guard let name = note.userInfo?["name"] as? String else { return }
-                MainActor.assumeIsolated { self?.values.removeValue(forKey: name); self?.objectWillChange.send() }
+                MainActor.assumeIsolated {
+                    guard let self, self.pendingWrites[name] == nil else { return }
+                    self.values.removeValue(forKey: name)
+                    self.objectWillChange.send()
+                }
             }
         if observesWritingAids {
             commits = app.events.subscribe { [weak self] event in
@@ -42,8 +48,24 @@ final class PenOptions: ObservableObject {
 
     func set<V>(_ key: SettingKey<V>, _ value: V) {
         guard let json = try? JSONValue.from(value) else { return }
+        let token = UUID(), previous = lastWrite
+        pendingWrites[key.name] = token
         values[key.name] = json
-        app.perform(CommandIDs.settingsSet, ["name": .string(key.name), "value": json], session: session)
+        // A notification for an earlier write must not roll back a newer switch/slider
+        // value while its command is still queued. Persist in interaction order.
+        lastWrite = Task { @MainActor [self] in
+            await previous?.value
+            do {
+                _ = try await app.bus.execute(CommandIDs.settingsSet,
+                    ["name": .string(key.name), "value": json], session: session)
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                    userInfo: ["command": CommandIDs.settingsSet, "error": NibError.wrap(error)])
+            }
+            guard pendingWrites[key.name] == token else { return }
+            pendingWrites.removeValue(forKey: key.name)
+            values.removeValue(forKey: key.name)
+        }
     }
 
     var presets: ToolPresets { value(NibSettings.presets(tool)) }

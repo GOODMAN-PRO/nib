@@ -173,6 +173,7 @@ final class InputProbe: UIGestureRecognizer {
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        cancelPresentation()
         for t in touches { active[ObjectIdentifier(t)] = t.type }
         if event.buttonMask.contains(.secondary) { secondary = true }
     }

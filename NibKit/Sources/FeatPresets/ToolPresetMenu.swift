@@ -300,8 +300,12 @@ final class PresetMenuModel {
     func openPicker() {
         guard let app, let session else { return }
         let tool = self.tool, slot = colourSlot
+        let initial = editedSwatch.color
+        // Release the menu's modal input catcher before handing input to UIKit. Keep the
+        // edited target and initial colour even as the menu's presentation changes.
+        close()
         SystemColourPicker.present(title: String(localized: "\(PresetText.toolName(tool)) Colour"),
-                                   initial: editedSwatch.color, supportsAlpha: tool != "highlighter",
+                                   initial: initial, supportsAlpha: tool != "highlighter",
                                    commitsOnFinishOnly: slot == nil, app: app, session: session) { colour in
             let hex = tool == "highlighter" ? PresetColour.rgbHex(colour) : colour.hex
             let call = slot.map { i in
@@ -309,7 +313,6 @@ final class PresetMenuModel {
             } ?? PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])
             PresetActions.run(app, session: session, [call])
         }
-        close()
     }
 
     var canPickFromPage: Bool {

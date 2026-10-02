@@ -6,6 +6,11 @@ import NibDesign
 import NibTesting
 @testable import FeatObjectMenu
 
+private final class MenuTouch: UITouch {
+    var inputType: UITouch.TouchType = .direct
+    override var type: UITouch.TouchType { inputType }
+}
+
 /// A window's floating host, including transient unavailability and canvas-to-container layout offsets.
 @MainActor
 final class FakeFloatingHost: FloatingHosting {
@@ -828,6 +833,132 @@ final class FeatObjectMenuTests: XCTestCase {
     }
 
     // MARK: menu.showAt
+
+    func testPageMenuWaitsForFingerAndContextGestureToFinish() async throws {
+        let probe = InputProbe(target: nil, action: nil)
+        probe.makePassive()
+        let touch = MenuTouch()
+        let event = UIEvent()
+        probe.touchesBegan([touch], with: event)
+        XCTAssertFalse(probe.allowsContextMenu, "A finger hold belongs to the command tap chain")
+        let competing = UILongPressGestureRecognizer()
+        XCTAssertFalse(probe.canPrevent(competing))
+        XCTAssertFalse(probe.canBePrevented(by: competing), "Keep observing until the finger lifts")
+
+        var presentations = 0
+        probe.presentWhenIdle { presentations += 1 }
+        await Task.yield()
+        XCTAssertEqual(presentations, 0, "Do not present while UIKit is resolving the same long-press")
+        probe.touchesEnded([touch], with: event)
+        // UIKit resets failed recognizers after dispatching the final contact callbacks.
+        probe.reset()
+        XCTAssertEqual(presentations, 0, "Presentation must also wait for gesture callback unwinding")
+        try await waitUntil({ presentations == 1 })
+        probe.reset()
+        await Task.yield()
+        XCTAssertEqual(presentations, 1)
+        XCTAssertTrue(probe.allowsContextMenu)
+    }
+
+    func testCancelledContactAndDetachedMenuDoNotPresentLater() async throws {
+        for cancelledContact in [true, false] {
+            let probe = InputProbe(target: nil, action: nil)
+            let touch = MenuTouch()
+            let event = UIEvent()
+            var presentations = 0
+            probe.touchesBegan([touch], with: event)
+            probe.presentWhenIdle { presentations += 1 }
+            if cancelledContact {
+                probe.touchesCancelled([touch], with: event)
+                probe.reset()
+            } else {
+                probe.touchesEnded([touch], with: event)
+                probe.reset()
+                probe.cancelPresentation() // attachment detached before the deferred presentation
+            }
+            await Task.yield()
+            XCTAssertEqual(presentations, 0)
+        }
+    }
+
+    func testPageMenuOffersCommentAtHeldPointAndTemporaryScreenshotTool() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let savedPasteboard = ObjectMenuEntries.pasteboardHasContent
+        ObjectMenuEntries.pasteboardHasContent = { false }
+        defer { ObjectMenuEntries.pasteboardHasContent = savedPasteboard }
+        // F037 supplies this descriptor in the app; exercise the host without importing another feature.
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.comment", title: "Add Comment", location: .pageLongPress, order: 600,
+            owner: "builtin", command: CommandIDs.commentAdd,
+            params: { ObjectMenuEntries.pageParams($0, pointKey: "at") }))
+        var commentParams: JSONValue?
+        standIn(h, CommandIDs.commentAdd) { commentParams = $0 }
+        h.session.selectTool("lasso")
+        let ctx = PageMenus.context(app: h.app, session: h.session, doc: doc, page: page, point: Point(420, 700))
+        let entries = h.app.ui.menuItems(.pageLongPress, ctx)
+        let attachment = ObjectMenuAttachment()
+        let menu = attachment.uiMenu(entries.map { ObjectMenuEntry($0, context: ctx) }, context: ctx,
+                                     facts: nil, title: "", shortcuts: false)
+        XCTAssertTrue(menu.children.contains { $0.title == "Add Comment" && $0 is UIAction })
+        XCTAssertTrue(menu.children.contains { $0.title == "Take Screenshot" && $0 is UIAction })
+        let comment = try XCTUnwrap(entries.first { $0.command == CommandIDs.commentAdd })
+        try await h.run(comment.command, comment.params(ctx))
+        XCTAssertEqual(commentParams, ["page": "page:FIXTUREDOC01/FIXTUREPG001", "at": [420, 700]])
+        let screenshot = try XCTUnwrap(entries.first { $0.id == ObjectMenuIDs.pageScreenshot })
+        try await h.run(screenshot.command, screenshot.params(ctx))
+        XCTAssertEqual(h.session.tool, ObjectMenuIDs.screenshotTool)
+        XCTAssertEqual(h.session.temporaryReturnTool, "lasso")
+        XCTAssertEqual(h.undoDepth(doc), 0)
+    }
+
+    func testPageMenuWithoutAnActiveContactPresentsImmediately() {
+        let probe = InputProbe(target: nil, action: nil)
+        var presented = false
+        probe.presentWhenIdle { presented = true }
+        XCTAssertTrue(presented, "Command callers without a held touch must not wait for a touch reset")
+    }
+
+    func testShowAtRetainsPageActionsThroughTheHeldContact() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let savedPasteboard = ObjectMenuEntries.pasteboardHasContent
+        ObjectMenuEntries.pasteboardHasContent = { false }
+        defer { ObjectMenuEntries.pasteboardHasContent = savedPasteboard }
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.comment", title: "Add Comment", location: .pageLongPress, order: 600,
+            owner: "builtin", command: CommandIDs.commentAdd))
+        let host = FakeCanvasHost(h)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.addSubview(host.canvasView)
+        window.isHidden = false
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer {
+            attachment.detach(from: host)
+            window.isHidden = true
+        }
+        let probe = try XCTUnwrap(host.canvasView.gestureRecognizers?.compactMap { $0 as? InputProbe }.first)
+        let interaction = try XCTUnwrap(host.canvasView.interactions.compactMap { $0 as? UIEditMenuInteraction }.first)
+        let touch = MenuTouch(), event = UIEvent()
+        probe.touchesBegan([touch], with: event)
+        let out = try await h.run(CommandIDs.menuShowAt, [
+            "page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [420, 700], "gesture": "longPress"
+        ])
+        XCTAssertEqual(out["handled"], true)
+        XCTAssertEqual(out["items"], ["Add Comment", "Take Screenshot"])
+        let configuration = UIEditMenuConfiguration(identifier: nil, sourcePoint: CGPoint(x: 420, y: 700))
+        func menu() -> UIMenu? {
+            attachment.editMenuInteraction(interaction, menuFor: configuration, suggestedActions: [])
+        }
+        XCTAssertNil(menu(), "The hold handler must not race UIKit's native context-menu gesture")
+        probe.touchesEnded([touch], with: event)
+        probe.reset()
+        try await waitUntil({ menu() != nil })
+        XCTAssertEqual(menu()?.children.map { $0.title }, ["Add Comment", "Take Screenshot"])
+        XCTAssertEqual(attachment.editMenuInteraction(interaction, targetRectFor: configuration).origin,
+                       host.viewPoint(Point(420, 700), page: page))
+    }
 
     func testShowAtWithoutAWindowReportsTheEntries() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])

@@ -128,6 +128,83 @@ final class FeatToolbarTests: XCTestCase {
         ToolbarEntry(id: id, title: id, group: group, toolID: id, command: nil, hideable: hideable, isPlugin: plugin)
     }
 
+    /// Pencil defaults to More. Retained pen settings must release input when More opens, and selecting
+    /// its pencil item must target this window and dismiss the overflow without changing document content.
+    func testPencilInMoreAfterPenSettingsRemainsInteractiveAndSelectsItsWindow() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.settings = { _ in AnyView(Text("Pen settings").frame(height: 700)) }
+        h.app.ui.toolbar.register(pen)
+        h.app.ui.toolbar.register(ToolbarItemDescriptor(
+            id: "pencil.item", title: "Pencil", icon: "pencil", group: .tools, order: 11,
+            owner: TestToolsFeature.id, toolID: "pencil", settings: { _ in AnyView(Text("Pencil settings")) }))
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: "pencil", title: "Pencil", owner: TestToolsFeature.id) {
+            TestTool(id: "pencil", isSticky: true)
+        })
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let pencil = try XCTUnwrap(model.more.first { $0.id == "pencil" })
+        XCTAssertEqual(pencil.accessibilityID, "tool.pencil")
+        XCTAssertTrue(pencil.isEnabled)
+        XCTAssertFalse(model.shown.contains { $0.id == "pencil" }, "Keep the six-tool default palette")
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+
+        let host = UIHostingController(rootView:
+            NibDropletContainer {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+            })
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+
+        func panels() -> [UIScrollView] {
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        model.openSettings()
+        try await waitUntil("Pen settings is interactive") {
+            host.view.layoutIfNeeded()
+            return panels().contains { $0.isUserInteractionEnabled && $0.bounds.height > 400 }
+        }
+        // A settings edit/ink commit refreshes the retained panels before the next tool switch.
+        try await h.run(TestTouch.descriptor.id)
+        model.refresh()
+        let before = try h.app.workspace.content(Fixtures.docID)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        model.moreOpen = true
+        XCTAssertFalse(model.settingsOpen, "More must close settings synchronously, before animation/mirroring")
+        try await waitUntil("Only More accepts input") {
+            host.view.layoutIfNeeded()
+            let visible = panels().filter { $0.isUserInteractionEnabled }
+            return visible.count == 1 && visible[0].bounds.height < 400
+        }
+        let more = try XCTUnwrap(panels().first { $0.isUserInteractionEnabled })
+        XCTAssertFalse(more.accessibilityElementsHidden)
+        XCTAssertNotNil(more.hitTest(CGPoint(x: more.bounds.midX, y: more.bounds.midY), with: nil))
+        for closed in panels() where closed !== more {
+            XCTAssertTrue(closed.accessibilityElementsHidden)
+            XCTAssertNil(closed.hitTest(CGPoint(x: closed.bounds.midX, y: closed.bounds.midY), with: nil))
+        }
+
+        model.select(pencil.id)
+        try await waitUntil("Pencil is selected through the command") { h.session.tool == "pencil" }
+        XCTAssertEqual(model.tool, "pencil")
+        XCTAssertFalse(model.moreOpen)
+        XCTAssertFalse(model.settingsOpen)
+        XCTAssertEqual(other.tool, "pen")
+        XCTAssertNotNil(model.settingsView(for: "pencil"))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), before)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), items)
+
+        model.moreOpen = true
+        model.settingsOpen = true
+        XCTAssertFalse(model.moreOpen, "Opening settings must also close More")
+    }
+
     /// Closed settings and More remain mounted for their bud animations. Their native scroll views must
     /// release touches, including after ink/commit refreshes, so a visible Lasso button can receive its tap.
     func testPaletteClosedPopoversReleaseHitTargetsAfterDrawingAndSettingsDismissal() async throws {

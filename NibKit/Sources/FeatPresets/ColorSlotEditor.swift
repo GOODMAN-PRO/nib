@@ -256,12 +256,12 @@ enum TapePatternCache {
 /// Presents `UIColorPickerViewController` (grid, spectrum, sliders with hex, and the system eyedropper) and reports
 /// the chosen colour. A slot changes with every settled choice; a new slot is added once, when the picker closes.
 @MainActor
-final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
-    private static var active: SystemColourPicker?
+final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
     private let commitsOnFinishOnly: Bool
     private let onPick: @MainActor (RGBA) -> Void
     private var latest: RGBA?
     private var committed: RGBA?
+    private var finished = false
 
     init(initial: RGBA, commitsOnFinishOnly: Bool, onPick: @escaping @MainActor (RGBA) -> Void) {
         self.committed = initial
@@ -272,29 +272,44 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
 
     static func present(title: String, initial: RGBA, supportsAlpha: Bool, commitsOnFinishOnly: Bool, app: NibApp,
                         session: EditorSession, onPick: @escaping @MainActor (RGBA) -> Void) {
-        let picker = UIColorPickerViewController()
+        let picker = PresetColourPickerController()
         picker.title = title
         picker.supportsAlpha = supportsAlpha
         picker.selectedColor = PresetColour.uiColor(initial)
         let coordinator = SystemColourPicker(initial: initial, commitsOnFinishOnly: commitsOnFinishOnly, onPick: onPick)
         picker.delegate = coordinator
-        active = coordinator
+        // UIKit's delegate is weak. Its own controller, not a process-global slot, keeps
+        // it alive so opening a picker in another window cannot detach this one.
+        picker.colourCoordinator = coordinator
         picker.modalPresentationStyle = .formSheet
+        picker.presentationController?.delegate = coordinator
         if let sheet = picker.sheetPresentationController {
             sheet.detents = [.medium(), .large()]
+            sheet.selectedDetentIdentifier = .large
             sheet.prefersGrabberVisible = true
         }
         PresetPresenter.present(picker, app: app, session: session)
     }
 
     func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor, continuously: Bool) {
+        guard !finished else { return }
         latest = PresetColour.rgba(color)
         if !continuously && !commitsOnFinishOnly { commitLatest() }
     }
 
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+        // UIKit dismisses its Close button presentation before this callback.
+        finish()
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finish()
+    }
+
+    private func finish() {
+        guard !finished else { return }
+        finished = true
         commitLatest()
-        if Self.active === self { Self.active = nil }
     }
 
     private func commitLatest() {
@@ -302,6 +317,11 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
         committed = c
         onPick(c)
     }
+}
+
+/// Owns the weak native delegates for exactly the lifetime of this window's picker.
+private final class PresetColourPickerController: UIColorPickerViewController {
+    var colourCoordinator: SystemColourPicker?
 }
 
 /// Presents system view controllers from the window the tool menu lives in (never another window's navigator: two

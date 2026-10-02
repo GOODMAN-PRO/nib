@@ -148,7 +148,8 @@ final class SelectionOverlayView: UIView {
     override var accessibilityFrame: CGRect {
         get {
             guard let content else { return .zero }
-            return UIAccessibility.convertToScreenCoordinates(content.box, in: self)
+            guard let window else { return convert(content.box, to: nil) }
+            return window.convert(convert(content.box, to: window), to: window.screen.coordinateSpace)
         }
         set { super.accessibilityFrame = newValue }
     }

@@ -1,7 +1,9 @@
 import XCTest
 import UIKit
 import Combine
+import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatEraser
 
@@ -568,6 +570,176 @@ final class FeatEraserTests: XCTestCase {
     }
 
     // MARK: Settings model (popover and options bar)
+
+    func testEraserPopoverReopensAndClosedSettingsReleasePresetAndCanvasTouches() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let settings = try XCTUnwrap(h.app.ui.toolbar.get("eraser")?.settings?(h.session))
+        func root(presented: Bool) -> some View {
+            NibDropletContainer {
+                NibBudPopover(id: "test.eraser.settings", source: "test.eraser",
+                              isPresented: .constant(presented), title: "Eraser") { settings }
+            }
+        }
+        let host = UIHostingController(rootView: root(presented: false))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        func scrollViews(_ view: UIView) -> [UIScrollView] {
+            (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews)
+        }
+        for presented in [false, true, false, true, false] {
+            host.rootView = root(presented: presented)
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                host.view.layoutIfNeeded()
+                let panels = scrollViews(host.view)
+                if !panels.isEmpty && panels.allSatisfy({ $0.isUserInteractionEnabled == presented
+                    && $0.accessibilityElementsHidden == !presented }) { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            let panels = scrollViews(host.view)
+            XCTAssertFalse(panels.isEmpty)
+            for panel in panels {
+                XCTAssertEqual(panel.isUserInteractionEnabled, presented, "reopened mode/filter controls accept touches")
+                XCTAssertEqual(panel.accessibilityElementsHidden, !presented)
+                if !presented {
+                    XCTAssertNil(panel.hitTest(CGPoint(x: panel.bounds.midX, y: panel.bounds.midY), with: nil),
+                                 "the closed popover must not intercept size presets or filtered erase gestures")
+                }
+            }
+        }
+    }
+
+    func testReloadPreservesUnacknowledgedModeFilterAndSizeChoices() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let model = EraserOptions(app: h.app)
+        let bar = EraserOptions(app: h.app)
+        model.mode = .stroke
+        model.only(.pencil)
+        model.selectSize(28)
+        // A notification for another eraser setting can reload the model before settings.set runs.
+        model.reload()
+        XCTAssertEqual(model.mode, .stroke)
+        XCTAssertEqual(model.filter, [.pencil])
+        XCTAssertEqual(model.size, 28)
+
+        // A second choice must win over both an old command completion and a queued store notification.
+        model.only(.tape)
+        model.selectSize(6)
+        model.reload()
+        XCTAssertEqual(model.filter, [.tape])
+        XCTAssertEqual(model.size, 6)
+        await model.pendingSettingsWrite?.value
+        await eventually { bar.mode == .stroke && bar.filter == [.tape] && bar.size == 6 }
+        XCTAssertEqual(EraserSettings.mode(h.app.settings), .stroke)
+        XCTAssertEqual(EraserSettings.filter(h.app.settings), [.tape])
+        XCTAssertEqual(EraserSettings.size(h.app.settings), 6)
+        XCTAssertEqual(bar.mode, .stroke)
+        XCTAssertEqual(bar.filter, [.tape])
+        XCTAssertEqual(bar.size, 6)
+    }
+
+    func testFinishedSizeChoiceFlushesSliderAndCannotBeOverwrittenByItsDebounce() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let model = EraserOptions(app: h.app)
+        model.size = 52
+        model.selectSize(6)
+        await model.pendingSettingsWrite?.value
+        XCTAssertEqual(EraserSettings.size(h.app.settings), 6, "preset commits without waiting for the slider timer")
+        await settle()
+        XCTAssertEqual(EraserSettings.size(h.app.settings), 6, "a cancelled slider write cannot replace the preset")
+        model.size = 54
+        model.flushSizeWrite() // Removing the settings view finishes the drag.
+        await model.pendingSettingsWrite?.value
+        XCTAssertEqual(EraserSettings.size(h.app.settings), 54)
+    }
+
+    func testFilterChoicesReachCanvasAndEachWholeStrokeEraseUndoesIndependently() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let originals = InkTool.allCases.enumerated().map { index, ink in
+            line("INK\(index)", y: Float(10 + index * 20), tool: ink, z: "V\(index)")
+        }
+        seedPage2(h, originals + [line("UNTOUCHED", y: 150, z: "W")])
+        h.session.page = Fixtures.page2
+        h.session.tool = "eraser"
+        let host = FakeCanvasHost(h), tool = EraserTool()
+        tool.activate(host)
+        let model = EraserOptions(app: h.app)
+        model.mode = .stroke
+        for (index, ink) in InkTool.allCases.enumerated() {
+            if !model.filter.contains(ink) { model.toggle(ink) }
+            for other in InkTool.allCases where other != ink && model.filter.contains(other) { model.toggle(other) }
+            model.reload()
+            XCTAssertEqual(model.filter, [ink])
+            await model.pendingSettingsWrite?.value
+            let before = try h.snapshot()
+            tool.touchesBegan(CanvasSample(page: Fixtures.page2, location: Point(50, 0)), host: host)
+            tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: Point(50, 90)), host: host)
+            await tool.pendingCommit?.value
+            XCTAssertEqual(Set(try items(h, Fixtures.page2).map(\.id)),
+                           Set((originals + [line("UNTOUCHED", y: 150, z: "W")]).map(\.id)).subtracting([NibID("INK\(index)")]),
+                           "only the enabled \(ink.rawValue) stroke is removed")
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
+    }
+
+    func testSizeChoicesChangeCanvasCutDiameterAtZoomAndUndoRestoresOriginal() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        seedPage2(h, [line("SIZE", y: 50)])
+        h.session.page = Fixtures.page2
+        h.session.tool = "eraser"
+        let host = FakeCanvasHost(h), tool = EraserTool()
+        host.zoomScale = 2
+        tool.activate(host)
+        let model = EraserOptions(app: h.app)
+        model.mode = .precision
+        var previousGap = 0.0
+        for size in EraserSettings.presets + [54] {
+            model.selectSize(size)
+            await model.pendingSettingsWrite?.value
+            let before = try h.snapshot()
+            tool.tap(CanvasSample(page: Fixtures.page2, location: Point(50, 50)), host: host)
+            await tool.pendingCommit?.value
+            let pieces = try items(h, Fixtures.page2).compactMap(\.stroke).sorted { $0.points[0].x < $1.points[0].x }
+            XCTAssertEqual(pieces.count, 2)
+            let left = try XCTUnwrap(pieces.first?.points.last)
+            let right = try XCTUnwrap(pieces.last?.points.first)
+            let gap = Double(right.x - left.x)
+            XCTAssertGreaterThan(gap, previousGap)
+            XCTAssertEqual(gap, size / host.zoomScale + 2, accuracy: 0.1, "screen diameter plus the ink nib")
+            previousGap = gap
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
+    }
+
+    func testDeleteSheetHandwritingChoiceRespectsScopeAndUndoRestoresAllPages() async throws {
+        for scope in DeleteItemsScope.allCases {
+            let h = Harness(features: [FeatEraserFeature.self])
+            seedPage2(h, [line("OTHERPEN", y: 10), line("OTHERPENCIL", y: 30, tool: .pencil, z: "W"),
+                          line("OTHERHIGHLIGHT", y: 50, tool: .highlighter, z: "X")])
+            let first = try items(h), second = try items(h, Fixtures.page2)
+            let before = try h.snapshot()
+            var groups: Set<DeleteItemsGroup> = []
+            groups[member: .handwriting] = true
+            let params = try XCTUnwrap(DeleteItemsGroup.params(doc: h.session.document, page: h.session.page,
+                                                               groups: groups, scope: scope))
+            let count = DeleteItemsSheet.count(params, app: h.app, session: h.session)
+            let result = try await h.run(CommandIDs.pageDeleteItems, params)
+            XCTAssertEqual(result["removed"]?.intValue, count)
+            func keeps(_ item: Item) -> Bool { item.stroke?.style.tool != .pen && item.stroke?.style.tool != .pencil }
+            XCTAssertEqual(try items(h), first.filter(keeps))
+            XCTAssertEqual(try items(h, Fixtures.page2), scope == .page ? second : second.filter(keeps))
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
+    }
 
     func testEraserOptionsWriteThroughSettingsKeepOneFilterOnAndNeverWriteBack() async throws {
         let h = Harness(features: [FeatEraserFeature.self])

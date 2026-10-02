@@ -156,6 +156,10 @@ private final class InputSurfaceContainer: UIView {
 /// Gate before PencilKit's private drawing recogniser sees a contact. Its delegate remains PencilKit-owned.
 @MainActor
 private final class InputInkCanvas: PKCanvasView {
+    // PencilKit holds only the transient wet drawing. The document command records the
+    // stroke once; native drawing/retirement must not add a second step to the window.
+    override var undoManager: UndoManager? { nil }
+
     var acceptsContact: ((CGPoint, UIEvent?) -> Bool)?
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard acceptsContact?(point, event) != false else { return nil }

@@ -64,7 +64,7 @@ public struct ToolPresets: Codable, Equatable {
         switch tool {
         case "highlighter":
             return ToolPresets(swatches: [PresetSwatch(color: RGBA(0xFF, 0xE0, 0x3D, 0x80)), PresetSwatch(color: RGBA(0x7C, 0xE3, 0x8B, 0x80)),
-                                          PresetSwatch(color: RGBA(0xFF, 0x8F, 0xB1, 0x80))], widths: [8, 12, 18])
+                                          PresetSwatch(color: RGBA(0xFF, 0x8F, 0xB1, 0x80))], widths: [8, 14, 20])
         case "tape":
             return ToolPresets(swatches: [PresetSwatch(color: RGBA(0xF4, 0xC4, 0x30)), PresetSwatch(color: RGBA(0x8E, 0xC5, 0xFF)),
                                           PresetSwatch(color: RGBA(0xFF, 0xA8, 0xA8))], widths: [12, 18, 26])

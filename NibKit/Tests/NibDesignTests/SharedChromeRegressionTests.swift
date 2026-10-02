@@ -8,6 +8,62 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testRetainedPopoverStopsNativeScrollingAndHitTestingAcrossRelayouts() async throws {
+        func panel(_ presented: Bool, width: CGFloat) -> some View {
+            NibPopoverPanel(title: "Apple Pencil", width: width, maxHeight: 220) {
+                ForEach(0..<24) { index in
+                    Button("Preference \(index)") {}
+                        .frame(minHeight: NibMetrics.hitTarget)
+                }
+            }
+            .budsFrom("settings", isPresented: .constant(presented))
+        }
+        let host = UIHostingController(rootView: panel(true, width: 312))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 760, height: 706))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scroll(in view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { scroll(in: $0) }.first
+        }
+        func settle() async throws {
+            for _ in 0..<5 {
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        try await settle()
+        let original = try XCTUnwrap(scroll(in: host.view))
+        XCTAssertGreaterThan(original.contentSize.height, original.bounds.height)
+        original.setContentOffset(CGPoint(x: 0, y: 180), animated: false)
+
+        // Closing, relayout while closed, then reopening must retain the content and
+        // scroll position, but never leave an invisible native input surface on top.
+        for (presented, width) in [(false, CGFloat(312)), (false, 280), (true, 280)] {
+            host.rootView = panel(presented, width: width)
+            try await settle()
+            let current = try XCTUnwrap(scroll(in: host.view))
+            XCTAssertTrue(current === original, "Keep the user's position in a long preferences panel")
+            XCTAssertEqual(current.isScrollEnabled, presented)
+            XCTAssertEqual(current.isUserInteractionEnabled, presented)
+            XCTAssertEqual(current.accessibilityElementsHidden, !presented)
+            if !presented {
+                XCTAssertNil(current.hitTest(CGPoint(x: current.bounds.midX, y: current.bounds.midY), with: nil),
+                             "A closed popover must not consume the next navigation or preset tap")
+                // Reproduce UIKit refreshing the retained host after the probe disabled it.
+                // SwiftUI's source-level gate must still protect the controls underneath.
+                current.isUserInteractionEnabled = true
+                let point = current.convert(CGPoint(x: current.bounds.midX, y: current.bounds.midY), to: host.view)
+                let hit = host.view.hitTest(point, with: nil)
+                XCTAssertFalse(hit?.isDescendant(of: current) == true,
+                               "A native host refresh must not resurrect a closed menu's hit target")
+                current.isUserInteractionEnabled = false
+            }
+            XCTAssertEqual(current.contentOffset.y, 180, accuracy: 1)
+        }
+    }
+
     func testPlannerFormAdaptsToAConstrainedViewportWithoutLosingDateAndWeekControls() async throws {
         // A keyboard, landscape phone or resized iPad window supplies a finite height,
         // unlike the ideal-size query below. The default must not force a 640 pt form

@@ -201,6 +201,50 @@ final class FeatUndoUITests: XCTestCase {
         }
     }
 
+    func testSingleInkUndoLeavesCleanDocumentHistory() async throws {
+        let h = harness()
+        let undo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
+        let redo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.redo)))
+        let before = try h.snapshot()
+        let stroke = Stroke(style: .defaultPen, points: [
+            StrokePoint(x: 140, y: 220, width: 2, height: 2),
+            StrokePoint(x: 240, y: 220, t: 0.2, width: 2, height: 2)
+        ])
+        _ = try await h.insert([Item(kind: .stroke, stroke: stroke)])
+        XCTAssertEqual(undo.isEnabled?(h.session), true)
+        _ = try await h.app.bus.execute(CommandIDs.undo, undo.resolvedParams(for: h.session), session: h.session)
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(undo.isEnabled?(h.session), false)
+        XCTAssertEqual(redo.isEnabled?(h.session), true)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testHistoryRevertKeepsLaterStrokeGeometryAndCanBeUndone() async throws {
+        let h = harness()
+        func add(y: Float) async throws -> Item {
+            let stroke = Stroke(style: .defaultPen, points: [
+                StrokePoint(x: 140, y: y, width: 2, height: 2),
+                StrokePoint(x: 240, y: y, t: 0.2, width: 2, height: 2)
+            ])
+            let items = try await h.insert([Item(kind: .stroke, stroke: stroke)])
+            return try XCTUnwrap(items.first)
+        }
+        let earlier = try await add(y: 220)
+        let later = try await add(y: 320)
+        let model = HistoryViewModel(app: h.app, session: h.session)
+        await model.show(doc: Fixtures.docID)
+        XCTAssertEqual(model.rows.count, 2)
+        await model.revert(try XCTUnwrap(model.rows.last))
+        XCTAssertEqual(model.receipt, .reverted(count: 1, kept: 0))
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        XCTAssertFalse(items.contains { $0.id == earlier.id && !$0.deleted })
+        XCTAssertEqual(items.first { $0.id == later.id }, later)
+        _ = try await h.run(CommandIDs.undo)
+        let restored = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        XCTAssertEqual(restored.first { $0.id == earlier.id }?.stroke, earlier.stroke)
+        XCTAssertEqual(restored.first { $0.id == later.id }, later)
+    }
+
     /// A retained closed popover must not consume the next tap on Undo. This exercises UIKit's actual
     /// scroll hit target, which can survive SwiftUI hiding the popover's contents.
     func testClosedPopoverLeavesUndoHitTargetAccessible() async throws {
@@ -239,11 +283,12 @@ final class FeatUndoUITests: XCTestCase {
                            "Closing the menu must return the centre tap to Undo")
             XCTAssertEqual(scroll.isUserInteractionEnabled, presented)
             if !presented {
-                // Reproduce the original native-host state: the same point is swallowed even though
-                // the menu's presentation binding is false. Restore it before the next lifecycle step.
+                // UIKit may re-enable a retained native host during layout. A closed menu
+                // must still let Undo (and the History sidebar toggle) receive the tap.
                 scroll.isUserInteractionEnabled = true
                 let intercepted = try XCTUnwrap(host.view.hitTest(point, with: nil))
-                XCTAssertTrue(intercepted.isDescendant(of: scroll))
+                XCTAssertFalse(intercepted.isDescendant(of: scroll),
+                               "A native host refresh must not make a closed popover intercept commands")
                 scroll.isUserInteractionEnabled = false
             }
         }

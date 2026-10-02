@@ -6,6 +6,38 @@ import NibTesting
 import NibDesign
 @testable import FeatPresets
 
+@MainActor
+private final class PresetTestNavigator: SceneNavigator {
+    let session: EditorSession
+    var openDocuments: [DocumentID] { [] }
+    var activeDocument: DocumentID? { session.document }
+    var rootViewController: UIViewController? { nil }
+    var presented: [UIViewController] = []
+    var onPresent: ((UIViewController) -> Void)?
+
+    init(session: EditorSession) { self.session = session }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {
+        onPresent?(viewController)
+        presented.append(viewController)
+    }
+}
+
+/// Like the toolbar, re-read the feature's descriptor from a SwiftUI body. Constructing
+/// a descriptor once in the test would freeze the Binding's cached value in the root view.
+private struct PresetPopoverTestHost: View {
+    let model: PresetMenuModel
+
+    var body: some View {
+        let popover = model.makePopover()
+        NibPopoverPanel(title: popover.title) { popover.content }
+            .budsFrom(popover.source, isPresented: popover.isPresented, instant: true)
+    }
+}
+
 /// Paints `rect` (page points) in `colour` over white, for the requested region; `scaleFactor` makes it answer with a
 /// different scale than asked, the way a renderer that caps the long edge does.
 final class PaintedRenderer: PageRenderer {
@@ -657,6 +689,114 @@ final class FeatPresetsTests: XCTestCase {
         let failed = await PresetActions.run(h.app, session: h.session, unknown).value
         XCTAssertFalse(failed, "a failed command reports false")
         XCTAssertEqual(presets(h, "tape"), after)
+    }
+
+    func testColourChoiceReleasesNativePopoverAndKeepsSelectedInk() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.open(.colour(.slot(0)))
+        let host = UIHostingController(rootView: PresetPopoverTestHost(model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+
+        func scrollViews(_ view: UIView) -> [UIScrollView] {
+            (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews)
+        }
+        for _ in 0..<100 where scrollViews(host.view).isEmpty {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let scroll = try XCTUnwrap(scrollViews(host.view).first)
+        XCTAssertTrue(scroll.isUserInteractionEnabled, "the open editor accepts colour choices")
+        let original = presets(h, "pen")
+        let choice = try XCTUnwrap(model.pick(vermilion))
+        let succeeded = await choice.value
+        XCTAssertTrue(succeeded)
+        for _ in 0..<100 where scroll.isUserInteractionEnabled {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(model.popover)
+        XCTAssertFalse(scroll.isUserInteractionEnabled, "retained native popover content must release canvas input")
+        XCTAssertTrue(scroll.accessibilityElementsHidden)
+        XCTAssertFalse(scroll.isScrollEnabled, "layout must not reactivate the closed scroll host")
+        let changed = presets(h, "pen")
+        XCTAssertEqual(changed.color, vermilion, "the next stroke reads the edited selected slot")
+        XCTAssertEqual(changed.selectedSwatch, original.selectedSwatch)
+        XCTAssertEqual(changed.swatches.count, original.swatches.count)
+        XCTAssertEqual(changed.widths, original.widths)
+
+        model.open(.colour(.slot(1)))
+        for _ in 0..<100 where !scroll.isUserInteractionEnabled || !scroll.isScrollEnabled {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(scroll.isUserInteractionEnabled, "opening another slot restores its controls")
+        XCTAssertTrue(scroll.isScrollEnabled)
+    }
+
+    func testCustomPickerClosesPopoverBeforePresentationAndRetainsEachWindowDelegate() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.open(.colour(.slot(0)))
+        let initial = model.editedSwatch.color
+        navigator.onPresent = { _ in
+            XCTAssertNil(model.popover, "the popover must give up modal input before presenting UIKit")
+            XCTAssertFalse(model.makePopover().isPresented.wrappedValue)
+        }
+        model.openPicker()
+        let first = try XCTUnwrap(navigator.presented.last as? UIColorPickerViewController)
+        XCTAssertEqual(PresetColour.rgba(first.selectedColor), initial)
+        XCTAssertTrue(first.supportsAlpha)
+        XCTAssertEqual(first.sheetPresentationController?.selectedDetentIdentifier, .large)
+
+        // A second scene can show its picker while the first scene's remains open.
+        let otherSession = EditorSession()
+        h.app.services.sessions.add(otherSession)
+        let otherNavigator = PresetTestNavigator(session: otherSession)
+        h.app.ui.activeNavigator = otherNavigator
+        let other = PresetMenuModel(app: h.app, session: otherSession, tool: "highlighter")
+        other.open(.colour(.slot(0)))
+        other.openPicker()
+        let second = try XCTUnwrap(otherNavigator.presented.last as? UIColorPickerViewController)
+        XCTAssertFalse(second.supportsAlpha)
+        let firstDelegate = try XCTUnwrap(first.delegate as? SystemColourPicker,
+                                         "another window must not release the first picker's weak delegate")
+        XCTAssertFalse(first.delegate === second.delegate)
+        let custom = try XCTUnwrap(RGBA(hex: "#D03080"))
+        firstDelegate.colorPickerViewController(first, didSelect: PresetColour.uiColor(custom), continuously: false)
+        for _ in 0..<100 where presets(h, "pen").color != custom {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(presets(h, "pen").color, custom)
+        XCTAssertEqual(presets(h, "highlighter"), ToolPresets.defaults(for: "highlighter"))
+        await assertInvalid(h, "preset.setSwatch", ["tool": "pen", "index": 0, "color": "#ZZZZZZ"], path: "$.color")
+        XCTAssertEqual(presets(h, "pen").color, custom)
+    }
+
+    func testPickerCloseAndSwipeCommitOnlyOnce() {
+        let picker = UIColorPickerViewController()
+        let presentation = UIPresentationController(presentedViewController: picker, presenting: nil)
+        var picks: [RGBA] = []
+        let coordinator = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        coordinator.colorPickerViewController(picker, didSelect: PresetColour.uiColor(vermilion), continuously: true)
+        coordinator.presentationControllerDidDismiss(presentation)
+        XCTAssertEqual(picks, [vermilion], "a swipe must not lose the new colour")
+        coordinator.colorPickerViewControllerDidFinish(picker)
+        coordinator.colorPickerViewController(picker, didSelect: .blue, continuously: false)
+        coordinator.presentationControllerDidDismiss(presentation)
+        XCTAssertEqual(picks, [vermilion], "late delegate callbacks cannot add a second swatch")
+
+        let closed = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        closed.colorPickerViewController(picker, didSelect: PresetColour.uiColor(vermilion), continuously: true)
+        closed.colorPickerViewControllerDidFinish(picker)
+        closed.presentationControllerDidDismiss(presentation)
+        XCTAssertEqual(picks, [vermilion, vermilion], "Close followed by presentation dismissal also commits once")
     }
 
     /// A slot commits every settled choice; a new slot commits once, when the picker closes; an unchanged colour never.
