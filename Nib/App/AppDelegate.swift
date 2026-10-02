@@ -11,6 +11,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         if !NibUITestMode.isEnabled { SafeMode.beginLaunch() }
+        do { try NibUITestMode.prepareStorage() }
+        catch { UITestFixture.failure = "Could not prepare fixture storage: \(error)" }
         let app = NibApp(defaults: UITestFixture.defaults())
         app.gateway.presenter = AppDelegate.confirmer
         let disabled = NibUITestMode.isEnabled ? Set<String>() : SafeMode.disabledFeatures
@@ -20,6 +22,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         DesignGallery.registerSettingsPage(in: app)   // Settings › Advanced › Developer (NibDesign is not a feature)
         registerBackgroundTasks(app)   // must run before this method returns
         Task { @MainActor in
+            guard UITestFixture.failure == nil else { return }
             await app.start(features)
             if NibUITestMode.isEnabled {
                 do {

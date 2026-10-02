@@ -718,6 +718,47 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testDocumentCoversRemainHittableAcrossLibraryRotation() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        let host = UIHostingController(rootView: LibraryRootView(model: model, idiom: .pad)
+            .environment(\.scenePhase, .active))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1032, height: 1376))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func descendants(_ view: UIView) -> [UIView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        for mode in [NibLiquidMode.full, .off] {
+            model.liquidMode = mode
+            for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+                window.frame = CGRect(origin: .zero, size: size)
+                host.view.frame = window.bounds
+                for _ in 0..<30 {
+                    host.view.setNeedsLayout(); host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let probes = descendants(host.view).compactMap { $0 as? NibReflowTouchTarget<String>.Probe }
+                XCTAssertFalse(probes.isEmpty)
+                var checked = 0
+                for probe in probes {
+                    let point = probe.convert(CGPoint(x: probe.bounds.midX, y: probe.bounds.midY), to: host.view)
+                    guard host.view.bounds.contains(point) else { continue }
+                    var ancestor = probe.superview
+                    while let view = ancestor, !(view is UIScrollView) { ancestor = view.superview }
+                    let scroll = try XCTUnwrap(ancestor as? UIScrollView)
+                    let hit = host.view.hitTest(point, with: nil)
+                    XCTAssertTrue(hit === scroll || hit?.isDescendant(of: scroll) == true,
+                                  "Library cover at \(point) intercepted by \(String(describing: hit)) in \(mode), \(size)")
+                    XCTAssertTrue(scroll.isUserInteractionEnabled)
+                    checked += 1
+                }
+                XCTAssertGreaterThan(checked, 0)
+            }
+        }
+    }
+
     func testLibraryRootChromeSnapshots() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)

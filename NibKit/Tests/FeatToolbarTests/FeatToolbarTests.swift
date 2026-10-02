@@ -141,7 +141,7 @@ final class FeatToolbarTests: XCTestCase {
         let host = UIHostingController(rootView:
             NibDropletContainer(inking: inking) {
                 ToolbarRootView(model: model, size: size, compact: false)
-            }.environment(\.accessibilityReduceMotion, true))
+            })
         host.safeAreaRegions = []
         let window = UIWindow(frame: CGRect(origin: .zero, size: size))
         window.rootViewController = host

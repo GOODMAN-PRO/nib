@@ -93,33 +93,50 @@ final class NibUI {
     func launchFixture(scenario: FixtureScenario = .standard) throws {
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
-        XCUIDevice.shared.orientation = .portrait
         app.launch()
         _ = try waitForState { $0.screen == "library" }
-        // Rotate the launched scene, so SwiftUI publishes its populated landscape accessibility layout.
-        XCUIDevice.shared.orientation = .landscapeLeft
+        // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
+        // resets add an unrelated orientation-confirmation race before Nib even launches.
+        if XCUIDevice.shared.orientation != .landscapeLeft { XCUIDevice.shared.orientation = .landscapeLeft }
+        let landscape = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            app.frame.width > app.frame.height
+        }, object: nil)
+        guard XCTWaiter.wait(for: [landscape], timeout: 15) == .completed else {
+            throw Failure.message("Nib's launched scene did not reach landscape")
+        }
+        _ = try waitForState { $0.screen == "library" }
     }
 
     func state() throws -> QAState {
-        let value = try XCTUnwrap(probe.value as? String, "Missing nib.qa.state; launch with -NibUITestFixture")
-        let state = try JSONDecoder().decode(QAState.self, from: Data(value.utf8))
-        if let error = state.fixtureError { throw Failure.message("Fixture failed: \(error)") }
+        if let state = try readState() { return state }
+        return try waitForState(timeout: 10) { _ in true }
+    }
+
+    private func readState() throws -> QAState? {
+        guard probe.exists,
+              let state = try NibUITestSnapshot.decode(probe.value, as: QAState.self) else { return nil }
+        if let failure = state.fixtureError { throw Failure.message("Fixture failed: \(failure)") }
         return state
     }
 
     @discardableResult
     func waitForState(timeout: TimeInterval = 30, _ matches: @escaping (QAState) -> Bool) throws -> QAState {
-        guard probe.waitForExistence(timeout: timeout) else { throw Failure.message("QA probe missing\n\(app.debugDescription)") }
         var latest: QAState?
         var error: Error?
         let predicate = NSPredicate { [self] _, _ in
-            do { latest = try state(); return matches(latest!) }
+            do {
+                // Do not assert inside the polling loop: XCTest can omit an element/value for one snapshot even
+                // after waitForExistence succeeded. Decode only fresh values and keep the original deadline.
+                guard let state = try readState() else { return false }
+                latest = state
+                return matches(state)
+            }
             catch let caught { error = caught; return true }
         }
         let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: nil)], timeout: timeout)
         if let error { throw error }
         guard result == .completed, let latest else {
-            throw Failure.message("State did not converge: \(String(describing: probe.value))\n\(app.debugDescription)")
+            throw Failure.message("State did not converge (missing or unmatched nib.qa.state): \(String(describing: latest))\n\(app.debugDescription)")
         }
         return latest
     }

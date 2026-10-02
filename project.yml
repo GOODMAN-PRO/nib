@@ -157,8 +157,9 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: NibUITests
-      # Compile the pure gesture geometry in both the runner and NibContractsTests.
+      # Compile pure UI-test helpers in both the runner and NibContractsTests.
       - path: NibKit/Sources/NibContracts/UI/NibUITestScrollGeometry.swift
+      - path: NibKit/Sources/NibContracts/UI/NibUITestSnapshot.swift
     dependencies:
       - target: Nib
     settings:

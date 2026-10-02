@@ -8,6 +8,45 @@ public enum NibUITestMode {
     public static let rootURL: URL? = isEnabled
         ? FileManager.default.temporaryDirectory.appendingPathComponent("NibUITests-" + UUID().uuidString, isDirectory: true)
         : nil
+
+    /// Called before features open their stores. Each simulator/app installation has its own temporary container;
+    /// a terminated fixture process cannot clean up after itself, so the next launch reclaims its packages.
+    public static func prepareStorage() throws {
+        guard let rootURL else { return }
+        try NibUITestStorage.prepare(root: rootURL, in: FileManager.default.temporaryDirectory)
+    }
+}
+
+public enum NibUITestStorage {
+    /// Only direct, UUID-named fixture directories belong to us. Never traverse symlinks or clean another app's
+    /// container, production library, result bundles, or unrelated temporary files. Errors remain real failures.
+    public static func prepare(root: URL, in temporaryDirectory: URL) throws {
+        let fm = FileManager.default
+        let parent = temporaryDirectory.standardizedFileURL
+        let current = root.standardizedFileURL
+        func isFixtureName(_ name: String) -> Bool {
+            let prefix = "NibUITests-"
+            return name.hasPrefix(prefix) && UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+        }
+        guard current.deletingLastPathComponent() == parent, isFixtureName(current.lastPathComponent) else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
+        var currentExists = false
+        for entry in try fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: Array(keys)) {
+            guard isFixtureName(entry.lastPathComponent) else { continue }
+            let values = try entry.resourceValues(forKeys: keys)
+            if entry.standardizedFileURL == current {
+                guard values.isDirectory == true, values.isSymbolicLink != true else {
+                    throw CocoaError(.fileWriteFileExists)
+                }
+                currentExists = true
+            } else if values.isDirectory == true && values.isSymbolicLink != true {
+                try fm.removeItem(at: entry)
+            }
+        }
+        if !currentExists { try fm.createDirectory(at: current, withIntermediateDirectories: false) }
+    }
 }
 
 /// Extra prerequisites are explicit so ordinary canvas tests retain their four-page notebook and one board.
