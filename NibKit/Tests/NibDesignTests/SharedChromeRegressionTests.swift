@@ -26,7 +26,9 @@ final class SharedChromeRegressionTests: XCTestCase {
             }
             for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
             let scroll = try XCTUnwrap(list(in: host.view))
-            let frame = scroll.convert(scroll.bounds, to: host.view)
+            // SwiftUI List may extend its native scroll view under the header and
+            // reserve that space with adjustedContentInset instead of its frame.
+            let frame = scroll.convert(scroll.bounds.inset(by: scroll.adjustedContentInset), to: host.view)
             XCTAssertGreaterThan(frame.height, 200, "Planner controls need more than a single-row viewport")
             XCTAssertGreaterThanOrEqual(frame.minY, 60, "Scrolling content must clear the sheet header")
             XCTAssertLessThanOrEqual(frame.maxY, size.height + 1)
@@ -58,8 +60,13 @@ final class SharedChromeRegressionTests: XCTestCase {
         let scroll = try XCTUnwrap(list(in: host.view))
         XCTAssertNil(scroll.hitTest(CGPoint(x: scroll.bounds.midX, y: scroll.bounds.midY), with: nil),
                      "A closed menu must not claim the text editor's touch")
-        let input = UITextView(frame: CGRect(x: 20, y: 300, width: 400, height: 80))
-        host.view.addSubview(input)
+        let parent = try XCTUnwrap(scroll.superview)
+        let input = UITextView(frame: scroll.frame)
+        parent.insertSubview(input, belowSubview: scroll)
+        let point = CGPoint(x: input.frame.midX, y: input.frame.midY)
+        let hit = try XCTUnwrap(parent.hitTest(point, with: nil))
+        XCTAssertTrue(hit === input || hit.isDescendant(of: input),
+                      "The input behind the retained popover must receive the tap")
         XCTAssertTrue(input.becomeFirstResponder())
         input.insertText("First block title")
         XCTAssertTrue(input.isFirstResponder)
@@ -72,6 +79,9 @@ final class SharedChromeRegressionTests: XCTestCase {
         let content = SheetViewportFixture().modifier(NibSheetChrome())
             .fixedSize(horizontal: false, vertical: true)
         let host = UIHostingController(rootView: content)
+        // This is a form-content measurement, not a full-screen hosting controller.
+        // A hostless UIWindow's status/home safe areas are not part of the 640 pt form.
+        host.safeAreaRegions = []
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 1366))
         window.rootViewController = host
         window.isHidden = false

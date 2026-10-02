@@ -406,6 +406,59 @@ final class FeatTemplateUITests: XCTestCase {
         }
     }
 
+    func testTemplateGridReservesSpaceForEveryCoverAtNarrowSheetWidths() {
+        // A 600 pt sheet leaves only 324 pt beside the sidebar. Four 88 pt covers
+        // used to overlap, making Carbon unreachable even after scrolling.
+        let layout = TemplateBrowserLayout(width: 600, compactSizeClass: false,
+            accessibilitySize: false, cover: true)
+        XCTAssertFalse(layout.compact)
+        XCTAssertEqual(layout.columns, 3)
+        XCTAssertEqual(layout.tileSize, NibMetrics.coverStripSize)
+        XCTAssertLessThanOrEqual(CGFloat(layout.columns) * layout.tileSize.width
+            + CGFloat(layout.columns - 1) * NibSpacing.m, layout.gridWidth)
+
+        let wide = TemplateBrowserLayout(width: 760, compactSizeClass: false,
+            accessibilitySize: false, cover: false)
+        XCTAssertEqual(wide.columns, 4)
+        XCTAssertEqual(wide.tileSize, NibMetrics.paperTileSize)
+    }
+
+    func testTemplateGridFitsPaperCoversAndNoCoverAcrossResizingAndAccessibility() {
+        for width: CGFloat in [320, 344, 390, 599, 600, 664, 720, 760, 1024] {
+            for compact in [false, true] {
+                for accessibility in [false, true] {
+                    for cover in [false, true] {
+                        let layout = TemplateBrowserLayout(width: width, compactSizeClass: compact,
+                            accessibilitySize: accessibility, cover: cover)
+                        let base = cover ? NibMetrics.coverStripSize : NibMetrics.paperTileSize
+                        let cellWidth = (layout.gridWidth - CGFloat(layout.columns - 1) * NibSpacing.m) / CGFloat(layout.columns)
+                        XCTAssertGreaterThanOrEqual(layout.tileSize.width, NibMetrics.hitTarget)
+                        XCTAssertLessThanOrEqual(layout.tileSize.width, cellWidth)
+                        XCTAssertEqual(layout.tileSize.height / layout.tileSize.width,
+                            base.height / base.width, accuracy: 0.0001)
+                        XCTAssertLessThanOrEqual(layout.gridWidth + NibSpacing.xl * 2
+                            + (layout.compact ? 0 : NibMetrics.settingsSectionListWidth + NibSpacing.l), width)
+                        if accessibility { XCTAssertEqual(layout.columns, 1) }
+                        else if layout.compact { XCTAssertEqual(layout.columns, 3) }
+
+                        // No cover and every built-in/custom cover share this size. Their full
+                        // hit rectangles, including Carbon in column 2, fit without intersecting.
+                        let frames = (0..<layout.columns).map { column in
+                            CGRect(x: CGFloat(column) * (cellWidth + NibSpacing.m)
+                                + (cellWidth - layout.tileSize.width) / 2,
+                                y: 0, width: layout.tileSize.width, height: layout.tileSize.height)
+                        }
+                        for (index, frame) in frames.enumerated() {
+                            XCTAssertGreaterThanOrEqual(frame.minX, 0)
+                            XCTAssertLessThanOrEqual(frame.maxX, layout.gridWidth + 0.0001)
+                            for other in frames.dropFirst(index + 1) { XCTAssertFalse(frame.intersects(other)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testInvalidIDsAndHiddenSettingsAndConformance() async throws {
         let h = harness(); registerPaper(h)
         do { _ = try await h.run("template.group.create", ["title": "Bad", "id": "../outside"]); XCTFail("Expected invalid ID") }

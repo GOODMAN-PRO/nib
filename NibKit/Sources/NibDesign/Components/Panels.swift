@@ -431,12 +431,10 @@ public extension View {
 struct NibSheetChrome: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
-            chrome(content)
-                // Lists have no intrinsic height. Supply an ideal form height for the sizing
-                // pass; fixed-height content still keeps its own dimensions, and the system
-                // can propose a smaller viewport when the keyboard or a compact window needs it.
-                .frame(idealHeight: NibMetrics.newDocumentSheetSize.height)
-                .presentationSizing(.form.fitted(horizontal: true, vertical: true))
+            NibSheetContentLayout {
+                chrome(content)
+            }
+            .presentationSizing(.form.fitted(horizontal: true, vertical: true))
         } else {
             chrome(content)
         }
@@ -450,6 +448,28 @@ struct NibSheetChrome: ViewModifier {
                 .presentationCornerRadius(NibRadius.sheet)
                 .presentationBackground(NibColor.backgroundSecondary)
         }
+    }
+}
+
+/// Native lists have no useful intrinsic height. Give flexible content a form-sized
+/// proposal during ideal sizing, without imposing that height on an intrinsic sheet
+/// (or on the finite viewport supplied by a keyboard or a smaller window).
+private struct NibSheetContentLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        if let height = proposal.height, height.isFinite {
+            return content.sizeThatFits(proposal)
+        }
+        let intrinsic = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        let form = content.sizeThatFits(ProposedViewSize(width: proposal.width,
+                                                       height: NibMetrics.newDocumentSheetSize.height))
+        // A fixed-height view returns the same size for both proposals. A List/ScrollView
+        // expands to fill the form proposal instead of collapsing to its ~10 pt ideal.
+        return form.height > intrinsic.height ? form : intrinsic
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
     }
 }
 

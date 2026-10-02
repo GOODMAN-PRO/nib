@@ -43,6 +43,20 @@ private final class MinimapTestFloatingHost: FloatingHosting {
 }
 
 @MainActor
+private final class WhiteboardDeferredDismissalController: UIViewController {
+    let presenter = UIViewController()
+    var isPresented = true
+    var dismissalCompletion: (() -> Void)?
+    var onDismiss: (() -> Void)?
+
+    override var presentingViewController: UIViewController? { isPresented ? presenter : nil }
+    override func dismiss(animated flag: Bool, completion: (() -> Void)? = nil) {
+        dismissalCompletion = completion
+        onDismiss?()
+    }
+}
+
+@MainActor
 final class FeatWhiteboardTests: XCTestCase {
     private let boardRef = "page:FIXTUREDOC04/FIXTUREBRD01"
 
@@ -780,6 +794,80 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertNil(draft.template(in: templates))
         XCTAssertEqual(WhiteboardDraft(language: "en-GB").resolvedTitle, "Untitled Whiteboard")
         XCTAssertEqual(BoardPaper.board.title, "Board", "the palette names the papers")
+    }
+
+    func testCreationWaitsForSheetDismissalBeforeOpeningBoard() async throws {
+        let h = harness()
+        let sheet = WhiteboardDeferredDismissalController()
+        let presentation = WhiteboardCreationPresentation()
+        presentation.controller = sheet
+        let dismissRequested = expectation(description: "UIKit dismissal requested")
+        sheet.onDismiss = { dismissRequested.fulfill() }
+        var createdID: String?
+        var openedID: String?
+        var panelClosed = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { params, _ in
+            createdID = params["id"]?.stringValue
+            XCTAssertEqual(params["kind"], "whiteboard")
+            XCTAssertTrue(sheet.isPresented, "Keep the draft visible until creation succeeds")
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Stand-in.",
+                                                  effect: .session)) { params, _ in
+            XCTAssertFalse(sheet.isPresented, "Opening must not detach a still-presented creation sheet")
+            XCTAssertTrue(panelClosed, "Clear the library's panel state before replacing its presenter")
+            openedID = params["doc"]?.stringValue
+            return [:]
+        }
+        let creation = Task { @MainActor in
+            try await WhiteboardCreator.create(WhiteboardDraft(language: "fr-FR"), folder: nil,
+                                                app: h.app, session: h.session) {
+                await presentation.dismiss()
+                panelClosed = true
+            }
+        }
+        await fulfillment(of: [dismissRequested], timeout: 2)
+        XCTAssertNotNil(createdID)
+        XCTAssertNil(openedID, "Wait for completion, not merely the request to dismiss")
+        XCTAssertFalse(panelClosed)
+        let complete = try XCTUnwrap(sheet.dismissalCompletion)
+        sheet.isPresented = false
+        complete()
+        let id = try await creation.value
+        XCTAssertEqual(createdID, id.raw)
+        XCTAssertEqual(openedID, NodeRef.document(id).description)
+    }
+
+    func testFailedCreationKeepsDraftOpenAndDoesNotNavigate() async {
+        let h = harness()
+        var dismissed = false
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { _, _ in
+            throw NibError(.unavailable, "Storage unavailable")
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Stand-in.",
+                                                  effect: .session)) { _, _ in
+            opened = true
+            return [:]
+        }
+        await expectError(.unavailable) {
+            _ = try await WhiteboardCreator.create(WhiteboardDraft(language: "en-GB"), folder: nil,
+                                                    app: h.app, session: h.session) { dismissed = true }
+        }
+        XCTAssertFalse(dismissed, "A failed create must preserve the draft for retry")
+        XCTAssertFalse(opened)
+    }
+
+    func testDismissalWithoutAPresentedSheetCompletes() async {
+        let presentation = WhiteboardCreationPresentation()
+        await presentation.dismiss()
+        let sheet = WhiteboardDeferredDismissalController()
+        sheet.isPresented = false
+        presentation.controller = sheet
+        await presentation.dismiss()
+        XCTAssertNil(sheet.dismissalCompletion)
     }
 
     /// New Whiteboard is one sheet: the folder it creates in travels as a `panel.open` param.

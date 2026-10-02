@@ -938,7 +938,7 @@ final class CreateUITests: XCTestCase {
         calendar.tap() // Triggers the interruption monitor for first-launch system prompts.
         let continueButton = calendar.buttons["Continue"]
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
-        try NibSystemCalendar.openNewEvent(in: calendar)
+        try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
         try replace(title, with: eventTitle)
         calendar.buttons["Add"].tap()

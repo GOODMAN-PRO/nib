@@ -106,7 +106,8 @@ enum RecognitionLanguages {
 @MainActor
 enum WhiteboardCreator {
     @discardableResult
-    static func create(_ draft: WhiteboardDraft, folder: FolderID?, app: NibApp, session: EditorSession?) async throws -> DocumentID {
+    static func create(_ draft: WhiteboardDraft, folder: FolderID?, app: NibApp, session: EditorSession?,
+                       beforeOpen: @MainActor () async -> Void) async throws -> DocumentID {
         let id = NibID.make()
         let template = draft.template(in: app.content.templates)
         try await run(app, CommandIDs.docCreate, draft.createParams(id: id, folder: folder, template: template), session)
@@ -114,6 +115,8 @@ enum WhiteboardCreator {
             await follow(app, CommandIDs.docSetLanguage,
                          ["doc": .string(NodeRef.document(id).description), "language": .string(draft.language)], session)
         }
+        // Keep the presenting library attached until its creation sheet has finished dismissing.
+        await beforeOpen()
         await follow(app, CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)], session)
         return id
     }
@@ -136,6 +139,62 @@ enum WhiteboardCreator {
 
 // MARK: - Sheet
 
+@MainActor
+final class WhiteboardCreationPresentation: ObservableObject {
+    weak var controller: UIViewController?
+
+    func dismiss() async {
+        guard let controller, controller.presentingViewController != nil else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            controller.dismiss(animated: true) { continuation.resume() }
+        }
+    }
+}
+
+/// Resolve this sheet's own presentation, including when hosted inside a navigation controller.
+private struct WhiteboardPresentationReader: UIViewRepresentable {
+    let presentation: WhiteboardCreationPresentation
+
+    func makeUIView(context: Context) -> PresentationView {
+        let view = PresentationView()
+        view.presentation = presentation
+        return view
+    }
+
+    func updateUIView(_ view: PresentationView, context: Context) {
+        view.presentation = presentation
+        view.resolveController()
+    }
+
+    final class PresentationView: UIView {
+        weak var presentation: WhiteboardCreationPresentation?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            resolveController()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            resolveController()
+        }
+
+        func resolveController() {
+            var responder: UIResponder? = self
+            while let current = responder {
+                if var controller = current as? UIViewController {
+                    while controller.presentingViewController == nil, let parent = controller.parent {
+                        controller = parent
+                    }
+                    if controller.presentingViewController != nil { presentation?.controller = controller }
+                    return
+                }
+                responder = current.next
+            }
+        }
+    }
+}
+
 /// New Whiteboard (D-116): name, background pattern (dot grid, grid, lined, blank), colour (light or dark) and
 /// handwriting language, then Create. An opaque sheet: the Tinted Create in the header is its only water.
 struct WhiteboardCreateSheet: View {
@@ -149,6 +208,7 @@ struct WhiteboardCreateSheet: View {
     private let patterns: [BoardPattern]
     @State private var draft: WhiteboardDraft
     @State private var creating = false
+    @StateObject private var presentation = WhiteboardCreationPresentation()
 
     init(app: NibApp, folder: FolderID?, session: EditorSession?, onDone: @escaping () -> Void) {
         self.app = app
@@ -207,6 +267,12 @@ struct WhiteboardCreateSheet: View {
             }
         }
         .background(NibColor.backgroundSecondary)
+        .background {
+            WhiteboardPresentationReader(presentation: presentation)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .interactiveDismissDisabled(creating)
     }
 
     private var nameRow: some View {
@@ -233,8 +299,10 @@ struct WhiteboardCreateSheet: View {
         creating = true
         Task { @MainActor in
             do {
-                try await WhiteboardCreator.create(draft, folder: folder, app: app, session: session)
-                onDone()
+                try await WhiteboardCreator.create(draft, folder: folder, app: app, session: session) {
+                    await presentation.dismiss()
+                    onDone()
+                }
             } catch {
                 creating = false
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,

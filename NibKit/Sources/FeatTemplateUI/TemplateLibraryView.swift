@@ -152,6 +152,27 @@ final class TemplateBrowserModel: ObservableObject {
     }
 }
 
+/// Budget the sidebar and tiles from the same proposal, before laying out either.
+/// Fixed-size paper tiles must never overflow narrower flexible grid columns.
+struct TemplateBrowserLayout {
+    let compact: Bool
+    let gridWidth: CGFloat
+    let columns: Int
+    let tileSize: CGSize
+
+    init(width: CGFloat, compactSizeClass: Bool, accessibilitySize: Bool, cover: Bool) {
+        compact = compactSizeClass || accessibilitySize || width < NibMetrics.compactBreakpoint
+        let contentWidth = max(NibMetrics.hitTarget, width - NibSpacing.xl * 2)
+        gridWidth = max(NibMetrics.hitTarget, contentWidth - (compact ? 0 : NibMetrics.settingsSectionListWidth + NibSpacing.l))
+        let base = cover ? NibMetrics.coverStripSize : NibMetrics.paperTileSize
+        let minimumWidth = compact ? NibMetrics.hitTarget : base.width
+        let capacity = max(1, Int((gridWidth + NibSpacing.m) / (minimumWidth + NibSpacing.m)))
+        columns = min(accessibilitySize ? 1 : compact ? 3 : 4, capacity)
+        let tileWidth = min(base.width, (gridWidth - CGFloat(columns - 1) * NibSpacing.m) / CGFloat(columns))
+        tileSize = CGSize(width: tileWidth, height: tileWidth * base.height / base.width)
+    }
+}
+
 @MainActor
 struct TemplateBrowser: View {
     @ObservedObject var model: TemplateBrowserModel
@@ -160,23 +181,38 @@ struct TemplateBrowser: View {
     @Environment(\.dynamicTypeSize) private var typeSize
     @State private var widthText = ""
     @State private var heightText = ""
-    @State private var availableWidth = NibMetrics.newDocumentSheetSize.width
     @State private var deletingTemplate: String?
-    private var compact: Bool { sizeClass == .compact || typeSize.isAccessibilitySize || availableWidth < NibMetrics.compactBreakpoint }
 
     var body: some View {
+        GeometryReader { geometry in
+            let layout = TemplateBrowserLayout(width: geometry.size.width,
+                compactSizeClass: sizeClass == .compact, accessibilitySize: typeSize.isAccessibilitySize,
+                cover: model.kind == "cover")
+            browser(layout)
+        }
+        .font(NibFont.body).foregroundStyle(NibColor.label)
+        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange)) { _ in Task { await model.load() } }
+        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange)) { _ in Task { await model.load() } }
+        .confirmationDialog(String(localized: "Delete this custom template?"), isPresented: Binding(get: { deletingTemplate != nil }, set: { if !$0 { deletingTemplate = nil } }), titleVisibility: .visible) {
+            Button(String(localized: "Delete Template"), role: .destructive) {
+                if let id = deletingTemplate { model.action(CommandIDs.templateDelete, ["id": .string(id)]); deletingTemplate = nil }
+            }
+        }
+    }
+
+    private func browser(_ layout: TemplateBrowserLayout) -> some View {
         Group {
-            if compact {
+            if layout.compact {
                 ScrollView {
                     VStack(spacing: NibSpacing.l) {
-                        options
+                        options(compact: true)
                         categoryPicker
-                        gridContent
+                        gridContent(layout)
                     }
                 }.scrollBounceBehavior(.basedOnSize).nibFadeBottomEdge()
             } else {
                 VStack(spacing: NibSpacing.l) {
-                    options
+                    options(compact: false)
                     HStack(alignment: .top, spacing: NibSpacing.l) {
                         ScrollView {
                             VStack(alignment: .leading, spacing: NibSpacing.xs) {
@@ -187,21 +223,14 @@ struct TemplateBrowser: View {
                                 }
                             }
                         }.frame(width: NibMetrics.settingsSectionListWidth)
-                        ScrollView { gridContent }.scrollBounceBehavior(.basedOnSize).nibFadeBottomEdge()
+                        ScrollView { gridContent(layout) }
+                            .frame(width: layout.gridWidth)
+                            .scrollBounceBehavior(.basedOnSize).nibFadeBottomEdge()
                     }
                 }
             }
         }
-        .font(NibFont.body).foregroundStyle(NibColor.label)
         .padding(.horizontal, NibSpacing.xl)
-        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange)) { _ in Task { await model.load() } }
-        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange)) { _ in Task { await model.load() } }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
-        .confirmationDialog(String(localized: "Delete this custom template?"), isPresented: Binding(get: { deletingTemplate != nil }, set: { if !$0 { deletingTemplate = nil } }), titleVisibility: .visible) {
-            Button(String(localized: "Delete Template"), role: .destructive) {
-                if let id = deletingTemplate { model.action(CommandIDs.templateDelete, ["id": .string(id)]); deletingTemplate = nil }
-            }
-        }
     }
     private var categoryPicker: some View {
         Picker(String(localized: "Template group"), selection: $model.category) {
@@ -209,7 +238,7 @@ struct TemplateBrowser: View {
         }.pickerStyle(.menu).frame(minHeight: NibMetrics.hitTarget)
     }
 
-    @ViewBuilder private var options: some View {
+    @ViewBuilder private func options(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: NibSpacing.l) { sizeControl; orientationControl }
@@ -265,16 +294,16 @@ struct TemplateBrowser: View {
             model.size = size; model.error = nil
         } catch { model.error = error.localizedDescription }
     }
-    private var gridContent: some View {
+    private func gridContent(_ layout: TemplateBrowserLayout) -> some View {
         VStack(spacing: NibSpacing.l) {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: NibSpacing.m), count: typeSize.isAccessibilitySize ? 1 : compact ? 3 : 4), spacing: NibSpacing.l) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: NibSpacing.m), count: layout.columns), spacing: NibSpacing.l) {
                 if model.kind == "cover" {
-                    NibPaperTile(name: String(localized: "No cover"), isSelected: model.selection == TemplateIDs.blank, size: NibMetrics.coverStripSize,
+                    NibPaperTile(name: String(localized: "No cover"), isSelected: model.selection == TemplateIDs.blank, size: layout.tileSize,
                                  action: { model.select(TemplateIDs.blank) }) { NibPaper.white.color }
                 }
                 ForEach(model.builtins) { template in
                     VStack(spacing: NibSpacing.xs) {
-                        tile(template.id, title: template.title, custom: false)
+                        tile(template.id, title: template.title, custom: false, size: layout.tileSize)
                             .opacity(model.hidden.contains(template.id) ? NibOpacity.recede : 1)
                         if model.hidden.contains(template.id) { Text(String(localized: "Hidden")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
                     }
@@ -285,7 +314,7 @@ struct TemplateBrowser: View {
                         }
                 }
                 ForEach(model.customs.map(\.template)) { template in
-                    tile(template.id, title: template.title, custom: true)
+                    tile(template.id, title: template.title, custom: true, size: layout.tileSize)
                         .contextMenu {
                             if management {
                                 Button(String(localized: "Delete Template"), role: .destructive) { deletingTemplate = template.id }
@@ -297,16 +326,10 @@ struct TemplateBrowser: View {
                 Text(String(localized: "Import a PDF or image to add templates to this group."))
                     .font(NibFont.body).foregroundStyle(NibColor.labelSecondary).padding(NibSpacing.l)
             }
-        }
+        }.frame(width: layout.gridWidth)
     }
-    private var tileSize: CGSize {
-        let base = model.kind == "cover" ? NibMetrics.coverStripSize : NibMetrics.paperTileSize
-        guard compact, !typeSize.isAccessibilitySize else { return base }
-        let width = max(NibMetrics.hitTarget, min(base.width, (availableWidth - NibSpacing.xl * 2 - NibSpacing.m * 2) / 3))
-        return CGSize(width: width, height: width * base.height / base.width)
-    }
-    private func tile(_ id: String, title: String, custom: Bool) -> some View {
-        NibPaperTile(name: title, isSelected: model.selection == id, size: tileSize,
+    private func tile(_ id: String, title: String, custom: Bool, size: CGSize) -> some View {
+        NibPaperTile(name: title, isSelected: model.selection == id, size: size,
             action: {
                 let intrinsic = custom ? model.groups.flatMap(\.liveTemplates).first { $0.id == id }?.size : nil
                 model.select(id, size: intrinsic)
