@@ -62,6 +62,12 @@ final class InsertUITests: XCTestCase {
             found = sources.flatMap { $0.alerts.allElementsBoundByIndex }.first {
                 $0.buttons.allElementsBoundByIndex.contains { $0.label.hasPrefix("Allow") || $0.label == "OK" }
             }
+            if found == nil {
+                // Some system paste sheets expose their buttons without an XCUIElementTypeAlert ancestor.
+                found = sources.first {
+                    $0.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Allow'")).firstMatch.exists
+                }
+            }
             return found != nil
         }, object: nil)
         _ = XCTWaiter.wait(for: [expectation], timeout: timeout)
@@ -248,6 +254,8 @@ final class InsertUITests: XCTestCase {
         let before = try ui.state().itemCountOnPage
         UIPasteboard.general.setData(try gif ? gifData() : imageData(), forPasteboardType: gif ? UTType.gif.identifier : UTType.png.identifier)
         try ui.selectTool("image"); ui.coordinate(point).tap(); try tap("Paste")
+        try allowSystemPermissionIfPresented(timeout: 3)
+        if try ui.state().itemCountOnPage == before { outside() }
         try counts(before + 1)
         try selectAt()
     }
@@ -661,7 +669,10 @@ final class InsertUITests: XCTestCase {
         // Save a blue/red source to the real photo library, then replace a different green image.
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); try ui.tapCommand("item.delete"); try counts(4)
         UIPasteboard.general.setData(imageData(true), forPasteboardType: UTType.png.identifier)
-        try ui.selectTool("image"); ui.coordinate(point).tap(); try tap("Paste"); try counts(5); try selectAt()
+        try ui.selectTool("image"); ui.coordinate(point).tap(); try tap("Paste")
+        try allowSystemPermissionIfPresented(timeout: 3)
+        if try ui.state().itemCountOnPage == 4 { outside() }
+        try counts(5); try selectAt()
         let before = try item("image")
         try menu("Replace Image")
         let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
