@@ -195,6 +195,7 @@ final class DropletField {
     @ObservationIgnored private var dismissers: [String: () -> Void] = [:]
     @ObservationIgnored private var pendingBuds: [String: (source: String, presented: Bool)] = [:]
     @ObservationIgnored private var driver: DisplayLinkDriver?
+    @ObservationIgnored private var isActive = true
     @ObservationIgnored private var restoreWork: DispatchWorkItem?
     @ObservationIgnored private var nextSatellite = 0
     @ObservationIgnored private var stroke: CGRect = .null
@@ -1055,9 +1056,15 @@ final class DropletField {
 
     // MARK: Frame loop
 
+    func setActive(_ active: Bool) {
+        isActive = active
+        if active { wake() } else { driver?.stop() }
+    }
+
     func wake() {
         // Geometry and visibility must be available even while the display link is parked (or inking).
         publish()
+        guard isActive, !isInking else { return }
         let state = ProcessInfo.processInfo.thermalState
         let hot = state == .serious || state == .critical
         if hot != isThermallyThrottled { isThermallyThrottled = hot }
@@ -1079,7 +1086,8 @@ final class DropletField {
             stepReshape(&e)
             if !moving && !e.isDragging { e.landing = nil }
             let budBusy = e.bud.map { $0.presented ? !$0.revealed : $0.closingAt != nil } ?? false
-            if moving || e.isDragging || e.reshape != .idle || budBusy { busy = true }
+            // Holding a settled droplet is not work. Gesture updates wake the field when the finger moves.
+            if moving || e.reshape != .idle || budBusy { busy = true }
             entries[id] = e
         }
         if stepBonds(step) { busy = true }
@@ -1096,6 +1104,16 @@ final class DisplayLinkDriver: NSObject {
     private var link: CADisplayLink?
     private var last: CFTimeInterval = 0
     private let onTick: (CFTimeInterval) -> Bool
+    var isRunning: Bool { link != nil }
+
+    private final class Target: NSObject {
+        weak var owner: DisplayLinkDriver?
+        init(_ owner: DisplayLinkDriver) { self.owner = owner }
+        @objc func step(_ link: CADisplayLink) {
+            guard let owner else { link.invalidate(); return }
+            owner.advance(at: link.timestamp)
+        }
+    }
 
     init(onTick: @escaping (CFTimeInterval) -> Bool) {
         self.onTick = onTick
@@ -1104,7 +1122,7 @@ final class DisplayLinkDriver: NSObject {
 
     func start() {
         guard link == nil else { return }
-        let l = CADisplayLink(target: self, selector: #selector(step(_:)))
+        let l = CADisplayLink(target: Target(self), selector: #selector(Target.step(_:)))
         l.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
         l.add(to: .main, forMode: .common)
         link = l
@@ -1114,10 +1132,13 @@ final class DisplayLinkDriver: NSObject {
     func stop() {
         link?.invalidate()
         link = nil
+        last = 0
     }
 
-    @objc private func step(_ displayLink: CADisplayLink) {
-        let now = displayLink.timestamp
+    deinit { link?.invalidate() }
+
+    func advance(at now: CFTimeInterval) {
+        guard isRunning else { return }
         let dt = last == 0 ? 1.0 / 120 : min(max(now - last, 1.0 / 240), 1.0 / 30)
         last = now
         if !onTick(dt) { stop() }

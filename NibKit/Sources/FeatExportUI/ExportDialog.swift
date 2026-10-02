@@ -435,22 +435,12 @@ private struct ExportPageChoice: View {
 }
 
 private struct ExportProgress: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var moving = false
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
             Text(String(localized: "Preparing export…")).font(NibFont.caption1)
-            GeometryReader { proxy in
-                NibProgressBar(value: 0.3)
-                    .offset(x: reduceMotion ? 0 : (moving ? proxy.size.width : -proxy.size.width * 0.3))
-            }.frame(height: NibStroke.thick).clipped()
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(String(localized: "Preparing export…"))
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(NibMotion.glide.animation.speed(0.2).repeatForever(autoreverses: false)) { moving = true }
-        }
     }
 }
 

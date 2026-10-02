@@ -873,6 +873,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         case .changed:
             swipeLocation = location
             extendSwipe(to: location)
+            startAutoScroll()
         default:
             swipe = nil
             swipeLocation = nil
@@ -892,6 +893,13 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         autoScroll = link
     }
 
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        swipe = nil
+        swipeLocation = nil
+        stopAutoScroll()
+    }
+
     private func stopAutoScroll() {
         autoScroll?.invalidate()
         autoScroll = nil
@@ -899,7 +907,8 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     /// Near the top or bottom edge the list scrolls under the still finger, and the swipe keeps selecting.
     @objc private func autoScrollTick(_ link: CADisplayLink) {
-        guard swipe != nil, let collectionView = collectionView, let location = swipeLocation else { return }
+        guard swipe != nil, let collectionView = collectionView, collectionView.window != nil,
+              let location = swipeLocation else { stopAutoScroll(); return }
         let bounds = collectionView.bounds
         let band = NibMetrics.hitTarget
         var depth: CGFloat = 0
@@ -908,13 +917,13 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         } else if location.y > bounds.maxY - band {
             depth = location.y - (bounds.maxY - band)
         }
-        guard depth != 0 else { return }
+        guard depth != 0 else { stopAutoScroll(); return }
         let inset = collectionView.adjustedContentInset
         let top = -inset.top
         let bottom = max(top, collectionView.contentSize.height - bounds.height + inset.bottom)
         let y = min(max(collectionView.contentOffset.y + depth / 4, top), bottom)
         let moved = y - collectionView.contentOffset.y
-        guard moved != 0 else { return }
+        guard moved != 0 else { stopAutoScroll(); return }
         collectionView.contentOffset.y = y
         let next = CGPoint(x: location.x, y: location.y + moved)
         swipeLocation = next

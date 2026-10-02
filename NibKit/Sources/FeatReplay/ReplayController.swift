@@ -179,6 +179,7 @@ final class ReplayController: NSObject, ObservableObject {
     private weak var app: NibApp?
     private var subscription: EventSubscription?
     private var displayLink: CADisplayLink?
+    private var lifecycleObservers: [NSObjectProtocol] = []
     private let target = ReplayDisplayTarget()
     private var refreshTask: Task<Void, Never>?
     private var eventSequence: UInt64 = 0
@@ -196,7 +197,11 @@ final class ReplayController: NSObject, ObservableObject {
 
     init(app: NibApp) { self.app = app; super.init(); target.owner = self }
 
-    deinit { subscription?.cancel(); displayLink?.invalidate() }
+    deinit {
+        subscription?.cancel()
+        displayLink?.invalidate()
+        lifecycleObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
 
     static func of(_ services: NibServices) -> ReplayController? { services.get(serviceKey, as: ReplayController.self) }
 
@@ -209,6 +214,16 @@ final class ReplayController: NSObject, ObservableObject {
 
     func start(resync: Bool = true) {
         guard subscription == nil, let app else { return }
+        for name in [UIApplication.didBecomeActiveNotification, UIApplication.willResignActiveNotification,
+                     UIAccessibility.reduceMotionStatusDidChangeNotification] {
+            lifecycleObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) {
+                [weak self] notification in
+                MainActor.assumeIsolated {
+                    self?.stopDisplayLink()
+                    if notification.name != UIApplication.willResignActiveNotification { self?.tick() }
+                }
+            })
+        }
         subscription = app.events.subscribe { [weak self] event in
             Task { @MainActor [weak self] in self?.receive(event) }
         }
@@ -255,19 +270,34 @@ final class ReplayController: NSObject, ObservableObject {
     private func stopDisplayLink() { displayLink?.invalidate(); displayLink = nil }
 
     private func ensureDisplayLink() {
-        guard sample?.playing == true, displayLink == nil, !NibApp.isHostlessTest else { return }
+        guard sample?.playing == true, loadedClip != nil, displayLink == nil, !NibApp.isHostlessTest,
+              UIApplication.shared.applicationState == .active, hasVisibleReplay else { return }
         let link = CADisplayLink(target: target, selector: #selector(ReplayDisplayTarget.tick))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30, preferred: 30)
+        let fps: Float = UIAccessibility.isReduceMotionEnabled ? 4 : 30
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: fps, maximum: fps, preferred: fps)
         link.add(to: .main, forMode: .common)
         displayLink = link
+    }
+
+    private var hasVisibleReplay: Bool {
+        guard let app, let doc = NodeRef(clipRef ?? "")?.documentID else { return false }
+        return app.services.sessions.sessions.contains {
+            $0.document == doc && options(for: $0).enabled
+                && ($0.editor as? UIViewController)?.viewIfLoaded?.window != nil
+        }
     }
 
     /// The frame path never invokes the bus or waits for linkage reads.
     func tick(now: Double = Date().timeIntervalSince1970) {
         pruneSessions()
-        guard let sample, let clip = loadedClip, sample.clip == clipRef else { return }
+        guard let sample, let clip = loadedClip, sample.clip == clipRef else { stopDisplayLink(); return }
         let elapsed = sample.playing ? max(0, now - sample.at) * sample.rate : 0
         update(time: clip.start + min(max(sample.t + elapsed, 0), clip.duration))
+        if sample.playing, sample.t + elapsed < clip.duration, hasVisibleReplay {
+            ensureDisplayLink()
+        } else {
+            stopDisplayLink()
+        }
     }
 
     /// Explicit resync for startup and replay commands, never a per-frame poll.
@@ -431,6 +461,7 @@ final class ReplayController: NSObject, ObservableObject {
         if let followAlong { options.followAlong = followAlong; lastFollowed[session.id] = nil; scheduleLinks() }
         if !options.enabled { setReplay(nil, session: session) }
         if let lastTime { update(time: lastTime) }
+        tick()
     }
 
     func setFullScreen(_ on: Bool, for session: EditorSession, query: ReplayReader.Query) async throws {

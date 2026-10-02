@@ -366,7 +366,7 @@ private struct RecordingRow: View {
                 NibStatusDot(.recording)
             }
             VStack(alignment: .leading, spacing: NibSpacing.xxs) {
-                TimelineView(.animation(minimumInterval: 0.5, paused: paused)) { _ in
+                AudioTimelineView(interval: 0.5, paused: paused) {
                     Text(paused ? String(localized: "Paused · \(AudioText.clock(audio.elapsed))")
                                 : String(localized: "Recording · \(AudioText.clock(audio.elapsed))"))
                         .font(NibFont.headline)
@@ -503,6 +503,7 @@ enum AudioChromeActions {
 /// centre inside the window's droplet container, gives it the Clear 40 pt HUD droplet (NibHUDGroup's surface), and
 /// recedes it while the Pencil is down. It shows in every document window, since the recording is app-wide.
 struct RecorderHUD: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var audio: AudioController
     let app: NibApp
     let session: EditorSession
@@ -527,12 +528,12 @@ struct RecorderHUD: View {
                 NibStatusDot(.recording)
                     .padding(.leading, NibSpacing.s)
             }
-            TimelineView(.animation(minimumInterval: 0.5, paused: frozen)) { _ in
+            AudioTimelineView(interval: 0.5, paused: frozen) {
                 NibHUDText(AudioText.clock(audio.elapsed), secondary: paused ? String(localized: "Paused") : nil)
                     .accessibilityLabel(paused ? String(localized: "Recording paused") : String(localized: "Recording"))
                     .accessibilityValue(AudioText.spoken(audio.elapsed))
             }
-            TimelineView(.animation(minimumInterval: 0.1, paused: frozen)) { _ in
+            AudioTimelineView(interval: 0.1, paused: frozen || reduceMotion) {
                 NibWaveform(levels: audio.recorder?.meter.recentLevels ?? [])
             }
             NibIconButton(paused ? .recordDot : .pause,
@@ -575,7 +576,7 @@ struct AudioPlaybackBar: View {
     var body: some View {
         let clips = doc.map { audio.playableClips($0) } ?? []
         let loaded = loadedPlayback(clips)
-        TimelineView(.animation(minimumInterval: 0.25, paused: loaded?.isPlaying != true || inking.isInking)) { _ in
+        AudioTimelineView(interval: 0.25, paused: loaded?.isPlaying != true || inking.isInking) {
             content(clips: clips, loaded: loaded)
         }
         .onAppear { inking.watch(session.inking) }
@@ -798,4 +799,31 @@ private struct ShareSheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+/// Clocks sample real work; they are not animations. An empty schedule parks hidden/paused chrome.
+struct AudioTickSchedule: TimelineSchedule {
+    let interval: TimeInterval
+    let active: Bool
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnySequence<Date> {
+        guard active else { return AnySequence([]) }
+        return AnySequence(PeriodicTimelineSchedule(from: startDate, by: interval).entries(from: startDate, mode: mode))
+    }
+}
+
+private struct AudioTimelineView<Content: View>: View {
+    let interval: TimeInterval
+    let paused: Bool
+    @ViewBuilder let content: () -> Content
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var visible = false
+
+    var body: some View {
+        TimelineView(AudioTickSchedule(interval: interval, active: visible && !paused && scenePhase == .active)) { _ in
+            content()
+        }
+        .onAppear { visible = true }
+        .onDisappear { visible = false }
+    }
 }

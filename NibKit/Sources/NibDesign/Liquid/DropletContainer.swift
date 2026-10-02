@@ -18,6 +18,8 @@ public struct NibDropletContainer<Content: View>: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.self) private var environment
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var isVisible = false
     private let inking: NibInkingState?
     private let content: Content
 
@@ -35,6 +37,13 @@ public struct NibDropletContainer<Content: View>: View {
     private var usesSystemGlass: Bool { Self.systemGlassAvailable && mode != .off }
 
     public var body: some View {
+        containerBody
+            .onAppear { isVisible = true; field.setActive(scenePhase == .active) }
+            .onDisappear { isVisible = false; field.setActive(false) }
+            .onChange(of: scenePhase) { _, phase in field.setActive(isVisible && phase == .active) }
+    }
+
+    private var containerBody: some View {
         ZStack {
             if field.hasOpenBud {
                 DismissCatcher(field: field)
@@ -55,7 +64,7 @@ public struct NibDropletContainer<Content: View>: View {
         .environment(\.nibGlassNamespace, glassNamespace)
         .environment(\.nibIsInking, field.isFrozen)
         .environment(\.nibChromeAppearance, NibChromeAppearance(environment))
-        .onChange(of: reduceMotion, initial: true) { _, value in field.reduceMotion = value || NibUITestMode.isEnabled }
+        .onChange(of: reduceMotion, initial: true) { _, value in field.reduceMotion = value || NibUITestMode.isEnabled; field.wake() }
         .onChange(of: mode, initial: true) { _, value in
             field.mode = value
             field.usesSystemGlass = Self.systemGlassAvailable && value != .off
