@@ -266,7 +266,7 @@ final class DropletField {
             if n.head != b.head.value { n.head = b.head.value }
             if n.tail != b.tail.value { n.tail = b.tail.value }
         }
-        let open = entries.values.contains { $0.bud?.presented == true }
+        let open = entries.values.contains { $0.bud?.presented == true && $0.style.modalWhenBudded }
         if open != hasOpenBud { hasOpenBud = open }
         let next = buildClusters()
         if next != clusters { clusters = next }
@@ -681,7 +681,7 @@ final class DropletField {
     // MARK: Bud-off
 
     func dismissBuds() {
-        for (id, dismiss) in dismissers where entries[id]?.bud?.presented == true {
+        for (id, dismiss) in dismissers where entries[id]?.bud?.presented == true && entries[id]?.style.modalWhenBudded == true {
             dismiss()
         }
     }

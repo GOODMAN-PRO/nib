@@ -75,7 +75,7 @@ struct AttachedDroplet<Content: View>: View {
         let p = node.presentation
         let requestedHidden = bud.map { !$0.isPresented.wrappedValue } ?? false
         let hidden = p.hasBud ? p.hidden : requestedHidden
-        let isOpenBud = bud != nil && !hidden
+        let isOpenBud = bud != nil && !hidden && style.modalWhenBudded
         let draggable = managesDrag && style.drag != .fixed
         let recede = p.recedes ? NibLiquid.recedeOpacity : 1
         return content

@@ -311,11 +311,11 @@ enum GlobalShortcuts {
         key("newTextDocument", String(localized: "New Text Document"), KeyShortcut("t", [.command, .shift]), batch,
             scope: .library, session: { _ in ShortcutActions.newTextDocument() })
         key("open", String(localized: "Open…"), KeyShortcut("o", .command), CommandIDs.searchOpen,
-            ["scope": "library"], scope: .global)
+            ["scope": "lib"], scope: .global)
 
         // Library (D-082).
         key("searchLibrary", String(localized: "Search Library"), KeyShortcut("f", .command), CommandIDs.searchOpen,
-            ["scope": "library"], scope: .library)
+            ["scope": "lib"], scope: .library)
 
         // File, in a document (P-051, D-082).
         key("rename", String(localized: "Rename…"), KeyShortcut("r", .command), CommandIDs.panelOpen,

@@ -325,8 +325,11 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
             guard fileCompletion == nil else { throw NibError.unavailable("a free file picker") }
             return try await withCheckedThrowingContinuation { continuation in
                 fileCompletion = continuation
-                parent.present(picker, animated: !UIAccessibility.isReduceMotionEnabled)
-                if picker.presentingViewController == nil { finishFiles(false) }
+                // UIKit attaches the presentation asynchronously. Checking immediately can
+                // finish the command and delete its staging files while Files still reads them.
+                parent.present(picker, animated: !UIAccessibility.isReduceMotionEnabled) { [weak self, weak picker] in
+                    if picker?.presentingViewController == nil { self?.finishFiles(false) }
+                }
             }
         }
         let activity = UIActivityViewController(activityItems: urls, applicationActivities: nil)
@@ -340,11 +343,12 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
                 if let error { continuation.resume(throwing: NibError.wrap(error)) }
                 else { continuation.resume(returning: complete) }
             }
-            parent.present(activity, animated: !UIAccessibility.isReduceMotionEnabled)
-            if activity.presentingViewController == nil && !resumed {
-                resumed = true
-                activity.completionWithItemsHandler = nil
-                continuation.resume(returning: false)
+            parent.present(activity, animated: !UIAccessibility.isReduceMotionEnabled) { [weak activity] in
+                if activity?.presentingViewController == nil && !resumed {
+                    resumed = true
+                    activity?.completionWithItemsHandler = nil
+                    continuation.resume(returning: false)
+                }
             }
         }
     }

@@ -72,8 +72,8 @@ struct LibraryGridView: View {
             }
             else if model.rows.isEmpty && model.error == nil {
                 NibEmptyState(symbol: .notebook, title: String(localized: "No notebooks yet"), message: String(localized: "Write something, or bring in a PDF."),
-                    primary: NibAction(String(localized: "New Notebook"), command: "library.setView") { model.setView(["menu": "new"]) },
-                    secondary: NibAction(String(localized: "Import"), command: CommandIDs.importPick) { model.perform(CommandIDs.importPick, model.folder == nil ? [:] : ["folder": model.folderRef]) })
+                    primary: NibAction(String(localized: "New Notebook"), command: CommandIDs.panelOpen) { model.perform(CommandIDs.panelOpen, ["id": "create.newNotebook", "folder": model.folderRef]) },
+                    secondary: NibAction(String(localized: "Import"), command: CommandIDs.importPick) { model.perform(CommandIDs.importPick, ["target": model.folderRef]) })
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : NibMetrics.libraryGutter) {
@@ -170,15 +170,8 @@ struct LibraryGridView: View {
             }
         }
     }
-    @ViewBuilder private func cell(_ row: LibraryRow, list: Bool = false) -> some View {
-        if model.collection == .documents {
-            LibraryCell(row: row, model: model, list: list)
-                .nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
-                                   order: row.isFolder ? model.folderRefs : model.documentRefs) { model.drop($0) }
-        } else {
-            // Collections contain documents from different parents, so sibling reordering does not apply.
-            LibraryCell(row: row, model: model, list: list)
-        }
+    private func cell(_ row: LibraryRow, list: Bool = false) -> some View {
+        LibraryCell(row: row, model: model, list: list)
     }
     private var selectionGesture: some Gesture {
         DragGesture(minimumDistance: NibSpacing.xs + NibSpacing.xxs, coordinateSpace: .named("library.selection"))
@@ -218,31 +211,52 @@ struct LibraryCell: View {
     init(row: LibraryRow, model: LibraryViewModel, list: Bool) {
         self.row = row; self.model = model; self.cache = model.coverCache; self.list = list
     }
+    private func activate() {
+        if model.selection.isSelecting { model.setView(["selection": "toggle", "refs": .array([.string(row.ref)])]) }
+        else if row.isFolder { model.setView(["folder": .string(row.ref), "sidebar": false]) }
+        else { model.perform(CommandIDs.docOpen, ["doc": .string(row.ref)]) }
+    }
+    private func step(_ delta: Int) {
+        let order = row.isFolder ? model.folderRefs : model.documentRefs
+        reflow.step(row.ref, by: delta, order: order, onDrop: model.drop)
+    }
     private var isLocked: Bool { row.locked == true || model.app.services.lock?.isLocked(row.nodeID) == true }
     private func accessibilityValue(subtitle: String?) -> String {
         [isLocked && row.locked != true ? String(localized: "Locked") : "", row.accessibilityValue(subtitle: subtitle)]
             .filter { !$0.isEmpty }.joined(separator: ", ")
     }
-    var body: some View {
-        let visibleSubtitle = isLocked ? nil : subtitle
-        VStack(alignment: .leading, spacing: NibSpacing.xs) {
-            Button {
-                if model.selection.isSelecting { model.setView(["selection": "toggle", "refs": .array([.string(row.ref)])]) }
-                else if row.isFolder { model.setView(["folder": .string(row.ref), "sidebar": false]) }
-                else { model.perform(CommandIDs.docOpen, ["doc": .string(row.ref)]) }
-            } label: {
-                if list { LibraryListRow(row: row, model: model, subtitle: visibleSubtitle) }
-                else { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+    private var visibleSubtitle: String? { isLocked ? nil : subtitle }
+    private var itemButton: some View {
+        Button(action: activate) {
+            if list { LibraryListRow(row: row, model: model, subtitle: visibleSubtitle) }
+            else { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+        }
+        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
+        .modifier(LibraryItemReflow(row: row, model: model))
+        .contextMenu {
+            LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
+            if model.collection == .documents {
+                Button("Move earlier") { step(-1) }
+                Button("Move later") { step(1) }
             }
-            .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(row.accessibilityLabel)
-            .accessibilityIdentifier(row.isFolder ? "cmd.library.setView" : "cmd.doc.open")
-            .accessibilityValue(accessibilityValue(subtitle: visibleSubtitle))
-            .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
-            .contextMenu {
-                LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
-            } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+        } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.accessibilityLabel)
+        .accessibilityIdentifier(row.isFolder ? "cmd.library.setView" : "cmd.doc.open")
+        .accessibilityValue(accessibilityValue(subtitle: visibleSubtitle))
+        .accessibilityAction { activate() }
+        .accessibilityActions {
+            if model.collection == .documents {
+                Button("Move earlier") { step(-1) }
+                Button("Move later") { step(1) }
+            }
+        }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            itemButton
             if model.renaming == row.ref { LibraryRenameField(row: row, model: model) }
         }
         .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
@@ -269,6 +283,17 @@ struct LibraryCell: View {
         .task(id: row.ref + String(row.modified ?? 0) + ":" + String(cache.revisions[row.nodeID] ?? 0) + ":" + String(isLocked)) {
             subtitle = cache.subtitle(row, app: model.app)
         }
+    }
+}
+
+private struct LibraryItemReflow: ViewModifier {
+    let row: LibraryRow
+    @ObservedObject var model: LibraryViewModel
+    func body(content: Content) -> some View {
+        if model.collection == .documents {
+            content.nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
+                order: row.isFolder ? model.folderRefs : model.documentRefs, onDrop: model.drop)
+        } else { content }
     }
 }
 
@@ -377,21 +402,36 @@ struct LibraryRenameField: View {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
     @State private var text = ""
+    @State private var error: String?
+    @State private var saving = false
     @FocusState private var focused: Bool
     var body: some View {
-        HStack(spacing: NibSpacing.xs) {
-            TextField(String(localized: "Name"), text: $text).font(NibFont.body).focused($focused).onSubmit(save)
-                .accessibilityLabel(String(localized: "Rename \(row.name)"))
-            NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
-                .accessibilityIdentifier("cmd.library.rename")
-            NibIconButton(.xmark, label: String(localized: "Cancel Rename")) { model.setView(["rename": ""]) }
-            .accessibilityIdentifier("cmd.library.setView")
-        }.frame(minHeight: NibMetrics.hitTarget).onAppear { text = row.name; focused = true }
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            HStack(spacing: NibSpacing.xs) {
+                TextField(String(localized: "Name"), text: $text).font(NibFont.body).focused($focused).onSubmit(save)
+                    .accessibilityLabel(String(localized: "Rename \(row.name)"))
+                NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
+                    .accessibilityIdentifier("cmd.library.rename")
+                NibIconButton(.xmark, label: String(localized: "Cancel Rename")) { model.setView(["rename": ""]) }
+                .accessibilityIdentifier("cmd.library.setView")
+            }.frame(minHeight: NibMetrics.hitTarget)
+            .disabled(saving)
+            if let error { Text(error).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
+        }.onAppear { text = row.name; focused = true }
     }
     private func save() {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        model.perform(CommandIDs.libraryRename, ["ref": .string(row.ref), "title": .string(text)])
-        model.setView(["rename": ""])
+        guard !saving else { return }
+        let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { error = String(localized: "Enter a name."); return }
+        saving = true
+        Task { @MainActor in
+            defer { saving = false }
+            do {
+                _ = try await model.app.bus.execute(CommandIDs.libraryRename,
+                    ["ref": .string(row.ref), "title": .string(title)], session: model.session)
+                model.setView(["rename": ""])
+            } catch { self.error = NibError.wrap(error).message; focused = true }
+        }
     }
 }
 

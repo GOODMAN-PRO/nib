@@ -381,7 +381,8 @@ final class LibraryViewModel: ObservableObject {
         case .none: break
         case .combine(let ref, into: let target):
             let refs = selection.refs.contains(ref) ? documentRefs.filter { selection.refs.contains($0) && $0 != target } : [ref]
-            moveDrop(refs: refs, destination: target)
+            confirmation = LibraryConfirmation(title: String(localized: "Combine"), command: CommandIDs.libraryMove,
+                params: ["refs": .array(refs.map(JSONValue.string)), "folder": .string(target)])
         case .reorder(let move):
             guard collection == .documents else { return }
             // Apply immediately, in the same update that clears reflow's offsets.
@@ -479,7 +480,10 @@ struct LibraryRootView: View {
     @State private var searchText = ""
     var body: some View {
         GeometryReader { geometry in
-            let compact = LibraryPresentation.isCompact(size: geometry.size, idiom: idiom)
+            // Keyboard avoidance changes the available content height, not the window's
+            // navigation mode. Switching stacks here destroys a focused inline editor.
+            let windowSize = model.controller?.viewIfLoaded?.bounds.size ?? geometry.size
+            let compact = LibraryPresentation.isCompact(size: windowSize, idiom: idiom)
             let short = LibraryPresentation.isCompactHeight(size: geometry.size)
             let inlineSidebar = !compact && geometry.size.width >= NibMetrics.librarySidebarBreakpoint
             ZStack {
@@ -730,12 +734,12 @@ struct LibraryRootView: View {
         HStack(spacing: NibSpacing.l) {
             if compact {
                 NibDropletButton(id: "library.controls", symbol: .search, label: String(localized: "Search Library")) {
-                    model.perform(CommandIDs.searchOpen)
+                    model.perform(CommandIDs.searchOpen, ["scope": "lib"])
                 }
                 .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
             } else {
                 NibBarGroup(id: "library.controls") {
-                    NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen) }
+                    NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen, ["scope": "lib"]) }
                     .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
                     NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
                     .accessibilityIdentifier("cmd.library.setView")

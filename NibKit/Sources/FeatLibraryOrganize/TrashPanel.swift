@@ -393,6 +393,7 @@ struct TrashPanel: View {
             } label: {
                 rowContent(entry)
             }
+            .contextMenu { actions([entry]) }
             .disabled(isWorking)
         }
     }

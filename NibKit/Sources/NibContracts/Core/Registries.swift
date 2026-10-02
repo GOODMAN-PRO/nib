@@ -656,9 +656,11 @@ public enum KeyCommandRouting {
     /// True when the key command should take priority over what the system does with the same keys (the shell sets
     /// `UIKeyCommand.wantsPriorityOverSystemBehavior`): always, except for a key without ⌘, ⌥ or ⌃ (a letter, an
     /// arrow, Space, Return, Tab, Delete or Escape, with or without ⇧) while text has the keyboard, where typing,
-    /// cursor movement and the text view's own Escape win.
+    /// cursor movement and the text view's own Escape win. Command-A also belongs to an active text input;
+    /// selecting library items must not steal Select All from a rename or colour field.
     public static func overridesSystemKeys(_ d: KeyCommandDescriptor, in context: KeyCommandContext) -> Bool {
-        !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+        if context.isEditingText, d.shortcut == KeyShortcut("a", [.command]) { return false }
+        return !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
     }
 
     /// How many document kinds a command is live in: its `docKinds`, or every kind when they are nil or empty.
