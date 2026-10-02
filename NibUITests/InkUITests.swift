@@ -746,6 +746,12 @@ final class InkUITests: XCTestCase {
 
     func testRestoreDefaultsCancelPreservesAndConfirmResetsOnlySelectedTool() throws {
         let defaults = swatches.map(\.label)
+        let defaultWidth = String(describing: try control("Thickness 2", type: .button).value)
+        try width(2, edit: true)
+        _ = try slider("Thickness", to: 0.8)
+        try tap("Dashed"); closePopover()
+        let customWidth = String(describing: try control("Thickness 2", type: .button).value)
+        XCTAssertNotEqual(customWidth, defaultWidth)
         try swatchMenu("Change Colour"); try chooseColour("Vermilion"); closePopover()
         let custom = swatches.map(\.label)
         try ui.selectTool("highlighter")
@@ -754,8 +760,13 @@ final class InkUITests: XCTestCase {
         try ui.selectTool("pen")
         try swatchMenu("Restore Default Presets"); cancelConfirmation()
         XCTAssertEqual(swatches.map(\.label), custom)
+        XCTAssertEqual(String(describing: try control("Thickness 2", type: .button).value), customWidth,
+                       "Cancel must preserve customised width and pattern as well as colours")
         try swatchMenu("Restore Default Presets"); try tap("cmd.preset.reset")
         try wait("Confirmed reset must restore pen defaults") { self.swatches.map(\.label) == defaults }
+        XCTAssertEqual(String(describing: try control("Thickness 2", type: .button).value), defaultWidth,
+                       "Restore Defaults must restore width and Solid pattern")
+        let blank = try raster(); try draw(); _ = try visibleInk(after: blank)
         try ui.selectTool("highlighter")
         XCTAssertEqual(swatches.map(\.label), highlighter, "Reset must not alter another tool")
     }
@@ -1032,11 +1043,16 @@ final class InkUITests: XCTestCase {
     func testHeldShapeAdjustmentChangesGeometryAndCommitsOnlyOnLift() throws {
         try settings("pen"); try toggle("Draw and Hold", to: true); closePopover()
         let before = try ui.state(), blank = try raster()
+        let endpointRegion = CGRect(x: 0.58, y: 0.68, width: 0.04, height: 0.04)
+        let blankEndpoint = try raster(endpointRegion)
         try heldPath(line, adjust: CGPoint(x: 0.60, y: 0.70))
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.strokeCountOnPage == before.strokeCountOnPage }
         _ = try visibleInk(after: blank)
         XCTAssertGreaterThan(try raster(CGRect(x: 0.58, y: 0.68, width: 0.04, height: 0.04)).darkPixels, 0,
                              "Moving the held tip must move the final shape endpoint")
+        XCTAssertGreaterThan(try raster(endpointRegion).changed(from: blankEndpoint), 10,
+                             "The adjusted endpoint must contain newly drawn geometry")
+        try assertNoNewInk(try ui.state())
         try undo(to: before)
     }
 

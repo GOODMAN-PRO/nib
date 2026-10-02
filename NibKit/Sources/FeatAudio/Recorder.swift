@@ -19,7 +19,9 @@ protocol AudioSampleSource: AnyObject {
 
 /// The microphone through AVAudioEngine's input tap.
 final class MicrophoneSource: AudioSampleSource {
-    private let engine = AVAudioEngine()
+    // Build the graph only after prepare() has activated the recording session. Constructing it
+    // under the previous category can initialise I/O against the route we are about to replace.
+    private lazy var engine = AVAudioEngine()
     private var tapped = false
     private var observer: NSObjectProtocol?
     /// The input changed under a running tap (headset in or out): the controller restarts capture.
@@ -148,6 +150,31 @@ final class Recorder {
     /// one (AudioRecord), so hours of silence are never encoded.
     static let maximumFill: Double = 600
 
+    private static let startupQueue = DispatchQueue(label: "app.nib.audio.startup", qos: .userInitiated)
+
+    /// Audio session activation and the first inputNode access make synchronous Core Audio RPCs.
+    /// Keep those, graph preparation and engine.start off the main actor so the permission return,
+    /// document presentation and system callbacks can finish while the microphone comes online.
+    static func open(url: URL, source: AudioSampleSource,
+                     onFailure: @escaping @MainActor (Error) -> Void) async throws -> Recorder {
+        try await withCheckedThrowingContinuation { continuation in
+            startupQueue.async {
+                var recorder: Recorder?
+                do {
+                    let ready = try Recorder(url: url, source: source)
+                    recorder = ready
+                    ready.onFailure = onFailure
+                    try ready.start()
+                    continuation.resume(returning: ready)
+                } catch {
+                    if let recorder { recorder.closeFile() } else { source.close() }
+                    try? FileManager.default.removeItem(at: url)
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     let url: URL
     let sampleRate: Double
     let format: AVAudioFormat
@@ -166,13 +193,12 @@ final class Recorder {
     private var converter: AVAudioConverter?             // the delivering thread
 
     /// `url` is the live file (`.aac`).
-    init(url: URL, source: AudioSampleSource) throws {
+    private init(url: URL, source: AudioSampleSource) throws {
         let input = try source.prepare()
         let rate = Self.aacRates.contains(input) ? input : 48_000
         guard input > 0,
               let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)
         else {
-            source.close()
             throw NibError.unavailable("a microphone")
         }
         let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate,
@@ -181,7 +207,6 @@ final class Recorder {
         do {
             file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
         } catch {
-            source.close()
             throw NibError(.internalError, "The audio file could not be created: \(error.localizedDescription)")
         }
         self.url = url
@@ -360,14 +385,8 @@ extension AudioController {
         defer { starting = false }
         stopPlayback()
         let source = try await captureSource()
-        let recorder = try Recorder(url: url, source: source)
-        recorder.onFailure = { [weak self] error in self?.recordingFailed(error) }
-        do {
-            try recorder.start()
-        } catch {
-            _ = await recorder.finish()
-            try? FileManager.default.removeItem(at: url)
-            throw error
+        let recorder = try await Recorder.open(url: url, source: source) { [weak self] error in
+            self?.recordingFailed(error)
         }
         LiveRecordings.add(doc: doc, clip: clip)
         let now = clock()

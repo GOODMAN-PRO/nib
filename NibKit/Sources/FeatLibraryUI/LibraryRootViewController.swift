@@ -783,20 +783,28 @@ struct LibraryRootView: View {
 }
 
 /// SwiftUI owns focus after a grid button is selected. Install the registered
-/// selection commands in that hosting tree as well as the shell's responder chain.
+/// library commands in that hosting tree as well as the shell's responder chain.
 struct LibrarySelectionShortcuts: View {
     @ObservedObject var model: LibraryViewModel
     static func isEnabled(_ model: LibraryViewModel) -> Bool {
-        model.selection.isSelecting && model.tab == nil && model.modal == nil && model.menu == nil &&
+        model.selection.isSelecting && canRoute(model)
+    }
+    private static func canRoute(_ model: LibraryViewModel) -> Bool {
+        model.tab == nil && model.modal == nil && model.menu == nil &&
             model.renaming == nil && model.floating.presentedIDs.isEmpty && !model.session.isEditingText
+    }
+    static func descriptors(_ model: LibraryViewModel) -> [KeyCommandDescriptor] {
+        guard canRoute(model) else { return [] }
+        let context = KeyCommandContext(inDocument: false, docKind: nil)
+        return KeyCommandRouting.active(model.app.content.keyCommands.all, in: context).filter {
+            $0.scope == .library && ($0.owner != FeatLibraryUIFeature.id || isEnabled(model))
+        }
     }
     var body: some View {
         Group {
-            if Self.isEnabled(model) {
-                ForEach(model.app.content.keyCommands.all.filter { $0.owner == FeatLibraryUIFeature.id }, id: \.id) { descriptor in
-                    Button(descriptor.title) { model.perform(descriptor.command, descriptor.resolvedParams(for: model.session)) }
-                        .keyboardShortcut(shortcut(descriptor.shortcut))
-                }
+            ForEach(Self.descriptors(model), id: \.id) { descriptor in
+                Button(descriptor.title) { model.perform(descriptor.command, descriptor.resolvedParams(for: model.session)) }
+                    .keyboardShortcut(shortcut(descriptor.shortcut))
             }
         }
         .frame(width: 0, height: 0)

@@ -212,6 +212,31 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(model.modal?.params["folder"], "lib")
     }
 
+    func testContributedLibraryShortcutIsRoutedWithoutSelectionAndKeepsWindowParent() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.ui.panels.register(PanelDescriptor(id: "organize.folder.new", title: "New Folder", icon: "folder",
+            placement: .sheet, order: 0, owner: "organize") { _ in AnyView(EmptyView()) })
+        h.app.content.keyCommands.register(KeyCommandDescriptor(id: "organize.newFolder", title: "New Folder",
+            shortcut: KeyShortcut("n", [.command, .control]), command: CommandIDs.panelOpen,
+            params: ["id": "organize.folder.new"], scope: .library, owner: "organize"))
+        // Stand in for F017's library forwarding; this target owns the browser and its focused host.
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel",
+            summary: "Forward to the library", effect: .session, target: .app)) { params, context in
+            try await context.execute(CommandIDs.librarySetView, ["panel": params["id"] ?? .null])
+        }
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "folder:FIXTUREFLD01"], session: h.session)
+        XCTAssertFalse(model.selection.isSelecting)
+        let key = try XCTUnwrap(LibrarySelectionShortcuts.descriptors(model).first { $0.id == "organize.newFolder" })
+        XCTAssertEqual(key.shortcut, KeyShortcut("n", [.command, .control]))
+        model.session.isEditingText = true
+        XCTAssertTrue(LibrarySelectionShortcuts.descriptors(model).isEmpty)
+        model.session.isEditingText = false
+        _ = try await h.app.bus.execute(key.command, key.resolvedParams(for: h.session), session: h.session)
+        XCTAssertEqual(model.modal?.id, "organize.folder.new")
+        XCTAssertEqual(model.modal?.params["folder"], "folder:FIXTUREFLD01")
+        XCTAssertTrue(LibrarySelectionShortcuts.descriptors(model).isEmpty, "The presented sheet owns keyboard input")
+    }
+
     func testAccessibilityReflowStepUsesSameDropAndHonoursBothBoundaries() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         await model.appear()

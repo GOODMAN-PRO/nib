@@ -6,6 +6,7 @@ import NibContracts
 @MainActor
 final class QAStateProbe: UIView {
     private weak var shell: ShellViewController?
+    let clipboardProbe = QAClipboardProbe()
 
     init(shell: ShellViewController) {
         self.shell = shell
@@ -53,6 +54,7 @@ final class QAStateProbe: UIView {
                 "itemCountOnPage": .number(Double(items.filter { !$0.deleted }.count)),
                 "strokeCountOnPage": .number(Double(items.filter { !$0.deleted && $0.kind == .stroke }.count)),
                 "selectionCount": .number(Double(session.selection.items.count)),
+                "clipboardChangeCount": .number(Double(UIPasteboard.general.changeCount)),
                 "undoAvailable": .bool(UndoRoute.resolve(redo: false, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
                 "redoAvailable": .bool(UndoRoute.resolve(redo: true, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
                 "openPanels": .array(session.openPanels.sorted().map(JSONValue.string)),
@@ -78,5 +80,28 @@ final class QAStateProbe: UIView {
             if let canvas = findCanvas(in: child) { return canvas }
         }
         return nil
+    }
+}
+
+/// Keeps fragment bytes out of the compact state JSON. The helper checks that Copy changed the clipboard before
+/// consuming this payload; Nib can read its own output without cross-app authorization.
+@MainActor
+final class QAClipboardProbe: UIView {
+    init() {
+        super.init(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        isUserInteractionEnabled = false
+        isAccessibilityElement = true
+        accessibilityIdentifier = "nib.qa.clipboard"
+        accessibilityLabel = "QA copied fragment"
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var accessibilityValue: String? {
+        get {
+            let snapshot = NibUITestClipboardSnapshot(pasteboard: .general)
+            return (try? JSONEncoder().encode(snapshot)).map { String(decoding: $0, as: UTF8.self) }
+        }
+        set { }
     }
 }

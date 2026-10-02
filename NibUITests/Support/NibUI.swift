@@ -26,6 +26,7 @@ struct QAState: Decodable {
     let rendererCachePurgeCount: Int?
     let memoryWarningCount: Int?
     let cachedPageCount: Int?
+    let clipboardChangeCount: Int?
 }
 
 /// All coordinates are normalized to the real canvas viewport, not the whole device screen.
@@ -86,6 +87,25 @@ final class NibUI {
 
     func tapCommand(_ id: String) throws {
         try tapControl("cmd." + id, overflow: ["menu.more", "tool.more"])
+    }
+
+    /// Uses the real Copy control and reads its actual pasteboard output in the writing app. A background runner's
+    /// UIPasteboard.data read can be denied or stall indefinitely; clipboard contents are not a session-state proxy.
+    func copyFragment() throws -> Data {
+        struct Snapshot: Decodable {
+            let changeCount: Int
+            let fragment: Data?
+        }
+        let before = try XCTUnwrap(state().clipboardChangeCount, "Missing clipboard revision")
+        try tapCommand("clipboard.copy")
+        _ = try waitForState(timeout: 8) { ($0.clipboardChangeCount ?? before) > before }
+        let probe = app.descendants(matching: .any)["nib.qa.clipboard"].firstMatch
+        let value = try XCTUnwrap(probe.value as? String, "Missing copied-fragment probe")
+        let snapshot = try JSONDecoder().decode(Snapshot.self, from: Data(value.utf8))
+        guard snapshot.changeCount > before, let fragment = snapshot.fragment else {
+            throw Failure.message("Copy must export a fresh app.nib.fragment")
+        }
+        return fragment
     }
 
     func selectTool(_ id: String) throws {

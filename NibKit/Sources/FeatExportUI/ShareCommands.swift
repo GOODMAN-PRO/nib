@@ -319,17 +319,15 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
     func deliver(_ urls: [URL], destination: String, ctx: CommandContext) async throws -> Bool {
         let parent = try ExportPresentation.topController(ctx)
         if destination == "files" {
+            guard parent.viewIfLoaded?.window != nil, !parent.isBeingDismissed,
+                  parent.presentedViewController == nil else {
+                throw NibError.unavailable("a window ready to export")
+            }
             let picker = UIDocumentPickerViewController(forExporting: urls, asCopy: true)
             picker.delegate = self
             ExportPresentation.anchor(picker, in: parent)
-            guard fileCompletion == nil else { throw NibError.unavailable("a free file picker") }
-            return try await withCheckedThrowingContinuation { continuation in
-                fileCompletion = continuation
-                // UIKit attaches the presentation asynchronously. Checking immediately can
-                // finish the command and delete its staging files while Files still reads them.
-                parent.present(picker, animated: !UIAccessibility.isReduceMotionEnabled) { [weak self, weak picker] in
-                    if picker?.presentingViewController == nil { self?.finishFiles(false) }
-                }
+            return try await waitForFiles {
+                parent.present(picker, animated: !UIAccessibility.isReduceMotionEnabled)
             }
         }
         let activity = UIActivityViewController(activityItems: urls, applicationActivities: nil)
@@ -352,9 +350,21 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
             }
         }
     }
+    /// Presentation is not delivery: Files reads these URLs later, after the user chooses
+    /// a destination. Only the picker delegate may release the command's staging files.
+    func waitForFiles(present: () -> Void) async throws -> Bool {
+        guard fileCompletion == nil else { throw NibError.unavailable("a free file picker") }
+        // UIDocumentPickerViewController.delegate is weak. Keep its owner alive until
+        // the delegate completes this operation, including while the task is suspended.
+        defer { withExtendedLifetime(self) {} }
+        return try await withCheckedThrowingContinuation { continuation in
+            fileCompletion = continuation
+            present()
+        }
+    }
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finishFiles(false) }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { finishFiles(!urls.isEmpty) }
-    private func finishFiles(_ value: Bool) {
+    func finishFiles(_ value: Bool) {
         let completion = fileCompletion
         fileCompletion = nil
         completion?.resume(returning: value)

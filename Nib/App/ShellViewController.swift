@@ -45,6 +45,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             let probe = QAStateProbe(shell: self)
             qaProbe = probe
             view.addSubview(probe)
+            view.addSubview(probe.clipboardProbe)
         }
         registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
             (shell: ShellViewController, _: UITraitCollection) in
@@ -416,7 +417,10 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         addChild(vc)
         setOverrideTraitCollection(chromeTraits, forChild: vc)
         view.addSubview(vc.view)
-        if let qaProbe { view.bringSubviewToFront(qaProbe) }
+        if let qaProbe {
+            view.bringSubviewToFront(qaProbe)
+            view.bringSubviewToFront(qaProbe.clipboardProbe)
+        }
         vc.didMove(toParent: self)
         content = vc
         keyCommandCache = nil

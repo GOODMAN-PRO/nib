@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import UIKit
 import NibContracts
 import NibDesign
@@ -152,6 +153,100 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertEqual(undo.resolvedParams(for: library), [:])
         XCTAssertEqual(undo.isEnabled?(library), false)
         XCTAssertEqual(undo.resolvedTitle(for: library), "Undo")
+    }
+
+    /// CreateUITests' QuickNote sequence, using the registered toolbar commands and real stored strokes.
+    /// The invoking window must keep its document even when another window is active.
+    func testToolbarUndoRedoRetainsStrokeIdentityInTheInvokingDocument() async throws {
+        let h = harness()
+        let doc = NibID.make(), page = NibID.make()
+        let content = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook), pages: [
+            PageRecord(id: page, order: "V", size: .a4, background: .ofTemplate("builtin.ruled"))
+        ])
+        _ = try h.library.createDocument(content, title: "Untitled", in: nil)
+        h.session.document = doc
+        h.session.page = page
+        let undo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
+        let redo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.redo)))
+        let otherWindow = EditorSession()
+        otherWindow.document = Fixtures.docID
+        h.app.services.sessions.add(otherWindow)
+
+        func run(_ button: ToolbarItemDescriptor) async throws {
+            XCTAssertEqual(button.isEnabled?(h.session), true)
+            let result = try await h.app.bus.execute(try XCTUnwrap(button.command),
+                button.resolvedParams(for: h.session), session: h.session)
+            XCTAssertEqual(result["done"]?.boolValue, true)
+        }
+        func strokes() throws -> [Item] { try h.app.workspace.items(doc, page: page) }
+
+        var expected: [Item] = []
+        for _ in 0..<2 {
+            let stroke = Stroke(style: .defaultPen, points: [
+                StrokePoint(x: 40, y: 60, width: 2, height: 2),
+                StrokePoint(x: 60, y: 66, width: 2, height: 2)
+            ])
+            let written = try await h.insert([Item(kind: .stroke, stroke: stroke)], page: page, doc: doc)
+            XCTAssertEqual(try strokes().count, expected.count + 1)
+            try await run(undo)
+            XCTAssertEqual(try strokes().map(\.id), expected.map(\.id))
+            XCTAssertTrue(h.app.bus.history.canRedo(doc))
+            try await run(redo)
+            expected += written
+            XCTAssertEqual(try strokes().map(\.id), expected.map(\.id))
+            XCTAssertEqual(try strokes().map(\.stroke), expected.map(\.stroke))
+            XCTAssertEqual(h.session.document, doc)
+            XCTAssertEqual(h.session.page, page)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+    }
+
+    /// A retained closed popover must not consume the next tap on Undo. This exercises UIKit's actual
+    /// scroll hit target, which can survive SwiftUI hiding the popover's contents.
+    func testClosedPopoverLeavesUndoHitTargetAccessible() async throws {
+        let h = harness()
+        let undo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
+        func chrome(presented: Bool) -> some View {
+            ZStack {
+                NibToolbarItem(.undo, label: undo.resolvedTitle(for: h.session)) {
+                    h.app.perform(CommandIDs.undo, undo.resolvedParams(for: h.session), session: h.session)
+                }
+                NibPopoverPanel(title: "Document menu") { Text("Retained menu content") }
+                    .budsFrom("title", isPresented: .constant(presented))
+            }
+        }
+        let host = UIHostingController(rootView: chrome(presented: false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrollView(in view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { scrollView(in: $0) }.first
+        }
+        for presented in [false, true, false] {
+            host.rootView = chrome(presented: presented)
+            for _ in 0..<5 {
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let scroll = try XCTUnwrap(scrollView(in: host.view))
+            let point = CGPoint(x: host.view.bounds.midX, y: host.view.bounds.midY)
+            XCTAssertTrue(scroll.bounds.contains(scroll.convert(point, from: host.view)),
+                          "The retained menu must overlap Undo to exercise interception")
+            let hit = try XCTUnwrap(host.view.hitTest(point, with: nil))
+            XCTAssertEqual(hit.isDescendant(of: scroll), presented,
+                           "Closing the menu must return the centre tap to Undo")
+            XCTAssertEqual(scroll.isUserInteractionEnabled, presented)
+            if !presented {
+                // Reproduce the original native-host state: the same point is swallowed even though
+                // the menu's presentation binding is false. Restore it before the next lifecycle step.
+                scroll.isUserInteractionEnabled = true
+                let intercepted = try XCTUnwrap(host.view.hitTest(point, with: nil))
+                XCTAssertTrue(intercepted.isDescendant(of: scroll))
+                scroll.isUserInteractionEnabled = false
+            }
+        }
     }
 
     /// Shell v2 falls back to the window's UndoManager when the document has nothing to undo. The ⌘Z / ⇧⌘Z titles

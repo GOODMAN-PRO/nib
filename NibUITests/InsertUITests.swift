@@ -165,10 +165,7 @@ final class InsertUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == $0.itemCountOnPage }
     }
     private func fragment() throws -> JSON {
-        UIPasteboard.general.items = []
-        try ui.tapCommand("clipboard.copy")
-        try wait("Copy must export a Nib fragment") { UIPasteboard.general.data(forPasteboardType: "app.nib.fragment") != nil }
-        let data = try XCTUnwrap(UIPasteboard.general.data(forPasteboardType: "app.nib.fragment"))
+        let data = try ui.copyFragment()
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? JSON)
     }
     private func items() throws -> [JSON] { try XCTUnwrap(fragment()["items"] as? [JSON]) }

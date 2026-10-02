@@ -32,7 +32,7 @@ final class FeatExportUITests: XCTestCase {
             let data = Fixtures.pdfData()
             let asset = try ctx.services.assets!.putTemporary(data, ext: "pdf")
             return ["files": .array((0..<probe.fileCount).map { index in
-                ["asset": .string("tmp:" + asset.name), "name": .string("Notes\(index).pdf"), "bytes": .number(Double(data.count))]
+                ["asset": .string("tmp:" + asset.name), "name": .string(probe.fileName ?? "Notes\(index).pdf"), "bytes": .number(Double(data.count))]
             })]
         }
         return (h, presenter, probe)
@@ -318,6 +318,49 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertEqual(ExportFiles.uniqueName("notes.pdf", used: &used), "notes (2).pdf")
     }
 
+    func testFilesExportKeepsReadablePDFsUntilSaveOrCancelThenCleansUp() async throws {
+        for saved in [true, false] {
+            let (h, presenter, probe) = harness()
+            probe.fileCount = 2
+            probe.fileName = "Physics — Motion.pdf"
+            let system = SystemExportPresenter()
+            defer { system.finishFiles(false) }
+            let presented = expectation(description: "Files presentation requested")
+            var deliveredURLs: [URL] = []
+            var completed = false
+            presenter.onDelivery = { urls in
+                deliveredURLs = urls
+                return try await system.waitForFiles { presented.fulfill() }
+            }
+            let export = Task {
+                let result = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"], "destination": "files"])
+                completed = true
+                return result
+            }
+            await fulfillment(of: [presented], timeout: 5)
+            // The presentation call has returned, but a destination has not been picked.
+            // Let queued work run: export completion here would delete Files' source PDFs.
+            await Task.yield()
+            XCTAssertFalse(completed)
+            XCTAssertEqual(deliveredURLs.map(\.lastPathComponent), ["Physics — Motion.pdf", "Physics — Motion (2).pdf"])
+            for url in deliveredURLs {
+                XCTAssertNotNil(PDFDocument(data: try Data(contentsOf: url)))
+            }
+            do {
+                _ = try await system.waitForFiles { XCTFail("A second picker replaced the pending delivery") }
+                XCTFail("Concurrent file delivery was accepted")
+            } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+            system.finishFiles(saved)
+            system.finishFiles(!saved) // A duplicate callback must not resume twice or change the outcome.
+            let result = try await export.value
+            XCTAssertEqual(result["completed"], .bool(saved))
+            let cleaned = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                deliveredURLs.allSatisfy { !FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().path) }
+            }, object: nil)
+            await fulfillment(of: [cleaned], timeout: 5)
+        }
+    }
+
     func testMixedPDFSizesRemainSeparatePrintPages() throws {
         let portrait = CGRect(x: 0, y: 0, width: 595, height: 842)
         let landscape = CGRect(x: 0, y: 0, width: 842, height: 595)
@@ -402,6 +445,7 @@ final class FeatExportUITests: XCTestCase {
 private final class ExportProbe {
     var calls: [JSONValue] = []
     var fileCount = 1
+    var fileName: String?
     var onExport: (() -> Void)?
 }
 
@@ -413,6 +457,7 @@ private final class RecordingExportPresenter: ExportPresenting {
     var filesExistedDuringDelivery = false
     var printCount = 0
     var lockedScreens = 0
+    var onDelivery: (([URL]) async throws -> Bool)?
     func showLocked(doc: DocumentID, retry: String, params: JSONValue, ctx: CommandContext) async throws { lockedScreens += 1 }
     func show(selection: ExportSelection, draft: ExportDraft, printing: Bool, instant: Bool, ctx: CommandContext) async throws {
         self.selection = selection
@@ -421,6 +466,7 @@ private final class RecordingExportPresenter: ExportPresenting {
     func deliver(_ urls: [URL], destination: String, ctx: CommandContext) async throws -> Bool {
         destinations.append(destination)
         filesExistedDuringDelivery = urls.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+        if let onDelivery { return try await onDelivery(urls) }
         return true
     }
     func printPDF(_ url: URL, title: String, ctx: CommandContext) async throws -> Bool {
