@@ -305,7 +305,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                   self.tracks.isEmpty, let touches = event.allTouches,
                   let touch = touches.first(where: { $0.phase == .began }),
                   let target = host.pagePoint(self.surfaceContainer.convert(point, to: host.canvasView)),
-                  case .tool(let tool) = self.decision(touch), tool.inputMode == .pencilKit,
+                  case .tool(let tool) = self.decision(touch, remember: false), tool.inputMode == .pencilKit,
                   self.inputPage != target.page else { return }
             self.inputPage = target.page
             self.updateSurfaces()
@@ -446,10 +446,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             guard surface.acceptedContacts.isEmpty || surface.acceptedContacts.contains(contact),
                   let sample = TouchTap.sample(touch, event: event, touchID: 0, host: host),
                   sample.page == surface.page, surface.region.contains(sample.location) else { return false }
-            if case .tool(let tool) = self.decision(touch), tool.inputMode == .pencilKit {
-                surface.acceptedContacts.insert(contact)
-                return true
-            }
+            // UIKit may hit-test speculatively, or again after touchesEnded. A probe is not
+            // contact delivery: reserving it here can permanently exclude the next finger.
+            // TouchTap admits the contact from its actual hit view in begin(_:event:id:).
+            if case .tool(let tool) = self.decision(touch, remember: false), tool.inputMode == .pencilKit { return true }
             return false
         }
         surfaces.append(surface)
@@ -500,7 +500,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     // MARK: Routing and palm rejection
 
-    private func decision(_ touch: UITouch) -> GestureRouter.Route {
+    private func decision(_ touch: UITouch, remember: Bool = true) -> GestureRouter.Route {
         let key = ObjectIdentifier(touch)
         if let route = decisions[key] { return route }
         guard let host = host else { return .rejected }
@@ -513,7 +513,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         if case .attachment = candidate { route = candidate }
         else if rejectsPalm(touch, host: host) { route = .rejected }
         else { route = candidate }
-        decisions[key] = route
+        if remember { decisions[key] = route }
         return route
     }
 
@@ -550,10 +550,6 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
            }) {
             let contact = ObjectIdentifier(touch)
             surface.acceptedContacts.insert(contact)
-            if surface.awaitingContact {
-                surface.startedContact = contact
-                surface.awaitingContact = false
-            }
         }
         begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: route,
               contact: ObjectIdentifier(touch))
@@ -595,6 +591,12 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             track.capture = capture
             if tool.inputMode == .pencilKit {
                 capture.surface = surface
+                // PencilKit can begin before our observing recognizer receives touchesBegan.
+                // Bind that native begin only when the actual contact is admitted, never at hit-test time.
+                if let surface = surface, surface.awaitingContact {
+                    surface.startedContact = contact
+                    surface.awaitingContact = false
+                }
                 surface?.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
                                          nativeStarted: surface?.startedContact == capture.contact)
                 if surface?.startedContact == capture.contact { surface?.nativeCaptureID = capture.id }

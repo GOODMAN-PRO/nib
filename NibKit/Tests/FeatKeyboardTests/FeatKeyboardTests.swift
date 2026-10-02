@@ -630,6 +630,78 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
     }
 
+    func testCanvasActionDiscoveryRoutesSelectAllAndGoToPage() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let root = KeyboardWindowController(session: h.session)
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let keyboard = attachment.keyboard
+        keyboard.restoreFocus()
+        let focused = try XCTUnwrap(CanvasKeyboardFocus.firstResponder(in: window))
+        XCTAssertTrue(focused === keyboard)
+
+        // The Pages feature's dialog wins over F073's fallback, as it does in the app.
+        var go = descriptor("pages.goToPage", "g", [.command, .option], scope: .document,
+                            kinds: [.notebook, .whiteboard], owner: "pages", command: CommandIDs.panelOpen)
+        go.params = ["id": "pages.goToPage"]
+        h.app.content.keyCommands.register(go)
+        let recorder = stand(in: h, for: [CommandIDs.selectionSelectAll, CommandIDs.panelOpen])
+        let selectAll = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == "a" })
+        let goToPage = try XCTUnwrap(keyboard.keyCommands?.first {
+            $0.input == "g" && $0.modifierFlags == [.command, .alternate]
+        })
+        for (key, command) in [(selectAll, CommandIDs.selectionSelectAll), (goToPage, CommandIDs.panelOpen)] {
+            let action = try XCTUnwrap(key.action)
+            // Hardware keyboard discovery asks about the selector before providing a concrete key.
+            XCTAssertTrue(focused.canPerformAction(action, withSender: nil))
+            XCTAssertTrue(focused.canPerformAction(action, withSender: NSObject()))
+            let target = try XCTUnwrap(focused.target(forAction: action, withSender: nil) as? UIResponder)
+            XCTAssertTrue(target === keyboard)
+            XCTAssertTrue(target.canPerformAction(action, withSender: key))
+            XCTAssertTrue(key.wantsPriorityOverSystemBehavior)
+            let ran = expectation(description: command)
+            recorder.onCall = { if $0 == command { ran.fulfill() } }
+            _ = target.perform(action, with: key)
+            await fulfillment(of: [ran], timeout: 3)
+            recorder.onCall = nil
+        }
+        XCTAssertEqual(recorder.params(CommandIDs.selectionSelectAll),
+                       [["page": .string(NodeRef.page(doc, Fixtures.page1).description)]])
+        XCTAssertEqual(recorder.params(CommandIDs.panelOpen), [["id": "pages.goToPage"]])
+        XCTAssertTrue(h.app.ui.activeNavigator === root)
+        XCTAssertTrue(h.app.services.sessions.active === h.session)
+
+        let action = try XCTUnwrap(selectAll.action)
+        // A settings/search field need not set session.isEditingText to keep native Select All.
+        let field = UITextField(frame: CGRect(x: 20, y: 20, width: 200, height: 44))
+        root.view.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        XCTAssertFalse(h.session.isEditingText)
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: selectAll))
+        XCTAssertTrue(keyboard.canPerformAction(action, withSender: goToPage))
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+
+        // Accepting discovery must not make a fabricated/stale concrete command executable.
+        let stale = UIKeyCommand(title: "Removed", action: action, input: "a",
+                                 modifierFlags: .command, propertyList: "removed.shortcut")
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: stale))
+        h.session.document = nil
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: NSObject()))
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: selectAll))
+        h.session.document = doc
+        attachment.detach(from: host)
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+    }
+
     func testCanvasFocusRecoveryAfterRemovalAndRotationPreservesTextFields() async throws {
         let h = await started()
         let host = FakeCanvasHost(h)

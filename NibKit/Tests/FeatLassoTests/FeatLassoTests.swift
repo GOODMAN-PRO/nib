@@ -1,6 +1,8 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatLasso
 
@@ -372,6 +374,160 @@ final class FeatLassoTests: XCTestCase {
     }
 
     // MARK: The overlay
+
+    func testLassoSettingsPopoverReopensAndReleasesCanvasTouchesWhenClosed() async throws {
+        let h = harness()
+        let settings = try XCTUnwrap(FeatLassoFeature.toolbarItem(h.app).settings?(h.session))
+        func root(presented: Bool) -> some View {
+            NibDropletContainer {
+                NibBudPopover(id: "test.lasso.settings", source: "test.lasso",
+                              isPresented: .constant(presented), title: "Lasso") { settings }
+            }
+        }
+        let host = UIHostingController(rootView: root(presented: false))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        func scrollViews(_ view: UIView) -> [UIScrollView] {
+            (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews)
+        }
+        for presented in [false, true, false, true, false] {
+            host.rootView = root(presented: presented)
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                host.view.layoutIfNeeded()
+                let panels = scrollViews(host.view)
+                if !panels.isEmpty && panels.allSatisfy({ $0.isUserInteractionEnabled == presented
+                    && $0.accessibilityElementsHidden == !presented }) { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            let panels = scrollViews(host.view)
+            XCTAssertFalse(panels.isEmpty, "Settings stays mounted while its popover closes")
+            for panel in panels {
+                XCTAssertEqual(panel.isUserInteractionEnabled, presented)
+                XCTAssertEqual(panel.accessibilityElementsHidden, !presented)
+                if !presented {
+                    XCTAssertNil(panel.hitTest(CGPoint(x: panel.bounds.midX, y: panel.bounds.midY), with: nil),
+                                 "Closed Lasso settings must release taps and loops to the canvas")
+                }
+            }
+        }
+    }
+
+    func testSelectionOverlayPublishesIncomingBoundsAndClearWithoutQueuedCanvasRefresh() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        let overlay = SelectionOverlay()
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+
+        try await h.run("selection.set", ["refs": [.string(ref(Fixtures.imageID))]])
+        XCTAssertEqual(overlay.view.content?.box, CGRect(x: 320, y: 480, width: 64, height: 64))
+        // Change synchronously, as a command does. Reading session.selection from the publisher
+        // instead of its incoming value would draw the previous image here.
+        let next = Rect(x: 120, y: 240, width: 150, height: 90)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1,
+                                        items: [Fixtures.shapeID], bounds: next)
+        XCTAssertEqual(overlay.view.content?.box, next.cg)
+        XCTAssertEqual(overlay.view.accessibilityValue, "1 item")
+
+        h.session.selection = Selection()
+        XCTAssertNil(overlay.view.content)
+        XCTAssertFalse(overlay.view.isAccessibilityElement)
+        XCTAssertTrue(overlay.view.accessibilityElementsHidden)
+        XCTAssertEqual(overlay.view.accessibilityFrame, .zero)
+    }
+
+    func testSelectionAccessibilityBoundsFollowAncestorLayoutBeforeCanvasRefresh() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        let controller = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        controller.view.addSubview(host.canvasView)
+        let overlay = SelectionOverlay()
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        try await h.run("selection.set", ["refs": [.string(ref(Fixtures.imageID))]])
+        overlay.canvasDidChange(host)
+        let before = overlay.view.accessibilityFrame
+
+        // A parent layout/scroll happens before the canvas's next notification. The content
+        // is already at its new screen location; the VoiceOver target must follow immediately.
+        host.canvasView.frame.origin = CGPoint(x: 80, y: 114)
+        host.canvasView.bounds.origin = CGPoint(x: -35, y: 60)
+        let box = try XCTUnwrap(overlay.view.content?.box)
+        let expected = UIAccessibility.convertToScreenCoordinates(box, in: overlay.view)
+        XCTAssertNotEqual(before, expected)
+        XCTAssertEqual(overlay.view.accessibilityFrame, expected)
+        XCTAssertNil(overlay.view.hitTest(CGPoint(x: box.midX, y: box.midY), with: nil),
+                     "The accessible outline must never intercept a canvas tap or lasso")
+
+        overlay.detach(from: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1,
+                                        items: [Fixtures.imageID], bounds: Rect(x: 1, y: 2, width: 3, height: 4))
+        XCTAssertNil(overlay.view.content, "A detached overlay stops observing the session")
+    }
+
+    func testNarrowLowerStrokeLoopAndEmptyTapPreserveBothLines() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        host.zoomScale = 1.2767101196075796
+        h.session.zoom = host.zoomScale
+        h.session.tool = "lasso"
+        let lowerID: ElementID = "LOWERSTROK01"
+        let upperID: ElementID = "UPPERSTROK01"
+        // Reproduce the UI test's viewport geometry on the fitted, inset page.
+        func point(_ x: Double, _ y: Double) -> Point {
+            Point((x * 1376 - 352) / host.zoomScale, (y * 1032 - 124.2) / host.zoomScale)
+        }
+        editFixturePage(h) { items in
+            items = [(upperID, 0.56), (lowerID, 0.73)].map { id, y in
+                let pts = [point(0.42, y), point(0.56, y)]
+                return Item(id: id, kind: .stroke, z: y == 0.56 ? "a" : "b",
+                            stroke: Stroke(style: .defaultPen, points: pts.map {
+                                StrokePoint(x: Float($0.x), y: Float($0.y))
+                            }))
+            }
+        }
+        let before = try h.snapshot()
+        let tool = LassoTool()
+        let loop = [point(0.38, 0.69), point(0.63, 0.69), point(0.63, 0.77),
+                    point(0.38, 0.77), point(0.38, 0.69)]
+        for pass in 0..<2 {
+            let samples = loop.enumerated().map { index, p in
+                CanvasSample(page: Fixtures.page1, location: p, timestamp: Double(index) * 0.175,
+                             isPencil: false, touchID: pass + 1)
+            }
+            tool.touchesBegan(samples[0], host: host)
+            tool.touchesMoved(Array(samples[1...3]), host: host)
+            tool.touchesEnded(samples[4], host: host)
+            await tool.pending?.value
+            XCTAssertEqual(h.session.selection.items, [lowerID])
+            let bounds = try XCTUnwrap(h.session.selection.bounds)
+            XCTAssertTrue(bounds.contains(point(0.49, 0.73)))
+            XCTAssertFalse(bounds.contains(point(0.49, 0.56)))
+
+            let empty = point(0.68, 0.82)
+            if pass == 0 {
+                // Finger taps run the tap chain; Pencil taps go directly to the active tool.
+                let out = try await h.run("selection.tapAt", ["page": .string(pageRef),
+                    "point": .array([.number(empty.x), .number(empty.y)]), "gesture": "tap"])
+                XCTAssertEqual(out["handled"]?.boolValue, true)
+            } else {
+                tool.tap(CanvasSample(page: Fixtures.page1, location: empty), host: host)
+                await tool.pending?.value
+            }
+            XCTAssertTrue(h.session.selection.isEmpty)
+            XCTAssertEqual(h.session.tool, "lasso")
+            XCTAssertEqual(try h.snapshot(), before, "Selection and clearing must preserve source ink and geometry")
+        }
+    }
 
     func testOverlayDrawsTheOutlineAndBoundsAndFollowsTheSelection() async throws {
         let h = harness()

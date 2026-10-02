@@ -685,7 +685,8 @@ final class SelectionUITests: XCTestCase {
         }
     }
     func testLockPreventsDragUntilUnlocked() throws {
-        try selectedInk(); let b = try bounds(), before = try ui.state()
+        // ARCHITECTURE §6.1 limits item.setLocked to images, text boxes, shapes and sticky notes.
+        try pasteImage(); let b = try bounds(), before = try ui.state()
         try menu("Lock")
         XCTAssertTrue(query("cmd.item.setLocked").firstMatch.waitForExistence(timeout: 5))
         drag(centre(b), CGPoint(x: b.midX + 60, y: b.midY + 25))

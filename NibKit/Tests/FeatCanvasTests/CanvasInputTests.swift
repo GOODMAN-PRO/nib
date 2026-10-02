@@ -386,6 +386,108 @@ final class CanvasInputTests: XCTestCase {
     }
     private func waitForGesture() async throws { try await Task.sleep(nanoseconds: 380_000_000) }
 
+    private final class HitTestTouch: UITouch {
+        let target: UIView
+        let point: CGPoint
+        var contactPhase: UITouch.Phase = .began
+        init(target: UIView, point: CGPoint) { self.target = target; self.point = point; super.init() }
+        override var type: UITouch.TouchType { .pencil }
+        override var phase: UITouch.Phase { contactPhase }
+        override var view: UIView? { target }
+        override func location(in view: UIView?) -> CGPoint { target.convert(point, to: view) }
+    }
+    private final class HitTestEvent: UIEvent {
+        let contact: UITouch
+        init(_ contact: UITouch) { self.contact = contact; super.init() }
+        override var allTouches: Set<UITouch>? { [contact] }
+    }
+
+    func testSpeculativeAndEndedHitTestsDoNotReserveTheNextDrawingContact() throws {
+        let tool = Tool(); tool.inputMode = .pencilKit
+        let (_, editor, input) = try installed(tool)
+        defer { editor.closeCanvas() }
+        let canvas = try XCTUnwrap(canvases(editor.host.wetInkContainer).first { $0.isUserInteractionEnabled })
+        let start = event(editor.host, id: 190)
+        let point = canvas.convert(editor.host.viewPoint(start.location, page: start.page), from: editor.host.canvasView)
+        let probe = HitTestTouch(target: canvas, point: point)
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(probe)))
+        probe.contactPhase = .ended
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(probe)))
+        let delivered = HitTestTouch(target: canvas, point: point)
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(delivered)),
+                        "Hit testing must not reserve a contact that UIKit never delivered")
+        XCTAssertTrue(input.acceptContact(ObjectIdentifier(delivered), sample: start) === canvas)
+        input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(delivered))
+        input.canvasViewDidBeginUsingTool(canvas)
+        input.end(start)
+        input.canvasViewDidEndUsingTool(canvas)
+        // UIKit may ask about the old touch once more after the observer has released it.
+        delivered.contactPhase = .ended
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(delivered)))
+        let next = NSObject()
+        XCTAssertTrue(input.acceptContact(ObjectIdentifier(next), sample: start) === canvas,
+                      "A post-lift hit test must not block the next word")
+    }
+
+    func testConsecutiveNativeFirstStrokesCommitOnceAndRemainUndoable() async throws {
+        for style in [InkStyle.defaultPen, .defaultHighlighter] {
+            let tool = Tool(); tool.inputMode = .pencilKit; tool.style = style
+            let (harness, editor, input) = try installed(tool)
+            defer { editor.closeCanvas() }
+            var received: [Stroke] = []
+            harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Add Ink", summary: "Adds test ink.",
+                params: .obj(["page": .ref, "strokes": .arr(.anything())], required: ["page", "strokes"]), examples: [], effect: .edit)) { params, ctx in
+                    guard case let .page(doc, page)? = NodeRef(params["page"]?.stringValue ?? "") else { throw NibError.notFound("page") }
+                    let strokes = try (params["strokes"] ?? []).decode([Stroke].self)
+                    received += strokes
+                    var refs: [JSONValue] = []
+                    try ctx.mutate("Add Ink") { tx in
+                        for stroke in strokes {
+                            let item = try tx.put(Item(id: NibID.make(), kind: .stroke, stroke: stroke), doc: doc, page: page)
+                            refs.append(.string(NodeRef.item(doc, page, item.id).description))
+                        }
+                    }
+                    return ["refs": .array(refs)]
+                }
+            let before = try harness.snapshot()
+            let canvas = try XCTUnwrap(canvases(editor.host.wetInkContainer).first { $0.isUserInteractionEnabled })
+            for index in 0..<3 {
+                let start = event(editor.host, id: 191 + index, pencil: index == 1,
+                                  point: Point(140 + Double(index) * 50, 220))
+                let contact = NSObject()
+                // Native recognition precedes TouchTap. No speculative hit-test reservation is needed.
+                input.canvasViewDidBeginUsingTool(canvas)
+                XCTAssertTrue(input.acceptContact(ObjectIdentifier(contact), sample: start) === canvas)
+                input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(contact))
+                var end = start; end.location.x += 30; end.timestamp += 0.1
+                input.move([end], screenPoint: end.location, id: start.touchID)
+                if index == 1 { input.canvasViewDidEndUsingTool(canvas); input.end(end) }
+                else { input.end(end); input.canvasViewDidEndUsingTool(canvas) }
+                let pk = PKBridge.pkStroke(Stroke(style: style,
+                    points: [StrokePoint(x: Float(start.location.x), y: 220),
+                             StrokePoint(x: Float(end.location.x), y: 220, t: 0.1)], t0: Date().timeIntervalSince1970))
+                canvas.drawing = PKDrawing(strokes: canvas.drawing.strokes + [pk])
+                input.canvasViewDrawingDidChange(canvas)
+                input.canvasViewDrawingDidChange(canvas)
+                for _ in 0..<200 {
+                    if received.count == index + 1 && canvas.drawing.strokes.isEmpty { break }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                XCTAssertEqual(received.count, index + 1, "Every word reaches ink.addStrokes exactly once")
+                XCTAssertEqual(tool.finished, index + 1)
+                XCTAssertTrue(canvas.drawing.strokes.isEmpty, "Wet ink retires after dry rendering")
+                XCTAssertFalse(harness.session.inking.isInking)
+            }
+            XCTAssertEqual(received.map(\.style), Array(repeating: style, count: 3))
+            let after = try harness.snapshot()
+            XCTAssertNotEqual(after, before)
+            for _ in 0..<3 { _ = try await harness.run("edit.undo", ["doc": .string(Fixtures.docID.raw)]) }
+            XCTAssertEqual(try harness.snapshot(), before)
+            for _ in 0..<3 { _ = try await harness.run("edit.redo", ["doc": .string(Fixtures.docID.raw)]) }
+            XCTAssertEqual(try harness.snapshot(), after)
+        }
+    }
+
     func testLedgerMatchesNativeStrokeIdentityAcrossMissingAndOverlappingCaptures() {
         var ledger = WetInkLedger<String, String>()
         let missing = UUID(), first = UUID(), second = UUID()

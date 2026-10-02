@@ -362,7 +362,11 @@ final class CanvasKeyboardResponder: UIView {
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         guard action == #selector(runCanvasKey(_:)) else { return super.canPerformAction(action, withSender: sender) }
-        return (sender as? UIKeyCommand).flatMap { descriptor(for: $0) } != nil
+        // UIKit probes the action without a UIKeyCommand while discovering keyboard targets.
+        // Rejecting that probe hides every canvas shortcut, even when its descriptor is live.
+        // Once UIKit supplies a command, still validate its ID against the current registry/focus.
+        guard let command = sender as? UIKeyCommand else { return !descriptors.isEmpty }
+        return descriptor(for: command) != nil
     }
 
     @objc private func runCanvasKey(_ command: UIKeyCommand) {

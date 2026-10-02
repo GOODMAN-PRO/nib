@@ -138,6 +138,8 @@ enum ObjectMenuHub {
 final class InputProbe: UIGestureRecognizer {
     private var active: [ObjectIdentifier: UITouch.TouchType] = [:]
     private var secondary = false
+    private var pendingPresentation: (() -> Void)?
+    private var presentationTask: Task<Void, Never>?
 
     /// Passive: never cancels, delays or excludes anyone's touches.
     func makePassive() {
@@ -152,6 +154,24 @@ final class InputProbe: UIGestureRecognizer {
         secondary || !active.values.contains { $0 == .direct || $0 == .pencil }
     }
 
+    /// The canvas hold and UIKit's context-menu recognizer both fire while the finger is down. Even when our
+    /// context-menu delegate declines that finger, UIKit can dismiss an edit menu presented by the hold handler.
+    /// Keep the requested edit menu until this contact finishes and UIKit has unwound its gesture callbacks.
+    func presentWhenIdle(_ present: @escaping () -> Void) {
+        cancelPresentation()
+        guard !active.isEmpty else { present(); return }
+        pendingPresentation = present
+    }
+
+    func cancelPresentation() {
+        pendingPresentation = nil
+        presentationTask?.cancel()
+        presentationTask = nil
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         for t in touches { active[ObjectIdentifier(t)] = t.type }
         if event.buttonMask.contains(.secondary) { secondary = true }
@@ -159,7 +179,10 @@ final class InputProbe: UIGestureRecognizer {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { end(touches) }
 
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { end(touches) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        cancelPresentation()
+        end(touches)
+    }
 
     private func end(_ touches: Set<UITouch>) {
         for t in touches { active[ObjectIdentifier(t)] = nil }
@@ -170,6 +193,14 @@ final class InputProbe: UIGestureRecognizer {
         super.reset()
         active = [:]
         secondary = false
+        guard let present = pendingPresentation else { return }
+        pendingPresentation = nil
+        presentationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self else { return }
+            self.presentationTask = nil
+            present()
+        }
     }
 }
 
@@ -255,6 +286,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         subscriptions = []
         reshow?.cancel()
         reshow = nil
+        probe.cancelPresentation()
         if let contextMenu { host.canvasView.removeInteraction(contextMenu) }
         if let editMenu { host.canvasView.removeInteraction(editMenu) }
         contextMenu = nil
@@ -456,9 +488,12 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     @discardableResult
     private func presentEditMenu(_ menu: UIMenu, at point: CGPoint, target: CGRect) -> Bool {
         guard let editMenu, let host, host.canvasView.window != nil else { return false }
-        pendingMenu = menu
-        pendingTarget = target
-        editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        probe.presentWhenIdle { [weak self, weak host, weak editMenu] in
+            guard let self, let host, let editMenu, self.host === host, host.canvasView.window != nil else { return }
+            self.pendingMenu = menu
+            self.pendingTarget = target
+            editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        }
         return true
     }
 

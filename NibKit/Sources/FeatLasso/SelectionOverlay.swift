@@ -1,4 +1,5 @@
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
@@ -30,6 +31,7 @@ enum SelectionStyle {
 @MainActor
 final class SelectionOverlay: CanvasAttachment {
     let view = SelectionOverlayView()
+    private var selectionObservation: AnyCancellable?
     /// Bounds of a selection set without them (another feature writing `session.selection` directly), recomputed only
     /// when the selection changes; scrolling and zooming just re-project.
     private var fallback: (selection: Selection, bounds: Rect?)?
@@ -41,21 +43,27 @@ final class SelectionOverlay: CanvasAttachment {
             guard let host = host else { return }
             host.app.perform(CommandIDs.selectionClear, [:], session: host.session)
         }
-        render(host)
+        // Published sends the incoming value before session.selection changes. Render that value
+        // directly so the outline and accessibility bounds never lag behind the selection command.
+        selectionObservation = host.session.$selection.sink { [weak self, weak host] selection in
+            guard let self, let host else { return }
+            self.render(selection, host: host)
+        }
     }
 
     func detach(from host: CanvasHost) {
+        selectionObservation = nil
         view.removeFromSuperview()
         view.onClear = nil
+        view.show(nil)
         fallback = nil
     }
 
     func canvasDidChange(_ host: CanvasHost) {
-        render(host)
+        render(host.session.selection, host: host)
     }
 
-    private func render(_ host: CanvasHost) {
-        let selection = host.session.selection
+    private func render(_ selection: Selection, host: CanvasHost) {
         view.frame = host.canvasView.bounds
         guard !selection.isEmpty, selection.doc == host.documentID, let page = selection.page,
               host.pageFrame(page) != nil, let bounds = bounds(of: selection, host: host) else {
@@ -134,6 +142,17 @@ final class SelectionOverlayView: UIView {
         return nil
     }
 
+    // Screen coordinates captured during a selection callback become stale if the containing
+    // canvas scrolls or its window lays out before the next attachment refresh. Keep the content
+    // box local and project it at the accessibility read, just as UIKit does for ordinary views.
+    override var accessibilityFrame: CGRect {
+        get {
+            guard let content else { return .zero }
+            return UIAccessibility.convertToScreenCoordinates(content.box, in: self)
+        }
+        set { super.accessibilityFrame = newValue }
+    }
+
     @objc private func deselect() -> Bool {
         guard let clear = onClear else { return false }
         clear()
@@ -148,9 +167,9 @@ final class SelectionOverlayView: UIView {
         boxLayer.path = content.flatMap { $0.drawsBox ? CGPath(rect: $0.box, transform: nil) : nil }
         CATransaction.commit()
         isAccessibilityElement = content != nil
+        accessibilityElementsHidden = content == nil
         if let c = content {
             accessibilityValue = c.count == 1 ? String(localized: "1 item") : String(localized: "\(c.count) items")
-            accessibilityFrame = UIAccessibility.convertToScreenCoordinates(c.box, in: self)
         } else {
             accessibilityValue = nil
         }
