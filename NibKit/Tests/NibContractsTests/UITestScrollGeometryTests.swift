@@ -2,6 +2,19 @@ import XCTest
 import NibContracts
 
 final class UITestScrollGeometryTests: XCTestCase {
+    func testOverflowMenuDragRevealsAddPageWithoutTouchingCanvas() throws {
+        // More / Current Template frames from the Create distribution regression.
+        let menu = CGRect(x: 1048, y: 104, width: 312, height: 520)
+        let viewport = try XCTUnwrap(NibUITestScrollGeometry.viewport(scroll: menu,
+            window: CGRect(x: 0, y: 0, width: 1376, height: 1032), obstructions: []))
+        let drag = NibUITestScrollGeometry.drag(in: viewport, toward: 1354.5)
+        XCTAssertTrue(menu.contains(drag.start))
+        XCTAssertTrue(menu.contains(drag.end))
+        XCTAssertGreaterThan(drag.start.y, drag.end.y, "An action below More's viewport needs an upward drag")
+        XCTAssertLessThan(drag.start.y - drag.end.y, viewport.height,
+                          "Keep overlap so adjacent menu rows are not skipped")
+    }
+
     func testFolderFormDragStaysAboveKeyboardAndShortcutsBar() throws {
         // Actual frames from LibraryUITests' failure: the old 0.8-height start
         // landed on the keyboard's 7 key, inserting text instead of scrolling.

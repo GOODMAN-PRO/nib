@@ -586,7 +586,11 @@ struct ElementsPopover: View {
     @StateObject private var model: ElementsModel
 
     init(app: NibApp, session: EditorSession) {
-        _model = StateObject(wrappedValue: ElementsModel(app: app, session: session))
+        self.init(model: ElementsModel(app: app, session: session))
+    }
+
+    init(model: ElementsModel) {
+        _model = StateObject(wrappedValue: model)
     }
 
     var body: some View {
@@ -603,6 +607,8 @@ struct ElementsPopover: View {
         .onDisappear { model.stop() }
         .alert(model.prompt?.title ?? "", isPresented: $model.showsPrompt, presenting: model.prompt) { prompt in
             TextField(prompt.placeholder, text: $model.promptText)
+                .accessibilityLabel(prompt == .gifLink ? String(localized: "GIF web address") : prompt.placeholder)
+                .accessibilityIdentifier(prompt.placeholder)
                 .textInputAutocapitalization(prompt == .gifLink ? TextInputAutocapitalization.never
                                                                 : TextInputAutocapitalization.sentences)
                 .autocorrectionDisabled(prompt == .gifLink)
@@ -661,6 +667,8 @@ struct ElementsStickersPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
             NibSearchField(text: $model.query, prompt: String(localized: "Search elements"))
+                .accessibilityLabel(String(localized: "Search elements"))
+                .accessibilityIdentifier("Search elements")
             if searching {
                 results
             } else {
@@ -708,11 +716,18 @@ struct ElementsStickersPane: View {
     }
 
     private func grid(_ elements: [ElementInfo]) -> some View {
-        LazyVGrid(columns: columns, spacing: NibSpacing.s) {
-            ForEach(elements, id: \.key) { element in
-                ElementCell(model: model, element: element)
+        // Keep the collection controls below the grid in reach, even with a large collection and a selection.
+        // The outer tool panel is bounded; only the thumbnails should grow into a scrolling catalogue.
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: NibSpacing.s) {
+                ForEach(elements, id: \.key) { element in
+                    ElementCell(model: model, element: element)
+                }
             }
         }
+        .frame(height: 2 * 64 + NibSpacing.s)
+        .scrollBounceBehavior(.basedOnSize)
+        .accessibilityLabel(String(localized: "Elements in collection"))
     }
 }
 
@@ -870,6 +885,8 @@ struct ElementsGIFPane: View {
                 NibSearchField(text: $model.gifQuery, prompt: String(localized: "Search GIPHY")) {
                     Task { await model.searchGIFs() }
                 }
+                .accessibilityLabel(String(localized: "Search GIPHY"))
+                .accessibilityIdentifier("Search GIPHY")
                 HStack(spacing: NibSpacing.s) {
                     ForEach(GiphyKind.allCases, id: \.self) { kind in
                         NibChip(kind.title, style: .filter(isSelected: model.gifKind == kind),
@@ -1335,6 +1352,8 @@ struct ElementsSettingsView: View {
                     }
                 } else {
                     NibSecureField(text: $draftKey, prompt: String(localized: "Paste your GIPHY API key"), onSubmit: saveKey)
+                        .accessibilityLabel(String(localized: "Paste your GIPHY API key"))
+                        .accessibilityIdentifier("Paste your GIPHY API key")
                     Button(String(localized: "Save Key"), action: saveKey)
                         .font(NibFont.body)
                         .frame(minHeight: NibMetrics.hitTarget)

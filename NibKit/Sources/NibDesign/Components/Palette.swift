@@ -700,7 +700,13 @@ public struct NibToolPalette<Settings: View>: View {
         let gap = compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
         let width = popoverWidth(bounds)
         return NibPopoverPanel(title: tool.label, width: width) { settings(tool.id) }
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { popoverSize = $0 }
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                // Native glass rounds fractional sizes during placement. Do not feed that
+                // subpixel noise back into the placement cache and start another layout pass.
+                if abs(size.width - popoverSize.width) > 0.25 || abs(size.height - popoverSize.height) > 0.25 {
+                    popoverSize = size
+                }
+            }
             .droplet(id + ".settings", style: .popover)
             .budsFrom(id + "." + tool.id, isPresented: $settingsOpen)
             .position(placement.centre(size: popoverSize, beside: anchor, gap: gap, in: bounds))
@@ -735,7 +741,11 @@ public struct NibToolPalette<Settings: View>: View {
                 }
             }
         }
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { moreSize = $0 }
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+            if abs(size.width - moreSize.width) > 0.25 || abs(size.height - moreSize.height) > 0.25 {
+                moreSize = size
+            }
+        }
         .droplet(id + ".more", style: .popover)
         .budsFrom(id + "." + Self.moreID, isPresented: $moreOpen)
         .position(placement.centre(size: moreSize, beside: anchor, gap: gap, in: bounds))

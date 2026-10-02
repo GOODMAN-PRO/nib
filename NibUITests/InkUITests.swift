@@ -68,9 +68,7 @@ final class InkUITests: XCTestCase {
             }
             if attempt == 0 { _ = query.firstMatch.waitForExistence(timeout: 3) }
             if scroll {
-                let panels = (ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex).filter {
-                    $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.height > 180 && $0.frame.width > 200
-                }
+                let panels = scrollPanels
                 // Prefer the target's own scroller. Settings has a navigation list alongside its detail list.
                 let containing = panels.filter { $0.descendants(matching: type).matching(predicate).count > 0 }
                 guard let panel = containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
@@ -110,6 +108,18 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    private var scrollPanels: [XCUIElement] {
+        (ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex).filter { panel in
+            guard panel.identifier != "nib.canvas", panel.frame.height > 180, panel.frame.width > 200 else { return false }
+            if panel.isHittable { return true }
+            // DESIGN §14.8 puts settings in the right-hand inset grouped list. XCTest can
+            // mark that container non-hittable while its visible rows accept input; dropping
+            // it here makes the fallback repeatedly scroll the 220-point section sidebar.
+            return [.collectionView, .table].contains(panel.elementType)
+                && panel.buttons.allElementsBoundByIndex.contains { $0.isHittable }
+        }
+    }
+
     private func scrollPanel(_ panel: XCUIElement, down: Bool) {
         // The centre of a pen popover contains custom sliders which consume drag gestures.
         // Scroll from the panel's 16-point content padding, clear of every slider and toggle.
@@ -144,8 +154,7 @@ final class InkUITests: XCTestCase {
             let native = element.switches.firstMatch
             let target = native.exists ? native : element
             for _ in 0..<4 where scroll {
-                let panels = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
-                guard let panel = panels.filter({ $0.isHittable && $0.identifier != "nib.canvas" && $0.frame.height > 180 })
+                guard let panel = scrollPanels
                     .filter({ $0.switches.matching(NSPredicate(format: "label == %@", label)).count > 0 })
                     .min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else { break }
                 // XCTest marks a partly clipped switch hittable even when its centre is
@@ -1275,8 +1284,7 @@ final class InkUITests: XCTestCase {
         let squeeze = ui.app.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).element(boundBy: 1)
         for _ in 0..<12 {
             if squeeze.exists && squeeze.isHittable { break }
-            let panels = ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex + ui.app.scrollViews.allElementsBoundByIndex
-            let detail = try XCTUnwrap(panels.filter { $0.isHittable && $0.frame.height > 200 }.max(by: { $0.frame.minX < $1.frame.minX }))
+            let detail = try XCTUnwrap(scrollPanels.max(by: { $0.frame.minX < $1.frame.minX }))
             scrollPanel(detail, down: false)
         }
         XCTAssertTrue(squeeze.exists && squeeze.isHittable, "Squeeze must offer its own palette binding")

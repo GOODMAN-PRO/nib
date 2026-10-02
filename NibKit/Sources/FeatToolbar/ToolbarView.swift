@@ -466,6 +466,13 @@ final class ToolbarModel: ObservableObject {
     /// A disabled item runs nothing.
     func select(_ id: String) {
         guard let d = descriptors[id], d.isEnabled?(session) ?? true else { return }
+        // Release modal input in the same action that chooses the tool. Command execution is
+        // asynchronous; waiting for $tool leaves a retained menu over the next canvas/palette tap
+        // (and command accessories do not publish a tool change at all).
+        settingsOpen = false
+        moreOpen = false
+        closeOptionsPopovers()
+        expandOptions()
         if let toolID = d.toolID {
             app.perform(CommandIDs.toolSelect, ["tool": .string(toolID)], session: session)
         } else if let command = d.command {

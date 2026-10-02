@@ -475,11 +475,15 @@ struct LibraryRenameField: View {
 }
 
 /// A click-drag from empty space selects with a mouse/trackpad, independently of touch scrolling.
-private struct LibraryPointerMarquee: UIViewRepresentable {
+struct LibraryPointerMarquee: UIViewRepresentable {
     var changed: (CGPoint, CGPoint, Bool) -> Void
     func makeCoordinator() -> Coordinator { Coordinator(changed) }
     func makeUIView(context: Context) -> Probe {
         let view = Probe()
+        // This full-grid view measures pointer coordinates; it is not a touch
+        // surface. The pan lives on the ancestor scroll view, so leaving the
+        // probe interactive can swallow the SwiftUI card's document-open tap.
+        view.isUserInteractionEnabled = false
         view.attach = { [weak coordinator = context.coordinator] view in coordinator?.attach(view) }
         return view
     }

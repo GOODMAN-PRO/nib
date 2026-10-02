@@ -150,6 +150,33 @@ final class ShellRoutingTests: XCTestCase {
                        "the canvas key is not live at all while typing")
     }
 
+    func testClipboardShortcutsReturnToCanvasAfterNativeTextEditing() {
+        // F014 registers canvas commands. During the Insert flow, UIKit must own
+        // Select All, Copy, clear and Paste in the text box, including presses
+        // forwarded unhandled through the hosting controller to the shell.
+        let clipboard = ["x", "c", "v"].map {
+            key("clipboard." + $0, KeyShortcut($0, [.command]), scope: .canvas)
+        }
+        let selectAll = key("selection.all", KeyShortcut("a", [.command]), scope: .canvas)
+        let commands = clipboard + [selectAll]
+        for kind in [DocumentKind.notebook, .whiteboard, .textDocument] {
+            let editing = KeyCommandContext(docKind: kind, isEditingText: true)
+            XCTAssertTrue(KeyCommandRouting.active(commands, in: editing).isEmpty,
+                          "The shell must leave native text selection and clipboard actions to the editor")
+            for command in commands {
+                XCTAssertNil(KeyCommandRouting.unhandledPress(command.shortcut, descriptors: commands, in: editing),
+                             "A forwarded native editing shortcut must not mutate the canvas selection")
+            }
+
+            let finished = KeyCommandContext(docKind: kind)
+            XCTAssertEqual(KeyCommandRouting.active(commands, in: finished).map(\.id), commands.map(\.id))
+            for command in commands {
+                XCTAssertEqual(KeyCommandRouting.unhandledPress(command.shortcut, descriptors: commands, in: finished)?.id,
+                               command.id, "Finishing text editing must restore the canvas clipboard commands")
+            }
+        }
+    }
+
     func testTheLibraryContext() {
         XCTAssertEqual(KeyCommandContext(docKind: nil), KeyCommandContext(inDocument: false, docKind: nil))
         XCTAssertEqual(KeyCommandContext(docKind: .whiteboard, isEditingText: true),

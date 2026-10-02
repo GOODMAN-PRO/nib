@@ -1,9 +1,22 @@
 import XCTest
 import AVFoundation
 import AudioToolbox
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatAudio
+
+/// Observe rendered clock values without a microphone or an XCUITest session.
+private struct AudioClockProbe: UIViewRepresentable {
+    let value: Double
+    let rendered: (Double) -> Void
+
+    func makeUIView(context: Context) -> UILabel { UILabel() }
+    func updateUIView(_ view: UILabel, context: Context) {
+        view.text = String(value)
+        rendered(value)
+    }
+}
 
 /// Synthetic PCM instead of the microphone (hostless tests have none): the test pushes seconds of a tone or of
 /// silence in tap-sized buffers.
@@ -219,6 +232,89 @@ final class FeatAudioTests: XCTestCase {
     }
 
     // MARK: Recording
+
+    func testRecordingTimelineRendersAndRefreshesWithoutPublishedAudioChanges() async throws {
+        let (h, audio) = try harness()
+        var now = 100.0
+        audio.clock = { now }
+        audio.recording = .init(doc: Fixtures.docID, clip: NibID("CLOCK"), startedAt: now)
+        var displayed: Double?
+        let activity = AudioForegroundActivity(active: true, notifications: NotificationCenter())
+        let view = AudioTimelineView(interval: 0.05, paused: false, activity: activity) {
+            AudioClockProbe(value: audio.elapsed) { displayed = $0 }
+        }.environment(\.scenePhase, .inactive) // Embedded UIKit hosts need not supply a SwiftUI Scene.
+        let host = UIHostingController(rootView: view)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await waitUntil { displayed == 0 }
+        now += 3
+        try await waitUntil { displayed == 3 }
+        XCTAssertEqual(audio.recording?.startedAt, 100)
+        _ = h // Keep the app alive while its view is hosted.
+    }
+
+    func testPausedAudioTimelineRendersThenResumesAndParksInBackground() async throws {
+        var value = 0.0
+        var displayed: Double?
+        let notifications = NotificationCenter()
+        let activity = AudioForegroundActivity(active: true, notifications: notifications)
+        func view(paused: Bool) -> some View {
+            AudioTimelineView(interval: 0.05, paused: paused, activity: activity) {
+                AudioClockProbe(value: value) { displayed = $0 }
+            }
+        }
+        let host = UIHostingController(rootView: view(paused: true))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await waitUntil { displayed == 0 }
+        value = 3
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(displayed, 0, "Paused controls remain visible without periodic refreshes")
+        host.rootView = view(paused: false)
+        try await waitUntil { displayed == 3 }
+        value = 5
+        try await waitUntil { displayed == 5 }
+        notifications.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        try await waitUntil { !activity.isActive }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        value = 7
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(displayed, 5, "Background chrome must not keep ticking")
+        notifications.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        try await waitUntil { displayed == 7 }
+    }
+
+    func testMicrophoneReadinessWaitsForPermissionDialogToReturnToForeground() async throws {
+        let notifications = NotificationCenter()
+        let activity = AudioForegroundActivity(active: false, notifications: notifications)
+        var ready = false
+        let startup = Task { try await activity.waitUntilActive(); ready = true }
+        defer { startup.cancel() }
+        await Task.yield()
+        XCTAssertFalse(ready, "Permission granted is not sufficient while UIKit is still inactive")
+        notifications.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        try await waitUntil { ready }
+        try await startup.value
+        // No notification is needed when activation preceded the recording request.
+        try await activity.waitUntilActive()
+        notifications.post(name: UIApplication.willResignActiveNotification, object: nil)
+        try await waitUntil { !activity.isActive }
+        let cancelled = Task { try await activity.waitUntilActive() }
+        cancelled.cancel()
+        do {
+            try await cancelled.value
+            XCTFail("Cancelling a pending start must not activate the microphone")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
 
     func testRecordThenStopWithSyntheticSourceCreatesClipWithTheRightDuration() async throws {
         let (h, audio) = try harness()

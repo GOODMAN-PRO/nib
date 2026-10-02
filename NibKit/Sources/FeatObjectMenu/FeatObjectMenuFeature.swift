@@ -5,7 +5,7 @@ import NibDesign
 
 /// Object menu & page long-press menu (F013). Renders `MenuLocation.objectMenu` as a Clear capsule above the selection
 /// (quick icons + More, a system menu with the full list and its submenus) and `MenuLocation.pageLongPress` as the
-/// system edit menu on a finger long-press over an empty spot, or as a context menu on a right-click (pointer). Owns
+/// native menu on a finger long-press over an empty spot, or as a context menu on a right-click (pointer). Owns
 /// the generic entries (Cut, Copy, Duplicate, Delete, Colour, Arrange, Lock / Unlock, Take Screenshot, Style, Paste)
 /// and their commands: item.delete, item.arrange, item.recolor, item.setLocked, selection.screenshot and menu.showAt.
 /// Add Comment, Create Element, Convert and the other object actions are registered by their owners and appear here.

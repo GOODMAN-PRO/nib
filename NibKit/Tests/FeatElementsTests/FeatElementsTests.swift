@@ -3,6 +3,7 @@ import UIKit
 import SwiftUI
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatElements
 
 /// Canned GIPHY replies, so no test touches the network.
@@ -828,6 +829,178 @@ final class FeatElementsTests: XCTestCase {
     }
 
     // MARK: GIPHY
+
+    /// The starter grid used to push the collection bar below the tool panel's 520 pt viewport.
+    /// Measure real SwiftUI content with both optional footer actions, not a duplicate layout formula.
+    func testStickerCatalogueLeavesRoomForCollectionControlsWithSelection() async throws {
+        let h = harness()
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [NibID("FIXTURESHP01")])
+        h.app.ui.panels.register(PanelDescriptor(id: PanelIDs.gallery, title: "Gallery", icon: "square.grid.2x2",
+                                                placement: .libraryTab, order: 0, owner: "pluginmanager") { _ in
+            AnyView(EmptyView())
+        })
+        let model = ElementsModel(app: h.app, session: h.session)
+        await model.start()
+        defer { model.stop() }
+        model.select(StarterElements.stickers)
+        await model.reload()
+        XCTAssertEqual(model.elements.count, 24)
+        XCTAssertTrue(model.hasSelection && model.canInsert)
+        XCTAssertNotNil(model.galleryPanel)
+        for width in [NibMetrics.popoverWidth, NibMetrics.floatingPanelSize.width] {
+            let host = UIHostingController(rootView: VStack(spacing: NibSpacing.m) {
+                Text("Elements").font(NibFont.headline)
+                NibSegmentedControl(selection: .constant(ElementsModel.Tab.stickers),
+                                    options: ElementsModel.Tab.allCases) { $0.title }
+                ElementsStickersPane(model: model)
+            }.padding(NibSpacing.l))
+            let size = host.sizeThatFits(in: CGSize(width: width, height: 10_000))
+            XCTAssertLessThanOrEqual(size.height, NibMetrics.popoverMaxHeight,
+                                     "Collection controls and selection actions must fit without scrolling the entire panel")
+        }
+    }
+
+    private func textFields(in view: UIView) -> [UITextField] {
+        (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { textFields(in: $0) }
+    }
+
+    func testGIFLinkAlertExposesAnAccessibleEditableAddress() async throws {
+        let h = harness()
+        let model = ElementsModel(app: h.app, session: h.session)
+        let host = UIHostingController(rootView: ElementsPopover(model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 768, height: 1024))
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            host.dismiss(animated: false)
+            model.stop()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        model.ask(.gifLink)
+        for _ in 0..<100 where host.presentedViewController == nil {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let alert = try XCTUnwrap(host.presentedViewController as? UIAlertController)
+        let field = try XCTUnwrap(alert.textFields?.first)
+        XCTAssertEqual(field.accessibilityIdentifier, "https://")
+        XCTAssertEqual(field.accessibilityLabel, "GIF web address")
+        XCTAssertTrue(field.isEnabled)
+        XCTAssertEqual(field.placeholder, "https://")
+    }
+
+    /// Placeholders alone disappear when typing and were absent from the fields' accessibility labels.
+    func testGiphyKeyAndSearchFieldsHavePersistentAccessibleNames() async throws {
+        let h = harness()
+        let originalKey = GiphyKey.load()
+        defer { GiphyKey.save(originalKey) }
+        XCTAssertTrue(GiphyKey.save(nil))
+        let host = UIHostingController(rootView: ElementsSettingsView(app: h.app))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 540, height: 750))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        for _ in 0..<100 where textFields(in: host.view).isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            host.view.layoutIfNeeded()
+        }
+        let field = try XCTUnwrap(textFields(in: host.view).first { $0.isSecureTextEntry })
+        XCTAssertEqual(field.accessibilityIdentifier, "Paste your GIPHY API key")
+        XCTAssertEqual(field.accessibilityLabel, "Paste your GIPHY API key")
+
+        XCTAssertTrue(GiphyKey.save("unit-test-key"))
+        let model = ElementsModel(app: h.app, session: h.session)
+        model.gifQuery = "physics"
+        let searchHost = UIHostingController(rootView: ElementsGIFPane(model: model))
+        window.rootViewController = searchHost
+        searchHost.view.layoutIfNeeded()
+        for _ in 0..<100 where textFields(in: searchHost.view).isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            searchHost.view.layoutIfNeeded()
+        }
+        let search = try XCTUnwrap(textFields(in: searchHost.view).first)
+        XCTAssertEqual(search.accessibilityIdentifier, "Search GIPHY")
+        XCTAssertEqual(search.accessibilityLabel, "Search GIPHY")
+        XCTAssertEqual(search.text, "physics")
+    }
+
+    func testGiphySearchRetryAndKeyChangesKeepTheDraftQuery() async throws {
+        let h = harness()
+        XCTAssertTrue(GiphyKey.save("unit-test-key"))
+        defer { GiphyKey.save(nil) }
+        let transport = FakeGiphyTransport()
+        transport.status = 403
+        let runtime = try XCTUnwrap(h.app.services.get(ElementsRuntime.key, as: ElementsRuntime.self))
+        runtime.giphy = GiphyClient(transport: transport)
+        let model = ElementsModel(app: h.app, session: h.session)
+        model.gifQuery = "physics"
+        await model.searchGIFs()
+        guard case .failed = model.gifState else { return XCTFail("A rejected key must offer a retry") }
+        await model.searchGIFs()
+        XCTAssertEqual(transport.requests.count, 2)
+        XCTAssertEqual(model.gifQuery, "physics")
+        for request in transport.requests {
+            let url = try XCTUnwrap(request.url)
+            XCTAssertTrue(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .contains(URLQueryItem(name: "q", value: "physics")) == true)
+        }
+        XCTAssertTrue(GiphyKey.save(nil))
+        model.refreshGIFKey()
+        XCTAssertEqual(model.gifState, .needsKey)
+        XCTAssertEqual(model.gifQuery, "physics")
+        XCTAssertTrue(GiphyKey.save("replacement-key"))
+        model.refreshGIFKey()
+        XCTAssertEqual(model.gifState, .idle)
+        transport.status = 200
+        transport.body = Data(Self.giphyReply.utf8)
+        await model.searchGIFs()
+        XCTAssertEqual(model.gifState, .loaded)
+        XCTAssertEqual(model.gifQuery, "physics")
+    }
+
+    func testGIFLinkPromptDispatchesOneAnimatedInsertAndRejectsInvalidInput() async throws {
+        let h = harness()
+        h.session.tool = "lasso"
+        h.session.tool = ElementsTool.toolID
+        let model = ElementsModel(app: h.app, session: h.session)
+        var insertions: [JSONValue] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.imageInsert, title: "Insert Image", summary: "Stand-in.",
+                                                  effect: .read)) { params, _ in
+            insertions.append(params)
+            return [:]
+        }
+        model.ask(.gifLink)
+        XCTAssertTrue(model.showsPrompt)
+        XCTAssertEqual(model.prompt, .gifLink)
+        XCTAssertEqual(model.promptText, "")
+        model.promptText = "  https://example.com/animation.gif  "
+        await model.submit(.gifLink)
+        for _ in 0..<100 where insertions.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(insertions.count, 1)
+        XCTAssertEqual(insertions.first?["url"], "https://example.com/animation.gif")
+        XCTAssertEqual(insertions.first?["animated"], true)
+        XCTAssertEqual(insertions.first?["page"], "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertEqual(h.session.tool, "lasso")
+
+        let errorShown = expectation(description: "Invalid link reports an address error")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.imageInsert)
+            XCTAssertEqual((note.userInfo?["error"] as? NibError)?.path, "$.url")
+            errorShown.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        model.ask(.gifLink)
+        XCTAssertEqual(model.promptText, "", "Reopening the prompt starts with an empty draft")
+        model.promptText = "not a URL"
+        await model.submit(.gifLink)
+        await fulfillment(of: [errorShown], timeout: 1)
+        model.pick(.gif)
+        await model.picked(.failure(CocoaError(.userCancelled)))
+        XCTAssertEqual(insertions.count, 1, "Invalid links and cancelling Files must not insert anything")
+    }
 
     private static let giphyReply = #"""
     {"data": [

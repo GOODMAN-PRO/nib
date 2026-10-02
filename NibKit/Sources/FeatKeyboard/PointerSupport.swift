@@ -353,7 +353,9 @@ final class CanvasKeyboardResponder: UIView {
     override var keyCommands: [UIKeyCommand]? {
         let context = context
         return descriptors.map { d in
-            let command = UIKeyCommand(title: d.title, action: #selector(runCanvasKey(_:)),
+            let action = d.shortcut == KeyShortcut("a", .command)
+                ? #selector(selectAll(_:)) : #selector(runCanvasKey(_:))
+            let command = UIKeyCommand(title: d.title, action: action,
                                        input: Self.input(d.shortcut.key),
                                        modifierFlags: Self.modifiers(d.shortcut.modifiers), propertyList: d.id)
             command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
@@ -367,6 +369,7 @@ final class CanvasKeyboardResponder: UIView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(selectAll(_:)) { return selectAllDescriptor(sender) != nil }
         guard action == #selector(runCanvasKey(_:)) else { return super.canPerformAction(action, withSender: sender) }
         // UIKit probes the action without a UIKeyCommand while discovering keyboard targets.
         // Rejecting that probe hides every canvas shortcut, even when its descriptor is live.
@@ -375,8 +378,37 @@ final class CanvasKeyboardResponder: UIView {
         return descriptor(for: command) != nil
     }
 
+    /// UIKit's Edit menu and standard Command-A dispatch use selectAll(_:), not our private
+    /// key selector. Both entry points must resolve the same live, window-scoped descriptor.
+    /// In particular, never take Select All from a native text input or a presented sheet.
+    private func selectAllDescriptor(_ sender: Any?) -> KeyCommandDescriptor? {
+        guard !context.isEditingText, !CanvasKeyboardFocus.hasModal(window?.rootViewController),
+              let descriptor = descriptors.first(where: { $0.shortcut == KeyShortcut("a", .command) }) else {
+            return nil
+        }
+        if let command = sender as? UIKeyCommand {
+            if let id = command.propertyList as? String {
+                guard id == descriptor.id else { return nil }
+            } else {
+                // A system-created Edit command has no registry ID attached.
+                guard command.input?.lowercased() == "a", command.modifierFlags == .command else { return nil }
+            }
+        }
+        return descriptor
+    }
+
+    override func selectAll(_ sender: Any?) {
+        guard let descriptor = selectAllDescriptor(sender) else { return }
+        run(descriptor)
+    }
+
     @objc private func runCanvasKey(_ command: UIKeyCommand) {
-        guard let host, let descriptor = descriptor(for: command) else { return }
+        guard let descriptor = descriptor(for: command) else { return }
+        run(descriptor)
+    }
+
+    private func run(_ descriptor: KeyCommandDescriptor) {
+        guard let host else { return }
         if window?.isKeyWindow == true,
            let navigator = window?.rootViewController as? SceneNavigator, navigator.session === host.session {
             host.app.ui.activeNavigator = navigator

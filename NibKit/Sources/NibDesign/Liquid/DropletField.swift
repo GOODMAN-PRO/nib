@@ -308,6 +308,16 @@ final class DropletField {
     func setRest(_ id: String, _ rect: CGRect, style: DropletStyle) {
         register(id, style: style)
         guard var e = entries[id], NibGeometry.isUsable(rect) else { return }
+        // Native glass/scroll layout can alternate between subpixel frames (for example a
+        // three-row More grid at y = 433⅓ and 433½). Feeding that rounding noise back into
+        // FLIP publishes another geometry update indefinitely and starves control input.
+        // Compare against the retained frame so small real movements accumulate. A quarter
+        // point is below one display pixel on supported screens; genuine layout changes remain live.
+        if e.hasRest,
+           abs(rect.minX - e.rest.minX) <= 0.25, abs(rect.minY - e.rest.minY) <= 0.25,
+           abs(rect.width - e.rest.width) <= 0.25, abs(rect.height - e.rest.height) <= 0.25 {
+            return
+        }
         if !e.hasRest || (!e.hasPresented && !e.isDragging && e.bud == nil) {
             e.rest = rect
             e.hasRest = true

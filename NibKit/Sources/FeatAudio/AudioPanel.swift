@@ -812,15 +812,23 @@ struct AudioTickSchedule: TimelineSchedule {
     }
 }
 
-private struct AudioTimelineView<Content: View>: View {
+struct AudioTimelineView<Content: View>: View {
     let interval: TimeInterval
     let paused: Bool
     @ViewBuilder let content: () -> Content
-    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject var activity: AudioForegroundActivity
     @State private var visible = false
 
+    init(interval: TimeInterval, paused: Bool, activity: AudioForegroundActivity = .shared,
+         @ViewBuilder content: @escaping () -> Content) {
+        self.interval = interval
+        self.paused = paused
+        self.activity = activity
+        self.content = content
+    }
+
     var body: some View {
-        TimelineView(AudioTickSchedule(interval: interval, active: visible && !paused && scenePhase == .active)) { _ in
+        TimelineView(AudioTickSchedule(interval: interval, active: visible && !paused && activity.isActive)) { _ in
             content()
         }
         .onAppear { visible = true }

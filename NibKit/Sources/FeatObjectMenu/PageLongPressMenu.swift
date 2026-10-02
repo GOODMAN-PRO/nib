@@ -7,7 +7,7 @@ import NibDesign
 
 // The page long-press / right-click menu (T-084, P-050) and the canvas side of the object menu. One canvas attachment
 // per canvas: it presents the lasso object menu through the window's floating host when the selection becomes
-// non-empty, keeps it beside the selection, shows `MenuLocation.pageLongPress` as the system edit menu at a long-pressed
+// non-empty, keeps it beside the selection, shows `MenuLocation.pageLongPress` as a native menu at a long-pressed
 // point (`menu.showAt`, which is also the long-press tap handler), and answers a right-click (secondary click, or a
 // pointer click-and-hold) with a context menu: the object menu over the selection or an item, the page menu elsewhere.
 // It never claims a touch, so the canvas, the handles and the tools keep every gesture.
@@ -205,6 +205,22 @@ final class InputProbe: UIGestureRecognizer {
     }
 }
 
+/// An invisible source for UIKit's vertical menu, positioned at the held page point. It must neither intercept
+/// canvas input nor introduce an empty accessibility control. The menu's actions remain native accessible items.
+final class PageMenuAnchor: UIButton {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        showsMenuAsPrimaryAction = true
+        preferredMenuElementOrder = .fixed
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+    }
+
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+}
+
 /// "objectmenu.menus": the object menu, the page menu and the right-click menus of one canvas.
 @MainActor
 final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInteractionDelegate,
@@ -213,6 +229,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     let model: ObjectMenuModel
     private var contextMenu: UIContextMenuInteraction?
     private var editMenu: UIEditMenuInteraction?
+    private let pageMenuAnchor = PageMenuAnchor(frame: .zero)
     private let probe: InputProbe
     private weak var floating: FloatingHosting?
     private var subscriptions: [EventSubscription] = []
@@ -288,10 +305,15 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         reshow?.cancel()
         reshow = nil
         probe.cancelPresentation()
+        pageMenuAnchor.contextMenuInteraction?.dismissMenu()
+        pageMenuAnchor.menu = nil
+        pageMenuAnchor.removeFromSuperview()
         if let contextMenu { host.canvasView.removeInteraction(contextMenu) }
         if let editMenu { host.canvasView.removeInteraction(editMenu) }
         contextMenu = nil
         editMenu = nil
+        pendingMenu = nil
+        pendingTarget = .null
         host.canvasView.removeGestureRecognizer(probe)
         dismissFloating()
         model.clear()
@@ -473,7 +495,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     // MARK: Page menu
 
-    /// Shows the page menu at `point` of `page` as the system edit menu. False when the page is not on screen here.
+    /// Page actions are a vertical system menu. The text-edit strip pages horizontally and can hide insertion
+    /// actions behind unrelated clipboard entries even on an iPad. Keep that strip only as the pre-17.4 fallback.
     @discardableResult
     func showPageMenu(page: PageID, point: Point) -> Bool {
         guard let host, host.pageFrame(page) != nil else { return false }
@@ -483,6 +506,23 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         let menu = uiMenu(entries.map { ObjectMenuEntry($0, context: context) }, context: context, facts: nil, title: "",
                           shortcuts: false)
         let v = host.viewPoint(point, page: page)
+        if #available(iOS 17.4, *) {
+            guard host.canvasView.window != nil else { return false }
+            probe.presentWhenIdle { [weak self, weak host] in
+                guard let self, let host, self.host === host, host.canvasView.window != nil,
+                      host.session.document == context.doc else { return }
+                self.editMenu?.dismissMenu()
+                self.pendingMenu = menu
+                self.pendingTarget = CGRect(origin: v, size: .zero)
+                self.pageMenuAnchor.frame = CGRect(origin: v, size: CGSize(width: 1, height: 1))
+                self.pageMenuAnchor.menu = self.pendingMenu
+                if self.pageMenuAnchor.superview !== host.canvasView {
+                    host.canvasView.addSubview(self.pageMenuAnchor)
+                }
+                self.pageMenuAnchor.performPrimaryAction()
+            }
+            return true
+        }
         return presentEditMenu(menu, at: v, target: CGRect(origin: v, size: .zero))
     }
 

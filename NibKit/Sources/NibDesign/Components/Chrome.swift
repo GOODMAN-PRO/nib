@@ -168,7 +168,11 @@ public struct NibToolOptionsBar<Content: View>: View {
         if let availableWidth {
             ScrollView(.horizontal) {
                 controls
-                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                        // This measurement sets the viewport width. Ignore native subpixel
+                        // rounding rather than feeding it back into another layout pass.
+                        if contentWidth.map({ abs(width - $0) > 0.25 }) ?? true { contentWidth = width }
+                    }
             }
             .scrollIndicators(.hidden)
             .scrollBounceBehavior(.basedOnSize, axes: .horizontal)

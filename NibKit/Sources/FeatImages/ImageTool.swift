@@ -435,7 +435,11 @@ final class ImageMenuController: UIViewController {
         let box = WeakController()
         let menu = ImageSourceMenu(app: app, session: session, target: { target }, close: { then in
             guard let controller = box.controller, controller.presentingViewController != nil else { return then() }
-            controller.dismiss(animated: true, completion: then)
+            if controller.isBeingDismissed {
+                ImagePresenter.afterTransition(controller.transitionCoordinator, then: then)
+            } else {
+                controller.dismiss(animated: true, completion: then)
+            }
         })
         let controller = ImageMenuController(content: AnyView(NibPopoverPanel(title: String(localized: "Insert Image")) { menu }))
         box.controller = controller
@@ -450,7 +454,7 @@ final class ImageMenuController: UIViewController {
             sheet.prefersGrabberVisible = true
         }
         current = controller
-        presenter.present(controller, animated: true)
+        ImagePresenter.present(controller, from: presenter)
     }
 
     static func dismissCurrent() {
@@ -484,6 +488,33 @@ enum ImagePresenter {
             responder = r.next
         }
         return nil
+    }
+
+    /// A dismissing controller still occupies UIKit's presentation slot. Skipping it in `top` is not enough:
+    /// wait for the transition, then resolve the presenter again (including an interactively cancelled dismissal).
+    static func present(_ controller: UIViewController, from presenter: UIViewController) {
+        var top = presenter
+        while top.isBeingDismissed, let parent = top.presentingViewController { top = parent }
+        while let next = top.presentedViewController, !next.isBeingDismissed { top = next }
+        let transition = top.presentedViewController?.transitionCoordinator ?? top.transitionCoordinator
+        afterTransition(transition) {
+            var ready = top
+            while let next = ready.presentedViewController, !next.isBeingDismissed { ready = next }
+            ready.present(controller, animated: true)
+        }
+    }
+
+    static func afterTransition(_ transition: UIViewControllerTransitionCoordinator?, then: @escaping () -> Void) {
+        guard let transition else { then(); return }
+        // UIKit may call the completion even when it reports that no alongside animation was queued.
+        var completed = false
+        let finish = {
+            guard !completed else { return }
+            completed = true
+            // Let UIKit unwind its completion callbacks and detach the dismissed controller before presenting again.
+            DispatchQueue.main.async(execute: then)
+        }
+        if !transition.animate(alongsideTransition: nil, completion: { _ in finish() }) { finish() }
     }
 }
 
@@ -540,8 +571,9 @@ enum ImageProviders {
 }
 
 @MainActor
-final class PhotosPickerSession: NSObject, PHPickerViewControllerDelegate {
+final class PhotosPickerSession: NSObject, PHPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
     private var continuation: CheckedContinuation<[NSItemProvider], Never>?
+    private let completion = ImagePickerCompletion<[NSItemProvider]>()
 
     func run(limit: Int, from presenter: UIViewController) async -> [NSItemProvider] {
         var config = PHPickerConfiguration()
@@ -552,15 +584,45 @@ final class PhotosPickerSession: NSObject, PHPickerViewControllerDelegate {
         picker.delegate = self
         return await withCheckedContinuation { c in
             continuation = c
-            presenter.present(picker, animated: true)
+            picker.presentationController?.delegate = self
+            ImagePresenter.present(picker, from: presenter)
         }
     }
 
     nonisolated func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
         MainActor.assumeIsolated {
-            picker.dismiss(animated: true)
-            continuation?.resume(returning: results.map { $0.itemProvider })
+            completion.finish(results.map { $0.itemProvider }, dismissing: picker) { [self] providers in
+                continuation?.resume(returning: providers)
+                continuation = nil
+            }
+        }
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        completion.finish([], dismissing: nil) { [self] providers in
+            continuation?.resume(returning: providers)
             continuation = nil
+        }
+    }
+}
+
+/// Completion belongs to the whole presentation, not just the picker delegate callback. A subsequent picker must
+/// not race this one's dismissal; late or duplicate callbacks must never resume a continuation twice.
+@MainActor
+final class ImagePickerCompletion<Value> {
+    private var finished = false
+
+    func finish(_ value: Value, dismissing controller: UIViewController?, then: @escaping (Value) -> Void) {
+        guard !finished else { return }
+        finished = true
+        guard let controller, controller.presentingViewController != nil || controller.isBeingDismissed else {
+            then(value)
+            return
+        }
+        if controller.isBeingDismissed {
+            ImagePresenter.afterTransition(controller.transitionCoordinator) { then(value) }
+        } else {
+            controller.dismiss(animated: true) { then(value) }
         }
     }
 }
@@ -646,8 +708,9 @@ final class ScanSession: NSObject, VNDocumentCameraViewControllerDelegate {
 }
 
 @MainActor
-final class FilesSession: NSObject, UIDocumentPickerDelegate {
+final class FilesSession: NSObject, UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate {
     private var continuation: CheckedContinuation<[Data], Never>?
+    private let completion = ImagePickerCompletion<[Data]>()
 
     func run(multiple: Bool, from presenter: UIViewController) async -> [Data] {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.image], asCopy: true)
@@ -655,21 +718,28 @@ final class FilesSession: NSObject, UIDocumentPickerDelegate {
         picker.delegate = self
         return await withCheckedContinuation { c in
             continuation = c
-            presenter.present(picker, animated: true)
+            picker.presentationController?.delegate = self
+            ImagePresenter.present(picker, from: presenter)
         }
     }
 
     nonisolated func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         let images = urls.compactMap { try? Data(contentsOf: $0) }
-        MainActor.assumeIsolated { finish(images) }
+        MainActor.assumeIsolated { finish(images, controller: controller) }
     }
 
     nonisolated func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        MainActor.assumeIsolated { finish([]) }
+        MainActor.assumeIsolated { finish([], controller: controller) }
     }
 
-    private func finish(_ images: [Data]) {
-        continuation?.resume(returning: images)
-        continuation = nil
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finish([], controller: nil)
+    }
+
+    private func finish(_ images: [Data], controller: UIViewController?) {
+        completion.finish(images, dismissing: controller) { [self] images in
+            continuation?.resume(returning: images)
+            continuation = nil
+        }
     }
 }

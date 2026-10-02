@@ -524,6 +524,7 @@ extension AudioController {
         default:
             throw microphoneOff()
         }
+        try await AudioForegroundActivity.shared.waitUntilActive()
         let mic = MicrophoneSource()
         mic.onConfigurationChange = { [weak self] in self?.inputChanged() }
         return mic

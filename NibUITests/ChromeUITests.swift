@@ -60,6 +60,7 @@ final class ChromeUITests: XCTestCase {
     /// Scroll the containing sheet/popover, never the document, to reach offscreen controls.
     private func reachable(_ name: String) throws -> XCUIElement {
         let q = query(name)
+        if !q.firstMatch.exists { ui.revealFormElement(q.firstMatch) }
         _ = try require(name)
         for _ in 0..<12 {
             let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
@@ -323,6 +324,91 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
     }
 
+    func testMorePencilDrawsAndUndoRedoRestoresStroke() throws {
+        try open(); let before = try ui.state()
+        try tap("tool.more"); try tap("tool.pencil")
+        _ = try ui.waitForState { $0.tool == "pencil" }
+        try draw()
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage }
+        try ui.tapCommand("edit.redo")
+        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
+    }
+
+    func testEraserOptionsEraseRealInkAndUndoRestoresIt() throws {
+        try open(); try ui.selectTool("pen"); try draw()
+        let inked = try ui.state()
+        try settings("eraser"); try tap("Whole stroke"); outside()
+        try ui.drawStroke([CGPoint(x: 0.5, y: 0.62), CGPoint(x: 0.5, y: 0.72)])
+        _ = try ui.waitForState { $0.strokeCountOnPage == inked.strokeCountOnPage - 1 }
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.strokeCountOnPage == inked.strokeCountOnPage }
+    }
+
+    func testShapePaletteCreatesUndoableShape() throws {
+        try open(); let before = try ui.state()
+        try ui.selectTool("shape")
+        try ui.drawStroke([CGPoint(x: 0.4, y: 0.6), CGPoint(x: 0.6, y: 0.75)])
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 }
+        XCTAssertEqual(try ui.state().strokeCountOnPage, before.strokeCountOnPage)
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
+    }
+
+    private func insertTextItem(tool: String, editor: String) throws {
+        try open(); let before = try ui.state()
+        try ui.selectTool(tool)
+        ui.coordinate(CGPoint(x: 0.5, y: 0.65)).tap()
+        let field = ui.app.textViews[editor]
+        XCTAssertTrue(field.waitForExistence(timeout: 10), "Selected tool must open its text editor")
+        field.typeText("Chrome accessory text")
+        escape()
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.undoAvailable }
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
+    }
+    func testTextPaletteInsertsEditableUndoableText() throws { try insertTextItem(tool: "text", editor: "Text box") }
+    func testMoreStickyInsertsEditableUndoableNote() throws { try insertTextItem(tool: "sticky", editor: "Sticky note") }
+
+    func testMoreEditHandwritingSelectsToolWithoutAddingInk() throws {
+        try open(); try ui.selectTool("pen"); try draw(); let before = try ui.state()
+        try tap("tool.more"); try tap("tool.smartink.edit")
+        _ = try ui.waitForState { $0.tool == "smartink.edit" }
+        try sameContent(before)
+        try ui.selectTool("pen"); try draw(y: 0.73)
+    }
+
+    func testMoreGraphAccessoryInsertsUndoableGraph() throws {
+        try open(); let before = try ui.state()
+        try tap("tool.more"); try tap("cmd.math.graph.create"); try panel("mathgraph.editor")
+        try replace("Graph expressions, one per line", "y = x")
+        try tap("Insert Graph"); try panel("mathgraph.editor", shown: false)
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 }
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
+    }
+
+    func testMoreAudioAccessoryStartsAndStopsRecorder() throws {
+        try open(); let before = try ui.state()
+        try tap("tool.more"); try tap("cmd.audio.record")
+        let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
+        if alert.waitForExistence(timeout: 3) {
+            let allow = alert.buttons.matching(NSPredicate(format: "label IN {'Allow', 'OK'}")).firstMatch
+            if allow.exists { allow.tap() }
+        }
+        _ = try reachable("Pause Recording")
+        try tap("Stop Recording")
+        try wait("Stop Recording must dismiss the active recorder") { !self.query("Pause Recording").firstMatch.exists }
+        try sameContent(before, history: false)
+    }
+
+    func testMoreBoardTemplatesAccessoryOpensCorrectPanel() throws {
+        try open("Concept map"); let before = try ui.state()
+        try tap("tool.more"); try tap("Templates"); try panel("whiteboard.templates")
+        try tap("cmd.panel.close"); try panel("whiteboard.templates", shown: false)
+        try sameContent(before)
+    }
+
     func testMoreImageOpensSourcePickerAndCancelDoesNotInsert() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.image"); ui.coordinate(CGPoint(x: 0.5, y: 0.65)).tap(); try tap("Files")
@@ -449,6 +535,17 @@ final class ChromeUITests: XCTestCase {
         try more("Hide Tools"); try more("Show Tools"); _ = try reachable("menu.toolSettings")
         try sameContent(before); try ui.selectTool("pen"); try draw()
     }
+    func testPageScrollCollapsesOptionsAndChoosingToolRestoresThem() throws {
+        try open(); try ui.selectTool("pen"); let before = try ui.state()
+        _ = try reachable("menu.toolSettings")
+        try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.75), to: CGPoint(x: 0.12, y: 0.45))
+        _ = try ui.waitForState { abs($0.contentOffset.y - before.contentOffset.y) > 20 }
+        try wait("Page scrolling must collapse the secondary options bar") {
+            !self.query("menu.toolSettings").firstMatch.exists
+        }
+        try ui.selectTool("highlighter"); _ = try reachable("menu.toolSettings")
+        try settings("highlighter"); try tap("Thickness 2"); outside(); try draw()
+    }
     private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
     private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
     private func saveLayout(_ name: String) throws {
@@ -484,6 +581,27 @@ final class ChromeUITests: XCTestCase {
         _ = try reachable("Show Highlighter"); XCTAssertFalse(query("Hide Highlighter").firstMatch.exists)
         try doneCustomizing(); XCTAssertFalse(query("tool.highlighter").firstMatch.exists)
         try tap("tool.more"); try tap("tool.highlighter"); try draw()
+    }
+
+    func testApplySavedLayoutRestoresReorderedToolsWithLassoFirst() throws {
+        try open(); try customize()
+        let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
+        XCTAssertTrue(handle.waitForExistence(timeout: 5))
+        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Pen"))
+        try wait("Reordering must move Highlighter above Pen") {
+            self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Pen").firstMatch.frame.minY
+        }
+        try saveLayout("Reordered chrome")
+        try tap("Reset Toolbar"); try tap("Reset Writing Tools")
+        try tap("Apply Reordered chrome")
+        XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Pen").frame.minY)
+        XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
+        try doneCustomizing()
+        let lasso = try reachable("tool.lasso").frame, highlighter = try reachable("tool.highlighter").frame
+        if let edge = try ui.state().paletteDock?.edge, ["left", "right"].contains(edge) {
+            XCTAssertLessThan(lasso.midY, highlighter.midY)
+        } else { XCTAssertLessThan(lasso.midX, highlighter.midX) }
+        try ui.selectTool("highlighter"); try draw()
     }
     func testDeleteSavedLayoutOnlyRemovesChosenName() throws {
         try open(); try customize(); try saveLayout("Keep chrome"); try saveLayout("Delete chrome")
@@ -673,6 +791,18 @@ final class ChromeUITests: XCTestCase {
         key("l", [.command, .option]); XCTAssertTrue(try require("Layer 3").isSelected)
         XCTAssertTrue((query("Layer 3").firstMatch.value as? String ?? "").contains("1 item"))
     }
+    func testActiveLayerLimitsLassoSelectionToChosenLayer() throws {
+        try layers(); try tap("Layer 2"); try tap("cmd.panel.close")
+        try ui.selectTool("pen"); try draw(y: 0.62)
+        key("3", [.command, .option]); try draw(y: 0.72)
+        try ui.selectTool("lasso")
+        let outline = [CGPoint(x: 0.35, y: 0.58), CGPoint(x: 0.65, y: 0.58),
+                       CGPoint(x: 0.65, y: 0.78), CGPoint(x: 0.35, y: 0.78), CGPoint(x: 0.35, y: 0.58)]
+        try ui.drawStroke(outline)
+        _ = try ui.waitForState { $0.selectionCount == 1 }
+        key("2", [.command, .option]); try ui.drawStroke(outline)
+        _ = try ui.waitForState { $0.selectionCount == 1 }
+    }
     func testLayerVisibilityChangesViewerWithoutDeletingContentAndPersists() throws {
         try layers(); try tap("Layer 2"); try tap("cmd.panel.close")
         try ui.selectTool("pen"); try draw(); let before = try ui.state()
@@ -747,6 +877,28 @@ final class ChromeUITests: XCTestCase {
         for angle in [0, 45, 90] {
             try rulerMenu("Set Angle…"); try replace("Angle in degrees", String(angle)); try tap("Set Angle")
             try wait("Ruler angle must be \(angle) degrees") { (self.ruler.value as? String ?? "").hasPrefix("\(angle) degrees") }
+        }
+        try sameContent(before)
+    }
+
+    func testRulerTwoFingerRotationSnapsToFortyFiveWithoutEditing() throws {
+        try showRuler(); let before = try ui.state()
+        try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try tap("Set Angle")
+        let frame = ruler.frame, radius = min(frame.width * 0.3, 90)
+        let paths = [CGFloat(-1), CGFloat(1)].map { direction in
+            (0...12).map { step -> NSValue in
+                let angle = CGFloat(step) / 12 * .pi / 4
+                return NSValue(cgPoint: CGPoint(x: frame.midX + direction * radius * cos(angle),
+                                               y: frame.midY - direction * radius * sin(angle)))
+            }
+        }
+        let done = XCTestExpectation(description: "Two fingers rotate ruler")
+        var failure: Error?
+        NibTouchPaths.perform(paths, duration: 0.8) { error in failure = error; done.fulfill() }
+        XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 16), .completed)
+        if let failure { throw failure }
+        try wait("Two-finger rotation must snap to 45 degrees") {
+            (self.ruler.value as? String ?? "").hasPrefix("45 degrees")
         }
         try sameContent(before)
     }

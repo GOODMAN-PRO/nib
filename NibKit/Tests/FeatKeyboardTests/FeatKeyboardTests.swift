@@ -762,6 +762,73 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
     }
 
+    func testNativeSelectAllActionUsesCanvasWindowAndYieldsToTextAndModal() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let root = KeyboardWindowController(session: h.session)
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let keyboard = attachment.keyboard
+        keyboard.restoreFocus()
+
+        let action = #selector(UIResponderStandardEditActions.selectAll(_:))
+        let key = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == "a" })
+        XCTAssertEqual(key.action, action, "Command-A and the native Edit action share one route")
+        let focused = try XCTUnwrap(CanvasKeyboardFocus.firstResponder(in: window))
+        XCTAssertTrue(focused.canPerformAction(action, withSender: nil))
+        let target = try XCTUnwrap(focused.target(forAction: action, withSender: nil) as? UIResponder)
+        XCTAssertTrue(target === keyboard)
+
+        let other = EditorSession()
+        other.document = Fixtures.textDocID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let recorder = stand(in: h, for: [CommandIDs.selectionSelectAll])
+        let ran = expectation(description: "Native Select All reaches the invoking page")
+        recorder.onCall = { _ in ran.fulfill() }
+        _ = target.perform(action, with: nil)
+        await fulfillment(of: [ran], timeout: 3)
+        XCTAssertEqual(recorder.params(CommandIDs.selectionSelectAll),
+                       [["page": .string(NodeRef.page(doc, Fixtures.page1).description)]])
+        XCTAssertTrue(h.app.services.sessions.active === h.session)
+
+        let nativeKey = UIKeyCommand(input: "a", modifierFlags: .command, action: action)
+        XCTAssertTrue(keyboard.canPerformAction(action, withSender: nativeKey))
+        let nativeRan = expectation(description: "System Command-A has no registry propertyList")
+        recorder.onCall = { _ in nativeRan.fulfill() }
+        _ = target.perform(action, with: nativeKey)
+        await fulfillment(of: [nativeRan], timeout: 3)
+        XCTAssertEqual(recorder.params(CommandIDs.selectionSelectAll).count, 2)
+        let wrongKey = UIKeyCommand(input: "a", modifierFlags: .alternate, action: action)
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: wrongKey))
+
+        let text = UITextView(frame: CGRect(x: 20, y: 20, width: 200, height: 80))
+        text.text = "Unicode café 日本語"
+        root.view.addSubview(text)
+        XCTAssertTrue(text.becomeFirstResponder())
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+        text.selectAll(nil)
+        XCTAssertEqual(text.selectedRange, NSRange(location: 0, length: (text.text as NSString).length))
+        text.resignFirstResponder()
+        text.removeFromSuperview()
+        keyboard.restoreFocus()
+        XCTAssertTrue(keyboard.canPerformAction(action, withSender: nil))
+        root.modal = UIViewController()
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+        root.modal = nil
+        h.session.isEditingText = true
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+        h.session.isEditingText = false
+        attachment.detach(from: host)
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+    }
+
     func testCanvasFocusRecoveryAfterRemovalAndRotationPreservesTextFields() async throws {
         let h = await started()
         let host = FakeCanvasHost(h)

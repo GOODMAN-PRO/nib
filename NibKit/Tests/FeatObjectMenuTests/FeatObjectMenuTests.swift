@@ -960,6 +960,67 @@ final class FeatObjectMenuTests: XCTestCase {
                        host.viewPoint(Point(420, 700), page: page))
     }
 
+    func testPageInsertionMenuKeepsActionsAndRoutesTheirHeldPageContext() async throws {
+        guard #available(iOS 17.4, *) else { return }
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let savedPasteboard = ObjectMenuEntries.pasteboardHasContent
+        ObjectMenuEntries.pasteboardHasContent = { true }
+        defer { ObjectMenuEntries.pasteboardHasContent = savedPasteboard }
+        // Include the neighbouring entries that crowded the horizontal edit menu in the app.
+        for (id, title, command, order) in [
+            ("test.graph", "Insert Graph", "math.graph.create", 110),
+            ("test.pasteStyle", "Paste and Match Style", "clipboard.paste", 120),
+            ("test.typing", "Start Typing", CommandIDs.textStartPageText, 150),
+            ("test.comment", "Add Comment", CommandIDs.commentAdd, 600)
+        ] {
+            h.app.ui.menus.register(MenuItemDescriptor(
+                id: id, title: title, location: .pageLongPress, order: order, owner: "builtin", command: command,
+                params: { ObjectMenuEntries.pageParams($0, pointKey: "at") }))
+        }
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.hidden", title: "Hidden", location: .pageLongPress, order: 700, owner: "builtin",
+            command: "test.hidden", isVisible: { _ in false }))
+        var commentParams: JSONValue?, typingParams: JSONValue?
+        standIn(h, CommandIDs.commentAdd) { commentParams = $0 }
+        standIn(h, CommandIDs.textStartPageText) { typingParams = $0 }
+        let host = FakeCanvasHost(h)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.addSubview(host.canvasView)
+        window.makeKeyAndVisible()
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer {
+            attachment.detach(from: host)
+            window.isHidden = true
+        }
+        let out = try await h.run(CommandIDs.menuShowAt, [
+            "page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [420, 700]
+        ])
+        XCTAssertEqual(out["handled"], true)
+        let anchor = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? PageMenuAnchor }.first)
+        try await waitUntil({ anchor.isHeld }, "The native vertical menu must actually be presented")
+        XCTAssertEqual(anchor.frame.origin, host.viewPoint(Point(420, 700), page: page))
+        XCTAssertTrue(anchor.showsMenuAsPrimaryAction)
+        XCTAssertEqual(anchor.preferredMenuElementOrder, .fixed)
+        XCTAssertFalse(anchor.point(inside: .zero, with: nil), "The source must not take canvas touches")
+        XCTAssertFalse(anchor.isAccessibilityElement)
+        let actions = try XCTUnwrap(anchor.menu).children.compactMap { $0 as? UIAction }
+        XCTAssertEqual(actions.map(\.title), ["Paste", "Insert Graph", "Paste and Match Style",
+                                             "Start Typing", "Add Comment", "Take Screenshot"])
+        // Invoke the actual native menu actions, including the host's command-dispatch closures.
+        anchor.sendAction(try XCTUnwrap(actions.first { $0.title == "Add Comment" }))
+        anchor.sendAction(try XCTUnwrap(actions.first { $0.title == "Start Typing" }))
+        try await waitUntil({ commentParams != nil && typingParams != nil })
+        let expected: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "at": [420, 700]]
+        XCTAssertEqual(commentParams, expected)
+        XCTAssertEqual(typingParams, expected)
+        attachment.detach(from: host)
+        XCTAssertNil(anchor.superview)
+        XCTAssertNil(anchor.menu, "Detached canvases must release the menu and its context")
+    }
+
     func testShowAtWithoutAWindowReportsTheEntries() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         try await withPasteboard(true) {

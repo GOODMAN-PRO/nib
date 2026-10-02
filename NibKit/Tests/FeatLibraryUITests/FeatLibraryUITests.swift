@@ -751,6 +751,24 @@ final class FeatLibraryUITests: XCTestCase {
                     let hit = host.view.hitTest(point, with: nil)
                     XCTAssertTrue(hit === scroll || hit?.isDescendant(of: scroll) == true,
                                   "Library cover at \(point) intercepted by \(String(describing: hit)) in \(mode), \(size)")
+                    // Being inside the scroll view is insufficient: the native
+                    // pointer-marquee measurement view spans the whole grid.
+                    let measurementViews = descendants(scroll).compactMap { $0 as? LibraryPointerMarquee.Probe }
+                    XCTAssertFalse(measurementViews.isEmpty)
+                    for measurement in measurementViews {
+                        let localPoint = measurement.convert(point, from: host.view)
+                        XCTAssertNil(measurement.hitTest(localPoint, with: nil),
+                                     "Coordinate measurement must be transparent to UIKit hit testing")
+                        XCTAssertFalse(hit === measurement || hit?.isDescendant(of: measurement) == true,
+                                       "The marquee probe intercepted the cover at \(point)")
+                    }
+                    let marqueePans = (scroll.gestureRecognizers ?? []).filter {
+                        $0.delegate is LibraryPointerMarquee.Coordinator
+                    }
+                    XCTAssertEqual(marqueePans.count, 1, "Pointer selection must remain on the scroll view")
+                    XCTAssertEqual(marqueePans.first?.allowedTouchTypes,
+                                   [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)])
+                    XCTAssertEqual(marqueePans.first?.cancelsTouchesInView, false)
                     XCTAssertTrue(scroll.isUserInteractionEnabled)
                     checked += 1
                 }

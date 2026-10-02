@@ -42,7 +42,11 @@ public struct NibPopoverPanel<Content: View>: View {
                 content
             }
             .padding(NibSpacing.l)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                // The native scroll/glass host can return fractional rounding noise. The
+                // measured height also sets this viewport's height, so avoid a layout feedback loop.
+                if abs(height - contentHeight) > 0.25 { contentHeight = height }
+            }
             .background(PopoverScrollInteraction(isPresented: isPresented))
         }
         // Gate the native scroll host at its source, not only the animated droplet around it.
@@ -215,7 +219,11 @@ public struct NibBudPopover<Content: View>: View {
             let centre = placement.centre(size: size, beside: anchor, gap: gap, in: bounds)
             NibPopoverPanel(title: title, subtitle: subtitle, width: min(width, available.width),
                             maxHeight: available.height) { content }
-                .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { measured in
+                    if abs(measured.width - size.width) > 0.25 || abs(measured.height - size.height) > 0.25 {
+                        size = measured
+                    }
+                }
                 .droplet(id, style: .popover)
                 .budsFrom(source, isPresented: $isPresented)
                 .position(x: centre.x - frame.minX, y: centre.y - frame.minY)

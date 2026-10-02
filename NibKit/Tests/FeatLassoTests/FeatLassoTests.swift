@@ -249,6 +249,40 @@ final class FeatLassoTests: XCTestCase {
         }
     }
 
+    func testSelectAllKeyboardBatchReplacesSelectionAcrossKindsWithoutEditingContent() async throws {
+        let h = harness()
+        editFixturePage(h) { items in
+            for i in items.indices where items[i].id == Fixtures.imageID { items[i].locked = true }
+            for i in items.indices where items[i].id == Fixtures.mathID { items[i].layer = 2 }
+        }
+        // Select All includes text, ink/tape, shapes and connectors even when the lasso's
+        // gesture filters exclude them. It replaces both an empty and a single-object selection.
+        try await h.run(CommandIDs.settingsSet, ["name": "lasso.include", "value": []])
+        h.session.tool = "lasso"
+        let before = try h.snapshot()
+        let undoDepth = h.undoDepth(Fixtures.docID)
+        let expected = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).filter { $0.layer == 0 }
+        let other = EditorSession()
+        other.document = Fixtures.textDocID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        for initial in [Selection(), Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])] {
+            h.session.selection = initial
+            // This is the registered keyboard descriptor's actual command/parameter shape.
+            let result = try await h.run(CommandIDs.batch, ["calls": [[
+                "command": .string(CommandIDs.selectionSelectAll), "params": ["page": .string(pageRef)]
+            ]]])
+            XCTAssertEqual(result["results"]?.arrayValue?.first?["ok"]?.boolValue, true)
+            XCTAssertEqual(h.session.selection.items, expected.map(\.id))
+            XCTAssertEqual(h.session.selection.doc, Fixtures.docID)
+            XCTAssertEqual(h.session.selection.page, Fixtures.page1)
+            XCTAssertNil(h.session.selection.outline)
+            XCTAssertTrue(other.selection.isEmpty, "Select All belongs to the invoking window")
+            XCTAssertEqual(try h.snapshot(), before, "Selection must preserve text, tape and anchored diagram data")
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), undoDepth, "Select All must not disturb grouped diagram undo")
+        }
+    }
+
     func testDrawerHitAreasDecideLassoAndTapHits() async throws {
         let h = harness()
         // A collapsed sticky note answers only at its 24 pt icon in the top-left corner of its frame (400, 120, 140, 140).

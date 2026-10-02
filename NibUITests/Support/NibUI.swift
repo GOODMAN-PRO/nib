@@ -194,11 +194,31 @@ final class NibUI {
             app.descendants(matching: .any).matching(identifier: identifier).allElementsBoundByIndex
                 .first { $0.isHittable && $0.isEnabled }
         }
-        if let control = candidate(id) { control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); return }
+        func revealInMenu() -> XCUIElement? {
+            for _ in 0..<16 {
+                if let control = candidate(id) { return control }
+                // More contains full sections (including Add Page) in a bounded viewport.
+                // Scroll its real host; existence alone does not make an offscreen row actionable.
+                guard let scroll = app.scrollViews.allElementsBoundByIndex.first(where: {
+                    $0.identifier != "nib.canvas" && $0.isHittable &&
+                    $0.descendants(matching: .any).matching(identifier: id).count > 0
+                }), let viewport = NibUITestScrollGeometry.viewport(
+                    scroll: scroll.frame, window: app.frame, obstructions: []) else { return nil }
+                let target = scroll.descendants(matching: .any).matching(identifier: id).firstMatch
+                let drag = NibUITestScrollGeometry.drag(in: viewport, toward: target.frame.midY)
+                let origin = app.coordinate(withNormalizedOffset: .zero)
+                origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
+                    .press(forDuration: 0.01, thenDragTo: origin.withOffset(
+                        CGVector(dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
+                        withVelocity: .slow, thenHoldForDuration: 0.15)
+            }
+            return candidate(id)
+        }
+        if let control = revealInMenu() { control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); return }
         for identifier in overflow {
             if let menu = candidate(identifier) {
                 menu.tap()
-                if let control = candidate(id) { control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); return }
+                if let control = revealInMenu() { control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); return }
                 if menu.isHittable { menu.tap() }
             }
         }
@@ -273,8 +293,10 @@ final class NibUI {
 extension NibUI {
     static func openCalendarEvent(in calendar: XCUIApplication) throws {
         let title = calendar.textFields["Title"]
+        // iPadOS 26 exposes the toolbar action as add-plus-button / lowercase "add".
+        // Prefer its stable identifier; localized display casing is not a command contract.
         let add = calendar.buttons.matching(NSPredicate(
-            format: "label IN {'Add', 'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
+            format: "identifier == 'add-plus-button' OR label IN[c] {'Add', 'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
         if add.waitForExistence(timeout: 3), add.isHittable {
             add.tap()
         }

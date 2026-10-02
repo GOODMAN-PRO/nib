@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatToolbar
 
@@ -304,6 +304,126 @@ final class FeatToolbarTests: XCTestCase {
         try await h.run(TestTouch.descriptor.id)
         model.refresh()
         XCTAssertEqual(h.session.tool, "lasso", "A later commit must not restore Pen")
+    }
+
+    /// Insert tools share the palette's input path. Exercise the retained native panels in an active
+    /// scene, including the lower rows of More, then dispatch to the owning window.
+    func testInsertToolsRemainReachableAfterPopoverRelayoutAndSelectTheirWindow() async throws {
+        let h = harness()
+        // Keep insert tools in the lower rows, as in the fully registered app's More grid.
+        for index in 0..<8 {
+            h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                id: "extra.\(index)", title: "Accessory \(index)", icon: "ruler", group: .accessories,
+                order: 31 + index, owner: TestToolsFeature.id, command: "ruler.toggle"))
+        }
+        let inserts = ["shape", "image", "sticky", "tape", "elements"]
+        for (index, id) in inserts.enumerated() {
+            h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                id: id + ".item", title: id, icon: "square", group: .tools, order: 40 + index,
+                owner: TestToolsFeature.id, toolID: id,
+                settings: { _ in AnyView(Text(id + " settings").frame(height: 600)) }))
+            h.app.ui.canvasTools.register(CanvasToolDescriptor(id: id, title: id, owner: TestToolsFeature.id) {
+                TestTool(id: id, isSticky: false)
+            })
+        }
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let host = UIHostingController(rootView:
+            NibDropletContainer {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+            }
+            .environment(\.scenePhase, .active))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+
+        func panels() -> [UIScrollView] {
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        for id in ["text"] + inserts {
+            print("Insert palette regression: \(id)")
+            let item = try XCTUnwrap((model.shown + model.more).first { $0.id == id })
+            XCTAssertEqual(item.accessibilityID, "tool." + id)
+            XCTAssertTrue(item.isEnabled)
+            if model.more.contains(where: { $0.id == id }) {
+                model.openSettings()
+                model.moreOpen = true
+                model.refresh()
+                try await waitUntil("More owns its native hit target for \(id)") {
+                    host.view.layoutIfNeeded()
+                    let open = panels().filter { $0.isUserInteractionEnabled }
+                    guard open.count == 1, let panel = open.first else { return false }
+                    // Check both the first and last grid rows; the centre alone can miss an overlap.
+                    return [CGFloat(0.25), 0.8].allSatisfy { fraction in
+                        let point = panel.convert(CGPoint(x: panel.bounds.midX,
+                                                          y: panel.bounds.minY + panel.bounds.height * fraction), to: window)
+                        let hit = window.hitTest(point, with: nil)
+                        return hit === panel || hit?.isDescendant(of: panel) == true
+                    }
+                }
+            }
+            model.select(id)
+            XCTAssertFalse(model.moreOpen, "Choosing a tool releases More before command execution")
+            XCTAssertFalse(model.settingsOpen, "Choosing a tool releases settings before command execution")
+            try await waitUntil("\(id) activates in the palette's window") { h.session.tool == id }
+            XCTAssertEqual(model.tool, id)
+            XCTAssertEqual(other.tool, "pen")
+            XCTAssertFalse(model.moreOpen)
+            XCTAssertFalse(model.settingsOpen)
+            try await waitUntil("\(id)'s closed menus release the next input") {
+                host.view.layoutIfNeeded()
+                return !panels().isEmpty && panels().allSatisfy {
+                    !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden
+                }
+            }
+            XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before)
+            // Insert tools hand back only when the canvas explicitly finishes their use.
+            model.refresh()
+            XCTAssertEqual(h.session.tool, id)
+            model.select("pen")
+            try await waitUntil("return to Pen before the next insert tool") { h.session.tool == "pen" }
+        }
+    }
+
+    func testMoreGridRoundingNoiseDoesNotRestartLayoutButRealMovementDoes() throws {
+        let field = DropletField()
+        field.setActive(false)
+        field.reduceMotion = true
+        let id = "toolbar.palette.more"
+        let rest = CGRect(x: 92, y: 433.33333333333337, width: 312, height: 236.33333333333337)
+        field.setRest(id, rest, style: .popover)
+        field.setBud(id, source: "toolbar.palette.more.source", presented: true, instant: true, dismiss: {})
+        let settled = field.node(id).presentation
+        let settledFrame = try XCTUnwrap(field.visualFrame(id))
+        // Frames captured from the native three-row More grid's layout feedback loop.
+        let rounded = CGRect(x: 92, y: 433.5, width: 312, height: 236.33333333333326)
+        for frame in [rounded, rest, rounded, rest, rest.offsetBy(dx: 0, dy: 0.25)] {
+            field.setRest(id, frame, style: .popover)
+            XCTAssertEqual(field.node(id).presentation, settled,
+                           "Rounding noise must not republish presentation and restart SwiftUI layout")
+            XCTAssertEqual(field.visualFrame(id), settledFrame)
+        }
+        for delta in [CGFloat(0.1), 0.2] {
+            field.setRest(id, rest.offsetBy(dx: delta, dy: 0), style: .popover)
+            XCTAssertEqual(field.visualFrame(id), settledFrame)
+        }
+        field.setRest(id, rest.offsetBy(dx: 0.3, dy: 0), style: .popover)
+        XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).minX, rest.minX + 0.3, accuracy: 1e-9,
+                       "Small real moves accumulate against the retained frame instead of being lost")
+        let moved = rest.offsetBy(dx: 12, dy: 24)
+        field.setRest(id, moved, style: .popover)
+        let movedFrame = try XCTUnwrap(field.visualFrame(id))
+        XCTAssertEqual(movedFrame.minX, moved.minX, accuracy: 1e-9)
+        XCTAssertEqual(movedFrame.minY, moved.minY, accuracy: 1e-9,
+                       "An actual dock/layout change must still take effect")
+        field.unregister(id)
     }
 
     func testConformance() async {
