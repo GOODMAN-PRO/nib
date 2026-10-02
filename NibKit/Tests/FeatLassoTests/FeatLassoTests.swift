@@ -311,6 +311,33 @@ final class FeatLassoTests: XCTestCase {
 
     // MARK: The tool
 
+    func testClosedFingerLassoSelectsEnclosedStrokeAtCanvasZoom() async throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        host.zoomScale = 1.2767101196075796
+        h.session.tool = "lasso"
+        let tool = LassoTool()
+        tool.activate(host)
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let loop = [Point(60, 90), Point(300, 90), Point(300, 155), Point(60, 155), Point(60, 90)]
+        let samples = loop.enumerated().map { index, point in
+            CanvasSample(page: Fixtures.page1, location: point, timestamp: Double(index) * 0.175,
+                         isPencil: false, touchID: 1)
+        }
+
+        tool.touchesBegan(samples[0], host: host)
+        tool.touchesMoved(Array(samples[1...3]), host: host)
+        tool.touchesEnded(samples[4], host: host)
+        let command = try XCTUnwrap(tool.pending, "A closed finger loop must issue a selection command")
+        await command.value
+
+        XCTAssertEqual(h.session.selection.items, [Fixtures.strokeID])
+        XCTAssertNotNil(h.session.selection.outline)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before,
+                       "Lasso selection must not alter the ink or create an undoable edit")
+        XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+
     func testFreehandAndRectangleGesturesSelect() async throws {
         let h = harness()
         let host = FakeCanvasHost(h)

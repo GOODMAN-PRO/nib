@@ -76,7 +76,7 @@ final class CreateUITests: XCTestCase {
         try replace(ui.app.textFields["Title"], with: "Cancelled draft")
         try tap("Cancel")
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
-        XCTAssertFalse(ui.app.textFields["Title"].exists)
+        try wait("create.cancel must dismiss the draft") { !self.ui.app.textFields["Title"].exists }
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages, "create.cancel must not leave a package")
     }
 
@@ -274,7 +274,9 @@ final class CreateUITests: XCTestCase {
         try tap("No cover")
         try scrollTap("More Templates…")
         try scrollTap("Custom Colour")
-        let hex = ui.app.textFields.matching(NSPredicate(format: "label CONTAINS[c] 'hex'")).firstMatch
+        let hex = ui.app.descendants(matching: .any).matching(NSPredicate(
+            format: "(elementType == %d OR elementType == %d) AND (label CONTAINS[c] 'hex' OR placeholderValue CONTAINS[c] 'hex')",
+            XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue)).firstMatch
         try replace(hex, with: "#CEDFED")
         try tap("Choose Template")
         try scrollTo(ui.app.textFields["Title"], name: "Title")
@@ -449,10 +451,10 @@ final class CreateUITests: XCTestCase {
     }
 
     func testQuickNoteUsesSavedPaperDefaults() throws {
-        try notebook("Default graph source")
+        try notebook("Default planner source")
         try tap("No cover")
-        try scrollTap("Grid")
-        try scrollTap("Graph Paper")
+        try scrollTap("Planners")
+        try scrollTap("Daily Planner")
         try chooseSize("Letter")
         let existing = try create()
         let before = try livePages(existing)
@@ -460,7 +462,7 @@ final class CreateUITests: XCTestCase {
         let quick = try quickNote()
         XCTAssertNotEqual(quick, existing)
         try assertDocument(quick, kind: "notebook", pages: 1)
-        XCTAssertEqual(try livePages(quick).map(template), ["builtin.graph"],
+        XCTAssertEqual(try livePages(quick).map(template), ["builtin.plannerDaily"],
                        "doc.quickNote must use the saved default paper")
         try assertSize(quick, width: 612, height: 792)
         XCTAssertTrue(NSDictionary(dictionary: ["pages": before]).isEqual(to: ["pages": try livePages(existing)]),
@@ -633,7 +635,12 @@ final class CreateUITests: XCTestCase {
         // DESIGN §14.6: the 104 × 136 preview immediately precedes the title field, separated by 16 pt.
         let rect = CGRect(x: title.minX - 120, y: title.midY - 68, width: 104, height: 136).insetBy(dx: 8, dy: 8)
         let screenshot = ui.app.screenshot().image
-        let image = try XCTUnwrap(screenshot.cgImage)
+        // XCTest can return a portrait pixel buffer with a landscape UIImage orientation.
+        // Drawing it first applies that orientation before cropping in accessibility coordinates.
+        let upright = UIGraphicsImageRenderer(size: screenshot.size).image { _ in
+            screenshot.draw(in: CGRect(origin: .zero, size: screenshot.size))
+        }
+        let image = try XCTUnwrap(upright.cgImage)
         let scale = CGFloat(image.width) / ui.app.frame.width
         let crop = try XCTUnwrap(image.cropping(to: CGRect(x: rect.minX * scale, y: rect.minY * scale,
                                                           width: rect.width * scale, height: rect.height * scale)))
@@ -728,6 +735,20 @@ final class CreateUITests: XCTestCase {
         field.tap()
         field.typeKey("a", modifierFlags: [.command])
         field.typeText(text)
+        dismissKeyboard()
+    }
+
+    private func dismissKeyboard() {
+        let keyboard = ui.app.keyboards.firstMatch
+        guard keyboard.exists else { return }
+        let hide = keyboard.buttons.matching(NSPredicate(
+            format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
+        if hide.exists && hide.isHittable {
+            hide.tap()
+        } else {
+            // iPad's system keyboard has a dismissal key at its lower-right corner.
+            keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.94)).tap()
+        }
     }
 
     private func newMenu(_ choice: String) throws {
@@ -807,10 +828,10 @@ final class CreateUITests: XCTestCase {
     private func distribution(_ choice: String) throws {
         try notebook("\(choice) distribution")
         try tap("No cover")
-        try scrollTap("Grid")
-        try scrollTap("Graph Paper")
         try scrollTap(choice)
         XCTAssertTrue(button(choice).isSelected, "create.applyPattern must select the distribution")
+        try scrollTap("Grid")
+        try scrollTap("Graph Paper")
         let id = try create()
         for _ in 0..<3 { try ui.tapCommand("page.add") }
         try ui.waitForState { $0.pageCount == 4 }
@@ -851,10 +872,19 @@ final class CreateUITests: XCTestCase {
         // Calendar is a real system dependency. Create an event through its UI, without injecting app state.
         let eventTitle = "Nib Creation Event " + UUID().uuidString.prefix(8)
         let calendar = XCUIApplication(bundleIdentifier: "com.apple.mobilecal")
+        let monitor = addUIInterruptionMonitor(withDescription: "Calendar first-launch permissions") { alert in
+            for label in ["Allow While Using App", "Allow", "OK"] where alert.buttons[label].exists {
+                alert.buttons[label].tap()
+                return true
+            }
+            return false
+        }
+        defer { removeUIInterruptionMonitor(monitor) }
         calendar.launch()
+        calendar.tap() // Triggers the interruption monitor for first-launch system prompts.
         let continueButton = calendar.buttons["Continue"]
-        if continueButton.waitForExistence(timeout: 3) { continueButton.tap() }
-        let add = calendar.buttons["Add"]
+        if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
+        let add = calendar.buttons.matching(NSPredicate(format: "label IN {'Add', 'Add Event', 'Create Event'}")).firstMatch
         try require(add, "Calendar system app must allow adding the event used by this test")
         add.tap()
         let title = calendar.textFields["Title"]

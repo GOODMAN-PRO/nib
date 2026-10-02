@@ -17,7 +17,12 @@ final class CanvasUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
-        try ui.launchFixture()
+        let scenario: NibUI.FixtureScenario
+        if name.contains("testFailedPage") { scenario = .failedRender }
+        else if name.contains("testLargeDocumentMemoryRecovery") { scenario = .largeDocument }
+        else if name.contains("testBoardMarkSeen") { scenario = .unseenBoards }
+        else { scenario = .standard }
+        try ui.launchFixture(scenario: scenario)
     }
 
     override func tearDownWithError() throws {
@@ -112,6 +117,7 @@ final class CanvasUITests: XCTestCase {
     }
 
     private func go(_ number: Int, shortcut: Bool = false) throws {
+        let count = try ui.state().pageCount
         if shortcut { key("g", [.command, .option]) }
         else { try more("Go to Page…") }
         let field = try require("Page number or title")
@@ -120,10 +126,10 @@ final class CanvasUITests: XCTestCase {
         try tap("Go")
         _ = try ui.waitForState { !$0.openPanels.contains("pages.goToPage") }
         eventually("Go must activate page \(number)") {
-            self.ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Page \(number) of 4"))
+            self.ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Page \(number) of \(count)"))
                 .allElementsBoundByIndex.contains { $0.frame.height <= 60 && $0.frame.width > 0 }
         }
-        _ = try page(number)
+        _ = try page(number, count: count)
     }
 
     /// The paper accessibility element, excluding the identically labelled 40-point HUD.
@@ -914,11 +920,8 @@ final class CanvasUITests: XCTestCase {
     func testFailedPageTryAgainReloadsWithoutLosingInk() throws {
         try open()
         let before = try ui.state()
-        // No production-data mutation or fabricated renderer failure. A seeded failed page is required.
-        guard element("Try Again").exists else {
-            XCTFail("Coverage prerequisite missing: -NibUITestFixture has no failed-render page or UI failure trigger; cannot exercise Try Again")
-            return
-        }
+        _ = try require("Try Again")
+        XCTAssertEqual(try ui.state().renderFailureCount, 1)
         try tap("Try Again")
         eventually("Try Again must clear the failed-page state") { !self.element("Try Again").exists }
         unchanged(before, try ui.state())
@@ -928,30 +931,36 @@ final class CanvasUITests: XCTestCase {
 
     func testFailedPageRestoreOpensBackupFlow() throws {
         try open()
-        guard element("Restore from Backup").exists else {
-            XCTFail("Coverage prerequisite missing: no failed-render fixture exposes Restore from Backup")
-            return
-        }
+        _ = try require("Restore from Backup")
+        XCTAssertEqual(try ui.state().renderFailureCount, 1)
         let before = try ui.state()
         try tap("Restore from Backup")
         _ = try ui.waitForState { $0.openPanels != before.openPanels }
+        _ = try require("Cloud & Backup")
         XCTAssertEqual(try ui.state().pageCount, before.pageCount)
     }
 
-    // canvas.largeDocument; F006. Background/foreground is real, but is not proof of memory pressure.
+    // canvas.largeDocument; F006/F100. Fixture delivers a UIKit memory warning, not OS jetsam.
     func testLargeDocumentMemoryRecoveryRequiresStressFixture() throws {
         try open()
         let before = try ui.state()
+        XCTAssertGreaterThanOrEqual(before.pageCount, 300)
         try ui.selectTool("pen")
         try ui.drawStroke([CGPoint(x: 0.4, y: 0.62), CGPoint(x: 0.6, y: 0.67)])
         let inked = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try go(4)
+        let away = try ui.state()
+        let warnings = try XCTUnwrap(away.memoryWarningCount)
+        let purges = try XCTUnwrap(away.rendererCachePurgeCount)
         XCUIDevice.shared.press(.home)
         ui.app.activate()
+        _ = try ui.waitForState {
+            ($0.memoryWarningCount ?? 0) > warnings && ($0.rendererCachePurgeCount ?? 0) > purges
+        }
         try go(1)
         unchanged(inked, try ui.state())
-        XCTAssertGreaterThanOrEqual(try ui.state().pageCount, 300,
-            "Coverage prerequisite missing: fixture has four pages, no 300-page document or controllable memory-pressure trigger; resume alone is not memory recovery")
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.redoAvailable }
     }
 
     // whiteboard.boardActions; F044
@@ -1057,13 +1066,27 @@ final class CanvasUITests: XCTestCase {
     func testBoardMarkSeenPreservesContentAndAcknowledgesAction() throws {
         try open(whiteboard)
         try boards()
-        try tap("Select")
-        try tap("Select All")
         let before = try ui.state()
+        let unseen = try XCTUnwrap(before.unseenFixturePages)
+        XCTAssertEqual(unseen.count, 2, "Offscreen remote boards must start unseen")
+        let receipts = try XCTUnwrap(before.boardReadReceipts)
+        try tap("Select")
+        try tap("Board 2")
+        _ = try require("1 board selected")
         try tap("Mark as Seen")
-        unchanged(before, try ui.state())
-        // A local, never-shared board has no unseen changes. No toast is promised by the spec.
-        // Do not mistake a successful no-op for proof that the chosen scope cleared remote changes.
-        XCTFail("Coverage prerequisite missing: fixture has no unseen board changes and nib.qa.state has no read-receipt fields; Mark as Seen effect cannot be verified")
+        let marked = try ui.waitForState { $0.unseenFixturePages?.count == 1 }
+        unchanged(before, marked)
+        let remaining = try XCTUnwrap(marked.unseenFixturePages?.first)
+        XCTAssertEqual(remaining, unseen[1], "Board 3 must remain unseen when only Board 2 is selected")
+        let acknowledged = unseen[0]
+        XCTAssertNotNil(marked.boardReadReceipts?[acknowledged] ?? nil)
+        XCTAssertNotEqual(marked.boardReadReceipts?[acknowledged] ?? nil, receipts[acknowledged] ?? nil)
+        XCTAssertEqual(marked.boardReadReceipts?[remaining] ?? nil, receipts[remaining] ?? nil)
+        try tap("Select All")
+        try tap("Mark as Seen")
+        let allSeen = try ui.waitForState { $0.unseenFixturePages?.isEmpty == true }
+        unchanged(before, allSeen)
+        XCTAssertNotNil(allSeen.boardReadReceipts?[remaining] ?? nil)
+        XCTAssertNotEqual(allSeen.boardReadReceipts?[remaining] ?? nil, receipts[remaining] ?? nil)
     }
 }
