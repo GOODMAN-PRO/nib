@@ -446,12 +446,13 @@ final class FeatStudyEditorTests: XCTestCase {
         let editor = try XCTUnwrap(descriptor.make(doc, h.session, h.app) as? StudySetViewController)
         let added = expectation(description: "Opening a pristine study set creates its first card")
         let observation = h.app.bus.observeCommits { change in
-            if change.documents.contains(doc) { added.fulfill() }
+            if change.command == CommandIDs.cardAdd, change.documents.contains(doc) { added.fulfill() }
         }
+        defer { observation.cancel() }
         editor.loadViewIfNeeded()
-        editor.viewDidAppear(false)
+        editor.beginAppearanceTransition(true, animated: false)
+        editor.endAppearanceTransition()
         await fulfillment(of: [added], timeout: 5)
-        observation.cancel()
         let model = editor.model
         await model.prepareForEditing()
         let card = try XCTUnwrap(model.currentCard)

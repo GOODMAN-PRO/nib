@@ -30,6 +30,7 @@ public enum FeatKeyboardFeature: NibFeature {
         for d in catalog { app.content.keyCommands.register(d) }
         PointerSupport.register(app, owner: id)
         KeyboardPanels.register(app, owner: id)
+        LibraryCreationShortcuts.register(app, owner: id)
 
         var page = SettingsPageDescriptor(id: KeyboardSettingsPage.id, title: String(localized: "Keyboard and Pointer"),
                                           icon: NibSymbol.keyboard.name, section: .general, order: 400, owner: id) { app in
@@ -48,6 +49,77 @@ public enum FeatKeyboardFeature: NibFeature {
 
     public static func start(_ app: NibApp) async {
         app.services.get(KeyboardRuntime.serviceKey, as: KeyboardRuntime.self)?.start()
+    }
+}
+
+/// SwiftUI's library hosting tree owns keyboard dispatch even when the outer shell has
+/// first-responder status. Contribute its creation keys through the chrome host, just as
+/// the library contributes selection keys. The registry remains the sole command source.
+@MainActor
+enum LibraryCreationShortcuts {
+    static let overlayID = "keyboard.libraryCreation"
+    static let shortcuts: Set<KeyShortcut> = [
+        KeyShortcut("n", [.command, .option]), KeyShortcut("n", [.command, .shift]),
+        KeyShortcut("t", [.command, .shift]), KeyShortcut("w", [.command, .shift])
+    ]
+
+    static func register(_ app: NibApp, owner: String) {
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: overlayID, owner: owner, placement: .center, surface: .none,
+            recedesWhileWriting: false, isVisible: { $0.kind == nil && $0.session.document == nil }) {
+                AnyView(LibraryCreationShortcutView(context: $0))
+            })
+    }
+
+    static func descriptors(in context: ChromeContext) -> [KeyCommandDescriptor] {
+        guard context.kind == nil, context.session.document == nil else { return [] }
+        let keys = KeyCommandContext(docKind: nil, isEditingText: context.session.isEditingText,
+                                     hasTabs: !(context.navigator?.openDocuments.isEmpty ?? true))
+        return KeyCommandRouting.active(context.app.content.keyCommands.all, in: keys).filter {
+            shortcuts.contains(ShortcutRules.normalized($0.shortcut))
+        }
+    }
+
+    /// Revalidate at dispatch: a plugin may have replaced a descriptor since SwiftUI rendered.
+    static func perform(_ id: String, in context: ChromeContext) {
+        guard let descriptor = descriptors(in: context).first(where: { $0.id == id }),
+              let navigator = context.navigator, navigator.session === context.session,
+              !CanvasKeyboardFocus.hasModal(navigator.rootViewController) else { return }
+        context.app.ui.activeNavigator = navigator
+        context.app.services.sessions.activate(context.session)
+        context.app.perform(descriptor.command, descriptor.resolvedParams(for: context.session),
+                            session: context.session)
+    }
+
+    static func shortcut(_ key: KeyShortcut) -> KeyboardShortcut {
+        var modifiers: EventModifiers = []
+        if key.modifiers.contains(.command) { modifiers.insert(.command) }
+        if key.modifiers.contains(.shift) { modifiers.insert(.shift) }
+        if key.modifiers.contains(.option) { modifiers.insert(.option) }
+        if key.modifiers.contains(.control) { modifiers.insert(.control) }
+        return KeyboardShortcut(KeyEquivalent(key.key.lowercased().first ?? " "), modifiers: modifiers)
+    }
+}
+
+private struct LibraryCreationShortcutView: View {
+    let context: ChromeContext
+    @State private var revision = 0
+
+    var body: some View {
+        let _ = revision
+        Group {
+            ForEach(LibraryCreationShortcuts.descriptors(in: context), id: \.id) { descriptor in
+                Button(descriptor.title) { LibraryCreationShortcuts.perform(descriptor.id, in: context) }
+                    .keyboardShortcut(LibraryCreationShortcuts.shortcut(descriptor.shortcut))
+            }
+        }
+        .frame(width: 0, height: 0)
+        .clipped()
+        .accessibilityHidden(true)
+        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange,
+                                                        object: context.app.content.keyCommands)) { _ in
+            revision += 1
+        }
     }
 }
 

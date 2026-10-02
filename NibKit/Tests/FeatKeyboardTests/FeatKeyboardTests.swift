@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 import NibDesign
@@ -32,6 +33,8 @@ private final class Recorder {
 @MainActor
 private final class KeyboardWindowController: UIViewController, SceneNavigator {
     let session: EditorSession
+    var modal: UIViewController?
+    override var presentedViewController: UIViewController? { modal ?? super.presentedViewController }
     init(session: EditorSession) { self.session = session; super.init(nibName: nil, bundle: nil) }
     required init?(coder: NSCoder) { nil }
     var openDocuments: [DocumentID] { session.document.map { [$0] } ?? [] }
@@ -179,6 +182,99 @@ final class FeatKeyboardTests: XCTestCase {
         for d in h.app.content.keyCommands.all {
             XCTAssertNil(d.params["keyboardShortcut"], "\(d.id): static params are what plugins and the AI read")
         }
+    }
+
+    func testLibraryCreationBridgeRoutesAllFourShortcutsToItsWindow() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root)
+        // F044 owns this key; F073 must bridge its descriptor without registering a duplicate.
+        var board = descriptor("whiteboard.new", "w", [.command, .shift], scope: .library,
+                               owner: "whiteboard", command: CommandIDs.panelOpen)
+        board.params = ["id": "whiteboard.create"]
+        h.app.content.keyCommands.register(board)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(LibraryCreationShortcuts.overlayID))
+        XCTAssertTrue(overlay.isVisible(context))
+        XCTAssertEqual(overlay.surface, .none)
+        let keys = LibraryCreationShortcuts.descriptors(in: context)
+        XCTAssertEqual(Set(keys.map(\.shortcut)), LibraryCreationShortcuts.shortcuts)
+        XCTAssertTrue(ShortcutRules.conflicts(in: h.app.content.keyCommands.all).isEmpty)
+        for key in keys {
+            let binding = LibraryCreationShortcuts.shortcut(key.shortcut)
+            XCTAssertEqual(binding.key.character, key.shortcut.key.first)
+            XCTAssertTrue(binding.modifiers.contains(.command))
+            XCTAssertEqual(binding.modifiers.contains(.shift), key.shortcut.modifiers.contains(.shift))
+            XCTAssertEqual(binding.modifiers.contains(.option), key.shortcut.modifiers.contains(.option))
+        }
+
+        let recorder = stand(in: h, for: [CommandIDs.panelOpen, CommandIDs.docQuickNote,
+                                          CommandIDs.docCreate, CommandIDs.docOpen])
+        // Each press starts with another window active, as in a multiple-window iPad session.
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        let otherRoot = KeyboardWindowController(session: other)
+        h.app.services.sessions.add(other)
+        for (id, command) in [("keyboard.newNotebook", CommandIDs.panelOpen),
+                              ("keyboard.quickNote", CommandIDs.docQuickNote),
+                              ("keyboard.newTextDocument", CommandIDs.docOpen),
+                              ("keyboard.newTextDocument", CommandIDs.docOpen),
+                              (board.id, CommandIDs.panelOpen)] {
+            h.app.ui.activeNavigator = otherRoot
+            h.app.services.sessions.activate(other)
+            let ran = expectation(description: id)
+            recorder.onCall = { if $0 == command { ran.fulfill() } }
+            LibraryCreationShortcuts.perform(id, in: context)
+            await fulfillment(of: [ran], timeout: 3)
+            recorder.onCall = nil
+            XCTAssertTrue(h.app.ui.activeNavigator === root)
+            XCTAssertTrue(h.app.services.sessions.active === h.session)
+        }
+        XCTAssertEqual(recorder.params(CommandIDs.panelOpen), [
+            ["id": "create.newNotebook", "kind": "notebook"], ["id": "whiteboard.create"]
+        ])
+        XCTAssertEqual(recorder.params(CommandIDs.docQuickNote), [[:]])
+        let created = recorder.params(CommandIDs.docCreate)
+        XCTAssertEqual(created.compactMap { $0["kind"]?.stringValue }, ["textDocument", "textDocument"])
+        let ids = created.compactMap { $0["id"]?.stringValue }
+        XCTAssertEqual(Set(ids).count, 2, "Resolve a fresh document ID on every press")
+        XCTAssertEqual(recorder.params(CommandIDs.docOpen),
+                       ids.map { ["doc": .string(NodeRef.document(NibID($0)).description)] })
+    }
+
+    func testLibraryCreationBridgeRevalidatesScopeAndReplacement() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root)
+        let original = try key(h, "newNotebook")
+        var replacement = original
+        replacement.id = "plugin.newNotebook"
+        replacement.owner = "plugin"
+        replacement.scope = .library
+        replacement.order = -1
+        h.app.content.keyCommands.register(replacement)
+        let live = LibraryCreationShortcuts.descriptors(in: context)
+        XCTAssertFalse(live.contains { $0.id == original.id })
+        XCTAssertTrue(live.contains { $0.id == replacement.id })
+        h.app.ui.activeNavigator = nil
+        root.modal = UIViewController()
+        LibraryCreationShortcuts.perform(replacement.id, in: context)
+        XCTAssertNil(h.app.ui.activeNavigator, "Creation must not run behind an existing modal")
+        XCTAssertEqual(LibraryCreationShortcuts.descriptors(in: context).map(\.id), live.map(\.id),
+                       "Keep bindings installed across modal dismissal; revalidate when pressed")
+        root.modal = nil
+        LibraryCreationShortcuts.perform(original.id, in: context)
+        XCTAssertNil(h.app.ui.activeNavigator, "Stale shortcuts must not dispatch or activate a window")
+        h.session.document = Fixtures.docID
+        XCTAssertTrue(LibraryCreationShortcuts.descriptors(in: context).isEmpty)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(LibraryCreationShortcuts.overlayID))
+        XCTAssertFalse(overlay.isVisible(context), "The bridge belongs only to the library hosting tree")
+        h.session.document = nil
+        var documentContext = context
+        documentContext.kind = .textDocument
+        XCTAssertTrue(LibraryCreationShortcuts.descriptors(in: documentContext).isEmpty)
+        XCTAssertFalse(overlay.isVisible(documentContext))
     }
 
     func testOtherOwnersKeepTheirKeysAndNothingIsDuplicated() async throws {

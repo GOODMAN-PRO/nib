@@ -1326,14 +1326,22 @@ final class FeatLibraryUITests: XCTestCase {
     func testSessionModelReleasedAfterControllerAndSessionRemoval() async throws {
         let h = harness(), session = EditorSession()
         h.app.services.sessions.add(session)
-        var controller: LibraryRootViewController? = LibraryRootViewController(app: h.app, navigator: LibraryTestNavigator(app: h.app, session: session))
-        weak var releasedController = controller
-        weak var model = controller?.model
+        var controller: LibraryRootViewController?
+        weak var releasedController: LibraryRootViewController?
+        weak var model: LibraryViewModel?
+        // UIKit construction can leave temporary autoreleased controller references.
+        // Establish one explicit owner before testing removal of that owner.
+        autoreleasepool {
+            let instance = LibraryRootViewController(app: h.app, navigator: LibraryTestNavigator(app: h.app, session: session))
+            controller = instance
+            releasedController = instance
+            model = instance.model
+        }
         _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["layout": "list"], session: session)
         XCTAssertEqual(model?.layout, .list)
         h.app.services.sessions.remove(session)
-        controller = nil
-        XCTAssertNil(releasedController)
+        autoreleasepool { controller = nil }
+        XCTAssertNil(releasedController, "Loaded: \(releasedController?.isViewLoaded == true), parent: \(String(describing: releasedController?.parent)), presenter: \(String(describing: releasedController?.presentingViewController))")
         XCTAssertNil(model)
         XCTAssertNil(LibraryModels.get(h.app).models[session.id])
     }

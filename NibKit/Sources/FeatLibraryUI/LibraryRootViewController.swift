@@ -471,12 +471,6 @@ final class LibraryRootViewController: UIViewController {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
     }
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        // A full-screen sheet may have hidden the controller without recreating
-        // SwiftUI's task. Resume catalog observation when that sheet returns.
-        Task { @MainActor [weak self] in await self?.model.appear() }
-    }
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         model.isVisible = false
