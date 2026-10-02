@@ -410,21 +410,11 @@ struct LinkEditorSheet: View {
 
 struct LinkWebsiteForm: View {
     @ObservedObject var model: LinkEditorModel
-    @FocusState private var focused: Bool
 
     var body: some View {
         List {
             Section {
-                TextField(String(localized: "Website address"), text: $model.url)
-                    .accessibilityLabel(Text(String(localized: "Website address")))
-                    .font(NibFont.body)
-                    .keyboardType(.URL)
-                    .textContentType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.done)
-                    .focused($focused)
-                    .onSubmit { model.save() }
+                LinkWebsiteAddressField(text: $model.url, onSubmit: { model.save() })
                     .frame(minHeight: NibMetrics.hitTarget)
             } footer: {
                 Text(String(localized: "Opens in your browser. An address without https:// gets it added."))
@@ -433,7 +423,65 @@ struct LinkWebsiteForm: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
-        .onAppear { if model.url.isEmpty { focused = true } }
+    }
+}
+
+/// Keep the name on the editable control itself, independent of its placeholder and current value.
+/// Native editing callbacks update the draft before either Return or the sheet's Add Link action saves it.
+struct LinkWebsiteAddressField: UIViewRepresentable {
+    @Binding var text: String
+    var onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> AddressField {
+        let field = AddressField()
+        field.placeholder = String(localized: "Website address")
+        field.accessibilityLabel = String(localized: "Website address")
+        field.font = NibUIFont.body
+        field.adjustsFontForContentSizeCategory = true
+        field.keyboardType = .URL
+        field.textContentType = .URL
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.returnKeyType = .done
+        field.text = text
+        field.focusOnAttach = text.isEmpty
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .editingChanged)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return field
+    }
+
+    func updateUIView(_ field: AddressField, context: Context) {
+        context.coordinator.parent = self
+        if field.text != text { field.text = text }
+    }
+
+    final class AddressField: UITextField {
+        var focusOnAttach = false
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil, focusOnAttach else { return }
+            focusOnAttach = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window != nil else { return }
+                self.becomeFirstResponder()
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: LinkWebsiteAddressField
+        init(_ parent: LinkWebsiteAddressField) { self.parent = parent }
+        @objc func changed(_ field: UITextField) { parent.text = field.text ?? "" }
+        func textFieldShouldReturn(_ field: UITextField) -> Bool {
+            changed(field)
+            parent.onSubmit()
+            return true
+        }
     }
 }
 

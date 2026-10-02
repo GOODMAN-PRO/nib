@@ -277,6 +277,129 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertFalse(overlay.isVisible(documentContext))
     }
 
+    func testHostedLibraryCreationShortcutsHaveNativeTargetsAndDispatchToTheirScene() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(LibraryCreationShortcuts.overlayID))
+        let host = UIHostingController(rootView: overlay.makeView(context))
+        root.addChild(host)
+        root.view.addSubview(host.view)
+        host.didMove(toParent: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        host.view.frame = root.view.bounds
+        host.view.layoutIfNeeded()
+
+        func responder(in view: UIView) -> LibraryCreationKeyboardResponder? {
+            if let keyboard = view as? LibraryCreationKeyboardResponder { return keyboard }
+            return view.subviews.lazy.compactMap { responder(in: $0) }.first
+        }
+        let keyboard = try XCTUnwrap(responder(in: host.view),
+            "The rendered overlay must install a native target, not invisible SwiftUI shortcut buttons")
+        keyboard.restoreFocus()
+        XCTAssertTrue(CanvasKeyboardFocus.firstResponder(in: window) === keyboard)
+        XCTAssertFalse(keyboard is any UIKeyInput, "Library focus must not open a software keyboard")
+
+        let recorder = stand(in: h, for: [CommandIDs.panelOpen, CommandIDs.docQuickNote,
+                                          CommandIDs.docCreate, CommandIDs.docOpen])
+        let other = EditorSession()
+        let otherRoot = KeyboardWindowController(session: other)
+        h.app.services.sessions.add(other)
+        let cases: [(String, UIKeyModifierFlags, String)] = [
+            ("n", [.command, .alternate], CommandIDs.panelOpen),
+            ("n", [.command, .shift], CommandIDs.docQuickNote),
+            ("t", [.command, .shift], CommandIDs.docOpen),
+            ("t", [.command, .shift], CommandIDs.docOpen)
+        ]
+        for (input, modifiers, expected) in cases {
+            h.app.ui.activeNavigator = otherRoot
+            h.app.services.sessions.activate(other)
+            let command = try XCTUnwrap(keyboard.keyCommands?.first {
+                $0.input == input && $0.modifierFlags == modifiers
+            })
+            let action = try XCTUnwrap(command.action)
+            XCTAssertTrue(command.wantsPriorityOverSystemBehavior)
+            XCTAssertFalse(command.title.isEmpty)
+            XCTAssertTrue(keyboard.canPerformAction(action, withSender: nil), "UIKit's discovery probe needs a target")
+            XCTAssertTrue(keyboard.canPerformAction(action, withSender: command))
+            let ran = expectation(description: expected)
+            recorder.onCall = { if $0 == expected { ran.fulfill() } }
+            XCTAssertTrue(UIApplication.shared.sendAction(action, to: nil, from: command, for: nil))
+            await fulfillment(of: [ran], timeout: 3)
+            recorder.onCall = nil
+            XCTAssertTrue(h.app.ui.activeNavigator === root)
+            XCTAssertTrue(h.app.services.sessions.active === h.session)
+        }
+        XCTAssertEqual(recorder.params(CommandIDs.panelOpen), [["id": "create.newNotebook", "kind": "notebook"]])
+        XCTAssertEqual(recorder.params(CommandIDs.docQuickNote), [[:]])
+        let created = recorder.params(CommandIDs.docCreate)
+        XCTAssertEqual(created.compactMap { $0["kind"]?.stringValue }, ["textDocument", "textDocument"])
+        let ids = created.compactMap { $0["id"]?.stringValue }
+        XCTAssertEqual(Set(ids).count, 2)
+        XCTAssertEqual(recorder.params(CommandIDs.docOpen),
+                       ids.map { ["doc": .string(NodeRef.document(NibID($0)).description)] })
+    }
+
+    func testLibraryCreationNativeResponderRevalidatesAndPreservesTextAndModalFocus() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let keyboard = LibraryCreationKeyboardResponder(context: ChromeContext(app: h.app, session: h.session, navigator: root))
+        root.view.addSubview(keyboard)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        keyboard.restoreFocus()
+        XCTAssertTrue(keyboard.isFirstResponder)
+        let original = try key(h, "newNotebook")
+        let stale = try XCTUnwrap(keyboard.keyCommands?.first { $0.propertyList as? String == original.id })
+        let action = try XCTUnwrap(stale.action)
+        var replacement = original
+        replacement.id = "plugin.newNotebook"
+        replacement.owner = "plugin"
+        replacement.scope = .library
+        replacement.order = -1
+        h.app.content.keyCommands.register(replacement)
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: stale))
+        XCTAssertTrue(keyboard.keyCommands?.contains { $0.propertyList as? String == replacement.id } == true)
+        h.app.ui.activeNavigator = nil
+        _ = keyboard.perform(action, with: stale)
+        XCTAssertNil(h.app.ui.activeNavigator, "A replaced command must not activate or mutate a scene")
+
+        let field = UITextField(frame: CGRect(x: 0, y: 0, width: 200, height: 44))
+        root.view.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        keyboard.restoreFocus()
+        XCTAssertTrue(field.isFirstResponder, "Creation shortcuts must not steal text focus")
+        field.resignFirstResponder()
+        root.modal = UIViewController()
+        keyboard.restoreFocus()
+        XCTAssertFalse(keyboard.isFirstResponder)
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
+        XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+        root.modal = nil
+        keyboard.restoreFocus()
+        XCTAssertTrue(keyboard.isFirstResponder, "Native keys return after dismissing a sheet")
+
+        h.session.document = Fixtures.docID
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true, "A retained library view must not route in a document")
+        h.session.document = nil
+        let otherWindow = UIWindow(frame: window.bounds)
+        otherWindow.rootViewController = UIViewController()
+        otherWindow.makeKeyAndVisible()
+        defer { otherWindow.isHidden = true }
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true, "An inactive scene must not offer creation commands")
+        keyboard.restoreFocus()
+        XCTAssertFalse(window.isKeyWindow)
+        keyboard.context = nil
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true, "A dismantled overlay must not dispatch")
+    }
+
     func testOtherOwnersKeepTheirKeysAndNothingIsDuplicated() async throws {
         let h = Harness(features: [])
         let registry = h.app.content.keyCommands

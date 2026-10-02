@@ -601,7 +601,7 @@ struct ElementsPopover: View {
     @StateObject private var model: ElementsModel
 
     init(app: NibApp, session: EditorSession) {
-        self.init(model: ElementsModel(app: app, session: session))
+        _model = StateObject(wrappedValue: ElementsModel(app: app, session: session))
     }
 
     init(model: ElementsModel) {

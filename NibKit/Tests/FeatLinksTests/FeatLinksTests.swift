@@ -318,6 +318,20 @@ final class FeatLinksTests: XCTestCase {
         field.sendActions(for: .editingChanged)
         XCTAssertEqual(model.url, "https://example.com/lab")
         XCTAssertEqual(field.accessibilityLabel, "Website address", "The name must survive replacement of the placeholder")
+        let saved = expectation(description: "Return saves the address")
+        model.dismiss = { saved.fulfill() }
+        _ = field.delegate?.textFieldShouldReturn?(field)
+        await fulfillment(of: [saved], timeout: 10)
+        XCTAssertEqual(LinkText.links(in: try fixtureText(h)).first?.link.url, "https://example.com/lab")
+        let editTarget = try LinkEditorPresenter.makeTarget(ref: textRef, range: nil, editing: nil,
+                                                            workspace: h.app.workspace, content: h.app.content)
+        let editModel = LinkEditorModel(app: h.app, session: h.session, target: editTarget)
+        let removed = expectation(description: "Remove Link finishes")
+        editModel.dismiss = { removed.fulfill() }
+        editModel.remove()
+        await fulfillment(of: [removed], timeout: 10)
+        XCTAssertTrue(LinkText.links(in: try fixtureText(h)).isEmpty)
+        XCTAssertEqual(try fixtureText(h).plainText, target.excerpt)
     }
 
     func testEditorTargetsTheLinkAroundACaretOrTheWholeText() async throws {

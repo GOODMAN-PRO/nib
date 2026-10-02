@@ -854,10 +854,9 @@ final class InsertUITests: XCTestCase {
 
     private func sticky(_ text: String = "Lab reminder") throws {
         try ui.selectTool("sticky"); try tap("tool.sticky")
-        replace(try control("Author name on new notes", .textField, scroll: true), with: "UI Author")
         // DESIGN.md keeps the native keyboard: taps at the canvas's lower coordinates
         // hit its keys until input is submitted, rather than dismissing the popover.
-        try control("Author name on new notes", .textField).typeText("\n")
+        replace(try control("Author name on new notes", .textField, scroll: true), with: "UI Author\n")
         try wait("Submitting the author name must dismiss the keyboard") { !self.ui.app.keyboards.firstMatch.isHittable }
         outside(); ui.coordinate(point).tap()
         let editor = try control("Sticky note", .textView)

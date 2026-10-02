@@ -53,9 +53,9 @@ public enum FeatKeyboardFeature: NibFeature {
     }
 }
 
-/// SwiftUI's library hosting tree owns keyboard dispatch even when the outer shell has
-/// first-responder status. Contribute its creation keys through the chrome host, just as
-/// the library contributes selection keys. The registry remains the sole command source.
+/// Keep creation commands below the library's hosting boundary using a native responder.
+/// Invisible SwiftUI shortcut buttons can consume keys without delivering their actions
+/// in an embedded host. The registry remains the sole command source.
 @MainActor
 enum LibraryCreationShortcuts {
     static let overlayID = "keyboard.libraryCreation"
@@ -81,11 +81,12 @@ enum LibraryCreationShortcuts {
         }
     }
 
-    /// Revalidate at dispatch: a plugin may have replaced a descriptor since SwiftUI rendered.
+    /// Revalidate at dispatch: a plugin may have replaced a descriptor since UIKit queried it.
     static func perform(_ id: String, in context: ChromeContext) {
         guard let descriptor = descriptors(in: context).first(where: { $0.id == id }),
               let navigator = context.navigator, navigator.session === context.session,
               !CanvasKeyboardFocus.hasModal(navigator.rootViewController) else { return }
+        if let window = navigator.rootViewController?.viewIfLoaded?.window, !window.isKeyWindow { return }
         context.app.ui.activeNavigator = navigator
         context.app.services.sessions.activate(context.session)
         context.app.perform(descriptor.command, descriptor.resolvedParams(for: context.session),
@@ -102,25 +103,109 @@ enum LibraryCreationShortcuts {
     }
 }
 
-private struct LibraryCreationShortcutView: View {
+private struct LibraryCreationShortcutView: UIViewRepresentable {
     let context: ChromeContext
-    @State private var revision = 0
 
-    var body: some View {
-        let _ = revision
-        Group {
-            ForEach(LibraryCreationShortcuts.descriptors(in: context), id: \.id) { descriptor in
-                Button(descriptor.title) { LibraryCreationShortcuts.perform(descriptor.id, in: context) }
-                    .keyboardShortcut(LibraryCreationShortcuts.shortcut(descriptor.shortcut))
-            }
+    func makeUIView(context: Context) -> LibraryCreationKeyboardResponder {
+        LibraryCreationKeyboardResponder(context: self.context)
+    }
+
+    func updateUIView(_ view: LibraryCreationKeyboardResponder, context: Context) {
+        view.context = self.context
+        view.scheduleFocus()
+    }
+
+    static func dismantleUIView(_ view: LibraryCreationKeyboardResponder, coordinator: ()) {
+        view.context = nil
+        view.resignFirstResponder()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: LibraryCreationKeyboardResponder,
+                     context: Context) -> CGSize? { .zero }
+}
+
+/// A non-text responder: no keyboard, touch target or duplicate SwiftUI key binding.
+/// Native key commands remain discoverable and dispatch through the invoking window.
+@MainActor
+final class LibraryCreationKeyboardResponder: UIView {
+    var context: ChromeContext?
+    private let observers = NotificationBag()
+    private var focusScheduled = false
+
+    init(context: ChromeContext) {
+        self.context = context
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+        for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
+                     UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
+                     UIResponder.keyboardDidHideNotification, .nibChromeNeedsUpdate] {
+            observers.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                KeyboardRuntime.onMain { self?.scheduleFocus() }
+            })
         }
-        .frame(width: 0, height: 0)
-        .clipped()
-        .accessibilityHidden(true)
-        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange,
-                                                        object: context.app.content.keyCommands)) { _ in
-            revision += 1
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override var canBecomeFirstResponder: Bool { true }
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        scheduleFocus()
+    }
+
+    func scheduleFocus() {
+        guard context != nil, !focusScheduled else { return }
+        focusScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.focusScheduled = false
+            self.restoreFocus()
         }
+    }
+
+    func restoreFocus() {
+        guard let context, let window, window.isKeyWindow, !isFirstResponder,
+              !context.session.isEditingText, !descriptors.isEmpty,
+              CanvasKeyboardFocus.mayReplace(CanvasKeyboardFocus.firstResponder(in: window), canvas: self) else { return }
+        becomeFirstResponder()
+    }
+
+    private var descriptors: [KeyCommandDescriptor] {
+        guard let context, let window, window.isKeyWindow,
+              context.navigator?.session === context.session,
+              context.navigator?.rootViewController?.viewIfLoaded?.window === window,
+              !CanvasKeyboardFocus.hasModal(window.rootViewController) else { return [] }
+        return LibraryCreationShortcuts.descriptors(in: context)
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        descriptors.map { descriptor in
+            let key = descriptor.shortcut
+            var modifiers: UIKeyModifierFlags = []
+            if key.modifiers.contains(.command) { modifiers.insert(.command) }
+            if key.modifiers.contains(.shift) { modifiers.insert(.shift) }
+            if key.modifiers.contains(.option) { modifiers.insert(.alternate) }
+            if key.modifiers.contains(.control) { modifiers.insert(.control) }
+            let command = UIKeyCommand(title: descriptor.title, action: #selector(runCreationKey(_:)),
+                                       input: key.key.lowercased(), modifierFlags: modifiers, propertyList: descriptor.id)
+            command.wantsPriorityOverSystemBehavior = true
+            return command.nibCommand(descriptor.command)
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(runCreationKey(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        // UIKit first discovers targets with a nil/non-command sender.
+        guard let command = sender as? UIKeyCommand else { return !descriptors.isEmpty }
+        return descriptors.contains { $0.id == command.propertyList as? String }
+    }
+
+    @objc private func runCreationKey(_ command: UIKeyCommand) {
+        guard let context, let descriptor = descriptors.first(where: { $0.id == command.propertyList as? String }) else { return }
+        LibraryCreationShortcuts.perform(descriptor.id, in: context)
     }
 }
 
