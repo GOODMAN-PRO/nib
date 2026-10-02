@@ -26,6 +26,118 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testLiftCannotBeCancelledByTouchDownBridgeBeforeIntentIsKnown() {
+        let lift = LiftRecognizer()
+        // The SwiftUI bridge is not a pan or a long press. It can recognise at
+        // touch-down; the lift must keep receiving samples until it classifies intent.
+        let bridge = UIGestureRecognizer()
+        XCTAssertEqual(lift.state, .possible)
+        XCTAssertFalse(lift.canBePrevented(by: bridge))
+        XCTAssertFalse(lift.canBePrevented(by: UIPanGestureRecognizer()))
+        XCTAssertFalse(lift.canBePrevented(by: UILongPressGestureRecognizer()))
+        lift.state = .failed
+        XCTAssertTrue(lift.canBePrevented(by: bridge), "A yielded hold must allow the native context menu")
+    }
+
+    func testLibraryDragYieldsToOverlappingMenuAndPanelButAllowsSelectionStack() {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        XCTAssertTrue(LibraryItemReflow.acceptsDrag(model))
+        model.selection.isSelecting = true
+        XCTAssertTrue(LibraryItemReflow.acceptsDrag(model))
+        for menu in ["sort", "new", "app"] {
+            model.menu = menu
+            XCTAssertFalse(LibraryItemReflow.acceptsDrag(model), "An overlaid menu must not start the card underneath it")
+        }
+        model.menu = nil
+        model.modal = LibraryPanel(id: "test.sheet", params: [:], presentation: .sheet)
+        XCTAssertFalse(LibraryItemReflow.acceptsDrag(model))
+        model.modal = nil
+        model.confirmation = LibraryConfirmation(title: "Combine", command: CommandIDs.libraryMove, params: [:])
+        XCTAssertFalse(LibraryItemReflow.acceptsDrag(model))
+        model.confirmation = nil
+        XCTAssertTrue(LibraryItemReflow.acceptsDrag(model))
+    }
+
+    func testNativeLibraryResponderDispatchesSelectAllEscapeAndReturn() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let controller = try XCTUnwrap(controllers.last as? LibraryRootViewController)
+        await model.appear()
+        var opened: String?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open",
+            summary: "Record selected document", effect: .session, target: .app)) { params, _ in
+                opened = params["doc"]?.stringValue; return [:]
+        }
+        func send(_ input: String, modifiers: UIKeyModifierFlags = []) throws {
+            let command = try XCTUnwrap(controller.keyCommands?.first { $0.input == input && $0.modifierFlags == modifiers })
+            XCTAssertTrue(controller.canPerformAction(try XCTUnwrap(command.action), withSender: command))
+            XCTAssertTrue(command.wantsPriorityOverSystemBehavior)
+            _ = controller.perform(command.action, with: command)
+        }
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "begin"], session: h.session)
+        try send("a", modifiers: .command)
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(model.selection.refs, Set(model.visibleRefs))
+        XCTAssertTrue(model.selection.refs.contains("folder:FIXTUREFLD01"))
+        try send(UIKeyCommand.inputEscape)
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertFalse(model.selection.isSelecting)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+
+        let ref = try XCTUnwrap(model.documentRefs.first)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "replace", "refs": [.string(ref)]], session: h.session)
+        try send("\r")
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(opened, ref)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView,
+            ["selection": "replace", "refs": ["folder:FIXTUREFLD01"]], session: h.session)
+        try send("\r")
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(model.folder, Fixtures.folderID)
+        XCTAssertFalse(model.selection.isSelecting)
+    }
+
+    func testNativeNewFolderKeyKeepsItsModifiersAndCurrentParent() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let controller = try XCTUnwrap(controllers.last as? LibraryRootViewController)
+        h.app.ui.panels.register(PanelDescriptor(id: "organize.folder.new", title: "New Folder", icon: "folder",
+            placement: .sheet, order: 0, owner: "organize") { _ in AnyView(EmptyView()) })
+        h.app.content.keyCommands.register(KeyCommandDescriptor(id: "organize.newFolder", title: "New Folder",
+            shortcut: KeyShortcut("n", [.command, .control]), command: CommandIDs.librarySetView,
+            params: ["panel": "organize.folder.new"], scope: .library, owner: "organize"))
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "folder:FIXTUREFLD01"], session: h.session)
+        let command = try XCTUnwrap(controller.keyCommands?.first { $0.input == "n" })
+        XCTAssertEqual(command.modifierFlags, [.command, .control])
+        XCTAssertTrue(controller.canPerformAction(try XCTUnwrap(command.action), withSender: nil))
+        _ = controller.perform(command.action, with: command)
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(model.modal?.id, "organize.folder.new")
+        XCTAssertEqual(model.modal?.params["folder"], "folder:FIXTUREFLD01")
+        XCTAssertFalse(controller.canPerformAction(try XCTUnwrap(command.action), withSender: command), "Do not replay a stale key behind a sheet")
+    }
+
+    func testUnhandledHardwareKeysUseRegistryWinnerAndRespectTextEditing() {
+        let h = harness()
+        let keys = h.app.content.keyCommands.all
+        let library = KeyCommandContext(inDocument: false, docKind: nil)
+        for shortcut in [KeyShortcut("a", .command), KeyShortcut("escape"), KeyShortcut("return")] {
+            let descriptor = KeyCommandRouting.unhandledPress(shortcut, descriptors: keys, in: library)
+            XCTAssertEqual(descriptor?.command, CommandIDs.librarySetView)
+            XCTAssertNil(KeyCommandRouting.unhandledPress(shortcut, descriptors: keys,
+                in: KeyCommandContext(inDocument: false, docKind: nil, isEditingText: true)))
+            XCTAssertNil(KeyCommandRouting.unhandledPress(shortcut, descriptors: keys,
+                in: KeyCommandContext(inDocument: true, docKind: .notebook)))
+        }
+        XCTAssertNil(KeyCommandRouting.unhandledPress(KeyShortcut("a"), descriptors: keys, in: library))
+        let folder = KeyCommandDescriptor(id: "organize.newFolder", title: "New Folder",
+            shortcut: KeyShortcut("n", [.command, .control]), command: CommandIDs.panelOpen,
+            scope: .library, owner: "organize")
+        let global = KeyCommandDescriptor(id: "global.new", title: "New",
+            shortcut: folder.shortcut, command: CommandIDs.docOpen, scope: .global, owner: "test")
+        XCTAssertEqual(KeyCommandRouting.unhandledPress(folder.shortcut, descriptors: [global, folder], in: library)?.id, folder.id)
+        XCTAssertNil(KeyCommandRouting.unhandledPress(KeyShortcut("n", .command), descriptors: [folder], in: library))
+    }
+
     func testNewMenuNativeScrollStopsInterceptingAfterDismissalAndReattaches() {
         let scroll = UIScrollView()
         let content = UIView()

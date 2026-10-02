@@ -467,6 +467,27 @@ final class LibraryRootViewController: UIViewController {
             host.view.topAnchor.constraint(equalTo: view.topAnchor), host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)])
         host.didMove(toParent: self)
     }
+    override var keyCommands: [UIKeyCommand]? {
+        LibrarySelectionShortcuts.descriptors(model).map {
+            LibrarySelectionShortcuts.command($0, action: #selector(runLibraryKeyCommand(_:)))
+        }
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(runLibraryKeyCommand(_:)) else {
+            return super.canPerformAction(action, withSender: sender)
+        }
+        let descriptors = LibrarySelectionShortcuts.descriptors(model)
+        guard let command = sender as? UIKeyCommand else { return !descriptors.isEmpty }
+        return descriptors.contains { $0.id == command.propertyList as? String }
+    }
+    @objc private func runLibraryKeyCommand(_ sender: UIKeyCommand) {
+        guard let descriptor = LibrarySelectionShortcuts.descriptors(model).first(where: {
+            $0.id == sender.propertyList as? String
+        }) else { return }
+        if let navigator = model.navigator { model.app.ui.activeNavigator = navigator }
+        model.app.services.sessions.activate(model.session)
+        model.perform(descriptor.command, descriptor.resolvedParams(for: model.session))
+    }
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
@@ -605,7 +626,6 @@ struct LibraryRootView: View {
                 .environment(\.horizontalSizeClass, compact ? .compact : .regular)
             }
             .coordinateSpace(name: "library.chrome")
-            .background(LibrarySelectionShortcuts(model: model))
             .onPreferenceChange(LibraryTargets.self) { targets = $0; model.dropTargets = $0 }
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
                 chromeFrames = frames
@@ -782,16 +802,23 @@ struct LibraryRootView: View {
     }
 }
 
-/// SwiftUI owns focus after a grid button is selected. Install the registered
-/// library commands in that hosting tree as well as the shell's responder chain.
-struct LibrarySelectionShortcuts: View {
-    @ObservedObject var model: LibraryViewModel
+/// Native commands remain in the hosting controller's responder chain. Invisible
+/// SwiftUI shortcut buttons can claim a key without delivering their action in an
+/// embedded host, so they must not compete with this table or the shell's table.
+@MainActor
+enum LibrarySelectionShortcuts {
     static func isEnabled(_ model: LibraryViewModel) -> Bool {
         model.selection.isSelecting && canRoute(model)
     }
     private static func canRoute(_ model: LibraryViewModel) -> Bool {
-        model.tab == nil && model.modal == nil && model.menu == nil &&
-            model.renaming == nil && model.floating.presentedIDs.isEmpty && !model.session.isEditingText
+        model.tab == nil && model.modal == nil && model.menu == nil && model.confirmation == nil &&
+            model.renaming == nil && model.floating.presentedIDs.isEmpty && !model.session.isEditingText &&
+            !hasTextFocus(model.controller?.viewIfLoaded)
+    }
+    private static func hasTextFocus(_ view: UIView?) -> Bool {
+        guard let view else { return false }
+        if view.isFirstResponder && view is any UITextInput { return true }
+        return view.subviews.contains { hasTextFocus($0) }
     }
     static func descriptors(_ model: LibraryViewModel) -> [KeyCommandDescriptor] {
         guard canRoute(model) else { return [] }
@@ -800,25 +827,21 @@ struct LibrarySelectionShortcuts: View {
             $0.scope == .library && ($0.owner != FeatLibraryUIFeature.id || isEnabled(model))
         }
     }
-    var body: some View {
-        Group {
-            ForEach(Self.descriptors(model), id: \.id) { descriptor in
-                Button(descriptor.title) { model.perform(descriptor.command, descriptor.resolvedParams(for: model.session)) }
-                    .keyboardShortcut(shortcut(descriptor.shortcut))
-            }
-        }
-        .frame(width: 0, height: 0)
-        .clipped()
-        .accessibilityHidden(true)
-    }
-    private func shortcut(_ key: KeyShortcut) -> KeyboardShortcut {
-        let equivalent: KeyEquivalent = key.key == "escape" ? .escape : key.key == "return" ? .return : KeyEquivalent(key.key.first ?? " ")
-        var modifiers: EventModifiers = []
+    static func command(_ descriptor: KeyCommandDescriptor, action: Selector) -> UIKeyCommand {
+        let key = descriptor.shortcut
+        let special = ["escape": UIKeyCommand.inputEscape, "return": "\r", "tab": "\t",
+                       "delete": UIKeyCommand.inputDelete, "space": " ",
+                       "up": UIKeyCommand.inputUpArrow, "down": UIKeyCommand.inputDownArrow,
+                       "left": UIKeyCommand.inputLeftArrow, "right": UIKeyCommand.inputRightArrow]
+        var modifiers: UIKeyModifierFlags = []
         if key.modifiers.contains(.command) { modifiers.insert(.command) }
         if key.modifiers.contains(.shift) { modifiers.insert(.shift) }
-        if key.modifiers.contains(.option) { modifiers.insert(.option) }
+        if key.modifiers.contains(.option) { modifiers.insert(.alternate) }
         if key.modifiers.contains(.control) { modifiers.insert(.control) }
-        return KeyboardShortcut(equivalent, modifiers: modifiers)
+        let command = UIKeyCommand(title: descriptor.title, action: action,
+            input: special[key.key] ?? key.key, modifierFlags: modifiers, propertyList: descriptor.id)
+        command.wantsPriorityOverSystemBehavior = true
+        return command.nibCommand(descriptor.command)
     }
 }
 

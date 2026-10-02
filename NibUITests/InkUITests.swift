@@ -113,8 +113,11 @@ final class InkUITests: XCTestCase {
     private func scrollPanel(_ panel: XCUIElement, down: Bool) {
         // The centre of a pen popover contains custom sliders which consume drag gestures.
         // Scroll from the panel's 16-point content padding, clear of every slider and toggle.
-        let start = panel.coordinate(withNormalizedOffset: CGVector(dx: 0.025, dy: down ? 0.2 : 0.8))
-        let end = panel.coordinate(withNormalizedOffset: CGVector(dx: 0.025, dy: down ? 0.8 : 0.2))
+        // Native Settings lists inset their cells farther than that padding; their empty margin
+        // does not scroll. Use a row's centre for those lists, away from the trailing switches.
+        let x: CGFloat = [.collectionView, .table].contains(panel.elementType) ? 0.5 : 0.025
+        let start = panel.coordinate(withNormalizedOffset: CGVector(dx: x, dy: down ? 0.2 : 0.8))
+        let end = panel.coordinate(withNormalizedOffset: CGVector(dx: x, dy: down ? 0.8 : 0.2))
         start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0)
     }
 
@@ -196,9 +199,11 @@ final class InkUITests: XCTestCase {
 
     private func width(_ slot: Int, edit: Bool = false) throws {
         let button = try control("Thickness \(slot)", type: .button)
-        if !button.isSelected { button.tap() }
+        // Tap the visible cell centre, as Support/NibUI does for command controls. XCTest's
+        // inferred hit point can land on the adjacent slot in this tightly packed options bar.
+        if !button.isSelected { button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
         try wait("Thickness \(slot) must be selected") { button.isSelected }
-        if edit { button.tap() }
+        if edit { button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
     }
 
     private func swatchMenu(_ action: String, index: Int = 0) throws {
@@ -209,7 +214,7 @@ final class InkUITests: XCTestCase {
 
     private func chooseColour(_ name: String) throws {
         // Use the actual slot editor, avoiding a similarly named quick swatch behind it.
-        let candidates = ui.app.buttons.matching(NSPredicate(format: "label == %@", name)).allElementsBoundByIndex
+        let candidates = ui.app.buttons.matching(NSPredicate(format: "label == %@ AND identifier != 'cmd.preset.select'", name)).allElementsBoundByIndex
         let option = try XCTUnwrap(candidates.last(where: { $0.isHittable }), "Missing palette colour \(name)")
         option.tap()
     }
@@ -461,6 +466,15 @@ final class InkUITests: XCTestCase {
         XCTAssertLessThan(lower.zoom, upper.zoom)
         try ui.pinchZoom(scale: 0.3, velocity: -1)
         XCTAssertEqual(try ui.state().zoom, lower.zoom, accuracy: 0.02, "Zoom must saturate at its lower bound")
+        // Zooming out changes the active page under the viewport centre. The probe counts are
+        // per-page: compare the original page, not an empty neighbouring page now in view.
+        if try ui.state().page != initial.page {
+            try ui.tapCommand("sidebar.toggle"); try tap("Page 1", scroll: true)
+            _ = try ui.waitForState { $0.page == initial.page }
+            try ui.tapCommand("sidebar.toggle")
+        }
+        XCTAssertEqual(try ui.state().undoAvailable, initial.undoAvailable,
+                       "Pinching must not create an edit on any page")
         try assertNoNewInk(initial)
     }
 
@@ -1247,7 +1261,8 @@ final class InkUITests: XCTestCase {
 
     func testPencilDoubleTapAndSqueezeBindingChoicesPersist() throws {
         try pencilSettings()
-        let choices = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Switch between current tool and eraser'"))
+        // Exclude the Use iPad setting row, whose subtitle repeats this action's title.
+        let choices = ui.app.buttons.matching(NSPredicate(format: "label == 'Switch between current tool and eraser'"))
         let first = choices.firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 5)); first.tap()
         XCTAssertTrue(first.isSelected, "Double-tap binding must persist its choice")

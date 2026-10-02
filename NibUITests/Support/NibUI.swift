@@ -39,6 +39,57 @@ final class NibUI {
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards }
 
+    func revealFormElement(_ element: XCUIElement) {
+        if !element.exists { _ = app.collectionViews.firstMatch.waitForExistence(timeout: 2) }
+        for _ in 0..<24 {
+            guard let list = app.collectionViews.allElementsBoundByIndex.last, list.isHittable else { return }
+            // Include the shortcuts bar: it is above the Keyboard accessibility frame.
+            let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
+            guard let viewport = NibUITestScrollGeometry.viewport(
+                scroll: list.frame, window: app.frame, obstructions: obstructions) else { return }
+            if element.exists && element.isHittable {
+                let belongsToList = list.descendants(matching: element.elementType)
+                    .matching(NSPredicate(format: "label == %@", element.label)).count > 0
+                if !belongsToList || viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
+            }
+            let drag = NibUITestScrollGeometry.drag(in: viewport, toward: element.exists ? element.frame.midY : nil)
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let start = origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
+            let end = origin.withOffset(CGVector(dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY))
+            start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
+        }
+    }
+
+    /// Complete Files' New Folder action using the editor supplied by the OS.
+    /// iOS 26 uses an inline text view and Done; older pickers use an alert and Create.
+    func nameNewFilesFolder(_ title: String) throws {
+        let inline = app.textViews["DOC.inlineRenameField"]
+        let alertField = app.alerts.textFields.firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            inline.isHittable || alertField.isHittable
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
+            throw Failure.message("Files must expose its new-folder name editor")
+        }
+        let usesInlineEditor = inline.isHittable
+        let field = usesInlineEditor ? inline : alertField
+        field.tap()
+        field.typeKey("a", modifierFlags: .command)
+        field.typeText(title)
+        if usesInlineEditor {
+            field.typeText("\n")
+        } else {
+            let create = app.alerts.buttons["Create"]
+            guard create.isHittable && create.isEnabled else { throw Failure.message("Files Create must be available") }
+            create.tap()
+        }
+        let finished = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !field.exists }, object: nil)
+        guard XCTWaiter.wait(for: [finished], timeout: 12) == .completed else {
+            throw Failure.message("Files must finish naming the new folder")
+        }
+    }
+
     func launchFixture(scenario: FixtureScenario = .standard) throws {
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]

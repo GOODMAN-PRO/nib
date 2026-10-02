@@ -646,9 +646,10 @@ private struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            // A context menu must wait until the lift has either moved or yielded
-            // to a stationary hold. Otherwise its long press steals a 0.4 s drag.
-            otherGestureRecognizer is UILongPressGestureRecognizer
+            // Menus wait for a stationary hold; scrolling waits for an early
+            // swipe. Otherwise a pan can scroll the grid at the same time as a
+            // held card lifts, or a long press can steal the pickup gesture.
+            otherGestureRecognizer is UILongPressGestureRecognizer || otherGestureRecognizer is UIPanGestureRecognizer
         }
         @objc func handle() {
             let reflow = target.reflow
@@ -687,7 +688,7 @@ enum ReflowLiftIntent {
     }
 }
 
-private final class LiftRecognizer: UIGestureRecognizer {
+final class LiftRecognizer: UIGestureRecognizer {
     private(set) var start = CGPoint.zero
     private(set) var point = CGPoint.zero
     private(set) var velocity = CGVector.zero
@@ -737,6 +738,12 @@ private final class LiftRecognizer: UIGestureRecognizer {
         super.reset(); velocity = .zero; beganAt = 0; sampledAt = 0
     }
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // SwiftUI's responder bridge recognises at touch-down, before there is
+        // enough movement to classify a scroll, lift, or context-menu hold. It
+        // must not cancel this recogniser during that decision window. Early
+        // movement fails in touchesMoved; a stationary hold fails at menuDelay.
+        // Once failed, the native menu is free to recognise the same touch.
+        if state == .possible { return false }
         // Once held, the scroll view must not win the first movement before this
         // recognizer receives it. A normal immediate swipe fails us above.
         if beganAt > 0,

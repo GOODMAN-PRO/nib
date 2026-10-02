@@ -286,11 +286,15 @@ struct LibraryCell: View {
     }
 }
 
-private struct LibraryItemReflow: ViewModifier {
+struct LibraryItemReflow: ViewModifier {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
+    static func acceptsDrag(_ model: LibraryViewModel) -> Bool {
+        model.collection == .documents && model.menu == nil && model.modal == nil &&
+            model.confirmation == nil && model.renaming == nil && model.floating.presentedIDs.isEmpty
+    }
     func body(content: Content) -> some View {
-        if model.collection == .documents {
+        if Self.acceptsDrag(model) {
             content.nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
                 order: row.isFolder ? model.folderRefs : model.documentRefs,
                 onDrop: { model.drop($0, from: row.isFolder ? model.folderReflow : model.reflow) })

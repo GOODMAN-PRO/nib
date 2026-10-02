@@ -167,27 +167,7 @@ final class LibraryUITests: XCTestCase {
     }
 
     private func revealFormElement(_ element: XCUIElement) {
-        // SwiftUI List lazily exposes rows. Scroll the presented form rather than treating
-        // an off-screen field as a missing control (including the small fitted iPad sheets).
-        if !element.exists { _ = app.collectionViews.firstMatch.waitForExistence(timeout: 2) }
-        for _ in 0..<24 {
-            let list = app.collectionViews.allElementsBoundByIndex.last
-            if element.exists && element.isHittable {
-                guard let list,
-                      list.descendants(matching: element.elementType)
-                        .matching(NSPredicate(format: "label == %@", element.label)).count > 0 else { return }
-                let centre = CGPoint(x: element.frame.midX, y: element.frame.midY)
-                if list.frame.insetBy(dx: 0, dy: 6).contains(centre) { return }
-            }
-            guard let list, list.isHittable else { return }
-            // Partly visible rows report hittable before the actual field/switch centre
-            // enters the viewport. Centre them before tapping so the touch reaches the control.
-            let delta = element.exists ? element.frame.midY - list.frame.midY : list.frame.height
-            let travel = max(-0.6, min(0.6, delta / max(1, list.frame.height)))
-            let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5 + travel / 2))
-            let end = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5 - travel / 2))
-            start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
-        }
+        ui.revealFormElement(element)
     }
 
     private func replace(_ field: XCUIElement, with text: String) throws {
@@ -911,10 +891,12 @@ final class LibraryUITests: XCTestCase {
         }
         if !button("New Folder").isHittable { try tap("More") }
         try tap("New Folder")
-        try replace(app.alerts.textFields.firstMatch, with: fixtureFolder)
-        try tap("Create")
+        // DESIGN §13 keeps the native Files picker: its editor may be inline,
+        // rather than an alert. This changes setup only; the real drop is still required.
+        try ui.nameNewFilesFolder(fixtureFolder)
         let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", fixtureFolder)).firstMatch
-        if directory.isHittable { directory.tap() }
+        try visible(directory, "Files must create the external fixture folder")
+        directory.tap()
         try tap("Save")
         try eventually("Save to Files must finish or report an export error", timeout: 20) {
             !self.app.buttons["Save"].exists || self.app.alerts.firstMatch.exists

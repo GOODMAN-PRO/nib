@@ -143,6 +143,7 @@ struct LibraryBuds: View {
                 .accessibilityHidden(!isPresented("new"))
             NibBudPopover(id: "library.app.menu", source: "library.app", isPresented: binding("app"), title: String(localized: "Nib")) {
                 LibraryMenuEntries(model: model, location: .appMenu)
+                    .background(LibraryMenuScrollInteraction(isPresented: isPresented("app")))
             }
             .allowsHitTesting(isPresented("app"))
             .accessibilityHidden(!isPresented("app"))
@@ -163,6 +164,7 @@ struct LibraryBuds: View {
                         .accessibilityIdentifier("cmd.library.setView")
                     }
                 }
+                .background(LibraryMenuScrollInteraction(isPresented: isPresented("sort")))
             }
             .allowsHitTesting(isPresented("sort"))
             .accessibilityHidden(!isPresented("sort"))

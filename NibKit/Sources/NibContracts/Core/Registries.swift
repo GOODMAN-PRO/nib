@@ -629,6 +629,16 @@ public extension KeyCommandDescriptor {
 /// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
 /// hands UIKit one command per shortcut, so two features mapping the same keys never race).
 public enum KeyCommandRouting {
+    /// Fallback for a hardware press UIKit delivered without invoking its
+    /// UIKeyCommand (for example through an embedded SwiftUI hosting tree).
+    /// Use the same winner and text-input priority rules as the command table.
+    public static func unhandledPress(_ shortcut: KeyShortcut, descriptors: [KeyCommandDescriptor],
+                                      in context: KeyCommandContext) -> KeyCommandDescriptor? {
+        active(descriptors, in: context).first {
+            $0.shortcut == shortcut && overridesSystemKeys($0, in: context)
+        }
+    }
+
     /// True when `a` wins over `b` for the same shortcut, most specific first: the command limited to fewer document
     /// kinds (`docKinds`; nil, empty and every kind all count as every kind, so they tie); then the narrower scope
     /// (`.canvas`, then `.document` or `.library`, then `.global`); then the lower `order`; then the id.

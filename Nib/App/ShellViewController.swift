@@ -243,12 +243,42 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
 
     override var canBecomeFirstResponder: Bool { true }
 
-    #if DEBUG
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        NSLog("%@", "[Library key diagnostic] presses \(presses.compactMap { $0.key?.charactersIgnoringModifiers }) first responder \(String(describing: ShellFocus.firstResponder()))")
-        super.pressesBegan(presses, with: event)
+        guard !showsDocument else { super.pressesBegan(presses, with: event); return }
+        // UIKit calls this only for presses not consumed by a UIKeyCommand.
+        // Embedded SwiftUI hosts can leave a registered command unhandled even
+        // with this shell as first responder. Replay the same validated route;
+        // never intercept typing or dispatch a recognised shortcut a second time.
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key else { continue }
+            let input: String
+            switch key.keyCode {
+            case .keyboardReturnOrEnter, .keypadEnter: input = "return"
+            case .keyboardEscape: input = "escape"
+            case .keyboardTab: input = "tab"
+            case .keyboardDeleteOrBackspace: input = "delete"
+            case .keyboardUpArrow: input = "up"
+            case .keyboardDownArrow: input = "down"
+            case .keyboardLeftArrow: input = "left"
+            case .keyboardRightArrow: input = "right"
+            case .keyboardSpacebar: input = "space"
+            default: input = key.charactersIgnoringModifiers.lowercased()
+            }
+            var modifiers: KeyModifiers = []
+            if key.modifierFlags.contains(.command) { modifiers.insert(.command) }
+            if key.modifierFlags.contains(.shift) { modifiers.insert(.shift) }
+            if key.modifierFlags.contains(.alternate) { modifiers.insert(.option) }
+            if key.modifierFlags.contains(.control) { modifiers.insert(.control) }
+            guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
+                descriptors: app.content.keyCommands.all, in: keyCommandContext),
+                  let command = keyCommands?.first(where: { $0.propertyList as? String == descriptor.id }),
+                  let action = command.action, canPerformAction(action, withSender: command) else { continue }
+            runKeyCommand(command)
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
     }
-    #endif
 
     /// What decides which key commands are live in this window: the document kind it shows, whether text has the
     /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
