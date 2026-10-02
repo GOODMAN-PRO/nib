@@ -143,12 +143,17 @@ final class InkUITests: XCTestCase {
             // Tap the switch thumb itself; the row's centre can be plain text or clipped at a popover edge.
             let native = element.switches.firstMatch
             let target = native.exists ? native : element
-            for _ in 0..<4 where !target.isHittable && scroll {
+            for _ in 0..<4 where scroll {
                 let panels = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
-                if let panel = panels.filter({ $0.isHittable && $0.identifier != "nib.canvas" && $0.frame.height > 180 })
-                    .first(where: { $0.switches.matching(NSPredicate(format: "label == %@", label)).count > 0 }) {
-                    scrollPanel(panel, down: false)
-                }
+                guard let panel = panels.filter({ $0.isHittable && $0.identifier != "nib.canvas" && $0.frame.height > 180 })
+                    .filter({ $0.switches.matching(NSPredicate(format: "label == %@", label)).count > 0 })
+                    .min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else { break }
+                // XCTest marks a partly clipped switch hittable even when its centre is
+                // outside the popover. DESIGN §10.6 makes that tap dismiss the popover.
+                // Scroll the actual tap point into view before exercising the switch.
+                let centre = CGPoint(x: target.frame.midX, y: target.frame.midY)
+                if target.isHittable && panel.frame.insetBy(dx: 2, dy: 2).contains(centre) { break }
+                scrollPanel(panel, down: centre.y < panel.frame.minY)
             }
             XCTAssertTrue(target.isHittable, "\(label) switch thumb must be visible")
             target.coordinate(withNormalizedOffset: CGVector(dx: native.exists ? 0.5 : 0.92, dy: 0.5)).tap()

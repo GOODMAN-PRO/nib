@@ -169,9 +169,15 @@ final class NibUI {
         try tapCommand("clipboard.copy")
         _ = try waitForState(timeout: 8) { ($0.clipboardChangeCount ?? before) > before }
         let probe = app.descendants(matching: .any)["nib.qa.clipboard"].firstMatch
-        let value = try XCTUnwrap(probe.value as? String, "Missing copied-fragment probe")
-        let snapshot = try JSONDecoder().decode(Snapshot.self, from: Data(value.utf8))
-        guard snapshot.changeCount > before, let fragment = snapshot.fragment else {
+        var fragment: Data?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            guard let value = probe.value as? String,
+                  let snapshot = try? JSONDecoder().decode(Snapshot.self, from: Data(value.utf8)),
+                  snapshot.changeCount > before, let data = snapshot.fragment else { return false }
+            fragment = data
+            return true
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed, let fragment else {
             throw Failure.message("Copy must export a fresh app.nib.fragment")
         }
         return fragment

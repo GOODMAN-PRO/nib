@@ -87,21 +87,68 @@ final class QAStateProbe: UIView {
 /// consuming this payload; Nib can read its own output without cross-app authorization.
 @MainActor
 final class QAClipboardProbe: UIView {
+    private var snapshot: String?
+    private var loadedRevision: Int?
+    private var loadingRevision: Int?
+    private var refreshScheduled = false
+
     init() {
         super.init(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
         isUserInteractionEnabled = false
         isAccessibilityElement = true
         accessibilityIdentifier = "nib.qa.clipboard"
         accessibilityLabel = "QA copied fragment"
+        NotificationCenter.default.addObserver(self, selector: #selector(scheduleRefresh),
+                                               name: UIPasteboard.changedNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override var accessibilityValue: String? {
         get {
-            let snapshot = NibUITestClipboardSnapshot(pasteboard: .general)
-            return (try? JSONEncoder().encode(snapshot)).map { String(decoding: $0, as: UTF8.self) }
+            // XCTest evaluates values while matching unrelated identifiers too. A
+            // synchronous pasteboard read here can deadlock its accessibility RPC.
+            scheduleRefresh()
+            guard loadedRevision == UIPasteboard.general.changeCount else { return nil }
+            return snapshot
         }
         set { }
     }
+
+    @objc private func scheduleRefresh() {
+        guard !refreshScheduled else { return }
+        refreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.refreshScheduled = false
+            self.refresh()
+        }
+    }
+
+    private func refresh() {
+        let board = UIPasteboard.general
+        let revision = board.changeCount
+        guard revision != loadedRevision, revision != loadingRevision else { return }
+        loadingRevision = revision
+        let type = "app.nib.fragment"
+        guard let provider = board.itemProviders.first(where: { $0.hasItemConformingToTypeIdentifier(type) }) else {
+            finish(nil, revision: revision)
+            return
+        }
+        provider.loadDataRepresentation(forTypeIdentifier: type) { [weak self] data, _ in
+            DispatchQueue.main.async { self?.finish(data, revision: revision) }
+        }
+    }
+
+    private func finish(_ data: Data?, revision: Int) {
+        guard loadingRevision == revision else { return }
+        loadingRevision = nil
+        guard UIPasteboard.general.changeCount == revision else { scheduleRefresh(); return }
+        let value: JSONValue = ["changeCount": .number(Double(revision)),
+                                "fragment": data.map { .string($0.base64EncodedString()) } ?? .null]
+        snapshot = value.jsonString()
+        loadedRevision = revision
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 }

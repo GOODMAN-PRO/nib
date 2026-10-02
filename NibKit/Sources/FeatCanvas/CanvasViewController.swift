@@ -1087,7 +1087,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         guard action == #selector(panFromKeyboard(_:)) else { return super.canPerformAction(action, withSender: sender) }
-        guard let id = (sender as? UIKeyCommand)?.propertyList as? String else { return false }
+        // UIKit discovers the action with no concrete command before routing a key.
+        guard let command = sender as? UIKeyCommand else { return !livePanCommands.isEmpty }
+        guard let id = command.propertyList as? String else { return false }
         return livePanCommands.contains { $0.id == id }
     }
 

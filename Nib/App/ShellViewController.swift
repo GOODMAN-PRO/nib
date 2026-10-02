@@ -269,11 +269,18 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             case .keyboardSpacebar: input = "space"
             default: input = key.charactersIgnoringModifiers.lowercased()
             }
+            // A forwarded press can carry the chord on its event rather than its
+            // individual UIKey. Keep both, or Command-D becomes the plain D tool
+            // shortcut and Command-Option-0 selects a colour instead of zooming.
+            let flags = key.modifierFlags.union(event?.modifierFlags ?? [])
             var modifiers: KeyModifiers = []
-            if key.modifierFlags.contains(.command) { modifiers.insert(.command) }
-            if key.modifierFlags.contains(.shift) { modifiers.insert(.shift) }
-            if key.modifierFlags.contains(.alternate) { modifiers.insert(.option) }
-            if key.modifierFlags.contains(.control) { modifiers.insert(.control) }
+            if flags.contains(.command) { modifiers.insert(.command) }
+            if flags.contains(.shift) { modifiers.insert(.shift) }
+            if flags.contains(.alternate) { modifiers.insert(.option) }
+            if flags.contains(.control) { modifiers.insert(.control) }
+            #if DEBUG
+            NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0)")
+            #endif
             guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
                 descriptors: app.content.keyCommands.all, in: keyCommandContext),
                   let command = keyCommands?.first(where: { $0.propertyList as? String == descriptor.id }),

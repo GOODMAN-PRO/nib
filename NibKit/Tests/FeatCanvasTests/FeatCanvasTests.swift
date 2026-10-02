@@ -727,6 +727,10 @@ final class FeatCanvasTests: XCTestCase {
         for key in keys {
             XCTAssertEqual(key.modifierFlags, .alternate)
             XCTAssertTrue(key.wantsPriorityOverSystemBehavior)
+            let action = try XCTUnwrap(key.action)
+            XCTAssertTrue(vc.canPerformAction(action, withSender: nil), "UIKit must discover the pan action before providing a key")
+            XCTAssertTrue(vc.canPerformAction(action, withSender: NSObject()))
+            XCTAssertTrue(vc.canPerformAction(action, withSender: key))
             let start = vc.scrollView.contentOffset
             vc.panFromKeyboard(key)
             await waitUntil("keyboard pan") { vc.scrollView.contentOffset != start }
@@ -736,6 +740,8 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.items(Fixtures.whiteboardID, page: Fixtures.boardID), before)
         h.session.isEditingText = true
         XCTAssertTrue(vc.keyCommands?.isEmpty == true)
+        XCTAssertFalse(vc.canPerformAction(try XCTUnwrap(keys[0].action), withSender: nil))
+        XCTAssertFalse(vc.canPerformAction(try XCTUnwrap(keys[0].action), withSender: keys[0]))
         vc.panFromKeyboard(keys[0])
         XCTAssertEqual(vc.scrollView.contentOffset, initial)
     }
