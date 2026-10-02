@@ -10,6 +10,7 @@ enum UITestFixture {
     static var renderer: NibUITestRenderer?
     static var memoryWarningCount = 0
     private static var backgroundObserver: NSObjectProtocol?
+    private static var appearanceObserver: NSObjectProtocol?
 
     static func defaults() -> UserDefaults {
         guard NibUITestMode.isEnabled else { return .standard }
@@ -23,6 +24,23 @@ enum UITestFixture {
 
     static func configure(_ app: NibApp) {
         guard NibUITestMode.isEnabled else { return }
+        // Capture-only override. Observe newly visible windows as well as the initial scene;
+        // sheets and auxiliary windows must inherit the requested fixture appearance.
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "-NibUITestAppearance"), index + 1 < arguments.count,
+           ["light", "dark"].contains(arguments[index + 1]) {
+            let style: UIUserInterfaceStyle = arguments[index + 1] == "dark" ? .dark : .light
+            for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+                scene.windows.forEach { $0.overrideUserInterfaceStyle = style }
+            }
+            appearanceObserver = NotificationCenter.default.addObserver(
+                forName: UIWindow.didBecomeVisibleNotification, object: nil, queue: .main
+            ) { notification in
+                MainActor.assumeIsolated {
+                    (notification.object as? UIWindow)?.overrideUserInterfaceStyle = style
+                }
+            }
+        }
         app.settings.setJSON("onboarding.done", true)
         app.settings.set(NibSettings.stylusMode, .anyInput)
         app.settings.set(NibSettings.liquidMode, "off")

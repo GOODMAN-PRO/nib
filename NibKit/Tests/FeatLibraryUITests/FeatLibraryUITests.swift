@@ -48,6 +48,73 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertTrue(scroll.isUserInteractionEnabled)
     }
 
+    func testSlowHeldDragKeepsPickupIntentWhileStationaryHoldYieldsToContextMenu() {
+        XCTAssertTrue(ReflowLiftIntent.yieldsToMenu(distance: 0))
+        XCTAssertFalse(ReflowLiftIntent.yieldsToMenu(distance: 3))
+        XCTAssertFalse(ReflowLiftIntent.yieldsToMenu(distance: 3, stationaryFor: 0.05))
+        XCTAssertTrue(ReflowLiftIntent.yieldsToMenu(distance: 3, stationaryFor: 0.2), "Small drift that stops must still open the context menu")
+        XCTAssertFalse(ReflowLiftIntent.protectsLift(elapsed: 0.15, distance: 10), "An immediate swipe must still scroll")
+        XCTAssertTrue(ReflowLiftIntent.protectsLift(elapsed: 0.4, distance: 3), "Slow movement must not lose to a context menu before pickup slop")
+        XCTAssertTrue(ReflowLiftIntent.protectsLift(elapsed: 0.7, distance: 10))
+        XCTAssertFalse(ReflowLiftIntent.protectsLift(elapsed: 0.7, distance: 0))
+    }
+
+    func testDropUsesReleasedFingerAndCorrectCarrierEvenBeforeHoverRender() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.reload()
+        var moved: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryMove, title: "Move", summary: "Record move", effect: .library, target: .library)) { params, _ in
+            moved = params; return [:]
+        }
+        let ref = try XCTUnwrap(model.documentRefs.first)
+        model.reflow.layout = NibReflowLayout(columns: 3, cell: NibMetrics.coverSize)
+        model.reflow.begin(ref, order: model.documentRefs, at: .zero)
+        let target = CGRect(x: 10, y: -100, width: 180, height: 78)
+        model.dropTargets = ["folder:FIXTUREFLD01": target]
+        model.reflow.move(to: CGPoint(x: target.midX, y: target.midY))
+        model.dropTarget = nil // The SwiftUI monitor has not rendered this final move.
+        let drop = model.reflow.end()
+        model.drop(drop, from: model.reflow)
+        for _ in 0..<30 { await Task.yield() }
+        XCTAssertEqual(moved?["refs"], [.string(ref)])
+        XCTAssertEqual(moved?["folder"], "folder:FIXTUREFLD01")
+        XCTAssertNil(model.dropTarget)
+        XCTAssertNotNil(model.floating.toast?.action)
+    }
+
+    func testDropDestinationExcludesSelfAndChoosesFolderOverSidebar() {
+        let targets = ["sidebar": CGRect(x: 0, y: 0, width: 320, height: 700),
+                       "sidebarFolder:folder:DESTINATION": CGRect(x: 20, y: 100, width: 260, height: 44),
+                       "folder:SOURCE": CGRect(x: 400, y: 100, width: 200, height: 78)]
+        XCTAssertEqual(LibraryDropDestination.match(CGPoint(x: 100, y: 120), carried: "folder:SOURCE", targets: targets)?.key, "folder:DESTINATION")
+        XCTAssertNil(LibraryDropDestination.match(CGPoint(x: 450, y: 120), carried: "folder:SOURCE", targets: targets))
+        XCTAssertNil(LibraryDropDestination.match(CGPoint(x: 100, y: 400), carried: "folder:SOURCE", targets: targets))
+    }
+
+    func testSelectionShortcutsFollowSelectionAndYieldToEditorsAndPanels() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        XCTAssertFalse(LibrarySelectionShortcuts.isEnabled(model))
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "begin"], session: h.session)
+        XCTAssertTrue(LibrarySelectionShortcuts.isEnabled(model))
+        let keys = h.app.content.keyCommands.all.filter { $0.owner == FeatLibraryUIFeature.id }
+        XCTAssertEqual(Set(keys.map(\.shortcut.key)), ["a", "escape", "return"])
+        let selectAll = try XCTUnwrap(keys.first { $0.shortcut.key == "a" })
+        _ = try await h.app.bus.execute(selectAll.command, selectAll.resolvedParams(for: h.session), session: h.session)
+        XCTAssertEqual(model.selection.refs, Set(model.visibleRefs))
+        model.renaming = model.visibleRefs.first
+        XCTAssertFalse(LibrarySelectionShortcuts.isEnabled(model))
+        model.renaming = nil; model.menu = "app"
+        XCTAssertFalse(LibrarySelectionShortcuts.isEnabled(model))
+        model.menu = nil; h.session.isEditingText = true
+        XCTAssertFalse(LibrarySelectionShortcuts.isEnabled(model))
+        h.session.isEditingText = false
+        let escape = try XCTUnwrap(keys.first { $0.shortcut.key == "escape" })
+        _ = try await h.app.bus.execute(escape.command, escape.resolvedParams(for: h.session), session: h.session)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+        XCTAssertFalse(LibrarySelectionShortcuts.isEnabled(model))
+    }
+
     func testOutgoingMenuCannotDismissNewerAppMenu() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": "app"], session: h.session)
@@ -58,6 +125,11 @@ final class FeatLibraryUITests: XCTestCase {
         model.setMenuPresented(false, menu: "app")
         for _ in 0..<20 { await Task.yield() }
         XCTAssertNil(model.menu)
+        // Also cover a dismissal already queued before the new menu command runs.
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": "app"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView,
+            ["menu": "none", "menuIfCurrent": "new"], session: h.session)
+        XCTAssertEqual(model.menu, "app")
     }
 
     func testMenuActivationClosesBudBeforeOpeningInlineRename() async throws {
@@ -1255,11 +1327,13 @@ final class FeatLibraryUITests: XCTestCase {
         let h = harness(), session = EditorSession()
         h.app.services.sessions.add(session)
         var controller: LibraryRootViewController? = LibraryRootViewController(app: h.app, navigator: LibraryTestNavigator(app: h.app, session: session))
+        weak var releasedController = controller
         weak var model = controller?.model
         _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["layout": "list"], session: session)
         XCTAssertEqual(model?.layout, .list)
         h.app.services.sessions.remove(session)
         controller = nil
+        XCTAssertNil(releasedController)
         XCTAssertNil(model)
         XCTAssertNil(LibraryModels.get(h.app).models[session.id])
     }

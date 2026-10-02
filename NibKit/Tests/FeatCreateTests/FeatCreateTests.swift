@@ -44,8 +44,32 @@ private final class FakeNavigator: SceneNavigator {
     func presentModal(_ viewController: UIViewController) { presented.append(viewController) }
 }
 
+/// A unit-test presentation whose UIKit completion can be released independently of the dismiss request.
+/// The package's hostless XCTest process has no application scene in which to present a real modal.
+@MainActor
+private final class DeferredDismissalController: UIViewController {
+    let presenter = UIViewController()
+    var isPresented = true
+    var dismissalCompletion: (() -> Void)?
+    override var presentingViewController: UIViewController? { isPresented ? presenter : nil }
+    override func dismiss(animated flag: Bool, completion: (() -> Void)? = nil) {
+        dismissalCompletion = completion
+    }
+}
+
 @MainActor
 final class FeatCreateTests: XCTestCase {
+    func testSavedMinimumCustomSizeRetainsFractionalMillimetres() async throws {
+        let h = harness()
+        h.app.settings.set(NibSettings.defaultPageSize, PageSize(72, 144))
+        let model = NewNotebookModel(app: h.app, folder: Fixtures.folderID, kind: .notebook,
+                                     session: h.session, navigator: nil)
+        XCTAssertEqual(model.customWidth, 25.4, accuracy: 0.0001)
+        XCTAssertEqual(model.customHeight, 50.8, accuracy: 0.0001)
+        let created = await model.create()
+        XCTAssertTrue(created, "A saved valid custom page must not be rejected after rounding millimetres")
+    }
+
     func testInvalidCustomDimensionsDoNotCreateOrRememberClampedPages() async throws {
         let h = harness()
         let before = h.library.children(of: Fixtures.folderID).map(\.id)
@@ -522,26 +546,27 @@ final class FeatCreateTests: XCTestCase {
         }
     }
 
-    func testCreationDismissalWaitsForUIKitToRemoveTheModal() async {
+    func testCreationDismissalWaitsForUIKitToRemoveTheModal() async throws {
         let h = harness()
-        let presenter = UIViewController()
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
-        window.rootViewController = presenter
-        window.isHidden = false
-        defer { window.isHidden = true; window.rootViewController = nil }
-        let sheet = UIViewController()
-        sheet.modalPresentationStyle = .formSheet
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            presenter.present(sheet, animated: false) { continuation.resume() }
-        }
-        XCTAssertNotNil(presenter.presentedViewController)
+        let sheet = DeferredDismissalController()
         let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
         model.presentationController = sheet
-        await model.dismissPresentation()
-        XCTAssertNil(presenter.presentedViewController, "Creation can now safely replace the presenting library")
+        var finished = false
+        let dismissal = Task { @MainActor in
+            await model.dismissPresentation()
+            finished = true
+        }
+        await settle { sheet.dismissalCompletion != nil }
+        let complete = try XCTUnwrap(sheet.dismissalCompletion, "Dismissal must be requested from the presenting controller")
+        XCTAssertFalse(finished, "Navigation must wait while UIKit still presents the creation sheet")
+        sheet.isPresented = false
+        complete()
+        await dismissal.value
+        XCTAssertTrue(finished)
+        XCTAssertNil(sheet.presentingViewController, "Creation can now safely replace the presenting library")
     }
 
-    func testDistributionPersistsWithTheNotebookAndIsUndoable() async throws {
+    func testDistributionPersistsWithTheNotebook() async throws {
         let h = harness()
         let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
         model.draft.title = "Alternating paper"
@@ -554,10 +579,27 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(distribution["pattern"], "everyOther")
         let background = try XCTUnwrap(distribution["background"]).decode(Background.self)
         XCTAssertEqual(background.template?.id, model.draft.paper.id, "The cover must not become repeating paper")
-        _ = try await h.run("create.applyPattern", ["doc": .string(NodeRef.document(node.id).description), "pattern": "allPages"])
-        XCTAssertEqual(try h.app.workspace.content(node.id).meta.ext?["create.paperDistribution"]?["pattern"], "allPages")
-        XCTAssertTrue(h.app.bus.undo(node.id))
-        XCTAssertEqual(try h.app.workspace.content(node.id).meta.ext?["create.paperDistribution"]?["pattern"], "everyOther")
+        let reopened = try h.app.workspace.content(node.id)
+        XCTAssertEqual(reopened.meta.ext?["create.paperDistribution"]?["pattern"], "everyOther")
+        XCTAssertEqual(NotebookDraft.initial(settings: h.app.settings).distribution, .everyOther,
+                       "The next creation sheet remembers the last distribution without changing existing notebooks")
+    }
+
+    func testDistributionUsesNodeSetAfterDocCreate() async throws {
+        let h = harness()
+        let log = CallLog()
+        stubDocCreate(h, log: log)
+        stub(h, CommandIDs.nodeSet, effect: .edit, log: log)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Alternating"
+        model.draft.distribution = .everyOther
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let distribution = try XCTUnwrap(log.params(CommandIDs.nodeSet).first?["fields"]?["meta"]?["ext"]?["create.paperDistribution"])
+        XCTAssertEqual(distribution["pattern"], "everyOther")
+        XCTAssertEqual(try distribution["background"]?.decode(Background.self).template?.id, TemplateIDs.ruled)
+        XCTAssertEqual(log.calls.map(\.command).filter { [CommandIDs.docCreate, CommandIDs.nodeSet].contains($0) },
+                       [CommandIDs.docCreate, CommandIDs.nodeSet])
     }
 
     func testTemplateChoiceBecomesThePaper() {

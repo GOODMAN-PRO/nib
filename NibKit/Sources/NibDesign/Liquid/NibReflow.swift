@@ -623,6 +623,21 @@ private struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
         func detach() { gesture.view?.removeGestureRecognizer(gesture) }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             guard let probe, probe.window != nil, !probe.isHidden else { return false }
+            // Window-level recognisers must not receive touches in a sheet or an
+            // occluded/removed library. Geometry alone overlaps those surfaces.
+            var ancestor: UIView? = probe
+            while let view = ancestor {
+                guard !view.isHidden, view.alpha > 0.01 else { return false }
+                ancestor = view.superview
+            }
+            var responder: UIResponder? = probe
+            while let current = responder {
+                if let controller = current as? UIViewController {
+                    guard let touched = touch.view, touched.isDescendant(of: controller.view) else { return false }
+                    break
+                }
+                responder = current.next
+            }
             let receives = probe.bounds.contains(touch.location(in: probe))
             #if DEBUG
             if receives { NSLog("%@", "[Reflow diagnostic] touch in \(probe.bounds)") }
@@ -664,7 +679,9 @@ private struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
 /// the six-point pickup slop. Only a stationary hold yields to the item menu.
 enum ReflowLiftIntent {
     static let menuDelay = NibReflowMetrics.liftDelay + 0.35
-    static func yieldsToMenu(distance: CGFloat) -> Bool { distance < 1 }
+    static func yieldsToMenu(distance: CGFloat, stationaryFor: TimeInterval = 0) -> Bool {
+        distance < 1 || stationaryFor >= NibReflowMetrics.dwell
+    }
     static func protectsLift(elapsed: TimeInterval, distance: CGFloat) -> Bool {
         elapsed >= NibReflowMetrics.liftDelay && !yieldsToMenu(distance: distance)
     }
@@ -684,7 +701,15 @@ private final class LiftRecognizer: UIGestureRecognizer {
         beganAt = touch.timestamp; sampledAt = beganAt
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.state == .possible else { return }
-            guard ReflowLiftIntent.yieldsToMenu(distance: hypot(self.point.x - self.start.x, self.point.y - self.start.y)) else { return }
+            guard ReflowLiftIntent.yieldsToMenu(distance: hypot(self.point.x - self.start.x, self.point.y - self.start.y),
+                                              stationaryFor: CACurrentMediaTime() - self.sampledAt) else {
+                // A little drift that stops is still a context-menu hold. Keep
+                // checking while movement has begun but has not crossed pickup slop.
+                if let work = self.holdTimeout {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + NibReflowMetrics.dwell, execute: work)
+                }
+                return
+            }
             #if DEBUG
             NSLog("%@", "[Reflow diagnostic] stationary timeout")
             #endif
@@ -714,6 +739,9 @@ private final class LiftRecognizer: UIGestureRecognizer {
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
         // Once held, the scroll view must not win the first movement before this
         // recognizer receives it. A normal immediate swipe fails us above.
+        if beganAt > 0,
+           preventingGestureRecognizer is UIPanGestureRecognizer,
+           CACurrentMediaTime() - beganAt >= NibReflowMetrics.liftDelay { return false }
         if beganAt > 0,
            ReflowLiftIntent.protectsLift(elapsed: CACurrentMediaTime() - beganAt,
                 distance: hypot(point.x - start.x, point.y - start.y)) { return false }

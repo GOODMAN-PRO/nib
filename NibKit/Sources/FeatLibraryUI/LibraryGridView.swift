@@ -292,7 +292,8 @@ private struct LibraryItemReflow: ViewModifier {
     func body(content: Content) -> some View {
         if model.collection == .documents {
             content.nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
-                order: row.isFolder ? model.folderRefs : model.documentRefs, onDrop: model.drop)
+                order: row.isFolder ? model.folderRefs : model.documentRefs,
+                onDrop: { model.drop($0, from: row.isFolder ? model.folderReflow : model.reflow) })
         } else { content }
     }
 }

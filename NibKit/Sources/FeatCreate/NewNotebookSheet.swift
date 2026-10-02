@@ -235,6 +235,7 @@ struct NotebookDraft: Equatable {
             r.size = pageSize
             r.cover = hasCover ? coverRef(templates.get(cover.id)) : nil
             r.background = custom
+            r.distribution = distribution
         case .whiteboard:
             r.template = boardRef(templates.get(board.id))
         case .textDocument, .studySet:
@@ -258,6 +259,7 @@ struct NotebookDraft: Equatable {
             out.append((name: NibSettings.defaultPageSize.name, value: size))
         }
         out.append((name: NibSettings.coverByDefault.name, value: .bool(hasCover)))
+        out.append((name: PaperDistribution.setting.name, value: .string(distribution.rawValue)))
         return out
     }
 
@@ -280,6 +282,7 @@ struct NotebookDraft: Equatable {
         case NibSettings.defaultCover.name: return try? JSONValue.from(settings.get(NibSettings.defaultCover))
         case NibSettings.defaultPageSize.name: return try? JSONValue.from(settings.get(NibSettings.defaultPageSize))
         case NibSettings.coverByDefault.name: return .bool(settings.get(NibSettings.coverByDefault))
+        case PaperDistribution.setting.name: return .string(settings.get(PaperDistribution.setting))
         default: return settings.json(name)
         }
     }
@@ -301,51 +304,20 @@ struct NotebookDraft: Equatable {
         return NotebookDraft(kind: kind, title: "", paper: base, paperColour: paperColour,
                              hasCover: settings.get(NibSettings.coverByDefault), cover: coverBase, cloth: cloth,
                              size: size, orientation: orientation, board: TemplateRef(TemplateIDs.whiteboardDots),
-                             custom: nil)
+                             custom: nil,
+                             distribution: PaperDistribution(rawValue: settings.get(PaperDistribution.setting)) ?? .allPages)
     }
 }
 
 /// Stored on the notebook, so adding pages after reopening keeps the chosen distribution.
 enum PaperDistribution: String, CaseIterable {
     case allPages, everyOther
+    static let setting = SettingKey<String>("create.paperDistribution", default: "allPages")
     var title: String {
         switch self {
         case .allPages: return String(localized: "All pages")
         case .everyOther: return String(localized: "Every other")
         }
-    }
-}
-
-struct ApplyCreationPaper: NibCommand {
-    struct Params: Codable { var doc: String; var pattern: String }
-    static let descriptor = CommandDescriptor(
-        id: "create.applyPattern", title: "Set Paper Distribution",
-        summary: "Remember whether new notebook pages use its paper on all pages or alternate with plain paper.",
-        params: .obj(["doc": .ref, "pattern": .str("Distribution", choices: PaperDistribution.allCases.map(\.rawValue))],
-                     required: ["doc", "pattern"]),
-        examples: [["doc": "doc:FIXTUREDOC01", "pattern": "everyOther"]], effect: .edit)
-
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
-        guard let pattern = PaperDistribution(rawValue: p.pattern) else {
-            throw NibError.invalid("Unknown paper distribution", path: "$.pattern")
-        }
-        let doc = NodeRef.documentID(from: p.doc)
-        try ctx.mutate { tx in
-            let content = try tx.content(doc)
-            guard content.meta.kind == .notebook else {
-                throw NibError.invalid("Paper distribution requires a notebook", path: "$.doc")
-            }
-            guard let paper = content.livePages.first(where: {
-                !($0.background.template.map { ctx.content.templates.get($0.id)?.isCover ?? $0.id.hasPrefix("cover.") } ?? false)
-            }) else { return }
-            var meta = content.meta
-            var ext = meta.ext ?? [:]
-            ext["create.paperDistribution"] = ["pattern": .string(pattern.rawValue),
-                                               "background": try JSONValue.from(paper.background)]
-            meta.ext = ext
-            try tx.putMeta(meta)
-        }
-        return NoResult()
     }
 }
 
@@ -365,6 +337,7 @@ struct CreationRequest: Equatable {
     var cover: TemplateRef?
     /// A custom paper applied after creation (`page.setBackground`).
     var background: Background?
+    var distribution: PaperDistribution = .allPages
 
     init(id: DocumentID, kind: DocumentKind, title: String, folder: FolderID? = nil, template: TemplateRef? = nil,
          size: PageSize? = nil, cover: TemplateRef? = nil, background: Background? = nil) {
@@ -415,6 +388,8 @@ enum DocumentBlueprint {
             meta.defaultTemplate = r.template
             let size = r.size ?? .a4
             let paper = r.background ?? Background(kind: .template, template: r.template ?? TemplateRef(TemplateIDs.blank))
+            meta.ext = ["create.paperDistribution": ["pattern": .string(r.distribution.rawValue),
+                                                     "background": (try? JSONValue.from(paper)) ?? .null]]
             var pages: [PageRecord] = []
             let keys = FractionalIndex.sequence(after: nil, count: r.cover == nil ? 1 : 2)
             if let cover = r.cover {
@@ -480,6 +455,20 @@ enum DocumentCreator {
         if applyCustomPaper, let background = r.background,
            let warning = await applyBackground(background, r, runner, workspace, templates: templates) {
             warnings.append(warning)
+        }
+        if r.kind == .notebook, runner.has(CommandIDs.nodeSet) {
+            do {
+                let content = try workspace.content(r.id)
+                if let paper = content.livePages.first(where: { !isCover($0, templates) }) {
+                    let distribution: JSONValue = ["pattern": .string(r.distribution.rawValue),
+                                                    "background": try JSONValue.from(paper.background)]
+                    _ = try await runner.run(CommandIDs.nodeSet,
+                        ["ref": .string(NodeRef.document(r.id).description),
+                         "fields": ["meta": ["ext": ["create.paperDistribution": distribution]]]])
+                }
+            } catch {
+                warnings.append(String(localized: "The notebook was created, but its paper distribution could not be saved: \(NibError.wrap(error).message)"))
+            }
         }
         return warnings
     }
@@ -659,7 +648,7 @@ final class NewNotebookModel: ObservableObject {
         if !papers.contains(where: { $0.id == draft.paper.id }) {
             let d = app.content.templates.get(draft.paper.id)
             papers.insert(TemplateOption(id: draft.paper.id, title: d?.title ?? String(localized: "Default paper"),
-                                         category: d?.category ?? String(localized: "Default"), definition: d), at: 0)
+                                         category: d.map(Self.paperGroup) ?? Self.paperGroups[0], definition: d), at: 0)
         }
         var covers = all.filter(\.isCover).map(option)
         if !covers.contains(where: { $0.id == draft.cover.id }) {
@@ -682,8 +671,8 @@ final class NewNotebookModel: ObservableObject {
         self.groups = groups
         self.draft = draft
         self.group = papers.first { $0.id == draft.paper.id }?.category ?? groups.first ?? ""
-        customWidth = PageSizeChoice.millimetres(draft.size.size.width).rounded()
-        customHeight = PageSizeChoice.millimetres(draft.size.size.height).rounded()
+        customWidth = PageSizeChoice.millimetres(draft.size.size.width)
+        customHeight = PageSizeChoice.millimetres(draft.size.size.height)
     }
 
     static let whiteboardCategory = "Whiteboard"
@@ -790,8 +779,8 @@ final class NewNotebookModel: ObservableObject {
             draft.size = choice
             draft.orientation = orientation
             if choice.isCustom {
-                customWidth = PageSizeChoice.millimetres(choice.size.width).rounded()
-                customHeight = PageSizeChoice.millimetres(choice.size.height).rounded()
+                customWidth = PageSizeChoice.millimetres(choice.size.width)
+                customHeight = PageSizeChoice.millimetres(choice.size.height)
             }
         }
     }
@@ -832,15 +821,6 @@ final class NewNotebookModel: ObservableObject {
         if draft.kind == .notebook && draft.isUntitled {
             let title = app.services.library?.node(id)?.title ?? request.title
             await PendingCreations.mark(id, PendingCreation(kind: .untitled, title: title), runner: runner)
-        }
-        if draft.kind == .notebook {
-            do {
-                _ = try await runner.run(ApplyCreationPaper.descriptor.id,
-                                         ["doc": .string(NodeRef.document(id).description),
-                                          "pattern": .string(draft.distribution.rawValue)])
-            } catch {
-                CreateLog.log.error("Paper distribution: \(NibError.wrap(error).message, privacy: .public)")
-            }
         }
         // The presenting library/editor must remain attached until UIKit finishes dismissing its sheet.
         await beforeOpen()
@@ -1159,8 +1139,8 @@ struct NewNotebookSheet: View {
                         NibPaperTile(name: option.title, isSelected: draft.hasCover && draft.cover.id == option.id,
                                      size: NibMetrics.coverStripSize, action: { model.selectCover(option) }) {
                             CoverPreview(definition: option.definition,
-                                         params: draft.coverRef(option.definition).params,
-                                         page: draft.pageSize, cloth: draft.cloth)
+                                         params: draft.cover.id == option.id ? draft.coverRef(option.definition).params : [:],
+                                         page: draft.pageSize, cloth: draft.cover.id == option.id ? draft.cloth : nil)
                         }
                     }
                 }
@@ -1360,6 +1340,7 @@ private struct NewNotebookWindowReader: UIViewRepresentable {
     func makeUIView(context: Context) -> WindowView {
         let view = WindowView()
         view.onChange = onChange
+        view.onController = onController
         return view
     }
 

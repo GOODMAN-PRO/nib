@@ -93,6 +93,11 @@ final class PageCommandTests: XCTestCase {
             let explicit = try await h.run("page.add", ["doc": "doc:DISTRIBUTION", "position": "end",
                                                        "source": "template", "template": .string(TemplateIDs.ruled)])
             XCTAssertEqual(try pageRecord(h, refs(explicit)[0]).background.template?.id, TemplateIDs.ruled)
+            if pattern == "allPages" {
+                let following = try await h.run("page.add", ["doc": "doc:DISTRIBUTION", "position": "end"])
+                XCTAssertEqual(try pageRecord(h, refs(following)[0]).background.template?.id, TemplateIDs.ruled,
+                               "All pages preserves page.add's current-paper behavior after an explicit paper change")
+            }
         }
     }
 

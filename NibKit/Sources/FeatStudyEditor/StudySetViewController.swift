@@ -76,6 +76,7 @@ final class StudySetModel: ObservableObject {
     /// drafts it touches. Each typing pause is its own undo step, as in the other text editors.
     private var ownGroups = Set<String>()
     private var pendingCommit: Task<Void, Never>?
+    private var preparingFirstCard = false
     private var observation: CommitObservation?
     private var readOnlyWatch: AnyCancellable?
     /// Decoded pictures (slot-sized) and rendered freeform sides, bounded by bitmap bytes.
@@ -271,6 +272,20 @@ final class StudySetModel: ObservableObject {
     }
 
     // MARK: Cards
+
+    /// Both creation routes open a set with no cards. Give a pristine set editable Term / Definition fields
+    /// through the normal undoable command. Tombstones distinguish a deliberately emptied set (or an undone
+    /// first card) from a new one, so reopening must not silently recreate a deleted card.
+    func prepareForEditing() async {
+        guard !preparingFirstCard else { return }
+        reload()
+        guard !readOnly, !isMissing,
+              let content = try? app.workspace.content(doc), content.meta.kind == .studySet,
+              content.cards.isEmpty else { return }
+        preparingFirstCard = true
+        defer { preparingFirstCard = false }
+        await addCard(after: nil)
+    }
 
     @discardableResult
     func addCard(after anchor: NibID?, inPane: Bool = false) async -> NibID? {
@@ -629,6 +644,7 @@ final class StudySetViewController: UIViewController, DocumentEditing {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
+        Task { [weak self] in await self?.model.prepareForEditing() }
     }
 
     override func viewWillDisappear(_ animated: Bool) {

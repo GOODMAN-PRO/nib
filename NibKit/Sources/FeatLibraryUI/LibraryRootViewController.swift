@@ -69,6 +69,7 @@ final class LibraryViewModel: ObservableObject {
     @Published var modal: LibraryPanel?
     @Published var absorbing: [String: CGSize] = [:]
     var dropFrame: CGRect?
+    var dropTargets: [String: CGRect] = [:]
     @Published var dropTarget: String?
     let coverCache: LibraryCoverCache
     @Published var hasLibraryDrag = false
@@ -117,7 +118,7 @@ final class LibraryViewModel: ObservableObject {
             }
         }
         NotificationCenter.default.publisher(for: .nibRegistryDidChange).sink { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.registryRevision += 1
                 self?.refreshSidebarCounts()
             }
@@ -127,30 +128,39 @@ final class LibraryViewModel: ObservableObject {
                 (note.userInfo?["session"] as? String).map { $0 == session.id.raw } ?? true
             }
             .sink { [weak self] _ in
-                Task { @MainActor in self?.registryRevision += 1 }
+                Task { @MainActor [weak self] in self?.registryRevision += 1 }
             }.store(in: &observations)
         session.objectWillChange.sink { [weak self] _ in
             // Published session properties notify before changing; evaluate visibility on the next actor turn.
-            Task { @MainActor in self?.registryRevision += 1 }
+            Task { @MainActor [weak self] in self?.registryRevision += 1 }
         }.store(in: &observations)
         NotificationCenter.default.publisher(for: .nibCommandFailed, object: app).sink { [weak self] notification in
             guard let command = notification.userInfo?["command"] as? String,
                   command.hasPrefix("library.") || command.hasPrefix("folder.") else { return }
-            Task { @MainActor in await self?.markDirty() }
+            Task { @MainActor [weak self] in await self?.markDirty() }
         }.store(in: &observations)
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings).sink { [weak self] note in
             let name = note.userInfo?["name"] as? String
-            Task { @MainActor in
-                guard let self else { return }
-                self.liquidMode = NibLiquidMode(rawValue: self.app.settings.get(NibSettings.liquidMode)) ?? .full
-                if name?.hasPrefix("searchui.recent.") == true || name?.hasPrefix("collab.shared.") == true {
-                    self.refreshSidebarCounts()
-                    if self.collection == .recents { await self.markDirty() }
-                }
-                if self.collection == .documents && name == LibraryOrder.viewKey(self.folder) { self.restoreView() }
-                if name == LibraryOrder.viewKey(self.folder) || name == LibraryOrder.key(self.folder) { self.applySort() }
+            // Commands already publish these notifications on main. Reconcile
+            // before returning instead of retaining a window in a suspended task.
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.settingsDidChange(name) }
+            } else {
+                Task { @MainActor [weak self] in self?.settingsDidChange(name) }
             }
         }.store(in: &observations)
+    }
+
+    private func settingsDidChange(_ name: String?) {
+        liquidMode = NibLiquidMode(rawValue: app.settings.get(NibSettings.liquidMode)) ?? .full
+        if name?.hasPrefix("searchui.recent.") == true || name?.hasPrefix("collab.shared.") == true {
+            refreshSidebarCounts()
+            if collection == .recents {
+                Task { @MainActor [weak self] in await self?.markDirty() }
+            }
+        }
+        if collection == .documents && name == LibraryOrder.viewKey(folder) { restoreView() }
+        if name == LibraryOrder.viewKey(folder) || name == LibraryOrder.key(folder) { applySort() }
     }
 
     deinit { eventSubscription?.cancel() }
@@ -365,8 +375,16 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func drop(_ drop: NibReflowDrop<String>) {
-        if let destination = dropTarget, let carried = reflow.carried ?? folderReflow.carried {
+    func drop(_ drop: NibReflowDrop<String>) { self.drop(drop, from: nil) }
+
+    func drop(_ drop: NibReflowDrop<String>, from source: NibReflow<String>?) {
+        // onChange coalesces finger updates. Resolve the final point synchronously
+        // before the released carrier/monitor clears its hover state.
+        if let lift = source?.lift {
+            let match = LibraryDropDestination.match(lift.location, carried: lift.id, targets: dropTargets)
+            dropTarget = match?.key; dropFrame = match?.value
+        }
+        if let destination = dropTarget, let carried = source?.carried ?? reflow.carried ?? folderReflow.carried {
             let refs = selection.refs.contains(carried) ? selection.refs.sorted() : [carried]
             if let frame = dropFrame, let source = reflow.carrierFrame {
                 absorbing[carried] = CGSize(width: frame.midX - source.midX, height: frame.midY - source.midY)
@@ -593,7 +611,8 @@ struct LibraryRootView: View {
                 .environment(\.horizontalSizeClass, compact ? .compact : .regular)
             }
             .coordinateSpace(name: "library.chrome")
-            .onPreferenceChange(LibraryTargets.self) { targets = $0 }
+            .background(LibrarySelectionShortcuts(model: model))
+            .onPreferenceChange(LibraryTargets.self) { targets = $0; model.dropTargets = $0 }
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
                 chromeFrames = frames
                 model.updateMenuAnchors(from: frames)
@@ -766,6 +785,38 @@ struct LibraryRootView: View {
             NibIconButton(.xmark, label: String(localized: "Finish Selecting")) { model.setView(["selection": "clear"]) }
             .accessibilityIdentifier("cmd.library.setView")
         }
+    }
+}
+
+/// SwiftUI owns focus after a grid button is selected. Install the registered
+/// selection commands in that hosting tree as well as the shell's responder chain.
+struct LibrarySelectionShortcuts: View {
+    @ObservedObject var model: LibraryViewModel
+    static func isEnabled(_ model: LibraryViewModel) -> Bool {
+        model.selection.isSelecting && model.tab == nil && model.modal == nil && model.menu == nil &&
+            model.renaming == nil && model.floating.presentedIDs.isEmpty && !model.session.isEditingText
+    }
+    var body: some View {
+        Group {
+            if Self.isEnabled(model) {
+                ForEach(model.app.content.keyCommands.all.filter { $0.owner == FeatLibraryUIFeature.id }, id: \.id) { descriptor in
+                    Button(descriptor.title) { model.perform(descriptor.command, descriptor.resolvedParams(for: model.session)) }
+                        .keyboardShortcut(shortcut(descriptor.shortcut))
+                }
+            }
+        }
+        .frame(width: 0, height: 0)
+        .clipped()
+        .accessibilityHidden(true)
+    }
+    private func shortcut(_ key: KeyShortcut) -> KeyboardShortcut {
+        let equivalent: KeyEquivalent = key.key == "escape" ? .escape : key.key == "return" ? .return : KeyEquivalent(key.key.first ?? " ")
+        var modifiers: EventModifiers = []
+        if key.modifiers.contains(.command) { modifiers.insert(.command) }
+        if key.modifiers.contains(.shift) { modifiers.insert(.shift) }
+        if key.modifiers.contains(.option) { modifiers.insert(.option) }
+        if key.modifiers.contains(.control) { modifiers.insert(.control) }
+        return KeyboardShortcut(equivalent, modifiers: modifiers)
     }
 }
 
@@ -1006,6 +1057,18 @@ struct LibraryPanelView: View {
 }
 
 /// Only this leaf observes finger locations; the grid publishes a change when its target or drag phase changes.
+enum LibraryDropDestination {
+    static func match(_ point: CGPoint, carried: String, targets: [String: CGRect]) -> (key: String, value: CGRect)? {
+        let match = targets.filter {
+            $0.key != "sidebar" && !$0.key.hasPrefix("card:") && $0.key != carried &&
+            $0.key != "sidebarFolder:" + carried &&
+            $0.value.insetBy(dx: -(NibSpacing.m + NibStroke.thin), dy: -(NibSpacing.m + NibStroke.thin)).contains(point)
+        }.min { $0.value.width * $0.value.height < $1.value.width * $1.value.height }
+        return match.map { ($0.key.replacingOccurrences(of: "sidebarFolder:", with: "")
+            .replacingOccurrences(of: "breadcrumb:", with: ""), $0.value) }
+    }
+}
+
 private struct LibraryDragMonitor: View {
     @ObservedObject var model: LibraryViewModel
     var targets: [String: CGRect]
@@ -1024,11 +1087,8 @@ private struct LibraryDragMonitor: View {
             reflow.isPaused = false; reflow.isCondensed = false
             return
         }
-        let match = targets.filter {
-            $0.key != "sidebar" && !$0.key.hasPrefix("card:") && $0.key != lift.id &&
-            $0.key != "sidebarFolder:" + lift.id && $0.value.insetBy(dx: -(NibSpacing.m + NibStroke.thin), dy: -(NibSpacing.m + NibStroke.thin)).contains(lift.location)
-        }.min { $0.value.width * $0.value.height < $1.value.width * $1.value.height }
-        let destination = match?.key.replacingOccurrences(of: "sidebarFolder:", with: "").replacingOccurrences(of: "breadcrumb:", with: "")
+        let match = LibraryDropDestination.match(lift.location, carried: lift.id, targets: targets)
+        let destination = match?.key
         if model.dropTarget != destination { model.dropTarget = destination }
         model.dropFrame = match?.value
         let paused = match != nil, condensed = targets["sidebar"]?.contains(lift.location) == true

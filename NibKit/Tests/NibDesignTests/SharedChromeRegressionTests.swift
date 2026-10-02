@@ -14,11 +14,15 @@ final class SharedChromeRegressionTests: XCTestCase {
         let content = SheetViewportFixture().modifier(NibSheetChrome())
             .fixedSize(horizontal: false, vertical: true)
         let host = UIHostingController(rootView: content)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 1366))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
         let size = host.sizeThatFits(in: CGSize(width: 720, height: 1366))
         host.view.frame = CGRect(origin: .zero, size: size)
         host.view.layoutIfNeeded()
-        func list(in view: UIView) -> UICollectionView? {
-            if let list = view as? UICollectionView { return list }
+        func list(in view: UIView) -> UIScrollView? {
+            if let list = view as? UIScrollView { return list }
             return view.subviews.lazy.compactMap { list(in: $0) }.first
         }
         for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }

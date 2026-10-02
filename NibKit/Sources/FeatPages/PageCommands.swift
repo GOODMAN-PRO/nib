@@ -143,11 +143,12 @@ struct PageAdd: NibCommand {
             // F021 persists the creation choice on this notebook. Explicit template/import choices still win.
             if source == "current", current.meta.kind == .notebook,
                let distribution = current.meta.ext?["create.paperDistribution"],
+               distribution["pattern"]?.stringValue == "everyOther",
                let paper = try? distribution["background"]?.decode(Background.self) {
                 let paperIndex = current.livePages.filter { page in
                     page.order < keys[i] && !(page.background.template.map { PageTemplates.isCover($0, ctx.content) } ?? false)
                 }.count + i
-                if distribution["pattern"]?.stringValue == "everyOther", paperIndex % 2 == 1 {
+                if paperIndex % 2 == 1 {
                     var plain = TemplateRef(TemplateIDs.blank)
                     plain.params[TemplateParamNames.paper] = paper.template?.params[TemplateParamNames.paper]
                     background = Background(kind: .template, template: plain)

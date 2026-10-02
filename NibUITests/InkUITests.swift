@@ -892,6 +892,35 @@ final class InkUITests: XCTestCase {
         try undo(to: before)
     }
 
+    func testDeleteSpecificHighlighterKeepsHandwritingAndUndoRestoresHighlight() throws {
+        try draw()
+        let penRegion = CGRect(x: 0.42, y: 0.61, width: 0.16, height: 0.02)
+        let pen = try raster(penRegion)
+        try ui.selectTool("highlighter")
+        let highlightRegion = CGRect(x: 0.38, y: 0.69, width: 0.24, height: 0.06)
+        let blank = try raster(highlightRegion)
+        try draw([CGPoint(x: 0.4, y: 0.72), CGPoint(x: 0.6, y: 0.72)])
+        let highlight = try visibleInk(after: blank, region: highlightRegion)
+        let before = try ui.state()
+        try tap("menu.more"); try tap("Delete Specific Items…", scroll: true)
+        try tap("This page")
+        try toggle("Handwriting", to: false)
+        try toggle("Highlighter", to: true)
+        try tap("Delete 1 Item")
+        _ = try ui.waitForState {
+            $0.strokeCountOnPage == before.strokeCountOnPage - 1 &&
+            $0.itemCountOnPage == before.itemCountOnPage - 1 && $0.page == before.page
+        }
+        XCTAssertLessThan(try raster(penRegion).changed(from: pen), 30,
+                          "Deleting only highlights must preserve the unselected handwriting")
+        XCTAssertLessThan(try raster(highlightRegion).changed(from: blank), 30,
+                          "The selected highlight must disappear")
+        try undo(to: before)
+        let restored = try visibleInk(after: blank, region: highlightRegion)
+        XCTAssertLessThan(restored.changed(from: highlight), 30,
+                          "Undo must restore the deleted highlight's appearance")
+    }
+
     func testDeleteSpecificItemsDocumentScopeRemovesInkOnOtherPages() throws {
         try draw()
         let first = try ui.state()

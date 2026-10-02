@@ -7,7 +7,7 @@ extension LibraryViewModel {
     func setMenuPresented(_ presented: Bool, menu source: String) {
         // A retracting bud can deliver its dismissal after another menu opened.
         guard presented || menu == source else { return }
-        setView(["menu": presented ? .string(source) : "none"])
+        setView(presented ? ["menu": .string(source)] : ["menu": "none", "menuIfCurrent": .string(source)])
     }
 
     func activateMenu(command: String, params: JSONValue) {

@@ -72,6 +72,7 @@ struct LibrarySetView: NibCommand {
         var selection: String?
         var refs: [String]?
         var menu: String?
+        var menuIfCurrent: String?
         var rename: String?
         var renameSelected: Bool?
         var openSelected: Bool?
@@ -86,7 +87,9 @@ struct LibrarySetView: NibCommand {
             "sort": .str(choices: LibrarySort.allCases.map(\.rawValue)), "filter": .str(choices: LibraryFilter.allCases.map(\.rawValue)),
             "panel": .str("registered panel id, or documents"), "params": .anything("panel parameters"), "close": .bool(),
             "selection": .str(choices: ["all", "clear", "begin", "toggle", "replace"]), "refs": .arr(.ref),
-            "menu": .str(choices: ["new", "app", "sort", "none"]), "rename": .ref, "renameSelected": .bool(), "openSelected": .bool(),
+            "menu": .str(choices: ["new", "app", "sort", "none"]),
+            "menuIfCurrent": .str("Apply this menu change only while this source menu is current", choices: ["new", "app", "sort"]),
+            "rename": .ref, "renameSelected": .bool(), "openSelected": .bool(),
             "search": .str(), "sidebar": .bool()]),
         examples: [["layout": "list", "sort": "created"], ["folder": "lib", "filter": "folders"]],
         effect: .session, target: .app)
@@ -169,7 +172,7 @@ struct LibrarySetView: NibCommand {
             default: break
             }
         }
-        if let menu = p.menu {
+        if let menu = p.menu, p.menuIfCurrent == nil || model.menu == p.menuIfCurrent {
             #if DEBUG
             NSLog("%@", "[Library menu diagnostic] \(menu) \(model.menuAnchors)")
             #endif
