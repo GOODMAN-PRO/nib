@@ -366,6 +366,30 @@ final class OutlinePanelModel: ObservableObject {
     var doc: DocumentID? { tracker.doc }
     var app: NibApp { tracker.app }
 
+    private var sourcesHidden: Bool { !showsPDF && !showsCustom }
+
+    var emptyTitle: String {
+        sourcesHidden ? String(localized: "Outline entries hidden") : String(localized: "No outline yet")
+    }
+
+    var emptyMessage: String? {
+        if sourcesHidden {
+            return String(localized: "PDF Outline and Custom Outline are both turned off in the options.")
+        }
+        return canAdd ? String(localized: "Entries take you straight back to a page.") : nil
+    }
+
+    var emptyAction: NibAction? {
+        if sourcesHidden {
+            return NibAction(String(localized: "Show outline"), handler: {
+                self.setOption(OutlineSettings.showPDFOutline, true)
+                self.setOption(OutlineSettings.showCustomOutline, true)
+            })
+        }
+        guard canAdd else { return nil }
+        return NibAction(String(localized: "Add entry"), handler: { self.beginAdd() })
+    }
+
     private func rebuild(_ content: DocumentContent?, switched: Bool) {
         if switched {
             collapsed = []
@@ -566,8 +590,8 @@ struct OutlinePanel: View {
             }
             if model.sections.isEmpty {
                 ScrollView {
-                    NibEmptyState(symbol: .outline, title: String(localized: "No outline yet"), message: emptyMessage,
-                                  primary: emptyAction)
+                    NibEmptyState(symbol: .outline, title: model.emptyTitle, message: model.emptyMessage,
+                                  primary: model.emptyAction)
                         .frame(maxWidth: .infinity)
                 }
             } else {
@@ -588,19 +612,6 @@ struct OutlinePanel: View {
         .disabled(!model.canAdd)
         .accessibilityHint(String(localized: "Adds an outline entry for the current page."))
         .padding(.horizontal, NibSpacing.xs)
-    }
-
-    private var emptyAction: NibAction? {
-        guard model.canAdd else { return nil }
-        let model = self.model
-        return NibAction(String(localized: "Add entry"), handler: { model.beginAdd() })
-    }
-
-    private var emptyMessage: String? {
-        if !model.showsPDF && !model.showsCustom {
-            return String(localized: "PDF Outline and Custom Outline are both turned off in the options.")
-        }
-        return model.canAdd ? String(localized: "Entries take you straight back to a page.") : nil
     }
 
     private var promptTitle: String {

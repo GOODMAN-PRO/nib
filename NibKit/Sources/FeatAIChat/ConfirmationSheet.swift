@@ -15,7 +15,7 @@ final class ChatConfirmation: Identifiable {
 
     var targetRefs: [String] {
         var seen = Set<String>()
-        return ((summary?.all ?? []) + Self.references(in: request.params))
+        return ((summary?.all ?? []) + Self.references(in: Self.redacted(request.params)))
             .filter { seen.insert($0).inserted }
     }
 

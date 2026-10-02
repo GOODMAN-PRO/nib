@@ -8,6 +8,10 @@ import NibTesting
 final class ChatViewModelTests: XCTestCase {
     func testPageLabelUsesOneBasedScopedPageEvenWhenCanvasMoves() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read the visible canvas context.", effect: .read)) { _, ctx in
+            let index = try ctx.workspace.content(Fixtures.docID).pageIndex(ctx.session?.page ?? Fixtures.page1) ?? 0
+            return ["document": ["kind": "notebook"], "page": ["index": .number(Double(index))]]
+        }
         let model = ChatRuntime.get(h.app).model(for: h.session)
         try model.setScope(.page)
         let title = try XCTUnwrap(h.app.services.library?.node(Fixtures.docID)?.title)
@@ -71,7 +75,11 @@ final class ChatViewModelTests: XCTestCase {
         model.isStreaming = false
         XCTAssertEqual(model.scopeUnavailableReason(.selection), "Select an item first")
         XCTAssertEqual(model.scopeUnavailableReason(.block), "Select a block first")
+        var invalidations = 0
+        let observation = model.objectWillChange.sink { invalidations += 1 }
+        defer { observation.cancel() }
         h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.textID])
+        XCTAssertGreaterThan(invalidations, 0, "An idle scope menu must update when the canvas selection changes.")
         XCTAssertNil(model.scopeUnavailableReason(.selection))
         XCTAssertNotNil(model.scopeUnavailableReason(.block))
         h.session.document = nil; h.session.page = nil
@@ -119,7 +127,7 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(pending.targetRefs, [ref])
         XCTAssertTrue(try XCTUnwrap(pending.labels[ref]).localizedCaseInsensitiveContains("page 1"))
         XCTAssertTrue(try XCTUnwrap(pending.labels[ref]).contains(try XCTUnwrap(h.app.services.library?.node(Fixtures.docID)?.title)))
-        XCTAssertTrue(pending.consequences.contains("Remove 1 item."))
+        XCTAssertTrue(pending.consequences.contains("Remove 1 item."), "Unexpected approval copy: \(pending.consequences)")
         XCTAssertTrue(pending.consequences.contains("This action may delete or replace content."))
         XCTAssertFalse(pending.actionSummary.contains("refs"))
         XCTAssertFalse(pending.parameterSummary.contains("secret-value"))

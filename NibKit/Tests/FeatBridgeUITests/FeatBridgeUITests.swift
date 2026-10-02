@@ -828,6 +828,21 @@ final class FeatBridgeUITests: XCTestCase {
 
     // MARK: Pairing text
 
+    func testPairingKeepsRepositoryCommandsInDevelopmentDiagnostics() {
+        let pairing = BridgePairing(host: "192.168.1.20", port: 7331, token: "nib_test")
+        XCTAssertEqual(BridgeSnippet.pairing, [.claudeCode, .json])
+        for snippet in BridgeSnippet.pairing {
+            XCTAssertFalse(pairing.text(snippet).contains("tools/smoke"))
+        }
+        #if DEBUG
+        XCTAssertEqual(BridgeSnippet.developerDiagnostics, [.smokeShell, .smokePowerShell])
+        #else
+        XCTAssertTrue(BridgeSnippet.developerDiagnostics.isEmpty,
+                      "shipping builds must not expose repository smoke-test commands")
+        #endif
+        XCTAssertTrue(Set(BridgeSnippet.pairing).isDisjoint(with: BridgeSnippet.developerDiagnostics))
+    }
+
     func testClaudeCodeCommandAndJSONConfiguration() throws {
         let token = "nib_" + String(repeating: "Q", count: 39) + "wXyZ"
         let pairing = BridgePairing(host: "192.168.1.20", port: 7331, token: token)

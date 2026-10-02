@@ -467,7 +467,7 @@ final class CloudStatusModel {
 struct ContainerLibraryBanner: View {
     let app: NibApp
     var body: some View {
-        NibBanner(String(localized: "Your library is inside Nib. Reinstalling with another signer can delete it. Move it to a folder outside the app."),
+        NibBanner(String(localized: "Your library is stored inside Nib and may be lost if you reinstall the app. Move or copy it to a folder outside Nib."),
                   action: NibAction(CloudStatusModel.shared(app).canCopyLibrary ? String(localized: "Copy Library…") : String(localized: "Move Library…"), command: CommandIDs.libraryRelocate) {
                       let model = CloudStatusModel.shared(app)
                       model.perform(CommandIDs.libraryRelocate, params: ["copy": .bool(model.canCopyLibrary)])

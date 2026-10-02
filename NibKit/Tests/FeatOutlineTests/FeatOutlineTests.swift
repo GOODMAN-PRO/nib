@@ -624,6 +624,77 @@ final class FeatOutlineTests: XCTestCase {
 
     // MARK: Panel model
 
+    func testHiddenOutlineActionRestoresBothSourcesWithoutChangingTheDocument() async throws {
+        let h = harness()
+        let pdf = FakePDFService()
+        pdf.outlines[Fixtures.pdfAsset.name] = [PDFOutlineNode(title: "Chapter 1", pageIndex: 0)]
+        h.app.services.pdf = pdf
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        try await waitUntil { model.sections.map { $0.kind } == [.pdf, .custom] }
+        let originalSections = model.sections
+        let originalOutline = try h.app.workspace.content(doc).outline
+        try await h.run("settings.set", ["name": .string(OutlineSettings.showThumbnails.name), "value": true])
+        for key in [OutlineSettings.showPDFOutline, OutlineSettings.showCustomOutline] {
+            try await h.run("settings.set", ["name": .string(key.name), "value": false])
+        }
+        try await waitUntil { !model.showsPDF && !model.showsCustom && model.showsThumbnails }
+
+        XCTAssertTrue(model.sections.isEmpty)
+        XCTAssertEqual(model.emptyTitle, "Outline entries hidden")
+        XCTAssertEqual(model.emptyMessage, "PDF Outline and Custom Outline are both turned off in the options.")
+        let action = try XCTUnwrap(model.emptyAction)
+        XCTAssertEqual(action.title, "Show outline")
+        action.handler()
+
+        try await waitUntil { model.sections == originalSections }
+        XCTAssertTrue(h.app.settings.get(OutlineSettings.showPDFOutline))
+        XCTAssertTrue(h.app.settings.get(OutlineSettings.showCustomOutline))
+        XCTAssertTrue(model.showsThumbnails)
+        XCTAssertNil(model.prompt)
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertEqual(try h.app.workspace.content(doc).outline, originalOutline)
+    }
+
+    func testHiddenOutlineCanBeShownWithoutACurrentPage() async throws {
+        let h = harness()
+        h.session.page = nil
+        for key in [OutlineSettings.showPDFOutline, OutlineSettings.showCustomOutline] {
+            try await h.run("settings.set", ["name": .string(key.name), "value": false])
+        }
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        XCTAssertFalse(model.canAdd)
+        XCTAssertEqual(model.emptyTitle, "Outline entries hidden")
+        let action = try XCTUnwrap(model.emptyAction)
+        XCTAssertEqual(action.title, "Show outline")
+        action.handler()
+        try await waitUntil { model.showsPDF && model.showsCustom && !model.sections.isEmpty }
+        XCTAssertNil(model.prompt)
+        XCTAssertNil(h.session.page)
+    }
+
+    func testEmptyOutlineKeepsAddEntryWhenASourceIsVisible() async throws {
+        let h = harness()
+        try await h.run("outline.delete", ["entry": entryRef(Fixtures.outlineID)])
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        for (pdf, custom) in [(true, true), (true, false), (false, true)] {
+            try await h.run("settings.set", ["name": .string(OutlineSettings.showPDFOutline.name), "value": .bool(pdf)])
+            try await h.run("settings.set", ["name": .string(OutlineSettings.showCustomOutline.name), "value": .bool(custom)])
+            try await waitUntil { model.showsPDF == pdf && model.showsCustom == custom }
+            XCTAssertTrue(model.sections.isEmpty)
+            XCTAssertEqual(model.emptyTitle, "No outline yet")
+            XCTAssertEqual(model.emptyMessage, "Entries take you straight back to a page.")
+            let action = try XCTUnwrap(model.emptyAction)
+            XCTAssertEqual(action.title, "Add entry")
+            action.handler()
+            XCTAssertEqual(model.prompt, .add(Fixtures.page1))
+            model.cancelPrompt()
+        }
+        h.session.page = nil
+        try await waitUntil { !model.canAdd }
+        XCTAssertNil(model.emptyAction)
+        XCTAssertNil(model.emptyMessage)
+    }
+
     func testPanelModelLoadsThePDFOutlineAndFollowsCommits() async throws {
         let h = harness()
         let pdf = FakePDFService()

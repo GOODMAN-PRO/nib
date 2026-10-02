@@ -170,6 +170,7 @@ final class ChatViewModel: ObservableObject {
     @Published var needsImagePicker = false
     @Published var retryPrompt: String?
     private var generation: UUID?
+    private var sessionObservation: AnyCancellable?
     var turnToken: UUID? { generation }
     @Published private(set) var isLoadingChat = false
     private var loadToken: UUID?
@@ -187,6 +188,8 @@ final class ChatViewModel: ObservableObject {
         }
         refreshContextLabel()
         refreshProviderLabel()
+        // Scope-menu prerequisites follow the canvas selection even when the conversation is idle.
+        sessionObservation = session?.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
     }
 
     static func tokenKey(_ chat: String) -> SettingKey<Int> { SettingKey("aichat.tokens." + chat, default: 0) }

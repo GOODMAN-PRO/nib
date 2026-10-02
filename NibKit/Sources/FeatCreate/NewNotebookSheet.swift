@@ -610,12 +610,32 @@ struct TemplateOption: Identifiable, Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
+enum CustomDimension: Hashable {
+    case width, height
+}
+
 @MainActor
 final class NewNotebookModel: ObservableObject {
     @Published var draft: NotebookDraft
     @Published var group: String
     @Published private(set) var isWorking = false
     @Published private(set) var message: String?
+    @Published private(set) var invalidDimension: CustomDimension?
+
+    /// Validation stays beside the size fields; command failures stay beside Create.
+    var actionMessage: String? { invalidDimension == nil ? message : nil }
+    var dimensionMessage: String? { invalidDimension == nil ? nil : message }
+    var createActionTitle: String {
+        isWorking ? String(localized: "Creating…") : draft.kind.createTitle
+    }
+    var firstInvalidDimension: CustomDimension? {
+        guard draft.kind == .notebook, draft.size.isCustom else { return nil }
+        for (field, value) in [(CustomDimension.width, customWidth), (.height, customHeight)] {
+            let points = PageSizeChoice.points(value)
+            if !points.isFinite || !PageSizeChoice.customRange.contains(points) { return field }
+        }
+        return nil
+    }
     /// Custom size fields, in millimetres (portrait).
     @Published var customWidth: Double
     @Published var customHeight: Double
@@ -732,6 +752,10 @@ final class NewNotebookModel: ObservableObject {
         set {
             if let name = newValue, let preset = PageSizeChoice.presets.first(where: { $0.name == name }) {
                 draft.size = preset
+                if invalidDimension != nil {
+                    invalidDimension = nil
+                    message = nil
+                }
             } else {
                 applyCustomSize()
             }
@@ -743,6 +767,10 @@ final class NewNotebookModel: ObservableObject {
         let w = min(max(PageSizeChoice.points(customWidth), range.lowerBound), range.upperBound)
         let h = min(max(PageSizeChoice.points(customHeight), range.lowerBound), range.upperBound)
         draft.size = PageSizeChoice(name: nil, size: PageSizeChoice.portrait(PageSize(w, h)))
+        if invalidDimension != nil {
+            invalidDimension = firstInvalidDimension
+            if invalidDimension == nil { message = nil }
+        }
     }
 
     /// The full template picker (F045, `template.choose {kind: paper, size, color?}` → {background, size}): its choice
@@ -790,12 +818,10 @@ final class NewNotebookModel: ObservableObject {
         guard !isWorking else { return false }
         // The preview may clamp while the user edits, but creation must validate the entered
         // dimensions, not silently create a different page from a zero/negative value.
-        if draft.kind == .notebook && draft.size.isCustom {
-            let dimensions = [customWidth, customHeight].map(PageSizeChoice.points)
-            guard dimensions.allSatisfy({ $0.isFinite && PageSizeChoice.customRange.contains($0) }) else {
-                message = String(localized: "Enter a width and height between 25.4 and 5080 millimetres.")
-                return false
-            }
+        invalidDimension = firstInvalidDimension
+        if invalidDimension != nil {
+            message = String(localized: "Enter a width and height between 25.4 and 5080 millimetres.")
+            return false
         }
         isWorking = true
         message = nil
@@ -983,6 +1009,7 @@ struct NewNotebookSheet: View {
     @State private var windowSize: CGSize?
     @Environment(\.dynamicTypeSize) private var typeSize
     @FocusState private var titleFocused: Bool
+    @FocusState private var focusedDimension: CustomDimension?
 
     init(app: NibApp, folder: FolderID?, kind: NewDocumentKind, session: EditorSession?, navigator: SceneNavigator?,
          onDone: @escaping () -> Void) {
@@ -1015,21 +1042,30 @@ struct NewNotebookSheet: View {
 
     private var sheetContent: some View {
         VStack(spacing: 0) {
-            NibSheetHeader(draft.kind.sheetTitle, primaryTitle: compact ? nil : String(localized: "Create"),
-                           isPrimaryEnabled: !model.isWorking, onCancel: onDone, onPrimary: create, primaryCommand: "doc.create")
+            NibSheetHeader(draft.kind.sheetTitle, primaryTitle: compact ? nil : (model.isWorking ? String(localized: "Creating…") : String(localized: "Create")),
+                           isPrimaryEnabled: !model.isWorking,
+                           onCancel: { if !model.isWorking { onDone() } }, onPrimary: create, primaryCommand: "doc.create")
+                .disabled(model.isWorking)
                 // The shared header supplies 20 pt; align its phone content to the scroll view's 16 pt margin.
                 .padding(.horizontal, contentInset - NibSpacing.xl)
+            if !compact, let message = model.actionMessage {
+                NibBanner(message, style: .warning)
+                    .padding(.horizontal, contentInset)
+                    .padding(.bottom, NibSpacing.s)
+            }
             if draft.kind == .notebook {
                 NewNotebookFormViewport(contentInset: contentInset) {
                     VStack(alignment: .leading, spacing: NibSpacing.xl) {
                         formHeading
                         coverSection
                     }
+                    .disabled(model.isWorking)
                 } paper: {
                     VStack(alignment: .leading, spacing: NibSpacing.xl) {
                         paperSection
                         optionsSection
                     }
+                    .disabled(model.isWorking)
                 }
             } else {
                 ScrollView {
@@ -1037,6 +1073,7 @@ struct NewNotebookSheet: View {
                         formHeading
                         if draft.kind == .whiteboard { boardSection }
                     }
+                    .disabled(model.isWorking)
                     .padding(.vertical, NibSpacing.xl)
                 }
                 .contentMargins(.horizontal, contentInset, for: .scrollContent)
@@ -1045,12 +1082,17 @@ struct NewNotebookSheet: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if compact {
-                NibButton(draft.kind.createTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: create)
-                    .accessibilityIdentifier("cmd.doc.create")
-                    .disabled(model.isWorking)
-                    .padding(.horizontal, NibSpacing.l)
-                    .padding(.vertical, NibSpacing.s)
-                    .background(NibColor.backgroundSecondary)
+                VStack(spacing: NibSpacing.s) {
+                    if let message = model.actionMessage {
+                        NibBanner(message, style: .warning)
+                    }
+                    NibButton(model.createActionTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: create)
+                        .accessibilityIdentifier("cmd.doc.create")
+                        .disabled(model.isWorking)
+                }
+                .padding(.horizontal, NibSpacing.l)
+                .padding(.vertical, NibSpacing.s)
+                .background(NibColor.backgroundSecondary)
             }
         }
         .background(NibColor.backgroundSecondary)
@@ -1071,6 +1113,10 @@ struct NewNotebookSheet: View {
                 await model.dismissPresentation()
                 onDone()
             }
+            if let field = model.invalidDimension {
+                titleFocused = false
+                focusedDimension = field
+            }
         }
     }
 
@@ -1078,9 +1124,6 @@ struct NewNotebookSheet: View {
 
     @ViewBuilder
     private var formHeading: some View {
-        if let message = model.message {
-            NibBanner(message, style: .warning)
-        }
         kindPicker
         titleRow
     }
@@ -1147,11 +1190,14 @@ struct NewNotebookSheet: View {
                 .padding(NibStroke.ring + NibStroke.ringOutset)
             }
             if draft.hasCover && model.coverTakesColour {
-                NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
-                              selection: Binding(get: { model.draft.cloth?.rawValue },
-                                                 set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
-                              columns: swatchColumns(count: NibCoverCloth.allCases.count + 1),
-                              noneLabel: String(localized: "Cover's own colour"))
+                NibInspectorSection(String(localized: "Cover colour")) {
+                    NibChip(String(localized: "Use cover's colour"), style: .filter(isSelected: draft.cloth == nil),
+                            action: { model.selectCloth(nil) })
+                    NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
+                                  selection: Binding(get: { model.draft.cloth?.rawValue },
+                                                     set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
+                                  columns: swatchColumns(count: NibCoverCloth.allCases.count))
+                }
             }
         }
     }
@@ -1278,21 +1324,26 @@ struct NewNotebookSheet: View {
         return min(count, max(1, Int((width - contentInset * 2) / NibMetrics.hitTarget)))
     }
 
+    @ViewBuilder
     private var customSizeFields: some View {
         HStack(spacing: NibSpacing.s) {
-            millimetreField(String(localized: "Width"), value: $model.customWidth)
+            millimetreField(String(localized: "Width"), field: .width, value: $model.customWidth)
             Text(String(localized: "by"))
                 .font(NibFont.footnote)
                 .foregroundStyle(NibColor.labelSecondary)
-            millimetreField(String(localized: "Height"), value: $model.customHeight)
+            millimetreField(String(localized: "Height"), field: .height, value: $model.customHeight)
             Text(String(localized: "mm"))
                 .font(NibFont.footnote)
                 .foregroundStyle(NibColor.labelSecondary)
         }
+        if let message = model.dimensionMessage {
+            NibBanner(message, style: .warning)
+        }
     }
 
-    private func millimetreField(_ label: String, value: Binding<Double>) -> some View {
+    private func millimetreField(_ label: String, field: CustomDimension, value: Binding<Double>) -> some View {
         TextField(label, value: value, format: .number.precision(.fractionLength(0...1)))
+            .focused($focusedDimension, equals: field)
             .keyboardType(.decimalPad)
             .font(NibFont.body)
             .multilineTextAlignment(.trailing)

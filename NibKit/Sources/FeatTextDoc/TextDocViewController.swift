@@ -1,4 +1,5 @@
 import UIKit
+import SwiftUI
 import Combine
 import ImageIO
 import PhotosUI
@@ -46,6 +47,16 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     /// Blocks whose local text is newer than the model: block.update calls in flight, per block.
     private var pendingText: [NibID: Int] = [:]
     private let emptyLabel = UILabel()
+    private(set) var contentLoadFailed = false
+    private lazy var loadFailureView: UIView = {
+        let notice = UIHostingConfiguration {
+            NibBanner(String(localized: "Couldn't load this document. Retry to load its content."),
+                      action: NibAction(String(localized: "Retry")) { [weak self] in self?.retryDocumentLoad() })
+        }.margins(.all, NibSpacing.l).makeContentView()
+        notice.accessibilityIdentifier = "textdoc.loadError"
+        notice.isHidden = true
+        return notice
+    }()
 
     private let imageCache = NSCache<NSString, UIImage>()
     private var aspects: [String: CGFloat] = [:]
@@ -138,13 +149,16 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         cv.contentInset.top = NibMetrics.barTopGap + NibMetrics.barHeight
         cv.delegate = self
         cv.accessibilityLabel = String(localized: "Text document")
-        view.addSubview(cv)
+        let editorStack = UIStackView(arrangedSubviews: [cv, loadFailureView])
+        editorStack.axis = .vertical
+        editorStack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(editorStack)
         view.keyboardLayoutGuide.usesBottomSafeArea = false
         NSLayoutConstraint.activate([
-            cv.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            cv.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            cv.topAnchor.constraint(equalTo: view.topAnchor),
-            cv.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor)
+            editorStack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            editorStack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            editorStack.topAnchor.constraint(equalTo: view.topAnchor),
+            editorStack.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor)
         ])
 
         // Taps below the last block continue the document there.
@@ -228,11 +242,21 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     private func reloadFromModel(usingReloadData: Bool) {
         guard let content = try? app.workspace.content(documentID) else {
             log.error("text document \(self.documentID.raw, privacy: .public) could not be loaded")
+            contentLoadFailed = true
+            loadFailureView.isHidden = false
+            emptyLabel.isHidden = true
             return
         }
+        contentLoadFailed = false
+        loadFailureView.isHidden = true
         // A commit that lands while newer keystrokes are still queued must not roll the text view back.
         let live = BlockOverlay.keepLocalText(content.liveBlocks, local: byID, pending: Set(pendingText.keys))
         applyBlocks(live, usingReloadData: usingReloadData)
+    }
+
+    func retryDocumentLoad() {
+        // Reconfigure in place so the caret, displayed content and queued local edits survive a retry.
+        reloadFromModel(usingReloadData: false)
     }
 
     /// Diffs `newBlocks` against what is on screen and applies it without animation (typing, undo and remote edits
@@ -256,7 +280,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
             }
         }
         pruneCaches()
-        emptyLabel.isHidden = !blocks.isEmpty
+        emptyLabel.isHidden = contentLoadFailed || !blocks.isEmpty
     }
 
     func reloadAll() {
@@ -807,22 +831,42 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 
     private func askForVideoLink(_ id: NibID) {
         guard !isReadOnly else { return }
+        present(makeVideoLinkAlert(for: id), animated: true)
+    }
+
+    func makeVideoLinkAlert(for id: NibID) -> UIAlertController {
         let alert = UIAlertController(title: String(localized: "Video Link"),
-                                      message: String(localized: "Paste the address of the video."), preferredStyle: .alert)
+                                      message: nil, preferredStyle: .alert)
         alert.addTextField { field in
             field.keyboardType = .URL
             field.autocapitalizationType = .none
             field.autocorrectionType = .no
             field.placeholder = "https://"
+            field.accessibilityLabel = String(localized: "Video URL")
             field.text = self.byID[id]?.url
         }
         alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel))
-        alert.addAction(UIAlertAction(title: String(localized: "Add Link"), style: .default) { [weak self, weak alert] _ in
-            guard let self = self, let text = alert?.textFields?.first?.text, !text.isEmpty else { return }
-            let params = BlockUpdate.Params(ref: self.blockRef(id), url: text)
+        let add = UIAlertAction(title: String(localized: "Add Link"), style: .default) { [weak self, weak alert] _ in
+            guard let self = self, let text = alert?.textFields?.first?.text,
+                  let url = BlockMedia.webURL(text) else { return }
+            let params = BlockUpdate.Params(ref: self.blockRef(id), url: url.absoluteString)
             self.enqueue { await self.execute(BlockUpdate.self, params, group: NibID.make().raw) }
-        })
-        present(alert, animated: true)
+        }
+        alert.addAction(add)
+        let validate = { [weak alert, weak add] in
+            guard let alert = alert, let field = alert.textFields?.first else { return }
+            let text = (field.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let valid = BlockMedia.webURL(text) != nil
+            add?.isEnabled = valid
+            let message = text.isEmpty || valid
+                ? String(localized: "Paste a video page or file URL starting with https:// or http://.")
+                : String(localized: "Enter a complete video URL starting with https:// or http://, including the website address.")
+            alert.message = message
+            field.accessibilityHint = message
+        }
+        alert.textFields?.first?.addAction(UIAction { _ in validate() }, for: .editingChanged)
+        validate()
+        return alert
     }
 
     private static func temporaryFile(_ ext: String) -> URL {

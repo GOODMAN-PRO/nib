@@ -59,6 +59,73 @@ private final class DeferredDismissalController: UIViewController {
 
 @MainActor
 final class FeatCreateTests: XCTestCase {
+    func testCustomDimensionErrorsIdentifyFirstFieldAndClearAfterCorrection() async {
+        let h = harness()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.sizeSelection = nil
+        model.customWidth = 0
+        model.customHeight = 6000
+        model.applyCustomSize()
+        XCTAssertNil(model.dimensionMessage, "Do not show validation before Create")
+
+        let created = await model.create()
+        XCTAssertFalse(created)
+        XCTAssertEqual(model.invalidDimension, .width)
+        XCTAssertNotNil(model.dimensionMessage)
+        XCTAssertNil(model.actionMessage, "Size errors belong beside the fields")
+
+        model.customWidth = 100
+        model.applyCustomSize()
+        XCTAssertEqual(model.invalidDimension, .height)
+        XCTAssertNotNil(model.dimensionMessage)
+        model.customHeight = 150
+        model.applyCustomSize()
+        XCTAssertNil(model.invalidDimension)
+        XCTAssertNil(model.dimensionMessage)
+        XCTAssertNil(model.actionMessage)
+
+        model.customHeight = 0
+        model.applyCustomSize()
+        let invalid = await model.create()
+        XCTAssertFalse(invalid)
+        model.sizeSelection = "A4"
+        XCTAssertNil(model.invalidDimension)
+        XCTAssertNil(model.dimensionMessage, "A preset removes the custom-size error")
+        XCTAssertNil(model.actionMessage)
+    }
+
+    func testCreationProgressAndPinnedFailureRecoverForRetry() async {
+        let h = harness()
+        let log = CallLog()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Progress"
+        model.draft.hasCover = false
+        stub(h, "doc.create", log: log) { _ in
+            XCTAssertTrue(model.isWorking, "The form and Cancel must stay disabled during creation")
+            XCTAssertEqual(model.createActionTitle, String(localized: "Creating…"))
+            XCTAssertNil(model.actionMessage)
+            let duplicate = await model.create()
+            XCTAssertFalse(duplicate, "Repeated Create must not start another operation")
+            throw NibError(.internalError, "disk full")
+        }
+        let failed = await model.create()
+        XCTAssertFalse(failed)
+        XCTAssertEqual(log.count("doc.create"), 1)
+        XCTAssertFalse(model.isWorking)
+        XCTAssertEqual(model.createActionTitle, NewDocumentKind.notebook.createTitle)
+        XCTAssertTrue(model.actionMessage?.contains("disk full") ?? false)
+        XCTAssertNil(model.dimensionMessage, "Creation failures belong beside the pinned action")
+
+        stubDocCreate(h, log: log)
+        let retried = await model.create {
+            XCTAssertTrue(model.isWorking, "Keep controls disabled through the existing dismiss/open handoff")
+            XCTAssertNil(model.actionMessage)
+        }
+        XCTAssertTrue(retried)
+        XCTAssertFalse(model.isWorking)
+        XCTAssertNil(model.actionMessage)
+    }
+
     func testSavedMinimumCustomSizeRetainsFractionalMillimetres() async throws {
         let h = harness()
         h.app.settings.set(NibSettings.defaultPageSize, PageSize(72, 144))

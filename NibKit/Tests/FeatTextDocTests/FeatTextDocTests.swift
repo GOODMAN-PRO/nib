@@ -123,6 +123,138 @@ final class FeatTextDocTests: XCTestCase {
 
     // MARK: Registration and conformance
 
+    func testImageFailureRetryAndLateCompletionsKeepTheCurrentBlock() throws {
+        let host = StubCellHost()
+        host.deferImages = true
+        let cell = BlockCell(frame: CGRect(x: 0, y: 0, width: 320, height: 200))
+        cell.host = host
+        var image = TextBlock(id: "IMAGESTATE1", kind: .image, text: .empty, order: "a")
+        image.asset = AssetRef("missing.png")
+        image.caption = RichText(plain: "My caption")
+        var env = environment(.image)
+        env.readOnly = true
+        cell.configure(image, environment: env)
+        XCTAssertEqual(cell.imageLoadState, .loading)
+        XCTAssertEqual(host.imageCompletions.count, 1)
+        host.imageCompletions[0](nil)
+        XCTAssertEqual(cell.imageLoadState, .unavailable)
+        XCTAssertEqual(cell.captionView.text, "My caption")
+
+        cell.retryImageLoad()
+        XCTAssertEqual(cell.imageLoadState, .loading)
+        let decoded = try XCTUnwrap(UIImage(data: Fixtures.pngData))
+        host.imageCompletions[1](decoded)
+        XCTAssertEqual(cell.imageLoadState, .loaded)
+        host.imageCompletions[0](nil)
+        XCTAssertEqual(cell.imageLoadState, .loaded, "an older failure cannot overwrite a successful retry")
+        XCTAssertEqual(cell.block, image, "retry also works read-only without editing the block")
+
+        cell.retryImageLoad()
+        cell.prepareForReuse()
+        host.imageCompletions[2](nil)
+        XCTAssertNil(cell.imageLoadState)
+        cell.configure(image, environment: env)
+        let text = TextBlock(id: "TEXTSTATE1", kind: .paragraph, text: RichText(plain: "Notes"), order: "b")
+        cell.configure(text, environment: environment(.paragraph))
+        host.imageCompletions[3](decoded)
+        XCTAssertNil(cell.imageLoadState)
+        XCTAssertEqual(cell.textView.text, "Notes")
+    }
+
+    func testMissingAndUndecodableImagesShowFailureAndRecoverWhenRetried() async throws {
+        let h = harness()
+        let editor = openEditor(h)
+        let cell = BlockCell()
+        cell.host = editor
+        var image = TextBlock(id: "BADIMAGE1", kind: .image, text: .empty, order: "a")
+        image.asset = AssetRef("unavailable.png")
+        cell.configure(image, environment: environment(.image))
+        try await waitUntil("missing image failure") { cell.imageLoadState == .unavailable }
+        h.assets.install(Data("not an image".utf8), as: try XCTUnwrap(image.asset), doc: doc)
+        cell.retryImageLoad()
+        try await waitUntil("undecodable image failure") { cell.imageLoadState == .unavailable }
+        h.assets.install(Fixtures.pngData, as: try XCTUnwrap(image.asset), doc: doc)
+        cell.retryImageLoad()
+        try await waitUntil("image retry recovery") { cell.imageLoadState == .loaded }
+    }
+
+    func testInitialDocumentLoadFailureShowsRetryAndRecovers() throws {
+        let h = harness()
+        let saved = try h.app.workspace.content(doc)
+        h.app.workspace.close(doc)
+        h.persistence.heads[doc] = nil
+        let editor = openEditor(h)
+        XCTAssertTrue(editor.contentLoadFailed)
+        XCTAssertTrue(editor.blocks.isEmpty)
+        let notice = try XCTUnwrap(editor.view.subviews.compactMap { $0 as? UIStackView }.first?.arrangedSubviews.last)
+        XCTAssertFalse(notice.isHidden)
+        XCTAssertEqual(notice.accessibilityIdentifier, "textdoc.loadError")
+        editor.retryDocumentLoad()
+        XCTAssertTrue(editor.contentLoadFailed)
+        h.persistence.heads[doc] = saved
+        editor.retryDocumentLoad()
+        XCTAssertFalse(editor.contentLoadFailed)
+        XCTAssertTrue(notice.isHidden)
+        XCTAssertEqual(editor.blocks, saved.liveBlocks)
+    }
+
+    func testDocumentFailureAndRetryPreservePendingTextAndCaptionEdits() async throws {
+        let h = harness()
+        try await h.run("block.insert", ["doc": .string(NodeRef.document(doc).description), "kind": "image", "id": "CAPTIONRETRY1"])
+        let editor = openEditor(h)
+        let body = BlockTextView()
+        body.blockID = Fixtures.paragraphBlockID
+        body.role = .body
+        body.style = BlockStyle.make(kind: .paragraph)
+        body.attributedText = body.style?.attributed(RichText(plain: "Pending notes"))
+        editor.textViewDidChange(body)
+        let caption = BlockTextView()
+        caption.blockID = NibID("CAPTIONRETRY1")
+        caption.role = .caption
+        caption.style = BlockStyle.make(kind: .image, caption: true)
+        caption.attributedText = caption.style?.attributed(RichText(plain: "Pending caption"))
+        editor.textViewDidChange(caption)
+        let displayed = editor.blocks
+        let saved = try h.app.workspace.content(doc)
+        h.app.workspace.close(doc)
+        h.persistence.heads[doc] = nil
+        editor.reloadAll()
+        XCTAssertTrue(editor.contentLoadFailed)
+        XCTAssertEqual(editor.blocks, displayed)
+        h.persistence.heads[doc] = saved
+        editor.retryDocumentLoad()
+        XCTAssertFalse(editor.contentLoadFailed)
+        XCTAssertEqual(editor.blocks, displayed, "retry must overlay local edits still waiting to commit")
+        await editor.flushEdits()
+        XCTAssertEqual(try block(h, Fixtures.paragraphBlockID.raw).text.plainText, "Pending notes")
+        XCTAssertEqual(try block(h, "CAPTIONRETRY1").caption?.plainText, "Pending caption")
+    }
+
+    func testVideoLinkAlertValidatesWithoutDismissingOrLosingInput() throws {
+        let editor = openEditor(harness())
+        let alert = editor.makeVideoLinkAlert(for: Fixtures.paragraphBlockID)
+        let field = try XCTUnwrap(alert.textFields?.first)
+        let add = try XCTUnwrap(alert.actions.first { $0.title == "Add Link" })
+        XCTAssertFalse(add.isEnabled)
+        for input in ["", "   ", "example.com/video", "https://", "file:///video.mp4", "javascript:alert(1)"] {
+            field.text = input
+            field.sendActions(for: .editingChanged)
+            XCTAssertFalse(add.isEnabled, input)
+            XCTAssertEqual(field.text, input)
+            XCTAssertTrue(try XCTUnwrap(alert.message).contains("https:// or http://"))
+            XCTAssertEqual(field.accessibilityHint, alert.message)
+        }
+        XCTAssertTrue(try XCTUnwrap(alert.message).contains("including the website address"))
+        for input in ["https://example.com/video", "http://example.com/lecture.mp4", "  https://example.com/watch?v=1  "] {
+            field.text = input
+            field.sendActions(for: .editingChanged)
+            XCTAssertTrue(add.isEnabled, input)
+        }
+        field.text = ""
+        field.sendActions(for: .editingChanged)
+        XCTAssertFalse(add.isEnabled, "clearing a valid URL disables Add again")
+    }
+
     func testConformance() async {
         let problems = await CommandConformance.check(features: [FeatTextDocFeature.self])
         XCTAssertEqual(problems, [])
@@ -984,9 +1116,13 @@ final class FeatTextDocTests: XCTestCase {
 @MainActor
 private final class StubCellHost: BlockCellHost {
     let tableView = UIView()
+    var deferImages = false
+    var imageCompletions: [(UIImage?) -> Void] = []
     var documentID: DocumentID { Fixtures.textDocID }
     var assetStore: AssetStore? { nil }
-    func loadImage(_ asset: AssetRef, maxPixel: CGFloat, completion: @escaping (UIImage?) -> Void) { completion(nil) }
+    func loadImage(_ asset: AssetRef, maxPixel: CGFloat, completion: @escaping (UIImage?) -> Void) {
+        if deferImages { imageCompletions.append(completion) } else { completion(nil) }
+    }
     func cachedAspect(_ asset: AssetRef) -> CGFloat? { nil }
     func linkMetadata(for url: URL, completion: @escaping (LPLinkMetadata) -> Void) -> LPLinkMetadata? { nil }
     func embeddedView(for block: TextBlock) -> UIView? { block.kind == .table ? tableView : nil }

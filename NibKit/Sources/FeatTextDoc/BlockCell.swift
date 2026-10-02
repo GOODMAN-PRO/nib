@@ -1,4 +1,5 @@
 import UIKit
+import SwiftUI
 import LinkPresentation
 import NibContracts
 import NibDesign
@@ -446,6 +447,9 @@ final class BlockCell: UICollectionViewCell {
     private var checkboxCenterY: NSLayoutConstraint!
     private var mediaHeight: NSLayoutConstraint!
     private var imageAspect: NSLayoutConstraint?
+    enum ImageLoadState { case loading, unavailable, loaded }
+    private(set) var imageLoadState: ImageLoadState?
+    private var imageRequest = UUID()
 
     private lazy var imageView: UIImageView = {
         let v = UIImageView()
@@ -751,21 +755,17 @@ final class BlockCell: UICollectionViewCell {
     }
 
     private func configureMedia(_ block: TextBlock, previous: TextBlock?, env: Environment) {
+        imageRequest = UUID()
+        imageLoadState = nil
         switch block.kind {
         case .divider:
             setMediaContent(hairlineBox, height: NibSpacing.xxl)
         case .image:
             if let asset = block.asset {
-                setMediaContent(imageView, height: nil)
                 imageView.accessibilityLabel = block.caption.map { $0.plainText } ?? String(localized: "Image")
                 if previous?.asset != asset || previous?.id != block.id { imageView.image = nil }
                 setImageAspect(host?.cachedAspect(asset) ?? TextDocMetrics.defaultImageAspect)
-                let maxPixel = max(bounds.width, TextDocMetrics.columnWidth) * max(traitCollection.displayScale, 1)
-                host?.loadImage(asset, maxPixel: maxPixel) { [weak self] image in
-                    guard let self = self, self.block?.asset == asset, let image = image else { return }
-                    self.imageView.image = image
-                    if image.size.width > 0 { self.setImageAspect(image.size.height / image.size.width) }
-                }
+                retryImageLoad()
             } else {
                 showAddButton(title: String(localized: "Add Image"), symbol: .image, readOnly: env.readOnly, isImage: true)
             }
@@ -798,6 +798,49 @@ final class BlockCell: UICollectionViewCell {
         default:
             setMediaContent(nil, height: nil)
         }
+    }
+
+    /// Retry reads the same asset; it never replaces the block or its caption, including in read-only documents.
+    func retryImageLoad() {
+        guard let block = block, block.kind == .image, let asset = block.asset else { return }
+        let request = UUID()
+        imageRequest = request
+        imageLoadState = .loading
+        if imageView.image == nil {
+            showImageStatus(String(localized: "Loading image…"), failed: false)
+        } else {
+            setMediaContent(imageView, height: nil)
+        }
+        let complete: (UIImage?) -> Void = { [weak self] image in
+            guard let self = self, self.imageRequest == request,
+                  self.block?.id == block.id, self.block?.kind == .image, self.block?.asset == asset else { return }
+            guard let image = image else {
+                self.imageView.image = nil
+                self.imageLoadState = .unavailable
+                self.showImageStatus(String(localized: "Image unavailable. Retry loading the image."), failed: true)
+                return
+            }
+            self.imageLoadState = .loaded
+            self.imageView.image = image
+            if image.size.width > 0 { self.setImageAspect(image.size.height / image.size.width) }
+            self.setMediaContent(self.imageView, height: nil)
+        }
+        let maxPixel = max(bounds.width, TextDocMetrics.columnWidth) * max(traitCollection.displayScale, 1)
+        if let host = host { host.loadImage(asset, maxPixel: maxPixel, completion: complete) }
+        else { complete(nil) }
+    }
+
+    private func showImageStatus(_ message: String, failed: Bool) {
+        let action: NibAction? = failed ? NibAction(String(localized: "Retry")) { [weak self] in
+            self?.retryImageLoad()
+        } : nil
+        let status = UIHostingConfiguration {
+            NibBanner(message, style: failed ? .warning : .info, symbol: failed ? .warningTriangle : .image,
+                      action: action)
+                .frame(minHeight: TextDocMetrics.placeholderHeight)
+        }.margins(.all, 0).makeContentView()
+        status.accessibilityIdentifier = failed ? "textdoc.image.unavailable" : "textdoc.image.loading"
+        setMediaContent(status, height: nil)
     }
 
     private func showAddButton(title: String, symbol: NibSymbol, readOnly: Bool, isImage: Bool) {
@@ -901,6 +944,8 @@ final class BlockCell: UICollectionViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
+        imageRequest = UUID()
+        imageLoadState = nil
         isHovered = false
         aiButton.isHidden = true
         var c = aiButton.configuration
