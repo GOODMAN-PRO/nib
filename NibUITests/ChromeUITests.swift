@@ -62,7 +62,9 @@ final class ChromeUITests: XCTestCase {
         let q = query(name)
         _ = try require(name)
         for _ in 0..<12 {
-            if let target = q.allElementsBoundByIndex.first(where: { $0.isHittable && $0.isEnabled }) { return target }
+            let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
+            if let button = candidates.first(where: { $0.elementType == .button && !$0.identifier.hasPrefix("tool.") }) { return button }
+            if let target = candidates.first { return target }
             let containers = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
             guard let scroller = containers.first(where: {
                 $0.identifier != "nib.canvas" && $0.isHittable && $0.descendants(matching: .any)
@@ -152,7 +154,7 @@ final class ChromeUITests: XCTestCase {
     func testTitleMoveActuallyMovesNoteAndPreservesContent() throws {
         try open(); let before = try ui.state()
         try menu("title", "Move to Folder"); try panel("chrome.move")
-        try tap("Semester Notes"); try tap("Move Here")
+        try tap("Semester Notes")
         try panel("chrome.move", shown: false)
         try sameContent(before, history: false)
         try ui.tapCommand("window.showLibrary"); try tap("Semester Notes")
@@ -162,10 +164,13 @@ final class ChromeUITests: XCTestCase {
     func testTitleRecognitionLanguageAppliesAndReopens() throws {
         try open(); let before = try ui.state()
         try menu("title", "Recognition Language")
-        try tap("English")
+        let english = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'English'")).firstMatch
+        XCTAssertTrue(english.waitForExistence(timeout: 10)); let label = english.label; english.tap()
+        try wait("Recognition language must save its selection") { english.isSelected }
         try ui.dismissSheets()
         try menu("title", "Recognition Language")
-        XCTAssertTrue(try require("English").isSelected, "Recognition language must retain the chosen English language")
+        XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch.isSelected,
+                      "Recognition language must retain the chosen English language")
         try ui.dismissSheets(); try sameContent(before, history: false)
     }
 
@@ -181,7 +186,7 @@ final class ChromeUITests: XCTestCase {
 
     func testAddPageMenuAddsExactlyOnePageAndUndoRedo() throws {
         try open(); let before = try ui.state()
-        try menu("addPage", "Add Page After")
+        try menu("addPage", "Current Template")
         _ = try ui.waitForState { $0.pageCount == before.pageCount + 1 }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.pageCount == before.pageCount }
@@ -191,7 +196,7 @@ final class ChromeUITests: XCTestCase {
 
     func testShareExportOpensCorrectSheetAndCancelIsInert() throws {
         try open(); let before = try ui.state()
-        try menu("share", "Export All")
+        try menu("share", "Export all…")
         _ = try ui.waitForState { !$0.openPanels.isEmpty }
         _ = try require("PDF")
         try ui.dismissSheets(); try sameContent(before)
@@ -199,7 +204,7 @@ final class ChromeUITests: XCTestCase {
 
     func testMenusOutsideDismissWithoutInkOrHistoryChanges() throws {
         try open(); let before = try ui.state()
-        for (id, row) in [("title", "Rename"), ("addPage", "Add Page After"), ("share", "Export All"), ("more", "Document Editing Settings")] {
+        for (id, row) in [("title", "Rename"), ("addPage", "Current Template"), ("share", "Export all…"), ("more", "Document Editing Settings")] {
             try tap("menu." + id); _ = try reachable(row)
             outside()
             try wait("Outside tap must close \(id)") { !self.query(row).allElementsBoundByIndex.contains { $0.isHittable } }
@@ -237,7 +242,7 @@ final class ChromeUITests: XCTestCase {
     func testRegisteredSidebarPanelsAndCloseButton() throws {
         try open(); let before = try ui.state()
         try ui.tapCommand("sidebar.toggle")
-        for (title, id) in [("Pages", "pages.sidebar"), ("Outline", "outline"), ("Bookmarks", "bookmarks"), ("History", "undo.history")] {
+        for (title, id) in [("Pages", "sidebar.pages"), ("Outline", "outline.tab"), ("Bookmarks", "outline.bookmarks"), ("History", "undo.history")] {
             try tap("Panel Options"); try tap(title); try panel(id)
             _ = try require(title)
         }
@@ -278,7 +283,7 @@ final class ChromeUITests: XCTestCase {
     // chrome.options; chrome.moreTools; chrome.scrubTools
     func testToolSettingsSwitchReplacesPopoverAndInkToolsActuallyDraw() throws {
         try open()
-        for (tool, option) in [("pen", "Fountain"), ("highlighter", "Straight Line"), ("eraser", "Whole Stroke")] {
+        for (tool, option) in [("pen", "Fountain Pen"), ("highlighter", "Straight line"), ("eraser", "Whole stroke")] {
             try settings(tool); _ = try require(option)
             XCTAssertEqual(query("menu.toolSettings").count, 1, "Only the active tool may own the settings trigger")
             outside()
@@ -287,15 +292,15 @@ final class ChromeUITests: XCTestCase {
         try settings("pen")
         try tap("tool.highlighter")
         _ = try ui.waitForState { $0.tool == "highlighter" }
-        XCTAssertFalse(query("Fountain").firstMatch.exists, "Switching tools must dismiss the old settings popover")
-        try tap("menu.toolSettings"); _ = try require("Straight Line")
-        XCTAssertFalse(query("Fountain").firstMatch.exists)
+        XCTAssertFalse(query("Fountain Pen").firstMatch.exists, "Switching tools must dismiss the old settings popover")
+        try tap("menu.toolSettings"); _ = try require("Straight line")
+        XCTAssertFalse(query("Fountain Pen").firstMatch.exists)
     }
 
     func testSelectedToolTapOpensSettingsAndChangesPenType() throws {
         try open(); try ui.selectTool("pen"); try tap("tool.pen")
         try tap("Pencil"); outside(); try draw()
-        try tap("tool.pen"); XCTAssertTrue(try require("Pencil").isSelected)
+        try tap("tool.pen"); XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@ AND NOT identifier BEGINSWITH %@", "Pencil", "tool.")).firstMatch.isSelected)
         outside(); try draw(y: 0.72)
     }
 
@@ -320,16 +325,18 @@ final class ChromeUITests: XCTestCase {
 
     func testMoreImageOpensSourcePickerAndCancelDoesNotInsert() throws {
         try open(); let before = try ui.state()
-        try tap("tool.more"); try tap("tool.image"); try tap("Files")
+        try tap("tool.more"); try tap("tool.image"); ui.coordinate(CGPoint(x: 0.5, y: 0.65)).tap(); try tap("Files")
         _ = try require("Browse"); try tap("Cancel"); try sameContent(before)
     }
 
     func testMoreElementsOpensRegisteredPanel() throws {
         try open(); let before = try ui.state()
-        try tap("tool.more"); try tap("Elements")
-        try panel("elements.panel")
-        try tap("cmd.panel.close"); try panel("elements.panel", shown: false)
-        try sameContent(before)
+        try tap("tool.more"); try tap("tool.elements")
+        _ = try ui.waitForState { $0.tool == "elements" }
+        try tap("tool.elements"); try replace("Search elements", "Heart"); try tap("Heart")
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 }
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
     }
 
     func testMoreZoomWindowAndPinchChangeBoundedZoomWithoutMarks() throws {
@@ -386,7 +393,7 @@ final class ChromeUITests: XCTestCase {
     }
     func testDockRightKeepsSettingsInsideWindow() throws {
         try open(); try dock("right"); try settings("pen")
-        let option = try reachable("Fountain")
+        let option = try reachable("Fountain Pen")
         XCTAssertTrue(ui.app.frame.contains(option.frame), "Right-docked settings must stay onscreen")
         outside(); try draw()
     }
@@ -458,7 +465,7 @@ final class ChromeUITests: XCTestCase {
         try customize(); try tap("Show Highlighter")
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5), "Customise must expose a real reorder handle")
-        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)))
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.5, thenDragTo: try reachable("Hide Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)))
         try doneCustomizing(); try customize()
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
         XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Pen").frame.minY, "Reordered layout must persist")
@@ -510,7 +517,7 @@ final class ChromeUITests: XCTestCase {
         let old = try ui.state().document
         key("n", [.command, .option])
         try replace("Title", title)
-        try tap("No cover"); try tap("Create Notebook")
+        try tap("No cover"); try ui.tapCommand("doc.create")
         _ = try ui.waitForState { $0.screen == "document" && $0.document != old }
     }
     private func secondTab() throws -> (QAState, QAState) {
@@ -559,8 +566,6 @@ final class ChromeUITests: XCTestCase {
         let (first, second) = try secondTab()
         // The strip may have no capsule-sized gap; its overflow remains the real tab route.
         try tap("Tabs")
-        let board = try reachable("Concept map")
-        board.press(forDuration: 0.8)
         try tap("Close Tab")
         _ = try ui.waitForState { $0.document == first.document }
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
@@ -781,7 +786,7 @@ final class ChromeUITests: XCTestCase {
     private func timer(_ duration: String = "1:30", name: String = "Chrome countdown") throws {
         try timeKeeper(); try replace("Duration", duration); try replace("Timer name", name)
         // End field editing before a global canvas shortcut can be interpreted as text.
-        ui.app.swipeDown()
+        key(XCUIKeyboardKey.escape.rawValue)
         try tap("Start Timer")
         let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
         if alert.waitForExistence(timeout: 2), alert.buttons["Don't Allow"].exists { alert.buttons["Don't Allow"].tap() }
@@ -821,7 +826,7 @@ final class ChromeUITests: XCTestCase {
         _ = try reachable("Chrome countdown")
         try tap("cmd.panel.close")
         try timer("1:00", name: "Discarded countdown")
-        try timeKeeper(); try tap("Discard Session"); try tap("cmd.timer.control")
+        try timeKeeper(); try tap("Discard Session"); try tap("Discard Session")
         _ = try reachable("Start Timer")
         XCTAssertFalse(query("Discarded countdown").firstMatch.exists, "Discarded session must not enter history")
     }
@@ -880,3 +885,149 @@ final class ChromeUITests: XCTestCase {
         try tap("Show Less"); try tap("Show All")
         XCTAssertEqual(ui.app.staticTexts.matching(identifier: "Chrome history 6").count, 1)
     }
+
+    // pdf.textActions/markSelection/copyDefineSpeak. An external input PDF is generated in a
+    // disposable Files subfolder; importing, selecting and annotating it all use the actual UI.
+    // No document package, settings, probe, app command or selection is injected.
+    private func importTextPDF() throws {
+        let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()
+        let fm = FileManager.default
+        let roots = try fm.contentsOfDirectory(at: containers, includingPropertiesForKeys: nil).flatMap { container in
+            (try? fm.contentsOfDirectory(at: container.appendingPathComponent("tmp"), includingPropertiesForKeys: [.creationDateKey])) ?? []
+        }.filter { $0.lastPathComponent.hasPrefix("NibUITests-") }
+        let fixture = try XCTUnwrap(roots.sorted {
+            ((try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast) >
+            ((try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast)
+        }.first)
+        let folderName = "Chrome PDF " + String(UUID().uuidString.prefix(8))
+        let folder = fixture.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Documents").appendingPathComponent(folderName)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        imports = folder
+        let data = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 595, height: 842)).pdfData { context in
+            context.beginPage()
+            let text = "Velocity measures displacement over time. Acceleration changes velocity."
+            (text as NSString).draw(in: CGRect(x: 72, y: 380, width: 450, height: 110),
+                withAttributes: [.font: UIFont.systemFont(ofSize: 22), .foregroundColor: UIColor.black])
+        }
+        try data.write(to: folder.appendingPathComponent("Chrome selection.pdf"))
+        try tap("New"); try tap("Import Files")
+        let local = ui.app.cells["DOC.sidebar.item.On My iPad"]
+        if local.waitForExistence(timeout: 5), local.isHittable { local.tap() }
+        let nib = ui.app.cells["Nib, Container"]
+        if nib.waitForExistence(timeout: 3), nib.isHittable { nib.tap() }
+        let directory = ui.app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", folderName)).firstMatch
+        XCTAssertTrue(directory.waitForExistence(timeout: 10), "Files must show external PDF input folder")
+        directory.tap()
+        let pdf = ui.app.cells.matching(NSPredicate(format: "label CONTAINS 'Chrome selection'")).firstMatch
+        XCTAssertTrue(pdf.waitForExistence(timeout: 10)); pdf.tap()
+        let pick = ui.app.buttons["Open"]
+        if pick.waitForExistence(timeout: 2), pick.isHittable { pick.tap() }
+        _ = try ui.waitForState { $0.screen == "document" && $0.pageCount == 1 }
+        try ui.selectTool("lasso")
+    }
+    private func selectPDFText() throws {
+        let papers = ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 1 of 1'"))
+        let paper = try XCTUnwrap(papers.allElementsBoundByIndex.first { $0.frame.height > 100 }, "Imported PDF must expose its page")
+        paper.coordinate(withNormalizedOffset: CGVector(dx: 115.0 / 595, dy: 393.0 / 842)).press(forDuration: 1)
+        _ = try require("Highlight")
+    }
+    private func pdfAction(_ name: String) throws {
+        if !query(name).firstMatch.isHittable {
+            let next = ui.app.buttons["Show more items"]
+            if next.exists { next.tap() }
+        }
+        try tap(name)
+    }
+    func testPDFLongPressOffersTextActionsAndOutsideDismissIsInert() throws {
+        try importTextPDF(); let before = try ui.state(); try selectPDFText()
+        for action in ["Highlight", "Strikethrough", "Define", "Speak", "Copy"] { _ = try require(action) }
+        outside(); try sameContent(before)
+    }
+    private func markPDF(_ action: String) throws {
+        try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction(action)
+        let marked = try ui.waitForState { $0.strokeCountOnPage > before.strokeCountOnPage && $0.undoAvailable }
+        XCTAssertEqual(marked.itemCountOnPage - before.itemCountOnPage, marked.strokeCountOnPage - before.strokeCountOnPage,
+                       "PDF annotation must be erasable ink over the selected range")
+        try ui.tapCommand("edit.undo")
+        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.itemCountOnPage == before.itemCountOnPage }
+        try ui.tapCommand("edit.redo")
+        _ = try ui.waitForState { $0.strokeCountOnPage == marked.strokeCountOnPage }
+    }
+    func testPDFHighlightCreatesUndoableRangeAnnotation() throws { try markPDF("Highlight") }
+    func testPDFStrikethroughCreatesUndoableRangeAnnotation() throws { try markPDF("Strikethrough") }
+    func testPDFCopyPastesSelectedTextIntoRenameField() throws {
+        try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Copy")
+        _ = try ui.waitForState { ($0.clipboardChangeCount ?? 0) > (before.clipboardChangeCount ?? 0) }
+        try menu("title", "Rename")
+        let field = try reachable("Title"); field.tap(); key("a", .command); key("v", .command)
+        try wait("PDF Copy must put the selected text on the real pasteboard") { (field.value as? String ?? "").contains("Velocity") }
+        try tap("sheet.dismiss"); try sameContent(before)
+    }
+    func testPDFDefineOpensDictionaryForSelectedText() throws {
+        try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Define")
+        _ = try require("Done")
+        XCTAssertTrue(ui.app.navigationBars.count > 0, "Define must present the system dictionary")
+        try tap("Done"); try sameContent(before)
+    }
+    func testPDFSpeakStartsSpeechAndOffersStopSpeaking() throws {
+        try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Speak")
+        try selectPDFText(); try pdfAction("Stop Speaking")
+        try sameContent(before)
+    }
+
+    // present.setMode/controls. The shared lane has no external display. Verify that the
+    // disconnected UI is correctly scoped; the full actions below also run if a display is supplied.
+    func testPresentationModesAndControlsAreScopedToConnectedDisplay() throws {
+        try open(); let before = try ui.state(); try tap("menu.share")
+        if query("Mirror Entire Screen").firstMatch.exists {
+            for mode in ["Mirror Entire Screen", "Presenter Page", "Full Page"] {
+                try tap(mode); try tap("menu.share")
+                XCTAssertTrue(try require(mode).isSelected, "Share mode checkmark must follow the selected presentation mode")
+            }
+            outside(); try tap("Blank Screen"); _ = try require("Show Screen")
+            try tap("Show Screen"); _ = try require("Blank Screen")
+            try tap("Laser Pointer"); _ = try ui.waitForState { $0.tool == "laser" }
+            try ui.drawStroke([CGPoint(x: 0.4, y: 0.6), CGPoint(x: 0.6, y: 0.65)])
+            try sameContent(before)
+            try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.8), to: CGPoint(x: 0.12, y: 0.25))
+            try tap("Stop Presenting"); try wait("Stop must dismiss presenter HUD") { !self.query("Blank Screen").firstMatch.exists }
+        } else {
+            XCTAssertFalse(query("Presenter Page").firstMatch.exists)
+            XCTAssertFalse(query("Full Page").firstMatch.exists)
+            outside()
+            XCTAssertFalse(query("Blank Screen").firstMatch.exists, "No presenter controls without an external display")
+            try sameContent(before)
+        }
+    }
+
+    // chrome.status: details must open from the actual title-adjacent status, including after rotation.
+    func testBridgeStatusPillOpensDetailsAndTurnOffHasEffect() throws {
+        try tap("App Menu"); try tap("Settings"); try tap("Bridge")
+        try toggle("MCP bridge", to: true); try ui.dismissSheets(); try open()
+        let before = try ui.state()
+        for orientation in [UIDeviceOrientation.portrait, .landscapeLeft] {
+            XCUIDevice.shared.orientation = orientation
+            let status = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'MCP bridge'")).firstMatch
+            XCTAssertTrue(status.waitForExistence(timeout: 10), "Enabled bridge must expose title-adjacent status")
+            status.tap(); _ = try require("MCP Bridge"); _ = try reachable("Open Bridge Settings")
+            outside(); try sameContent(before)
+        }
+        let status = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'MCP bridge'")).firstMatch
+        status.tap(); try tap("Turn Off Bridge")
+        try wait("Turn Off Bridge must remove its enabled status pill") { !status.exists }
+        try sameContent(before)
+    }
+    func testPresenceDoesNotInventPeersAndTitleDetailsRetainLiveSession() throws {
+        try open(); let before = try ui.state()
+        try menu("title", "Collaborators"); try tap("Start Live Session")
+        let join = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Join code:'")).firstMatch
+        XCTAssertTrue(join.waitForExistence(timeout: 20), "Starting a live session must produce a join code")
+        try ui.dismissSheets()
+        let presence = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Collaborators' OR label BEGINSWITH 'Live session'" )).firstMatch
+        // Presence beads represent other participants (DESIGN §14.14), not the lone host.
+        XCTAssertFalse(presence.exists, "Hosting alone must not invent collaborator presence")
+        try menu("title", "Collaborators")
+        XCTAssertTrue(join.waitForExistence(timeout: 8), "Reopened details must retain the live session's join code")
+        try sameContent(before)
+    }
+}

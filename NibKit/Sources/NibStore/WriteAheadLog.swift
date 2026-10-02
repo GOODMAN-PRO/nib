@@ -5,8 +5,8 @@ import NibContracts
 /// line to `<directory>/<doc>.jsonl` (Application Support/Nib/wal), and `loadHead` replays whatever is left. The file
 /// is truncated only after a package write that holds everything logged before it: the persistence merges what
 /// earlier failed writes left unsaved into every write, so a change is always either on disk or still in the log.
-/// Appends and truncation run on the persistence's serial queue, and replay reads through the same queue, so the three
-/// never interleave.
+/// Appends and truncation run on the persistence's serial queue. A separate lock makes replay reads atomic with
+/// those local operations without waiting for NSFileCoordinator work on that queue. No package I/O holds this lock.
 final class WriteAheadLog {
     struct Entry: Codable {
         var head: DocumentContent?
@@ -16,6 +16,7 @@ final class WriteAheadLog {
     }
 
     let directory: URL
+    private let lock = NSLock()
 
     init(directory: URL) {
         self.directory = directory
@@ -37,6 +38,8 @@ final class WriteAheadLog {
     func append(_ entry: Entry, doc: DocumentID) throws {
         var line = try PackageCodec.encoder().encode(entry)
         line.append(0x0A)
+        lock.lock()
+        defer { lock.unlock() }
         let fm = FileManager.default
         let url = self.url(doc)
         if !fm.fileExists(atPath: url.path) {
@@ -59,13 +62,18 @@ final class WriteAheadLog {
 
     /// Entries in append order. A torn last line (the app died mid-append) is skipped.
     func read(_ doc: DocumentID) -> [Entry] {
-        guard let data = try? Data(contentsOf: url(doc)) else { return [] }
+        lock.lock()
+        let data = try? Data(contentsOf: url(doc))
+        lock.unlock()
+        guard let data else { return [] }
         let decoder = JSONDecoder()
         return data.split(separator: 0x0A).compactMap { try? decoder.decode(Entry.self, from: Data($0)) }
     }
 
     /// Everything logged so far is in the package files now.
     func truncate(_ doc: DocumentID) {
+        lock.lock()
+        defer { lock.unlock() }
         try? FileManager.default.removeItem(at: url(doc))
     }
 }

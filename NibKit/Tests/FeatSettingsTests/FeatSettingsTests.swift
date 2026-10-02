@@ -140,6 +140,58 @@ final class FeatSettingsTests: XCTestCase {
 
     // MARK: settings.open and the app menu
 
+    func testUnhandledCommandCommaOpensSettingsFromLibraryAndEveryDocumentKind() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(h)
+        h.app.ui.activeNavigator = navigator
+        let contexts = [KeyCommandContext(docKind: nil)] + DocumentKind.allCases.map {
+            KeyCommandContext(docKind: $0)
+        }
+        var expectedPresentations = 0
+        for var context in contexts {
+            for editingText in [false, true] {
+                context.isEditingText = editingText
+                let key = try XCTUnwrap(KeyCommandRouting.unhandledPress(KeyShortcut(",", [.command]),
+                    descriptors: h.app.content.keyCommands.all, in: context))
+                XCTAssertEqual(key.command, CommandIDs.settingsOpen)
+                let out = try await h.run(key.command, key.resolvedParams(for: h.session))
+                expectedPresentations += 1
+                XCTAssertEqual(out["opened"]?.stringValue, "settings")
+                XCTAssertEqual(navigator.requestedPages.count, expectedPresentations)
+                XCTAssertTrue(navigator.presented is SettingsRootViewController)
+                XCTAssertNil(KeyCommandRouting.unhandledPress(KeyShortcut(",", []),
+                    descriptors: h.app.content.keyCommands.all, in: context), "typing a comma never opens Settings")
+            }
+        }
+    }
+
+    func testSettingsOpenedFromDocumentExposesSelectionPagesInEditingAndProvidersInAI() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        // Stand-ins for the pages registered by F012, F041 and F086.
+        h.app.ui.settingsPages.register(page("transform.snapping", "Alignment and snapping", .editing, owner: "transform"))
+        h.app.ui.settingsPages.register(page("layers.settings", "Layers", .editing, owner: "layers"))
+        h.app.ui.settingsPages.register(page("ai.providers", "AI Providers", .ai, owner: "aisettings"))
+        let navigator = RecordingNavigator(h)
+        h.app.ui.activeNavigator = navigator
+        let key = try XCTUnwrap(KeyCommandRouting.unhandledPress(KeyShortcut(",", [.command]),
+            descriptors: h.app.content.keyCommands.all, in: KeyCommandContext(docKind: .notebook)))
+        try await h.run(key.command, key.resolvedParams(for: h.session))
+        let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
+        let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+        XCTAssertEqual(catalog.selected(root.state.section)?.section, .general)
+        root.state.select(.editing)
+        XCTAssertEqual(Set(catalog.selected(root.state.section)?.pages.map(\.id) ?? []),
+                       ["settings.editing", "transform.snapping", "layers.settings"])
+        for id in ["transform.snapping", "layers.settings"] {
+            root.show(page: id)
+            XCTAssertEqual(root.state.section, .editing)
+            XCTAssertEqual(root.state.detailPath.count, 1)
+            XCTAssertEqual(root.state.compactPath.count, 1)
+        }
+        root.state.select(.ai)
+        XCTAssertEqual(catalog.selected(root.state.section)?.pages.map(\.id), ["ai.providers"])
+    }
+
     func testSettingsOpenShowsTheRequestedPage() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
         let navigator = RecordingNavigator(h)

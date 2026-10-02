@@ -27,16 +27,29 @@ final class FeatLibraryUITests: XCTestCase {
     }
 
     func testLiftCannotBeCancelledByTouchDownBridgeBeforeIntentIsKnown() {
-        let lift = LiftRecognizer()
+        let target = NibReflowTouchTarget(id: "cover", reflow: NibReflow<String>(),
+                                         order: ["cover"], onDrop: { _ in })
+        let coordinator = target.makeCoordinator()
+        let lift = coordinator.gesture
         // The SwiftUI bridge is not a pan or a long press. It can recognise at
         // touch-down; the lift must keep receiving samples until it classifies intent.
         let bridge = UIGestureRecognizer()
+        let scroll = UIPanGestureRecognizer()
+        let menu = UILongPressGestureRecognizer()
         XCTAssertEqual(lift.state, .possible)
         XCTAssertFalse(lift.canBePrevented(by: bridge))
-        XCTAssertFalse(lift.canBePrevented(by: UIPanGestureRecognizer()))
-        XCTAssertFalse(lift.canBePrevented(by: UILongPressGestureRecognizer()))
-        lift.state = .failed
-        XCTAssertTrue(lift.canBePrevented(by: bridge), "A yielded hold must allow the native context menu")
+        XCTAssertFalse(lift.canBePrevented(by: scroll))
+        XCTAssertFalse(lift.canBePrevented(by: menu))
+        // Verify the actual delegate dependencies rather than assigning a terminal
+        // state to a recogniser without touches (UIKit immediately resets it).
+        XCTAssertTrue(coordinator.gestureRecognizer(lift, shouldBeRequiredToFailBy: menu),
+                      "A stationary hold must give the menu its turn when the lift yields")
+        XCTAssertTrue(coordinator.gestureRecognizer(lift, shouldBeRequiredToFailBy: scroll),
+                      "An early swipe must scroll after the lift fails, without scrolling during pickup")
+        XCTAssertFalse(coordinator.gestureRecognizer(lift, shouldBeRequiredToFailBy: bridge),
+                       "The SwiftUI touch bridge must keep delivering button and context-menu input")
+        XCTAssertTrue(ReflowLiftIntent.yieldsToMenu(distance: 0))
+        XCTAssertFalse(ReflowLiftIntent.yieldsToMenu(distance: 6, stationaryFor: 0))
     }
 
     func testLibraryDragYieldsToOverlappingMenuAndPanelButAllowsSelectionStack() {

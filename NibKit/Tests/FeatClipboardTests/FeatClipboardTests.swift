@@ -6,6 +6,24 @@ import NibTesting
 import NibDesign
 @testable import FeatClipboard
 
+/// Exercises the same provider reader as the system board without contacting the simulator's pasteboard.
+@MainActor
+private final class ProviderClipboardBoard: ClipboardBoard {
+    var providers: [NSItemProvider]
+    var snapshots = 0
+
+    init(_ providers: [NSItemProvider]) { self.providers = providers }
+    func contains(_ types: [String]) -> Bool {
+        providers.contains { provider in types.contains { provider.hasItemConformingToTypeIdentifier($0) } }
+    }
+    var hasStrings: Bool { providers.contains { $0.canLoadObject(ofClass: NSString.self) } }
+    func readProviders() -> [NSItemProvider] {
+        snapshots += 1
+        return providers
+    }
+    func write(_ representations: [String: Any]) { XCTFail("Paste must not overwrite the source clipboard") }
+}
+
 @MainActor
 final class FeatClipboardTests: XCTestCase {
     private var page1: String { "item:FIXTUREDOC01/FIXTUREPG001/" }
@@ -18,6 +36,23 @@ final class FeatClipboardTests: XCTestCase {
     }
 
     private func restoreBoard() { Clipboard.board = InMemoryClipboardBoard() }
+
+    /// A foreign provider can deliver only after the main queue processes another event (including Allow Paste).
+    /// No sleeps or real paste permissions: a synchronous wait in the reader cannot make this provider complete.
+    private func deferredProvider(_ representations: [String: Data],
+                                  onLoad: @escaping @MainActor (String) -> Void) -> NSItemProvider {
+        let provider = NSItemProvider()
+        for (type, data) in representations {
+            provider.registerDataRepresentation(forTypeIdentifier: type, visibility: .all) { completion in
+                DispatchQueue.main.async {
+                    onLoad(type)
+                    completion(data, nil)
+                }
+                return nil
+            }
+        }
+        return provider
+    }
 
     func testHostlessRunsUseAnInMemoryBoard() {
         _ = Harness(features: [FeatClipboardFeature.self])
@@ -197,6 +232,124 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(plainBox.text.plainText, "Bold")
         XCTAssertNil(plainBox.text.paragraphs.first?.runs.first?.attrs.bold)
         XCTAssertEqual(plainBox.style, TextBoxStyle())
+    }
+
+    func testDeferredImagePasteLeavesMainActorResponsiveAndUndoes() async throws {
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let before = try h.snapshot()
+        var delivered = false
+        let provider = deferredProvider([UTType.png.identifier: Fixtures.pngData]) { type in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertEqual(type, UTType.png.identifier)
+            XCTAssertEqual(try? h.snapshot(), before, "no mutation before the external bytes arrive")
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+            delivered = true
+        }
+        let board = ProviderClipboardBoard([provider])
+        Clipboard.board = board
+        let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [200, 300]])
+        XCTAssertTrue(delivered)
+        XCTAssertEqual(board.snapshots, 1)
+        XCTAssertEqual(out["source"], "image")
+        let pasted = try items(refs(out), in: h)
+        XCTAssertEqual(pasted.count, 1)
+        let image = try XCTUnwrap(pasted.first?.image)
+        XCTAssertEqual(try h.assets.data(image.asset, doc: Fixtures.docID), Fixtures.pngData)
+        XCTAssertEqual(pasted[0].bounds.midX, 200, accuracy: 0.001)
+        XCTAssertEqual(pasted[0].bounds.midY, 300, accuracy: 0.001)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before, "Undo removes the image and its asset use")
+    }
+
+    func testDeferredRichTextAndMatchStyleKeepRepresentationPriority() async throws {
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let before = try h.snapshot()
+        let styled = NSAttributedString(string: "Selection rich text", attributes: [.font: UIFont.boldSystemFont(ofSize: 36)])
+        let rtf = try styled.data(from: NSRange(location: 0, length: styled.length),
+                                  documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+        var loaded: [String] = []
+        let provider = deferredProvider([UTType.rtf.identifier: rtf,
+                                         UTType.utf8PlainText.identifier: Data(styled.string.utf8),
+                                         UTType.png.identifier: Fixtures.pngData]) { loaded.append($0) }
+        let board = ProviderClipboardBoard([provider])
+        Clipboard.board = board
+        let rich = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        let richBox = try XCTUnwrap(try items(refs(rich), in: h).first?.text)
+        XCTAssertEqual(rich["source"], "text")
+        XCTAssertEqual(richBox.text.plainText, styled.string)
+        XCTAssertEqual(richBox.text.paragraphs.first?.runs.first?.attrs.bold, true)
+        XCTAssertEqual(richBox.text.paragraphs.first?.runs.first?.attrs.size, 36)
+        XCTAssertEqual(loaded, [UTType.rtf.identifier], "rich text wins over a preview image; unused flavours stay unread")
+
+        var saved = TextBoxStyle()
+        saved.defaults.size = 18
+        h.app.settings.set(NibSettings.defaultTextStyle, saved)
+        loaded.removeAll()
+        // A fresh provider also exercises data-backed UTF-8, as used by external rich-text applications.
+        board.providers = [deferredProvider([UTType.rtf.identifier: rtf,
+                                            UTType.utf8PlainText.identifier: Data(styled.string.utf8),
+                                            UTType.png.identifier: Fixtures.pngData]) { loaded.append($0) }]
+        let plain = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "matchStyle": true])
+        let plainBox = try XCTUnwrap(try items(refs(plain), in: h).first?.text)
+        XCTAssertEqual(plainBox.text.plainText, styled.string)
+        XCTAssertNil(plainBox.text.paragraphs.first?.runs.first?.attrs.bold)
+        XCTAssertEqual(plainBox.style, saved)
+        XCTAssertLessThan(plainBox.frame.h, richBox.frame.h)
+        XCTAssertEqual(loaded, [UTType.utf8PlainText.identifier])
+        XCTAssertEqual(board.snapshots, 2)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 2)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testUnavailableProviderPastesNothingWithoutUndo() async throws {
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let before = try h.snapshot()
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            DispatchQueue.main.async {
+                completion(nil, CocoaError(.userCancelled))
+            }
+            return nil
+        }
+        Clipboard.board = ProviderClipboardBoard([provider])
+        let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertEqual(out["source"], "empty")
+        XCTAssertEqual(refs(out), [])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testPasteRechecksReadOnlyModeAfterExternalLoad() async throws {
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let before = try h.snapshot()
+        let provider = deferredProvider([UTType.png.identifier: Fixtures.pngData]) { _ in h.session.readOnly = true }
+        Clipboard.board = ProviderClipboardBoard([provider])
+        let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertEqual(out["source"], "empty")
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testNonUserPasteNeverLoadsExternalProviders() async throws {
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let provider = deferredProvider([UTType.png.identifier: Fixtures.pngData,
+                                         UTType.utf8PlainText.identifier: Data("Private".utf8)]) { _ in
+            XCTFail("non-user calls must not request foreign content or paste permission")
+        }
+        let board = ProviderClipboardBoard([provider])
+        Clipboard.board = board
+        let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "matchStyle": true], as: .ai("t"))
+        XCTAssertEqual(out["source"], "empty")
+        XCTAssertEqual(board.snapshots, 0)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
     func testMatchStyleUsesTheSavedDefaultTextStyle() async throws {

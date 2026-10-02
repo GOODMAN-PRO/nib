@@ -906,6 +906,8 @@ final class SelectionUITests: XCTestCase {
 
     private func enableLayers() throws {
         key(",")
+        // DESIGN §14.8: iPad Settings shows sections, then their pages.
+        try tap("Editing")
         try tap("Layers", scroll: true); try toggle("Layers", to: true)
         try ui.dismissSheets()
     }
@@ -929,7 +931,7 @@ final class SelectionUITests: XCTestCase {
     // MARK: selection.snap — both exposed options, alignment also controls equal-spacing guides.
 
     private func snapping(align: Bool, grid: Bool) throws {
-        key(","); try tap("Alignment and snapping", scroll: true)
+        key(","); try tap("Editing"); try tap("Alignment and snapping", scroll: true)
         try toggle("Alignment guides", to: align); try toggle("Snap to grid", to: grid)
         try ui.dismissSheets()
     }

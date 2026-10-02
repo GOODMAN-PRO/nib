@@ -128,6 +128,94 @@ final class FeatToolbarTests: XCTestCase {
         ToolbarEntry(id: id, title: id, group: group, toolID: id, command: nil, hideable: hideable, isPlugin: plugin)
     }
 
+    /// Closed settings and More remain mounted for their bud animations. Their native scroll views must
+    /// release touches, including after ink/commit refreshes, so a visible Lasso button can receive its tap.
+    func testPaletteClosedPopoversReleaseHitTargetsAfterDrawingAndSettingsDismissal() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.settings = { _ in AnyView(Text("Pen settings").frame(height: 320)) }
+        h.app.ui.toolbar.register(pen)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let inking = NibInkingState()
+        let size = Self.landscape
+        let host = UIHostingController(rootView:
+            NibDropletContainer(inking: inking) {
+                ToolbarRootView(model: model, size: size, compact: false)
+            }.environment(\.accessibilityReduceMotion, true))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+
+        func popovers() -> [UIScrollView] {
+            // The fused options bar is 44 pt high; these are the settings and More panels.
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        func checkClosed() async throws {
+            try await waitUntil("closed palette popovers release their native hit targets") {
+                host.view.layoutIfNeeded()
+                let panels = popovers()
+                return panels.count >= 2 && panels.allSatisfy { !$0.isUserInteractionEnabled }
+            }
+            XCTAssertGreaterThanOrEqual(popovers().count, 2)
+            for scroll in popovers() {
+                XCTAssertTrue(scroll.accessibilityElementsHidden)
+                XCTAssertNil(scroll.hitTest(CGPoint(x: scroll.bounds.midX, y: scroll.bounds.midY), with: nil),
+                             "An invisible settings/More panel must not intercept a palette tap")
+            }
+        }
+        try await checkClosed()
+        inking.isInking = true
+        try await h.run(TestTouch.descriptor.id)
+        inking.isInking = false
+        model.refresh()
+        try await checkClosed()
+
+        model.openSettings()
+        try await waitUntil("Pen settings becomes interactive") {
+            host.view.layoutIfNeeded()
+            return popovers().contains { $0.isUserInteractionEnabled }
+        }
+        model.settingsOpen = false
+        try await checkClosed()
+        model.moreOpen = true
+        try await waitUntil("More becomes interactive") {
+            host.view.layoutIfNeeded()
+            return popovers().contains { $0.isUserInteractionEnabled }
+        }
+        model.moreOpen = false
+        try await checkClosed()
+    }
+
+    func testLassoPaletteActionAfterCommitSelectsItsWindowAndPreservesContent() async throws {
+        let h = harness()
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        try await h.run(TestTouch.descriptor.id)
+        let before = try h.app.workspace.content(Fixtures.docID)
+        let selection = h.session.selection
+        model.refresh()
+        XCTAssertEqual(model.shown.first?.id, "lasso")
+        XCTAssertEqual(model.shown.first?.accessibilityID, "tool.lasso")
+        model.select("lasso")
+        try await waitUntil("the palette selects Lasso through tool.select") { h.session.tool == "lasso" }
+        XCTAssertEqual(model.tool, "lasso")
+        XCTAssertEqual(other.tool, "pen", "The palette targets its own session, even when another window is active")
+        XCTAssertEqual(h.session.selection, selection)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), before)
+        try await waitUntil("Lasso is the remembered sticky tool") {
+            h.app.settings.json("toolbar.lastTool.notebook")?.stringValue == "lasso"
+        }
+        try await h.run(TestTouch.descriptor.id)
+        model.refresh()
+        XCTAssertEqual(h.session.tool, "lasso", "A later commit must not restore Pen")
+    }
+
     func testConformance() async {
         let problems = await CommandConformance.check(features: [FeatToolbarFeature.self])
         XCTAssertEqual(problems, [])

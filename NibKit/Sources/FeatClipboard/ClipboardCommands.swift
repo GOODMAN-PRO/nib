@@ -13,9 +13,9 @@ protocol ClipboardBoard: AnyObject {
     func contains(_ types: [String]) -> Bool
     /// True when the board holds text (never shows the system paste prompt).
     var hasStrings: Bool { get }
-    /// The `type` data of every item offering it (reading another app's content may show the system paste prompt).
-    func data(_ type: String) -> [Data]
-    var strings: [String] { get }
+    /// Snapshot the offered representations without synchronously fetching their contents. Loading a provider may
+    /// show the system paste prompt, so callers must await its asynchronous data/object loading API.
+    func readProviders() -> [NSItemProvider]
     /// Replaces the board with one item offering every representation (type identifier → `Data` or `String`).
     func write(_ representations: [String: Any])
 }
@@ -26,12 +26,7 @@ final class SystemClipboardBoard: ClipboardBoard {
     func contains(_ types: [String]) -> Bool { board.contains(pasteboardTypes: types) }
     var hasStrings: Bool { board.hasStrings }
 
-    func data(_ type: String) -> [Data] {
-        guard let set = board.itemSet(withPasteboardTypes: [type]) else { return [] }
-        return board.data(forPasteboardType: type, inItemSet: set) ?? []
-    }
-
-    var strings: [String] { board.strings ?? [] }
+    func readProviders() -> [NSItemProvider] { board.itemProviders }
     func write(_ representations: [String: Any]) { board.setItems([representations], options: [:]) }
 }
 
@@ -43,8 +38,16 @@ final class InMemoryClipboardBoard: ClipboardBoard {
     func contains(_ types: [String]) -> Bool { items.contains { item in types.contains { item[$0] != nil } } }
     var hasStrings: Bool { !strings.isEmpty }
 
-    func data(_ type: String) -> [Data] {
-        items.compactMap { item in (item[type] as? Data) ?? (item[type] as? String).map { Data($0.utf8) } }
+    func readProviders() -> [NSItemProvider] {
+        items.map { item in
+            let provider = NSItemProvider()
+            for (type, value) in item {
+                if let data = (value as? Data) ?? (value as? String).map({ Data($0.utf8) }) {
+                    DragFlavours.now(provider, type, visibility: .all, data: data)
+                }
+            }
+            return provider
+        }
     }
 
     var strings: [String] { items.compactMap { $0[UTType.utf8PlainText.identifier] as? String } }
@@ -74,15 +77,30 @@ enum PasteboardReader {
     /// (callers other than the user) reads a Nib fragment and nothing else: no system paste prompt with nobody at the
     /// device, and no other app's content handed to the caller.
     static func read(_ board: ClipboardBoard, matchStyle: Bool, style: TextBoxStyle, limits: PasteLimits,
-                     fragmentOnly: Bool = false) -> (fragment: NibFragment, source: String)? {
-        // Only what is needed is read: each read of another app's content can show the system paste prompt.
-        func plainText() -> (fragment: NibFragment, source: String)? {
-            let plain = board.hasStrings ? board.strings.joined(separator: "\n") : ""
+                     fragmentOnly: Bool = false) async -> (fragment: NibFragment, source: String)? {
+        // Non-user callers must not request external content (or trigger a permission prompt).
+        if fragmentOnly && !board.contains([NibFragment.typeIdentifier]) { return nil }
+        let providers = board.readProviders()
+        // One snapshot per paste, loaded only as needed. Never use UIPasteboard's synchronous data/strings
+        // getters here: waiting for a foreign provider or paste permission must leave the main actor responsive.
+        func data(_ type: String) async -> [Data] {
+            var result: [Data] = []
+            for provider in providers where provider.hasItemConformingToTypeIdentifier(type) {
+                if let bytes = await DropReader.loadData(provider, type) { result.append(bytes) }
+            }
+            return result
+        }
+        func plainText() async -> (fragment: NibFragment, source: String)? {
+            var strings: [String] = []
+            for provider in providers where provider.canLoadObject(ofClass: NSString.self) {
+                if let string = await DropReader.loadString(provider) { strings.append(string) }
+            }
+            let plain = strings.joined(separator: "\n")
             guard !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return (ContentFragments.text(RichText(plain: plain), style: style, width: limits.textWidth), "text")
         }
-        if matchStyle, !fragmentOnly, let text = plainText() { return text }
-        if board.contains([NibFragment.typeIdentifier]), let data = board.data(NibFragment.typeIdentifier).first {
+        if matchStyle, !fragmentOnly, let text = await plainText() { return text }
+        if let data = await data(NibFragment.typeIdentifier).first {
             // Any app can put a fragment on the pasteboard: a broken one falls through to the item's other flavours.
             do {
                 let fragment = try NibFragment.decode(data)
@@ -92,19 +110,19 @@ enum PasteboardReader {
             }
         }
         if fragmentOnly { return nil }
-        for type in richTypes where board.contains([type]) {
-            if let data = board.data(type).first, let rich = ContentFragments.richText(data, type: type),
+        for type in richTypes {
+            if let data = await data(type).first, let rich = ContentFragments.richText(data, type: type),
                !rich.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return (ContentFragments.text(rich, style: style, width: limits.textWidth), "text")
             }
         }
-        for type in imageTypes where board.contains([type.id]) {
-            let list = board.data(type.id)
+        for type in imageTypes {
+            let list = await data(type.id)
             guard !list.isEmpty else { continue }
             let fragment = ContentFragments.images(list.map { (data: $0, ext: type.ext) }, maxSize: limits.imageSize)
             if !fragment.items.isEmpty { return (fragment, "image") }
         }
-        return plainText()
+        return await plainText()
     }
 }
 
@@ -512,7 +530,7 @@ struct ClipboardPaste: NibCommand {
             source = "fragment"
         } else {
             let style = ClipboardCore.defaultTextStyle(ctx.services.settings)
-            guard let read = PasteboardReader.read(Clipboard.board, matchStyle: p.matchStyle ?? false, style: style,
+            guard let read = await PasteboardReader.read(Clipboard.board, matchStyle: p.matchStyle ?? false, style: style,
                                                    limits: PasteLimits(page: record.size), fragmentOnly: !user) else {
                 return Output(refs: [], source: "empty")
             }
@@ -520,6 +538,11 @@ struct ClipboardPaste: NibCommand {
             source = read.source
         }
         guard !fragment.items.isEmpty else { return Output(refs: [], source: "empty") }
+        // Paste access/provider loading can suspend while the document or window changes.
+        if ClipboardCore.windowIsReadOnly(ctx) { return Output(refs: [], source: "empty") }
+        try ClipboardCore.ensureUnlocked(doc, ctx)
+        try ClipboardCore.ensureWritable(doc, ctx, path: "$.page")
+        _ = try ClipboardCore.livePage(doc, page, ctx)
         let session = ctx.activeSession
         let visible = session?.document == doc && session?.page == page ? session?.visibleRect : nil
         let bounds = NibFragment.union(fragment.items)

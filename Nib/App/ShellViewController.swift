@@ -244,10 +244,10 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     override var canBecomeFirstResponder: Bool { true }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        guard !showsDocument else { super.pressesBegan(presses, with: event); return }
         // UIKit calls this only for presses not consumed by a UIKeyCommand.
         // Embedded SwiftUI hosts can leave a registered command unhandled even
-        // with this shell as first responder. Replay the same validated route;
+        // with this shell as first responder, in documents as well as the library.
+        // Replay the same validated route (including scope and text-input priority);
         // never intercept typing or dispatch a recognised shortcut a second time.
         var unhandled = presses
         for press in presses {

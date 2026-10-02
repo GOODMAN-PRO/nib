@@ -589,7 +589,7 @@ struct NibReflowDragModifier<ID: Hashable>: ViewModifier {
 
 /// Waits for both the lift hold and movement before recognising. A stationary long
 /// press remains available to the native context menu; an early swipe still scrolls.
-private struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
+struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
     let id: ID
     let reflow: NibReflow<ID>
     let order: [ID]
