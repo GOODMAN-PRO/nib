@@ -656,6 +656,38 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(Set(all.map { $0.shortcut }).count, all.count)   // no key combination twice
     }
 
+    func testTabShortcutHintsMatchRegisteredDestinationsIncludingOverflow() throws {
+        let keys = WindowShortcuts.descriptors(owner: FeatWindowsFeature.id)
+            .filter { $0.command == CommandIDs.tabSelect }
+        for count in [1, 5, 8, 9, 10, 12] {
+            for index in 0..<count {
+                let hint = TabCapsule.shortcutHint(index: index, count: count)
+                let matchingKeys = keys.filter {
+                    $0.params == ["index": .number(Double(index))]
+                        || (index == count - 1 && $0.params == ["index": -1])
+                }
+                if matchingKeys.isEmpty {
+                    XCTAssertNil(hint, "Tabs beyond eight only have a shortcut when last")
+                } else {
+                    let hint = try XCTUnwrap(hint)
+                    XCTAssertEqual(hint.modifiers, .command)
+                    XCTAssertTrue(matchingKeys.contains { $0.shortcut.key == String(hint.key.character) })
+                    if index < 8 {
+                        XCTAssertEqual(String(hint.key.character), String(index + 1))
+                    } else {
+                        XCTAssertEqual(hint.key.character, "9")
+                    }
+                }
+            }
+        }
+        let plan = TabStripLayout.documentPlan(count: 12, active: 11, width: 2000, compact: false)
+        let hints = plan.shown.compactMap { TabCapsule.shortcutHint(index: $0, count: 12)?.key.character }
+        XCTAssertEqual(hints, ["1", "2", "3", "4", "9"], "Hints follow document order, not visible slots")
+        XCTAssertNil(TabCapsule.shortcutHint(index: 0, count: 0))
+        XCTAssertNil(TabCapsule.shortcutHint(index: -1, count: 5))
+        XCTAssertNil(TabCapsule.shortcutHint(index: 5, count: 5))
+    }
+
     func testTabKeysStayLiveInTheLibraryWhileTheWindowHasTabs() async throws {
         let (h, _, _) = try windows()
         await FeatWindowsFeature.start(h.app)

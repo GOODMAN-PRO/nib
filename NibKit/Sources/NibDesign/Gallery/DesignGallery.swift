@@ -59,7 +59,7 @@ public struct DesignGallery: View {
             }
         }
         .background(NibColor.groupedBackground)
-        .navigationTitle(String(localized: "Design Gallery", bundle: .module))
+        .navigationTitle(String(localized: "Design gallery", bundle: .module))
     }
 }
 
@@ -504,7 +504,7 @@ struct GalleryComponents: View {
     private var buttonSection: some View {
         GallerySection(String(localized: "Buttons and badges", bundle: .module)) {
             HStack(spacing: NibSpacing.s) {
-                NibButton(String(localized: "New Notebook", bundle: .module), symbol: .plus, kind: .primary) {}
+                NibButton(String(localized: "New notebook", bundle: .module), symbol: .plus, kind: .primary) {}
                 NibButton(String(localized: "Import", bundle: .module), kind: .secondary) {}
             }
             HStack(spacing: NibSpacing.s) {
@@ -563,7 +563,7 @@ struct GalleryComponents: View {
             }
             NibRow(String(localized: "Plugins", bundle: .module), subtitle: String(localized: "Reads documents", bundle: .module),
                    icon: .puzzle, iconTint: NibColor.accent)
-            NibSheetHeader(String(localized: "New Notebook", bundle: .module), primaryTitle: String(localized: "Create", bundle: .module),
+            NibSheetHeader(String(localized: "New notebook", bundle: .module), primaryTitle: String(localized: "Create", bundle: .module),
                            onCancel: {})
             NibButton(String(localized: "Open a sheet", bundle: .module), kind: .secondary, size: .compact) { sheet = true }
             NibToast(String(localized: "Moved to Chemistry.", bundle: .module), action: NibAction(String(localized: "Undo", bundle: .module)) {})
@@ -610,7 +610,7 @@ struct GalleryComponents: View {
                 .nibGlass(.clear)
             NibEmptyState(symbol: .notebook, title: String(localized: "No notebooks yet", bundle: .module),
                           message: String(localized: "Write something, or bring in a PDF.", bundle: .module),
-                          primary: NibAction(String(localized: "New Notebook", bundle: .module)) {},
+                          primary: NibAction(String(localized: "New notebook", bundle: .module)) {},
                           secondary: NibAction(String(localized: "Import", bundle: .module)) {})
         }
     }

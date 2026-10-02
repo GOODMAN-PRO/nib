@@ -164,7 +164,7 @@ final class ShellConfirmationPresenter: ConfirmationPresenter {
             alert.addAction(UIAlertAction(title: String(localized: "Deny"), style: .cancel) { _ in
                 continuation.resume(returning: .deny)
             })
-            alert.addAction(UIAlertAction(title: String(localized: "Allow Rest of This Turn"), style: .default) { _ in
+            alert.addAction(UIAlertAction(title: String(localized: "Allow rest of this turn"), style: .default) { _ in
                 continuation.resume(returning: .allowRestOfGroup)
             })
             alert.addAction(UIAlertAction(title: String(localized: "Allow"), style: .default) { _ in

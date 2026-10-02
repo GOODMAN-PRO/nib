@@ -154,7 +154,8 @@ final class FeatToolbarTests: XCTestCase {
         let host = UIHostingController(rootView:
             NibDropletContainer {
                 ToolbarRootView(model: model, size: Self.landscape, compact: false)
-            })
+            }
+            .environment(\.scenePhase, .active))
         host.safeAreaRegions = []
         let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
         window.rootViewController = host
@@ -184,7 +185,17 @@ final class FeatToolbarTests: XCTestCase {
         }
         let more = try XCTUnwrap(panels().first { $0.isUserInteractionEnabled })
         XCTAssertFalse(more.accessibilityElementsHidden)
-        XCTAssertNotNil(more.hitTest(CGPoint(x: more.bounds.midX, y: more.bounds.midY), with: nil))
+        var inputRoute = "No window hit"
+        try await waitUntil("A window touch reaches the More grid instead of retained settings") {
+            host.view.layoutIfNeeded()
+            let point = more.convert(CGPoint(x: more.bounds.midX, y: more.bounds.midY), to: window)
+            guard let hit = window.hitTest(point, with: nil) else { return false }
+            inputRoute = "Hit \(hit) at \(point), expected a descendant of \(more)"
+            return hit === more || hit.isDescendant(of: more)
+        }
+        let point = more.convert(CGPoint(x: more.bounds.midX, y: more.bounds.midY), to: window)
+        let hit = window.hitTest(point, with: nil)
+        XCTAssertTrue(hit === more || hit?.isDescendant(of: more) == true, inputRoute)
         for closed in panels() where closed !== more {
             XCTAssertTrue(closed.accessibilityElementsHidden)
             XCTAssertNil(closed.hitTest(CGPoint(x: closed.bounds.midX, y: closed.bounds.midY), with: nil))
@@ -768,6 +779,96 @@ final class FeatToolbarTests: XCTestCase {
         let model = ToolbarModel(app: h.app, session: h.session)
         XCTAssertEqual(model.quickInks(compact: false).map { $0.index }, [0, 1, 2])
         XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [2])
+    }
+
+    func testCompactInkFollowsSelectionsBeyondTheThreeQuickSlots() async throws {
+        let h = harness()
+        var presets = ToolPresets.defaults(for: "pen")
+        presets.swatches += (3..<ToolPresets.maxSwatches).map {
+            PresetSwatch(color: RGBA(UInt8($0 * 20), 80, 160))
+        }
+        h.app.settings.set(NibSettings.presets("pen"), presets)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let regular = model.quickInks(compact: false)
+
+        for index in [3, 11, 1] {
+            presets.selectedSwatch = index
+            h.app.settings.set(NibSettings.presets("pen"), presets)
+            try await waitUntil("the selected ink refreshes") { model.swatchIndex == index }
+            XCTAssertEqual(model.quickInks(compact: true),
+                           [QuickSwatch(index: index, color: presets.swatches[index].color)])
+            XCTAssertEqual(model.quickInks(compact: false), regular)
+        }
+        // Editing the selected slot also refreshes the compact colour without changing its selection.
+        presets.swatches[1].color = RGBA(40, 90, 130)
+        h.app.settings.set(NibSettings.presets("pen"), presets)
+        try await waitUntil("the edited ink refreshes") {
+            model.quickInks(compact: true).first?.color == presets.swatches[1].color
+        }
+    }
+
+    func testHighlighterSwatchesAreOpaqueWithoutChangingStoredStrokeColours() {
+        let h = harness()
+        var presets = ToolPresets.defaults(for: "highlighter")
+        presets.swatches.append(PresetSwatch(color: RGBA(120, 180, 240, 64)))
+        presets.selectedSwatch = 3
+        h.app.settings.set(NibSettings.presets("highlighter"), presets)
+        h.session.tool = "highlighter"
+        let model = ToolbarModel(app: h.app, session: h.session)
+        for compact in [false, true] {
+            for swatch in model.quickInks(compact: compact) {
+                let stored = presets.swatches[swatch.index].color
+                XCTAssertEqual(swatch.color, RGBA(stored.r, stored.g, stored.b, 255))
+            }
+        }
+        XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [3])
+        XCTAssertEqual(h.app.settings.get(NibSettings.presets("highlighter")), presets)
+
+        var pen = ToolPresets.defaults(for: "pen")
+        pen.swatches[0].color = RGBA(40, 90, 130, 100)
+        h.app.settings.set(NibSettings.presets("pen"), pen)
+        h.session.tool = "pen"
+        XCTAssertEqual(model.quickInks(compact: false).first?.color, pen.swatches[0].color)
+    }
+
+    func testToolValueUsesLocalisedMillimetresAndPreservesAccessoryStates() {
+        XCTAssertEqual(ToolbarModel.accessibilityValue(colour: "Carbon", width: 1.2, isOn: true,
+                                                       isEnabled: false, locale: Locale(identifier: "en_GB")),
+                       "Carbon, 0.42 millimetres, On, Unavailable")
+        let french = ToolbarModel.accessibilityValue(colour: nil, width: 1.2, isOn: false,
+                                                      isEnabled: true, locale: Locale(identifier: "fr_FR"))
+        XCTAssertTrue(french?.contains("0,42") == true)
+        XCTAssertNil(ToolbarModel.accessibilityValue(colour: nil, isOn: false, isEnabled: true))
+    }
+
+    func testToolThicknessValueRefreshesWhenSelectingAndEditingWidths() async throws {
+        for tool in ["pen", "pencil", "highlighter"] {
+            let h = harness()
+            if tool != "pen" {
+                h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                    id: "\(tool).item", title: tool, icon: "pencil.tip", group: .tools, order: 15,
+                    owner: TestToolsFeature.id, toolID: tool))
+            }
+            h.session.tool = tool
+            var presets = ToolPresets.defaults(for: tool)
+            presets.widths = [72 / 25.4, 144 / 25.4, 216 / 25.4]
+            presets.selectedWidth = 0
+            h.app.settings.set(NibSettings.presets(tool), presets)
+            let model = ToolbarModel(app: h.app, session: h.session)
+            func value() -> String? { (model.shown + model.more).first { $0.id == tool }?.value }
+            func expected(_ millimetres: Double) -> String {
+                let width = String(format: String(localized: "%.2f millimetres"),
+                                   locale: Locale.current, millimetres)
+                return "\(ToolbarModel.colourName(presets.color, index: presets.selectedSwatch)), \(width)"
+            }
+            XCTAssertEqual(value(), expected(1), tool)
+            presets.selectedWidth = 2
+            h.app.settings.set(NibSettings.presets(tool), presets)
+            try await waitUntil("\(tool) announces the selected width") { value() == expected(3) }
+            presets.widths[2] = 288 / 25.4
+            h.app.settings.set(NibSettings.presets(tool), presets)
+            try await waitUntil("\(tool) announces the edited width") { value() == expected(4) }
+        }
     }
 
     /// A shared accessory and quick inks must never create palette chrome over a text document or study set.

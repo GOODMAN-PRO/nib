@@ -92,9 +92,13 @@ struct LibraryMenuEntries: View {
             } else {
                 ForEach(entries.filter { $0.submenu == nil }, id: \.id) { entry in menuButton(entry, context) }
                 ForEach(Array(Set(entries.compactMap(\.submenu))).sorted(), id: \.self) { title in
-                    Menu(title) {
+                    Menu {
                         ForEach(entries.filter { $0.submenu == title }, id: \.id) { entry in menuButton(entry, context) }
-                    }.frame(minHeight: NibMetrics.hitTarget).frame(height: rowHeight)
+                    } label: {
+                        LibraryMenuRow(title: title)
+                            .frame(minHeight: max(NibMetrics.hitTarget, rowHeight ?? 0))
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain)
                 }
             }
         }
@@ -103,23 +107,74 @@ struct LibraryMenuEntries: View {
     }
     private func menuButton(_ entry: MenuItemDescriptor, _ context: MenuContext) -> some View {
         Button(role: entry.destructive ? .destructive : nil) { activate(entry, context) } label: {
-            HStack {
-                if let icon = entry.icon, let symbol = NibSymbol(systemName: icon) { Image(nib: symbol) }
-                Text(entry.resolvedTitle(for: context))
-                if entry.isChecked?(context) == true { Image(nib: .checkmark) }
-                if let key = entry.shortcut { Text(LibraryShortcut.label(key)).font(NibFont.caption1) }
-            }
-        }.frame(minHeight: NibMetrics.hitTarget).frame(height: rowHeight)
+            LibraryMenuRow(title: entry.resolvedTitle(for: context),
+                symbol: entry.icon.flatMap(NibSymbol.init(systemName:)),
+                shortcut: entry.shortcut.map(LibraryShortcut.label), checked: entry.isChecked?(context) == true,
+                destructive: entry.destructive)
+                .frame(minHeight: max(NibMetrics.hitTarget, rowHeight ?? 0))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(entry.isChecked?(context) == true ? .isSelected : [])
         .accessibilityIdentifier("cmd." + entry.command)
     }
+
     private func activate(_ entry: MenuItemDescriptor, _ context: MenuContext) {
         if entry.destructive {
-            model.confirmation = LibraryConfirmation(title: entry.resolvedTitle(for: context), command: entry.command, params: entry.params(context))
+            model.confirmation = LibraryConfirmation(title: entry.resolvedTitle(for: context), command: entry.command, params: entry.params(context),
+                message: entry.command == CommandIDs.libraryTrash ? LibraryConfirmation.trashMessage(names: rows.map(\.name)) : nil)
             model.setView(["menu": "none"])
         } else { run(entry, context) }
     }
     private func run(_ entry: MenuItemDescriptor, _ context: MenuContext) {
         model.activateMenu(command: entry.command, params: entry.params(context))
+    }
+}
+
+/// One row layout for New, app, item, selection, sort and filter menus.
+struct LibraryMenuRow: View {
+    let title: String
+    var symbol: NibSymbol? = nil
+    var shortcut: String? = nil
+    var checked = false
+    var destructive = false
+    var body: some View {
+        HStack(spacing: NibSpacing.m) {
+            Group {
+                if let symbol { Image(nib: symbol).font(NibFont.glyph(.panel)) }
+                else { Color.clear }
+            }
+            .foregroundStyle(destructive ? NibColor.destructive : NibColor.label)
+            .frame(width: NibSpacing.xxl, height: NibSpacing.xxl)
+            .accessibilityHidden(true)
+            NibRow(title) {
+                HStack(spacing: NibSpacing.s) {
+                    if let shortcut { KeyHint(shortcut) }
+                    Image(nib: .checkmark)
+                        .foregroundStyle(NibColor.accent)
+                        .opacity(checked ? 1 : 0)
+                        .frame(width: NibSpacing.xxl)
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+struct LibraryMenuChoice: View {
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            LibraryMenuRow(title: title, checked: selected)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("cmd.library.setView")
     }
 }
 
@@ -155,12 +210,12 @@ struct LibraryBuds: View {
                         $0 == .grid ? String(localized: "Grid") : String(localized: "List")
                     }
                     ForEach(LibrarySort.allCases, id: \.self) { sort in
-                        NibButton(sort.title, symbol: model.sort == sort ? .checkmark : nil, kind: .plain) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
+                        LibraryMenuChoice(title: sort.title, selected: model.sort == sort) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
                         .accessibilityIdentifier("cmd.library.setView")
                     }
                     Divider()
                     ForEach(LibraryFilter.allCases, id: \.self) { filter in
-                        NibButton(filter.title, symbol: model.filter == filter ? .checkmark : nil, kind: .plain) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
+                        LibraryMenuChoice(title: filter.title, selected: model.filter == filter) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
                         .accessibilityIdentifier("cmd.library.setView")
                     }
                 }

@@ -54,7 +54,7 @@ struct PaletteItem: Identifiable, Equatable {
     let hasSettings: Bool
     /// The current ink (pen, pencil) or highlight colour (highlighter) on the glyph's colour layer.
     let tint: RGBA?
-    /// VoiceOver value, e.g. "Carbon", "On" or "Unavailable".
+    /// VoiceOver value, e.g. "Carbon, 0.42 millimetres", "On" or "Unavailable".
     let value: String?
     /// The key the shell runs this item with (`ToolbarShortcuts`), shown as a hint on hover and while ⌘ is held.
     let keyHint: KeyShortcut?
@@ -91,7 +91,7 @@ enum ToolKeyHint {
     }
 }
 
-/// One of the palette's three quick colours: the first slots of the current writing tool's presets.
+/// A colour slot of the current writing tool's presets, retaining its original index.
 struct QuickSwatch: Identifiable, Equatable {
     let index: Int
     let color: RGBA
@@ -235,7 +235,8 @@ final class ToolbarModel: ObservableObject {
             return PaletteItem(id: slot, descriptorID: d.id, accessibilityID: d.toolID.map { "tool." + $0 } ?? "cmd." + (d.command ?? d.id), title: d.resolvedTitle(for: session),
                                icon: d.resolvedIcon(for: session), isPlugin: plugins.contains(d.id),
                                isTool: d.toolID != nil, hasSettings: d.settings != nil, tint: presets?.color,
-                               value: Self.accessibilityValue(colour: colour, isOn: d.isOn?(session) ?? false,
+                               value: Self.accessibilityValue(colour: colour, width: presets?.width,
+                                                              isOn: d.isOn?(session) ?? false,
                                                               isEnabled: enabled),
                                keyHint: key?.shortcut, isEnabled: enabled, showsInCompactWidth: d.showsInCompactWidth)
         }
@@ -266,8 +267,13 @@ final class ToolbarModel: ObservableObject {
         var index = -1
         if app.commands.entry(Self.presetSelect) != nil {
             let presets = app.settings.get(NibSettings.presets(inkTool))
-            next = presets.swatches.prefix(3).enumerated().map { QuickSwatch(index: $0.offset, color: $0.element.color) }
-            index = presets.selectedSwatch < next.count ? presets.selectedSwatch : -1
+            next = presets.swatches.enumerated().map { slot, swatch in
+                // Match the options strip: transparency belongs to the highlight stroke, not its colour control.
+                let colour = inkTool == "highlighter"
+                    ? RGBA(swatch.color.r, swatch.color.g, swatch.color.b) : swatch.color
+                return QuickSwatch(index: slot, color: colour)
+            }
+            index = next.indices.contains(presets.selectedSwatch) ? presets.selectedSwatch : -1
         }
         if next != swatches { swatches = next }
         if index != swatchIndex { swatchIndex = index }
@@ -280,11 +286,16 @@ final class ToolbarModel: ObservableObject {
         return String(localized: "Colour \(index + 1)")
     }
 
-    /// What VoiceOver reads after an item's name: its colour, "On" for an accessory that is on (Zoom Window open,
-    /// timer running) and "Unavailable" while it is disabled.
-    static func accessibilityValue(colour: String?, isOn: Bool, isEnabled: Bool) -> String? {
+    /// What VoiceOver reads after an item's name: colour and thickness, then accessory and availability states.
+    /// Preset widths are page points; spoken thickness uses millimetres, like the tool's options strip.
+    static func accessibilityValue(colour: String?, width: Double? = nil, isOn: Bool, isEnabled: Bool,
+                                   locale: Locale = .current) -> String? {
         var parts: [String] = []
         if let colour { parts.append(colour) }
+        if let width {
+            parts.append(String(format: String(localized: "%.2f millimetres", locale: locale),
+                                locale: locale, width * 25.4 / 72))
+        }
         if isOn { parts.append(String(localized: "On")) }
         if !isEnabled { parts.append(String(localized: "Unavailable")) }
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
@@ -464,7 +475,8 @@ final class ToolbarModel: ObservableObject {
 
     /// The palette's quick inks: three on iPad; on iPhone one, the current ink (DESIGN.md §14.2).
     func quickInks(compact: Bool) -> [QuickSwatch] {
-        guard compact, let first = swatches.first else { return swatches }
+        guard compact else { return Array(swatches.prefix(3)) }
+        guard let first = swatches.first else { return [] }
         return [swatches.first { $0.index == swatchIndex } ?? first]
     }
 

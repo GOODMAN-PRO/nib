@@ -265,40 +265,73 @@ public struct NibSegmentedControl<Value: Hashable>: View {
         self.title = title
     }
 
+    @Environment(\.dynamicTypeSize) private var typeSize
+
     public var body: some View {
-        HStack(spacing: 0) {
-            ForEach(options, id: \.self) { option in
-                let selected = option == selection
-                Button {
-                    withAnimation(NibMotion.tap.animation) { selection = option }
-                } label: {
-                    Text(title(option))
-                        .font(selected ? NibFont.footnoteEmphasis : NibFont.footnote)
-                        .foregroundStyle(NibColor.label)
-                        .lineLimit(1)
-                        .padding(.horizontal, NibSpacing.m)
-                        .frame(maxWidth: .infinity, minHeight: 28)
-                        .background {
-                            if selected {
-                                RoundedRectangle(cornerRadius: NibRadius.segmentKnob, style: .continuous)
-                                    .fill(NibColor.backgroundTertiary)
-                                    .nibElevation(.rest)
-                                    .matchedGeometryEffect(id: "knob", in: knob)
-                            }
-                        }
-                        .padding(.vertical, 8)                 // 28 + 16: the 44 pt hit area
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(selected ? .isSelected : [])
+        if typeSize.isAccessibilitySize {
+            verticalOptions
+        } else {
+            ViewThatFits(in: .horizontal) {
+                horizontalOptions.fixedSize(horizontal: true, vertical: true)
+                verticalOptions
             }
+        }
+    }
+
+    private var horizontalOptions: some View {
+        HStack(spacing: 0) {
+            ForEach(options, id: \.self) { option in segment(option, vertical: false) }
         }
         .padding(.horizontal, 2)
         .background {
             RoundedRectangle(cornerRadius: NibRadius.segment, style: .continuous)
                 .fill(NibColor.fill3)
-                .padding(.vertical, 6)                         // the 32 pt visual track inside the 44 pt row
+                .padding(.vertical, 6)
         }
+    }
+
+    private var verticalOptions: some View {
+        VStack(spacing: NibSpacing.xs) {
+            ForEach(options, id: \.self) { option in segment(option, vertical: true) }
+        }
+    }
+
+    private func segment(_ option: Value, vertical: Bool) -> some View {
+        let selected = option == selection
+        let shape = RoundedRectangle(cornerRadius: NibRadius.segmentKnob, style: .continuous)
+        return Button {
+            withAnimation(NibMotion.tap.animation) { selection = option }
+        } label: {
+            HStack(spacing: NibSpacing.s) {
+                Text(title(option))
+                    .font(selected ? NibFont.footnoteEmphasis : NibFont.footnote)
+                    .lineLimit(vertical ? nil : 1)
+                    .fixedSize(horizontal: false, vertical: true)
+                if vertical {
+                    Spacer(minLength: 0)
+                    Image(nib: selected ? .checkCircleFill : .circle)
+                        .accessibilityHidden(true)
+                }
+            }
+            .foregroundStyle(NibColor.label)
+            .padding(.horizontal, NibSpacing.m)
+            .padding(.vertical, vertical ? NibSpacing.s : 0)
+            .frame(minWidth: NibMetrics.hitTarget, maxWidth: .infinity, minHeight: 28)
+            .background {
+                if selected {
+                    shape.fill(NibColor.backgroundTertiary)
+                        .nibElevation(.rest)
+                        .matchedGeometryEffect(id: "knob", in: knob)
+                } else if vertical {
+                    shape.fill(NibColor.fill3)
+                }
+            }
+            .padding(.vertical, vertical ? 0 : 8)
+            .frame(minHeight: NibMetrics.hitTarget)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(NibPressStyle(shape: shape))
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -327,7 +360,7 @@ public struct NibSearchField: View {
     public var body: some View {
         HStack(spacing: NibSpacing.s) {
             Image(nib: .search)
-                .font(NibFont.body)
+                .font(style == .onDroplet ? NibFont.glyph(.bar) : NibFont.body)
                 .foregroundStyle(style == .onDroplet ? AnyShapeStyle(NibChromeColor(NibColor.label)) : AnyShapeStyle(NibColor.labelSecondary))
                 .accessibilityHidden(true)
             TextField(prompt, text: $text, prompt: Text(prompt).foregroundStyle(foreground))
@@ -342,6 +375,7 @@ public struct NibSearchField: View {
                     text = ""
                 } label: {
                     Image(nib: .clearText)
+                        .font(style == .onDroplet ? NibFont.glyph(.bar) : NibFont.body)
                         .foregroundStyle(style == .onDroplet ? AnyShapeStyle(NibChromeColor(NibColor.label)) : AnyShapeStyle(NibColor.labelTertiary))
                         .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
                 }
@@ -380,7 +414,8 @@ public struct NibField: View {
 }
 
 /// Chips: context ("Page 3 · Handwriting", removable), citations (accent wash, inline), filters. The visuals stay
-/// 28 pt (20 pt for citations); every tappable part reaches 44 pt with padding that does not move the layout.
+/// 28 pt (20 pt for citations) at the default type size; the button owns a 44 × 44 pt target.
+/// The removable-context exception stays 28 pt wide × 44 pt tall.
 public struct NibChip: View {
     public enum Style: Sendable {
         case context, citation, filter(isSelected: Bool)
@@ -412,40 +447,50 @@ public struct NibChip: View {
     }
 
     public var body: some View {
-        HStack(spacing: 4) {
+        let shape = RoundedRectangle(cornerRadius: isCitation ? NibRadius.badge : 14, style: .continuous)
+        HStack(spacing: 0) {
             Button {
                 action?()
             } label: {
                 HStack(spacing: 4) {
+                    if isSelectedFilter {
+                        Image(nib: .checkmark)
+                            .font(NibFont.caption1Emphasis)
+                            .accessibilityHidden(true)
+                    }
                     if let symbol {
                         Image(nib: symbol).font(NibFont.caption1)
+                            .accessibilityHidden(true)
                     }
                     Text(title)
                         .font(isCitation ? NibFont.caption1Emphasis : NibFont.footnote)
                         .lineLimit(1)
                 }
-                .hitPadding(isCitation ? 12 : 8)
+                .padding(.horizontal, isCitation ? 6 : 10)
+                .padding(.vertical, isCitation ? 12 : 8)
+                .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(NibPressStyle(shape: shape, rectangularHitTarget: true))
+            .accessibilityAddTraits(isSelectedFilter ? .isSelected : [])
             .disabled(action == nil)
             if let onRemove {
                 Button(action: onRemove) {
                     Image(nib: .xmark).font(.system(size: 10, weight: .bold))
-                        .frame(width: 16, height: 16)
-                        .padding(.horizontal, 6)                   // 28 pt wide
-                        .hitPadding(14)                            // 44 pt tall
+                        .frame(width: 28, height: NibMetrics.hitTarget)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(NibPressStyle(shape: Capsule(), rectangularHitTarget: true))
                 .accessibilityLabel(String(localized: "Remove \(title)", bundle: .module))
             }
         }
         .foregroundStyle(isCitation ? NibColor.accent : (isSelectedFilter ? NibColor.label : NibColor.labelSecondary))
-        .padding(.horizontal, isCitation ? 6 : 10)
-        .frame(minHeight: isCitation ? 20 : 28)
-        .background(isCitation ? NibColor.accentWash : (isSelectedFilter ? NibColor.fill2 : NibColor.fill3),
-                    in: RoundedRectangle(cornerRadius: isCitation ? NibRadius.badge : 14, style: .continuous))
+        .background {
+            shape.fill(isCitation ? NibColor.accentWash : (isSelectedFilter ? NibColor.fill2 : NibColor.fill3))
+                .padding(.vertical, isCitation ? 12 : 8)
+        }
         .fixedSize()
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 

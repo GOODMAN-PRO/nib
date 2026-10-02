@@ -33,6 +33,8 @@ enum NibOptics {
     static let liftedShadow: CGFloat = 1.6
     /// The selection bead's key rim: the bead minus itself moved this far away from the light.
     static let beadRim: CGFloat = 0.8
+    /// Deep frost stops inside the body, leaving the optical rim clear.
+    static let frostInset: CGFloat = 1.5
 
     static func smoothstep(_ a: CGFloat, _ b: CGFloat, _ x: CGFloat) -> CGFloat {
         guard a.isFinite, b.isFinite, x.isFinite else { return 0 }

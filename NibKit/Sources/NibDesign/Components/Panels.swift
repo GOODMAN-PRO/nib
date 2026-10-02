@@ -502,42 +502,77 @@ public struct NibPanelHeader<Trailing: View>: View {
         self.menu = menu()
     }
 
+    @Environment(\.dynamicTypeSize) private var typeSize
+
     public var body: some View {
-        HStack(spacing: 10) {
-            Image(nib: symbol)
-                .font(NibFont.glyph(.round))
-                .foregroundStyle(NibColor.label)
-                .frame(width: 30, height: 30)
-                .background(NibColor.fill3, in: Circle())
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: NibSpacing.s) {
-                    Text(title)
-                        .font(NibFont.headline)
-                        .foregroundStyle(NibColor.label)
-                        .lineLimit(2)
-                        .accessibilityAddTraits(.isHeader)
-                    if let badge { NibBadge(badge) }
+        Group {
+            if typeSize.isAccessibilitySize {
+                stacked
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) {
+                        glyph
+                        heading.fixedSize(horizontal: true, vertical: true)
+                        Spacer(minLength: NibSpacing.s)
+                        controls
+                    }
+                    stacked
                 }
-                if let subtitle {
-                    Text(subtitle)
-                        .font(NibFont.caption1)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .lineLimit(2)
-                }
-            }
-            Spacer(minLength: NibSpacing.s)
-            HStack(spacing: 0) {
-                menu
-                NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
-                              action: onClose)
-                    .accessibilityIdentifier("cmd.panel.close")
             }
         }
         .padding(.leading, NibSpacing.l)
         .padding(.trailing, NibSpacing.xs)
         .padding(.vertical, NibSpacing.s)
         .frame(minHeight: 60)
+    }
+
+    private var stacked: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.s) {
+            HStack {
+                glyph
+                Spacer(minLength: NibSpacing.s)
+                controls
+            }
+            heading
+                .padding(.trailing, NibSpacing.m)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var glyph: some View {
+        Image(nib: symbol)
+            .font(NibFont.glyph(.round))
+            .foregroundStyle(NibColor.label)
+            .frame(width: 30, height: 30)
+            .background(NibColor.fill3, in: Circle())
+            .accessibilityHidden(true)
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: NibSpacing.s) {
+                Text(title)
+                    .font(NibFont.headline)
+                    .foregroundStyle(NibColor.label)
+                    .accessibilityAddTraits(.isHeader)
+                if let badge { NibBadge(badge) }
+            }
+            if let subtitle {
+                Text(subtitle)
+                    .font(NibFont.caption1)
+                    .foregroundStyle(NibColor.labelSecondary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 0) {
+            menu
+            NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
+                          action: onClose)
+                .accessibilityIdentifier("cmd.panel.close")
+        }
     }
 }
 
@@ -549,7 +584,7 @@ public extension NibPanelHeader where Trailing == EmptyView {
 }
 
 /// Chrome Nib draws around a plugin panel: `NibPanelHeader` with the "Plugin" badge and More (Reload, Permissions,
-/// Report a Problem). The plugin draws only inside `content`, and never draws its own glass.
+/// Report a problem). The plugin draws only inside `content`, and never draws its own glass.
 public struct NibPluginPanelChrome<Content: View>: View {
     let name: String
     let symbol: NibSymbol
@@ -577,7 +612,7 @@ public struct NibPluginPanelChrome<Content: View>: View {
                 Menu {
                     Button(String(localized: "Reload", bundle: .module), action: onReload)
                     Button(String(localized: "Permissions", bundle: .module), action: onPermissions)
-                    Button(String(localized: "Report a Problem", bundle: .module), action: onReport)
+                    Button(String(localized: "Report a problem", bundle: .module), action: onReport)
                 } label: {
                     Image(nib: .more)
                         .font(NibFont.glyph(.panel))

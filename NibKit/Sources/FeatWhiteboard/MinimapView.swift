@@ -690,8 +690,8 @@ struct MinimapMap: View {
             }
         }
         .frame(width: g.size.width, height: g.size.height, alignment: .topLeading)
-        // The droplet clips to its own body; the board render has no inset card or separate rounded bezel.
-        .clipped()
+        // Keep the edge-to-edge foreground inside the panel at rest; the droplet adds its shrinking body mask.
+        .clipShape(NibDropletShape(cornerRadius: DropletStyle.floatingPanel.cornerRadius))
         .contentShape(Rectangle())
         // Panning the viewport takes priority over the floating-panel preset's pickup gesture.
         .highPriorityGesture(DragGesture(minimumDistance: 3)

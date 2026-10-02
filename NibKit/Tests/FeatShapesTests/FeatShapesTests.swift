@@ -281,7 +281,7 @@ final class FeatShapesTests: XCTestCase {
         for kind in [ShapeKind.line, .arrow, .arc, .curve, .rectangle, .ellipse, .triangle, .polygon] {
             let shape = try ShapeGeometry.make(kind, frame: Frame(x: origin.x + 20, y: origin.y + 20, w: 120, h: 80),
                 points: nil, style: ShapeItemStyle(strokeWidth: 1.2, cornerRadius: 0, drawnWith: .pen))
-            let pixels = inkedPixels { cg in
+            let pixels = inkedPixels(name: "Held \(kind)") { cg in
                 cg.translateBy(x: -origin.x, y: -origin.y)
                 ShapeRenderer.draw(shape, in: cg, scale: 1, darkPaper: false)
             }
@@ -1011,11 +1011,17 @@ final class FeatShapesTests: XCTestCase {
     }
 
     /// Pixels with visible alpha after drawing into a transparent 160 × 120 pt bitmap at 1×.
-    private func inkedPixels(_ draw: (CGContext) -> Void) -> Int {
+    private func inkedPixels(name: String? = nil, _ draw: (CGContext) -> Void) -> Int {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = false
         let image = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 120), format: format).image { draw($0.cgContext) }
+        if let name {
+            let attachment = XCTAttachment(image: image)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
         guard let cg = image.cgImage else { return 0 }
         let w = cg.width, h = cg.height
         var data = [UInt8](repeating: 0, count: w * h * 4)

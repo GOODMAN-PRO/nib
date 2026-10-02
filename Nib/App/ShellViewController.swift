@@ -1,6 +1,7 @@
 import UIKit
 import SwiftUI
 import NibContracts
+import NibDesign
 
 /// Root of every window. Owns the tab model and implements `SceneNavigator`; everything visible is provided by
 /// features through `app.ui.screens` (library, document chrome, settings, onboarding) with minimal fallbacks.
@@ -34,6 +35,9 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        synchroniseLiquidMode()
+        NotificationCenter.default.addObserver(self, selector: #selector(synchroniseLiquidMode),
+            name: SettingsStore.didChange, object: app.settings)
         let focusTap = UITapGestureRecognizer(target: self, action: #selector(reclaimLibraryKeyFocusAfterTap))
         focusTap.cancelsTouchesInView = false
         focusTap.delaysTouchesBegan = false
@@ -458,6 +462,10 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         contentPresentationDidChange()
         // The new screen may take focus as it appears; only when nothing did does the shell take it.
         Task { @MainActor [weak self] in self?.reclaimKeyFocusIfNeeded() }
+    }
+
+    @objc private func synchroniseLiquidMode() {
+        traitOverrides[NibLiquidModeTrait.self] = NibLiquidMode(rawValue: app.settings.get(NibSettings.liquidMode)) ?? .full
     }
 
     private var chromeTraits: UITraitCollection {

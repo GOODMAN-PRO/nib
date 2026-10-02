@@ -398,6 +398,10 @@ struct ToolbarCustomizationView: View {
         HStack(spacing: NibSpacing.xs) {
             if let control {
                 controlButton(row, control)
+            } else {
+                Color.clear
+                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+                    .accessibilityHidden(true)
             }
             NibRow(row.title, icon: row.symbol) {
                 if row.isPlugin { NibBadge(.plugin) }

@@ -15,6 +15,19 @@ public struct NibDropletShape: Shape {
     }
 }
 
+/// Concentric Deep frost mask; body and optical layers retain their original bounds.
+struct NibFrostShape: Shape {
+    let shape: NibDropletShape
+
+    func path(in rect: CGRect) -> Path {
+        let inset = NibOptics.frostInset
+        let radius = min(shape.cornerRadius ?? min(rect.width, rect.height) / 2,
+                         min(rect.width, rect.height) / 2)
+        return NibDropletShape(cornerRadius: max(0, radius - inset))
+            .path(in: rect.insetBy(dx: inset, dy: inset))
+    }
+}
+
 /// The four droplet materials (DESIGN.md §2). Nothing else is glass.
 public enum NibGlass: Sendable {
     case clear, deep, tinted, bead
@@ -264,17 +277,16 @@ struct NibGlassModifier: ViewModifier {
         ZStack {
             NibWaterShadow(shape: shape)
             if kind == .deep && !frozen {
-                shape.fill(.ultraThinMaterial)
+                NibFrostShape(shape: shape).fill(.ultraThinMaterial)
             }
             shape.fill(tint)
             NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: kind == .tinted, tinted: kind == .tinted)
         }
     }
 
-    private var opaque: some View {
+    var opaque: some View {
         shape.fill(kind == .deep ? NibColor.backgroundSecondary : (kind == .tinted ? NibColor.accent : NibColor.chromeOpaque))
-            .overlay { shape.stroke(NibColor.waterLine, lineWidth: 0.8) }
-            .nibElevation(.rest)
+            .overlay { shape.stroke(NibColor.waterLine, lineWidth: NibStroke.outline) }
     }
 }
 

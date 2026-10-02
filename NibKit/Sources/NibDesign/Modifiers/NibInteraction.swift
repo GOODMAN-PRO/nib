@@ -18,25 +18,31 @@ public extension EnvironmentValues {
 /// (2 pt accent, 2 pt outside, concentric) in place of the system focus effect.
 public struct NibPressStyle: ButtonStyle {
     let shape: AnyShape
+    let rectangularHitTarget: Bool
 
-    public init<S: Shape>(shape: S) { self.shape = AnyShape(shape) }
+    /// Chips can keep the full rectangular hit target while hover and focus retain the visual shape.
+    public init<S: Shape>(shape: S, rectangularHitTarget: Bool = false) {
+        self.shape = AnyShape(shape)
+        self.rectangularHitTarget = rectangularHitTarget
+    }
     public init() { self.init(shape: Capsule()) }
 
     public func makeBody(configuration: Configuration) -> some View {
-        NibPressBody(configuration: configuration, shape: shape)
+        NibPressBody(configuration: configuration, shape: shape, rectangularHitTarget: rectangularHitTarget)
     }
 }
 
 struct NibPressBody: View {
     let configuration: ButtonStyleConfiguration
     let shape: AnyShape
+    var rectangularHitTarget = false
     @Environment(\.isFocused) private var isFocused
 
     var body: some View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .animation(NibMotion.tap.animation, value: configuration.isPressed)
-            .contentShape(.interaction, shape)
+            .contentShape(.interaction, rectangularHitTarget ? AnyShape(Rectangle()) : shape)
             .contentShape(.hoverEffect, shape)
             .hoverEffect(.highlight)
             .overlay {

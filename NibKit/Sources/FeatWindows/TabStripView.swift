@@ -308,6 +308,15 @@ struct TabCapsule: View {
     let width: CGFloat
     let model: TabStripModel
 
+    /// Display only: the shell owns the keys. ⌘9 selects the last tab, not the ninth.
+    static func shortcutHint(index: Int, count: Int) -> KeyboardShortcut? {
+        guard index >= 0, index < count else { return nil }
+        if index < 8 {
+            return KeyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+        }
+        return index == count - 1 ? KeyboardShortcut("9", modifiers: .command) : nil
+    }
+
     var body: some View {
         let items = model.menuItems(tab)
         HStack(spacing: 0) {
@@ -325,6 +334,7 @@ struct TabCapsule: View {
                     .contentShape(Rectangle().inset(by: -TabStripLayout.hitOutset))
             }
             .buttonStyle(NibPressStyle(shape: Capsule()))
+            .nibShortcutHint(Self.shortcutHint(index: tab.index, count: count))
             .accessibilityLabel(tab.title)
             .accessibilityValue(String(localized: "Tab \(tab.index + 1) of \(count)"))
             .accessibilityAddTraits(isSelected ? .isSelected : [])
@@ -336,7 +346,7 @@ struct TabCapsule: View {
             }
             .accessibilityShowsLargeContentViewer { Text(tab.title) }
             if isSelected {
-                NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .panel) { model.close(tab) }
+                NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .bar) { model.close(tab) }
                     .frame(width: TabStripLayout.closeWidth, height: TabStripLayout.tabHeight)
             }
         }

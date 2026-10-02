@@ -446,20 +446,23 @@ final class SqueezePalettePresenter {
     func present(_ model: PaletteModel, at point: CGPoint, in host: CanvasHost) -> Bool {
         dismiss()
         guard let window = host.canvasView.window else { return false }
+        let parent = window.rootViewController
+        // A child controller's view must live inside its parent's view hierarchy. Adding it
+        // directly to the window after addChild violates UIKit's hosting-controller containment.
+        let container = parent?.view ?? window
         let close: () -> Void = { [weak self] in self?.dismiss() }
         model.onDismiss = close
-        let overlay = PaletteOverlay(model: model, anchor: host.canvasView.convert(point, to: window),
-                                     insets: window.safeAreaInsets, dismiss: close)
+        let overlay = PaletteOverlay(model: model, anchor: host.canvasView.convert(point, to: container),
+                                     insets: container.safeAreaInsets, dismiss: close)
         let controller = PaletteHostingController(rootView: overlay)
         controller.onEscape = close
         controller.view.backgroundColor = .clear
-        controller.view.frame = window.bounds
+        controller.view.frame = container.bounds
         controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         let responder = Self.firstResponder(in: window)
             ?? (host.canvasView.canBecomeFirstResponder ? host.canvasView : nil)
-        let parent = window.rootViewController
         parent?.addChild(controller)
-        window.addSubview(controller.view)
+        container.addSubview(controller.view)
         if let parent { controller.didMove(toParent: parent) }
         model.start()
         self.controller = controller
@@ -484,12 +487,16 @@ final class SqueezePalettePresenter {
         model = nil
         host = nil
         if let view = restore as? UIView, view.window != nil { view.becomeFirstResponder() }
+        if let controller = restore as? UIViewController, controller.viewIfLoaded?.window != nil {
+            controller.becomeFirstResponder()
+        }
         UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 
-    /// The view that has the keyboard (only on open, never per frame).
-    private static func firstResponder(in view: UIView) -> UIView? {
+    /// Views and controllers can own the keyboard (only searched on open, never per frame).
+    private static func firstResponder(in view: UIView) -> UIResponder? {
         if view.isFirstResponder { return view }
+        if let controller = view.next as? UIViewController, controller.isFirstResponder { return controller }
         for subview in view.subviews {
             if let found = firstResponder(in: subview) { return found }
         }

@@ -176,8 +176,10 @@ public struct NibPaperTile<Content: View>: View {
                 Text(name)
                     .font(NibFont.caption1)
                     .foregroundStyle(isSelected ? NibColor.accent : NibColor.labelSecondary)
-                    .lineLimit(1)
-                    .frame(maxWidth: size.width)
+                    .lineLimit(nil)
+                    .multilineTextAlignment(.center)
+                    .frame(width: size.width)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .contentShape(Rectangle())
         }

@@ -603,6 +603,66 @@ final class FeatKeyboardTests: XCTestCase {
         withExtendedLifetime(editor) {}
     }
 
+    func testCanvasResponderRoutesFeatureOwnedPaletteShortcutAndRevalidatesItsWinner() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let root = KeyboardWindowController(session: h.session)
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let keyboard = attachment.keyboard
+        keyboard.restoreFocus()
+        XCTAssertTrue(CanvasKeyboardFocus.firstResponder(in: window) === keyboard)
+
+        // F043's shortcut is not in GlobalShortcuts.catalog. Register after attachment, as a
+        // feature/plugin can, and exercise discovery and dispatch through the actual responder.
+        var palette = descriptor("pencilhw.palette", "p", [.control, .command], scope: .document,
+                                 kinds: [.notebook, .whiteboard], owner: "pencilhw", command: CommandIDs.pencilPalette)
+        palette.params = ["kind": "tools"]
+        h.app.content.keyCommands.register(palette)
+        var receivedSession: EditorSession?
+        var receivedParams: JSONValue?
+        let ran = expectation(description: "Pencil palette in the keyboard's window")
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.pencilPalette, title: "Palette",
+            summary: "Records the palette request.", effect: .session, target: .app)) { params, ctx in
+            receivedSession = ctx.activeSession
+            receivedParams = params
+            ran.fulfill()
+            return [:]
+        }
+        let other = EditorSession()
+        other.document = Fixtures.textDocID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let key = try XCTUnwrap(keyboard.keyCommands?.first { $0.propertyList as? String == palette.id })
+        let action = try XCTUnwrap(key.action)
+        let target = try XCTUnwrap(keyboard.target(forAction: action, withSender: nil) as? UIResponder)
+        XCTAssertTrue(target === keyboard)
+        XCTAssertEqual(key.input, "p")
+        XCTAssertEqual(key.modifierFlags, [.control, .command])
+        XCTAssertTrue(key.wantsPriorityOverSystemBehavior)
+        _ = target.perform(action, with: key)
+        await fulfillment(of: [ran], timeout: 3)
+        XCTAssertTrue(receivedSession === h.session)
+        XCTAssertEqual(receivedParams, ["kind": "tools"])
+
+        var replacement = palette
+        replacement.id = "plugin.palette"
+        replacement.docKinds = [.notebook]
+        h.app.content.keyCommands.register(replacement)
+        XCTAssertNil(keyboard.descriptor(for: key), "A stale key cannot bypass the current winner")
+        XCTAssertEqual(keyboard.keyCommands?.filter {
+            $0.input == "p" && $0.modifierFlags == [.control, .command]
+        }.map { $0.propertyList as? String }, [replacement.id])
+        h.session.document = Fixtures.textDocID
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true, "A closed canvas cannot route its palette key")
+    }
+
     func testCanvasResponderRevalidatesRegistryAndTextFocus() async throws {
         let h = await started()
         let host = FakeCanvasHost(h)

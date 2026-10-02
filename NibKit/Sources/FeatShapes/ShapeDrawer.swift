@@ -1058,10 +1058,13 @@ enum ShapeRenderer {
         }
         guard !strokes.isEmpty else { return true }
         let drawing = PKBridge.drawing(strokes)
-        var rect = drawing.bounds
+        // PencilKit needs room around the nib when rasterising a thin synthetic path.
+        // Its tight fractional bounds can clip away axis-aligned outlines entirely.
+        var rect = drawing.bounds.insetBy(dx: -2, dy: -2)
         let clip = cg.boundingBoxOfClipPath
         if !clip.isNull, !clip.isInfinite { rect = rect.intersection(clip) }
         guard !rect.isNull, rect.width > 0, rect.height > 0 else { return true }
+        rect = rect.integral
         // ponytail: one bitmap per draw, capped at 16 Mpx; tile the ink if huge shapes at deep zoom ever look soft.
         var pxPerPt = CGFloat(max(scale, 0.25))
         let pixels = rect.width * rect.height * pxPerPt * pxPerPt
@@ -1070,7 +1073,7 @@ enum ShapeRenderer {
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
             image = drawing.image(from: rect, scale: pxPerPt)
         }
-        guard let cgImage = image?.cgImage else { return true }
+        guard let cgImage = image?.cgImage else { return false }
         cg.saveGState()
         defer { cg.restoreGState() }
         if tool == .highlighter {

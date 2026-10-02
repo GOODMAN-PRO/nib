@@ -111,7 +111,9 @@ final class LibraryViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if event.type == NibEventType.syncStatus {
-                    self.syncText = event.payload?["message"]?.stringValue ?? String(localized: "Syncing library")
+                    if let status = event.decode(SyncStatusPayload.self) {
+                        self.syncText = LibrarySyncPresentation.text(status)
+                    }
                 } else {
                     await self.markDirty()
                 }
@@ -402,7 +404,9 @@ final class LibraryViewModel: ObservableObject {
         case .combine(let ref, into: let target):
             let refs = selection.refs.contains(ref) ? documentRefs.filter { selection.refs.contains($0) && $0 != target } : [ref]
             confirmation = LibraryConfirmation(title: String(localized: "Combine"), command: CommandIDs.libraryMove,
-                params: ["refs": .array(refs.map(JSONValue.string)), "folder": .string(target)])
+                params: ["refs": .array(refs.map(JSONValue.string)), "folder": .string(target)],
+                message: LibraryConfirmation.combineMessage(names: refs.compactMap { ref in rows.first { $0.ref == ref }?.name },
+                    destination: rows.first { $0.ref == target }?.name ?? String(localized: "the destination document")))
         case .reorder(let move):
             guard collection == .documents else { return }
             // Apply immediately, in the same update that clears reflow's offsets.
@@ -500,6 +504,9 @@ final class LibraryRootViewController: UIViewController {
 }
 
 enum LibraryPresentation {
+    static func usesInlineSidebar(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
+        !isCompact(size: size, idiom: idiom) && size.width > size.height && size.width >= NibMetrics.librarySidebarBreakpoint
+    }
     static var actionPairWidth: CGFloat { 2 * NibMetrics.hitTarget + NibMetrics.minimumRestingGap }
     static func isCompactHeight(size: CGSize) -> Bool {
         size.height < NibMetrics.compactBreakpoint && size.width > size.height
@@ -527,7 +534,7 @@ struct LibraryRootView: View {
                 ?? model.controller?.viewIfLoaded?.bounds.size ?? geometry.size
             let compact = LibraryPresentation.isCompact(size: windowSize, idiom: idiom)
             let short = LibraryPresentation.isCompactHeight(size: geometry.size)
-            let inlineSidebar = !compact && geometry.size.width >= NibMetrics.librarySidebarBreakpoint
+            let inlineSidebar = LibraryPresentation.usesInlineSidebar(size: windowSize, idiom: idiom)
             ZStack {
                 let context = model.chromeContext(isCompact: compact)
                 let overlays = model.visibleChromeOverlays(context)
@@ -642,6 +649,12 @@ struct LibraryRootView: View {
                     }
                     .accessibilityIdentifier("cmd." + confirmation.command)
                 }
+            } message: {
+                if let message = model.confirmation?.message { Text(message) }
+            }
+            .onChange(of: inlineSidebar, initial: true) { _, inline in
+                // An inline sidebar becoming an overlay must not cover the library until requested.
+                if !inline && !compact && model.sidebarVisible { model.setView(["sidebar": false]) }
             }
             .onAppear { searchText = model.search }
             .onChange(of: model.rows.count, initial: true) { _, _ in
@@ -752,7 +765,7 @@ struct LibraryRootView: View {
         }
     }
     private var itemCount: some View {
-        Text(LibraryRow.itemCount(model.visibleRows.count) + " · " + (model.collection == .recents && model.sort == .modified ? String(localized: "Last opened") : model.sort.title))
+        Text(model.selection.isSelecting ? model.selection.statusText : LibraryRow.itemCount(model.visibleRows.count) + " · " + (model.collection == .recents && model.sort == .modified ? String(localized: "Last opened") : model.sort.title))
             .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -795,6 +808,7 @@ struct LibraryRootView: View {
     }
     private var selectionBar: some View {
         NibBarGroup(id: "library.selection") {
+            Text(model.selection.statusText).font(NibFont.hud).foregroundStyle(NibColor.label)
             LibraryMenuEntries(model: model, location: .librarySelection, rows: model.rows.filter { model.selection.refs.contains($0.ref) }, compact: true)
             NibIconButton(.xmark, label: String(localized: "Finish Selecting")) { model.setView(["selection": "clear"]) }
             .accessibilityIdentifier("cmd.library.setView")
@@ -1154,6 +1168,45 @@ struct LibraryConfirmation {
     var title: String
     var command: String
     var params: JSONValue
+    var message: String? = nil
+
+    static func itemSummary(names: [String]) -> String {
+        if names.count == 1 { return "“\(names[0])”" }
+        if names.count == 2 { return String(localized: "“\(names[0])” and “\(names[1])”") }
+        return LibraryRow.itemCount(names.count)
+    }
+    static func trashMessage(names: [String]) -> String {
+        String(localized: "Move \(itemSummary(names: names)) to Trash? You can restore them from Trash.")
+    }
+    static func combineMessage(names: [String], destination: String) -> String {
+        String(localized: "Add the contents of \(itemSummary(names: names)) to “\(destination)”. The source documents will move to Trash.")
+    }
+}
+
+enum LibrarySyncPresentation {
+    static func text(_ status: SyncStatusPayload) -> String {
+        if let message = status.message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return message }
+        let source: String
+        switch status.source {
+        case "backup": source = String(localized: "Backup")
+        case "webdav": source = "WebDAV"
+        case "store": source = String(localized: "Storage")
+        default: source = String(localized: "Library")
+        }
+        let state: String
+        switch status.state {
+        case "syncing": state = status.source == "backup" ? String(localized: "Backing up") : String(localized: "Syncing")
+        case "checking": state = String(localized: "Checking for changes")
+        case "downloading": state = String(localized: "Downloading")
+        case "ok": state = status.source == "backup" ? String(localized: "Backup complete") : String(localized: "Up to date")
+        case "idle": state = status.source == "backup" ? String(localized: "No backup in progress") : String(localized: "Up to date")
+        case "offline": state = String(localized: "Offline")
+        case "error": state = String(localized: "Couldn't complete. Review Cloud & Backup.")
+        case "warning": state = status.reason == "offline" ? String(localized: "Offline") : String(localized: "Needs attention. Review Cloud & Backup.")
+        default: state = String(localized: "Status unavailable")
+        }
+        return source + " · " + state
+    }
 }
 
 /// One app-wide cache; commits evict only the affected document, without a catalog query.
@@ -1213,7 +1266,8 @@ final class LibraryCoverCache: ObservableObject {
 
 // Library-specific tokens stay in F019's ownership until NibDesign adopts them.
 extension NibMetrics {
-    static let librarySidebarBreakpoint = compactBreakpoint + sidebarWidth
+    static let librarySidebarBreakpoint: CGFloat = 900
+    static let libraryRowPitch: CGFloat = 250
     static let libraryThumbnailMaxPixels = 512
     static let libraryCoverCacheCount = 96
     static let libraryCoverCacheBytes = 64 * 1024 * 1024
@@ -1258,12 +1312,12 @@ struct LibrarySidebarPlace: Identifiable {
 }
 
 struct LibraryStorageNotice: View {
-    static var message: String { String(localized: "A reinstall risks note loss.") }
+    static var message: String { String(localized: "Reinstalls can lose notes.") }
     let move: () -> Void
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {
         if dynamicTypeSize.isAccessibilitySize {
-            NibBanner(Self.message, action: NibAction(String(localized: "Move Library"), handler: move))
+            NibBanner(Self.message, action: NibAction(String(localized: "Review storage"), handler: move))
         } else {
             HStack(spacing: NibSpacing.s) {
                 Image(nib: .warningTriangle).font(NibFont.glyph(.panel))
@@ -1272,7 +1326,7 @@ struct LibraryStorageNotice: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .libraryChromeFrame("storage.message")
-                Button(String(localized: "Move Library"), action: move)
+                Button(String(localized: "Review storage"), action: move)
                     .font(NibFont.button).foregroundStyle(NibColor.accent)
                     .fixedSize().frame(minHeight: NibMetrics.hitTarget)
                     .buttonStyle(NibPressStyle())

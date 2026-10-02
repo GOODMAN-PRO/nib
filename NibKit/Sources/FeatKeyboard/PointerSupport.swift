@@ -340,7 +340,13 @@ final class CanvasKeyboardResponder: UIView {
     private var descriptors: [KeyCommandDescriptor] {
         guard let host, host.session.document == host.documentID else { return [] }
         return KeyCommandRouting.active(host.app.content.keyCommands.all, in: context).filter {
-            shortcuts.contains(ShortcutRules.normalized($0.shortcut))
+            if shortcuts.contains(ShortcutRules.normalized($0.shortcut)) { return true }
+            // Feature-owned page shortcuts (e.g. the Pencil palette) also need a target below the
+            // SwiftUI hosting boundary. Read the live registry so late registrations/replacements
+            // work; the keyboard feature's catalog is not the complete set of canvas commands.
+            guard $0.scope == .document || $0.scope == .canvas,
+                  let kinds = $0.docKinds, !kinds.isEmpty else { return false }
+            return kinds.isSubset(of: ShortcutContext.canvasKinds)
         }
     }
 

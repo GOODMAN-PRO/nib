@@ -557,7 +557,7 @@ final class DropletField {
             }
             let lift = liftProgress(e)
             return Render(id: id, material: e.style.material, path: bodyPath(e, inset: 0), innerPath: bodyPath(e, inset: 0.8),
-                          frostPath: bodyPath(e, inset: 1.5), frostOpacity: frost,
+                          frostPath: bodyPath(e, inset: NibOptics.frostInset), frostOpacity: frost,
                           budLine: e.bud.map { !$0.revealed || $0.closingAt != nil } ?? false,
                           paper: e.style.refracts ? paperShare(visualBox(e)) : 0,
                           lift: Double(lift), rim: Double(e.style.rimStrength(lift: lift)), castsShadow: !e.style.restsDry)

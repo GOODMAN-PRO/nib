@@ -22,14 +22,9 @@ enum LibraryCarrierVisibility {
 
 @MainActor
 enum LibraryFolderLayout {
-    static func minimumWidth(names: [String], font: UIFont) -> CGFloat {
-        let textWidth = names.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
-        // Budget for wide custom glyphs and text rounding before adding another folder column.
-        return max(NibMetrics.folderTileMinWidth, ceil(textWidth) + NibMetrics.barHeightMax + NibSpacing.m + 2 * NibSpacing.l + NibSpacing.s)
-    }
-
-    static func columnCount(width: CGFloat, minimum: CGFloat, gutter: CGFloat) -> Int {
-        min(4, max(1, Int((max(0, width) + gutter) / (minimum + gutter))))
+    static func columnCount(width: CGFloat, gutter: CGFloat) -> Int {
+        // Column count depends on the viewport, never on a folder's title.
+        min(4, max(1, Int((max(0, width) + gutter) / (NibMetrics.folderTileMinWidth + gutter))))
     }
 }
 
@@ -56,6 +51,7 @@ struct LibraryGridView: View {
     var compactHeight = false
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var contentWidth: CGFloat = 0
+    @ScaledMetric(relativeTo: .footnote) private var labelAllowance = NibMetrics.libraryRowPitch - NibMetrics.coverSize.height
     @State private var frames: [String: CGRect] = [:]
     @State private var dragSelection = LibrarySelection()
     @State private var selecting = false
@@ -63,7 +59,7 @@ struct LibraryGridView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {
         Group {
-            if model.isLoading && model.rows.isEmpty { ProgressView(String(localized: "Loading library")) }
+            if model.isLoading && model.rows.isEmpty { loadingPlaceholders }
             else if model.rows.isEmpty && model.error == nil && model.collection != .documents {
                 NibEmptyState(symbol: model.collection.symbol,
                     title: model.collection == .recents ? String(localized: "No recent documents") : String(localized: "No study sets yet"),
@@ -71,13 +67,13 @@ struct LibraryGridView: View {
                     primary: NibAction(String(localized: "Show Documents"), command: "library.setView") { model.setView(["collection": "documents"]) })
             }
             else if model.rows.isEmpty && model.error == nil {
-                NibEmptyState(symbol: .notebook, title: String(localized: "No notebooks yet"), message: String(localized: "Write something, or bring in a PDF."),
+                NibEmptyState(symbol: .notebook, title: model.folder == nil ? String(localized: "No notebooks yet") : String(localized: "Nothing in \(model.title) yet"), message: model.folder == nil ? String(localized: "Write something, or bring in a PDF.") : String(localized: "Drag notebooks here."),
                     primary: NibAction(String(localized: "New Notebook"), command: CommandIDs.panelOpen) { model.perform(CommandIDs.panelOpen, ["id": "create.newNotebook", "folder": model.folderRef]) },
-                    secondary: NibAction(String(localized: "Import"), command: CommandIDs.importPick) { model.perform(CommandIDs.importPick, ["target": model.folderRef]) })
+                    secondary: model.folder == nil ? NibAction(String(localized: "Import"), command: CommandIDs.importPick) { model.perform(CommandIDs.importPick, ["target": model.folderRef]) } : nil)
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : NibMetrics.libraryGutter) {
-                        if model.layout == .list { list }
+                        if usesRows { list }
                         else { grid }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -127,41 +123,75 @@ struct LibraryGridView: View {
             : max(1, Int((contentWidth + gutter) / (coverWidth + gutter)))
         return Array(repeating: GridItem(.fixed(coverWidth), spacing: gutter, alignment: .top), count: count)
     }
+    private var usesRows: Bool { model.layout == .list || dynamicTypeSize.isAccessibilitySize }
+    private var rowPitch: CGFloat {
+        max(NibMetrics.libraryRowPitch, NibMetrics.coverSize.height + labelAllowance)
+    }
     private var folderColumns: [GridItem] {
-        var font = NibUIFont.button
-        UITraitCollection(preferredContentSizeCategory: dynamicTypeSize.uiContentSizeCategory).performAsCurrent {
-            font = NibUIFont.button
-        }
-        let minimum = LibraryFolderLayout.minimumWidth(names: folders.map(\.name), font: font)
-        let count = LibraryFolderLayout.columnCount(width: contentWidth, minimum: minimum, gutter: gutter)
+        let count = LibraryFolderLayout.columnCount(width: contentWidth, gutter: gutter)
         let width = max(0, (contentWidth - CGFloat(count - 1) * gutter) / CGFloat(count))
         return Array(repeating: GridItem(.fixed(width), spacing: gutter, alignment: .top), count: count)
     }
-    @ViewBuilder private var grid: some View {
-        folderSection
-        documentSection
+    private var grid: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.x3) {
+            folderSection
+            documentSection
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder private var folderSection: some View {
         if !folders.isEmpty {
-            Text(String(localized: "Folders")).font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: folderColumns, alignment: .leading, spacing: gutter) {
-                ForEach(folders) { row in
-                    cell(row)
+            VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : gutter) {
+                Text(String(localized: "Folders")).font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
+                LazyVGrid(columns: folderColumns, alignment: .leading, spacing: gutter) {
+                    ForEach(folders) { row in cell(row) }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
     @ViewBuilder private var documentSection: some View {
         if !documents.isEmpty {
-            Text(documents.allSatisfy { $0.kind == "notebook" } ? String(localized: "Notebooks") : String(localized: "Documents"))
-                .font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: coverColumns, alignment: .leading, spacing: gutter) {
-                ForEach(documents) { row in
-                    cell(row)
+            VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : gutter) {
+                Text(documents.allSatisfy { $0.kind == "notebook" } ? String(localized: "Notebooks") : String(localized: "Documents"))
+                    .font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
+                LazyVGrid(columns: coverColumns, alignment: .leading, spacing: 0) {
+                    ForEach(documents) { row in
+                        cell(row).frame(height: model.renaming == row.ref ? nil : rowPitch, alignment: .top)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+    private var loadingPlaceholders: some View {
+        Group {
+            if usesRows {
+                LazyVStack(alignment: .leading, spacing: NibSpacing.l) {
+                    ForEach(0..<6) { _ in
+                        placeholder(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                            .padding(NibSpacing.s)
+                    }
+                }
+            } else {
+                LazyVGrid(columns: coverColumns, alignment: .leading, spacing: 0) {
+                    ForEach(0..<6) { _ in
+                        placeholder(width: coverWidth, height: sizeClass == .compact ? NibMetrics.coverSizeCompact.height : NibMetrics.coverSize.height)
+                            .frame(height: rowPitch, alignment: .top)
+                    }
                 }
             }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(String(localized: "Loading library"))
+        .onAppear { UIAccessibility.post(notification: .announcement, argument: String(localized: "Loading library")) }
+    }
+    private func placeholder(width: CGFloat, height: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous)
+            .fill(NibPaper.white.color)
+            .frame(width: width, height: height)
+            .nibElevation(.paper)
     }
     private var list: some View {
         LazyVStack(spacing: NibSpacing.xs) {
@@ -390,10 +420,14 @@ struct LibraryListRow: View {
                     .frame(width: NibMetrics.rowThumbnailWidth)
             }
             else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
+                .nibElevation(.paper)
                 .libraryCoverFrame(row.ref) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
-                Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label)
-                if !row.isFolder { Text(subtitle ?? row.subtitle()).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
+                Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label).lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !row.isFolder { Text(subtitle ?? row.subtitle()).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                    .lineLimit(nil).fixedSize(horizontal: false, vertical: true) }
                 Text(Date(timeIntervalSince1970: row.modified ?? 0), style: .date).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             }
             Spacer()

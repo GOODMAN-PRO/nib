@@ -211,13 +211,14 @@ final class NibDesignV2Tests: XCTestCase {
     func testFrameViewOutlinesItsBoundsWithTheRim() throws {
         let frame = NibFrameView(frame: CGRect(x: 0, y: 0, width: 300, height: 120))
         frame.layoutIfNeeded()
-        let layers = try XCTUnwrap(frame.layer.sublayers?.compactMap { $0 as? CAShapeLayer })
+        let layers = try XCTUnwrap(frame.layer.sublayers)
         XCTAssertEqual(layers.count, 2)
-        let rim = try XCTUnwrap(layers[0].path)
-        // The shape and its copy offset by (1.1, 1.5): the union of both boxes.
-        XCTAssertEqual(rim.boundingBoxOfPath.width, 301.1, accuracy: 0.01)
-        XCTAssertEqual(rim.boundingBoxOfPath.height, 121.5, accuracy: 0.01)
-        XCTAssertNotNil(layers[0].mask)
+        let rim = try XCTUnwrap(layers[0] as? NibDirectionalRimLayer)
+        // DESIGN.md §10.9 retires the offset crescent: optics stay inside the original silhouette.
+        XCTAssertEqual(rim.frame, frame.bounds)
+        XCTAssertEqual(rim.cornerRadius, NibRadius.zoomFrame)
+        let outline = try XCTUnwrap(layers[1] as? CAShapeLayer)
+        XCTAssertEqual(outline.lineWidth, 0.8)
     }
 
     @MainActor

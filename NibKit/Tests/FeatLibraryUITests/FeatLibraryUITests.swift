@@ -779,7 +779,7 @@ final class FeatLibraryUITests: XCTestCase {
             }
         }
     }
-    func testFolderTitlesFitTheirMeasuredGridCellsWithoutTruncation() async throws {
+    func testFolderTilesUseViewportColumnsWithTailTruncation() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         let rows = ["Research", "Semester Notes", "Reference notes", "Reading"].enumerated().map { index, title in
             LibraryRow(ref: "folder:TITLETEST0\(index)", kind: "folder", title: title)
@@ -794,15 +794,13 @@ final class FeatLibraryUITests: XCTestCase {
                     .environment(\.horizontalSizeClass, compact ? .compact : .regular)
                     .onPreferenceChange(LibraryFrames.self) { frames = $0 }
                 _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 768), variant: variant)
-                var font = NibUIFont.button
-                UITraitCollection(preferredContentSizeCategory: variant == .largeText ? .accessibilityExtraLarge : .large)
-                    .performAsCurrent { font = NibUIFont.button }
+                // DESIGN §5 requires tail truncation, not columns sized to the longest name.
+                let count = LibraryFolderLayout.columnCount(width: width, gutter: compact ? NibSpacing.l : NibMetrics.libraryGutter)
+                let gutter = compact ? NibSpacing.l : NibMetrics.libraryGutter
+                let expectedWidth = variant == .largeText ? width : (width - CGFloat(count - 1) * gutter) / CGFloat(count)
                 for row in rows {
                     let frame = try XCTUnwrap(frames[row.ref], "Every folder must be laid out")
-                    let textWidth = (row.name as NSString).size(withAttributes: [.font: font]).width
-                    let required = ceil(textWidth) + NibMetrics.hitTarget + NibSpacing.m + 2 * NibSpacing.l
-                    XCTAssertGreaterThanOrEqual(frame.width, required,
-                                                "\(row.name) must fit without an ellipsis (\(variant), compact: \(compact))")
+                    XCTAssertEqual(frame.width, expectedWidth, accuracy: 0.5)
                     XCTAssertGreaterThan(frame.height, 0)
                     XCTAssertGreaterThanOrEqual(frame.minX, -0.5)
                     XCTAssertLessThanOrEqual(frame.maxX, width + 0.5)
@@ -1127,19 +1125,88 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(model.selection.refs, [NodeRef.document(Fixtures.docID).description])
     }
 
-    func testFolderColumnsPreserveOrdinaryNamesBeforeAddingColumns() {
-        let minimum = LibraryFolderLayout.minimumWidth(names: ["Semester Notes", "Physics 9702"], font: NibUIFont.button)
-        let width: CGFloat = 656
-        let count = LibraryFolderLayout.columnCount(width: width, minimum: minimum, gutter: NibMetrics.libraryGutter)
-        XCTAssertLessThan(count, 4)
-        XCTAssertGreaterThanOrEqual((width - CGFloat(count - 1) * NibMetrics.libraryGutter) / CGFloat(count), minimum)
-        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 180, minimum: minimum, gutter: 16), 1)
-        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 1400, minimum: minimum, gutter: 24), 4)
-        var largeFont = NibUIFont.button
-        UITraitCollection(preferredContentSizeCategory: .accessibilityExtraLarge).performAsCurrent { largeFont = NibUIFont.button }
-        let largeMinimum = LibraryFolderLayout.minimumWidth(names: ["Semester 1", "Physikvorlesungen"], font: largeFont)
-        XCTAssertGreaterThan(largeMinimum, minimum)
-        XCTAssertLessThanOrEqual(LibraryFolderLayout.columnCount(width: width, minimum: largeMinimum, gutter: 24), count)
+    func testPortraitSidebarOverlaysEvenOnThirteenInchIPad() {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1032, height: 1376), CGSize(width: 1024, height: 1366)] {
+            XCTAssertFalse(LibraryPresentation.usesInlineSidebar(size: size, idiom: .pad))
+            XCTAssertTrue(LibraryPresentation.usesInlineSidebar(size: CGSize(width: size.height, height: size.width), idiom: .pad))
+        }
+        XCTAssertFalse(LibraryPresentation.usesInlineSidebar(size: CGSize(width: 899, height: 700), idiom: .pad))
+        XCTAssertTrue(LibraryPresentation.usesInlineSidebar(size: CGSize(width: 900, height: 700), idiom: .pad))
+        XCTAssertFalse(LibraryPresentation.usesInlineSidebar(size: CGSize(width: 932, height: 430), idiom: .phone))
+    }
+
+    func testSyncCompletionDoesNotLeaveSidebarSyncing() async {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        for (state, expected) in [("syncing", "Backup · Backing up"), ("ok", "Backup · Backup complete"),
+                                  ("idle", "Backup · No backup in progress")] {
+            h.app.events.emit(SyncStatusPayload(state: state, source: "backup"))
+            for _ in 0..<30 { await Task.yield() }
+            XCTAssertEqual(model.syncText, expected)
+        }
+        XCTAssertEqual(LibrarySyncPresentation.text(.init(state: "offline", source: "sync")), "Library · Offline")
+        XCTAssertEqual(LibrarySyncPresentation.text(.init(state: "warning", source: "webdav", reason: "offline")), "WebDAV · Offline")
+        XCTAssertEqual(LibrarySyncPresentation.text(.init(state: "error", source: "store", message: "Couldn't save this notebook.")), "Couldn't save this notebook.")
+        XCTAssertTrue(LibrarySyncPresentation.text(.init(state: "error", source: "backup")).contains("Review Cloud & Backup"))
+        XCTAssertFalse(LibrarySyncPresentation.text(.init(state: "unknown", source: "sync")).contains("Syncing"))
+    }
+
+    func testBulkActionScopeAndConfirmationCopy() {
+        var selection = LibrarySelection()
+        XCTAssertEqual(selection.statusText, "Select items")
+        selection.toggle("doc:A")
+        XCTAssertEqual(selection.statusText, "1 selected")
+        selection.toggle("doc:B")
+        XCTAssertEqual(selection.statusText, "2 selected")
+        selection.clear()
+        XCTAssertEqual(selection.statusText, "Select items")
+        XCTAssertEqual(LibraryConfirmation.trashMessage(names: ["Physics"]), "Move “Physics” to Trash? You can restore them from Trash.")
+        XCTAssertTrue(LibraryConfirmation.trashMessage(names: ["A", "B", "C"]).contains("3 items"))
+        let combine = LibraryConfirmation.combineMessage(names: ["Physics", "Chemistry"], destination: "Revision")
+        for name in ["Physics", "Chemistry", "Revision"] { XCTAssertTrue(combine.contains(name)) }
+        XCTAssertTrue(combine.contains("source documents will move to Trash"))
+        XCTAssertEqual(LibrarySort.modified.title, "Modified, newest first")
+        XCTAssertEqual(LibrarySort.created.title, "Created, newest first")
+    }
+
+    func testWrappingTitlesKeepCoverOriginsOnTheSameRowPitch() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.rows = (0..<4).map { index in
+            LibraryRow(ref: "doc:PITCH0\(index)", kind: "notebook", title: index == 0 ? "A long notebook title that wraps onto two lines" : "Notes", modified: Double(4 - index))
+        }
+        model.applySort()
+        var frames: [String: CGRect] = [:]
+        let view = LibraryGridView(model: model)
+            .environment(\.horizontalSizeClass, .regular)
+            .onPreferenceChange(LibraryFrames.self) { frames = $0 }
+        _ = try await hostlessLayoutImage(view, size: CGSize(width: 304, height: 700), variant: .light)
+        let first = try XCTUnwrap(frames["doc:PITCH00"])
+        let second = try XCTUnwrap(frames["doc:PITCH01"])
+        let next = try XCTUnwrap(frames["doc:PITCH02"])
+        XCTAssertEqual(first.minY, second.minY, accuracy: 0.5)
+        XCTAssertEqual(next.minY - first.minY, 250, accuracy: 0.5)
+    }
+
+    func testAccessibilityGridUsesFullWidthRowsWithoutClippingLongLabels() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.rows = [LibraryRow(ref: "doc:AXROW", kind: "textDocument", title: "A long document title that needs more than two lines at accessibility sizes")]
+        model.applySort()
+        var frames: [String: CGRect] = [:]
+        let view = LibraryGridView(model: model)
+            .environment(\.horizontalSizeClass, .regular)
+            .onPreferenceChange(LibraryFrames.self) { frames = $0 }
+        _ = try await hostlessLayoutImage(view, size: CGSize(width: 420, height: 900), variant: .largeText)
+        let row = try XCTUnwrap(frames["doc:AXROW"])
+        XCTAssertEqual(row.width, 420, accuracy: 0.5)
+        XCTAssertGreaterThan(row.height, NibMetrics.barHeightMax)
+        XCTAssertEqual(model.layout, .grid, "Accessibility changes presentation, not the saved layout preference")
+    }
+
+    func testFolderColumnsFollowAvailableWidthRatherThanNames() {
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 180, gutter: 16), 1)
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 361, gutter: 16), 2)
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 656, gutter: 24), 3)
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 826, gutter: 24), 4)
+        XCTAssertEqual(LibraryFolderLayout.columnCount(width: 1400, gutter: 24), 4)
     }
 
     func testMissingAndLockedCoverGlyphsContrastWithWhitePaperInBothThemes() throws {
@@ -1631,6 +1698,11 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(commands.count, commandCount, "Combine must wait for explicit confirmation")
         let confirmation = try XCTUnwrap(model.confirmation)
         XCTAssertEqual(confirmation.title, "Combine")
+        let message = try XCTUnwrap(confirmation.message)
+        for ref in refs.prefix(3) {
+            XCTAssertTrue(message.contains(try XCTUnwrap(model.rows.first { $0.ref == ref }).name))
+        }
+        XCTAssertTrue(message.contains("Trash"))
         _ = try await h.app.bus.execute(confirmation.command, confirmation.params, session: h.session)
         XCTAssertEqual(commands.last?.1["refs"], .array(refs.prefix(2).map(JSONValue.string)))
         XCTAssertEqual(commands.last?.1["folder"], .string(refs[2]))
