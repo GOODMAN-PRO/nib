@@ -117,13 +117,13 @@ struct SettingsPageLink: Hashable {
 final class SettingsNavigationState: ObservableObject {
     /// Regular layout: the selected section (nil = the first one).
     @Published var section: SettingsSection?
-    @Published var detailPath = NavigationPath()
-    @Published var compactPath = NavigationPath()
+    @Published var detailPath: [SettingsPageLink] = []
+    @Published var compactPath: [SettingsPageLink] = []
     @Published var query = ""
 
     func select(_ section: SettingsSection) {
         self.section = section
-        detailPath = NavigationPath()
+        detailPath = []
     }
 
     /// Shows one page in both layouts: its section, then the page itself (pushed, unless it is the section's only
@@ -132,10 +132,10 @@ final class SettingsNavigationState: ObservableObject {
         guard let page = catalog.page(id) else { return }
         query = ""
         section = page.section
-        var detail = NavigationPath()
+        var detail: [SettingsPageLink] = []
         if (catalog.group(page.section)?.pages.count ?? 0) > 1 { detail.append(SettingsPageLink(id: id)) }
         detailPath = detail
-        compactPath = NavigationPath([SettingsPageLink(id: id)])
+        compactPath = [SettingsPageLink(id: id)]
     }
 }
 
@@ -309,7 +309,7 @@ struct SettingsRootView: View {
                 .background(NibColor.backgroundSecondary)
             Divider()
             NavigationStack(path: $state.detailPath) {
-                SettingsSectionDetail(app: app, group: catalog.selected(state.section))
+                SettingsSectionDetail(app: app, catalog: catalog, state: state)
                     .navigationDestination(for: SettingsPageLink.self) { link in
                         SettingsPageHost(app: app, page: catalog.page(link.id))
                             .settingsDoneButton(onDone)
@@ -321,7 +321,7 @@ struct SettingsRootView: View {
 
     private var compact: some View {
         NavigationStack(path: $state.compactPath) {
-            SettingsIndexList(catalog: catalog, query: $state.query)
+            SettingsIndexList(catalog: catalog, state: state)
                 .navigationTitle(String(localized: "Settings"))
                 .navigationBarTitleDisplayMode(.large)
                 .navigationDestination(for: SettingsPageLink.self) { link in
@@ -398,12 +398,14 @@ struct SettingsSidebar: View {
 @MainActor
 struct SettingsIndexList: View {
     let catalog: SettingsCatalog
-    @Binding var query: String
+    @ObservedObject var state: SettingsNavigationState
+
+    private var query: String { state.query }
 
     var body: some View {
         List {
             Section {
-                NibSearchField(text: $query, prompt: String(localized: "Search settings"))
+                NibSearchField(text: $state.query, prompt: String(localized: "Search settings"))
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
             }
@@ -411,9 +413,7 @@ struct SettingsIndexList: View {
                 ForEach(catalog.groups) { group in
                     Section {
                         ForEach(group.pages, id: \.id) { page in
-                            NavigationLink(value: SettingsPageLink(id: page.id)) {
-                                NibRow(page.title, icon: page.symbol)
-                            }
+                            SettingsPageRow(page: page, catalog: catalog, state: state)
                         }
                     } header: {
                         SettingsHeader(group.section.title)
@@ -431,9 +431,8 @@ struct SettingsIndexList: View {
                 } else {
                     Section {
                         ForEach(results, id: \.id) { page in
-                            NavigationLink(value: SettingsPageLink(id: page.id)) {
-                                NibRow(page.title, subtitle: page.section.title, icon: page.symbol)
-                            }
+                            SettingsPageRow(page: page, catalog: catalog, state: state,
+                                            subtitle: page.section.title)
                         }
                     }
                 }
@@ -447,7 +446,10 @@ struct SettingsIndexList: View {
 @MainActor
 struct SettingsSectionDetail: View {
     let app: NibApp
-    let group: SettingsCatalog.SectionGroup?
+    let catalog: SettingsCatalog
+    @ObservedObject var state: SettingsNavigationState
+
+    private var group: SettingsCatalog.SectionGroup? { catalog.selected(state.section) }
 
     var body: some View {
         if let group {
@@ -457,9 +459,7 @@ struct SettingsSectionDetail: View {
                 List {
                     Section {
                         ForEach(group.pages, id: \.id) { page in
-                            NavigationLink(value: SettingsPageLink(id: page.id)) {
-                                NibRow(page.title, icon: page.symbol)
-                            }
+                            SettingsPageRow(page: page, catalog: catalog, state: state)
                         }
                     }
                 }
@@ -472,6 +472,34 @@ struct SettingsSectionDetail: View {
                           message: String(localized: "Settings from features and plugins appear here."))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+}
+
+/// Resolve page taps through the same state as search and deep links. Implicit value links in the embedded
+/// Settings navigation stack can leave the section list onscreen without opening their destination.
+@MainActor
+struct SettingsPageRow: View {
+    let page: SettingsPageDescriptor
+    let catalog: SettingsCatalog
+    @ObservedObject var state: SettingsNavigationState
+    var subtitle: String? = nil
+
+    func open() {
+        state.show(page: page.id, in: catalog)
+    }
+
+    var body: some View {
+        Button(action: open) {
+            NibRow(page.title, subtitle: subtitle, icon: page.symbol) {
+                Image(nib: .forward)
+                    .font(NibFont.footnoteEmphasis)
+                    .foregroundStyle(NibColor.labelSecondary)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(page.title))
     }
 }
 

@@ -86,6 +86,55 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertEqual(presenter.selection?.pageScopes, [.all])
     }
 
+    func testSelectedBoardDialogPreservesScopeAndDoesNotEditBoards() async throws {
+        let (h, presenter, probe) = harness()
+        let doc = Fixtures.whiteboardID
+        let second = PageRecord(id: "EXPORTBRD02", order: "k", size: nil,
+                                background: .ofTemplate("builtin.whiteboardDots"), title: "Board 2")
+        h.persistence.heads[doc]?.pages.append(second)
+        h.session.document = doc
+        h.session.page = second.id
+        let before = try h.app.workspace.peekContent(doc)
+        let depths = h.undoDepths()
+        let firstRef = NodeRef.page(doc, Fixtures.boardID).description
+        let secondRef = NodeRef.page(doc, second.id).description
+
+        _ = try await h.run("export.present", ["docs": [.string(NodeRef.document(doc).description)],
+                                               "pages": [.string(firstRef)]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        XCTAssertTrue(selection.isBoard)
+        XCTAssertEqual(selection.documents[0].pages.map(\.title), ["Board 1", "Board 2"])
+        XCTAssertEqual(selection.currentPage, secondRef)
+        XCTAssertEqual(draft.scope, .selected)
+        XCTAssertEqual(draft.selectedPages, [firstRef])
+        let params = try draft.submitParams(destination: "files", selection: selection)
+        XCTAssertEqual(params["pages"], .array([.string(firstRef)]))
+
+        // Closing discards the local draft, without submitting an export or changing the boards.
+        var cancelledDraft = draft
+        cancelledDraft.selectedPages = [secondRef]
+        XCTAssertEqual(draft.selectedPages, [firstRef])
+        XCTAssertTrue(probe.calls.isEmpty)
+        XCTAssertEqual(try h.app.workspace.peekContent(doc), before)
+        XCTAssertEqual(h.session.page, second.id)
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
+    func testFormatChoicesStayInOneRowAtPopoverWidth() {
+        let formats = ["pdf", "images", "nibnote", "zip"]
+        let titles = ["pdf": "PDF", "images": "Images", "nibnote": "Nib file", "zip": "Zipped Folder"]
+        for width in [NibMetrics.popoverWidth - 2 * NibSpacing.l, CGFloat(600)] {
+            let picker = ExportFormatPicker(selection: .constant("pdf"), options: formats) { titles[$0]! }
+                .environment(\.dynamicTypeSize, .large)
+            let host = UIHostingController(rootView: picker)
+            let size = host.sizeThatFits(in: CGSize(width: width, height: 2000))
+            XCTAssertLessThanOrEqual(size.width, width + 1)
+            XCTAssertLessThanOrEqual(size.height, NibMetrics.hitTarget + 1,
+                                     "Format choices must not push selected boards below the popover viewport")
+        }
+    }
+
     func testDialogSubmissionsPreserveScopesAndOptions() async throws {
         let (h, presenter, probe) = harness()
         _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])

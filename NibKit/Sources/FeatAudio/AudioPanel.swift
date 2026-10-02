@@ -819,11 +819,11 @@ struct AudioTimelineView<Content: View>: View {
     @ObservedObject var activity: AudioForegroundActivity
     @State private var visible = false
 
-    init(interval: TimeInterval, paused: Bool, activity: AudioForegroundActivity = .shared,
+    init(interval: TimeInterval, paused: Bool, activity: AudioForegroundActivity? = nil,
          @ViewBuilder content: @escaping () -> Content) {
         self.interval = interval
         self.paused = paused
-        self.activity = activity
+        self.activity = activity ?? .shared
         self.content = content
     }
 

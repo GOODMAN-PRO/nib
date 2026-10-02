@@ -798,6 +798,19 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(navigator.settingsPages.count, 1, "Settings opened once, through the command")
     }
 
+    /// Opening Settings ends this use of Elements, so returning can reopen its popover normally.
+    func testOpeningGiphySettingsFinishesTheNonStickyTool() {
+        let h = harness()
+        let navigator = ElementsTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        h.session.tool = "lasso"
+        h.session.tool = ElementsTool.toolID
+        let model = ElementsModel(app: h.app, session: h.session)
+        model.openSettings()
+        XCTAssertEqual(h.session.tool, "lasso", "Settings must not leave the Elements popover open underneath it")
+        XCTAssertEqual(navigator.settingsPages, [ElementsSettingsPage.id])
+    }
+
     /// GIPHY pages can overlap: a GIF already in the grid is not added twice (the grid needs unique ids).
     func testGIFPagesAppendWithoutDuplicates() {
         func gif(_ id: String) -> GiphyGIF {
@@ -911,7 +924,10 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(field.accessibilityIdentifier, "Paste your GIPHY API key")
         XCTAssertEqual(field.accessibilityLabel, "Paste your GIPHY API key")
 
-        XCTAssertTrue(GiphyKey.save("unit-test-key"))
+        field.text = "unit-test-key"
+        field.sendActions(for: .editingChanged)
+        _ = field.delegate?.textFieldShouldReturn?(field)
+        XCTAssertEqual(GiphyKey.load(), "unit-test-key", "Native input must update the draft and submit Save Key")
         let model = ElementsModel(app: h.app, session: h.session)
         model.gifQuery = "physics"
         let searchHost = UIHostingController(rootView: ElementsGIFPane(model: model))
@@ -925,6 +941,9 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(search.accessibilityIdentifier, "Search GIPHY")
         XCTAssertEqual(search.accessibilityLabel, "Search GIPHY")
         XCTAssertEqual(search.text, "physics")
+        search.text = "mechanics"
+        search.sendActions(for: .editingChanged)
+        XCTAssertEqual(model.gifQuery, "mechanics", "Native edits must reach the search model")
     }
 
     func testGiphySearchRetryAndKeyChangesKeepTheDraftQuery() async throws {
@@ -948,11 +967,11 @@ final class FeatElementsTests: XCTestCase {
                 .contains(URLQueryItem(name: "q", value: "physics")) == true)
         }
         XCTAssertTrue(GiphyKey.save(nil))
-        model.refreshGIFKey()
+        for _ in 0..<100 where model.gifState != .needsKey { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertEqual(model.gifState, .needsKey)
         XCTAssertEqual(model.gifQuery, "physics")
         XCTAssertTrue(GiphyKey.save("replacement-key"))
-        model.refreshGIFKey()
+        for _ in 0..<100 where model.gifState != .idle { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertEqual(model.gifState, .idle)
         transport.status = 200
         transport.body = Data(Self.giphyReply.utf8)

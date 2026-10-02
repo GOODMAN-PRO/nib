@@ -43,6 +43,7 @@ struct URLSessionGiphyTransport: GiphyTransport {
 enum GiphyKey {
     static let service = "app.nib.giphy"
     static let account = "apiKey"
+    static let didChange = Notification.Name("app.nib.elements.giphyKeyChanged")
 
     static func load() -> String? {
         guard let key = Keychain.getString(service: service, account: account)?
@@ -55,7 +56,10 @@ enum GiphyKey {
     @discardableResult
     static func save(_ key: String?) -> Bool {
         let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return Keychain.setString(trimmed.isEmpty ? nil : trimmed, service: service, account: account)
+        guard Keychain.setString(trimmed.isEmpty ? nil : trimmed, service: service, account: account) else { return false }
+        // Retained tool popovers do not necessarily appear again when Settings closes. Never include the secret.
+        NotificationCenter.default.post(name: didChange, object: nil)
+        return true
     }
 }
 

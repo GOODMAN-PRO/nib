@@ -234,13 +234,7 @@ struct ExportDialog: View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             if !printing {
                 NibInspectorSection(String(localized: "Format")) {
-                    if formatGroups.count <= 4 && !typeSize.isAccessibilitySize {
-                        NibSegmentedControl(selection: formatGroup, options: formatGroups) { formatTitle($0) }
-                    } else {
-                        Picker(String(localized: "Format"), selection: formatGroup) {
-                            ForEach(formatGroups, id: \.self) { id in Text(formatTitle(id)).tag(id) }
-                        }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
-                    }
+                    ExportFormatPicker(selection: formatGroup, options: formatGroups, title: formatTitle)
                     if formatGroup.wrappedValue == "images" {
                         NibSegmentedControl(selection: $draft.format, options: imageFormats.map(\.id)) { $0.uppercased() }
                     }
@@ -399,6 +393,36 @@ struct ExportDialog: View {
                 }
             }
         } catch { self.error = NibError.wrap(error).message }
+    }
+}
+
+/// Keep format selection to one row so the page/board scope is visible on opening the popover.
+/// A segmented control normally falls back to a vertical list; export uses a menu when it cannot fit.
+struct ExportFormatPicker: View {
+    @Binding var selection: String
+    let options: [String]
+    let title: (String) -> String
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    var body: some View {
+        if typeSize.isAccessibilitySize {
+            menu
+        } else {
+            ViewThatFits(in: .horizontal) {
+                NibSegmentedControl(selection: $selection, options: options, title: title)
+                    .fixedSize(horizontal: true, vertical: true)
+                menu
+            }
+        }
+    }
+
+    private var menu: some View {
+        Picker(String(localized: "Format"), selection: $selection) {
+            ForEach(options, id: \.self) { id in Text(title(id)).tag(id) }
+        }
+        .pickerStyle(.menu)
+        .font(NibFont.body)
+        .frame(minHeight: NibMetrics.hitTarget)
     }
 }
 

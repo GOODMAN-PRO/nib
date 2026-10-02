@@ -88,6 +88,37 @@ final class FeatDocChromeTests: XCTestCase {
 
     // MARK: Layout view model
 
+    func testOptionsMeasurementSettlesRoundingNoiseWithoutLosingRealResize() {
+        let initial = CGSize(width: 385, height: 44)
+        XCTAssertTrue(ChromeOptionsMeasurement.shouldUpdate(initial, previous: nil))
+        var retained = initial
+        var updates = 0
+        // Alternating native measurements must not continuously invalidate the palette/HUD during a press.
+        for index in 0..<100 {
+            let delta = index.isMultiple(of: 2) ? 1.0 / 6.0 : -1.0 / 6.0
+            let measured = CGSize(width: initial.width + delta, height: initial.height - delta)
+            if ChromeOptionsMeasurement.shouldUpdate(measured, previous: retained) {
+                retained = measured
+                updates += 1
+            }
+        }
+        XCTAssertEqual(updates, 0)
+        XCTAssertEqual(retained, initial)
+        // Compare against the retained measurement, not the preceding sample: small real changes accumulate.
+        for delta in [0.1, 0.2, 0.3] {
+            let measured = CGSize(width: initial.width + delta, height: initial.height)
+            if ChromeOptionsMeasurement.shouldUpdate(measured, previous: retained) { retained = measured }
+        }
+        XCTAssertEqual(retained.width, 385.3, accuracy: 0.001)
+        XCTAssertTrue(ChromeOptionsMeasurement.shouldUpdate(CGSize(width: 200, height: 44), previous: retained))
+        XCTAssertTrue(ChromeOptionsMeasurement.shouldUpdate(CGSize(width: 385.3, height: 60), previous: retained))
+        for invalid in [CGSize(width: CGFloat.infinity, height: 44), CGSize(width: 385, height: CGFloat.nan),
+                        CGSize(width: -1, height: 44)] {
+            XCTAssertFalse(ChromeOptionsMeasurement.shouldUpdate(invalid, previous: retained))
+            XCTAssertFalse(ChromeOptionsMeasurement.shouldUpdate(invalid, previous: nil))
+        }
+    }
+
     func testPortraitNavigatorMovesSidePaletteAndCompleteOptionsAboveTheWritingArea() throws {
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366)] {
             for side in SidebarSide.allCases {
@@ -320,6 +351,25 @@ final class FeatDocChromeTests: XCTestCase {
                                          size: size, in: region),
                        CGPoint(x: 1006, y: 534))
         XCTAssertEqual(FloatingSnap.initial(index: 1, size: size, in: region), CGPoint(x: 1006, y: 392))
+    }
+
+    func testFloatingCommentViewportKeepsComposerAboveKeyboard() {
+        // The failing iPad run placed the composer at y=620 while the keyboard began at y=534.
+        let original = CGRect(x: 16, y: 100, width: 1344, height: 916)
+        let keyboard = CGRect(x: 0, y: 534, width: 1376, height: 498)
+        let region = ChromeRegion.avoidingKeyboard(keyboard, in: original)
+        let size = CGSize(width: 344, height: min(ChromeLayout.floatingHeight, region.height))
+        for stored in [FloatingSnap.initial(index: 0, size: size, in: region), CGPoint(x: 1188, y: 736)] {
+            let centre = FloatingSnap.rest(centre: stored, size: size, in: region)
+            let contentHeight = FloatingSnap.contentHeight(viewport: size.height, providesHeader: true)
+            let contentBottom = centre.y - size.height / 2 + contentHeight
+            XCTAssertLessThanOrEqual(contentBottom, keyboard.minY - NibSpacing.l)
+            XCTAssertEqual(contentHeight, size.height, "The footer must fit without scrolling the whole thread")
+        }
+        XCTAssertEqual(ChromeRegion.avoidingKeyboard(nil, in: original), original)
+        XCTAssertEqual(FloatingSnap.contentHeight(viewport: 560, providesHeader: true), 560)
+        XCTAssertEqual(FloatingSnap.contentHeight(viewport: 418, providesHeader: false), 560,
+                       "Hosted forms retain their scrollable content")
     }
 
     func testWidePhoneAndCompactHeightPresentPanelsAsSheets() {
@@ -1098,6 +1148,37 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(r["panel"], "test.outline", "the sidebar comes back on the tab it showed")
 
         await assertCode(.invalidParams) { try await h.run("sidebar.toggle", ["mode": "grid"]) }
+    }
+
+    func testBoardsNavigatorOpensAndRemainsAvailableAfterReopeningWhiteboard() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        // Feature descriptors use the same ids, kinds and ordering as the installed navigator panels.
+        h.app.ui.panels.register(panel("sidebar.pages", .sidebarTab, order: 100, kinds: [.notebook]))
+        h.app.ui.panels.register(panel("outline.tab", .sidebarTab, order: 200, kinds: [.notebook]))
+        h.app.ui.panels.register(panel("whiteboard.boards", .sidebarTab, order: 100, kinds: [.whiteboard]))
+        h.app.ui.panels.register(panel("audio.panel", .sidebarTab, order: 300))
+        h.session.document = Fixtures.whiteboardID
+        let navigator = TestNavigator(session: h.session)
+        let container = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.whiteboardID,
+                                                        app: h.app, navigator: navigator)
+        let state = try chromeState(h)
+        let result = try await h.run("sidebar.toggle")
+        XCTAssertEqual(result["panel"], "whiteboard.boards")
+        XCTAssertEqual(h.session.openPanels, ["whiteboard.boards"])
+        let tabs = PanelResolver.tabs(h.app.ui.panels.all, side: .left, kind: .whiteboard, settings: h.app.settings)
+        XCTAssertTrue(SidebarNavigation.primary(tabs).contains { $0.id == "whiteboard.boards" })
+
+        h.session.document = nil
+        h.session.document = Fixtures.whiteboardID
+        let reopened = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.whiteboardID,
+                                                       app: h.app, navigator: navigator)
+        XCTAssertEqual(state.openPanels, ["whiteboard.boards"], "Reopening retains the Boards navigator")
+        _ = try await h.run("sidebar.toggle")
+        XCTAssertTrue(h.session.openPanels.isEmpty)
+        let shownAgain = try await h.run("sidebar.toggle")
+        XCTAssertEqual(shownAgain["panel"], "whiteboard.boards")
+        XCTAssertEqual(h.session.openPanels, ["whiteboard.boards"])
+        withExtendedLifetime((container, reopened)) {}
     }
 
     func testScrollDirectionIsAnUndoableNotebookEdit() async throws {

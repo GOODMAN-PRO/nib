@@ -356,18 +356,23 @@ final class FeatToolbarTests: XCTestCase {
                 model.openSettings()
                 model.moreOpen = true
                 model.refresh()
+                var inputRoute = "More has not laid out"
                 try await waitUntil("More owns its native hit target for \(id)") {
                     host.view.layoutIfNeeded()
                     let open = panels().filter { $0.isUserInteractionEnabled }
+                    inputRoute = "\(open.count) enabled panels; More=\(model.moreOpen), settings=\(model.settingsOpen)"
                     guard open.count == 1, let panel = open.first else { return false }
                     // Check both the first and last grid rows; the centre alone can miss an overlap.
                     return [CGFloat(0.25), 0.8].allSatisfy { fraction in
                         let point = panel.convert(CGPoint(x: panel.bounds.midX,
                                                           y: panel.bounds.minY + panel.bounds.height * fraction), to: window)
                         let hit = window.hitTest(point, with: nil)
-                        return hit === panel || hit?.isDescendant(of: panel) == true
+                        let reachesPanel = hit === panel || hit?.isDescendant(of: panel) == true
+                        if !reachesPanel { inputRoute += "; row \(fraction): hit \(String(describing: hit)) at \(point), panel \(panel)" }
+                        return reachesPanel
                     }
                 }
+                print("Insert palette input: \(id): \(inputRoute)")
             }
             model.select(id)
             XCTAssertFalse(model.moreOpen, "Choosing a tool releases More before command execution")
@@ -404,7 +409,8 @@ final class FeatToolbarTests: XCTestCase {
         let settledFrame = try XCTUnwrap(field.visualFrame(id))
         // Frames captured from the native three-row More grid's layout feedback loop.
         let rounded = CGRect(x: 92, y: 433.5, width: 312, height: 236.33333333333326)
-        for frame in [rounded, rest, rounded, rest, rest.offsetBy(dx: 0, dy: 0.25)] {
+        let roundedHeight = CGRect(x: 92, y: 433.5, width: 312, height: 236)
+        for frame in [rounded, rest, roundedHeight, rest, rounded, rest, rest.offsetBy(dx: 0, dy: 0.25)] {
             field.setRest(id, frame, style: .popover)
             XCTAssertEqual(field.node(id).presentation, settled,
                            "Rounding noise must not republish presentation and restart SwiftUI layout")
@@ -423,6 +429,10 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(movedFrame.minX, moved.minX, accuracy: 1e-9)
         XCTAssertEqual(movedFrame.minY, moved.minY, accuracy: 1e-9,
                        "An actual dock/layout change must still take effect")
+        let resized = CGRect(origin: moved.origin, size: CGSize(width: moved.width + 1, height: moved.height + 1))
+        field.setRest(id, resized, style: .popover)
+        XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).width, resized.width, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).height, resized.height, accuracy: 1e-9)
         field.unregister(id)
     }
 

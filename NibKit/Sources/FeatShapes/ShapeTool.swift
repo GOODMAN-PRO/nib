@@ -263,9 +263,9 @@ final class ShapeTool: CanvasTool {
     private(set) var pendingCreate: Task<Void, Never>?
 
     private struct Drag {
+        let touchID: Int
         let page: PageID
         let start: Point
-        let startView: CGPoint
         var current: Point
         var modifiers: KeyModifiers
         var moved: Bool
@@ -285,17 +285,25 @@ final class ShapeTool: CanvasTool {
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
-        guard !host.session.readOnly else { return }
-        drag = Drag(page: sample.page, start: sample.location, startView: host.viewPoint(sample.location, page: sample.page),
+        // A buffered dismissal tap can be delivered while a newer drag is already drawing.
+        // Keep ownership until that drag ends; another contact must not replace its start point.
+        guard !host.session.readOnly, !sample.isPredicted, drag == nil else { return }
+        drag = Drag(touchID: sample.touchID, page: sample.page, start: sample.location,
                     current: sample.location, modifiers: sample.modifiers, moved: false)
     }
 
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
-        guard var d = drag, let s = samples.last(where: { !$0.isPredicted }) ?? samples.last else { return }
-        d.current = CanvasMath.point(s, on: d.page, host: host)
-        d.modifiers = s.modifiers
-        let v = host.viewPoint(d.current, page: d.page)
-        if hypot(v.x - d.startView.x, v.y - d.startView.y) > Self.dragThreshold { d.moved = true }
+        guard var d = drag else { return }
+        // Predictions are not evidence of a drag. Inspect every actual coalesced sample so an
+        // excursion past the threshold is retained even when the last sample returns near the start.
+        for s in samples where !s.isPredicted && s.touchID == d.touchID {
+            d.current = CanvasMath.point(s, on: d.page, host: host)
+            d.modifiers = s.modifiers
+            // Use one transform for both endpoints: relayout/zoom must not turn a tap into a drag.
+            let startView = host.viewPoint(d.start, page: d.page)
+            let v = host.viewPoint(d.current, page: d.page)
+            if hypot(v.x - startView.x, v.y - startView.y) > Self.dragThreshold { d.moved = true }
+        }
         drag = d
         guard d.moved else { return }
         preview.show(shape(for: d, host: host), transform: CanvasMath.pageToView(host, page: d.page),
@@ -303,6 +311,7 @@ final class ShapeTool: CanvasTool {
     }
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
+        guard let active = drag, sample.touchID == active.touchID, !sample.isPredicted else { return }
         touchesMoved([sample], host: host)
         guard let d = drag else { return }
         drag = nil

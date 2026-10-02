@@ -267,8 +267,20 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var released: OwnRelease?
     @State private var tapped: String?
     @State private var mode: DragMode?
-    @State private var settingsOpen = false
-    @State private var moreOpen = false
+    @State private var localSettingsOpen = false
+    @State private var localMoreOpen = false
+    // A supplied binding is the presentation state, not a delayed mirror of local state.
+    // Otherwise a queued local dismissal can overwrite the next external menu opening.
+    private var settingsBinding: Binding<Bool> { settingsPresented ?? $localSettingsOpen }
+    private var moreBinding: Binding<Bool> { morePresented ?? $localMoreOpen }
+    private var settingsOpen: Bool {
+        get { settingsBinding.wrappedValue }
+        nonmutating set { settingsBinding.wrappedValue = newValue }
+    }
+    private var moreOpen: Bool {
+        get { moreBinding.wrappedValue }
+        nonmutating set { moreBinding.wrappedValue = newValue }
+    }
     @State private var recent: [String] = []
     @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 412)
     @State private var moreSize = CGSize(width: NibMetrics.popoverWidth, height: 124)
@@ -314,9 +326,9 @@ public struct NibToolPalette<Settings: View>: View {
     ///   - toolOptions: the active tool's options bar and, optionally, a popover that buds from a `nibBudAnchor`
     ///     inside that bar (a thickness slider, a colour editor). The palette places the popover as a full-size
     ///     child of the container, beside the bar, with the palette's own placement rule.
-    ///   - settingsPresented: mirrors the selected tool's settings popover both ways (a chevron in the options bar
+    ///   - settingsPresented: owns the selected tool's settings presentation (a chevron in the options bar
     ///     opens it; the chrome keeps one popover open at a time and guards touches while it is open).
-    ///   - morePresented: mirrors the More grid both ways.
+    ///   - morePresented: owns the More grid's presentation state.
     ///   - onReselect: called with the tool's id when the selected tool is tapped again (before its settings bud).
     public init(id: String = "palette", tools: [NibTool], moreTools: [NibTool] = [], selection: Binding<String>,
                 swatches: [NibSwatch], swatch: Binding<Int>, dock: Binding<NibPaletteDock>,
@@ -528,15 +540,15 @@ public struct NibToolPalette<Settings: View>: View {
                 if let along = slots(arrange(maxLength: current.isVertical ? r.height : r.width))[newValue] {
                     field?.setBead(id, head: along, glide: glide)
                 }
-                if !glide { settingsOpen = false }
-                moreOpen = false
+                // The external owner closes its menus synchronously with selection. This
+                // delayed observation must not dismiss a menu opened after that selection.
+                if settingsPresented == nil && !glide { settingsOpen = false }
+                if morePresented == nil { moreOpen = false }
                 // The previous tool's options popover closes with its bar.
                 if let previous = resolvedOptions(oldValue)?.popover, previous.isPresented.wrappedValue {
                     previous.isPresented.wrappedValue = false
                 }
             }
-            .modifier(PresentationMirror(isOpen: $settingsOpen, external: settingsPresented))
-            .modifier(PresentationMirror(isOpen: $moreOpen, external: morePresented))
         }
         .background(ReshapeWatcher(node: field?.node(id)) { phase in reshaped(phase) })
     }
@@ -703,12 +715,12 @@ public struct NibToolPalette<Settings: View>: View {
             .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
                 // Native glass rounds fractional sizes during placement. Do not feed that
                 // subpixel noise back into the placement cache and start another layout pass.
-                if abs(size.width - popoverSize.width) > 0.25 || abs(size.height - popoverSize.height) > 0.25 {
+                if abs(size.width - popoverSize.width) > 0.5 || abs(size.height - popoverSize.height) > 0.5 {
                     popoverSize = size
                 }
             }
             .droplet(id + ".settings", style: .popover)
-            .budsFrom(id + "." + tool.id, isPresented: $settingsOpen)
+            .budsFrom(id + "." + tool.id, isPresented: settingsBinding)
             .position(placement.centre(size: popoverSize, beside: anchor, gap: gap, in: bounds))
     }
 
@@ -742,12 +754,12 @@ public struct NibToolPalette<Settings: View>: View {
             }
         }
         .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
-            if abs(size.width - moreSize.width) > 0.25 || abs(size.height - moreSize.height) > 0.25 {
+            if abs(size.width - moreSize.width) > 0.5 || abs(size.height - moreSize.height) > 0.5 {
                 moreSize = size
             }
         }
         .droplet(id + ".more", style: .popover)
-        .budsFrom(id + "." + Self.moreID, isPresented: $moreOpen)
+        .budsFrom(id + "." + Self.moreID, isPresented: moreBinding)
         .position(placement.centre(size: moreSize, beside: anchor, gap: gap, in: bounds))
     }
 
@@ -845,22 +857,6 @@ struct NibToolOptionsPlacement: Layout {
             subview.place(at: CGPoint(x: rect.minX + centre.x, y: rect.minY + centre.y),
                           anchor: .center, proposal: proposed)
         }
-    }
-}
-
-/// Mirrors one of the palette's own popover flags into an optional binding the chrome passes, both ways.
-struct PresentationMirror: ViewModifier {
-    @Binding var isOpen: Bool
-    let external: Binding<Bool>?
-
-    func body(content: Content) -> some View {
-        content
-            .onChange(of: isOpen) { _, open in
-                if let external, external.wrappedValue != open { external.wrappedValue = open }
-            }
-            .onChange(of: external?.wrappedValue ?? false, initial: true) { _, open in
-                if external != nil, open != isOpen { isOpen = open }
-            }
     }
 }
 

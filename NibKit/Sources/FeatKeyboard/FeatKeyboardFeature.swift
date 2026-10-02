@@ -31,6 +31,7 @@ public enum FeatKeyboardFeature: NibFeature {
         PointerSupport.register(app, owner: id)
         KeyboardPanels.register(app, owner: id)
         LibraryCreationShortcuts.register(app, owner: id)
+        CanvasChromeShortcuts.register(app, owner: id)
 
         var page = SettingsPageDescriptor(id: KeyboardSettingsPage.id, title: String(localized: "Keyboard and Pointer"),
                                           icon: NibSymbol.keyboard.name, section: .general, order: 400, owner: id) { app in
@@ -120,6 +121,96 @@ private struct LibraryCreationShortcutView: View {
                                                         object: context.app.content.keyCommands)) { _ in
             revision += 1
         }
+    }
+}
+
+/// SwiftUI's document chrome can consume hardware-key dispatch before it reaches the
+/// UIKit canvas responder. Install bindings in that hosting tree as well. Both routes
+/// use the registry's winner and resolve parameters only in the invoking scene.
+@MainActor
+enum CanvasChromeShortcuts {
+    static let overlayID = "keyboard.canvasShortcuts"
+    private static let catalogKeys = Set(GlobalShortcuts.catalog(app: nil, owner: FeatKeyboardFeature.id)
+        .filter { $0.docKinds == ShortcutContext.canvasKinds }
+        .map { ShortcutRules.normalized($0.shortcut) })
+
+    static func register(_ app: NibApp, owner: String) {
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: overlayID, owner: owner, placement: .center, surface: .none,
+            recedesWhileWriting: false, docKinds: ShortcutContext.canvasKinds) {
+                AnyView(CanvasChromeShortcutView(context: $0))
+            })
+    }
+
+    static func descriptors(in context: ChromeContext) -> [KeyCommandDescriptor] {
+        guard let kind = context.kind, ShortcutContext.canvasKinds.contains(kind),
+              context.session.document != nil,
+              ShortcutContext(session: context.session, app: context.app).kind == kind else { return [] }
+        let window = context.navigator?.rootViewController?.viewIfLoaded?.window
+        let typing = context.session.isEditingText || window.map {
+            CanvasKeyboardFocus.isTextInput(CanvasKeyboardFocus.firstResponder(in: $0))
+        } == true
+        let keys = KeyCommandContext(docKind: kind, isEditingText: typing, hasTabs: true)
+        return KeyCommandRouting.active(context.app.content.keyCommands.all, in: keys).filter {
+            guard KeyCommandRouting.overridesSystemKeys($0, in: keys) else { return false }
+            if catalogKeys.contains(ShortcutRules.normalized($0.shortcut)) { return true }
+            guard $0.scope == .canvas || $0.scope == .document,
+                  let kinds = $0.docKinds, !kinds.isEmpty else { return false }
+            return kinds.isSubset(of: ShortcutContext.canvasKinds)
+        }
+    }
+
+    static func perform(_ id: String, in context: ChromeContext) {
+        guard let navigator = context.navigator, navigator.session === context.session,
+              !CanvasKeyboardFocus.hasModal(navigator.rootViewController),
+              let descriptor = descriptors(in: context).first(where: { $0.id == id }) else { return }
+        if let window = navigator.rootViewController?.viewIfLoaded?.window, !window.isKeyWindow { return }
+        context.app.ui.activeNavigator = navigator
+        context.app.services.sessions.activate(context.session)
+        context.app.perform(descriptor.command, descriptor.resolvedParams(for: context.session),
+                            session: context.session)
+    }
+
+    static func shortcut(_ key: KeyShortcut) -> KeyboardShortcut {
+        let equivalent: KeyEquivalent
+        switch key.key.lowercased() {
+        case "up": equivalent = .upArrow
+        case "down": equivalent = .downArrow
+        case "left": equivalent = .leftArrow
+        case "right": equivalent = .rightArrow
+        case "escape": equivalent = .escape
+        case "delete": equivalent = .delete
+        case "tab": equivalent = .tab
+        case "return": equivalent = .return
+        case "space": equivalent = .space
+        default: equivalent = KeyEquivalent(key.key.lowercased().first ?? " ")
+        }
+        return KeyboardShortcut(equivalent, modifiers: LibraryCreationShortcuts.shortcut(key).modifiers)
+    }
+}
+
+private struct CanvasChromeShortcutView: View {
+    let context: ChromeContext
+    @State private var revision = 0
+
+    var body: some View {
+        let _ = revision
+        Group {
+            ForEach(CanvasChromeShortcuts.descriptors(in: context), id: \.id) { descriptor in
+                Button(descriptor.title) { CanvasChromeShortcuts.perform(descriptor.id, in: context) }
+                    .keyboardShortcut(CanvasChromeShortcuts.shortcut(descriptor.shortcut))
+            }
+        }
+        .frame(width: 0, height: 0)
+        .clipped()
+        .accessibilityHidden(true)
+        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange,
+                                                        object: context.app.content.keyCommands)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: UITextField.textDidBeginEditingNotification)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: UITextField.textDidEndEditingNotification)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: UITextView.textDidBeginEditingNotification)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: UITextView.textDidEndEditingNotification)) { _ in revision += 1 }
     }
 }
 

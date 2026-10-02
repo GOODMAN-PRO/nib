@@ -353,9 +353,7 @@ final class CanvasKeyboardResponder: UIView {
     override var keyCommands: [UIKeyCommand]? {
         let context = context
         return descriptors.map { d in
-            let action = d.shortcut == KeyShortcut("a", .command)
-                ? #selector(selectAll(_:)) : #selector(runCanvasKey(_:))
-            let command = UIKeyCommand(title: d.title, action: action,
+            let command = UIKeyCommand(title: d.title, action: #selector(runCanvasKey(_:)),
                                        input: Self.input(d.shortcut.key),
                                        modifierFlags: Self.modifiers(d.shortcut.modifiers), propertyList: d.id)
             command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
@@ -419,8 +417,15 @@ final class CanvasKeyboardResponder: UIView {
 
     private static func input(_ key: String) -> String {
         switch key {
+        case "up": return UIKeyCommand.inputUpArrow
+        case "down": return UIKeyCommand.inputDownArrow
+        case "left": return UIKeyCommand.inputLeftArrow
+        case "right": return UIKeyCommand.inputRightArrow
         case "delete": return UIKeyCommand.inputDelete
         case "escape": return UIKeyCommand.inputEscape
+        case "tab": return "\t"
+        case "return": return "\r"
+        case "space": return " "
         default: return key
         }
     }

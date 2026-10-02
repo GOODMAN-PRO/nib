@@ -433,13 +433,10 @@ final class ImageMenuController: UIViewController {
         let app = host.app, session = host.session
         let target = ImageMenuTarget(doc: host.documentID, page: page, point: point, host: host, tool: tool)
         let box = WeakController()
+        let handoff = ImagePickerCompletion<Void>()
         let menu = ImageSourceMenu(app: app, session: session, target: { target }, close: { then in
-            guard let controller = box.controller, controller.presentingViewController != nil else { return then() }
-            if controller.isBeingDismissed {
-                ImagePresenter.afterTransition(controller.transitionCoordinator, then: then)
-            } else {
-                controller.dismiss(animated: true, completion: then)
-            }
+            // A second tap while the menu is closing must not queue another system picker.
+            handoff.finish((), dismissing: box.controller) { _ in then() }
         })
         let controller = ImageMenuController(content: AnyView(NibPopoverPanel(title: String(localized: "Insert Image")) { menu }))
         box.controller = controller
@@ -492,7 +489,8 @@ enum ImagePresenter {
 
     /// A dismissing controller still occupies UIKit's presentation slot. Skipping it in `top` is not enough:
     /// wait for the transition, then resolve the presenter again (including an interactively cancelled dismissal).
-    static func present(_ controller: UIViewController, from presenter: UIViewController) {
+    static func present(_ controller: UIViewController, from presenter: UIViewController,
+                        delegate: UIAdaptivePresentationControllerDelegate? = nil) {
         var top = presenter
         while top.isBeingDismissed, let parent = top.presentingViewController { top = parent }
         while let next = top.presentedViewController, !next.isBeingDismissed { top = next }
@@ -501,6 +499,8 @@ enum ImagePresenter {
             var ready = top
             while let next = ready.presentedViewController, !next.isBeingDismissed { ready = next }
             ready.present(controller, animated: true)
+            // UIKit creates the presentation controller as presentation begins; it can be nil beforehand.
+            if let delegate { controller.presentationController?.delegate = delegate }
         }
     }
 
@@ -512,9 +512,21 @@ enum ImagePresenter {
             guard !completed else { return }
             completed = true
             // Let UIKit unwind its completion callbacks and detach the dismissed controller before presenting again.
-            DispatchQueue.main.async(execute: then)
+            DispatchQueue.main.async { then() }
         }
         if !transition.animate(alongsideTransition: nil, completion: { _ in finish() }) { finish() }
+    }
+
+    /// UIKit cannot reliably dismiss during presentation, and a second dismiss does not attach a completion to a
+    /// dismissal already underway. After either transition, close the controller only if it is still presented.
+    static func dismiss(_ controller: UIViewController, then: @escaping () -> Void) {
+        afterTransition(controller.transitionCoordinator) {
+            if controller.presentingViewController != nil {
+                controller.dismiss(animated: true, completion: then)
+            } else {
+                then()
+            }
+        }
     }
 }
 
@@ -584,8 +596,7 @@ final class PhotosPickerSession: NSObject, PHPickerViewControllerDelegate, UIAda
         picker.delegate = self
         return await withCheckedContinuation { c in
             continuation = c
-            picker.presentationController?.delegate = self
-            ImagePresenter.present(picker, from: presenter)
+            ImagePresenter.present(picker, from: presenter, delegate: self)
         }
     }
 
@@ -615,15 +626,8 @@ final class ImagePickerCompletion<Value> {
     func finish(_ value: Value, dismissing controller: UIViewController?, then: @escaping (Value) -> Void) {
         guard !finished else { return }
         finished = true
-        guard let controller, controller.presentingViewController != nil || controller.isBeingDismissed else {
-            then(value)
-            return
-        }
-        if controller.isBeingDismissed {
-            ImagePresenter.afterTransition(controller.transitionCoordinator) { then(value) }
-        } else {
-            controller.dismiss(animated: true) { then(value) }
-        }
+        guard let controller else { then(value); return }
+        ImagePresenter.dismiss(controller) { then(value) }
     }
 }
 
@@ -718,8 +722,7 @@ final class FilesSession: NSObject, UIDocumentPickerDelegate, UIAdaptivePresenta
         picker.delegate = self
         return await withCheckedContinuation { c in
             continuation = c
-            picker.presentationController?.delegate = self
-            ImagePresenter.present(picker, from: presenter)
+            ImagePresenter.present(picker, from: presenter, delegate: self)
         }
     }
 

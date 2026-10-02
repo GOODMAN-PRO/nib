@@ -396,6 +396,40 @@ final class FeatCommentsTests: XCTestCase {
         XCTAssertEqual(h.app.ui.menuItems(.comment, threadMenu).map(\.id), [CommentMenus.revealID])
     }
 
+    func testObjectMenuDraftSendsAnchoredShapeCommentAndCopiesItsDeepLink() async throws {
+        let h = harness()
+        let panels = installPanelHost(h)
+        let clipboard = installClipboard(h)
+        let shapeRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"
+        let shape = try item(h, shapeRef)
+        let selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [shape.id], bounds: shape.bounds)
+        h.session.selection = selection
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1,
+                                  selection: selection, itemKinds: [.shape])
+        let menu = try XCTUnwrap(h.app.ui.menuItems(.objectMenu, context).first { $0.id == "comments.add.object" })
+        let depth = h.undoDepth(Fixtures.docID)
+        let result = try await h.run(menu.command, menu.params(context))
+        XCTAssertEqual(result["draft"]?.boolValue, true)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        guard case .draft(let draft)? = panels.target else { return XCTFail("Object menu must open the composer") }
+        XCTAssertEqual(draft.parent, shape.id)
+        XCTAssertEqual(draft.at, CommentRules.anchor(onto: shape))
+
+        let model = CommentThreadModel(app: h.app, session: h.session, target: panels.target)
+        let sent = await model.send("Shape annotation")
+        XCTAssertTrue(sent)
+        let ref = try XCTUnwrap(model.ref)
+        let comment = try item(h, ref)
+        XCTAssertEqual(comment.attachedTo, shape.id)
+        XCTAssertEqual(comment.comment?.anchor, draft.at)
+        XCTAssertEqual(comment.comment?.messages.map(\.text), ["Shape annotation"])
+        let link = try XCTUnwrap(CommentLink.url(ref: ref))
+        let copied = await CommentUI.copy(link: link, app: h.app, session: h.session)
+        XCTAssertTrue(copied)
+        XCTAssertEqual(clipboard.refs, ["nib://open/FIXTUREDOC01/FIXTUREPG001?comment=\(comment.id.raw)"])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+    }
+
     func testShowResolvedIsOneCheckedDocumentMoreEntry() async throws {
         let h = harness()
         let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1)

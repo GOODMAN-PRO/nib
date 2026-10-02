@@ -964,7 +964,9 @@ struct ChromeRootView: View {
             if reservesPaletteSpace(layout) {
                 ChromeOptionsMeasurement(chrome: chrome, live: live, tool: model.snapshot.tool,
                                          kind: model.snapshot.kind) { tool, size in
-                    if optionsSizes[tool] != size { optionsSizes[tool] = size }
+                    if ChromeOptionsMeasurement.shouldUpdate(size, previous: optionsSizes[tool]) {
+                        optionsSizes[tool] = size
+                    }
                 }
                 .id(model.snapshot.tool)
                 .hidden()
@@ -1048,9 +1050,9 @@ struct ChromeRootView: View {
             ? NibMetrics.panelWidth(typeSize) : NibMetrics.navigatorWidth
     }
 
-    private func floatingSize(_ layout: ChromeLayout) -> CGSize {
-        CGSize(width: min(NibMetrics.panelWidth(typeSize), layout.floatingRegion.width),
-               height: min(ChromeLayout.floatingHeight, layout.floatingRegion.height))
+    private func floatingSize(in region: CGRect) -> CGSize {
+        CGSize(width: min(NibMetrics.panelWidth(typeSize), region.width),
+               height: min(ChromeLayout.floatingHeight, region.height))
     }
 
     // MARK: Droplets
@@ -1072,8 +1074,10 @@ struct ChromeRootView: View {
                     .animation(motion, value: layout.toolbar)
             }
             if !layout.isCompact {
-                FloatingPanelsView(chrome: chrome, state: state, region: layout.floatingRegion,
-                                   size: floatingSize(layout))
+                // The canvas keeps its viewport while editable floating panels clear the keyboard.
+                let region = ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: layout.floatingRegion)
+                FloatingPanelsView(chrome: chrome, state: state, region: region,
+                                   size: floatingSize(in: region))
             }
             NavBarHost(chrome: chrome, live: live, snapshot: snapshot, layout: layout, sidebarMode: state.mode,
                        openMenu: $openMenu)
@@ -1247,6 +1251,15 @@ struct ChromeOptionsMeasurement: View {
     let tool: String
     let kind: DocumentKind
     let measured: (String, CGSize) -> Void
+
+    /// This measurement feeds back into the palette and HUD layout. Native scroll/glass hosts can alternate
+    /// between fractional sizes; publishing every rounding difference keeps rebuilding the chrome while a user
+    /// is pressing its controls. Compare with the retained size so genuine small changes still accumulate.
+    static func shouldUpdate(_ size: CGSize, previous: CGSize?) -> Bool {
+        guard size.width.isFinite, size.height.isFinite, size.width >= 0, size.height >= 0 else { return false }
+        guard let previous else { return true }
+        return abs(size.width - previous.width) > 0.25 || abs(size.height - previous.height) > 0.25
+    }
 
     var body: some View {
         let _ = live.tick

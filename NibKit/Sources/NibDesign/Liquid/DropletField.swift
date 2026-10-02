@@ -311,11 +311,12 @@ final class DropletField {
         // Native glass/scroll layout can alternate between subpixel frames (for example a
         // three-row More grid at y = 433⅓ and 433½). Feeding that rounding noise back into
         // FLIP publishes another geometry update indefinitely and starves control input.
-        // Compare against the retained frame so small real movements accumulate. A quarter
-        // point is below one display pixel on supported screens; genuine layout changes remain live.
+        // Native viewport heights also alternate by a third of a point. Compare against
+        // the retained frame so real changes accumulate: quarter-point position noise and
+        // half-point size noise must not restart layout; larger changes remain live.
         if e.hasRest,
            abs(rect.minX - e.rest.minX) <= 0.25, abs(rect.minY - e.rest.minY) <= 0.25,
-           abs(rect.width - e.rest.width) <= 0.25, abs(rect.height - e.rest.height) <= 0.25 {
+           abs(rect.width - e.rest.width) <= 0.5, abs(rect.height - e.rest.height) <= 0.5 {
             return
         }
         if !e.hasRest || (!e.hasPresented && !e.isDragging && e.bud == nil) {

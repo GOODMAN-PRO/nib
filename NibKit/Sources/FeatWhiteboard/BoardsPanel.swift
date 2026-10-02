@@ -342,21 +342,27 @@ struct BoardsList: View {
 
     private var toolbar: some View {
         HStack(spacing: 0) {
-            Button(model.isSelecting ? String(localized: "Done") : String(localized: "Select")) {
+            Button {
                 model.isSelecting.toggle()
-            }
-            .font(NibFont.button)
-            .foregroundStyle(NibColor.accent)
-            .buttonStyle(NibPressStyle())
-            .padding(.horizontal, NibSpacing.s)
-            .frame(minHeight: NibMetrics.hitTarget)
-            if model.isSelecting {
-                Button(String(localized: "Select All")) { model.selectAll() }
+            } label: {
+                Text(model.isSelecting ? String(localized: "Done") : String(localized: "Select"))
                     .font(NibFont.button)
-                    .foregroundStyle(NibColor.accent)
-                    .buttonStyle(NibPressStyle())
                     .padding(.horizontal, NibSpacing.s)
                     .frame(minHeight: NibMetrics.hitTarget)
+                    .contentShape(Rectangle())
+            }
+            .foregroundStyle(NibColor.accent)
+            .buttonStyle(NibPressStyle())
+            if model.isSelecting {
+                Button { model.selectAll() } label: {
+                    Text(String(localized: "Select All"))
+                        .font(NibFont.button)
+                        .padding(.horizontal, NibSpacing.s)
+                        .frame(minHeight: NibMetrics.hitTarget)
+                        .contentShape(Rectangle())
+                }
+                .foregroundStyle(NibColor.accent)
+                .buttonStyle(NibPressStyle())
             }
             Spacer(minLength: NibSpacing.s)
             NibIconButton(.templates, label: String(localized: "Templates"),

@@ -745,7 +745,8 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertTrue(field.becomeFirstResponder())
         XCTAssertFalse(h.session.isEditingText)
         XCTAssertFalse(keyboard.canPerformAction(action, withSender: selectAll))
-        XCTAssertTrue(keyboard.canPerformAction(action, withSender: goToPage))
+        XCTAssertTrue(keyboard.canPerformAction(try XCTUnwrap(goToPage.action), withSender: goToPage),
+                      "Go to Page stays enabled; the native Select All action belongs to the text field")
         field.resignFirstResponder()
         field.removeFromSuperview()
 
@@ -779,7 +780,7 @@ final class FeatKeyboardTests: XCTestCase {
 
         let action = #selector(UIResponderStandardEditActions.selectAll(_:))
         let key = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == "a" })
-        XCTAssertEqual(key.action, action, "Command-A and the native Edit action share one route")
+        XCTAssertTrue(keyboard.canPerformAction(action, withSender: key))
         let focused = try XCTUnwrap(CanvasKeyboardFocus.firstResponder(in: window))
         XCTAssertTrue(focused.canPerformAction(action, withSender: nil))
         let target = try XCTUnwrap(focused.target(forAction: action, withSender: nil) as? UIResponder)
@@ -896,6 +897,154 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertFalse(CanvasKeyboardFocus.mayReplace(UITextView(), canvas: host.canvasView))
         XCTAssertFalse(CanvasKeyboardFocus.mayReplace(UIView(), canvas: host.canvasView))
         XCTAssertTrue(CanvasKeyboardFocus.mayReplace(root, canvas: host.canvasView))
+    }
+
+    func testCanvasChromeRoutesPageSelectionZoomAndFeatureKeysToInvokingWindow() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let editor = FakeEditor(host)
+        h.session.editor = editor
+        let root = KeyboardWindowController(session: h.session)
+        var context = ChromeContext(app: h.app, session: h.session, navigator: root, kind: .notebook)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(CanvasChromeShortcuts.overlayID))
+        XCTAssertEqual(overlay.docKinds, [.notebook, .whiteboard])
+        XCTAssertEqual(overlay.surface, .none)
+        XCTAssertFalse(overlay.recedesWhileWriting)
+        var go = descriptor("pages.goToPage", "g", [.option, .command], scope: .document,
+                            kinds: [.notebook, .whiteboard], owner: "pages", command: CommandIDs.panelOpen)
+        go.params = ["id": "pages.goToPage"]
+        h.app.content.keyCommands.register(go)
+        let zoomWindow = descriptor("zoomwindow.toggle", "z", [.option, .command], scope: .document,
+                                    kinds: [.notebook], owner: "zoomwindow", command: "zoom.toggle")
+        h.app.content.keyCommands.register(zoomWindow)
+        let recorder = stand(in: h, for: [CommandIDs.selectionSelectAll, CommandIDs.viewZoom,
+                                         CommandIDs.panelOpen, "zoom.toggle"])
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        for (id, command) in [("keyboard.actualSize", CommandIDs.viewZoom),
+                              ("keyboard.zoomInEquals", CommandIDs.viewZoom),
+                              ("keyboard.zoomIn", CommandIDs.viewZoom),
+                              ("keyboard.zoomOut", CommandIDs.viewZoom),
+                              ("keyboard.zoomToFit", CommandIDs.viewZoom),
+                              (go.id, CommandIDs.panelOpen), (zoomWindow.id, "zoom.toggle")] {
+            h.app.services.sessions.activate(other)
+            h.app.ui.activeNavigator = nil
+            let d = try XCTUnwrap(CanvasChromeShortcuts.descriptors(in: context).first { $0.id == id })
+            let binding = CanvasChromeShortcuts.shortcut(d.shortcut)
+            XCTAssertEqual(binding.key.character, d.shortcut.key.first)
+            XCTAssertTrue(binding.modifiers.contains(.command))
+            XCTAssertEqual(binding.modifiers.contains(.option), d.shortcut.modifiers.contains(.option))
+            // Rotation can leave an arbitrary zoom. Resolve the live canvas, not a rendered snapshot.
+            host.zoomScale = 1.6798817363
+            let ran = expectation(description: id)
+            recorder.onCall = { if $0 == command { ran.fulfill() } }
+            CanvasChromeShortcuts.perform(id, in: context)
+            await fulfillment(of: [ran], timeout: 3)
+            XCTAssertTrue(h.app.services.sessions.active === h.session)
+            XCTAssertTrue(h.app.ui.activeNavigator === root)
+        }
+        XCTAssertEqual(recorder.params(CommandIDs.viewZoom),
+                       [["actual": true], ["scale": 2], ["scale": 2], ["scale": 1.5], ["fit": true]])
+        XCTAssertEqual(recorder.params(CommandIDs.panelOpen), [["id": "pages.goToPage"]])
+        XCTAssertEqual(recorder.params("zoom.toggle"), [[:]])
+
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        context.kind = .whiteboard
+        XCTAssertFalse(CanvasChromeShortcuts.descriptors(in: context).contains { $0.id == zoomWindow.id })
+        let selected = expectation(description: "Select All resolves the current board after framework insertion")
+        recorder.onCall = { if $0 == CommandIDs.selectionSelectAll { selected.fulfill() } }
+        CanvasChromeShortcuts.perform("keyboard.selectAll", in: context)
+        await fulfillment(of: [selected], timeout: 3)
+        XCTAssertEqual(recorder.params(CommandIDs.selectionSelectAll),
+                       [["page": .string(NodeRef.page(Fixtures.whiteboardID, Fixtures.boardID).description)]])
+        XCTAssertTrue(ShortcutRules.conflicts(in: h.app.content.keyCommands.all).isEmpty)
+        withExtendedLifetime(editor) {}
+    }
+
+    func testCanvasChromeYieldsToTextModalAndRegistryChanges() async throws {
+        let h = await started()
+        let root = KeyboardWindowController(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root, kind: .notebook)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 768, height: 1024))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let field = UITextField(frame: CGRect(x: 20, y: 20, width: 200, height: 44))
+        root.view.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        XCTAssertFalse(h.session.isEditingText, "Native dialog fields do not set the editor's text flag")
+        XCTAssertFalse(CanvasChromeShortcuts.descriptors(in: context).contains { $0.id == "keyboard.selectAll" })
+        h.app.ui.activeNavigator = nil
+        CanvasChromeShortcuts.perform("keyboard.selectAll", in: context)
+        XCTAssertNil(h.app.ui.activeNavigator)
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        XCTAssertTrue(CanvasChromeShortcuts.descriptors(in: context).contains { $0.id == "keyboard.selectAll" })
+        h.session.isEditingText = true
+        XCTAssertFalse(CanvasChromeShortcuts.descriptors(in: context).contains { $0.id == "keyboard.selectAll" })
+        h.session.isEditingText = false
+        root.modal = UIViewController()
+        CanvasChromeShortcuts.perform("keyboard.actualSize", in: context)
+        XCTAssertNil(h.app.ui.activeNavigator, "A shortcut cannot run behind a modal")
+        root.modal = nil
+        var replacement = try key(h, "actualSize")
+        replacement.id = "plugin.actualSize"
+        replacement.docKinds = [.notebook]
+        h.app.content.keyCommands.register(replacement)
+        CanvasChromeShortcuts.perform("keyboard.actualSize", in: context)
+        XCTAssertNil(h.app.ui.activeNavigator, "A stale rendered binding cannot bypass the new winner")
+        XCTAssertEqual(CanvasChromeShortcuts.descriptors(in: context).filter {
+            $0.shortcut == replacement.shortcut
+        }.map(\.id), [replacement.id])
+        h.session.document = nil
+        XCTAssertTrue(CanvasChromeShortcuts.descriptors(in: context).isEmpty)
+        h.session.document = Fixtures.textDocID
+        XCTAssertTrue(CanvasChromeShortcuts.descriptors(in: context).isEmpty, "A stale canvas host must stop routing")
+    }
+
+    func testNamedCanvasKeysMatchUIKitAndSwiftUIAndPanInAllDirections() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let root = KeyboardWindowController(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root, kind: .notebook)
+        let recorder = stand(in: h, for: [CommandIDs.viewScrollBy])
+        let keys: [(String, String, KeyEquivalent, Double, Double)] = [
+            ("up", UIKeyCommand.inputUpArrow, .upArrow, 0, -0.9),
+            ("down", UIKeyCommand.inputDownArrow, .downArrow, 0, 0.9),
+            ("left", UIKeyCommand.inputLeftArrow, .leftArrow, -0.9, 0),
+            ("right", UIKeyCommand.inputRightArrow, .rightArrow, 0.9, 0)
+        ]
+        for (name, input, equivalent, dx, dy) in keys {
+            var pan = descriptor("canvas.pan." + name, name, .option, scope: .canvas,
+                                 kinds: [.notebook, .whiteboard], owner: "canvas", command: CommandIDs.viewScrollBy)
+            pan.params = ["dx": .number(dx), "dy": .number(dy), "unit": "window"]
+            h.app.content.keyCommands.register(pan)
+            let key = try XCTUnwrap(attachment.keyboard.keyCommands?.first { $0.propertyList as? String == pan.id })
+            XCTAssertEqual(key.input, input)
+            XCTAssertEqual(key.modifierFlags, .alternate)
+            let binding = CanvasChromeShortcuts.shortcut(pan.shortcut)
+            XCTAssertEqual(binding.key, equivalent)
+            XCTAssertEqual(binding.modifiers, .option)
+            for swiftUI in [false, true] {
+                let ran = expectation(description: name)
+                recorder.onCall = { _ in ran.fulfill() }
+                if swiftUI {
+                    CanvasChromeShortcuts.perform(pan.id, in: context)
+                } else {
+                    _ = attachment.keyboard.perform(try XCTUnwrap(key.action), with: key)
+                }
+                await fulfillment(of: [ran], timeout: 3)
+                XCTAssertEqual(recorder.params(CommandIDs.viewScrollBy).last, pan.params)
+            }
+        }
+        for (name, equivalent) in [("return", KeyEquivalent.return), ("delete", .delete), ("escape", .escape),
+                                   ("tab", .tab), ("space", .space)] {
+            XCTAssertEqual(CanvasChromeShortcuts.shortcut(KeyShortcut(name, .option)).key, equivalent)
+        }
     }
 
     func testShortcutContextAndActions() {

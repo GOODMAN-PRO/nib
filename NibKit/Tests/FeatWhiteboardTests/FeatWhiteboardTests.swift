@@ -2,9 +2,15 @@ import XCTest
 import UIKit
 import SwiftUI
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatWhiteboard
+
+private struct WhiteboardHitTarget: UIViewRepresentable {
+    let control: UIButton
+    func makeUIView(context: Context) -> UIButton { control }
+    func updateUIView(_ view: UIButton, context: Context) {}
+}
 
 /// A renderer that runs `before` on every render, then fails or returns a blank image.
 private final class ScriptedRenderer: PageRenderer {
@@ -106,6 +112,42 @@ final class FeatWhiteboardTests: XCTestCase {
     }
 
     // MARK: Commands
+
+    func testFloatingCoordinateReferenceNeverClaimsBoardControlsAfterReuse() async throws {
+        let floating = NibFloatingHost()
+        let control = UIButton(type: .system)
+        let host = UIHostingController(rootView: ZStack {
+            WhiteboardHitTarget(control: control)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            NibFloatingLayer(host: floating)
+        }.ignoresSafeArea())
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376)] {
+            window.frame = CGRect(origin: .zero, size: size)
+            host.view.frame = window.bounds
+            for _ in 0..<5 {
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let reference = try XCTUnwrap(floating.referenceView)
+            XCTAssertNotNil(floating.containerRect(host.view.bounds, from: host.view))
+            // Native hosting can restore UIView's interaction flag while reusing a
+            // representable. A coordinate-only surface must remain inert itself.
+            reference.isUserInteractionEnabled = true
+            for point in [CGPoint(x: 48, y: 230), CGPoint(x: 186, y: 986),
+                          CGPoint(x: size.width - 290, y: 62), CGPoint(x: 132, y: 570)] {
+                let local = reference.convert(point, from: host.view)
+                XCTAssertNil(reference.hitTest(local, with: nil),
+                             "The floating coordinate reference must never consume Select, Move, Undo or menu taps")
+                let hit = host.view.hitTest(point, with: nil)
+                XCTAssertTrue(hit === control || hit?.isDescendant(of: control) == true,
+                              "Visible controls under the coordinate layer must receive the touch")
+            }
+        }
+    }
 
     /// Descriptor hygiene, examples, and the undo round trip of every edit example (convert included: without a
     /// renderer service the PDF page is drawn from the PDF itself).
@@ -440,6 +482,64 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), 2)
         XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
         XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).livePages.map(\.id), [Fixtures.boardID, first])
+        XCTAssertTrue(h.app.bus.redo(Fixtures.whiteboardID))
+        // Exercise the command used by the toolbar, including its invoking-window
+        // default, rather than only calling the history implementation directly.
+        let undone = try await h.run(CommandIDs.undo, [:])
+        XCTAssertEqual(undone["done"]?.boolValue, true)
+        XCTAssertEqual(model.boards.map(\.id), [Fixtures.boardID, first])
+        XCTAssertTrue(h.app.bus.history.canRedo(Fixtures.whiteboardID))
+    }
+
+    func testBoardSelectionRoutesSeenMoveDuplicateAndTemplatesWithoutNavigating() async throws {
+        let h = harness()
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04", "id": "BOARD2"])
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04", "id": "BOARD3"])
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        let before = try h.snapshot(Fixtures.whiteboardID)
+        let depth = h.undoDepth(Fixtures.whiteboardID)
+        model.isSelecting = true
+        model.toggle("BOARD2")
+        XCTAssertEqual(WhiteboardCopy.selectedBoards(model.selected.count), "1 board selected")
+        XCTAssertEqual(h.session.page, Fixtures.boardID, "Selecting an unseen board must not open or mark it read")
+
+        let seen = expectation(description: "Only the chosen board is marked seen")
+        let duplicate = expectation(description: "The chosen context-menu board is duplicated")
+        let templates = expectation(description: "Templates panel opens")
+        for command in [CommandIDs.collabMarkSeen, CommandIDs.pageDuplicate, CommandIDs.panelOpen] {
+            h.app.commands.register(CommandDescriptor(id: command, title: command, summary: "Routing receiver.",
+                                                      effect: .session)) { params, ctx in
+                XCTAssertTrue(ctx.session === h.session)
+                if command == CommandIDs.panelOpen {
+                    XCTAssertEqual(params["id"]?.stringValue, Whiteboard.templatesPanel)
+                    templates.fulfill()
+                } else {
+                    XCTAssertEqual(params["pages"], ["page:FIXTUREDOC04/BOARD2"])
+                    if command == CommandIDs.collabMarkSeen { seen.fulfill() } else { duplicate.fulfill() }
+                }
+                return [:]
+            }
+        }
+        model.markSeen(model.selected)
+        let context = model.menuContext(for: "BOARD2")
+        let item = try XCTUnwrap(h.app.ui.menuItems(.board, context).first { $0.command == CommandIDs.pageDuplicate })
+        model.run(item, context)
+        model.showTemplates()
+        await fulfillment(of: [seen, duplicate, templates], timeout: 5)
+        XCTAssertNotNil(h.app.content.boardTemplates.all.first { $0.title == "Flowchart" })
+
+        model.requestMove(model.selected)
+        XCTAssertTrue(model.showsMove, "Choosing Move must expose the destination sheet")
+        XCTAssertEqual(model.moving, [NibID("BOARD2")])
+        model.showsMove = false
+        model.selectAll()
+        model.requestMove(model.selected)
+        XCTAssertFalse(model.showsMove, "The last board must remain in the source whiteboard")
+        XCTAssertEqual(try h.snapshot(Fixtures.whiteboardID), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), depth)
+        XCTAssertEqual(h.session.page, Fixtures.boardID)
     }
 
     func testBoardAddDoesNotNavigateForAutomationPreviewOrUnrelatedWindow() async throws {

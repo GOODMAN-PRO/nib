@@ -98,7 +98,7 @@ struct LibraryGridView: View {
                             marquee = rect; dragSelection.marquee(rect, frames: frames)
                             model.setView(["selection": "replace", "refs": .array(dragSelection.refs.sorted().map(JSONValue.string))])
                         }
-                    })
+                    }.allowsHitTesting(false).accessibilityHidden(true))
                     .onPreferenceChange(LibraryFrames.self) { frames = $0 }
                     .simultaneousGesture(selectionGesture, including: model.selection.isSelecting ? .all : .subviews)
                     .padding(.bottom, NibSpacing.l)
@@ -491,6 +491,9 @@ struct LibraryPointerMarquee: UIViewRepresentable {
     static func dismantleUIView(_ uiView: Probe, coordinator: Coordinator) { coordinator.detach() }
     final class Probe: UIView {
         var attach: ((Probe) -> Void)?
+        // Measurement stays transparent even if a hosting/reuse update enables
+        // the native view. Pointer input belongs to the ancestor scroll view.
+        override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
         override func didMoveToWindow() { super.didMoveToWindow(); if window != nil { attach?(self) } }
     }
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {

@@ -388,8 +388,12 @@ final class InsertUITests: XCTestCase {
         XCTAssertEqual(json(first["style"]), json(second["style"]))
         let firstRuns = try XCTUnwrap(paragraphs(first).first?["runs"] as? [JSON])
         let secondRuns = try XCTUnwrap(paragraphs(second).first?["runs"] as? [JSON])
-        let firstSize = try XCTUnwrap((firstRuns.first?["attrs"] as? JSON)?["size"] as? Double)
-        XCTAssertEqual((secondRuns.first?["attrs"] as? JSON)?["size"] as? Double, firstSize,
+        // CONTRACTS.md: a nil run attribute inherits the text box's default style.
+        let firstDefault = ((first["style"] as? JSON)?["defaults"] as? JSON)?["size"] as? Double
+        let secondDefault = ((second["style"] as? JSON)?["defaults"] as? JSON)?["size"] as? Double
+        let firstSize = try XCTUnwrap((firstRuns.first?["attrs"] as? JSON)?["size"] as? Double ?? firstDefault)
+        let secondSize = try XCTUnwrap((secondRuns.first?["attrs"] as? JSON)?["size"] as? Double ?? secondDefault)
+        XCTAssertEqual(secondSize, firstSize,
                        "The saved default must carry the selected typography into newly typed text")
         XCTAssertEqual(try plain(second), "Second")
     }
@@ -851,6 +855,10 @@ final class InsertUITests: XCTestCase {
     private func sticky(_ text: String = "Lab reminder") throws {
         try ui.selectTool("sticky"); try tap("tool.sticky")
         replace(try control("Author name on new notes", .textField, scroll: true), with: "UI Author")
+        // DESIGN.md keeps the native keyboard: taps at the canvas's lower coordinates
+        // hit its keys until input is submitted, rather than dismissing the popover.
+        try control("Author name on new notes", .textField).typeText("\n")
+        try wait("Submitting the author name must dismiss the keyboard") { !self.ui.app.keyboards.firstMatch.isHittable }
         outside(); ui.coordinate(point).tap()
         let editor = try control("Sticky note", .textView)
         editor.typeText(text); try finish(); try counts(5)

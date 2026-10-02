@@ -590,7 +590,6 @@ struct TextFormatInspector: View {
     var showsPin = false
     @State var showsFontPicker = false
     @State var naming = false
-    @State var styleName = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
@@ -611,16 +610,98 @@ struct TextFormatInspector: View {
         .nibSheet(isPresented: $showsFontPicker) {
             FontPickerSheet { family in model.setFont(family) }
         }
-        .alert(String(localized: "Save Text Style"), isPresented: $naming) {
-            TextField(String(localized: "Name"), text: $styleName)
-            Button(String(localized: "Save")) {
-                model.saveStyle(named: styleName)
-                styleName = ""
+        .background(TextStyleNamePrompt(model: model, isPresented: $naming))
+    }
+}
+
+/// SwiftUI's alert builder can discard TextField accessibility modifiers when it creates
+/// the native alert. Configure the actual input so its name survives typing and VoiceOver focus.
+struct TextStyleNamePrompt: UIViewControllerRepresentable {
+    let model: TextFormatModel
+    @Binding var isPresented: Bool
+
+    func makeUIViewController(context: Context) -> Controller {
+        Controller(model: model, isPresented: $isPresented)
+    }
+
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.isPresented = $isPresented
+        controller.updatePresentation()
+    }
+
+    static func dismantleUIViewController(_ controller: Controller, coordinator: ()) {
+        controller.dismissPrompt()
+    }
+
+    final class Controller: UIViewController {
+        let model: TextFormatModel
+        var isPresented: Binding<Bool>
+        private weak var prompt: UIAlertController?
+        private weak var save: UIAlertAction?
+
+        init(model: TextFormatModel, isPresented: Binding<Bool>) {
+            self.model = model
+            self.isPresented = isPresented
+            super.init(nibName: nil, bundle: nil)
+        }
+
+        required init?(coder: NSCoder) { return nil }
+
+        override func loadView() {
+            view = UIView()
+            view.isUserInteractionEnabled = false
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            updatePresentation()
+        }
+
+        func updatePresentation() {
+            // Wait until SwiftUI finishes attaching/updating the containing controller.
+            DispatchQueue.main.async { [weak self] in self?.presentIfNeeded() }
+        }
+
+        func dismissPrompt() {
+            prompt?.dismiss(animated: false)
+            prompt = nil
+        }
+
+        private func presentIfNeeded() {
+            guard isPresented.wrappedValue else {
+                prompt?.dismiss(animated: true)
+                return
             }
-            .disabled(!TextSettings.isValidName(styleName.trimmingCharacters(in: .whitespaces)))
-            Button(String(localized: "Cancel"), role: .cancel) { styleName = "" }
-        } message: {
-            Text(String(localized: "Saved styles appear in the Style row of every text box. Names use up to 40 letters, digits, spaces, hyphens or underscores."))
+            guard viewIfLoaded?.window != nil, prompt == nil, presentedViewController == nil else { return }
+            let alert = UIAlertController(title: String(localized: "Save Text Style"),
+                message: String(localized: "Saved styles appear in the Style row of every text box. Names use up to 40 letters, digits, spaces, hyphens or underscores."),
+                preferredStyle: .alert)
+            alert.addTextField { [weak self] field in
+                field.placeholder = String(localized: "Name")
+                field.accessibilityLabel = String(localized: "Name")
+                field.accessibilityIdentifier = "text.style.name"
+                field.addAction(UIAction { [weak self, weak field] _ in
+                    guard let field else { return }
+                    self?.nameChanged(field)
+                }, for: .editingChanged)
+            }
+            let save = UIAlertAction(title: String(localized: "Save"), style: .default) { [weak self, weak alert] _ in
+                guard let self else { return }
+                self.model.saveStyle(named: alert?.textFields?.first?.text ?? "")
+                self.isPresented.wrappedValue = false
+            }
+            save.isEnabled = false
+            alert.addAction(save)
+            alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { [weak self] _ in
+                self?.isPresented.wrappedValue = false
+            })
+            self.save = save
+            prompt = alert
+            present(alert, animated: true)
+        }
+
+        private func nameChanged(_ field: UITextField) {
+            save?.isEnabled = TextSettings.isValidName((field.text ?? "").trimmingCharacters(in: .whitespaces))
         }
     }
 }
@@ -671,14 +752,89 @@ enum TextPopoverIDs {
     static let source = "text.format.more"
 }
 
+/// Paragraph pickers use the same above-keyboard presentation as More. Native UIButton menus
+/// in an input accessory can be positioned underneath the keyboard's separate window.
+enum TextFormatPanel {
+    case inspector, alignment, list, lineSpacing
+
+    var title: String {
+        switch self {
+        case .inspector: return String(localized: "Format")
+        case .alignment: return String(localized: "Alignment")
+        case .list: return String(localized: "List")
+        case .lineSpacing: return String(localized: "Line Spacing")
+        }
+    }
+
+    var choices: [TextParagraphChoice] {
+        switch self {
+        case .inspector: return []
+        case .alignment: return TextFormatOptions.alignments.map(TextParagraphChoice.alignment)
+        case .list: return ListKind.allCases.map(TextParagraphChoice.list)
+        case .lineSpacing: return LineSpacingOption.allCases.map(TextParagraphChoice.spacing)
+        }
+    }
+}
+
+enum TextParagraphChoice: Hashable {
+    case alignment(ParagraphAlignment), list(ListKind), spacing(LineSpacingOption)
+
+    var title: String {
+        switch self {
+        case .alignment(let value): return TextFormatOptions.alignmentTitle(value)
+        case .list(let value): return TextFormatOptions.listTitle(value)
+        case .spacing(let value): return value.title
+        }
+    }
+
+    func isSelected(in state: TextFormatState) -> Bool {
+        switch self {
+        case .alignment(let value): return value == (state.align == .natural ? .left : state.align)
+        case .list(let value): return value == state.list
+        case .spacing(let value): return value == state.lineSpacingOption
+        }
+    }
+
+    @MainActor func apply(to model: TextFormatModel) {
+        switch self {
+        case .alignment(let value): model.setAlign(value)
+        case .list(let value): model.setList(value)
+        case .spacing(let value): model.setLineSpacing(value)
+        }
+    }
+}
+
+struct TextFormatPanelContent: View {
+    let panel: TextFormatPanel
+    @ObservedObject var model: TextFormatModel
+    var onChoose: () -> Void
+
+    var body: some View {
+        if panel == .inspector {
+            TextFormatInspector(model: model)
+        } else {
+            VStack(alignment: .leading, spacing: NibSpacing.xs) {
+                ForEach(panel.choices, id: \.self) { choice in
+                    NibButton(choice.title, symbol: choice.isSelected(in: model.state) ? .checkmark : nil, kind: .plain) {
+                        choice.apply(to: model)
+                        onChoose()
+                    }
+                    .accessibilityAddTraits(choice.isSelected(in: model.state) ? .isSelected : [])
+                }
+            }
+        }
+    }
+}
+
 /// The More popover's open state. The floating host keeps the popover while a box is edited; this opens it, and a tap
 /// outside or Escape closes it (`onClose` gives the text view the keyboard back).
 @MainActor
 final class TextPopoverState: ObservableObject {
+    @Published var panel: TextFormatPanel = .inspector
     @Published var isPresented = false {
         didSet { if oldValue && !isPresented { onClose?() } }
     }
-    /// Height of the scrolling inspector, fitted above the keyboard.
+    /// Available content height above the keyboard; the editor uses this budget to select its presentation.
     @Published var contentHeight: CGFloat = NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight
     var onClose: (() -> Void)?
 }
@@ -696,12 +852,10 @@ struct TextFormatPopover: View {
 
     var body: some View {
         NibBudPopover(id: TextPopoverIDs.popover, source: TextPopoverIDs.source, isPresented: $state.isPresented,
-                      title: String(localized: "Format"), placement: .above) {
-            ScrollView {
-                TextFormatInspector(model: model)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-            .frame(height: state.contentHeight)
+                      title: state.panel.title, placement: .above) {
+            // NibBudPopover owns the vertical scroll view. Nesting a fixed-height scroll view
+            // here traps edge drags in the outer panel and strands the lower box controls.
+            TextFormatPanelContent(panel: state.panel, model: model) { state.isPresented = false }
         }
     }
 }
@@ -712,26 +866,34 @@ private struct TextStylesSection: View {
 
     var body: some View {
         NibInspectorSection(String(localized: "Style"), action: NibAction(String(localized: "Save Style…")) { naming = true }) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NibSpacing.s) {
-                    ForEach(TextPresets.ids, id: \.self) { id in
-                        NibChip(TextPresets.title(id), style: .filter(isSelected: false), action: { model.applyPreset(id) })
-                    }
-                    ForEach(model.styleNames, id: \.self) { name in
-                        NibChip(name, style: .filter(isSelected: false), action: { model.applyNamed(name) })
-                            .contextMenu {
-                                Button(role: .destructive) {
-                                    model.deleteStyle(named: name)
-                                } label: {
-                                    Text(String(localized: "Delete Style"))
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: NibSpacing.s) {
+                        ForEach(TextPresets.ids, id: \.self) { id in
+                            NibChip(TextPresets.title(id), style: .filter(isSelected: false), action: { model.applyPreset(id) })
+                        }
+                        ForEach(model.styleNames, id: \.self) { name in
+                            NibChip(name, style: .filter(isSelected: false), action: { model.applyNamed(name) })
+                                .id("saved." + name)
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        model.deleteStyle(named: name)
+                                    } label: {
+                                        Text(String(localized: "Delete Style"))
+                                    }
                                 }
-                            }
-                            .accessibilityAction(named: String(localized: "Delete Style")) {
-                                model.deleteStyle(named: name)
-                            }
+                                .accessibilityAction(named: String(localized: "Delete Style")) {
+                                    model.deleteStyle(named: name)
+                                }
+                        }
+                    }
+                    .padding(.vertical, NibSpacing.xs)
+                }
+                .onChange(of: model.styleNames) { before, after in
+                    if let added = after.first(where: { !before.contains($0) }) {
+                        proxy.scrollTo("saved." + added, anchor: .trailing)
                     }
                 }
-                .padding(.vertical, NibSpacing.xs)
             }
             NibButton(String(localized: "Set as Default for New Text"), kind: .plain, size: .compact) {
                 model.saveAsDefault()
@@ -969,6 +1131,7 @@ final class TextKeyboardBar: UIInputView {
     var onDone: (() -> Void)?
     var onMore: ((UIView) -> Void)?
     var onFonts: ((UIView) -> Void)?
+    var onParagraph: ((TextFormatPanel, UIView) -> Void)?
 
     private let model: TextFormatModel
     private var cancellables = Set<AnyCancellable>()
@@ -1034,15 +1197,15 @@ final class TextKeyboardBar: UIInputView {
         highlight.showsMenuAsPrimaryAction = true
         highlightButton = highlight
         let align = button(symbol: TextFormatOptions.alignmentSymbol(.left), label: String(localized: "Alignment"))
-        align.showsMenuAsPrimaryAction = true
+        routeParagraphButton(align, to: .alignment)
         alignButton = align
         let list = button(symbol: TextFormatOptions.listSymbol(.bullet), label: String(localized: "List"))
-        list.showsMenuAsPrimaryAction = true
+        routeParagraphButton(list, to: .list)
         listButton = list
         let outdent = button(symbol: .outdent, label: String(localized: "Decrease Indent")) { [weak self] in self?.model.indent(-1) }
         let indent = button(symbol: .indent, label: String(localized: "Increase Indent")) { [weak self] in self?.model.indent(1) }
         let spacing = button(symbol: .lineSpacing, label: String(localized: "Line Spacing"))
-        spacing.showsMenuAsPrimaryAction = true
+        routeParagraphButton(spacing, to: .lineSpacing)
         spacingButton = spacing
         let more = button(symbol: .moreCircle, label: String(localized: "More Formatting"))
         more.addAction(UIAction { [weak self, weak more] _ in
@@ -1161,17 +1324,14 @@ final class TextKeyboardBar: UIInputView {
                 self?.model.setHighlight(TextFormatOptions.highlight(h))
             }
         })
-        alignButton?.menu = UIMenu(children: TextFormatOptions.alignments.map { a in
-            UIAction(title: TextFormatOptions.alignmentTitle(a), image: UIImage(nib: TextFormatOptions.alignmentSymbol(a)),
-                     state: (s.align == .natural ? .left : s.align) == a ? .on : .off) { [weak self] _ in self?.model.setAlign(a) }
-        })
-        listButton?.menu = UIMenu(children: ListKind.allCases.map { l in
-            UIAction(title: TextFormatOptions.listTitle(l), image: UIImage(nib: TextFormatOptions.listSymbol(l)),
-                     state: s.list == l ? .on : .off) { [weak self] _ in self?.model.setList(l) }
-        })
-        spacingButton?.menu = UIMenu(title: String(localized: "Line Spacing"), children: LineSpacingOption.allCases.map { o in
-            UIAction(title: o.title, state: s.lineSpacingOption == o ? .on : .off) { [weak self] _ in self?.model.setLineSpacing(o) }
-        })
+
+    }
+
+    private func routeParagraphButton(_ button: UIButton, to panel: TextFormatPanel) {
+        button.addAction(UIAction { [weak self, weak button] _ in
+            guard let button else { return }
+            self?.onParagraph?(panel, button)
+        }, for: .primaryActionTriggered)
     }
 
     private func updateStyleMenu() {

@@ -13,6 +13,12 @@ enum FloatingSnap {
     /// Release projection: `p + v · 0.12 s`.
     static let projection: CGFloat = 0.12
 
+    /// Panels supplying their own header also lay out their body and footer inside the available viewport.
+    /// Keeping a comment thread at 560 pt after the keyboard shrinks its host leaves its composer below the clip.
+    static func contentHeight(viewport: CGFloat, providesHeader: Bool) -> CGFloat {
+        providesHeader ? viewport : max(viewport, ChromeLayout.floatingHeight)
+    }
+
     static func rest(centre: CGPoint, velocity: CGVector = .zero, size: CGSize, in region: CGRect) -> CGPoint {
         let landing = CGPoint(x: centre.x + velocity.dx * projection, y: centre.y + velocity.dy * projection)
         let halfWidth = min(size.width, region.width) / 2
@@ -90,9 +96,9 @@ struct FloatingPanelView: View {
                 panel.makeView(chrome.panelContext(panel.id, presentation: .floating))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            // Preserve the panel's normal viewport for views with their own scrolling thread/list. When the
-            // window clamps the droplet, the outer scroll keeps the header, composer and footer reachable.
-            .frame(width: size.width, height: max(size.height, ChromeLayout.floatingHeight))
+            // Self-contained panels keep their footer inside the viewport; hosted forms retain their scroll area.
+            .frame(width: size.width, height: FloatingSnap.contentHeight(viewport: size.height,
+                                                                       providesHeader: panel.providesHeader))
         }
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: size.width, height: size.height)

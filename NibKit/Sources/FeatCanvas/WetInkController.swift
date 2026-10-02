@@ -264,7 +264,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     private var decisions: [ObjectIdentifier: GestureRouter.Route] = [:]
     private var delivering: WetStrokeHandoff?
     private var notification: NSObjectProtocol?
-    private var pendingTap: (sample: CanvasSample, route: GestureRouter.Route, capture: Capture?)?
+    private var pendingTap: (sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route, capture: Capture?)?
+    private var secondTapID: Int?
     private var tapTask: Task<Void, Never>?
     private var gestureTasks: [UUID: Task<Void, Never>] = [:]
     private var closing = false
@@ -432,6 +433,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         canvas.showsVerticalScrollIndicator = false
         canvas.minimumZoomScale = 0.01
         canvas.maximumZoomScale = 8
+        // This nested scroll view only renders wet ink at the document's scale. Leaving its
+        // pinch enabled lets UIKit give the descendant scroll view ownership of a pinch,
+        // even though isScrollEnabled is false. Programmatic zoomScale still works.
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.delegate = self
         canvas.isAccessibilityElement = false // F006 owns the labelled, scrollable document accessibility surface.
         canvas.accessibilityElementsHidden = true
@@ -555,20 +561,33 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             let contact = ObjectIdentifier(touch)
             surface.acceptedContacts.insert(contact)
         }
-        begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: route,
+        begin(sample, screenPoint: Point(touch.location(in: nil)), route: route,
               contact: ObjectIdentifier(touch))
     }
 
-    /// UIKit edges translate contacts into these deterministic events; tests exercise the production state machine.
+    /// UIKit edges translate contacts into these deterministic events; screenPoint is in the fixed
+    /// window, never the scroll view's moving bounds. Tests exercise the same production state machine.
     func begin(_ sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route,
                contact: ObjectIdentifier? = nil, startedAt: Date? = nil) {
         guard let host = host else { return }
         let id = sample.touchID
         let track = Track(sample: sample, screenStart: screenPoint, route: route)
         tracks[id] = track
+        if !sample.isPencil, let pending = pendingTap,
+           pending.sample.page == sample.page,
+           sample.timestamp >= pending.sample.timestamp,
+           sample.timestamp - pending.sample.timestamp <= 0.3,
+           pending.screenPoint.distance(to: screenPoint) <= 24,
+           !isRejected(route) {
+            // A double tap's interval ends at the second DOWN, not its lift. Keep the
+            // provisional dot pending while that contact completes (or becomes a drag).
+            secondTapID = id
+            tapTask?.cancel()
+        }
         router?.begin(sample, route: route)
         let fingers = tracks.values.filter { !$0.sample.isPencil && !isRejectedOrClaimed($0.route) }
         if fingers.count > 1 {
+            flushPendingTap()
             navigating = true
             for finger in fingers {
                 finger.moved = true
@@ -624,13 +643,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
         let samples = TouchTap.samples(touch: touch, event: event, touchID: id,
                                       reduceLatency: reduceLatency, host: host)
-        move(samples, screenPoint: Point(touch.location(in: host.canvasView)), id: id)
+        move(samples, screenPoint: Point(touch.location(in: nil)), id: id)
     }
 
     func move(_ samples: [CanvasSample], screenPoint: Point, id: Int) {
         guard let host = host, let track = tracks[id], let last = samples.last(where: { !$0.isPredicted }) else { return }
         track.last = last
         if track.screenStart.distance(to: screenPoint) > 8 { track.moved = true }
+        if track.moved && secondTapID == id { flushPendingTap() }
         if let capture = track.capture, !capture.cancelled || capture.handedOff {
             let previousMotion = capture.stillness.lastMotion
             for sample in samples where !sample.isPredicted {
@@ -641,7 +661,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 capture.last = sample
                 if sample.timestamp > (capture.points.last?.timestamp ?? -.infinity) { capture.points.append(sample) }
                 capture.bounds = capture.bounds.union(Rect(x: point.x, y: point.y, width: 0, height: 0).insetBy(-capture.style.width / 2))
-                let screen = Point(host.viewPoint(point, page: capture.page))
+                let screen = Point(host.canvasView.convert(host.viewPoint(point, page: capture.page), to: nil))
                 capture.stillness.update(point: screen, timestamp: sample.timestamp)
             }
             host.updateInking(page: capture.page, strokeBounds: capture.bounds)
@@ -689,10 +709,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                     else if case .tool(let tool) = route, tool.inputMode == .taps { tool.tap(sample, host: host) }
                 } else {
                     track.capture?.gesturePending = true
-                    queueTap(sample, route: route, capture: track.capture)
+                    queueTap(sample, screenPoint: track.screenStart, route: route, capture: track.capture)
                 }
             }
         }
+        if secondTapID == id { flushPendingTap() }
         endInkingIfIdle()
         if tracks.isEmpty { navigating = false }
         if let capture = track.capture, let surface = capture.surface {
@@ -734,6 +755,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             if capture.tool.strokeHeld(capture.stroke(), page: capture.page, host: host) { cancel(capture) }
             else { capture.handedOff = false; endInkingIfIdle() }
         } else if !track.moved && !track.longPressed {
+            if secondTapID == id { flushPendingTap() }
             track.longPressed = true
             track.capture?.longPressed = true
             if !track.sample.isPencil {
@@ -750,19 +772,17 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
     }
 
-    private func queueTap(_ sample: CanvasSample, route: GestureRouter.Route, capture: Capture?) {
+    private func queueTap(_ sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route, capture: Capture?) {
         if let pending = pendingTap,
-           pending.sample.page == sample.page,
-           sample.timestamp >= pending.sample.timestamp,
-           sample.timestamp - pending.sample.timestamp <= 0.3,
-           pending.sample.location.distance(to: sample.location) * (host?.zoomScale ?? 1) <= 24 {
+           secondTapID == sample.touchID {
             tapTask?.cancel()
             pendingTap = nil
+            secondTapID = nil
             dispatchGesture(.doubleTap, sample: sample, route: route, captures: [pending.capture, capture].compactMap { $0 })
             return
         }
         flushPendingTap()
-        pendingTap = (sample, route, capture)
+        pendingTap = (sample, screenPoint, route, capture)
         tapTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
@@ -771,6 +791,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     }
 
     private func flushPendingTap() {
+        secondTapID = nil
         guard let pending = pendingTap else { return }
         pendingTap = nil
         tapTask?.cancel()
@@ -965,11 +986,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     }
     private func resetTouches(clearGestures: Bool = true) {
         if !clearGestures && tracks.isEmpty { decisions.removeAll(); navigating = false; return }
-        if clearGestures {
+        // A stream reset without a second lift aborts the reserved pair as well. Its timer
+        // was stopped on second-down, so retaining it would leave an orphaned pending dot.
+        if clearGestures || secondTapID != nil {
             tapTask?.cancel()
             tapTask = nil
             if let capture = pendingTap?.capture { cancel(capture) }
             pendingTap = nil
+            secondTapID = nil
             for task in gestureTasks.values { task.cancel() }
             gestureTasks.removeAll()
             for surface in surfaces {

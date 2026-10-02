@@ -97,8 +97,7 @@ final class ZoomWindowController: ObservableObject {
     }
 
     func detach() {
-        dismissOptions()
-        session.floatingHost?.dismiss(Self.optionsID)
+        removeOptions()
         commits?.cancel()
         commits = nil
         subscriptions.removeAll()
@@ -128,7 +127,7 @@ final class ZoomWindowController: ObservableObject {
             configureWriting()
             scheduleRender()
         } else {
-            dismissOptions()
+            removeOptions()
             renderTask?.cancel()
             // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless,
             // and the render when the pane shows again draws them.
@@ -166,6 +165,7 @@ final class ZoomWindowController: ObservableObject {
     func paneDisappeared() {
         paneAppearances = max(0, paneAppearances - 1)
         guard paneAppearances == 0 else { return }
+        removeOptions()
         renderTask?.cancel()
         clearWet()
     }
@@ -192,7 +192,7 @@ final class ZoomWindowController: ObservableObject {
         let pageChanged = shownDoc != state.doc || shownPage != state.page
         if pageChanged || shownRect != state.rect {
             if pageChanged {
-                dismissOptions()
+                removeOptions()
                 // Wet ink of another page: its commits (if any are still running) land there, not here.
                 clearWet()
             }
@@ -526,7 +526,7 @@ final class ZoomWindowController: ObservableObject {
     func newLine() { perform(ZoomNewLine.descriptor.id) }
 
     func close() {
-        dismissOptions()
+        removeOptions()
         perform(ZoomToggle.descriptor.id, ["on": false])
     }
 
@@ -543,6 +543,13 @@ final class ZoomWindowController: ObservableObject {
     /// Also used by the bud's Escape/outside-tap binding. Leave the view installed while it retracts;
     /// the closed bud releases its modal hit region, and detach removes the floating entry.
     func dismissOptions() { optionsPresented = false }
+
+    /// Once the pane or its page goes away there is no anchor to retract into. Remove the native
+    /// popover too: retaining its scroll host over the toolbar can swallow the next opening tap.
+    private func removeOptions() {
+        dismissOptions()
+        session.floatingHost?.dismiss(Self.optionsID)
+    }
 
     func chooseOption(_ action: () -> Void) {
         dismissOptions()

@@ -174,7 +174,10 @@ struct ZoomToggle: NibCommand {
         let content = try ctx.workspace.content(t.doc)
         let current: PageRecord? = state.doc == t.doc ? state.page.flatMap { content.page($0) } : nil
         let boxIsUsable = current.map { !$0.deleted && $0.size != nil } ?? false
-        if p.page != nil || at != nil || !boxIsUsable {
+        // Closing the pane, navigating and opening it again starts writing on the page now in view.
+        // A live pane (including an idempotent `on: true`) keeps its target until explicitly moved.
+        let reopeningOnAnotherPage = !state.isOn && t.session.page != nil && t.session.page != state.page
+        if p.page != nil || at != nil || !boxIsUsable || reopeningOnAnotherPage {
             let target: (PageRecord, PageSize)
             if let ref = p.page {
                 target = try ZoomTarget.page(ref, doc: t.doc, ctx)

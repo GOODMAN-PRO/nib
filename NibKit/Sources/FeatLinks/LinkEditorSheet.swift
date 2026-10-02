@@ -416,6 +416,7 @@ struct LinkWebsiteForm: View {
         List {
             Section {
                 TextField(String(localized: "Website address"), text: $model.url)
+                    .accessibilityLabel(Text(String(localized: "Website address")))
                     .font(NibFont.body)
                     .keyboardType(.URL)
                     .textContentType(.URL)

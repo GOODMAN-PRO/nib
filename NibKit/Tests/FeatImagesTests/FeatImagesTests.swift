@@ -214,6 +214,46 @@ final class FeatImagesTests: XCTestCase {
         XCTAssertEqual(results, [[]], "Cancel and the adaptive dismissal callback return no images, once")
     }
 
+    func testMenuHandoffDuringDismissalRunsOnlyTheFirstSourceChoice() async {
+        let menu = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        menu.dismissing = true
+        menu.transition = transition
+        let handoff = ImagePickerCompletion<Void>()
+        var sources: [String] = []
+        let finished = expectation(description: "First source choice runs after menu dismissal")
+
+        handoff.finish((), dismissing: menu) { _ in sources.append("photos"); finished.fulfill() }
+        handoff.finish((), dismissing: menu) { _ in sources.append("files") }
+        XCTAssertTrue(sources.isEmpty)
+        XCTAssertEqual(menu.dismissals, 0, "a second dismiss call could lose the picker handoff")
+        transition.complete()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(sources, ["photos"])
+    }
+
+    func testChoosingSourceDuringMenuPresentationWaitsForOpeningThenClosing() async {
+        let presenter = UIViewController()
+        let menu = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        menu.presentedBy = presenter
+        menu.transition = transition
+        let handoff = ImagePickerCompletion<Void>()
+        var openedPicker = false
+        let dismissing = expectation(description: "Menu closes after its opening transition")
+        menu.onDismiss = { dismissing.fulfill() }
+
+        handoff.finish((), dismissing: menu) { _ in openedPicker = true }
+        XCTAssertEqual(menu.dismissals, 0, "a fast source tap must not dismiss during the opening animation")
+        XCTAssertFalse(openedPicker)
+        menu.transition = nil
+        transition.complete()
+        await fulfillment(of: [dismissing], timeout: 5)
+        XCTAssertFalse(openedPicker, "the picker still waits for the menu's closing animation")
+        menu.completeDismissal()
+        XCTAssertTrue(openedPicker)
+    }
+
     func testFilesResultWaitsForSystemDismissalAndPreservesSelectedBytes() async {
         let picker = ImagePresentationSpy()
         let transition = ImageTransitionSpy()
@@ -729,6 +769,7 @@ private final class ImagePresentationSpy: UIViewController {
     var presentations: [UIViewController] = []
     var onPresent: (() -> Void)?
     var dismissals = 0
+    var onDismiss: (() -> Void)?
     private var didDismiss: (() -> Void)?
 
     override var presentedViewController: UIViewController? { shown }
@@ -743,6 +784,7 @@ private final class ImagePresentationSpy: UIViewController {
     override func dismiss(animated: Bool, completion: (() -> Void)? = nil) {
         dismissals += 1
         didDismiss = completion
+        onDismiss?()
     }
     func completeDismissal() {
         let completion = didDismiss

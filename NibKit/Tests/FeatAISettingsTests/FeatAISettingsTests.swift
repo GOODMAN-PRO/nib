@@ -42,6 +42,44 @@ final class FeatAISettingsTests: XCTestCase {
         XCTAssertEqual(try h.snapshotAll(), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0) // Session settings deliberately aren't document undo steps.
     }
+
+    func testAISectionOffersDirectProviderSetupAlongsideSubscriptionPagesAndSavesLocalModels() async throws {
+        let (h, store) = setupStore()
+        let pages = h.app.ui.settingsPages.all.filter { $0.owner == FeatAISettingsFeature.id }
+        let root = try XCTUnwrap(pages.first { $0.id == "settings.ai" })
+        XCTAssertEqual(root.title, "AI")
+        XCTAssertEqual(root.section, .ai)
+        XCTAssertEqual(Set(pages.filter { $0.id.hasPrefix(root.id + ".") }.map(\.id)),
+                       ["settings.ai.claude", "settings.ai.chatgpt", "settings.ai.addProvider"])
+        XCTAssertTrue(pages.allSatisfy { $0.section == root.section })
+        let add = try XCTUnwrap(pages.first { $0.title == "Add provider" })
+        XCTAssertEqual(add.section, .ai, "The multi-page AI section must expose provider creation directly")
+        for variant in NibSnapshot.Variant.allCases {
+            let image = NibSnapshot.image(add.makeView(h.app), size: NibMetrics.settingsSheetSize, variant: variant)
+            XCTAssertNotNil(image, "The registered Add provider destination must render: \(variant)")
+        }
+
+        // Follow the provider editor's production path, including its preset change and
+        // credential-free local endpoint used for both diagrams and audio transcription.
+        var draft = ProviderDraft(preset: .openAI)
+        draft.apply(.custom)
+        draft.name = "Local provider"
+        draft.baseURL = "http://127.0.0.1:7332/v1"
+        draft.model = "chat-model"
+        draft.transcriptionModel = "speech-model"
+        let config = try draft.config()
+        let runtime = try XCTUnwrap(h.app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self))
+        try await runtime.saveFromSettings(config, key: nil, app: h.app)
+        let model = ProviderListModel(app: h.app)
+        await model.refresh()
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.activeID, config.id)
+        XCTAssertEqual(store.provider(nil)?.config.model, "chat-model")
+        XCTAssertEqual(store.provider(nil)?.config.transcriptionModel, "speech-model")
+        XCTAssertFalse(try XCTUnwrap(model.providers.first).credentialsMissing)
+        XCTAssertNil(Keychain.getString(service: AIProviderConfig.keychainService, account: config.keychainAccount))
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
     func testSecretNeverReachesCommandHooksOrListResults() async throws {
         let (h, _) = setupStore()
         let c = try config()

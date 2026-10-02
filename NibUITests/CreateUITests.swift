@@ -160,14 +160,14 @@ final class CreateUITests: XCTestCase {
         try tap("No cover")
         try scrollTo(ui.app.textFields["Title"], name: "Title")
         let paperPreview = try previewPixels()
-        try tap("Carbon")
+        try coverTile("Carbon").tap()
         try scrollTo(ui.app.textFields["Title"], name: "Title")
         try wait("create.cover must update the live preview") {
             guard let pixels = try? self.previewPixels() else { return false }
             return pixels != paperPreview
         }
         try assertPreviewColour(0x2A2D33)
-        XCTAssertTrue(ui.app.buttons["Carbon"].firstMatch.isSelected, "Selected cover must expose the selection ring's state")
+        XCTAssertTrue(try coverTile("Carbon").isSelected, "Selected cover must expose the selection ring's state")
         let id = try create()
         try assertDocument(id, kind: "notebook", pages: 2)
         let pages = try livePages(id)
@@ -304,7 +304,7 @@ final class CreateUITests: XCTestCase {
         let oldPages = try livePages(oldID)
         try ui.tapCommand("window.showLibrary")
         try notebook("Saved defaults")
-        try tap("Carbon")
+        try coverTile("Carbon").tap()
         try scrollTap("Planners")
         try scrollTap("Daily Planner")
         try chooseSize("B5")
@@ -312,7 +312,7 @@ final class CreateUITests: XCTestCase {
         try assertDocument(created, kind: "notebook", pages: 2)
         try ui.tapCommand("window.showLibrary")
         try notebook("Uses saved defaults")
-        XCTAssertTrue(ui.app.buttons["Carbon"].firstMatch.isSelected, "create.defaults lost cover")
+        XCTAssertTrue(try coverTile("Carbon").isSelected, "create.defaults lost cover")
         try scrollTo(ui.app.buttons["Daily Planner"])
         XCTAssertTrue(ui.app.buttons["Daily Planner"].isSelected, "create.defaults lost paper")
         let second = try create()
@@ -346,7 +346,7 @@ final class CreateUITests: XCTestCase {
         try tap("Done")
         try notebook("Template settings defaults")
         try wait("Template settings must select the saved Carbon cover") {
-            self.ui.app.buttons["Carbon"].firstMatch.isSelected
+            (try? self.coverTile("Carbon").isSelected) == true
         }
         try scrollTo(ui.app.buttons["Daily Planner"], name: "Daily Planner")
         XCTAssertTrue(ui.app.buttons["Daily Planner"].isSelected)
@@ -505,12 +505,14 @@ final class CreateUITests: XCTestCase {
         let id = try quickNote()
         try drawAndUndoRedo()
         try exitQuickNote()
-        // The exit prompt must allow returning to the very same editor without saving or discarding.
-        let keep = ui.app.buttons.matching(NSPredicate(format: "label IN {'Keep Editing', 'Keep editing', 'Cancel', 'Back'}")).firstMatch
-        try require(keep, "quicknote.keep: exit prompt needs Keep Editing/Cancel/Back")
-        keep.tap()
+        // F021 specifies Save as Untitled / Combine / Delete, not a fourth Keep Editing
+        // button. Keep the untitled note through that explicit choice, then resume it.
+        try tap("Save as Untitled")
+        try wait("Keeping the QuickNote must dismiss the exit prompt") {
+            !self.ui.app.staticTexts["Save this QuickNote?"].exists
+        }
+        try ui.openDocument("Untitled")
         try ui.waitForState { $0.document == id && $0.strokeCountOnPage == 1 }
-        try wait("quicknote.keep must dismiss the exit prompt") { !self.ui.app.staticTexts["Save this QuickNote?"].exists }
         try drawAndUndoRedo()
         XCTAssertEqual(try ui.state().strokeCountOnPage, 2, "Keep editing must return to an editable canvas")
     }
@@ -621,8 +623,15 @@ final class CreateUITests: XCTestCase {
             String(try XCTUnwrap(components.day)), formatter.string(from: chosen))).firstMatch
         try require(day, "Native start-date picker must expose the chosen day")
         day.tap()
-        // Compact date pickers may keep their popover open after the day is selected.
-        if !button("Create Planner").isHittable { ui.app.staticTexts["New Event Planner"].tap() }
+        // The native compact date picker can overlap the header while XCTest still reports
+        // Create as hittable. Dismiss that system popover before invoking the create action;
+        // tapping the covered header instead can open the picker's month/year controls.
+        if ui.app.buttons["DatePicker.NextMonth"].exists {
+            ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).tap()
+            try wait("Native date picker must dismiss before Create Planner") {
+                !self.ui.app.buttons["DatePicker.NextMonth"].exists
+            }
+        }
         try tap("Create Planner")
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "notebook", pages: 7)
@@ -643,6 +652,15 @@ final class CreateUITests: XCTestCase {
     func testCalendarOpenNoteReusesExistingDocument() throws { try eventNote(reopen: true) }
 
     // MARK: UI helpers
+
+    private func coverTile(_ title: String) throws -> XCUIElement {
+        // DESIGN §14.6 separates the cover strip (led by No cover) from colour swatches.
+        // Carbon names both controls; only the tile selects or reports the cover template.
+        let strips = ui.app.scrollViews.containing(.button, identifier: "No cover").allElementsBoundByIndex
+        let strip = try XCTUnwrap(strips.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height },
+                                  "Creation sheet must expose its cover strip")
+        return strip.buttons.matching(NSPredicate(format: "label == %@", title)).firstMatch
+    }
 
     private func previewPixels() throws -> Data {
         let title = ui.app.textFields["Title"].frame
@@ -725,47 +743,43 @@ final class CreateUITests: XCTestCase {
 
     private func scrollTo(_ element: XCUIElement, name: String = "creation control") throws {
         for _ in 0..<12 {
-            // isHittable also admits a field with only a few pixels above the clipping edge.
-            // Reveal the actual editing area before tapping; a clipped border cannot take focus.
-            if element.exists, element.elementType == .textField,
-               let form = ui.app.scrollViews.allElementsBoundByIndex.last(where: {
-                   $0.isHittable && $0.frame.height > 200
-               }) {
-                let visible = form.frame.insetBy(dx: 0, dy: 16)
-                if element.frame.maxY > visible.maxY {
-                    form.swipeUp(velocity: .slow)
-                    continue
-                }
-                if element.frame.minY < visible.minY {
-                    form.swipeDown(velocity: .slow)
-                    continue
-                }
+            let exists = element.exists
+            if exists && element.elementType != .textField && element.isHittable { return }
+            let target = exists ? element.frame : nil
+            let candidates = (ui.app.collectionViews.allElementsBoundByIndex + ui.app.scrollViews.allElementsBoundByIndex)
+                .filter { $0.isHittable && $0.frame.height > 40 }
+            // Scroll the target's own container, not an unrelated card editor or paper grid.
+            let containers = exists ? candidates.filter { scroll in
+                scroll.descendants(matching: element.elementType).matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", element.identifier, element.label))
+                    .allElementsBoundByIndex.contains { $0.frame == target }
+            } : []
+            let scroll = containers.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+                ?? candidates.first { $0.elementType == .collectionView }
+                ?? candidates.last { $0.frame.height > 200 }
+            guard let scroll else {
+                if exists && element.isHittable { return }
+                break
             }
-            if element.exists && element.isHittable {
-                if name == "Title", let form = ui.app.scrollViews.allElementsBoundByIndex.last(where: {
-                    $0.isHittable && $0.frame.height > 200
-                }), element.frame.midY - 68 < form.frame.minY + 8 {
-                    form.swipeDown(velocity: .slow)
-                    continue
+            // DESIGN uses the native keyboard. Its covered area cannot receive form gestures,
+            // even when accessibility reports a scroll frame extending underneath it.
+            let keyboards = ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
+            guard let visible = NibUITestScrollGeometry.viewport(
+                scroll: scroll.frame, window: ui.app.frame, obstructions: keyboards) else { break }
+            if exists && element.isHittable, let target {
+                var required = target
+                if name == "Title" {
+                    required = required.union(CGRect(x: target.minX - 120, y: target.midY - 68, width: 104, height: 136))
                 }
-                return
+                if element.elementType != .textField || visible.contains(required) { return }
             }
-            let scroll = ui.app.collectionViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 40 }
-                ?? ui.app.scrollViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 200 }
-            guard let scroll else { break }
-            let down = element.exists && element.frame.midY < scroll.frame.minY
-            if scroll.frame.height < 200 {
-                // A short native list virtualizes its rows. End the drag while held, avoiding a fling
-                // that skips the entire Monday/date row between accessibility snapshots.
-                let start = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.2 : 0.8))
-                let end = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.8 : 0.2))
-                start.press(forDuration: 0.05, thenDragTo: end,
-                            withVelocity: XCUIGestureVelocity(rawValue: 40), thenHoldForDuration: 0.3)
-            } else if down {
-                scroll.swipeDown(velocity: .slow)
-            } else {
-                scroll.swipeUp(velocity: .slow)
-            }
+            let targetY = name == "Title" ? target.map { $0.midY - 68 } : target?.midY
+            let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
+            let origin = ui.app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: drag.start.x - ui.app.frame.minX, dy: drag.start.y - ui.app.frame.minY))
+                .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
+                    dx: drag.end.x - ui.app.frame.minX, dy: drag.end.y - ui.app.frame.minY)),
+                    withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
         }
         try require(element, "Missing required creation control: \(name)")
         XCTAssertTrue(element.isHittable, "Creation control is unreachable after scrolling")

@@ -718,6 +718,32 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testPointerMeasurementRemainsTransparentWhenReattachedAndEnabled() throws {
+        let scroll = UIScrollView(frame: CGRect(x: 0, y: 0, width: 400, height: 600))
+        let document = UIButton(frame: CGRect(x: 40, y: 40, width: 140, height: 224))
+        scroll.addSubview(document)
+        let measurement = LibraryPointerMarquee.Probe(frame: scroll.bounds)
+        let target = LibraryPointerMarquee { _, _, _ in XCTFail("A document tap must not select a range") }
+        let coordinator = target.makeCoordinator()
+        for _ in 0..<3 {
+            scroll.addSubview(measurement)
+            coordinator.attach(measurement)
+            // A measurement surface must never own the touch, even when a native
+            // hosting/reuse update restores UIView's default interaction flag.
+            measurement.isUserInteractionEnabled = true
+            let point = CGPoint(x: document.frame.midX, y: document.frame.midY)
+            XCTAssertTrue(scroll.hitTest(point, with: nil) === document)
+            XCTAssertTrue(coordinator.pan.view === scroll)
+            XCTAssertEqual((scroll.gestureRecognizers ?? []).filter { $0 === coordinator.pan }.count, 1)
+            XCTAssertEqual(coordinator.pan.allowedTouchTypes,
+                           [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)])
+            XCTAssertFalse(coordinator.pan.cancelsTouchesInView)
+            coordinator.detach()
+            measurement.removeFromSuperview()
+            XCTAssertNil(coordinator.pan.view)
+        }
+    }
+
     func testDocumentCoversRemainHittableAcrossLibraryRotation() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         await model.appear()
@@ -732,7 +758,14 @@ final class FeatLibraryUITests: XCTestCase {
         }
         for mode in [NibLiquidMode.full, .off] {
             model.liquidMode = mode
-            for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+            let portrait = CGSize(width: 1032, height: 1376), landscape = CGSize(width: 1376, height: 1032)
+            for (layout, size) in [(LibraryLayout.grid, portrait), (.grid, landscape),
+                                   (.list, portrait), (.list, landscape), (.grid, landscape)] {
+                model.layout = layout
+                // Leaving an editor and reopening the library reattaches its
+                // native measurement/gesture hosts; cover this as well as rotation.
+                window.rootViewController = nil
+                window.rootViewController = host
                 window.frame = CGRect(origin: .zero, size: size)
                 host.view.frame = window.bounds
                 for _ in 0..<30 {
@@ -750,7 +783,7 @@ final class FeatLibraryUITests: XCTestCase {
                     let scroll = try XCTUnwrap(ancestor as? UIScrollView)
                     let hit = host.view.hitTest(point, with: nil)
                     XCTAssertTrue(hit === scroll || hit?.isDescendant(of: scroll) == true,
-                                  "Library cover at \(point) intercepted by \(String(describing: hit)) in \(mode), \(size)")
+                                  "Library cover at \(point) intercepted by \(String(describing: hit)) in \(mode), \(layout), \(size)")
                     // Being inside the scroll view is insufficient: the native
                     // pointer-marquee measurement view spans the whole grid.
                     let measurementViews = descendants(scroll).compactMap { $0 as? LibraryPointerMarquee.Probe }

@@ -296,7 +296,7 @@ extension NibUI {
         // iPadOS 26 exposes the toolbar action as add-plus-button / lowercase "add".
         // Prefer its stable identifier; localized display casing is not a command contract.
         let add = calendar.buttons.matching(NSPredicate(
-            format: "identifier == 'add-plus-button' OR label IN[c] {'Add', 'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
+            format: "identifier == 'add-plus-button' OR label ==[c] 'Add' OR label IN {'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
         if add.waitForExistence(timeout: 3), add.isHittable {
             add.tap()
         }

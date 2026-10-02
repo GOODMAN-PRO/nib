@@ -254,6 +254,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let bar = TextKeyboardBar(model: model)
         bar.onDone = { [weak self] in self?.endEditing() }
         bar.onMore = { [weak self] source in self?.presentInspector(from: source) }
+        bar.onParagraph = { [weak self] panel, source in self?.presentInspector(from: source, panel: panel) }
         bar.onFonts = { [weak self] source in self?.presentFontPicker(from: source) }
         tv.inputAccessoryView = bar
 
@@ -866,18 +867,30 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     /// The keyboard bar's More: the whole format inspector as a Deep popover budded from the button, in the window's
     /// droplet container (contracts-v2 `FloatingHosting`). Without a floating host (a container that predates it,
     /// headless runs), or without room above the keyboard for it, a system popover shows it instead.
-    func presentInspector(from source: UIView) {
+    func presentInspector(from source: UIView, panel: TextFormatPanel = .inspector) {
         guard let st = state else { return }
+        st.popover.panel = panel
         if presentFloatingInspector(st, from: source) { return }
         guard let presenter = topPresenter() else { return }
         let vc = UIHostingController(rootView: ScrollView {
-            TextFormatInspector(model: st.model).padding(NibSpacing.l)
+            TextFormatPanelContent(panel: panel, model: st.model) { [weak presenter, weak st] in
+                presenter?.presentedViewController?.dismiss(animated: true) { st?.textView.becomeFirstResponder() }
+            }
+            .padding(NibSpacing.l)
         })
         vc.modalPresentationStyle = .popover
         vc.preferredContentSize = CGSize(width: NibMetrics.popoverWidth + 2 * NibSpacing.l, height: NibMetrics.popoverMaxHeight)
         if let popover = vc.popoverPresentationController {
-            popover.sourceView = source
-            popover.sourceRect = source.bounds
+            // The input accessory can live in a different window. Anchor in the presenting
+            // canvas's coordinate space and open upward so choices cannot sit under the keyboard.
+            if let canvas = host?.canvasView {
+                popover.sourceView = canvas
+                popover.sourceRect = source.convert(source.bounds, to: canvas)
+            } else {
+                popover.sourceView = source
+                popover.sourceRect = source.bounds
+            }
+            popover.permittedArrowDirections = .down
         }
         vc.presentationController?.delegate = self
         presenter.present(vc, animated: true)

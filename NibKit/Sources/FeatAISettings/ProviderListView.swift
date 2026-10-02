@@ -123,7 +123,7 @@ struct ProviderListView: View {
                 NavigationLink {
                     ProviderEditorView(app: app)
                 } label: {
-                    NibRow(String(localized: "Other providers"), icon: .plus)
+                    NibRow(String(localized: "Add provider"), icon: .plus)
                 }
             } header: { AISettingsHeader(String(localized: "Providers")) }
             Section {

@@ -186,6 +186,62 @@ final class FeatZoomWindowTests: XCTestCase {
         }
     }
 
+    func testToolbarReopensOnCurrentPageWithItsReturnHeightAndStrokeTarget() async throws {
+        let h = harness()
+        registerRuled(h, returnHeight: 24.7)
+        let (host, overlay) = try await openWindow(h)
+        defer { overlay.detach(from: host) }
+        let c = overlay.controller
+        let item = try XCTUnwrap(h.app.ui.toolbar.get("zoomwindow"))
+        let command = try XCTUnwrap(item.command)
+        c.setReturnHeight(50)
+        await c.pending?.value
+        let depth = h.undoDepth(Fixtures.docID)
+
+        c.close()
+        await c.pending?.value
+        h.session.page = Fixtures.page2
+        let opened = try await h.run(command, item.resolvedParams(for: h.session))
+        c.stateChanged()
+        XCTAssertEqual(opened["page"]?.stringValue, page2)
+        XCTAssertTrue(c.isActive)
+        XCTAssertTrue(ZoomStore.resolve(h.app).activePane(for: h.session) === c)
+        XCTAssertEqual(c.returnHeight, 24.7, accuracy: 1e-9)
+        let before = state(h).rect
+        c.newLine()
+        await c.pending?.value
+        XCTAssertEqual(state(h).rect.y - before.y, 24.7, accuracy: 1e-9)
+        XCTAssertTrue(c.strokeFinished(stroke(120, 150)))
+        XCTAssertEqual(host.committed.last?.page, Fixtures.page2)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "opening and navigation are session changes")
+
+        c.setReturnHeight(30)
+        await c.pending?.value
+        c.close()
+        await c.pending?.value
+        h.session.page = Fixtures.page1
+        _ = try await h.run(command, item.resolvedParams(for: h.session))
+        c.stateChanged()
+        XCTAssertEqual(state(h).page, Fixtures.page1)
+        XCTAssertEqual(c.returnHeight, 50, "return height stays with its page")
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page2)?.zoomReturnHeight, 30)
+    }
+
+    func testExplicitTargetAndAlreadyOpenPaneKeepTheirPage() async throws {
+        let h = harness()
+        try await h.run("zoom.toggle", ["on": true])
+        let original = state(h).rect
+        h.session.page = Fixtures.page2
+        try await h.run("zoom.toggle", ["on": true])
+        XCTAssertEqual(state(h).page, Fixtures.page1)
+        XCTAssertEqual(state(h).rect, original, "showing an open pane is idempotent")
+        try await h.run("zoom.toggle", ["on": false])
+        let explicit = try await h.run("zoom.toggle", ["on": true, "page": .string(page1), "at": [300, 400]])
+        XCTAssertEqual(explicit["page"]?.stringValue, page1, "an explicit target takes priority over the current page")
+        XCTAssertEqual(state(h).rect.midX, 300, accuracy: 1e-9)
+        XCTAssertEqual(state(h).rect.midY, 400, accuracy: 1e-9)
+    }
+
     func testDocumentHostingControllerExposesZoomShortcutsWhilePaneIsClosed() async throws {
         let h = harness()
         let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get("zoomwindow.keyboard"))
@@ -333,8 +389,42 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertTrue(c.optionsPresented, "the options can reopen after Escape")
         c.close()
         XCTAssertFalse(c.optionsPresented)
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID),
+                       "closing the pane must release its native options host before the next toolbar tap")
         await c.pending?.value
         overlay.detach(from: host)
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
+    }
+
+    func testPaneLifecycleRemovesOptionsAndAllowsReopening() async throws {
+        let h = harness()
+        let floating = OptionsHost()
+        h.session.floatingHost = floating
+        let (host, overlay) = try await openWindow(h)
+        defer { overlay.detach(from: host) }
+        let c = overlay.controller
+        c.toggleOptions()
+        // Closing via the toolbar/keyboard bypasses the pane's Close button.
+        try await h.run("zoom.toggle", ["on": false])
+        c.stateChanged()
+        XCTAssertFalse(c.optionsPresented)
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
+
+        try await h.run("zoom.toggle", ["on": true])
+        c.stateChanged()
+        c.toggleOptions()
+        XCTAssertTrue(c.optionsPresented)
+        try await h.run("zoom.setBox", ["page": .string(page2), "rect": [100, 200, 200, 50]])
+        c.stateChanged()
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID), "options belonged to the previous page")
+
+        c.toggleOptions()
+        c.paneAppeared()
+        c.paneAppeared()
+        c.paneDisappeared()
+        XCTAssertTrue(c.optionsPresented, "a replacement view still owns the pane")
+        c.paneDisappeared()
+        XCTAssertFalse(c.optionsPresented)
         XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
     }
 
