@@ -194,6 +194,12 @@ final class ChatViewModel: ObservableObject {
 
     static func tokenKey(_ chat: String) -> SettingKey<Int> { SettingKey("aichat.tokens." + chat, default: 0) }
     var tokenCount: Int { totalTokens }
+    static let connectionActions = [String(localized: "Use my Claude subscription"), String(localized: "Use my ChatGPT subscription"), String(localized: "Other providers")]
+    static func connectionPage(for action: String) -> String {
+        if action == connectionActions[0] { return "settings.ai.claude" }
+        if action == connectionActions[1] { return "settings.ai.chatgpt" }
+        return "settings.ai"
+    }
     var settingsPageID: String {
         app?.ui.settingsPages.all.first(where: { $0.owner == "aisettings" })?.id ?? "settings.ai"
     }
@@ -222,7 +228,9 @@ final class ChatViewModel: ObservableObject {
             return
         }
         let hasKey = !(Keychain.getString(service: AIProviderConfig.keychainService, account: config.keychainAccount) ?? "").isEmpty
-        let credentials = hasKey ? String(localized: "your API key") : String(localized: "no API key saved")
+        let credentials = config.extraHeaders["X-Nib-Subscription"] == "1"
+            ? String(localized: "your subscription")
+            : (hasKey ? String(localized: "your API key") : String(localized: "no API key saved"))
         let label = "\(config.model) · \(config.name) · \(credentials)"
         if providerLabel != label { providerLabel = label }
     }

@@ -146,15 +146,15 @@ struct ChatPanel: View {
     private var connectionBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.l) {
-                Text(String(localized: "Connect a model to use the assistant."))
+                Text(String(localized: "Use your Claude or ChatGPT subscription with Nib Agent on your Mac."))
                     .font(NibFont.callout).foregroundStyle(NibColor.label)
                     .fixedSize(horizontal: false, vertical: true)
-                ForEach(["Anthropic", "OpenAI-compatible", "Ollama", "LM Studio", "Custom"], id: \.self) { provider in
+                ForEach(ChatViewModel.connectionActions, id: \.self) { provider in
                     NibButton(provider, symbol: .settings, kind: .plain) {
-                        model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)])
+                        model.perform(CommandIDs.settingsOpen, ["page": .string(ChatViewModel.connectionPage(for: provider))])
                     }
                     .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
-                    .accessibilityHint(String(localized: "Opens AI settings. Choose this provider there."))
+                    .accessibilityHint(String(localized: "Opens setup for this provider."))
                 }
                 operationFeedback
             }

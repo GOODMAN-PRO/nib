@@ -35,6 +35,12 @@ public enum FeatAISettingsFeature: NibFeature {
         }
         page.keywords = ["AI", "providers", "privacy", "API key", "Ollama", "LM Studio", "models"]
         app.ui.settingsPages.register(page)
+        for (preset, pageID) in [(ProviderPreset.claudeSubscription, "settings.ai.claude"), (.chatGPTSubscription, "settings.ai.chatgpt")] {
+            app.ui.settingsPages.register(SettingsPageDescriptor(id: pageID, title: preset.title,
+                icon: NibSymbol.assistant.name, section: .ai, order: preset == .claudeSubscription ? 1 : 2, owner: id) {
+                AnyView(SubscriptionSetupView(app: $0, preset: preset))
+            })
+        }
     }
 }
 

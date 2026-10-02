@@ -545,7 +545,7 @@ Why things are substituted: CloudKit/iCloud sync, APNs push and Sign in with App
 | N-009 | Plugin SDK types (nib.d.ts) generated from the live registry | F078 |
 | N-010 | Plugin developer console and 'new plugin' template | F080 |
 | N-011 | Example plugins: hello, flashcards-from-selection, word-count panel, word-complete, planner template, graph paper | F082 |
-| N-012 | Bring-your-own AI providers: Anthropic, OpenAI and OpenAI-compatible (OpenRouter, Ollama, LM Studio, vLLM), custom Nib HTTP endpoint | F083 F086 |
+| N-012 | Bring-your-own AI providers: Claude/ChatGPT subscriptions through Nib Agent (no API key), Anthropic API, OpenAI and OpenAI-compatible (OpenRouter, Ollama, LM Studio, vLLM), custom Nib HTTP endpoint | F083 F086 |
 | N-013 | AI agent that reads, adds, edits and deletes anything through the command registry (within the exceptions below, where it asks and the user confirms) | F084 |
 | N-014 | Generated AI tool catalogue: fixed meta-tools + configurable direct tools | F084 |
 | N-015 | AI vision & OCR context: page renders with Set-of-Mark ids, recognised page text | F084 F055 |
@@ -693,3 +693,5 @@ Plugins, the in-app AI and bridge agents can do what the user can do by hand thr
 | F110 | Teacher toolkit: smart views, clusters & class navigator | FeatTeacher | 4 | S-098, S-109, S-110, S-111 |
 | F100 | Performance, memory & metrics | FeatPerformance | 4 | P-091, P-095 |
 | F111 | Integration tests & device smoke scripts | IntegrationTests | 4 | — |
+
+Nib Agent ownership: F086 owns `tools/agent/` (Node server, installer, setup docs and CLI tests); F083 owns the scoped subscription MCP handoff adapter; F085 owns subscription-first assistant entry actions; F091 owns bridge-pairing guidance. See AI.md §11 for security and media endpoint limits.

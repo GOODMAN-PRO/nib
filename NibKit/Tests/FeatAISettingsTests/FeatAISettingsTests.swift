@@ -301,7 +301,7 @@ final class FeatAISettingsTests: XCTestCase {
         catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
     }
     func testPresetsAndRegistrationConformance() async throws {
-        XCTAssertEqual(ProviderPreset.allCases.count, 7)
+        XCTAssertEqual(ProviderPreset.allCases, [.claudeSubscription, .chatGPTSubscription, .anthropic, .openAI, .openRouter, .ollama, .lmStudio, .custom, .nibHTTP])
         XCTAssertEqual(ProviderPreset.ollama.baseURL, "http://localhost:11434/v1")
         XCTAssertEqual(ProviderPreset.lmStudio.baseURL, "http://localhost:1234/v1")
         XCTAssertEqual(ProviderPreset.nibHTTP.kind, .nibHTTP)

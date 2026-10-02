@@ -1010,6 +1010,10 @@ struct BridgeSettingsPage: View {
 
     @ViewBuilder
     private var pairingSections: some View {
+        Section {
+            Text(String(localized: "To use your Claude or ChatGPT subscription inside Nib, connect Nib Agent in AI settings. Each turn uses a temporary tool token and keeps your AI confirmation policy. The token below is for external clients."))
+                .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+        } header: { BridgeHeader(String(localized: "Your subscriptions")) }
         if let pairing = model.pairing {
             Section {
                 if model.tokenRevealed {

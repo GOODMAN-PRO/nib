@@ -1,8 +1,9 @@
 # Nib AI: bring your own model, tools, safety, MCP bridge
 
-Nib has no AI of its own and no AI server. The user connects a model they control:
+Nib has no AI of its own and runs no hosted AI server. The user connects a model they control:
 
-- **Anthropic** (Claude)
+- **Your Claude or ChatGPT subscription through Nib Agent on your Mac** (first-class presets; no API keys, see §11)
+- **Anthropic API** (Claude)
 - **OpenAI**
 - **Any OpenAI-compatible endpoint**: OpenRouter, a local **Ollama** or **LM Studio**, vLLM, Groq, and similar
 - **Their own HTTP endpoint** speaking the Nib Agent Protocol
@@ -59,6 +60,8 @@ One turn:
 
 | Preset | kind | Base URL | Notes |
 |---|---|---|---|
+| Claude — your subscription | nibHTTP | `http://<mac>:7332/` | `claude-sonnet`, `claude-opus`, `claude-haiku`; pairing token in Keychain |
+| ChatGPT — your subscription | nibHTTP | `http://<mac>:7332/` | `chatgpt`; official Codex CLI signed in with ChatGPT |
 | Anthropic | anthropic | `https://api.anthropic.com` | header `x-api-key`, `anthropic-version: 2023-06-01` |
 | OpenAI | openAICompatible | `https://api.openai.com/v1` | `Authorization: Bearer` |
 | OpenRouter | openAICompatible | `https://openrouter.ai/api/v1` | extra headers `HTTP-Referer`, `X-Title: Nib` |
@@ -314,3 +317,27 @@ Because the developer builds Nib without a Mac, the bridge also serves as the **
 | Providers | Hand-authored SSE/NDJSON fixtures written from the wire formats in §2–§3 (`NibAIProvidersTests/Fixtures`: Anthropic, OpenAI, Ollama and Nib HTTP; no API keys needed) replayed through a `URLProtocol` stub, asserting the `ChatEvent` sequence, including split tool JSON and Ollama's whole-argument deltas. |
 | Agent | A scripted fake `AIProvider` makes three tool calls against the `Harness` fixture notebook. The test asserts one undo group, provenance, error-result retry, truncation cursor and ask-mode refusal (including a nested batch). Features that only consume `services.ai` use NibTesting's `FakeAIService`. |
 | Bridge | Golden JSON-RPC request/response pairs through the transport-free `MCPHandler`; the HTTP parser; the CIDR allowlist. |
+
+## 11. Your subscriptions (Claude, ChatGPT) through Nib Agent
+
+**Setup.** On your Mac, install Node 20+ and the official `claude` / `codex` CLIs. Run each once and sign in using your subscription (Claude Max or another eligible Claude plan; Sign in with ChatGPT for Codex). Run `node tools/agent/agent.mjs`. In Nib Settings › AI, choose **Claude — your subscription** or **ChatGPT — your subscription**, then paste the terminal’s `nib://agent/pair?host=…&port=7332&token=…` string. Alternatively discover the Mac over `_nib-agent._tcp` and enter its pairing token. Allow Local Network access. Connect and use subscription saves the token in the provider Keychain account, enables the bridge as the user without changing confirmation policies, tests a tiny completion, and activates that provider. Claude has a Sonnet/Opus/Haiku picker. Other providers remain available below these presets.
+
+`tools/agent/install-macos.sh` installs a login LaunchAgent; its private log is `~/Library/Logs/nib-agent.log`. The bearer token is generated on first run under `~/.config/nib-agent/`. See [setup and troubleshooting](../tools/agent/README.md). Windows/Linux use the same dependency-free Node server with manual pairing and native CLI executables; Bonjour advertising and the installer are macOS-only.
+
+**Protocol extension and scoped tools.** Subscription configs are `nibHTTP`, marked by the non-secret `X-Nib-Subscription: 1` header. Every request still contains the entire §3 conversation and receives NDJSON `ChatEvent`s. Failures emit `{"type":"error","code":"unavailable","message":"…","hint":"…"}`; blank lines keep an idle connection alive. Agent authorization is the normal provider `Authorization: Bearer` header. It must never be stored in `extraHeaders`.
+
+Tool-capable requests additionally carry a secret, transient body field:
+
+```json
+{"bridge":{"url":"http://<ipad>:<ephemeral-port>/mcp","token":"nib_<43 base64url chars>","mode":"handoff"}}
+```
+
+F083's `SubscriptionBridge` is an in-app MCP handoff adapter, separate from F090’s external-client listener. This separation is necessary: F090 executes as a bridge principal with its own group, whereas an in-app turn must retain its AI/plugin principal, Ask-mode restriction, policy and Undo group. The adapter supports initialize, ping, tools/list and tools/call. It exposes exactly `ChatRequest.tools`, accepts one call per request, authenticates a fresh random capability, rejects browser Origins and non-private network clients, and expires when streaming ends. It does **not** execute mutations. Its tools/call response has `result.nibHandoff: true`; Nib Agent converts the accepted proposal into the standard §3 `toolCall` + `stop(tool_use)` events and terminates that CLI. F084 executes it through the existing command bus and sends the results in the next stateless request. Confirmations, cancellation, change summaries, original-principal permissions, locked-document checks, provenance and one-turn Undo therefore stay in Nib. The Mac never receives F090’s reusable library-wide token. F091 explains this distinction in Bridge settings.
+
+An authenticated loopback MCP proxy connects each CLI to the supplied endpoint and filters to the request’s allowed tool names. Claude has an empty built-in tool set, exact MCP allowlist, strict MCP config, noninteractive `dontAsk`, disabled skills/hooks/Chrome, and no persisted session. Codex ignores user configuration and exec rules, uses a private empty working directory and read-only sandbox, disables shell/web/view-image/agents/goals/plugins/hooks, and reads a per-request model catalogue with file-patch capabilities removed and model-level code-mode/multi-agent overrides disabled. Only the scoped MCP handoff server gets automatic CLI approval; actual actions still wait for Nib’s gateway. Claude’s auth-status preflight rejects stored API-key logins, and Codex forces ChatGPT login. The existing CLI credential store is retained; API-key and inherited host-session environment variables are removed. Request images use Claude’s image input blocks or private Codex `--image` files; turn files are removed afterwards. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) for the CLI controls. These controls must be reverified after CLI upgrades.
+
+**Networks and privacy.** Keep Nib foregrounded. On Wi-Fi, the temporary callback uses the iPad’s local address. For Tailscale, the setup disclosure accepts this iPad’s address reachable from the Mac (`X-Nib-Bridge-Host`, non-secret). LAN HTTP is unencrypted: use a trusted private network or Tailscale, never public port forwarding. The bearer pairing string is a secret; discovery never advertises it. To revoke the Mac token, stop Nib Agent, remove its token file, restart and pair again. Subscription usage is processed by Anthropic/OpenAI under the user’s plan and limits. Nib owns no AI billing account.
+
+**Coverage and limits.** Chat, study questions, summaries, translation, outlines/titles, handwriting/text/diagram tool actions, math explanations and meeting summaries already go through the active `AIService`, so these routes work with either subscription without API credentials. The CLI/model controls actual token budgets; §3 `maxTokens` and `temperature` are advisory for subscription routes. Codex emits text when its message event completes; Claude also emits incremental text deltas. Each tool handoff starts a new CLI invocation, so tool-heavy turns have additional startup latency. Dedicated audio transcription and bitmap image-generation endpoints are absent from Protocol v1; use Nib’s on-device transcription/Image Playground where available, or a separately configured API provider for these operations. They are not claimed as subscription features.
+
+**Verification.** `node --test tools/agent` uses fake executables for auth, stream parsing, routing, failure recovery and tool restrictions. `node tools/agent/smoke.mjs` starts an agent, POSTs a tiny prompt with curl to each real subscription, checks for streamed text and no error, and shuts down. No prompts, keys or CLI diagnostic stderr are persisted by the agent. A saved login alone is insufficient: expired OAuth credentials must be renewed by opening the official CLI on the Mac.

@@ -84,7 +84,7 @@ targets:
         NSLocalNetworkUsageDescription: Nib uses the local network for live collaboration and the AI bridge.
         NSCalendarsFullAccessUsageDescription: Nib shows your calendar events and creates notes for meetings.
         NSCalendarsUsageDescription: Nib shows your calendar events and creates notes for meetings.
-        NSBonjourServices: [_nib._tcp, _nib-collab._tcp, _nib-collab._udp]
+        NSBonjourServices: [_nib-agent._tcp, _nib._tcp, _nib-collab._tcp, _nib-collab._udp]
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSUserActivityTypes: [app.nib.openDocument]

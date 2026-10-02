@@ -34,6 +34,7 @@ final class ProviderStore: AIProviderStore {
     private var active: UUID?
     private var isLoaded = false
     private var httpStorage: ProviderHTTP?
+    var bridgeIsEnabled: (() -> Bool)?
 
     /// The app's store: Application Support on a device, a private temporary folder in hostless tests.
     convenience init() {
@@ -160,7 +161,7 @@ final class ProviderStore: AIProviderStore {
     func provider(_ id: UUID?) -> AIProvider? {
         loadIfNeeded()
         guard let target = id ?? active, let entry = entries.first(where: { $0.config.id == target }) else { return nil }
-        return ProviderStore.makeProvider(entry.config, credential: credential(for: entry), http: http)
+        return ProviderStore.makeProvider(entry.config, credential: credential(for: entry), http: http, bridgeAllowed: bridgeIsEnabled?() ?? true)
     }
 
     // MARK: Credentials
@@ -181,10 +182,10 @@ final class ProviderStore: AIProviderStore {
         return entry.hasKey ? .missing : .none
     }
 
-    static func makeProvider(_ config: AIProviderConfig, credential: ProviderCredential, http: ProviderHTTP) -> AIProvider {
+    static func makeProvider(_ config: AIProviderConfig, credential: ProviderCredential, http: ProviderHTTP, bridgeAllowed: Bool = true) -> AIProvider {
         switch config.kind {
         case .anthropic: return AnthropicProvider(config: config, credential: credential, http: http)
-        case .nibHTTP: return NibHTTPProvider(config: config, credential: credential, http: http)
+        case .nibHTTP: return NibHTTPProvider(config: config, credential: credential, http: http, bridgeAllowed: bridgeAllowed)
         default: return OpenAICompatibleProvider(config: config, credential: credential, http: http)
         }
     }
