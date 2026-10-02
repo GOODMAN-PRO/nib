@@ -22,7 +22,9 @@ const TAG = A.jobTag || 'qa'
 const TRAILER = 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01GpZ3Q12FGHi43JsYU8aD5F'
 const TRAILER_RULE = `every commit message ends with a blank line then exactly these two adjacent lines:\n${TRAILER}`
 const say = (m) => console.log(`[${new Date().toTimeString().slice(0, 8)}] ${m}`)
-const minutesUntil = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); const t = new Date(); t.setHours(h, m, 0, 0); return (t - Date.now()) / 60000 }
+// Deadlines are "HH:MM" (today) or "YYYY-MM-DD HH:MM" (local time).
+const parseWhen = (w) => { const d = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})$/.exec(w); if (d) return new Date(`${d[1]}T${d[2]}:${d[3]}:00`); const [h, m] = w.split(':').map(Number); const t = new Date(); t.setHours(h, m, 0, 0); return t }
+const minutesUntil = (w) => (parseWhen(w) - Date.now()) / 60000
 const STATE = `${LOGS}/qa-state.json`
 const state = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, 'utf8')) : {}
 const save = () => fs.writeFileSync(STATE, JSON.stringify(state, null, 1))
@@ -208,6 +210,17 @@ The tests live in NibUITests/${cls}.swift (read them to see exactly what the use
     state.fixed[a.key].done = true; save()
   })
 
+  const LENSES = [
+      ['glass', 'MATERIAL + LIQUID GLASS: DESIGN.md §2, §7, §10 and the glass lines of §16 — rims, refraction, doubled edges, shading, glass bodies behind every floating control, dark-mode legibility, iOS 26 glass vs fallbacks.'],
+      ['layout', 'LAYOUT + TYPOGRAPHY + COLOUR: DESIGN.md §3-§6 and §14 per screen — spacing grid, alignment, radii, type scale, truncation, colour tokens light AND dark, overlaps between chrome/panels and page content or ink, portrait vs landscape.'],
+      ['slop', 'SLOP + ACCESSIBILITY: every line of DESIGN.md §16 and §12 — 44 pt targets, Dynamic Type, contrast, VoiceOver labels, Reduce Motion/Transparency; anything templated, generic, cluttered, duplicated or stray.'],
+      ['ux', 'UX + COPY + STATES: the product feel — empty states, error and confirmation messages, button and menu wording (consistent, specific, sentence case, no jargon), loading/progress states, disabled states, selection feedback, consistency of icons and terminology across screens, anything that feels unfinished.'],
+    ]
+  const capturePrompt = (dir) => `Capture the real app for the final polish review, through the UI-test lanes (no extra simulators: the Mac is out of memory).
+1. Write (or, if it already exists, finish and reuse) NibUITests/CaptureUITests.swift (only this file, plus — if missing — a fixture-only launch argument "-NibUITestAppearance light|dark" in the app's UI-test fixture code that sets the windows' overrideUserInterfaceStyle). One test per screen group: drive the real app into each state with the NibUITests/Support helpers (verify via the nib.qa.state probe), then attach XCTAttachment(screenshot: XCUIScreen.main.screenshot()) named "<nn>-<screen>-<light|dark>-<portrait|landscape>" with lifetime .keepAlways. Screens: library grid, list and an open folder; library search; new menu; new-notebook sheet; canvas with the palette docked left, top and bottom; the options bar; each tool's options (pen, highlighter, eraser, lasso, shapes, text); a lasso selection with its object menu; page sidebar; outline; document search with matches; AI assistant; plugin manager; settings (2-3 screens); export sheet; whiteboard; text document; study session; presentation mode; tabs with 3 documents; an empty folder; an empty/error state. Light AND dark, portrait AND landscape (XCUIDevice.shared.orientation). A capture test should not fail on cosmetic details — only when a state cannot be reached.
+2. Run ${UIRUN('NibUITests/CaptureUITests', 2)}
+3. Export: xcrun xcresulttool export attachments --path ${LOGS}/ui-CaptureUITests.xcresult --output-path ${dir} ; rename each exported file to its attachment name (the export's manifest.json maps them) as .png; write ${dir}/index.md listing each file, screen and state, and any state you could not reach and why.
+Answer status "ok", details = the file list (or "blocked" with the reason).`
   // ---------------------------------------------------------------- polish, concurrently with the area pipeline
   const polishP = (async () => {
     if (state.design?.done) return
@@ -217,11 +230,7 @@ The tests live in NibUITests/${cls}.swift (read them to see exactly what the use
     let cap = { status: 'blocked', details: [] }
     for (const name of ['capture', 'capture-2']) {
       if (pngs() > 0) break
-      cap = await codex(name, `Capture the real app for the final polish review, through the UI-test lanes (no extra simulators: the Mac is out of memory).
-1. Write (or, if it already exists, finish and reuse) NibUITests/CaptureUITests.swift (only this file, plus — if missing — a fixture-only launch argument "-NibUITestAppearance light|dark" in the app's UI-test fixture code that sets the windows' overrideUserInterfaceStyle). One test per screen group: drive the real app into each state with the NibUITests/Support helpers (verify via the nib.qa.state probe), then attach XCTAttachment(screenshot: XCUIScreen.main.screenshot()) named "<nn>-<screen>-<light|dark>-<portrait|landscape>" with lifetime .keepAlways. Screens: library grid, list and an open folder; library search; new menu; new-notebook sheet; canvas with the palette docked left, top and bottom; the options bar; each tool's options (pen, highlighter, eraser, lasso, shapes, text); a lasso selection with its object menu; page sidebar; outline; document search with matches; AI assistant; plugin manager; settings (2-3 screens); export sheet; whiteboard; text document; study session; presentation mode; tabs with 3 documents; an empty folder; an empty/error state. Light AND dark, portrait AND landscape (XCUIDevice.shared.orientation). A capture test should not fail on cosmetic details — only when a state cannot be reached.
-2. Run ${UIRUN('NibUITests/CaptureUITests', 2)}
-3. Export: xcrun xcresulttool export attachments --path ${LOGS}/ui-CaptureUITests.xcresult --output-path ${shots} ; rename each exported file to its attachment name (the export's manifest.json maps them) as .png; write ${shots}/index.md listing each file, screen and state, and any state you could not reach and why.
-Answer status "ok", details = the file list (or "blocked" with the reason).`, 'result', 'high', 2).catch((e) => ({ status: 'blocked', details: [e.message] }))
+      cap = await codex(name, capturePrompt(shots), 'result', 'high', 2).catch((e) => ({ status: 'blocked', details: [e.message] }))
       say(`polish: ${name} ${cap.status}, ${pngs()} screenshot(s)`)
     }
     let reviewShots = shots
@@ -231,12 +240,6 @@ Answer status "ok", details = the file list (or "blocked" with the reason).`, 'r
       shotNote = ` These screenshots are from the last design pass (this morning) — today's functional fixes changed some screens since, so CHECK EVERY FINDING AGAINST THE CURRENT CODE before reporting it, and also read the current view code of the screens shown for problems the screenshots cannot show.`
       say(`polish: no fresh screenshots — reviewing ${reviewShots} + the current code`)
     }
-    const LENSES = [
-      ['glass', 'MATERIAL + LIQUID GLASS: DESIGN.md §2, §7, §10 and the glass lines of §16 — rims, refraction, doubled edges, shading, glass bodies behind every floating control, dark-mode legibility, iOS 26 glass vs fallbacks.'],
-      ['layout', 'LAYOUT + TYPOGRAPHY + COLOUR: DESIGN.md §3-§6 and §14 per screen — spacing grid, alignment, radii, type scale, truncation, colour tokens light AND dark, overlaps between chrome/panels and page content or ink, portrait vs landscape.'],
-      ['slop', 'SLOP + ACCESSIBILITY: every line of DESIGN.md §16 and §12 — 44 pt targets, Dynamic Type, contrast, VoiceOver labels, Reduce Motion/Transparency; anything templated, generic, cluttered, duplicated or stray.'],
-      ['ux', 'UX + COPY + STATES: the product feel — empty states, error and confirmation messages, button and menu wording (consistent, specific, sentence case, no jargon), loading/progress states, disabled states, selection feedback, consistency of icons and terminology across screens, anything that feels unfinished.'],
-    ]
     const reviews = await Promise.all(LENSES.map(([key, lens]) => codex(`polish-review-${key}`, `Final polish review of the real Nib app. Read docs/DESIGN.md fully, open EVERY screenshot in ${reviewShots} with your image viewer (index.md explains each).${shotNote} Lens: ${lens}
 Report every real, visible problem — blocker, major AND minor polish — each with screen, owner (feature id from docs/forge-spec.json whose files draw it, or "shared"), problem and the concrete fix. No speculation. Do not change files.`, 'review', 'high').catch(() => ({ issues: [] }))))
     const issues = reviews.flatMap((r) => r.issues || [])
@@ -260,17 +263,43 @@ Fix each at the root per docs/DESIGN.md with NibDesign tokens/components; keep c
   const notCovered = Object.entries(state.fixed).filter(([k, f]) => f.notCovered || !(state.written[k]?.tests)).map(([k]) => k)
   if (notCovered.length) say(`not covered by UI tests: ${notCovered.join(', ')}`)
 
+  // ---------------------------------------------------------------- polish pass 2: real screenshots of the fixed app
+  if (!state.design2?.done) {
+    const shots2 = `${ROOT}-design/qa-final-2`
+    const n2 = () => { try { return fs.readdirSync(shots2).filter((f) => f.endsWith('.png')).length } catch { return 0 } }
+    for (const name of ['capture-p2', 'capture-p2b']) {
+      if (n2() > 0 || minutesUntil(A.shipBy) < 300) break
+      const c = await codex(name, capturePrompt(shots2), 'result', 'high', 2).catch((e) => ({ status: 'blocked', details: [e.message] }))
+      say(`polish 2: ${name} ${c.status}, ${n2()} screenshot(s)`)
+    }
+    if (n2() > 0) {
+      const reviews = await Promise.all(LENSES.map(([key, lens]) => codex(`polish2-review-${key}`, `Second polish review of the real Nib app, after today's functional fixes and a first polish pass. Read docs/DESIGN.md fully, open EVERY screenshot in ${shots2} with your image viewer (index.md explains each). Lens: ${lens}
+Report every real, visible problem — blocker, major AND minor — each with screen, owner (feature id from docs/forge-spec.json whose files draw it, or "shared"), problem and the concrete fix. Check each against the current code. No speculation. Do not change files.`, 'review', 'high').catch(() => ({ issues: [] }))))
+      const issues = reviews.flatMap((r) => r.issues || [])
+      say(`polish 2: ${issues.length} issue(s) (${issues.filter((i) => i.severity !== 'minor').length} blocker/major)`)
+      const groups = {}
+      for (const i of issues) (groups[normOwner(i.owner)] ||= []).push(`[${i.severity}] ${i.screen}: ${i.problem} -> ${i.fix}`)
+      await pool(Object.keys(groups), 4, (o) => codex(`polish2-fix-${o}`, `Polish fixes (pass 2). Edit ONLY files owned by ${o === 'shared' ? 'no feature (NibDesign, NibContracts, Nib/App, docs; keep changes backward compatible)' : o + ' (docs/forge-spec.json)'}; other jobs edit other files right now, so keep the code compiling at every moment and never run git add/commit/stash/checkout/reset.
+Findings (fix ALL of them, including minor):
+${groups[o].join('\n')}
+Fix each at the root per docs/DESIGN.md with NibDesign tokens/components; keep copy consistent; update/add unit tests for changed behaviour and check them with \`${TOOLS} targets ${DIR} "<the owner's test targets>"\`. Do not run UI tests. Answer status "ok", details = what you changed per finding.`, 'result', 'high').catch((e) => ({ status: 'blocked', details: [e.message] })))
+      say(`polish 2: committed ${await commit('QA: polish pass 2 (real screenshots)')}`)
+      state.design2 = { done: true, issues: issues.length, majors: issues.filter((i) => i.severity !== 'minor').length }
+    } else { say('polish 2: no screenshots captured'); state.design2 = { done: true, noScreenshots: true } }
+    save()
+  }
+
   // ---------------------------------------------------------------- final verify (unit suite + critical UI classes)
-  if (!state.finalVerify) {
+  if (!state.finalVerify2) {
     const inkIds = ((state.written.ink && state.written.ink.failures) || []).map((f) => qual(state.written.ink, f)).filter((t) => /^NibUITests\/\w+UITests\/\w+$/.test(t))
     const canvasSrc = fs.readFileSync(`${DIR}/NibUITests/CanvasUITests.swift`, 'utf8')
     const canvasIds = [...canvasSrc.matchAll(/func (test\w*(?:Zoom|Pinch|DoubleTap|Fit|Pan|Keyboard|Rotation)\w*)\s*\(/g)].map((m) => `NibUITests/CanvasUITests/${m[1]}`)
-    const laneA = inkIds.length ? inkIds.join(' ') : 'NibUITests/InkUITests'
+    const laneA = 'NibUITests/SmokeUITests NibUITests/InkUITests'
     const selIds = ((state.written.selection && state.fixed.selection && state.fixed.selection.remaining) || []).map((f) => String(f.test || '')).filter((t) => /^NibUITests\/SelectionUITests\/\w*(Lasso|Move|Resize|Delete|Copy|Paste|Duplicate|Undo)\w*$/.test(t)).slice(0, 15)
-    const laneB = ['NibUITests/SmokeUITests', ...canvasIds, ...selIds].join(' ')
-    const v = await codex('final-verify', `Final verification before shipping (the unit/package suite runs on GitHub CI during the ship step, so do NOT run the local full build). The critical UI regression set — start BOTH runs at the same time in the background (they take the two simulator lanes): (A) the pen/ink tests that failed before tonight's ink fixes: ${UIRUN(laneA, 3)} and (B) the smoke suite, the canvas zoom/pan/keyboard tests and the core selection interactions: \`${TOOLS} uitest ${DIR} "${laneB}"\` (log and result bundle named after the first identifiers, under ${LOGS}). Hard time limit: report by ${A.shipBy} whatever has run. Before running, make sure the worktree compiles (no half-finished edits are expected now; if the UI build fails, fix the compile error at the root). Fix anything the recent fixes or the polish broke (test wrong per spec -> fix the test; app wrong -> fix the app at the root), within the UI-run budget, and commit on ${BR} (${TRAILER_RULE}). Answer status "green"/"red", file "NibUITests", tests/passed/failed, failures (test = "<Class>/<testMethod>", owner, problem, evidence), notes.`, 'uiwrite', 'high', 3).catch((e) => ({ status: 'blocked', failures: [], notes: e.message }))
+    const laneB = 'NibUITests/CanvasUITests NibUITests/SelectionUITests'
+    const v = await codex('final-verify-2', `Final verification before shipping (the unit/package suite runs on GitHub CI during the ship step, so do NOT run the local full build). The critical UI regression set — start BOTH runs at the same time in the background (they take the two simulator lanes): (A) smoke + every pen/ink test: ${UIRUN(laneA, 3)} and (B) every canvas (zoom/pan/navigation) and selection test: \`${TOOLS} uitest ${DIR} "${laneB}"\` (log and result bundle named after the first identifiers, under ${LOGS}). Report by ${A.shipBy} at the latest. For each failure decide test-wrong (fix the test) or app-wrong (fix the app at the root if it is small and safe, otherwise report it), commit fixes on ${BR} (${TRAILER_RULE}). Before running, make sure the worktree compiles (no half-finished edits are expected now; if the UI build fails, fix the compile error at the root). Fix anything the recent fixes or the polish broke (test wrong per spec -> fix the test; app wrong -> fix the app at the root), within the UI-run budget, and commit on ${BR} (${TRAILER_RULE}). Answer status "green"/"red", file "NibUITests", tests/passed/failed, failures (test = "<Class>/<testMethod>", owner, problem, evidence), notes.`, 'uiwrite', 'high', 3).catch((e) => ({ status: 'blocked', failures: [], notes: e.message }))
     say(`final verify: ${v.status} — UI ${v.passed}/${v.tests} pass`)
-    state.finalVerify = v; save()
+    state.finalVerify2 = v; save()
   }
 
   // ---------------------------------------------------------------- ship
