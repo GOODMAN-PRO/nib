@@ -134,15 +134,14 @@ final class LibraryUITests: XCTestCase {
 
     private func option(_ title: String) throws {
         try tap("Sort and View")
-        let menus = app.scrollViews.allElementsBoundByIndex.filter {
-            $0.buttons.matching(self.matching("Manual")).count > 0
-        }
-        guard let menu = menus.last else {
-            throw NibUI.Failure.message("Sort and View did not open its options")
-        }
+        // Identify the panel by its own accessible title. Manual is the eighth
+        // sort row and can lie outside the native scroll view's accessibility viewport.
+        let menu = app.scrollViews.matching(matching("Sort and View")).firstMatch
+        try visible(menu, "Sort and View must present its options")
+        try eventually("Sort and View must be interactive") { menu.isHittable }
         let choice = menu.buttons.matching(matching(title)).firstMatch
+        for _ in 0..<5 where !choice.exists || !choice.isHittable { menu.swipeUp() }
         try visible(choice, "Sort and View is missing \(title)")
-        for _ in 0..<5 where !choice.isHittable { menu.swipeUp() }
         XCTAssertTrue(choice.isEnabled, "View option must be enabled: \(title)")
         choice.tap()
     }
@@ -208,6 +207,7 @@ final class LibraryUITests: XCTestCase {
         _ = try ui.waitForState { $0.openPanels.contains("organize.folder.new") }
         try replace(app.textFields["Folder name"], with: title)
         try tap("Create Folder")
+        try eventually("Creation sheet must dismiss before opening its new folder") { !self.app.textFields["Folder name"].exists }
         try visible(item(title, folder: true), "Created folder must appear in its current parent")
     }
 
@@ -609,6 +609,7 @@ final class LibraryUITests: XCTestCase {
         try visible(favourite, "Folder style must offer favourite toggle")
         favourite.tap()
         try tap("Save Changes")
+        try eventually("Folder style sheet must dismiss before reopening its context menu") { !self.app.textFields["Folder name"].exists }
         try context(folder, folder: true); try tap("Customise Folder")
         revealFormElement(app.textFields["Hex colour"])
         XCTAssertEqual(app.textFields["Hex colour"].value as? String, "#FF8800")
@@ -876,51 +877,44 @@ final class LibraryUITests: XCTestCase {
     func testAccessibleMoveEarlierLaterAndBoundaries() throws {
         try option("Name, A to Z")
         let before = documentOrder()
-        // Enable the actual system screen reader. A simulator that omits VoiceOver is a
-        // shared automation limitation, not evidence that the app's reorder action is broken.
-        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
-        settings.launch()
-        let accessibility = settings.descendants(matching: .any).matching(matching("Accessibility")).firstMatch
-        for _ in 0..<6 where !accessibility.isHittable { settings.swipeUp() }
-        try visible(accessibility, "VoiceOver setup: Settings must expose Accessibility")
-        accessibility.tap()
-        let voiceOver = settings.descendants(matching: .any).matching(matching("VoiceOver")).firstMatch
-        try visible(voiceOver, "VoiceOver setup: this simulator must provide VoiceOver")
-        voiceOver.tap()
-        let enabled = settings.switches["VoiceOver"].firstMatch
-        try visible(enabled, "VoiceOver setup: the system screen-reader switch is required")
-        if enabled.value as? String != "1" { enabled.tap() }
-        try eventually("VoiceOver setup: system screen reader must become enabled") { enabled.value as? String == "1" }
-        defer {
-            settings.activate()
-            if enabled.exists, enabled.value as? String == "1" { enabled.tap(); enabled.doubleTap() }
-            app.activate()
-        }
-        app.activate()
-        let cover = item(physics)
-        cover.tap() // VoiceOver focuses, rather than opens, the cover.
-        try library()
-        cover.swipeDown() // First custom rotor action: Move earlier.
-        cover.doubleTap()
+        // The visible equivalents call NibReflow.step, the exact handler used by the
+        // accessibility custom actions. Simulator runtimes do not provide VoiceOver.
+        try context(physics); try tap("Move earlier")
         let earlier = ["Concept map", "Lab report", physics, "Motion flashcards"]
-        try eventually("VoiceOver Move earlier must move exactly one sibling position") { self.documentOrder() == earlier }
-        cover.tap(); cover.swipeDown(); cover.swipeDown(); cover.doubleTap()
-        try eventually("VoiceOver Move later must restore the next sibling position") { self.documentOrder() == before }
-        cover.tap(); cover.swipeDown(); cover.swipeDown(); cover.doubleTap()
+        try eventually("Accessibility Move earlier must move exactly one sibling position") { self.documentOrder() == earlier }
+        try context(physics); try tap("Move later")
+        try eventually("Accessibility Move later must restore the next sibling position") { self.documentOrder() == before }
+        try context(physics); try tap("Move later")
         XCTAssertEqual(documentOrder(), before, "Move later on last sibling must preserve valid boundaries")
+        try context("Concept map"); try tap("Move earlier")
+        XCTAssertEqual(documentOrder(), before, "Move earlier on first sibling must preserve valid boundaries")
     }
 
     // library.dropImport
     func testExternalFilesDropImportsIntoCurrentFolder() throws {
-        // Produce a real, user-exported PDF so this test requires no preinstalled Files fixture.
+        // Loose files at Nib's Documents root are intentionally scanned as imports.
+        // Save the external fixture in a plain subfolder so it remains an external payload.
+        let fixtureFolder = "Library Drop " + String(UUID().uuidString.prefix(8))
         try context(physics); try tap("Export…")
         try tap("Save to Files")
         let localExport = app.cells["DOC.sidebar.item.On My iPad"]
         try visible(localExport, "Save to Files must offer local storage")
         localExport.tap()
         let exportFolder = app.cells["Nib, Container"]
-        try visible(exportFolder, "External-drop fixture needs a writable local Files folder")
-        exportFolder.tap()
+        if exportFolder.waitForExistence(timeout: 3) {
+            exportFolder.tap()
+        } else {
+            // Files can restore its recently used Nib directory directly instead
+            // of showing the On My iPad container list.
+            try visible(app.buttons["Nib, Actions Menu"],
+                        "External-drop fixture must be in Nib's local Files directory")
+        }
+        if !button("New Folder").isHittable { try tap("More") }
+        try tap("New Folder")
+        try replace(app.alerts.textFields.firstMatch, with: fixtureFolder)
+        try tap("Create")
+        let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", fixtureFolder)).firstMatch
+        if directory.isHittable { directory.tap() }
         try tap("Save")
         try eventually("Save to Files must finish or report an export error", timeout: 20) {
             !self.app.buttons["Save"].exists || self.app.alerts.firstMatch.exists
@@ -937,6 +931,8 @@ final class LibraryUITests: XCTestCase {
         if local.isHittable { local.tap() }
         let savedFolder = files.cells["Nib, Container"]
         if savedFolder.isHittable { savedFolder.tap() }
+        let fixtureDirectory = files.cells.matching(NSPredicate(format: "label BEGINSWITH %@", fixtureFolder)).firstMatch
+        if fixtureDirectory.isHittable { fixtureDirectory.tap() }
         let payload = files.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", physics)).firstMatch
         try visible(payload, "Exported PDF must be available as an external Files drag payload")
         // Use iPad multitasking to expose the destination next to Files. Missing system
@@ -954,13 +950,15 @@ final class LibraryUITests: XCTestCase {
         let target = app.staticTexts[folder].firstMatch
         try visible(target, "Drop destination must remain visible alongside Files")
         payload.press(forDuration: 0.5, thenDragTo: target)
-        let imported = item(physics)
-        try visible(imported, "External PDF drop must import into the visible folder", timeout: 30)
-        try ui.openDocument(physics)
+        // ImportReveal opens a single imported document. Verify its content there,
+        // then return to the library to check its persisted destination.
+        _ = try ui.waitForState(timeout: 30) { $0.screen == "document" && $0.document != nil }
         XCTAssertEqual(try ui.state().pageCount, 4, "Imported PDF must retain all exported pages")
         try backFromDocument(); try destination("Documents")
         try openFolder(folder)
         try visible(item(physics), "External drop destination must persist")
+        try ui.openDocument(physics)
+        XCTAssertEqual(try ui.state().pageCount, 4, "Reopening the imported PDF must preserve every page")
     }
 
 }
