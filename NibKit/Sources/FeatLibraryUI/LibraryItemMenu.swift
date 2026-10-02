@@ -146,7 +146,13 @@ struct LibraryBuds: View {
             .allowsHitTesting(isPresented("sort"))
             .accessibilityHidden(!isPresented("sort"))
         }
+        // The full-window host is also an overlay. Keep it out of hit testing and
+        // accessibility while no menu is open, including during scene/size changes.
+        // Leave its children mounted so an outgoing bud can finish retracting.
+        .allowsHitTesting(hasPresentedMenu)
+        .accessibilityHidden(!hasPresentedMenu)
     }
+    private var hasPresentedMenu: Bool { ["new", "app", "sort"].contains(where: isPresented) }
     // Buds stay mounted for their retract animation. Gate the entire geometry/scroll
     // host, not just the animated droplet: a closed menu must not cover library cards.
     private func isPresented(_ menu: String) -> Bool {

@@ -171,7 +171,11 @@ final class FeatLibraryUITests: XCTestCase {
                                     ids: ["library.controls", "library.new.button", popover],
                                     anchors: ["library.new", "library.sort"]) { capturedField = $0 })
                             })
-                        _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad), size: size,
+                        // Full-mode buds advance only in an active scene. A hostless
+                        // UIWindow otherwise leaves the display link parked, so it
+                        // cannot represent the foreground menu this test measures.
+                        _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad)
+                            .environment(\.scenePhase, .active), size: size,
                                                           variant: variant, settlePasses: mode == .full ? 60 : 10) {
                             guard let field = capturedField else { return }
                             anchorFrames = field.worldAnchors
@@ -262,9 +266,8 @@ final class FeatLibraryUITests: XCTestCase {
                     NibFloatingLayer(host: model.floating)
                 }
             }.nibLiquidMode(mode)
-                .environment(\.scenePhase, .active)
                 .ignoresSafeArea()
-            let host = UIHostingController(rootView: view)
+            let host = UIHostingController(rootView: view.environment(\.scenePhase, .inactive))
             let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
             window.rootViewController = host
             window.isHidden = false
@@ -291,6 +294,9 @@ final class FeatLibraryUITests: XCTestCase {
                 }
             }
 
+            try await settle()
+            assertDocumentsAreHittable()
+            host.rootView = view.environment(\.scenePhase, .active)
             try await settle()
             assertDocumentsAreHittable()
             for menu in ["new", "app", "sort"] {
@@ -329,6 +335,20 @@ final class FeatLibraryUITests: XCTestCase {
             let hit = host.view.hitTest(CGPoint(x: 906, y: 549.75), with: nil)
             XCTAssertTrue(hit === document || hit?.isDescendant(of: document) == true,
                           "Hidden library menus must not intercept the notebook-opening tap")
+
+            // Insert setup can show a system permission sheet before opening a
+            // document. Its inactive/active cycle must not restore an invisible
+            // full-window menu hit surface, even while rotating or losing anchors.
+            for phase in [ScenePhase.inactive, .background, .active] {
+                host.rootView = view.environment(\.scenePhase, phase)
+                model.updateMenuAnchors(from: [:])
+                try await settle()
+                assertDocumentsAreHittable()
+                model.updateMenuAnchors(from: Dictionary(uniqueKeysWithValues:
+                    ["new", "app", "sort"].map { ("anchor.library." + $0, anchor) }))
+                try await settle()
+                assertDocumentsAreHittable()
+            }
         }
     }
 

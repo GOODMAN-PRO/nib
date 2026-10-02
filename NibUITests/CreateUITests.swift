@@ -642,15 +642,18 @@ final class CreateUITests: XCTestCase {
         }
         // DESIGN §14.6: the 104 × 136 preview immediately precedes the title field, separated by 16 pt.
         let rect = CGRect(x: title.minX - 120, y: title.midY - 68, width: 104, height: 136).insetBy(dx: 8, dy: 8)
-        let screenshot = ui.app.screenshot().image
+        let window = ui.app.windows.firstMatch
+        let bounds = window.frame
+        let screenshot = window.screenshot().image
         // XCTest can return a portrait pixel buffer with a landscape UIImage orientation.
         // Drawing it first applies that orientation before cropping in accessibility coordinates.
-        let upright = UIGraphicsImageRenderer(size: screenshot.size).image { _ in
-            screenshot.draw(in: CGRect(origin: .zero, size: screenshot.size))
+        let upright = UIGraphicsImageRenderer(size: bounds.size).image { _ in
+            screenshot.draw(in: CGRect(origin: .zero, size: bounds.size))
         }
         guard let image = upright.cgImage else { throw NibUI.Failure.message("Preview screenshot has no pixels") }
-        let scale = CGFloat(image.width) / ui.app.frame.width
-        guard let crop = image.cropping(to: CGRect(x: rect.minX * scale, y: rect.minY * scale,
+        let scale = CGFloat(image.width) / bounds.width
+        guard let crop = image.cropping(to: CGRect(x: (rect.minX - bounds.minX) * scale,
+                                                   y: (rect.minY - bounds.minY) * scale,
                                                    width: rect.width * scale, height: rect.height * scale)),
               let data = UIImage(cgImage: crop).pngData() else {
             throw NibUI.Failure.message("Preview crop is outside the current screenshot")
@@ -725,7 +728,15 @@ final class CreateUITests: XCTestCase {
             let scroll = ui.app.collectionViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 40 }
                 ?? ui.app.scrollViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 200 }
             guard let scroll else { break }
-            if element.exists && element.frame.midY < scroll.frame.minY {
+            let down = element.exists && element.frame.midY < scroll.frame.minY
+            if scroll.frame.height < 200 {
+                // A short native list virtualizes its rows. End the drag while held, avoiding a fling
+                // that skips the entire Monday/date row between accessibility snapshots.
+                let start = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.2 : 0.8))
+                let end = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: down ? 0.8 : 0.2))
+                start.press(forDuration: 0.05, thenDragTo: end,
+                            withVelocity: XCUIGestureVelocity(rawValue: 40), thenHoldForDuration: 0.3)
+            } else if down {
                 scroll.swipeDown(velocity: .slow)
             } else {
                 scroll.swipeUp(velocity: .slow)
@@ -902,9 +913,16 @@ final class CreateUITests: XCTestCase {
         calendar.tap() // Triggers the interruption monitor for first-launch system prompts.
         let continueButton = calendar.buttons["Continue"]
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
-        let add = calendar.buttons.matching(NSPredicate(format: "label IN {'Add', 'Add Event', 'Create Event'}")).firstMatch
-        try require(add, "Calendar system app must allow adding the event used by this test")
-        add.tap()
+        let add = calendar.buttons.matching(NSPredicate(
+            format: "label IN {'Add', 'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
+        if add.waitForExistence(timeout: 3) {
+            add.tap()
+        } else {
+            // iOS 26's iPad Calendar can omit the visible + button's label from automation.
+            // This point is the + in its landscape toolbar (captured on the dedicated iPad simulator).
+            // The required Title field below verifies that the gesture really opened event creation.
+            calendar.coordinate(withNormalizedOffset: CGVector(dx: 0.152, dy: 0.04)).tap()
+        }
         let title = calendar.textFields["Title"]
         try replace(title, with: eventTitle)
         calendar.buttons["Add"].tap()
