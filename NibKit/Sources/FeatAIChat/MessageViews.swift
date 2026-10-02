@@ -152,6 +152,7 @@ struct ChatDraftView: View {
         NibButton(String(localized: "Insert"), kind: .primary, size: .compact) {
             model.perform("ai.chat.insertDraft", draft.asset == nil ? ["text": .string(revisedText)] : [:])
         }
+        .accessibilityIdentifier("cmd." + "ai.chat.insertDraft")
         .disabled(model.isStreaming || model.isGeneratingImage || model.scope.doc == nil)
         NibButton(String(localized: "Discard"), kind: .plain, size: .compact) { model.perform(ChatCommand.draft, ["action": "discard"]) }
     }

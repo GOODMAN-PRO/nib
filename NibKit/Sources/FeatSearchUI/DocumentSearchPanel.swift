@@ -167,6 +167,7 @@ struct DocumentSearchField: View {
             NibIconButton(.xmark, label: String(localized: "Close search")) {
                 app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
         }
         .padding(.trailing, NibSpacing.xs)
         .frame(maxWidth: .infinity)
@@ -190,12 +191,14 @@ struct SearchCounter: View {
             NibIconButton(.back, label: String(localized: "Find previous")) {
                 app.perform(CommandIDs.searchStep, ["direction": "previous"], session: session)
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.searchStep)
             .nibShortcutHint(KeyboardShortcut("g", modifiers: [.command, .shift]))
             NibHUDText(state.countLabel)
                 .accessibilityLabel(String(localized: "Search result \(state.countLabel)"))
             NibIconButton(.forward, label: String(localized: "Find next")) {
                 app.perform(CommandIDs.searchStep, ["direction": "next"], session: session)
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.searchStep)
             .nibShortcutHint(KeyboardShortcut("g", modifiers: [.command]))
         }
     }

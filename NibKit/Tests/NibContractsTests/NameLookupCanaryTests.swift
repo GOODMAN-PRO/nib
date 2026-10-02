@@ -82,7 +82,7 @@ enum NameLookupCanary {
         SettingsSection.self, SettingsPageDescriptor.self, InspectorContext.self, InspectorDescriptor.self, ToolMenuDescriptor.self,
         BlockViewContext.self, BlockViewDescriptor.self, PluginPanelFactory.self, CanvasToolDescriptor.self, DocumentEditorDescriptor.self,
         OpenMode.self, SceneNavigator.self, SceneHooks.self, ScreenRegistry.self, UIRegistries.self,
-        NibFeature.self, NibApp.self, SafeMode.self, InkOutline.self, FakeCanvasHost.self,
+        NibFeature.self, NibApp.self, SafeMode.self, NibUITestMode.self, InkOutline.self, FakeCanvasHost.self,
         InMemoryCollabTransport.self,
         // contracts-v2
         NibEventPayload.self, SyncStatusPayload.self, IndexProgressPayload.self, LaserMovedPayload.self,

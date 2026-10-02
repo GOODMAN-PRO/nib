@@ -217,6 +217,7 @@ public struct NibInspectorSection<Content: View>: View {
                             .hitPadding(13)
                     }
                     .buttonStyle(.plain)
+                    .nibCommand(action.command)
                 }
             }
             content
@@ -332,22 +333,25 @@ public struct NibSheetHeader: View {
     let isPrimaryEnabled: Bool
     let onCancel: () -> Void
     let onPrimary: () -> Void
+    let primaryCommand: String?
 
     /// `cancelTitle` nil = "Cancel" (a default argument cannot read the internal `Bundle.module`).
     public init(_ title: String, cancelTitle: String? = nil,
                 primaryTitle: String? = nil, isPrimaryEnabled: Bool = true, onCancel: @escaping () -> Void,
-                onPrimary: @escaping () -> Void = {}) {
+                onPrimary: @escaping () -> Void = {}, primaryCommand: String? = nil) {
         self.title = title
         self.cancelTitle = cancelTitle ?? String(localized: "Cancel", bundle: .module)
         self.primaryTitle = primaryTitle
         self.isPrimaryEnabled = isPrimaryEnabled
         self.onCancel = onCancel
         self.onPrimary = onPrimary
+        self.primaryCommand = primaryCommand
     }
 
     public var body: some View {
         HStack(spacing: NibSpacing.m) {
             Button(cancelTitle, action: onCancel)
+                .accessibilityIdentifier("sheet.dismiss")
                 .font(NibFont.body)
                 .foregroundStyle(NibColor.accent)
                 .buttonStyle(.plain)
@@ -362,6 +366,7 @@ public struct NibSheetHeader: View {
                 .accessibilityAddTraits(.isHeader)
             if let primaryTitle {
                 NibButton(primaryTitle, kind: .primary, size: .compact, shortcut: .defaultAction, action: onPrimary)
+                    .nibCommand(primaryCommand)
                     .disabled(!isPrimaryEnabled)
             }
         }
@@ -459,6 +464,7 @@ public struct NibPanelHeader<Trailing: View>: View {
                 menu
                 NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
                               action: onClose)
+                    .accessibilityIdentifier("cmd.panel.close")
             }
         }
         .padding(.leading, NibSpacing.l)

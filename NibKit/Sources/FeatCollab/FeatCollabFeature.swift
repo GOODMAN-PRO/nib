@@ -269,7 +269,7 @@ struct ShareLivePanel: View {
         if let other = live {
             NibBanner(String(localized: "“\(other.title)” is live. Leave that session to share this document."),
                       style: .info, symbol: .live,
-                      action: NibAction(String(localized: "Leave Session")) { perform(CommandIDs.collabLeave) })
+                      action: NibAction(String(localized: "Leave Session"), command: CommandIDs.collabLeave) { perform(CommandIDs.collabLeave) })
         }
         Text(String(localized: "Share this document live. People join with a code, you let each person in, and edits appear on every device as they happen."))
             .font(NibFont.callout)
@@ -351,6 +351,7 @@ struct ShareLivePanel: View {
         NibButton(String(localized: "End Live Session"), kind: .destructive, expands: true) {
             perform(CommandIDs.collabLeave)
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.collabLeave)
         .disabled(busy)
     }
 
@@ -391,10 +392,12 @@ struct ShareLivePanel: View {
         NibButton(String(localized: "Decline"), kind: .plain, size: .compact) {
             perform(CommandIDs.collabApprove, ["participant": .string(p.id), "allow": false])
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.collabApprove)
         .disabled(busy)
         NibButton(String(localized: "Approve"), kind: .secondary, size: .compact) {
             perform(CommandIDs.collabApprove, ["participant": .string(p.id), "allow": true])
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.collabApprove)
         .disabled(busy)
     }
 
@@ -441,6 +444,7 @@ struct ShareLivePanel: View {
         NibButton(String(localized: "Leave Live Session"), kind: .destructive, expands: true) {
             perform(CommandIDs.collabLeave)
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.collabLeave)
         .disabled(busy)
     }
 

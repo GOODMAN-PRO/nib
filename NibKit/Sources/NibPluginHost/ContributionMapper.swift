@@ -1835,6 +1835,7 @@ struct PluginPanelUnavailable: View {
                     context.dismiss()
                 }
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.panelClose)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)

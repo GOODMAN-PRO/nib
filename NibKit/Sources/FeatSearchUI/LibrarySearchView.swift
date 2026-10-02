@@ -221,7 +221,7 @@ struct SearchResults: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: NibSpacing.l) {
                         if let error = state.error {
-                            NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again")) {
+                            NibBanner(error, style: .warning, action: NibAction(String(localized: "Try search again"), command: CommandIDs.searchOpen) {
                                 app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "refresh": true], session: session)
                             })
                         } else if state.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -244,6 +244,7 @@ struct SearchResults: View {
                                         .padding(.vertical, NibSpacing.s)
                                         .frame(minHeight: NibMetrics.hitTarget)
                                     }
+                                    .accessibilityIdentifier("cmd." + CommandIDs.docOpen)
                                     .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
                                 }
                             } else {
@@ -380,6 +381,7 @@ struct SearchResultRow: View {
             .background(state.selectedID == hit.id ? NibColor.fill3 : NibColor.fill3.opacity(0),
                 in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow))
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
         .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(state.selectedID == hit.id ? .isSelected : [])

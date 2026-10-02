@@ -843,7 +843,7 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
             let image = item.icon.flatMap { NibSymbol(systemName: $0) }.flatMap { UIImage(nib: $0) }
             let action = UIAction(title: item.title, image: image, attributes: item.destructive ? .destructive : []) { [weak self] _ in
                 self?.model.run(item, context)
-            }
+            }.nibCommand(item.command)
             if let title = item.submenu {
                 if let i = submenus.firstIndex(where: { $0.title == title }) {
                     submenus[i].items.append(action)

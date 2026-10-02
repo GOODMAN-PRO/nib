@@ -53,6 +53,7 @@ struct AudioPanelView: View {
         .confirmationDialog(confirming?.title ?? "", isPresented: confirmBinding, titleVisibility: .visible,
                             presenting: confirming) { pending in
             Button(pending.button, role: .destructive) { execute(pending.command, pending.params) }
+            .accessibilityIdentifier("cmd." + pending.command)
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: { pending in
             Text(pending.message)
@@ -160,12 +161,14 @@ struct AudioPanelView: View {
                         if let symbol = item.icon.flatMap(NibSymbol.init(systemName:)) { Image(nib: symbol) }
                     }
                 }
+                .accessibilityIdentifier("cmd." + item.command)
             }
         }
         .accessibilityActions {
             Button(String(localized: "Rename")) { startRename(clip) }
             ForEach(items, id: \.id) { item in
                 Button(item.resolvedTitle(for: menuContext(clip))) { run(item, clip) }
+                .accessibilityIdentifier("cmd." + item.command)
             }
         }
     }
@@ -644,9 +647,11 @@ struct AudioPlaybackBar: View {
                 Toggle(String(localized: "Skip Silence"), isOn: Binding(get: { settings.skipSilence }, set: { on in
                     perform(CommandIDs.audioSetPlayback, ["skipSilence": .bool(on)])
                 }))
+                .accessibilityIdentifier("cmd." + CommandIDs.audioSetPlayback)
                 Toggle(String(localized: "Reduce Noise"), isOn: Binding(get: { settings.noiseReduction }, set: { on in
                     perform(CommandIDs.audioSetPlayback, ["noiseReduction": .bool(on)])
                 }))
+                .accessibilityIdentifier("cmd." + CommandIDs.audioSetPlayback)
             }
             Section {
                 Button {
@@ -654,6 +659,7 @@ struct AudioPlaybackBar: View {
                 } label: {
                     Label { Text(String(localized: "Close Player")) } icon: { Image(nib: .xmark) }
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.audioPause)
                 .disabled(loaded == nil)
             }
         } label: {

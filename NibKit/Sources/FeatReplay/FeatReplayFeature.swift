@@ -221,6 +221,7 @@ private struct ReplayFullScreenDock: View {
                   symbol: controller.playing ? .pause : .play, kind: .plain) {
             app?.perform(CommandIDs.audioPlay, ["toggle": true], session: source)
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.audioPlay)
         NibToggle(String(localized: "Follow pages"), isOn: Binding(get: { options.followAlong }, set: {
             app?.perform(CommandIDs.replaySetMode, ["mode": .string(options.mode.rawValue), "followAlong": .bool($0)], session: source)
         }))
@@ -228,5 +229,6 @@ private struct ReplayFullScreenDock: View {
                   shortcut: KeyboardShortcut(.escape, modifiers: [])) {
             app?.perform(CommandIDs.replaySetMode, ["mode": .string(options.mode.rawValue), "fullScreen": false], session: source)
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.replaySetMode)
     }
 }

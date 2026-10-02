@@ -501,6 +501,7 @@ extension View {
         toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button(String(localized: "Done"), action: onDone)
+                    .accessibilityIdentifier("sheet.dismiss")
                     .font(NibFont.bodyEmphasis)
                     .keyboardShortcut(.cancelAction)
             }
@@ -556,6 +557,7 @@ struct SettingsToggleRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xxs) {
             NibToggle(spec.title, isOn: model.binding(spec.key))
+                .accessibilityIdentifier("cmd.settings.set")
                 .accessibilityHint(spec.detail.map { Text($0) } ?? Text(verbatim: ""))
             if let detail = spec.detail {
                 Text(detail)
@@ -582,6 +584,7 @@ struct SettingsChoiceRow<Value: Hashable>: View {
                 .font(NibFont.body)
                 .foregroundStyle(NibColor.label)
             NibSegmentedControl(selection: $selection, options: options, title: label)
+                .accessibilityIdentifier("cmd.settings.set")
         }
         .padding(.vertical, NibSpacing.xxs)
         .accessibilityElement(children: .contain)
@@ -609,6 +612,7 @@ struct SettingsCheckRow: View {
             }
             .contentShape(Rectangle())
         }
+        .accessibilityIdentifier("cmd.settings.set")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

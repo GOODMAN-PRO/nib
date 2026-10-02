@@ -68,12 +68,12 @@ struct LibraryGridView: View {
                 NibEmptyState(symbol: model.collection.symbol,
                     title: model.collection == .recents ? String(localized: "No recent documents") : String(localized: "No study sets yet"),
                     message: model.collection == .recents ? String(localized: "Documents you open appear here.") : String(localized: "Create a study set from the New menu."),
-                    primary: NibAction(String(localized: "Show Documents")) { model.setView(["collection": "documents"]) })
+                    primary: NibAction(String(localized: "Show Documents"), command: "library.setView") { model.setView(["collection": "documents"]) })
             }
             else if model.rows.isEmpty && model.error == nil {
                 NibEmptyState(symbol: .notebook, title: String(localized: "No notebooks yet"), message: String(localized: "Write something, or bring in a PDF."),
-                    primary: NibAction(String(localized: "New Notebook")) { model.setView(["menu": "new"]) },
-                    secondary: NibAction(String(localized: "Import")) { model.perform(CommandIDs.importPick, model.folder == nil ? [:] : ["folder": model.folderRef]) })
+                    primary: NibAction(String(localized: "New Notebook"), command: "library.setView") { model.setView(["menu": "new"]) },
+                    secondary: NibAction(String(localized: "Import"), command: CommandIDs.importPick) { model.perform(CommandIDs.importPick, model.folder == nil ? [:] : ["folder": model.folderRef]) })
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : NibMetrics.libraryGutter) {
@@ -110,7 +110,7 @@ struct LibraryGridView: View {
                 .overlay {
                     if model.visibleRows.isEmpty {
                         NibEmptyState(symbol: .search, title: String(localized: "No matching items"),
-                            primary: NibAction(String(localized: "Show All Items")) { model.setView(["filter": "all", "search": ""]) })
+                            primary: NibAction(String(localized: "Show All Items"), command: "library.setView") { model.setView(["filter": "all", "search": ""]) })
                     }
                 }
             }
@@ -237,6 +237,7 @@ struct LibraryCell: View {
             .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(row.accessibilityLabel)
+            .accessibilityIdentifier(row.isFolder ? "cmd.library.setView" : "cmd.doc.open")
             .accessibilityValue(accessibilityValue(subtitle: visibleSubtitle))
             .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
             .contextMenu {
@@ -382,7 +383,9 @@ struct LibraryRenameField: View {
             TextField(String(localized: "Name"), text: $text).font(NibFont.body).focused($focused).onSubmit(save)
                 .accessibilityLabel(String(localized: "Rename \(row.name)"))
             NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
+                .accessibilityIdentifier("cmd.library.rename")
             NibIconButton(.xmark, label: String(localized: "Cancel Rename")) { model.setView(["rename": ""]) }
+            .accessibilityIdentifier("cmd.library.setView")
         }.frame(minHeight: NibMetrics.hitTarget).onAppear { text = row.name; focused = true }
     }
     private func save() {

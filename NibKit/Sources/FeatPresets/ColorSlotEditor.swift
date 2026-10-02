@@ -122,6 +122,7 @@ struct ColourEditor: View {
                                        registry: model.app?.content.tapePatterns) {
                                 model.tapSwatch(index)
                             }
+                            .accessibilityIdentifier("cmd.preset.select")
                         }
                         if model.presets.swatches.count < ToolPresets.maxSwatches {
                             NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
@@ -136,6 +137,7 @@ struct ColourEditor: View {
             }
             NibInspectorSection(slot == nil ? String(localized: "New Colour") : String(localized: "Colour")) {
                 NibSwatchGrid(swatches: inks.map(\.swatch), selection: inkSelection(slot: slot))
+                    .accessibilityIdentifier(slot == nil ? "cmd.preset.addSwatch" : "cmd.preset.setSwatch")
             }
             HStack(spacing: NibSpacing.s) {
                 NibButton(String(localized: "Custom"), symbol: .customColour, size: .compact) { model.openPicker() }
@@ -147,6 +149,7 @@ struct ColourEditor: View {
                 Spacer(minLength: 0)
                 if slot != nil, model.presets.swatches.count > 1 {
                     NibIconButton(.trash, label: String(localized: "Remove Colour")) { model.removeEdited() }
+                        .accessibilityIdentifier("cmd.preset.removeSwatch")
                 }
             }
         }
@@ -199,6 +202,7 @@ struct TapePatternGrid: View {
             PresetColour.swatch(colour, id: d.id, name: tiles[d.id] == nil ? d.title : name, pattern: tiles[d.id])
         }
         NibSwatchGrid(swatches: swatches, selection: selection, noneLabel: String(localized: "No Pattern"))
+            .accessibilityIdentifier(model.colourSlot == nil ? "cmd.preset.addSwatch" : "cmd.preset.setSwatch")
             .task(id: descriptors.map(\.id)) {
                 for d in descriptors where tiles[d.id] == nil {
                     if let tile = await TapePatternCache.pattern(d.id, registry: registry) { tiles[d.id] = tile }

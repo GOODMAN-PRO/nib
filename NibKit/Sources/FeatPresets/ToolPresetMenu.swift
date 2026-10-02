@@ -394,6 +394,7 @@ struct ToolPresetMenu: View {
         .confirmationDialog(String(localized: "Restore the default colours and thicknesses?"),
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button(String(localized: "Restore Defaults"), role: .destructive) { model.reset() }
+                .accessibilityIdentifier("cmd.preset.reset")
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "Your own \(PresetText.toolName(tool)) colours and thicknesses are replaced."))
@@ -412,6 +413,7 @@ struct ToolPresetMenu: View {
                                      label: String(localized: "Thickness \(i + 1)")) {
                     model.tapWidth(i)
                 }
+                .accessibilityIdentifier("cmd.preset.select")
                 .accessibilityValue(PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]))
                 .accessibilityHint(selected ? String(localized: "Double-tap to adjust.") : "")
                 .presetPopoverSource(tool, model.shown == .width(i))
@@ -477,6 +479,7 @@ struct ToolPresetMenu: View {
                        isSelected: false, registry: registry) {
                 if removable { model.remove(i) }
             }
+            .accessibilityIdentifier("cmd.preset.removeSwatch")
             .overlay(alignment: .topTrailing) {
                 if removable { RemoveBadge() }
             }
@@ -497,6 +500,7 @@ struct ToolPresetMenu: View {
             SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry) {
                 model.tapSwatch(i)
             }
+            .accessibilityIdentifier("cmd.preset.select")
             // In compact width the selected swatch remains the source while the popover adds a colour or
             // edits another saved slot: those controls no longer live in the bar.
             .presetPopoverSource(tool, isColourSource(i))
@@ -505,6 +509,7 @@ struct ToolPresetMenu: View {
                 Button(String(localized: "Rearrange Colours")) { model.beginArranging() }
                 if removable {
                     Button(String(localized: "Remove Colour"), role: .destructive) { model.remove(i) }
+                        .accessibilityIdentifier("cmd.preset.removeSwatch")
                 }
                 Button(String(localized: "Restore Default Presets"), role: .destructive) { confirmReset = true }
             }
@@ -564,6 +569,7 @@ struct WidthEditor: View {
                                 value: "\(PresetText.millimetres(width)) · \(PresetText.points(width))") {
                 NibSlider(value: Binding(get: { model.widthPosition }, set: { model.setWidthPosition($0) }),
                           label: String(localized: "Thickness"))
+                    .accessibilityIdentifier("cmd.preset.setWidth")
                     .accessibilityValue(PresetText.widthValue(width, pattern: pattern))
             }
             if PresetRules.patternTools.contains(model.tool) {
@@ -574,6 +580,7 @@ struct WidthEditor: View {
                                              label: PresetText.patternName(p), value: nil, hint: nil) {
                                 model.setPattern(p)
                             }
+                            .accessibilityIdentifier("cmd.preset.setWidth")
                         }
                     }
                 }

@@ -18,6 +18,7 @@ public struct NibTool: Identifiable, Hashable, Sendable {
     /// v2: false when the shell already registers the tool key as a key command. The palette then shows `shortcut` as
     /// a `KeyHint` (hover, ⌘ held) without registering it a second time.
     public let registersShortcut: Bool
+    public let accessibilityID: String
 
     public init(id: String, label: String, symbol: NibSymbol, isPlugin: Bool = false, hasSettings: Bool = true,
                 value: String? = nil, shortcut: KeyboardShortcut? = nil, tint: Color? = nil) {
@@ -26,7 +27,7 @@ public struct NibTool: Identifiable, Hashable, Sendable {
     }
 
     public init(id: String, label: String, symbol: NibSymbol, isPlugin: Bool = false, hasSettings: Bool = true,
-                value: String? = nil, shortcut: KeyboardShortcut?, registersShortcut: Bool, tint: Color? = nil) {
+                value: String? = nil, shortcut: KeyboardShortcut?, registersShortcut: Bool, tint: Color? = nil, accessibilityID: String? = nil) {
         self.id = id
         self.label = label
         self.symbol = symbol
@@ -35,6 +36,7 @@ public struct NibTool: Identifiable, Hashable, Sendable {
         self.value = value
         self.shortcut = shortcut
         self.registersShortcut = registersShortcut
+        self.accessibilityID = accessibilityID ?? "tool." + id
         self.tint = tint
     }
 
@@ -205,6 +207,7 @@ public struct NibToolButton: View {
         .nibShortcutHint(tool.hintOnlyShortcut)
         .nibTooltip(tool.label)
         .accessibilityLabel(tool.isPlugin ? String(localized: "\(tool.label), plugin", bundle: .module) : tool.label)
+        .accessibilityIdentifier(tool.accessibilityID)
         .accessibilityValue(tool.value ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .accessibilityShowsLargeContentViewer {
@@ -626,6 +629,7 @@ public struct NibToolPalette<Settings: View>: View {
                         swatch = index
                         field?.poke(id, 1.3)
                     }
+                    .accessibilityIdentifier("cmd.preset.select")
                     .frame(width: d.isVertical ? thick : NibMetrics.paletteSwatchPitch,
                            height: d.isVertical ? NibMetrics.paletteSwatchPitch : thick)
                 }
@@ -726,6 +730,7 @@ public struct NibToolPalette<Settings: View>: View {
                     .nibShortcut(tool.registeredShortcut)
                     .nibShortcutHint(tool.hintOnlyShortcut)
                     .accessibilityLabel(tool.label)
+                    .accessibilityIdentifier(tool.accessibilityID)
                     .accessibilityAddTraits(tool.id == selection ? .isSelected : [])
                 }
             }

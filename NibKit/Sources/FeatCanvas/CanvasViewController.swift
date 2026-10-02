@@ -128,6 +128,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         scrollView.delegate = self
         scrollView.host = self
+        scrollView.accessibilityIdentifier = "nib.canvas"
         view.addSubview(scrollView)
         fixedOverlay.frame = view.bounds
         fixedOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -1466,7 +1467,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         let empty = kind == .notebook && livePages.filter({ $0.size != nil }).isEmpty && !mode.isWorld
         if empty, emptyHost == nil {
             var add: NibAction?
-            if canAddPage { add = NibAction(String(localized: "Add Page"), handler: { [weak self] in self?.addPage() }) }
+            if canAddPage { add = NibAction(String(localized: "Add Page"), command: CommandIDs.pageAdd, handler: { [weak self] in self?.addPage() }) }
             let state = NibEmptyState(symbol: .addPage, title: String(localized: "No pages"),
                                       message: String(localized: "This notebook has no pages yet."), primary: add)
             let hosting = UIHostingController(rootView: state)
@@ -1612,6 +1613,7 @@ struct CanvasPageHUD: View {
         HStack(spacing: NibSpacing.xxs) {
             if model.canShowNavigator {
                 NibIconButton(.pages, label: model.navigatorLabel, size: .bar) { model.showNavigator() }
+                    .accessibilityIdentifier("cmd." + CommandIDs.sidebarToggle)
             }
             if model.isLoading {
                 ProgressView()

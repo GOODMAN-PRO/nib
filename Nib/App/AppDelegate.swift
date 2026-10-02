@@ -10,17 +10,26 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        SafeMode.beginLaunch()
-        let app = NibApp()
+        if !NibUITestMode.isEnabled { SafeMode.beginLaunch() }
+        let app = NibApp(defaults: UITestFixture.defaults())
         app.gateway.presenter = AppDelegate.confirmer
-        let disabled = SafeMode.disabledFeatures
+        let disabled = NibUITestMode.isEnabled ? Set<String>() : SafeMode.disabledFeatures
         let features = FeatureList.all.filter { !disabled.contains($0.id) }
         app.register(features)
+        UITestFixture.configure(app)
         DesignGallery.registerSettingsPage(in: app)   // Settings › Advanced › Developer (NibDesign is not a feature)
         registerBackgroundTasks(app)   // must run before this method returns
         Task { @MainActor in
             await app.start(features)
-            SafeMode.endLaunch()
+            if NibUITestMode.isEnabled {
+                do {
+                    try await UITestFixture.seed(app)
+                    UITestFixture.isReady = true
+                    app.ui.activeNavigator?.showLibrary(folder: nil)
+                } catch {
+                    UITestFixture.failure = String(describing: error)
+                }
+            } else { SafeMode.endLaunch() }
         }
         return true
     }

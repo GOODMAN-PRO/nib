@@ -591,6 +591,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
                               state: e.checked == true ? .on : .off) { [weak self] _ in
             self?.run(e, context: context, facts: facts)
         }
+        action.accessibilityIdentifier = "cmd." + e.descriptor.command
         if shortcuts, let s = e.shortcut { action.subtitle = ObjectMenuKeys.display(s) }
         return action
     }

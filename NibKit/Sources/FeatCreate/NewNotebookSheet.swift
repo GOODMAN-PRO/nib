@@ -936,7 +936,7 @@ struct NewNotebookSheet: View {
     private var sheetContent: some View {
         VStack(spacing: 0) {
             NibSheetHeader(draft.kind.sheetTitle, primaryTitle: compact ? nil : String(localized: "Create"),
-                           isPrimaryEnabled: !model.isWorking, onCancel: onDone, onPrimary: create)
+                           isPrimaryEnabled: !model.isWorking, onCancel: onDone, onPrimary: create, primaryCommand: "doc.create")
                 // The shared header supplies 20 pt; align its phone content to the scroll view's 16 pt margin.
                 .padding(.horizontal, contentInset - NibSpacing.xl)
             if draft.kind == .notebook {
@@ -966,6 +966,7 @@ struct NewNotebookSheet: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if compact {
                 NibButton(draft.kind.createTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: create)
+                    .accessibilityIdentifier("cmd.doc.create")
                     .disabled(model.isWorking)
                     .padding(.horizontal, NibSpacing.l)
                     .padding(.vertical, NibSpacing.s)

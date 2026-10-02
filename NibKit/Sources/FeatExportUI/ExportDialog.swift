@@ -326,12 +326,14 @@ struct ExportDialog: View {
                     NibButton(String(localized: "Save changes to \(selection.documents[0].sourceName ?? String(localized: "source"))…"), symbol: .saveToFiles, kind: .plain, expands: true) {
                         app.perform(CommandIDs.exportSaveToSource, ["doc": .string(selection.documents[0].ref)], session: session)
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.exportSaveToSource)
                 }
                 if app.commands.descriptor(CommandIDs.collabHost) != nil && selection.documents.count == 1 {
                     NibButton(String(localized: "Share live…"), symbol: .share, kind: .plain, expands: true) {
                         app.perform(CommandIDs.collabHost, ["doc": .string(selection.documents[0].ref)], session: session)
                         dismiss()
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.collabHost)
                 }
             }
         }
@@ -556,6 +558,7 @@ struct LockedExportSheet: View {
                     } catch { unlocking = false; self.error = NibError.wrap(error).message }
                 }
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.docUnlock)
             .disabled(unlocking).padding(.horizontal, NibSpacing.xl)
             Spacer(minLength: 0)
         }.background(NibColor.backgroundSecondary)

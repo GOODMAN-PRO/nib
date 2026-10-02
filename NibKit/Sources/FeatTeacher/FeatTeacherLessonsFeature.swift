@@ -174,13 +174,15 @@ private struct LessonPanel: View {
                             run(CommandIDs.folderCreate, ["title": .string(className)]) { _ in
                                 Task { await loadFolders() }
                             }
-                        }.disabled(className.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || loading)
+                        }
+                        .accessibilityIdentifier("cmd." + CommandIDs.folderCreate).disabled(className.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || loading)
                     }
                     NibButton(String(localized: "Load Class"), symbol: .folder) { performLoad() }
                         .disabled(folder.isEmpty || loading)
                     NibButton(String(localized: "Open Class Folder"), kind: .plain) {
                         run(CommandIDs.librarySetView, ["folder": .string(folder)])
-                    }.disabled(folder.isEmpty || loading)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.librarySetView).disabled(folder.isEmpty || loading)
                 }
                 if let error { NibBanner(error, style: .warning) }
                 if let receipt { NibBanner(receipt, style: .info) }
@@ -192,10 +194,12 @@ private struct LessonPanel: View {
                         .accessibilityLabel(String(localized: "Roster CSV"))
                     NibButton(String(localized: "Import Pasted Roster"), symbol: .importFile) {
                         run(CommandIDs.lessonImportRoster, ["csv": .string(csv), "folder": .string(folder)], completion: importedRoster)
-                    }.disabled(folder.isEmpty || loading || csv.isEmpty)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.lessonImportRoster).disabled(folder.isEmpty || loading || csv.isEmpty)
                     NibButton(String(localized: "Choose Roster File"), symbol: .importFile, kind: .plain) {
                         run(CommandIDs.lessonImportRoster, ["folder": .string(folder)], completion: importedRoster)
-                    }.disabled(folder.isEmpty || loading)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.lessonImportRoster).disabled(folder.isEmpty || loading)
                     if !roster.isEmpty {
                         DisclosureGroup(String(localized: "\(roster.count) students")) {
                             LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
@@ -220,14 +224,16 @@ private struct LessonPanel: View {
                             receipt = String(localized: "Published \(count) student copies.")
                             performLoad()
                         }
-                    }.disabled(folder.isEmpty || doc.isEmpty || roster.isEmpty || loading)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.lessonCreate).disabled(folder.isEmpty || doc.isEmpty || roster.isEmpty || loading)
                     NibButton(String(localized: "Create Sample Lesson"), symbol: .documentWrite, kind: .plain) {
                         run(CommandIDs.lessonCreate, ["doc": "sample", "folder": .string(folder), "students": []]) { value in
                             if let ref = value["refs"]?[0]?.stringValue { doc = ref }
                             receipt = String(localized: "Sample lesson created. Open it to try answer zones and hints.")
                             Task { await loadFolders(); await loadClass() }
                         }
-                    }.disabled(folder.isEmpty || loading)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.lessonCreate).disabled(folder.isEmpty || loading)
                     if widthClass == .compact || typeSize.isAccessibilitySize {
                         VStack(alignment: .leading, spacing: NibSpacing.s) { liveButtons }
                     } else { HStack(spacing: NibSpacing.s) { liveButtons } }
@@ -237,6 +243,7 @@ private struct LessonPanel: View {
                         NibButton(String(localized: "Manage Participants"), kind: .plain) {
                             run(CommandIDs.panelOpen, ["id": "collab.share"])
                         }
+                        .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
                     }
                 }
                 section(String(localized: "Assignments")) {
@@ -267,7 +274,8 @@ private struct LessonPanel: View {
                         run(CommandIDs.libraryMove, ["refs": [.string(folder)], "folder": .string(archiveFolder)]) { _ in
                             receipt = String(localized: "Class folder moved to Archive.")
                         }
-                    }.disabled(folder.isEmpty || archiveFolder.isEmpty || folder == archiveFolder || loading)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.libraryMove).disabled(folder.isEmpty || archiveFolder.isEmpty || folder == archiveFolder || loading)
                 }
             }
             .padding(widthClass == .compact ? NibSpacing.m : NibSpacing.xl)
@@ -325,10 +333,13 @@ private struct LessonPanel: View {
                     receipt = String(localized: "Quick Lesson started. Approve students in Manage Participants.")
                 }
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.collabHost)
                 .disabled(doc.isEmpty || loading)
             NibButton(String(localized: "Start Follow Me"), symbol: .present) { run(CommandIDs.collabFollowMe, ["on": true]) }
+            .accessibilityIdentifier("cmd." + CommandIDs.collabFollowMe)
                 .disabled(loading || !liveHosted)
             NibButton(String(localized: "Stop Follow Me"), symbol: .present, kind: .plain) { run(CommandIDs.collabFollowMe, ["on": false]) }
+            .accessibilityIdentifier("cmd." + CommandIDs.collabFollowMe)
                 .disabled(loading || !liveHosted)
         }
     }
@@ -346,6 +357,7 @@ private struct LessonPanel: View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
             NibRow(entry.student ?? entry.title, subtitle: entry.unreadable ? String(localized: "Unreadable assignment") : entry.state?.title) {
                 NibButton(String(localized: "Open Copy"), kind: .plain) { run(CommandIDs.docOpen, ["doc": .string(entry.id)]) }
+                .accessibilityIdentifier("cmd." + CommandIDs.docOpen)
             }
             if entry.returns > 0 {
                 NibButton(String(localized: "Open Returned Version"), symbol: .history, kind: .plain) { state("openReturn", ref: entry.id) }

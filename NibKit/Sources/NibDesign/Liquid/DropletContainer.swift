@@ -1,4 +1,5 @@
 import SwiftUI
+import NibContracts
 
 /// The one container per window for everything that floats. iOS 26+: the system's Liquid Glass inside a
 /// `GlassEffectContainer` (union and morph are the OS's; Nib adds necks with memory, buds and physics).
@@ -49,11 +50,12 @@ public struct NibDropletContainer<Content: View>: View {
                     .onChange(of: proxy.size) { _, size in field.updateBounds(size) }
             }
         }
+        .transaction { if NibUITestMode.isEnabled { $0.disablesAnimations = true; $0.animation = nil } }
         .environment(field)
         .environment(\.nibGlassNamespace, glassNamespace)
         .environment(\.nibIsInking, field.isFrozen)
         .environment(\.nibChromeAppearance, NibChromeAppearance(environment))
-        .onChange(of: reduceMotion, initial: true) { _, value in field.reduceMotion = value }
+        .onChange(of: reduceMotion, initial: true) { _, value in field.reduceMotion = value || NibUITestMode.isEnabled }
         .onChange(of: mode, initial: true) { _, value in
             field.mode = value
             field.usesSystemGlass = Self.systemGlassAvailable && value != .off

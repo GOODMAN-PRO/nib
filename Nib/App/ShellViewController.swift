@@ -12,6 +12,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
     private(set) var activeDocument: DocumentID?
     private var content: UIViewController?
     private var tabBar: UIView?
+    private var qaProbe: QAStateProbe?
     private var failureObserver: NSObjectProtocol?
     /// What the window shows right now, for key commands (`KeyCommandContext`): a document of `shownKind`, or the
     /// library / onboarding. `activeDocument` stays the selected tab while the library shows.
@@ -34,6 +35,11 @@ final class ShellViewController: UIViewController, SceneNavigator {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
+        if NibUITestMode.isEnabled {
+            let probe = QAStateProbe(shell: self)
+            qaProbe = probe
+            view.addSubview(probe)
+        }
         registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
             (shell: ShellViewController, _: UITraitCollection) in
             shell.synchroniseContentAppearance()
@@ -42,7 +48,9 @@ final class ShellViewController: UIViewController, SceneNavigator {
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
             Task { @MainActor in self?.toastIfActive(message) }
         }
-        if let onboarding = app.ui.screens.onboarding?(app, self) {
+        if NibUITestMode.isEnabled && !UITestFixture.isReady {
+            display(FallbackEditorViewController(message: "Preparing test fixture…"))
+        } else if let onboarding = app.ui.screens.onboarding?(app, self) {
             display(onboarding)
         } else {
             showLibrary(folder: nil)
@@ -245,7 +253,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
                                        propertyList: d.id)
             command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
-            return command
+            return command.nibCommand(d.command)
         }
         keyCommandCache = (generation, context, commands)
         return commands
@@ -366,6 +374,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
         addChild(vc)
         setOverrideTraitCollection(chromeTraits, forChild: vc)
         view.addSubview(vc.view)
+        if let qaProbe { view.bringSubviewToFront(qaProbe) }
         vc.didMove(toParent: self)
         content = vc
         keyCommandCache = nil
@@ -559,6 +568,7 @@ final class FallbackSettingsViewController: UITableViewController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak self] _ in
             self?.dismiss(animated: true)
         })
+        navigationItem.rightBarButtonItem?.accessibilityIdentifier = "sheet.dismiss"
     }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { pages.count }

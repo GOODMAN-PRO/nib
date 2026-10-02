@@ -436,6 +436,7 @@ struct ReturnToPagePill: View {
             .frame(minHeight: NibMetrics.hudHeight)
             .contentShape(Capsule())
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.linkBack)
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .accessibilityLabel(title)
         .accessibilityHint(String(localized: "Goes back to where you were before you followed the link."))

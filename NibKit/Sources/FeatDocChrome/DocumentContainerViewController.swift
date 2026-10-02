@@ -1150,7 +1150,7 @@ struct ChromeRootView: View {
                 switch item.action {
                 case .command(let command, let params):
                     rows.append(ChromeMenuRow(id: item.id, title: item.title, symbol: item.symbol, isOn: item.isOn,
-                                              isEnabled: item.isEnabled) {
+                                              isEnabled: item.isEnabled, command: command) {
                         openMenu = nil
                         chrome.tap(command, params)
                     })
@@ -1169,7 +1169,7 @@ struct ChromeRootView: View {
         ChromeMenuRow(id: item.id, title: item.resolvedTitle(for: context),
                       symbol: item.icon.flatMap { NibSymbol(systemName: $0) }, destructive: item.destructive,
                       section: section, isOn: item.isChecked?(context) ?? false,
-                      shortcut: item.shortcut.map { ChromeShortcuts.display($0) }) {
+                      shortcut: item.shortcut.map { ChromeShortcuts.display($0) }, command: item.command) {
             openMenu = nil
             chrome.run(item)
         }

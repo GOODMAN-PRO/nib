@@ -689,6 +689,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                                       attributes: item.destructive ? .destructive : []) { _ in
                     Task { @MainActor in model.perform(item, context) }
                 }
+                action.accessibilityIdentifier = "cmd." + item.command
                 if item.isChecked?(context) == true { action.state = .on }
                 return action
             }

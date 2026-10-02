@@ -44,6 +44,7 @@ struct PaletteItem: Identifiable, Equatable {
     /// The palette slot id: the tool id for tools (so the selection is `session.tool`), else the item id.
     let id: String
     let descriptorID: String
+    var accessibilityID: String = ""
     /// `resolvedTitle(for:)` of the window.
     let title: String
     /// `resolvedIcon(for:)` of the window.
@@ -221,7 +222,7 @@ final class ToolbarModel: ObservableObject {
             let key = keys.get(ToolbarShortcuts.prefix + d.id).flatMap { $0.owner == FeatToolbarFeature.id ? $0 : nil }
             let enabled = d.isEnabled?(session) ?? true
             let colour = presets.map { Self.colourName($0.color, index: $0.selectedSwatch) }
-            return PaletteItem(id: slot, descriptorID: d.id, title: d.resolvedTitle(for: session),
+            return PaletteItem(id: slot, descriptorID: d.id, accessibilityID: d.toolID.map { "tool." + $0 } ?? "cmd." + (d.command ?? d.id), title: d.resolvedTitle(for: session),
                                icon: d.resolvedIcon(for: session), isPlugin: plugins.contains(d.id),
                                isTool: d.toolID != nil, hasSettings: d.settings != nil, tint: presets?.color,
                                value: Self.accessibilityValue(colour: colour, isOn: d.isOn?(session) ?? false,
@@ -504,6 +505,13 @@ final class ToolbarModel: ObservableObject {
     /// The window's size and size class, for `toolbar.dock` (the default dock and the compact refusal).
     func windowDidChange(size: CGSize, compact: Bool) {
         runtime?.windowDidChange(session, size: size, compact: compact)
+        publishQADock(size: size, compact: compact)
+    }
+
+    func publishQADock(size: CGSize, compact: Bool) {
+        guard NibUITestMode.isEnabled else { return }
+        let value = dock(for: size, compact: compact)
+        session.toolOptions["nib.qa.paletteDock"] = ["edge": .string(value.edge.commandValue), "along": .number(Double(value.along))]
     }
 
     /// The window's UndoManager, which takes the "Move Palette" steps; nil when the palette leaves its window.
@@ -554,6 +562,7 @@ struct ToolbarRootView: View {
                 }
             }
             .frame(width: size.width, height: size.height, alignment: .topLeading)
+            .onChange(of: dock, initial: true) { _, _ in model.publishQADock(size: size, compact: compact) }
             .onChange(of: WindowMetrics(size: size, compact: compact), initial: true) { _, window in
                 model.windowDidChange(size: window.size, compact: window.compact)
             }
@@ -584,7 +593,7 @@ struct ToolbarRootView: View {
                 symbol: item.isPlugin ? NibSymbol.plugin(item.icon) : (NibSymbol(systemName: item.icon) ?? .puzzle),
                 isPlugin: item.isPlugin, hasSettings: item.hasSettings, value: item.value,
                 shortcut: item.keyHint.flatMap { ToolKeyHint.keyboardShortcut($0) }, registersShortcut: false,
-                tint: item.tint.map { Self.color($0) })
+                tint: item.tint.map { Self.color($0) }, accessibilityID: item.accessibilityID)
     }
 
     private func swatch(_ s: QuickSwatch) -> NibSwatch {
@@ -612,6 +621,7 @@ struct RevealToolsButton: View {
     var body: some View {
         // One bar button and the bar group's padding, 44 pt thick.
         NibToolbarItem(.pen, label: String(localized: "Show Tools"), action: action)
+            .accessibilityIdentifier("cmd.toolbar.setVisible")
             .nibChromeTypeCap()
             .dropletDockable(ToolbarModel.paletteID + ".reveal", length: NibMetrics.hitTarget + 2 * NibSpacing.xs,
                              thickness: NibMetrics.barHeight, current: dock, style: .bar, onDock: onDock)

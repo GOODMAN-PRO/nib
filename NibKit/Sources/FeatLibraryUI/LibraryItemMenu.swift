@@ -59,6 +59,7 @@ struct LibraryMenuEntries: View {
             if compact {
                 ForEach(entries.prefix(4), id: \.id) { entry in
                     NibIconButton(entry.icon.flatMap(NibSymbol.init(systemName:)) ?? .more, label: entry.resolvedTitle(for: context)) { activate(entry, context) }
+                        .accessibilityIdentifier("cmd." + entry.command)
                 }
                 if entries.count > 4 {
                     Menu {
@@ -87,6 +88,7 @@ struct LibraryMenuEntries: View {
                 if let key = entry.shortcut { Text(LibraryShortcut.label(key)).font(NibFont.caption1) }
             }
         }.frame(minHeight: NibMetrics.hitTarget).frame(height: rowHeight)
+        .accessibilityIdentifier("cmd." + entry.command)
     }
     private func activate(_ entry: MenuItemDescriptor, _ context: MenuContext) {
         if entry.destructive {
@@ -128,10 +130,12 @@ struct LibraryBuds: View {
                     }
                     ForEach(LibrarySort.allCases, id: \.self) { sort in
                         NibButton(sort.title, symbol: model.sort == sort ? .checkmark : nil, kind: .plain) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
+                        .accessibilityIdentifier("cmd.library.setView")
                     }
                     Divider()
                     ForEach(LibraryFilter.allCases, id: \.self) { filter in
                         NibButton(filter.title, symbol: model.filter == filter ? .checkmark : nil, kind: .plain) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
+                        .accessibilityIdentifier("cmd.library.setView")
                     }
                 }
             }
@@ -237,8 +241,10 @@ struct LibraryNewButton: View {
         Group {
             if compact {
                 NibDropletButton(id: "library.new.button", symbol: .plus, label: String(localized: "New"), kind: .tinted) { model.setView(["menu": "new"]) }
+                .accessibilityIdentifier("cmd.library.setView")
             } else {
                 NibDropletButton(id: "library.new.button", title: String(localized: "New"), symbol: .plus, kind: .tinted) { model.setView(["menu": "new"]) }
+                .accessibilityIdentifier("cmd.library.setView")
             }
         }
         .libraryChromeFrame("anchor.library.new")

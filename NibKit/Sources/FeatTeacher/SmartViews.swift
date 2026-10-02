@@ -288,7 +288,8 @@ struct SmartViewsPanel: View {
                     NibButton(String(localized: "Undo Saved Clusters"), symbol: .undo, kind: .plain) {
                         guard let source else { return }
                         run(CommandIDs.undo, ["doc": .string(source)]) { _ in self.receipt = nil; collect() }
-                    }.disabled(busy)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.undo).disabled(busy)
                 }
                 if busy { NibTraceRow(String(localized: "Collecting class answers"), phase: .running) }
                 if let collection {

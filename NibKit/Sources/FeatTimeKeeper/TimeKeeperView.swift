@@ -90,6 +90,7 @@ struct TimeKeeperPanel: View {
             Button(String(localized: "Delete Mode"), role: .destructive) {
                 run(CommandIDs.timerDeleteMode, ["name": .string(mode.name)])
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.timerDeleteMode)
         } message: { mode in
             Text(String(localized: "\(mode.name) will be removed from your modes on every device."))
         }
@@ -132,6 +133,7 @@ struct TimeKeeperPanel: View {
                 run(CommandIDs.stopwatchStart)
                 dismissIfBarShows()
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.stopwatchStart)
         }
     }
 
@@ -391,6 +393,7 @@ struct TimeKeeperRunningSection: View {
             Button(String(localized: "Discard Session"), role: .destructive) {
                 run(CommandIDs.timerControl, ["action": "discard"])
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
         } message: {
             Text(String(localized: "It won't be saved to your history."))
         }
@@ -414,6 +417,7 @@ struct TimeKeeperRunningSection: View {
                               symbol: keeper.barVisible ? NibSymbol.eyeSlash : NibSymbol.eye, kind: .plain) {
                         run(CommandIDs.timerControl, ["action": keeper.barVisible ? "hide" : "show"])
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
                 }
                 Spacer(minLength: 0)
                 NibButton(String(localized: "Discard Session"), kind: .destructive, size: .compact) {
@@ -429,9 +433,11 @@ struct TimeKeeperRunningSection: View {
             if let label = e.label { params["label"] = .string(label) }
             run(CommandIDs.timerStart, .object(params))
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.timerStart)
         NibButton(String(localized: "Done"), symbol: .checkmark, expands: true) {
             run(CommandIDs.timerControl, ["action": "stop"])
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
     }
 
     @ViewBuilder private func runningButtons(_ e: TimerEngine) -> some View {
@@ -440,14 +446,17 @@ struct TimeKeeperRunningSection: View {
                   shortcut: TimeKeeperKeys.pause) {
             run(CommandIDs.timerControl, ["action": "togglePause"])
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
         if e.kind == .stopwatch && e.state == .running {
             NibButton(String(localized: "Lap"), symbol: NibSymbol.lap, expands: true, shortcut: TimeKeeperKeys.lap) {
                 run(CommandIDs.stopwatchLap, [:])
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.stopwatchLap)
         }
         NibButton(String(localized: "Stop and Save"), symbol: .stop, expands: true) {
             run(CommandIDs.timerControl, ["action": "stop"])
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
     }
 }
 
@@ -600,26 +609,31 @@ struct TimeKeeperBar: View {
                         if let label = e.label { params["label"] = .string(label) }
                         run(CommandIDs.timerStart, .object(params))
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.timerStart)
                 } else {
                     NibIconButton(e.state == .running ? NibSymbol.pause : NibSymbol.play,
                                   label: e.state == .running ? String(localized: "Pause") : String(localized: "Resume"),
                                   shortcut: TimeKeeperKeys.pause) {
                         run(CommandIDs.timerControl, ["action": "togglePause"])
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
                 }
                 summary(e, at: t)
                 if e.kind == .stopwatch && e.state == .running {
                     NibIconButton(NibSymbol.lap, label: String(localized: "Record Lap"), shortcut: TimeKeeperKeys.lap) {
                         run(CommandIDs.stopwatchLap)
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.stopwatchLap)
                 }
                 NibIconButton(e.state == .finished ? NibSymbol.checkmark : NibSymbol.stop,
                               label: e.state == .finished ? String(localized: "Done") : String(localized: "Stop and Save")) {
                     run(CommandIDs.timerControl, ["action": "stop"])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
                 NibIconButton(.chevronDown, label: String(localized: "Hide Time Keeper")) {
                     run(CommandIDs.timerControl, ["action": "hide"])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
             }
             .padding(.horizontal, NibSpacing.xs)
             .frame(maxWidth: TimeKeeperBar.maxWidth)
@@ -662,6 +676,7 @@ struct TimeKeeperBar: View {
             .padding(.horizontal, NibSpacing.xs)
             .contentShape(Rectangle())
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.timerControl)
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .accessibilityLabel(e.label.map { "\($0), \(spoken)" } ?? spoken)
         .accessibilityAddTraits(.updatesFrequently)

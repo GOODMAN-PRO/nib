@@ -468,7 +468,7 @@ struct ContainerLibraryBanner: View {
     let app: NibApp
     var body: some View {
         NibBanner(String(localized: "Your library is inside Nib. Reinstalling with another signer can delete it. Move it to a folder outside the app."),
-                  action: NibAction(CloudStatusModel.shared(app).canCopyLibrary ? String(localized: "Copy Library…") : String(localized: "Move Library…")) {
+                  action: NibAction(CloudStatusModel.shared(app).canCopyLibrary ? String(localized: "Copy Library…") : String(localized: "Move Library…"), command: CommandIDs.libraryRelocate) {
                       let model = CloudStatusModel.shared(app)
                       model.perform(CommandIDs.libraryRelocate, params: ["copy": .bool(model.canCopyLibrary)])
                   })
@@ -490,6 +490,7 @@ struct CloudStatusButton: View {
                                  symbol: model.syncState.symbol) { open() }
             }
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
         .accessibilityValue(model.syncState.title)
         .onAppear { model.visibilityBegan() }
         .onDisappear { model.visibilityEnded() }
@@ -525,6 +526,7 @@ struct CloudStatusPanel: View {
                         NibButton(String(localized: "Open Copy to Verify"), symbol: .notebook, kind: .plain) {
                             context.app.perform(CommandIDs.docOpen, ["doc": .string(ref)], session: context.session)
                         }
+                        .accessibilityIdentifier("cmd." + CommandIDs.docOpen)
                     }
                     NibInspectorSection(String(localized: "Library")) {
                         NibRow(model.locationName, subtitle: model.provider, icon: .folder)
@@ -639,6 +641,7 @@ struct CloudStatusPanel: View {
             let params: JSONValue = page.map { ["page": .string($0)] } ?? [:]
             context.app.perform(CommandIDs.settingsOpen, params, session: context.session)
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
         .disabled(context.app.commands.entry(CommandIDs.settingsOpen) == nil)
     }
 }
@@ -657,10 +660,12 @@ struct RepairToolsView: View {
                 .fixedSize(horizontal: false, vertical: true)
             NibButton(String(localized: "Repair Library"), symbol: .retry) {
                 model.perform(CommandIDs.libraryRepair, session: session)
-            }.disabled(model.busy)
+            }
+            .accessibilityIdentifier("cmd." + CommandIDs.libraryRepair).disabled(model.busy)
             NibButton(String(localized: "Repair Library and Search Index"), symbol: .search, kind: .plain) {
                 model.perform(CommandIDs.libraryRepair, params: ["rebuildIndex": true], session: session)
-            }.disabled(model.busy || app.commands.entry(CommandIDs.indexRebuild) == nil)
+            }
+            .accessibilityIdentifier("cmd." + CommandIDs.libraryRepair).disabled(model.busy || app.commands.entry(CommandIDs.indexRebuild) == nil)
             if model.busy { NibTraceRow(String(localized: "Working…"), phase: .running) }
             if showMessages {
                 if let error = model.actionError { NibBanner(error) }

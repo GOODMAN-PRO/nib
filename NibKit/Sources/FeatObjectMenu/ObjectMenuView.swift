@@ -565,11 +565,13 @@ struct ObjectMenuBar: View {
             NibIconButton(entry.symbol ?? .customColour, label: entry.title, isOn: model.colourOpen) {
                 model.perform(entry)
             }
+            .accessibilityIdentifier("cmd." + entry.descriptor.command)
             .nibBudAnchor(ObjectMenuIDs.colourAnchor)
         } else {
             NibIconButton(entry.symbol ?? .more, label: entry.title, isOn: entry.checked == true) {
                 model.perform(entry)
             }
+            .accessibilityIdentifier("cmd." + entry.descriptor.command)
             .nibShortcutHint(ObjectMenuKeys.keyboardShortcut(entry.shortcut))
         }
     }
@@ -645,6 +647,7 @@ struct ObjectMenuBar: View {
                     Image(nib: glyph)
                 }
             }
+            .accessibilityIdentifier("cmd." + e.descriptor.command)
         } else {
             Button(role: e.destructive ? ButtonRole.destructive : nil) {
                 model.perform(e)
@@ -657,6 +660,7 @@ struct ObjectMenuBar: View {
                     Image(nib: glyph)
                 }
             }
+            .accessibilityIdentifier("cmd." + e.descriptor.command)
         }
     }
 }

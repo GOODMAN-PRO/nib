@@ -197,6 +197,7 @@ struct CommentMenuContent: View {
                 Text(entry.title)
             }
         }
+        .accessibilityIdentifier("cmd." + entry.command)
     }
 }
 

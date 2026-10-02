@@ -89,6 +89,7 @@ struct PanelPlacementMenu: View {
                 Section(String(localized: "Panels")) {
                     ForEach(additionalPanels, id: \.id) { tab in
                         Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
+                        .accessibilityIdentifier("cmd." + "panel.open")
                     }
                 }
             }
@@ -96,6 +97,7 @@ struct PanelPlacementMenu: View {
                 Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
                     chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
                 }
+                .accessibilityIdentifier("cmd." + "sidebar.toggle")
             }
             option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
             option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)

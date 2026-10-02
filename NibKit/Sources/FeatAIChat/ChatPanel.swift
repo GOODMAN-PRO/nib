@@ -22,6 +22,7 @@ struct ChatPanel: View {
                         Button(modeTitle(mode)) { model.perform(ChatCommand.open, ["mode": .string(mode.rawValue)]) }
                     }
                     Button(String(localized: "AI settings")) { model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)]) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
                 } label: {
                     Image(nib: .more).font(NibFont.glyph(.panel))
                         .foregroundStyle(NibColor.labelSecondary)
@@ -50,6 +51,7 @@ struct ChatPanel: View {
                 if let id = deletingChat { model.perform(CommandIDs.aiChatDelete, ["chat": .string(id)]) }
                 deletingChat = nil
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.aiChatDelete)
             Button(String(localized: "Cancel"), role: .cancel) { deletingChat = nil }
         } message: {
             Text(String(localized: "This conversation will be deleted on every device."))
@@ -139,6 +141,7 @@ struct ChatPanel: View {
                     NibButton(provider, symbol: .settings, kind: .plain) {
                         model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)])
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -237,6 +240,7 @@ struct ChatPanel: View {
                             NibButton(String(localized: "Save name"), kind: .secondary) {
                                 model.perform(CommandIDs.aiChatRename, ["chat": .string(chat.id), "title": .string(model.renameTitle)])
                             }
+                            .accessibilityIdentifier("cmd." + CommandIDs.aiChatRename)
                         }
                         HStack(spacing: NibSpacing.s) {
                             NibButton(String(localized: "Rename Conversation"), kind: .plain, size: .compact) {

@@ -41,10 +41,10 @@ public struct NibEmptyState: View {
             if primary != nil || secondary != nil {
                 HStack(spacing: NibSpacing.m) {
                     if let primary {
-                        NibButton(primary.title, kind: .primary, action: primary.handler)
+                        NibButton(primary.title, kind: .primary, action: primary.handler).nibCommand(primary.command)
                     }
                     if let secondary {
-                        NibButton(secondary.title, kind: .secondary, action: secondary.handler)
+                        NibButton(secondary.title, kind: .secondary, action: secondary.handler).nibCommand(secondary.command)
                     }
                 }
                 .padding(.top, NibSpacing.xxl)

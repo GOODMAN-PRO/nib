@@ -151,6 +151,20 @@ targets:
           - UTTypeIdentifier: app.nib.pages
             UTTypeDescription: Nib Pages
             UTTypeConformsTo: [public.json]
+  NibUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: NibUITests
+    dependencies:
+      - target: Nib
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nib.NibUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: Nib
+        SWIFT_OBJC_BRIDGING_HEADER: NibUITests/Support/NibTouchPaths.h
   NibWidgets:
     type: app-extension
     platform: iOS
@@ -215,3 +229,16 @@ schemes:
       config: Debug
     archive:
       config: Release
+  NibUITests:
+    build:
+      targets:
+        Nib: all
+        NibUITests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - name: NibUITests
+          parallelizable: false
+    run:
+      config: Debug

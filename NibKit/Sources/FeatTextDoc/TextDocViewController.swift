@@ -764,6 +764,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
                 self.newTypingGroup()
                 self.enqueue { await self.execute(d.command, params, group: NibID.make().raw) }
             }
+            action.accessibilityIdentifier = "cmd." + d.command
             if let title = d.submenu {
                 if groups[title] == nil { groupOrder.append(title) }
                 groups[title, default: []].append(action)
@@ -1381,7 +1382,7 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
         return UIAction { [weak self] _ in
             guard let self = self else { return }
             self.app.perform(CommandIDs.appOpenURL, ["url": .string(url.absoluteString)], session: self.session)
-        }
+        }.nibCommand(CommandIDs.appOpenURL)
     }
 
     /// The edit menu over selected block or caption text: the system's actions, then `ui.menus` entries at

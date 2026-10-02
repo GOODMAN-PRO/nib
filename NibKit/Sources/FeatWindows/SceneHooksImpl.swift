@@ -56,6 +56,10 @@ final class SceneHooksImpl: SceneHooks {
     }
 
     func sceneDidConnect(_ scene: UIWindowScene, options: UIScene.ConnectionOptions, navigator: SceneNavigator) {
+        if NibUITestMode.isEnabled {
+            scenes.add(navigator)
+            return
+        }
         let type = WindowState.activityType
         let requested = options.userActivities.first { $0.activityType == type }
         var restored: WindowState?

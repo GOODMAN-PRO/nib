@@ -323,7 +323,7 @@ struct BoardsList: View {
             if model.boards.isEmpty {
                 NibEmptyState(symbol: .whiteboard, title: String(localized: "No boards yet"),
                               message: String(localized: "Add a board to start drawing."),
-                              primary: NibAction(String(localized: "Add Board")) { model.add() })
+                              primary: NibAction(String(localized: "Add Board"), command: CommandIDs.boardAdd) { model.add() })
                     .frame(maxHeight: .infinity)
             } else {
                 list
@@ -443,6 +443,7 @@ struct BoardsList: View {
                     if let symbol = item.icon.flatMap({ NibSymbol(systemName: $0) }) { Image(nib: symbol) }
                 }
             }
+            .accessibilityIdentifier("cmd." + item.command)
         }
     }
 

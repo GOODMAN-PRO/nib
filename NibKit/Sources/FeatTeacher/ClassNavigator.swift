@@ -152,7 +152,8 @@ struct ClassNavigatorBar: View {
                 }
                 NibToolbarItem(.pages, label: String(localized: "Review Class Answers")) {
                     perform(CommandIDs.panelOpen, ["id": .string(FeatTeacherInsightsFeature.panelID), "doc": .string(navigator.current ?? "")])
-                }.disabled(busy)
+                }
+                .accessibilityIdentifier("cmd." + CommandIDs.panelOpen).disabled(busy)
             }
         }
     }

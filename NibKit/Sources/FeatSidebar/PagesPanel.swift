@@ -753,6 +753,7 @@ struct PagesSelectionBar: View {
                     // The entry's shortcut is display only: the grid's own key command runs it.
                     NibIconButton(PagesSelectionBar.symbol(item) ?? .more, label: item.resolvedTitle(for: context),
                                   size: .panel, isOn: item.isChecked?(context) ?? false) { model.perform(item, context) }
+                    .accessibilityIdentifier("cmd." + item.command)
                         .nibShortcutHint(SidebarShortcut.keyboard(item.shortcut))
                         .frame(maxWidth: .infinity)
                 }
@@ -772,6 +773,7 @@ struct PagesSelectionBar: View {
                 let model = self.model
                 Task { @MainActor in await model.confirm(pending) }
             }
+            .accessibilityIdentifier("cmd." + pending.item.command)
             Button(String(localized: "Cancel"), role: .cancel) { model.cancelPendingTrash() }
         } message: { _ in
             Text(String(localized: "You can restore them from the notebook's Trash."))
@@ -811,12 +813,14 @@ struct PagesSelectionBar: View {
             Toggle(isOn: Binding(get: { isOn }, set: { _ in model.perform(item, context) })) {
                 PagesSelectionBar.label(item, context)
             }
+            .accessibilityIdentifier("cmd." + item.command)
         } else {
             Button(role: item.destructive ? .destructive : nil) {
                 model.perform(item, context)
             } label: {
                 PagesSelectionBar.label(item, context)
             }
+            .accessibilityIdentifier("cmd." + item.command)
         }
     }
 

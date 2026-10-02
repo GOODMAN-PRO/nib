@@ -25,9 +25,10 @@ public enum NibLibraryFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         LibrarySettings.declare(app.settings, owner: id)
+        if NibUITestMode.isEnabled { LibrarySettings.saveRoot(nil, app.settings) }
         let fm = FileManager.default
-        let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
-        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
+        let support = NibUITestMode.rootURL ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
+        let documents = NibUITestMode.rootURL?.appendingPathComponent("Library", isDirectory: true) ?? fm.urls(for: .documentDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
         let library = FolderLibrary(settings: app.settings, clock: app.clock, events: app.events,
                                     locator: app.services.packages, workspace: app.workspace, bus: app.bus, services: app.services,
                                     cacheDirectory: support.appendingPathComponent("Nib/library", isDirectory: true),

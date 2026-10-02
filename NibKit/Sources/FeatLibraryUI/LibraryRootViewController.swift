@@ -501,14 +501,17 @@ struct LibraryRootView: View {
                                             if model.parentNavigation != nil { parentNavigation }
                                             else {
                                                 NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                                .accessibilityIdentifier("cmd.library.setView")
                                             }
                                         }
                                         ToolbarItemGroup(placement: .topBarTrailing) {
                                             NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                                            .accessibilityIdentifier("cmd.library.setView")
                                                 .libraryChromeFrame("anchor.library.sort")
                                             NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) {
                                                 model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"])
                                             }
+                                            .accessibilityIdentifier("cmd.library.setView")
                                         }
                                     }
                             }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -529,6 +532,7 @@ struct LibraryRootView: View {
                                                     : NibSpacing.x6 + NibSpacing.l) {
                             if !inlineSidebar && !compact {
                                 NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                .accessibilityIdentifier("cmd.library.setView")
                                     .libraryChromeFrame("top.sidebar")
                                     .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topLeading, isControls: true))
                             }
@@ -590,9 +594,15 @@ struct LibraryRootView: View {
                         model.confirmation = nil
                         model.perform(confirmation.command, confirmation.params)
                     }
+                    .accessibilityIdentifier("cmd." + confirmation.command)
                 }
             }
             .onAppear { searchText = model.search }
+            .onChange(of: model.rows.count, initial: true) { _, _ in
+                if NibUITestMode.isEnabled {
+                    DispatchQueue.main.async { UIAccessibility.post(notification: .layoutChanged, argument: nil) }
+                }
+            }
             .onChange(of: model.search) { _, value in if value != searchText { searchText = value } }
             .task(id: searchText) {
                 guard searchText != model.search else { return }
@@ -630,6 +640,7 @@ struct LibraryRootView: View {
                             NibSidebarRow(place.title, symbol: place.symbol, count: model.sidebarCounts[place.id],
                                           isSelected: place.collection.map { model.tab == nil && model.folder == nil && model.collection == $0 } ?? (model.tab?.id == place.id))
                         }
+                        .accessibilityIdentifier("cmd.library.setView")
                         .libraryDropTarget(place.id == PanelIDs.trash ? "trash" : "card:tab:" + place.id)
                     }
                     DisclosureGroup(String(localized: "Folders")) {
@@ -638,6 +649,7 @@ struct LibraryRootView: View {
                                 NibSidebarRow(row.name, symbol: .folderFill, count: model.sidebarCounts[row.ref], isSelected: model.tab == nil && model.collection == .documents && model.folder == row.nodeID,
                                               glyphTint: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) })
                             }
+                            .accessibilityIdentifier("cmd.library.setView")
                             .libraryDropTarget("sidebarFolder:" + row.ref)
                         }
                     }.font(NibFont.body).foregroundStyle(NibColor.label).padding(NibSpacing.m)
@@ -647,6 +659,7 @@ struct LibraryRootView: View {
                 Text(model.syncText).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                 Spacer()
                 NibIconButton(.settings, label: String(localized: "App Menu")) { model.setView(["menu": "app"]) }
+                .accessibilityIdentifier("cmd.library.setView")
                     .libraryChromeFrame("anchor.library.app")
             }
         }
@@ -673,7 +686,7 @@ struct LibraryRootView: View {
                     }
                     itemCount.libraryChromeFrame("metadata")
                     if let error = model.error {
-                        NibBanner(error, action: NibAction(String(localized: "Try Again")) { model.setView(["folder": model.folderRef]) })
+                        NibBanner(error, action: NibAction(String(localized: "Try Again"), command: "library.setView") { model.setView(["folder": model.folderRef]) })
                             .libraryChromeFrame("banner")
                     }
                     LibraryGridView(model: model, compactHeight: compactHeight)
@@ -702,6 +715,7 @@ struct LibraryRootView: View {
             NibButton(parent.title, symbol: .back, kind: .plain, size: .compact) {
                 model.setView(["folder": .string(parent.ref)])
             }
+            .accessibilityIdentifier("cmd.library.setView")
             .accessibilityLabel(String(localized: "Back to \(parent.title)"))
             .libraryDropTarget("breadcrumb:" + parent.ref)
             .libraryChromeFrame("parent.navigation")
@@ -718,12 +732,16 @@ struct LibraryRootView: View {
                 NibDropletButton(id: "library.controls", symbol: .search, label: String(localized: "Search Library")) {
                     model.perform(CommandIDs.searchOpen)
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
             } else {
                 NibBarGroup(id: "library.controls") {
                     NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
                     NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                    .accessibilityIdentifier("cmd.library.setView")
                         .libraryChromeFrame("anchor.library.sort")
                     NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
+                    .accessibilityIdentifier("cmd.library.setView")
                 }
             }
             LibraryNewButton(model: model, compact: compact)
@@ -733,6 +751,7 @@ struct LibraryRootView: View {
         NibBarGroup(id: "library.selection") {
             LibraryMenuEntries(model: model, location: .librarySelection, rows: model.rows.filter { model.selection.refs.contains($0.ref) }, compact: true)
             NibIconButton(.xmark, label: String(localized: "Finish Selecting")) { model.setView(["selection": "clear"]) }
+            .accessibilityIdentifier("cmd.library.setView")
         }
     }
 }
@@ -968,7 +987,7 @@ struct LibraryPanelView: View {
             }.background(NibColor.background)
         } else {
             NibEmptyState(symbol: .warningTriangle, title: String(localized: "Panel unavailable"),
-                primary: NibAction(String(localized: "Close")) { model.setView(["panel": .string(panel.id), "close": true]) })
+                primary: NibAction(String(localized: "Close"), command: "library.setView") { model.setView(["panel": .string(panel.id), "close": true]) })
         }
     }
 }

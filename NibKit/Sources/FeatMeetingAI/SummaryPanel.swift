@@ -109,13 +109,15 @@ struct SummaryPanel: View {
                     NibIconButton(.settings, label: String(localized: "Meeting AI"), size: .panel) {
                         model.run(CommandIDs.settingsOpen, ["page": .string(FeatMeetingAIFeature.settingsID)])
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
                 }
                 NibButton(String(localized: "Show Transcript"), symbol: .transcript, kind: .plain) {
                     model.run(CommandIDs.panelOpen, ["id": "transcription", "clip": .string(model.clip)])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
                 if let error = model.error { NibBanner(error) }
                 if let message = model.message {
-                    NibBanner(message, style: .info, action: NibAction(String(localized: "Undo")) {
+                    NibBanner(message, style: .info, action: NibAction(String(localized: "Undo"), command: CommandIDs.undo) {
                         if let doc = context.session?.document { model.run(CommandIDs.undo, ["doc": .string(NodeRef.document(doc).description)]) }
                     })
                 }
@@ -145,13 +147,14 @@ struct SummaryPanel: View {
                     NibButton(summary == nil ? String(localized: "Summarise Recording") : String(localized: "Regenerate Summary"),
                         symbol: .assistant, kind: .primary, expands: true) {
                             model.run(CommandIDs.meetingSummarize, ["clip": .string(model.clip)])
-                        }.disabled(model.working)
+                        }
+                    .accessibilityIdentifier("cmd." + CommandIDs.meetingSummarize).disabled(model.working)
                     if !model.recording {
                         NibButton(String(localized: "Generate Notes"), symbol: .text, expands: true) { notes("generate") }.disabled(model.working || model.transcribing)
                         NibButton(String(localized: "Enhance Notes"), symbol: .text, expands: true) { notes("enhance") }.disabled(model.working || model.transcribing)
                         if confirmTranscript {
                             NibBanner(String(localized: "Regenerating replaces transcript corrections and cannot be undone."),
-                                action: NibAction(String(localized: "Replace Transcript")) {
+                                action: NibAction(String(localized: "Replace Transcript"), command: CommandIDs.transcriptRegenerate) {
                                     confirmTranscript = false
                                     model.run(CommandIDs.transcriptRegenerate, ["clip": .string(model.clip)])
                                 })
@@ -189,7 +192,8 @@ struct SummaryPanel: View {
                     .font(NibFont.hud).foregroundStyle(NibColor.accent)
                     .frame(minHeight: NibMetrics.hitTarget, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-            }.buttonStyle(.plain).hoverEffect(.highlight)
+            }
+            .accessibilityIdentifier("cmd." + "transcript.seek").buttonStyle(.plain).hoverEffect(.highlight)
                 .accessibilityLabel(String(localized: "Play from \(MeetingTime.label(window.start)) and show linked notes"))
             Text(Locale.current.localizedString(forLanguageCode: window.language) ?? window.language)
                 .font(NibFont.caption1Emphasis).foregroundStyle(NibColor.labelSecondary)
@@ -240,6 +244,7 @@ struct MeetingRecordingSettings: View {
                 NibButton(String(localized: "Transcription Languages and Speech Access"), symbol: .transcript, kind: .plain, expands: true) {
                     app.perform(CommandIDs.settingsOpen, ["page": "transcription.recording"])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
                 if let error { NibBanner(error) }
             }.padding(NibSpacing.l).disabled(saving)
         }.font(NibFont.body).foregroundStyle(NibColor.label)

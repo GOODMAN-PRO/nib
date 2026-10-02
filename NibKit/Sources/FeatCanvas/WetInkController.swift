@@ -209,6 +209,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         var ledger = WetInkLedger<Capture, PKStroke>()
         var acceptedContacts: Set<ObjectIdentifier> = []
         var startedContact: ObjectIdentifier?
+        var fixtureAwaitingContact = false
         var toolEnded = false
         var active = true
         var replacingDrawing = false
@@ -510,7 +511,13 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         let at = touch.location(in: host.canvasView)
         let pencilPoint = tracks.values.first(where: { $0.last.isPencil }).map { host.viewPoint($0.last.location, page: $0.last.page) }
         let kind: PalmRejection.ContactKind = touch.type == .pencil ? .pencil : (touch.type == .direct ? .finger : .pointer)
-        return palmRejection.rejects(.init(kind: kind, majorRadius: Double(touch.majorRadius), location: Point(at)),
+        var radius = Double(touch.majorRadius)
+        #if targetEnvironment(simulator)
+        // XCTest's public drag/pinch APIs report ~37 pt contacts on iPad, larger than a real fingertip.
+        // Normalize that synthetic metadata only for the explicit fixture launch; retain all input routing.
+        if NibUITestMode.isEnabled { radius = 8 }
+        #endif
+        return palmRejection.rejects(.init(kind: kind, majorRadius: radius, location: Point(at)),
                                  pencilLocation: pencilPoint.map { Point($0) })
     }
 
@@ -523,7 +530,23 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     private func begin(_ touch: UITouch, event: UIEvent, id: Int) {
         guard let host = host, let sample = TouchTap.sample(touch, event: event, touchID: id, host: host) else { return }
-        begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: decision(touch),
+        let route = decision(touch)
+        #if targetEnvironment(simulator)
+        // Simulator synthesis can hit-test with an empty UIEvent, then deliver native tool-begin before
+        // TouchTap. Admit the actual hit view's contact once UIKit provides it; PencilKit still owns the ink.
+        if NibUITestMode.isEnabled, case .tool(let tool) = route, tool.inputMode == .pencilKit,
+           let hit = touch.view, let surface = surfaces.first(where: {
+               $0.active && $0.canvas.isUserInteractionEnabled && hit.isDescendant(of: $0.canvas)
+           }) {
+            let contact = ObjectIdentifier(touch)
+            surface.acceptedContacts.insert(contact)
+            if surface.fixtureAwaitingContact {
+                surface.startedContact = contact
+                surface.fixtureAwaitingContact = false
+            }
+        }
+        #endif
+        begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: route,
               contact: ObjectIdentifier(touch))
     }
 
@@ -771,6 +794,9 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         guard let surface = surfaces.first(where: { $0.canvas === canvasView }) else { return }
         surface.toolEnded = false
         surface.startedContact = surface.acceptedContacts.first
+        #if targetEnvironment(simulator)
+        surface.fixtureAwaitingContact = NibUITestMode.isEnabled && surface.startedContact == nil
+        #endif
         if let capture = surface.ledger.captures.first(where: { $0.payload.contact == surface.startedContact }) {
             surface.ledger.nativeBegin(capture.id)
         }
@@ -783,6 +809,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         // Reconcile after UIKit's end callbacks and PencilKit's final pressure notification.
         Task { @MainActor [weak self, weak surface] in
             await Task.yield()
+            #if targetEnvironment(simulator)
+            // The simulator delivers the final PKDrawing after native end, on a later render turn.
+            // Drawing-change callbacks reconcile immediately; only no-stroke cleanup waits in fixture mode.
+            if NibUITestMode.isEnabled { try? await Task.sleep(for: .seconds(1)) }
+            #endif
             guard let self = self, let surface = surface else { return }
             self.process(surface)
             surface.ledger.discardUnproduced(completedOnly: true)

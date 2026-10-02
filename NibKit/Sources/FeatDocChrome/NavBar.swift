@@ -316,6 +316,7 @@ struct NavBarView: View {
         if let provider = chrome.app.ui.toolbar.get(item.id)?.compactStatus,
            let content = provider(context) {
             content
+                .nibCommand(chrome.app.ui.toolbar.get(item.id)?.command)
                 .fixedSize(horizontal: true, vertical: false)
                 .font(NibFont.caption1)
                 .foregroundStyle(NibColor.label)
@@ -333,6 +334,7 @@ struct NavBarView: View {
                 titleLabel
             }
             .buttonStyle(NibPressStyle(shape: Capsule()))
+            .accessibilityIdentifier("menu.title")
             .nibBudAnchor(ChromeMenu.title.anchor)
             .accessibilityHint(String(localized: "Opens the document menu"))
         } else {
@@ -359,16 +361,20 @@ struct NavBarView: View {
         switch item.action {
         case .library:
             NibToolbarItem(item.symbol, label: item.title) { chrome.goToLibrary() }
+                .accessibilityIdentifier("cmd.window.showLibrary")
         case .menu(let menu):
             NibToolbarItem(item.symbol, label: item.title, isOn: openMenu == menu) { toggle(menu) }
                 .nibBudAnchor(menu.anchor)
+                .accessibilityIdentifier("menu." + menu.rawValue)
         case .command(let command, let params):
             if item.id == NavBarModel.sidebar {
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
+                    .accessibilityIdentifier("cmd." + command)
                     .contextMenu { sidebarModes(command, visible: item.isOn) }
             } else {
                 // NibDesign buttons dim themselves when disabled.
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
+                    .accessibilityIdentifier("cmd." + command)
                     .disabled(!item.isEnabled)
             }
         }
@@ -383,6 +389,7 @@ struct NavBarView: View {
             } label: {
                 Label { Text(String(localized: "Show as Sidebar")) } icon: { Image(nib: .sidebar) }
             }
+            .accessibilityIdentifier("cmd." + command)
         }
         if !visible || sidebarMode == .sidebar {
             Button {
@@ -390,6 +397,7 @@ struct NavBarView: View {
             } label: {
                 Label { Text(String(localized: "Show as Window")) } icon: { Image(nib: .pages) }
             }
+            .accessibilityIdentifier("cmd." + command)
         }
         if visible {
             Button {
@@ -397,6 +405,7 @@ struct NavBarView: View {
             } label: {
                 Label { Text(String(localized: "Hide Sidebar")) } icon: { Image(nib: .xmark) }
             }
+            .accessibilityIdentifier("cmd." + command)
         }
     }
 
@@ -441,6 +450,7 @@ struct ChromeMenuRow: Identifiable {
     var isEnabled = true
     /// A display-only shortcut label ("⌃⌘S", `MenuItemDescriptor.shortcut`).
     var shortcut: String? = nil
+    var command: String? = nil
     let action: () -> Void
 }
 
@@ -555,6 +565,7 @@ struct ChromeMenuList: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
+                .accessibilityIdentifier(row.command.map { "cmd." + $0 } ?? row.id)
                 .disabled(!row.isEnabled)
                 .opacity(row.isEnabled ? 1 : NibOpacity.disabled)
                 .accessibilityAddTraits(row.isOn ? .isSelected : [])

@@ -126,6 +126,7 @@ struct WindowTabsSettingsView: View {
                         app.perform(CommandIDs.settingsSet,
                                     ["name": .string(WindowSettings.showTabs.name), "value": .bool(value)])
                     }))
+                .accessibilityIdentifier("cmd." + CommandIDs.settingsSet)
             } footer: {
                 Text(String(localized: "Show tabs when more than one document is open."))
                     .font(NibFont.footnote)
@@ -330,6 +331,7 @@ struct TabCapsule: View {
             .accessibilityActions {
                 ForEach(items, id: \.id) { item in
                     Button(item.title) { model.run(item, on: tab) }
+                    .accessibilityIdentifier("cmd." + item.command)
                 }
             }
             .accessibilityShowsLargeContentViewer { Text(tab.title) }
@@ -385,6 +387,7 @@ struct TabMenu: View {
                 Text(item.title)
             }
         }
+        .accessibilityIdentifier("cmd." + item.command)
     }
 }
 

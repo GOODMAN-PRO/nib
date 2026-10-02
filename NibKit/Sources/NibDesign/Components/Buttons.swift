@@ -4,10 +4,12 @@ import SwiftUI
 public struct NibAction {
     public let title: String
     public let handler: () -> Void
+    public let command: String?
 
-    public init(_ title: String, handler: @escaping () -> Void) {
+    public init(_ title: String, command: String? = nil, handler: @escaping () -> Void) {
         self.title = title
         self.handler = handler
+        self.command = command
     }
 }
 
@@ -295,5 +297,12 @@ public struct NibBadge: View {
             .foregroundStyle(NibColor.onAccent)
             .frame(width: 22, height: 22)
             .background(fill, in: Circle())
+    }
+}
+
+public extension View {
+    /// Command identity is independent of localization and never replaces the VoiceOver label.
+    @ViewBuilder func nibCommand(_ command: String?) -> some View {
+        if let command { accessibilityIdentifier("cmd." + command) } else { self }
     }
 }
