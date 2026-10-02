@@ -117,7 +117,7 @@ final class CreateUITests: XCTestCase {
         let block = ui.app.textViews.firstMatch
         try require(block, "create.type: text document must open an editable first block")
         block.tap()
-        block.typeText("Created through Type")
+        ui.app.typeText("Created through Type")
         try wait("First block must accept typing") { (block.value as? String)?.contains("Created through Type") == true }
     }
 
@@ -336,7 +336,9 @@ final class CreateUITests: XCTestCase {
         try tap("Set as Default")
         try tap("Done")
         try notebook("Template settings defaults")
-        XCTAssertTrue(ui.app.buttons["Carbon"].firstMatch.isSelected)
+        try wait("Template settings must select the saved Carbon cover") {
+            self.ui.app.buttons["Carbon"].firstMatch.isSelected
+        }
         try scrollTo(ui.app.buttons["Daily Planner"], name: "Daily Planner")
         XCTAssertTrue(ui.app.buttons["Daily Planner"].isSelected)
         let id = try create()
@@ -379,7 +381,7 @@ final class CreateUITests: XCTestCase {
         let text = ui.app.textViews.firstMatch
         try require(text, "create.textDocument must open an editable first block")
         text.tap()
-        text.typeText("First block title")
+        ui.app.typeText("First block title")
         try wait("Text editor must retain typed first block") { (text.value as? String)?.contains("First block title") == true }
         try ui.tapCommand("window.showLibrary")
         try ui.openDocument("First block title")
@@ -407,7 +409,7 @@ final class CreateUITests: XCTestCase {
         let block = ui.app.textViews.firstMatch
         try require(block, "create.textDocument: Shift-Command-T must open an editable first block")
         block.tap()
-        block.typeText("Keyboard text document")
+        ui.app.typeText("Keyboard text document")
         try wait("Keyboard-created document must accept typing") {
             (block.value as? String)?.contains("Keyboard text document") == true
         }
@@ -535,8 +537,10 @@ final class CreateUITests: XCTestCase {
         try ui.waitForState { $0.document == nil && $0.screen == "library" }
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages,
                        "quicknote.delete must remove only the QuickNote and preserve every unrelated package")
-        XCTAssertFalse(ui.app.descendants(matching: .any).matching(identifier: "cmd.doc.open")
-            .matching(NSPredicate(format: "label BEGINSWITH 'Untitled'")).firstMatch.exists)
+        try wait("quicknote.delete must remove the Untitled document from the library") {
+            !self.ui.app.descendants(matching: .any).matching(identifier: "cmd.doc.open")
+                .matching(NSPredicate(format: "label BEGINSWITH 'Untitled'")).firstMatch.exists
+        }
         try ui.openDocument("Physics — Motion")
         XCTAssertEqual(try ui.state().pageCount, 4)
         XCTAssertEqual(try ui.state().strokeCountOnPage, 1)
@@ -566,8 +570,9 @@ final class CreateUITests: XCTestCase {
     func testEventPlannerLayoutAndDateProduceLinkedPages() throws {
         try newMenu("Event Planner")
         try tap("Weekly")
-        try tap("Monday")
+        try scrollTap("Monday")
         let decrement = ui.app.steppers.buttons["Decrement"].firstMatch
+        try scrollTo(decrement, name: "Planner count")
         try require(decrement, "Planner count stepper missing")
         decrement.tap()
         try tap("Create Planner")
@@ -591,7 +596,7 @@ final class CreateUITests: XCTestCase {
         try newMenu("Event Planner")
         try tap("Daily")
         let picker = ui.app.datePickers.firstMatch
-        try require(picker, "calendar.newPlanner must offer a start date")
+        try scrollTo(picker, name: "Planner start date")
         picker.tap()
         // Choose a different day in the displayed month through the native calendar, without setting app state.
         var calendar = Calendar(identifier: .gregorian)
@@ -632,6 +637,9 @@ final class CreateUITests: XCTestCase {
 
     private func previewPixels() throws -> Data {
         let title = ui.app.textFields["Title"].frame
+        guard title.width > 0, title.height > 0 else {
+            throw NibUI.Failure.message("Preview title has not finished layout")
+        }
         // DESIGN §14.6: the 104 × 136 preview immediately precedes the title field, separated by 16 pt.
         let rect = CGRect(x: title.minX - 120, y: title.midY - 68, width: 104, height: 136).insetBy(dx: 8, dy: 8)
         let screenshot = ui.app.screenshot().image
@@ -640,11 +648,14 @@ final class CreateUITests: XCTestCase {
         let upright = UIGraphicsImageRenderer(size: screenshot.size).image { _ in
             screenshot.draw(in: CGRect(origin: .zero, size: screenshot.size))
         }
-        let image = try XCTUnwrap(upright.cgImage)
+        guard let image = upright.cgImage else { throw NibUI.Failure.message("Preview screenshot has no pixels") }
         let scale = CGFloat(image.width) / ui.app.frame.width
-        let crop = try XCTUnwrap(image.cropping(to: CGRect(x: rect.minX * scale, y: rect.minY * scale,
-                                                          width: rect.width * scale, height: rect.height * scale)))
-        return try XCTUnwrap(UIImage(cgImage: crop).pngData())
+        guard let crop = image.cropping(to: CGRect(x: rect.minX * scale, y: rect.minY * scale,
+                                                   width: rect.width * scale, height: rect.height * scale)),
+              let data = UIImage(cgImage: crop).pngData() else {
+            throw NibUI.Failure.message("Preview crop is outside the current screenshot")
+        }
+        return data
     }
 
     private func assertPreviewColour(_ expected: UInt32) throws {
@@ -701,7 +712,7 @@ final class CreateUITests: XCTestCase {
     }
 
     private func scrollTo(_ element: XCUIElement, name: String = "creation control") throws {
-        for _ in 0..<7 {
+        for _ in 0..<12 {
             if element.exists && element.isHittable {
                 if name == "Title", let form = ui.app.scrollViews.allElementsBoundByIndex.last(where: {
                     $0.isHittable && $0.frame.height > 200
@@ -711,7 +722,8 @@ final class CreateUITests: XCTestCase {
                 }
                 return
             }
-            let scroll = ui.app.scrollViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 200 }
+            let scroll = ui.app.collectionViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 40 }
+                ?? ui.app.scrollViews.allElementsBoundByIndex.last { $0.isHittable && $0.frame.height > 200 }
             guard let scroll else { break }
             if element.exists && element.frame.midY < scroll.frame.minY {
                 scroll.swipeDown(velocity: .slow)
@@ -754,7 +766,10 @@ final class CreateUITests: XCTestCase {
     private func newMenu(_ choice: String) throws {
         try tap("New")
         // Menu accessibility labels include the displayed keyboard shortcut after the title.
-        let item = button(choice, prefix: true)
+        // Match a title boundary so “Study Set” cannot tap the library's “Study Sets” sidebar row.
+        let item = ui.app.buttons.matching(NSPredicate(
+            format: "label == %@ OR label BEGINSWITH %@ OR label BEGINSWITH %@",
+            choice, choice + " ", choice + ",")).firstMatch
         try require(item, "New menu must offer \(choice)")
         try scrollTo(item, name: choice)
         item.tap()
@@ -789,6 +804,9 @@ final class CreateUITests: XCTestCase {
         let state = try ui.waitForState { $0.screen == "document" && $0.document != nil }
         let id = try XCTUnwrap(state.document)
         try wait("Created document must be persisted") { (try? self.head(id)) != nil }
+        try wait("Creation sheet must dismiss after opening the document") {
+            !self.ui.app.buttons["cmd.doc.create"].exists
+        }
         return id
     }
 

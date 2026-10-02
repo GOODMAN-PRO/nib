@@ -2,6 +2,7 @@ import UIKit
 import PencilKit
 import NibContracts
 import NibDesign
+import os
 
 /// Pure capture ledger. A native tool-begin admits a capture; creationDate identifies the resulting
 /// stroke independently of its position in PKDrawing. Contacts that never draw cannot shift the queue.
@@ -49,19 +50,28 @@ struct WetInkLedger<Payload, Ink> {
         for i in captures.indices where captures[i].nativeStarted { captures[i].nativeEnded = true }
         for i in entries.indices where entries[i].capture?.nativeStarted == true { entries[i].capture?.nativeEnded = true }
     }
-    mutating func append(identity: Date, ink: Ink) {
+    mutating func append(identity: Date, ink: Ink, captureID: UUID? = nil) {
         if let i = entries.firstIndex(where: { $0.identity == identity }) {
-            if !entries[i].delivered { entries[i].ink = ink }
-            return
+            if entries[i].delivered { return }
+            entries[i].ink = ink
+            if entries[i].capture != nil { return }
         }
-        let nearest = captures.indices.filter { captures[$0].nativeStarted }.min {
+        // Native contact ownership wins over clocks. UIKit touch uptime, delivery time and
+        // PKStrokePath.creationDate are not a shared stroke identifier (synthesis and delayed
+        // recognition can differ by hundreds of milliseconds). Never reject ink for that skew.
+        let owner = captures.firstIndex { $0.id == captureID && $0.nativeStarted }
+        let nearest = owner ?? captures.indices.filter { captures[$0].nativeStarted }.min {
             abs(captures[$0].startedAt.timeIntervalSince(identity)) < abs(captures[$1].startedAt.timeIntervalSince(identity))
         }
-        let capture: Capture?
-        if let i = nearest, abs(captures[i].startedAt.timeIntervalSince(identity)) < 0.25 {
-            capture = captures.remove(at: i)
-        } else { capture = nil }
-        entries.append(Entry(identity: identity, capture: capture, ink: ink, ready: capture == nil || capture?.cancelled == true))
+        let capture = nearest.map { captures.remove(at: $0) }
+        if let i = entries.firstIndex(where: { $0.identity == identity }) {
+            entries[i].capture = capture
+            entries[i].ready = capture?.cancelled == true
+        } else {
+            // Drawing notifications may precede contact admission. Retain unmatched ink until
+            // reconciliation can bind it, rather than treating it as already safe to erase.
+            entries.append(Entry(identity: identity, capture: capture, ink: ink, ready: capture?.cancelled == true))
+        }
     }
     /// Called after a native end and drawing reconciliation. No-stroke captures cease blocking retirement.
     mutating func discardUnstartedEnded() { captures.removeAll { $0.ended && !$0.nativeStarted } }
@@ -209,7 +219,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         var ledger = WetInkLedger<Capture, PKStroke>()
         var acceptedContacts: Set<ObjectIdentifier> = []
         var startedContact: ObjectIdentifier?
-        var fixtureAwaitingContact = false
+        var awaitingContact = false
+        var nativeCaptureID: UUID?
         var toolEnded = false
         var active = true
         var replacingDrawing = false
@@ -531,21 +542,19 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     private func begin(_ touch: UITouch, event: UIEvent, id: Int) {
         guard let host = host, let sample = TouchTap.sample(touch, event: event, touchID: id, host: host) else { return }
         let route = decision(touch)
-        #if targetEnvironment(simulator)
-        // Simulator synthesis can hit-test with an empty UIEvent, then deliver native tool-begin before
-        // TouchTap. Admit the actual hit view's contact once UIKit provides it; PencilKit still owns the ink.
-        if NibUITestMode.isEnabled, case .tool(let tool) = route, tool.inputMode == .pencilKit,
+        // Hit-testing may have no touches yet, and native tool-begin can precede TouchTap.
+        // Admit the actual hit view's contact once UIKit provides it, for every input source.
+        if case .tool(let tool) = route, tool.inputMode == .pencilKit,
            let hit = touch.view, let surface = surfaces.first(where: {
                $0.active && $0.canvas.isUserInteractionEnabled && hit.isDescendant(of: $0.canvas)
            }) {
             let contact = ObjectIdentifier(touch)
             surface.acceptedContacts.insert(contact)
-            if surface.fixtureAwaitingContact {
+            if surface.awaitingContact {
                 surface.startedContact = contact
-                surface.fixtureAwaitingContact = false
+                surface.awaitingContact = false
             }
         }
-        #endif
         begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: route,
               contact: ObjectIdentifier(touch))
     }
@@ -588,6 +597,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 capture.surface = surface
                 surface?.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
                                          nativeStarted: surface?.startedContact == capture.contact)
+                if surface?.startedContact == capture.contact { surface?.nativeCaptureID = capture.id }
             }
             beginInking(capture)
         }
@@ -652,6 +662,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
         track.holdTask?.cancel()
         let route = track.route
+        #if DEBUG
+        if let capture = track.capture {
+            Logger(subsystem: "app.nib", category: "canvasinput").debug("Touch ended: tool=\(capture.tool.id, privacy: .public) samples=\(capture.points.count) moved=\(track.moved) cancelled=\(cancelled) deliveryLag=\(ProcessInfo.processInfo.systemUptime - sample.timestamp)")
+        }
+        #endif
         if cancelled {
             router?.cancel(id)
             if let capture = track.capture { cancel(capture) }
@@ -680,7 +695,6 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         for surface in surfaces {
             process(surface)
             surface.ledger.discardUnstartedEnded()
-            if surface.toolEnded { surface.ledger.discardUnproduced() }
             removeReady(surface)
         }
         if tracks.isEmpty { updateSurfaces() }
@@ -794,11 +808,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         guard let surface = surfaces.first(where: { $0.canvas === canvasView }) else { return }
         surface.toolEnded = false
         surface.startedContact = surface.acceptedContacts.first
-        #if targetEnvironment(simulator)
-        surface.fixtureAwaitingContact = NibUITestMode.isEnabled && surface.startedContact == nil
-        #endif
+        surface.awaitingContact = surface.startedContact == nil
         if let capture = surface.ledger.captures.first(where: { $0.payload.contact == surface.startedContact }) {
             surface.ledger.nativeBegin(capture.id)
+            surface.nativeCaptureID = capture.id
         }
     }
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
@@ -809,14 +822,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         // Reconcile after UIKit's end callbacks and PencilKit's final pressure notification.
         Task { @MainActor [weak self, weak surface] in
             await Task.yield()
-            #if targetEnvironment(simulator)
-            // The simulator delivers the final PKDrawing after native end, on a later render turn.
-            // Drawing-change callbacks reconcile immediately; only no-stroke cleanup waits in fixture mode.
-            if NibUITestMode.isEnabled { try? await Task.sleep(for: .seconds(1)) }
-            #endif
             guard let self = self, let surface = surface else { return }
             self.process(surface)
-            surface.ledger.discardUnproduced(completedOnly: true)
+            // Native end is not a drawing fence. Final PKDrawing callbacks can arrive on a
+            // later render turn; keep their admitted captures until that drawing is delivered.
             self.removeReady(surface)
             self.pruneSurfaces()
         }
@@ -828,9 +837,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     private func process(_ surface: Surface) {
         guard let host = host, !closing, !surface.replacingDrawing else { return }
-        for pk in surface.canvas.drawing.strokes { surface.ledger.append(identity: pk.path.creationDate, ink: pk) }
+        for pk in surface.canvas.drawing.strokes {
+            surface.ledger.append(identity: pk.path.creationDate, ink: pk, captureID: surface.nativeCaptureID)
+        }
         for entry in surface.ledger.takeDeliveries() {
             guard let capture = entry.capture?.payload else { continue }
+            #if DEBUG
+            Logger(subsystem: "app.nib", category: "canvasinput").debug("Native stroke delivered: tool=\(capture.tool.id, privacy: .public) clockSkew=\(entry.identity.timeIntervalSince(capture.startedAt))")
+            #endif
             let handoff = WetStrokeHandoff()
             delivering = handoff
             if host.isReadOnly { surface.ledger.markReady(capture.id) }

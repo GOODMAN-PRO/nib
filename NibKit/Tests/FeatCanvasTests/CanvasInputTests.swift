@@ -411,6 +411,131 @@ final class CanvasInputTests: XCTestCase {
         XCTAssertTrue(ledger.isEmpty, "An inactive surface is now reusable/prunable")
     }
 
+    func testLedgerTimestampSkewNeverDiscardsAnAdmittedStroke() throws {
+        // Real input can be delivered late; synthesized input can have a different clock origin.
+        for offset in [-10_000.0, -0.3, 0, 0.3, 10_000] {
+            var ledger = WetInkLedger<String, Int>()
+            let id = UUID(), nativeDate = Date(timeIntervalSince1970: 100_000)
+            ledger.register(id: id, startedAt: nativeDate.addingTimeInterval(offset), payload: "ink", nativeStarted: true)
+            ledger.end(id)
+            ledger.nativeEnd()
+            ledger.append(identity: nativeDate, ink: 42)
+            let delivery = try XCTUnwrap(ledger.takeDeliveries().first, "Clock offset \(offset) must not lose ink")
+            XCTAssertEqual(delivery.capture?.id, id)
+            XCTAssertEqual(delivery.ink, 42)
+            XCTAssertFalse(ledger.retire(), "Keep wet ink until the dry render fence")
+            ledger.append(identity: nativeDate, ink: 43)
+            XCTAssertTrue(ledger.takeDeliveries().isEmpty, "A repeated native notification must not duplicate a commit")
+            ledger.markReady(id)
+            XCTAssertTrue(ledger.retire())
+            XCTAssertTrue(ledger.isEmpty)
+        }
+    }
+
+    func testNativeContactOwnershipWinsOverNearestTimestamp() {
+        var ledger = WetInkLedger<String, Int>()
+        let old = UUID(), current = UUID(), date = Date(timeIntervalSince1970: 100)
+        ledger.register(id: old, startedAt: date, payload: "no drawing", nativeStarted: true)
+        ledger.end(old)
+        ledger.nativeEnd()
+        ledger.register(id: current, startedAt: date.addingTimeInterval(-0.3), payload: "current", nativeStarted: true)
+        ledger.append(identity: date, ink: 42, captureID: current)
+        ledger.end(current)
+        ledger.nativeEnd()
+        XCTAssertEqual(ledger.takeDeliveries().map { $0.capture?.payload }, ["current"])
+    }
+
+    func testDrawingBeforeContactAdmissionIsRetainedAndReconciled() {
+        var ledger = WetInkLedger<String, Int>()
+        let id = UUID(), date = Date(timeIntervalSince1970: 100)
+        ledger.append(identity: date, ink: 1)
+        XCTAssertFalse(ledger.retire(), "An early drawing callback is not permission to erase ink")
+        ledger.register(id: id, startedAt: date.addingTimeInterval(-0.3), payload: "ink", nativeStarted: true)
+        ledger.end(id)
+        ledger.nativeEnd()
+        ledger.append(identity: date, ink: 2, captureID: id)
+        XCTAssertEqual(ledger.takeDeliveries().map(\.ink), [2])
+        XCTAssertTrue(ledger.takeDeliveries().isEmpty)
+    }
+
+    func testTouchSamplesKeepCurrentTouchAndIndividualTimestamps() {
+        let current = CanvasSample(page: Fixtures.page1, location: Point(30, 40), timestamp: 12, touchID: 1)
+        var earlier = current; earlier.timestamp = 11; earlier.location.x = 20
+        var predicted = current; predicted.timestamp = 13; predicted.location.x = 50; predicted.isPredicted = true
+        XCTAssertEqual(TouchTap.samples(current: current, coalesced: [], predicted: []).map(\.timestamp), [12])
+        XCTAssertEqual(TouchTap.samples(current: current, coalesced: [earlier], predicted: [predicted]).map(\.timestamp), [11, 12, 13])
+        let batch = TouchTap.samples(current: current, coalesced: [earlier, current], predicted: [predicted])
+        XCTAssertEqual(batch.map(\.timestamp), [11, 12, 13], "Do not duplicate the coalesced tip or replace per-touch timestamps with event time")
+        XCTAssertEqual(batch.map(\.isPredicted), [false, false, true])
+    }
+
+    func testClosedFingerLoopWithoutCoalescedHistoryReachesSampleTool() throws {
+        let tool = Tool()
+        let (_, editor, input) = try installed(tool)
+        defer { editor.closeCanvas() }
+        let start = event(editor.host, id: 180, pencil: false, timestamp: 10)
+        input.begin(start, screenPoint: start.location, route: .tool(tool))
+        XCTAssertTrue(tool.beganIDs.isEmpty, "Finger taps wait for tap-handler arbitration")
+        let loop = [Point(240, 220), Point(240, 320), Point(140, 320), start.location]
+        for (index, point) in loop.enumerated() {
+            var current = start; current.location = point; current.timestamp += Double(index + 1) * 0.1
+            var prediction = current; prediction.location.x += 10; prediction.isPredicted = true
+            let samples = TouchTap.samples(current: current, coalesced: [], predicted: [prediction])
+            input.move(samples, screenPoint: point, id: start.touchID)
+        }
+        var end = start; end.timestamp += 0.5
+        input.end(end)
+        XCTAssertEqual(tool.beganIDs, [180])
+        XCTAssertEqual(tool.moved.filter { !$0.isPredicted }.map(\.location), loop)
+        XCTAssertEqual(tool.endedIDs, [180])
+        XCTAssertEqual(tool.taps, 0, "A closed drag is not a tap even though its endpoints coincide")
+    }
+
+    func testControllerCommitsSkewedFingerPencilAndHighlighterAfterLateNativeDrawing() async throws {
+        for style in [InkStyle.defaultPen, .defaultHighlighter] {
+            for pencil in [false, true] {
+                for offset in [-0.3, 0.3, 10_000.0] {
+                    let tool = Tool(); tool.inputMode = .pencilKit; tool.style = style
+                    let (harness, editor, input) = try installed(tool)
+                    defer { editor.closeCanvas() }
+                    var received: [Stroke] = []
+                    let committed = expectation(description: "Skewed native ink reaches ink.addStrokes")
+                    harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Add Ink", summary: "Records ink.",
+                        params: .obj(["page": .ref, "strokes": .arr(.anything())], required: ["page", "strokes"]), examples: [], effect: .edit)) { params, _ in
+                            received += try (params["strokes"] ?? []).decode([Stroke].self)
+                            committed.fulfill()
+                            return ["refs": []]
+                        }
+                    let nativeDate = Date()
+                    let start = event(editor.host, id: 181, pencil: pencil,
+                                      timestamp: ProcessInfo.processInfo.systemUptime + offset)
+                    let contact = NSObject()
+                    let canvas = try XCTUnwrap(input.acceptContact(ObjectIdentifier(contact), sample: start))
+                    input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(contact))
+                    input.canvasViewDidBeginUsingTool(canvas)
+                    var end = start; end.location.x += 30; end.timestamp += 0.1
+                    input.move([end], screenPoint: end.location, id: start.touchID)
+                    // Exercise both UIKit/native-end callback orders, then let cleanup run with no drawing.
+                    if pencil { input.canvasViewDidEndUsingTool(canvas); input.end(end) }
+                    else { input.end(end); input.canvasViewDidEndUsingTool(canvas) }
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                    XCTAssertEqual(tool.finished, 0)
+                    let pk = PKBridge.pkStroke(Stroke(style: style,
+                        points: [StrokePoint(x: 140, y: 220), StrokePoint(x: 170, y: 220, t: 0.1)],
+                        t0: nativeDate.timeIntervalSince1970))
+                    canvas.drawing = PKDrawing(strokes: [pk])
+                    input.canvasViewDrawingDidChange(canvas)
+                    input.canvasViewDrawingDidChange(canvas)
+                    await fulfillment(of: [committed], timeout: 5)
+                    XCTAssertEqual(tool.finished, 1)
+                    XCTAssertEqual(received.count, 1)
+                    XCTAssertEqual(received.first?.style, style)
+                    XCTAssertFalse(harness.session.inking.isInking)
+                }
+            }
+        }
+    }
+
     func testLedgerLiveCancellationEndedCancellationAndPendingDot() {
         var ledger = WetInkLedger<Int, Int>()
         let live = UUID(), ended = UUID(), dot = UUID(), date = Date()
