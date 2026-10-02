@@ -198,6 +198,7 @@ final class FeatToolbarTests: XCTestCase {
         h.app.services.sessions.activate(other)
         try await h.run(TestTouch.descriptor.id)
         let before = try h.app.workspace.content(Fixtures.docID)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
         let selection = h.session.selection
         model.refresh()
         XCTAssertEqual(model.shown.first?.id, "lasso")
@@ -208,6 +209,7 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(other.tool, "pen", "The palette targets its own session, even when another window is active")
         XCTAssertEqual(h.session.selection, selection)
         XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), before)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), items)
         try await waitUntil("Lasso is the remembered sticky tool") {
             h.app.settings.json("toolbar.lastTool.notebook")?.stringValue == "lasso"
         }
