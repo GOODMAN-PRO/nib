@@ -81,6 +81,11 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
     private func finish(_ touches: Set<UITouch>, event: UIEvent, cancelled: Bool) {
         enteringBegan = false
         for touch in touches {
+            #if DEBUG
+            if cancelled {
+                Logger(subsystem: "app.nib", category: "canvasinput").debug("Touch stream cancelled: phase=\(touch.phase.rawValue) coalesced=\(event.coalescedTouches(for: touch)?.count ?? 0) recognizerState=\(self.state.rawValue)")
+            }
+            #endif
             if let id = ids.removeValue(forKey: ObjectIdentifier(touch)) { ended?(touch, event, id, cancelled) }
         }
         state = ids.isEmpty ? .ended : .changed

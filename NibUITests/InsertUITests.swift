@@ -22,15 +22,19 @@ final class InsertUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
-        try ui.launchFixture()
-        try ui.openDocument("Physics — Motion")
-        _ = try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 }
         addUIInterruptionMonitor(withDescription: "System media permission") { alert in
             if let allow = alert.buttons.allElementsBoundByIndex.first(where: { $0.label.hasPrefix("Allow") || $0.label == "OK" }) {
                 allow.tap(); return true
             }
             return false
         }
+        try ui.launchFixture()
+        try allowSystemPermissionIfPresented(timeout: 2)
+        // XCTest invokes interruption monitors only on a subsequent interaction. A tap in the
+        // library's blank footer also dismisses a late permission sheet left by a terminated test.
+        ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.95)).tap()
+        try ui.openDocument("Physics — Motion")
+        _ = try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 }
     }
 
     override func tearDownWithError() throws {
@@ -49,9 +53,22 @@ final class InsertUITests: XCTestCase {
         self.ui = nil
     }
 
-    private func allowSystemPermissionIfPresented() throws {
-        let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
-        if alert.waitForExistence(timeout: 2) {
+    private func permissionAlert(timeout: TimeInterval) -> XCUIElement? {
+        // Depending on the simulator OS, the permission sheet is exposed under the requesting app
+        // or SpringBoard. Permission requests can arrive after the action's first idle transition.
+        let sources = [ui.app, XCUIApplication(bundleIdentifier: "com.apple.springboard")]
+        var found: XCUIElement?
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            found = sources.flatMap { $0.alerts.allElementsBoundByIndex }.first {
+                $0.buttons.allElementsBoundByIndex.contains { $0.label.hasPrefix("Allow") || $0.label == "OK" }
+            }
+            return found != nil
+        }, object: nil)
+        _ = XCTWaiter.wait(for: [expectation], timeout: timeout)
+        return found
+    }
+    private func allowSystemPermissionIfPresented(timeout: TimeInterval = 10) throws {
+        if let alert = permissionAlert(timeout: timeout) {
             let allow = alert.buttons.allElementsBoundByIndex.first { $0.label.hasPrefix("Allow") || $0.label == "OK" }
             try XCTUnwrap(allow, "Media permission prompt must offer an allow action").tap()
         }
@@ -1015,6 +1032,7 @@ final class InsertUITests: XCTestCase {
     private func startRecording() throws {
         try ui.tapCommand("audio.record")
         try allowSystemPermissionIfPresented()
+        if !visible("Pause Recording") { outside() }
         try wait("Recording must start and expose Pause Recording", timeout: 15) { self.visible("Pause Recording") }
     }
     private func recordClip(draw: Bool = false, minimumSeconds: Int = 4) throws {
@@ -1060,11 +1078,20 @@ final class InsertUITests: XCTestCase {
         resetMicrophonePermission = true
         ui.app.resetAuthorizationStatus(for: .microphone)
         try ui.launchFixture(); try ui.openDocument("Physics — Motion")
+        var denied = false
+        let denialMonitor = addUIInterruptionMonitor(withDescription: "Deny this recording's microphone request") { alert in
+            guard let button = alert.buttons.allElementsBoundByIndex.first(where: {
+                $0.label.contains("Allow") && !$0.label.hasPrefix("Allow")
+            }) else { return false }
+            button.tap(); denied = true; return true
+        }
+        defer { removeUIInterruptionMonitor(denialMonitor) }
         try ui.tapCommand("audio.record")
-        let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
-        XCTAssertTrue(alert.waitForExistence(timeout: 10), "First recording must request microphone permission")
-        let deny = alert.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Allow' AND NOT label BEGINSWITH 'Allow'")).firstMatch
-        XCTAssertTrue(deny.exists, "Microphone prompt must offer Don't Allow"); deny.tap()
+        if let alert = permissionAlert(timeout: 15) {
+            let deny = alert.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Allow' AND NOT label BEGINSWITH 'Allow'")).firstMatch
+            XCTAssertTrue(deny.exists, "Microphone prompt must offer Don't Allow"); deny.tap(); denied = true
+        } else { outside() }
+        try wait("The real microphone permission prompt must be denied") { denied }
         try panel("Audio")
         XCTAssertTrue(query("Microphone access is off for Nib. Turn it on in Settings to record.").firstMatch.waitForExistence(timeout: 10))
         XCTAssertTrue(query("No recordings yet").firstMatch.exists)
