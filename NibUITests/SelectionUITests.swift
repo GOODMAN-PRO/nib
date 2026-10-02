@@ -54,6 +54,12 @@ final class SelectionUITests: XCTestCase {
         for attempt in 0..<(scroll ? 10 : 2) {
             let matches = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
             if let found = matches.first(where: { [.button, .switch, .textField, .textView].contains($0.elementType) }) ?? matches.first {
+                // SwiftUI menus expose both the row and its label. An index in the mixed-type
+                // query can resolve differently when XCTest performs the action. Keep the
+                // intended labelled control (icons such as "scribble" are shared by rows).
+                let exact = ui.app.descendants(matching: found.elementType).matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", found.identifier, found.label))
+                if exact.count == 1 { return exact.firstMatch }
                 return found
             }
             if attempt == 0 { _ = q.firstMatch.waitForExistence(timeout: 3) }
@@ -735,7 +741,13 @@ final class SelectionUITests: XCTestCase {
 
     private func copyScreenshotAndCheck(_ before: QAState) throws {
         // Copy in UIActivityViewController transfers the generated PNG to the system clipboard.
-        try tap("Copy")
+        // F013 exports through the share sheet. The selection's own Copy button remains
+        // visible behind that sheet and copies a fragment instead of the screenshot.
+        let activities = ui.app.otherElements["ActivityListView"].firstMatch
+        XCTAssertTrue(activities.waitForExistence(timeout: 15), "Take Screenshot must present the system share sheet")
+        let copy = activities.descendants(matching: .any).matching(NSPredicate(format: "label == 'Copy'")).firstMatch
+        try wait("The screenshot share sheet must offer Copy") { copy.exists && copy.isHittable && copy.isEnabled }
+        copy.tap()
         try wait("Take Screenshot must export a decodable PNG", timeout: 15) {
             guard let data = UIPasteboard.general.data(forPasteboardType: UTType.png.identifier),
                   let image = UIImage(data: data) else { return false }
