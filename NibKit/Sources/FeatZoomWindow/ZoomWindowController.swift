@@ -42,6 +42,10 @@ final class ZoomWindowController: ObservableObject {
     @Published private(set) var autoAdvanceOn = true
     /// Bumped when the document head changes (the return height the options menu shows).
     @Published private(set) var pageRevision = 0
+    @Published var optionsPresented = false
+    static let optionsID = "zoomwindow.options"
+    static let optionsAnchor = "zoomwindow.options.anchor"
+
     /// The last UI command; the next one waits for it, and tests await it.
     private(set) var pending: Task<Void, Never>?
     /// Wet pane strokes whose commits have landed; the next render that includes them removes them from the pane.
@@ -93,6 +97,8 @@ final class ZoomWindowController: ObservableObject {
     }
 
     func detach() {
+        dismissOptions()
+        session.floatingHost?.dismiss(Self.optionsID)
         commits?.cancel()
         commits = nil
         subscriptions.removeAll()
@@ -122,6 +128,7 @@ final class ZoomWindowController: ObservableObject {
             configureWriting()
             scheduleRender()
         } else {
+            dismissOptions()
             renderTask?.cancel()
             // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless,
             // and the render when the pane shows again draws them.
@@ -185,6 +192,7 @@ final class ZoomWindowController: ObservableObject {
         let pageChanged = shownDoc != state.doc || shownPage != state.page
         if pageChanged || shownRect != state.rect {
             if pageChanged {
+                dismissOptions()
                 // Wet ink of another page: its commits (if any are still running) land there, not here.
                 clearWet()
             }
@@ -517,7 +525,29 @@ final class ZoomWindowController: ObservableObject {
 
     func newLine() { perform(ZoomNewLine.descriptor.id) }
 
-    func close() { perform(ZoomToggle.descriptor.id, ["on": false]) }
+    func close() {
+        dismissOptions()
+        perform(ZoomToggle.descriptor.id, ["on": false])
+    }
+
+    func toggleOptions() {
+        guard isActive, let floating = session.floatingHost else { return }
+        if optionsPresented {
+            dismissOptions()
+        } else {
+            floating.present(Self.optionsID) { ZoomOptions(controller: self, state: state) }
+            optionsPresented = true
+        }
+    }
+
+    /// Also used by the bud's Escape/outside-tap binding. Leave the view installed while it retracts;
+    /// the closed bud releases its modal hit region, and detach removes the floating entry.
+    func dismissOptions() { optionsPresented = false }
+
+    func chooseOption(_ action: () -> Void) {
+        dismissOptions()
+        action()
+    }
 
     /// 0 clears the page's override (back to the template's default).
     func setReturnHeight(_ height: Double) {
@@ -624,36 +654,188 @@ struct ZoomPane: View {
         controller.magnification.formatted(.number.precision(.fractionLength(1))) + "×"
     }
 
+    private var options: some View {
+        NibIconButton(.more, label: String(localized: "Zoom Window options"), size: .round) {
+            controller.toggleOptions()
+        }
+        .nibBudAnchor(ZoomWindowController.optionsAnchor)
+    }
+}
+
+/// Controlled presentation gives Escape and outside taps the same dismissal path. A native Menu's
+/// presentation belongs to UIKit and cannot be dismissed by the document's SwiftUI keyboard bridge.
+struct ZoomOptions: View {
+    @ObservedObject var controller: ZoomWindowController
+    @ObservedObject var state: ZoomState
+
+    var body: some View {
+        NibBudPopover(id: ZoomWindowController.optionsID, source: ZoomWindowController.optionsAnchor,
+                      isPresented: Binding(get: { controller.optionsPresented }, set: { if !$0 { controller.dismissOptions() } }),
+                      title: String(localized: "Zoom Window options"), placement: .above) {
+            VStack(alignment: .leading, spacing: NibSpacing.s) {
+                NibInspectorSection(String(localized: "Return Height")) {
+                    Text(returnHeightText).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+                    option(String(localized: "Match Template")) { controller.setReturnHeight(0) }
+                    option(String(localized: "Match Zoom Box")) { controller.setReturnHeight(state.rect.height) }
+                    option(String(localized: "Increase Return Height")) { controller.adjustReturnHeight(by: 2) }
+                    option(String(localized: "Decrease Return Height")) { controller.adjustReturnHeight(by: -2) }
+                }
+                NibInspectorSection(String(localized: "Margins")) {
+                    option(String(localized: "Set Left Margin at Zoom Box")) { controller.setMarginAtBox(left: true) }
+                    option(String(localized: "Set Right Margin at Zoom Box")) { controller.setMarginAtBox(left: false) }
+                    option(String(localized: "Reset Margins")) { controller.resetMargins() }
+                }
+                Toggle(String(localized: "Auto-Advance"), isOn: Binding(get: { controller.autoAdvanceOn },
+                    set: { on in controller.chooseOption { controller.setAutoAdvance(on) } }))
+            }
+        }
+        .background(ZoomOptionsKeyboard(isPresented: controller.optionsPresented, dismiss: controller.dismissOptions))
+    }
+
     private var returnHeightText: String {
         let value = controller.returnHeight.formatted(.number.precision(.fractionLength(0...1)))
         return String(localized: "Return height: \(value) pt")
     }
 
-    private var options: some View {
-        Menu {
-            Section(String(localized: "Return Height")) {
-                Text(returnHeightText)
-                Button(String(localized: "Match Template")) { controller.setReturnHeight(0) }
-                Button(String(localized: "Match Zoom Box")) { controller.setReturnHeight(state.rect.height) }
-                Button(String(localized: "Increase Return Height")) { controller.adjustReturnHeight(by: 2) }
-                Button(String(localized: "Decrease Return Height")) { controller.adjustReturnHeight(by: -2) }
-            }
-            Section(String(localized: "Margins")) {
-                Button(String(localized: "Set Left Margin at Zoom Box")) { controller.setMarginAtBox(left: true) }
-                Button(String(localized: "Set Right Margin at Zoom Box")) { controller.setMarginAtBox(left: false) }
-                Button(String(localized: "Reset Margins")) { controller.resetMargins() }
-            }
-            Toggle(String(localized: "Auto-Advance"), isOn: Binding(get: { controller.autoAdvanceOn },
-                                                                   set: { controller.setAutoAdvance($0) }))
-        } label: {
-            Image(nib: .more)
-                .font(NibFont.glyph(.panel))
-                .foregroundStyle(NibColor.label)
-                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+    private func option(_ title: String, action: @escaping () -> Void) -> some View {
+        Button { controller.chooseOption(action) } label: {
+            NibInspectorRow(title)
                 .contentShape(Rectangle())
         }
-        .hoverEffect(.highlight)
-        .accessibilityLabel(String(localized: "Zoom Window options"))
+        .buttonStyle(.plain)
+    }
+}
+
+/// Escape belongs to the open options, ahead of the canvas's Deselect command. The popover takes
+/// keyboard focus only while open, then returns it to the responder in the same window that had it.
+private struct ZoomOptionsKeyboard: UIViewRepresentable {
+    let isPresented: Bool
+    let dismiss: () -> Void
+    func makeUIView(context: Context) -> ZoomOptionsKeyView { ZoomOptionsKeyView() }
+    func updateUIView(_ view: ZoomOptionsKeyView, context: Context) {
+        view.onDismiss = dismiss
+        view.setPresented(isPresented)
+    }
+}
+
+final class ZoomOptionsKeyView: UIView {
+    var onDismiss: (() -> Void)?
+    private var presented = false
+    private weak var previous: UIResponder?
+
+    init() {
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        accessibilityElementsHidden = true
+    }
+    required init?(coder: NSCoder) { nil }
+    override var canBecomeFirstResponder: Bool { true }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if presented { takeFocus() }
+    }
+
+    func setPresented(_ value: Bool) {
+        presented = value
+        if value {
+            takeFocus()
+        } else if isFirstResponder {
+            let target = previous
+            previous = nil
+            resignFirstResponder()
+            let targetWindow = (target as? UIView)?.window ?? (target as? UIViewController)?.viewIfLoaded?.window
+            if let window, targetWindow === window { target?.becomeFirstResponder() }
+        }
+    }
+
+    private func takeFocus() {
+        guard let window, window.isKeyWindow, !isFirstResponder else { return }
+        previous = Self.firstResponder(in: window)
+        becomeFirstResponder()
+    }
+
+    private static func firstResponder(in view: UIView) -> UIResponder? {
+        if view.isFirstResponder { return view }
+        if let controller = view.next as? UIViewController, controller.isFirstResponder { return controller }
+        for child in view.subviews {
+            if let responder = firstResponder(in: child) { return responder }
+        }
+        return nil
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        guard presented else { return [] }
+        let escape = UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(dismissFromKeyboard(_:)))
+        escape.wantsPriorityOverSystemBehavior = true
+        return [escape]
+    }
+
+    @objc func dismissFromKeyboard(_ command: UIKeyCommand) {
+        guard presented else { return }
+        setPresented(false)
+        onDismiss?()
+    }
+}
+
+/// The document is inside a SwiftUI hosting controller. Register the Zoom keys in that host as well
+/// as the shell's command catalog, so focus on the canvas or its docked pane reaches the same commands.
+/// This zero-size chrome contribution stays installed while the pane is closed (the toggle opens it).
+struct ZoomKeyboardShortcuts: View {
+    let app: NibApp
+    @ObservedObject var session: EditorSession
+    @State private var anchor = UIView()
+
+    var body: some View {
+        ZStack {
+            Button("") { run(FeatZoomWindowFeature.toggleActionID) }
+                .keyboardShortcut("z", modifiers: [.command, .option])
+            Button("") { run(FeatZoomWindowFeature.newLineActionID) }
+                .keyboardShortcut(.return, modifiers: [.option])
+        }
+        .background(ZoomKeyboardAnchor(view: anchor))
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
+    private func run(_ id: String) {
+        guard let window = anchor.window, window.isKeyWindow,
+              let invocation = ZoomKeyboardRouting.invocation(id, app: app, session: session,
+                  isEditingText: ZoomKeyboardRouting.textHasFocus(in: window)) else { return }
+        app.perform(invocation.command, invocation.params, session: session)
+    }
+}
+
+private struct ZoomKeyboardAnchor: UIViewRepresentable {
+    let view: UIView
+    func makeUIView(context: Context) -> UIView { view }
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+@MainActor
+enum ZoomKeyboardRouting {
+    static func invocation(_ id: String, app: NibApp, session: EditorSession,
+                           isEditingText: Bool = false) -> Invocation? {
+        guard let doc = session.document,
+              let kind = try? app.workspace.content(doc).meta.kind else { return nil }
+        let context = KeyCommandContext(docKind: kind, isEditingText: session.isEditingText || isEditingText)
+        guard let descriptor = KeyCommandRouting.active(app.content.keyCommands.all, in: context)
+            .first(where: { $0.id == id }),
+              [FeatZoomWindowFeature.toggleActionID, FeatZoomWindowFeature.newLineActionID].contains(id) else { return nil }
+        let state = ZoomStore.resolve(app).state(for: session)
+        if id == FeatZoomWindowFeature.newLineActionID && (!state.isOn(in: doc) || session.readOnly) { return nil }
+        if id == FeatZoomWindowFeature.toggleActionID && session.readOnly && !state.isOn(in: doc) { return nil }
+        return Invocation(command: descriptor.command, params: descriptor.resolvedParams(for: session), session: session)
+    }
+
+    static func textHasFocus(in view: UIView) -> Bool {
+        if view.isFirstResponder {
+            if let text = view as? UITextView { return text.isEditable }
+            if let field = view as? UITextField { return field.isEnabled }
+            return view is UIKeyInput
+        }
+        return view.subviews.contains { textHasFocus(in: $0) }
     }
 }
 

@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import PencilKit
 import NibContracts
 import NibTesting
@@ -183,6 +184,194 @@ final class FeatZoomWindowTests: XCTestCase {
             XCTAssertEqual(e.code, .invalidParams)
             XCTAssertEqual(e.path, "$.page")
         }
+    }
+
+    func testDocumentHostingControllerExposesZoomShortcutsWhilePaneIsClosed() async throws {
+        let h = harness()
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get("zoomwindow.keyboard"))
+        let root = UIHostingController(rootView: overlay.makeView(ChromeContext(app: h.app, session: h.session, kind: .notebook))
+            .allowsHitTesting(overlay.isInteractive))
+        let container = UIViewController()
+        container.addChild(root)
+        container.view.addSubview(root.view)
+        root.didMove(toParent: container)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = container
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        root.view.layoutIfNeeded()
+        let laidOut = expectation(description: "Shortcut registration after hosting layout")
+        DispatchQueue.main.async { laidOut.fulfill() }
+        await fulfillment(of: [laidOut], timeout: 3)
+        let commands = root.keyCommands ?? []
+        XCTAssertTrue(commands.contains { $0.input == "z" && $0.modifierFlags == [.command, .alternate] })
+        XCTAssertTrue(commands.contains { $0.input == "\r" && $0.modifierFlags == [.alternate] })
+        XCTAssertFalse(state(h).isOn)
+    }
+
+    func testChromeKeyboardOpensClosedPaneAndUsesInvokingWindow() async throws {
+        let h = harness()
+        registerRuled(h, returnHeight: 24.7)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        other.page = Fixtures.page1
+        let otherState = ZoomStore.resolve(h.app).state(for: other)
+        let keyboard = try XCTUnwrap(h.app.ui.chromeOverlays.get("zoomwindow.keyboard"))
+        XCTAssertTrue(keyboard.isVisible(ChromeContext(app: h.app, session: other, kind: .notebook)))
+        XCTAssertFalse(keyboard.isInteractive)
+        XCTAssertFalse(otherState.isOn)
+        let depth = h.undoDepth(Fixtures.docID)
+
+        let toggle = try XCTUnwrap(ZoomKeyboardRouting.invocation(FeatZoomWindowFeature.toggleActionID,
+                                                                app: h.app, session: other))
+        XCTAssertTrue(toggle.session === other)
+        _ = try await h.app.bus.execute(toggle)
+        XCTAssertTrue(otherState.isOn)
+        XCTAssertFalse(state(h).isOn, "the globally active window must not receive the shortcut")
+        let before = otherState.rect
+        let line = try XCTUnwrap(ZoomKeyboardRouting.invocation(FeatZoomWindowFeature.newLineActionID,
+                                                              app: h.app, session: other))
+        _ = try await h.app.bus.execute(line)
+        XCTAssertEqual(otherState.rect.y - before.y, 24.7, accuracy: 1e-9)
+        XCTAssertEqual(otherState.rect.x, otherState.effectiveMargins(pageWidth: PageSize.a4.width).left)
+        _ = try await h.app.bus.execute(toggle)
+        XCTAssertFalse(otherState.isOn)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+    }
+
+    func testChromeKeyboardRespectsFocusReadOnlyAndRegistry() async throws {
+        let h = harness()
+        let toggle = FeatZoomWindowFeature.toggleActionID
+        let line = FeatZoomWindowFeature.newLineActionID
+        XCTAssertNil(ZoomKeyboardRouting.invocation(line, app: h.app, session: h.session))
+        XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session, isEditingText: true))
+        h.session.isEditingText = true
+        XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session))
+        h.session.isEditingText = false
+        h.session.readOnly = true
+        XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session))
+        h.session.readOnly = false
+        try await h.run("zoom.toggle", ["on": true])
+        h.session.readOnly = true
+        XCTAssertNotNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session), "closing remains available")
+        XCTAssertNil(ZoomKeyboardRouting.invocation(line, app: h.app, session: h.session))
+        h.session.readOnly = false
+        h.session.document = Fixtures.whiteboardID
+        XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session))
+        h.session.document = nil
+        XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session))
+        h.session.document = Fixtures.docID
+        h.app.content.keyCommands.unregister(id: toggle)
+        XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session), "the chrome follows the live registry")
+    }
+
+    private final class OptionsHost: FloatingHosting {
+        var views: [String: AnyView] = [:]
+        func present(_ id: String, content: AnyView) { views[id] = content }
+        func dismiss(_ id: String) { views[id] = nil }
+        func isPresenting(_ id: String) -> Bool { views[id] != nil }
+        func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { true }
+        func removeAnchor(_ id: String) {}
+        func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { rect }
+        func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+    }
+
+    func testOptionsEscapeOwnsFocusThenRestoresCanvasResponder() throws {
+        final class CanvasFocus: UIView {
+            override var canBecomeFirstResponder: Bool { true }
+        }
+        let root = UIViewController()
+        let canvas = CanvasFocus()
+        let options = ZoomOptionsKeyView()
+        root.view.addSubview(canvas)
+        root.view.addSubview(options)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        XCTAssertTrue(canvas.becomeFirstResponder())
+        var dismissals = 0
+        options.onDismiss = { dismissals += 1 }
+        options.setPresented(true)
+        XCTAssertTrue(options.isFirstResponder, "Escape must reach the options before canvas Deselect")
+        let escape = try XCTUnwrap(options.keyCommands?.first)
+        XCTAssertEqual(escape.input, UIKeyCommand.inputEscape)
+        XCTAssertEqual(escape.modifierFlags, [])
+        XCTAssertTrue(escape.wantsPriorityOverSystemBehavior)
+        options.dismissFromKeyboard(escape)
+        XCTAssertEqual(dismissals, 1)
+        XCTAssertTrue(canvas.isFirstResponder)
+        XCTAssertTrue(options.keyCommands?.isEmpty == true)
+        options.dismissFromKeyboard(escape)
+        XCTAssertEqual(dismissals, 1, "a stale key cannot dismiss another presentation")
+        options.setPresented(true)
+        options.setPresented(false) // outside tap or choosing a preset
+        XCTAssertTrue(canvas.isFirstResponder)
+    }
+
+    func testOptionsDismissalLeavesNewLineAvailableAndDoesNotEdit() async throws {
+        let h = harness()
+        registerRuled(h, returnHeight: 24.7)
+        let floating = OptionsHost()
+        h.session.floatingHost = floating
+        let (host, overlay) = try await openWindow(h)
+        let c = overlay.controller
+        let depth = h.undoDepth(Fixtures.docID)
+        let before = state(h).rect
+        c.toggleOptions()
+        XCTAssertTrue(c.optionsPresented)
+        XCTAssertTrue(floating.isPresenting(ZoomWindowController.optionsID))
+        // The same dismissal used by Escape and the outside-tap binding.
+        c.dismissOptions()
+        XCTAssertFalse(c.optionsPresented)
+        XCTAssertTrue(c.isActive)
+        c.newLine()
+        await c.pending?.value
+        XCTAssertEqual(state(h).rect.y - before.y, 24.7, accuracy: 1e-9)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        c.toggleOptions()
+        XCTAssertTrue(c.optionsPresented, "the options can reopen after Escape")
+        c.close()
+        XCTAssertFalse(c.optionsPresented)
+        await c.pending?.value
+        overlay.detach(from: host)
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
+    }
+
+    func testOptionsPresetsDismissAndKeepReturnHeightOnItsPage() async throws {
+        let h = harness()
+        registerRuled(h, returnHeight: 24.7)
+        let floating = OptionsHost()
+        h.session.floatingHost = floating
+        let (host, overlay) = try await openWindow(h)
+        let c = overlay.controller
+        c.toggleOptions()
+        c.chooseOption { c.setReturnHeight(state(h).rect.height) }
+        XCTAssertFalse(c.optionsPresented)
+        await c.pending?.value
+        XCTAssertEqual(c.returnHeight, 50)
+        for delta in [2.0, -2.0] {
+            c.toggleOptions()
+            c.chooseOption { c.adjustReturnHeight(by: delta) }
+            XCTAssertFalse(c.optionsPresented)
+            await c.pending?.value
+            XCTAssertEqual(c.returnHeight, delta > 0 ? 52 : 50)
+        }
+        try await h.run("zoom.setBox", ["page": .string(page2), "rect": [100, 200, 200, 50]])
+        c.stateChanged()
+        c.toggleOptions()
+        c.chooseOption { c.setReturnHeight(0) }
+        await c.pending?.value
+        XCTAssertEqual(c.returnHeight, 24.7)
+        c.newLine()
+        await c.pending?.value
+        XCTAssertEqual(state(h).rect.y, 224.7, accuracy: 1e-9)
+        try await h.run("zoom.setBox", ["page": .string(page1), "rect": [100, 200, 200, 50]])
+        c.stateChanged()
+        c.newLine()
+        await c.pending?.value
+        XCTAssertEqual(state(h).rect.y, 250)
+        overlay.detach(from: host)
     }
 
     func testSetBoxClampsIntoThePageAndStoresMargins() async throws {

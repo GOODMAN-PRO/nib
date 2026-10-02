@@ -23,8 +23,25 @@ private final class FakeEditor: DocumentEditing {
 @MainActor
 private final class Recorder {
     var calls: [(command: String, params: JSONValue)] = []
+    var onCall: ((String) -> Void)?
 
     func params(_ command: String) -> [JSONValue] { calls.filter { $0.command == command }.map { $0.params } }
+}
+
+/// A window navigator to exercise scene activation through the real UIKit responder chain.
+@MainActor
+private final class KeyboardWindowController: UIViewController, SceneNavigator {
+    let session: EditorSession
+    init(session: EditorSession) { self.session = session; super.init(nibName: nil, bundle: nil) }
+    required init?(coder: NSCoder) { nil }
+    var openDocuments: [DocumentID] { session.document.map { [$0] } ?? [] }
+    var activeDocument: DocumentID? { session.document }
+    var rootViewController: UIViewController? { self }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) { present(viewController, animated: false) }
 }
 
 /// A custom control, as a feature would build one in UIKit.
@@ -66,6 +83,7 @@ final class FeatKeyboardTests: XCTestCase {
             h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Test stand-in.", effect: .session,
                                                       target: .app, exposure: .ui)) { json, _ in
                 recorder.calls.append((id, json))
+                recorder.onCall?(id)
                 return .null
             }
         }
@@ -424,6 +442,165 @@ final class FeatKeyboardTests: XCTestCase {
             XCTAssertFalse(try key(h, name).isActive(in: text), name)
             XCTAssertTrue(try key(h, name).isActive(in: KeyCommandContext(docKind: .whiteboard, hasTabs: true)), name)
         }
+    }
+
+    // Exercise the UIKeyCommand target, rather than invoking descriptors directly as `press` does above.
+    func testCanvasResponderRoutesSelectionNavigationAndZoomToItsOwnSession() async throws {
+        let h = await started()
+        let recorder = stand(in: h, for: ["selection.selectAll", "item.delete", "panel.open", "view.zoom"])
+        let host = FakeCanvasHost(h)
+        let editor = FakeEditor(host)
+        h.session.editor = editor
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+
+        // The page owner replaces F073's fallback. The responder must use the actual Go to Page dialog.
+        var go = descriptor("pages.goToPage", "g", [.command, .option], scope: .document,
+                            kinds: [.notebook], owner: "pages", command: "panel.open")
+        go.params = ["id": "pages.goToPage"]
+        h.app.content.keyCommands.register(go)
+        // Another window is active: this canvas must still target the window that owns its responder.
+        let other = EditorSession()
+        other.document = Fixtures.textDocID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+
+        func send(_ input: String, _ modifiers: UIKeyModifierFlags, expecting id: String) async throws {
+            let key = try XCTUnwrap(attachment.keyboard.keyCommands?.first {
+                $0.input == input && $0.modifierFlags == modifiers
+            })
+            let action = try XCTUnwrap(key.action)
+            XCTAssertTrue(attachment.keyboard.canPerformAction(action, withSender: key))
+            let ran = expectation(description: id)
+            recorder.onCall = { if $0 == id { ran.fulfill() } }
+            _ = attachment.keyboard.perform(action, with: key)
+            await fulfillment(of: [ran], timeout: 3)
+            recorder.onCall = nil
+        }
+
+        try await send("a", .command, expecting: "selection.selectAll")
+        XCTAssertEqual(recorder.params("selection.selectAll").last,
+                       ["page": .string(NodeRef.page(doc, Fixtures.page1).description)])
+        // Resolve the selection when Delete is pressed, after Select All changed it.
+        h.session.selection = Selection(doc: doc, page: Fixtures.page1, items: [Fixtures.strokeID])
+        try await send(UIKeyCommand.inputDelete, [], expecting: "item.delete")
+        XCTAssertEqual(recorder.params("item.delete").last,
+                       ["refs": [.string(NodeRef.item(doc, Fixtures.page1, Fixtures.strokeID).description)]])
+        try await send("g", [.command, .alternate], expecting: "panel.open")
+        XCTAssertEqual(recorder.params("panel.open").last, ["id": "pages.goToPage"])
+        try await send("0", [.command, .alternate], expecting: "view.zoom")
+        XCTAssertEqual(recorder.params("view.zoom").last, ["actual": true])
+        host.zoomScale = 1
+        try await send("=", .command, expecting: "view.zoom")
+        XCTAssertEqual(recorder.params("view.zoom").last, ["scale": 1.25])
+        host.zoomScale = 1.25
+        try await send("+", .command, expecting: "view.zoom")
+        XCTAssertEqual(recorder.params("view.zoom").last, ["scale": 1.5])
+        host.zoomScale = 1.6798817363257628
+        host.canvasView.bounds.size = CGSize(width: 768, height: 1024)
+        attachment.canvasDidChange(host)
+        try await send("-", .command, expecting: "view.zoom")
+        XCTAssertEqual(recorder.params("view.zoom").last, ["scale": 1.5], "Read the canvas zoom after rotation")
+        try await send("0", .command, expecting: "view.zoom")
+        XCTAssertEqual(recorder.params("view.zoom").last, ["fit": true])
+        withExtendedLifetime(editor) {}
+    }
+
+    func testCanvasResponderRevalidatesRegistryAndTextFocus() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let keyboard = attachment.keyboard
+        let oldDelete = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == UIKeyCommand.inputDelete })
+        var replacement = descriptor("objectmenu.key.delete", "delete", scope: .canvas,
+                                     kinds: [.notebook, .whiteboard], owner: "objectmenu", command: "item.delete")
+        replacement.sessionParams = { [weak session = h.session] _ in
+            ["refs": .array((session?.selection.refs ?? []).map(JSONValue.string))]
+        }
+        h.app.content.keyCommands.register(replacement)
+        XCTAssertNil(keyboard.descriptor(for: oldDelete), "Cached keys cannot run an unregistered descriptor")
+        let delete = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == UIKeyCommand.inputDelete })
+        XCTAssertEqual(keyboard.descriptor(for: delete)?.id, replacement.id)
+        let selectAll = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == "a" })
+        h.session.isEditingText = true
+        XCTAssertNil(keyboard.descriptor(for: delete))
+        XCTAssertNil(keyboard.descriptor(for: selectAll), "Text editing keeps native Select All and Delete")
+        h.session.isEditingText = false
+        XCTAssertNotNil(keyboard.descriptor(for: delete))
+        attachment.detach(from: host)
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
+    }
+
+    func testCanvasFocusRecoveryAfterRemovalAndRotationPreservesTextFields() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let root = KeyboardWindowController(session: h.session)
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        attachment.keyboard.restoreFocus()
+        XCTAssertTrue(attachment.keyboard.isFirstResponder)
+
+        // A panel's text field takes focus, then disappears from the hierarchy when the panel closes.
+        let field = UITextField(frame: CGRect(x: 20, y: 20, width: 200, height: 44))
+        root.view.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        attachment.keyboard.restoreFocus()
+        XCTAssertTrue(field.isFirstResponder, "Never steal focus from a search or rename field")
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(field, canvas: host.canvasView))
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        attachment.keyboard.restoreFocus()
+        XCTAssertTrue(attachment.keyboard.isFirstResponder)
+
+        // UIKit can remove first-responder status during a size transition without reopening the document.
+        attachment.keyboard.resignFirstResponder()
+        host.canvasView.bounds.size = CGSize(width: 768, height: 1024)
+        attachment.canvasDidChange(host)
+        let recovered = expectation(description: "Focus repaired after canvas layout")
+        DispatchQueue.main.async { recovered.fulfill() }
+        await fulfillment(of: [recovered], timeout: 3)
+        XCTAssertTrue(attachment.keyboard.isFirstResponder)
+        let recorder = stand(in: h, for: ["view.zoom"])
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let key = try XCTUnwrap(attachment.keyboard.keyCommands?.first {
+            $0.input == "0" && $0.modifierFlags == [.command, .alternate]
+        })
+        let ran = expectation(description: "Actual Size reaches the focused canvas after rotation")
+        recorder.onCall = { _ in ran.fulfill() }
+        // Package tests are hostless (ARCHITECTURE §15), with no UIApplication dispatcher. Start at the
+        // window's actual first responder, let UIKit resolve the action target, and invoke that target.
+        let action = try XCTUnwrap(key.action)
+        let focused = try XCTUnwrap(CanvasKeyboardFocus.firstResponder(in: window))
+        XCTAssertTrue(focused === attachment.keyboard)
+        let target = try XCTUnwrap(focused.target(forAction: action, withSender: key) as? UIResponder)
+        XCTAssertTrue(target === attachment.keyboard)
+        XCTAssertTrue(target.responds(to: action))
+        _ = target.perform(action, with: key)
+        await fulfillment(of: [ran], timeout: 3)
+        XCTAssertEqual(recorder.params("view.zoom"), [["actual": true]])
+        XCTAssertTrue(h.app.ui.activeNavigator === root)
+        XCTAssertTrue(h.app.services.sessions.active === h.session)
+        XCTAssertEqual(attachment.keyboard.editingInteractionConfiguration, .none)
+        XCTAssertFalse(attachment.keyboard.isUserInteractionEnabled)
+        XCTAssertTrue(attachment.keyboard.accessibilityElementsHidden)
+
+        let button = UIButton()
+        host.canvasView.addSubview(button)
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(button, canvas: host.canvasView))
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(UITextView(), canvas: host.canvasView))
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(UIView(), canvas: host.canvasView))
+        XCTAssertTrue(CanvasKeyboardFocus.mayReplace(root, canvas: host.canvasView))
     }
 
     func testShortcutContextAndActions() {

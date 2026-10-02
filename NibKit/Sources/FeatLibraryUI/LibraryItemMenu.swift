@@ -118,9 +118,13 @@ struct LibraryBuds: View {
     var body: some View {
         ZStack {
             LibraryNewMenuPopover(model: model, isPresented: binding("new"))
+                .allowsHitTesting(isPresented("new"))
+                .accessibilityHidden(!isPresented("new"))
             NibBudPopover(id: "library.app.menu", source: "library.app", isPresented: binding("app"), title: String(localized: "Nib")) {
                 LibraryMenuEntries(model: model, location: .appMenu)
             }
+            .allowsHitTesting(isPresented("app"))
+            .accessibilityHidden(!isPresented("app"))
             NibBudPopover(id: "library.sort.menu", source: "library.sort", isPresented: binding("sort"), title: String(localized: "Sort and View")) {
                 VStack(alignment: .leading, spacing: NibSpacing.s) {
                     NibSegmentedControl(selection: Binding(get: { model.layout }, set: {
@@ -139,10 +143,17 @@ struct LibraryBuds: View {
                     }
                 }
             }
+            .allowsHitTesting(isPresented("sort"))
+            .accessibilityHidden(!isPresented("sort"))
         }
     }
+    // Buds stay mounted for their retract animation. Gate the entire geometry/scroll
+    // host, not just the animated droplet: a closed menu must not cover library cards.
+    private func isPresented(_ menu: String) -> Bool {
+        model.menu == menu && model.menuAnchors["library." + menu] != nil
+    }
     private func binding(_ menu: String) -> Binding<Bool> {
-        Binding(get: { model.menu == menu && model.menuAnchors["library." + menu] != nil },
+        Binding(get: { isPresented(menu) },
                 set: { model.setView(["menu": $0 ? .string(menu) : "none"]) })
     }
 }

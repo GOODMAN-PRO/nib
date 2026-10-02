@@ -56,10 +56,6 @@ final class SceneHooksImpl: SceneHooks {
     }
 
     func sceneDidConnect(_ scene: UIWindowScene, options: UIScene.ConnectionOptions, navigator: SceneNavigator) {
-        if NibUITestMode.isEnabled {
-            scenes.add(navigator)
-            return
-        }
         let type = WindowState.activityType
         let requested = options.userActivities.first { $0.activityType == type }
         var restored: WindowState?
@@ -115,15 +111,18 @@ final class SceneHooksImpl: SceneHooks {
     // MARK: Opening a window
 
     /// The decision behind `sceneDidConnect`, free of UIKit types so it can be tested.
-    func connect(_ navigator: SceneNavigator, requested: WindowState?, restored: WindowState?, external: Bool) {
+    func connect(_ navigator: SceneNavigator, requested: WindowState?, restored: WindowState?, external: Bool,
+                 allowsRestoration: Bool = !NibUITestMode.isEnabled) {
         scenes.add(navigator)
         let coldLaunch = !launchHandled
         launchHandled = true
+        // Fixture launches ignore saved sessions, which may refer to a previous fixture's documents. Explicit
+        // new-window requests still use the normal opening path, including their chosen page and lock gate.
         if let state = requested {
             restore(state, into: navigator, reason: .request)
-        } else if let state = restored {
+        } else if allowsRestoration, let state = restored {
             restore(state, into: navigator, reason: .restoration)
-        } else if coldLaunch, !external, let doc = scenes.lastSession.active {
+        } else if allowsRestoration, coldLaunch, !external, let doc = scenes.lastSession.active {
             restore(WindowState(tabs: [doc], active: doc, page: scenes.lastSession.page), into: navigator, reason: .coldLaunch)
         } else {
             scenes.updateSceneTitle(navigator)

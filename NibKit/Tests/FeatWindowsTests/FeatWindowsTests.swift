@@ -329,6 +329,70 @@ final class FeatWindowsTests: XCTestCase {
 
     // MARK: Windows
 
+    func testRequestedBoardOpensInBothWindowsWhenRestorationIsDisabled() async throws {
+        let (h, scenes, hooks) = try windows()
+        let origin = window(h, scenes)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC04", "page": "page:FIXTUREDOC04/FIXTUREBRD01"],
+                      in: origin)
+        var requested: NSUserActivity?
+        scenes.supportsMultipleWindows = { true }
+        scenes.requestWindow = { activity, _ in requested = activity }
+        let stale = WindowState(tabs: [notebook], active: notebook, page: Fixtures.page2)
+        h.app.settings.set(WindowSettings.lastSession, stale)
+
+        // Exercise the same command/activity handoff as the board's Open in New Window menu.
+        for command in ["window.open", "doc.open"] {
+            requested = nil
+            var params: JSONValue = ["doc": "doc:FIXTUREDOC04", "page": "page:FIXTUREDOC04/FIXTUREBRD01"]
+            if command == "doc.open" {
+                params = ["doc": "doc:FIXTUREDOC04", "page": "page:FIXTUREDOC04/FIXTUREBRD01", "mode": "newWindow"]
+            }
+            try await run(h, command, params, in: origin)
+            let activity = try XCTUnwrap(requested)
+            XCTAssertEqual(activity.activityType, WindowState.activityType)
+            let target = FakeNavigator(app: h.app)
+            hooks.connect(target, requested: WindowState(userInfo: activity.userInfo ?? [:]), restored: stale,
+                          external: false, allowsRestoration: false)
+
+            XCTAssertTrue(scenes.navigator(sessionID: target.session.id) === target)
+            for navigator in [origin, target] {
+                XCTAssertEqual(navigator.openDocuments, [board])
+                XCTAssertEqual(navigator.session.document, board)
+                XCTAssertEqual(navigator.session.page, Fixtures.boardID)
+                XCTAssertEqual(navigator.editorsBuilt, 1)
+            }
+        }
+    }
+
+    func testDisablingRestorationSkipsSavedScenesAndColdLaunchButRegistersWindows() throws {
+        let saved = WindowState(tabs: [board], active: board, page: Fixtures.boardID)
+        for restored in [nil, saved] as [WindowState?] {
+            let (h, scenes, hooks) = try windows()
+            h.app.settings.set(WindowSettings.lastSession, saved)
+            let navigator = FakeNavigator(app: h.app)
+            hooks.connect(navigator, requested: nil, restored: restored, external: false, allowsRestoration: false)
+            XCTAssertTrue(scenes.navigator(sessionID: navigator.session.id) === navigator)
+            XCTAssertTrue(navigator.openDocuments.isEmpty)
+            XCTAssertNil(navigator.session.document)
+            XCTAssertEqual(navigator.editorsBuilt, 0)
+        }
+    }
+
+    func testExplicitLibraryRequestDoesNotRestoreASavedDocument() throws {
+        for allowsRestoration in [false, true] {
+            let (h, scenes, hooks) = try windows()
+            let saved = WindowState(tabs: [board], active: board, page: Fixtures.boardID)
+            h.app.settings.set(WindowSettings.lastSession, saved)
+            let navigator = FakeNavigator(app: h.app)
+            let activity = WindowState.library.activity()
+            hooks.connect(navigator, requested: WindowState(userInfo: activity.userInfo ?? [:]), restored: saved,
+                          external: false, allowsRestoration: allowsRestoration)
+            XCTAssertTrue(navigator.openDocuments.isEmpty)
+            XCTAssertNil(navigator.session.document)
+            XCTAssertEqual(navigator.editorsBuilt, 0)
+        }
+    }
+
     func testNewWindowRequestsCarryTheDocumentAndPage() async throws {
         let (h, scenes, _) = try windows()
         let navigator = window(h, scenes)

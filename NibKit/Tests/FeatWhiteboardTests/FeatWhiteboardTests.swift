@@ -388,6 +388,128 @@ final class FeatWhiteboardTests: XCTestCase {
         }
     }
 
+    func testAddBoardMenuAndSidebarRevealOnlyInInvokingWindow() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let other = EditorSession()
+        other.document = Fixtures.whiteboardID
+        other.page = Fixtures.boardID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        var navigations: [PageID] = []
+        let sidebarNavigated = expectation(description: "sidebar addition revealed")
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Go", summary: "Stand-in.",
+                                                  effect: .session)) { params, ctx in
+            let (doc, page) = try ctx.pageOrSession(params["page"]?.stringValue)
+            XCTAssertTrue(ctx.session === h.session)
+            XCTAssertNotNil(try ctx.workspace.content(doc).page(page), "commit before navigating")
+            ctx.session?.page = page
+            navigations.append(page)
+            if navigations.count == 2 { sidebarNavigated.fulfill() }
+            return [:]
+        }
+        let menu = try XCTUnwrap(h.app.ui.menus.get("whiteboard.addBoard"))
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.whiteboardID)
+        let out = try await h.run(menu.command, menu.params(context))
+        let first = try XCTUnwrap(h.session.page)
+        XCTAssertEqual(out["ref"]?.stringValue, NodeRef.page(Fixtures.whiteboardID, first).description)
+        XCTAssertNotEqual(first, Fixtures.boardID)
+        XCTAssertTrue(try h.app.workspace.items(Fixtures.whiteboardID, page: first).isEmpty)
+
+        let model = BoardsModel(app: h.app, session: h.session)
+        model.add()
+        await fulfillment(of: [sidebarNavigated], timeout: 5)
+        XCTAssertEqual(navigations.count, 2, "each entry point navigates once")
+        XCTAssertNotEqual(h.session.page, first)
+        XCTAssertEqual(other.page, Fixtures.boardID)
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), 2)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).livePages.map(\.id), [Fixtures.boardID, first])
+    }
+
+    func testBoardAddDoesNotNavigateForAutomationPreviewOrUnrelatedWindow() async throws {
+        let h = harness()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Go", summary: "Stand-in.",
+                                                  effect: .session)) { _, _ in
+            XCTFail("adding a board must not steal this window's navigation")
+            return [:]
+        }
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04"])
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04"], as: .ai("test"))
+        let before = try h.snapshot(Fixtures.whiteboardID)
+        _ = try await h.app.bus.execute(Invocation(command: CommandIDs.boardAdd,
+                                                   params: ["doc": "doc:FIXTUREDOC04"],
+                                                   session: h.session, dryRun: true))
+        XCTAssertEqual(try h.snapshot(Fixtures.whiteboardID), before)
+        _ = try await h.app.bus.execute(Invocation(command: CommandIDs.boardAdd,
+                                                   params: ["doc": "doc:FIXTUREDOC04"]))
+        XCTAssertEqual(h.session.page, Fixtures.boardID)
+    }
+
+    func testRenameCommandAReplacesWholeNameAndPersists() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        model.beginRename(try XCTUnwrap(model.boards.first))
+        XCTAssertTrue(h.session.isEditingText)
+        let canvasSelectAll = KeyCommandDescriptor(id: "test.selectAll", title: "Select All",
+            shortcut: KeyShortcut("a", .command), command: CommandIDs.selectionSelectAll,
+            scope: .canvas, owner: "test")
+        XCTAssertFalse(canvasSelectAll.isActive(in: KeyCommandContext(docKind: .whiteboard,
+            isEditingText: h.session.isEditingText)))
+
+        let saved = expectation(description: "rename saved")
+        let subscription = h.app.bus.observeCommits { changes in
+            if changes.documents.contains(Fixtures.whiteboardID) { saved.fulfill() }
+        }
+        defer { subscription.cancel() }
+        let editor = BoardRenameEditor(text: Binding(get: { model.renameText }, set: { model.renameText = $0 }),
+                                       commit: { model.commitRename() }, cancel: { model.cancelRename() })
+        let coordinator = editor.makeCoordinator()
+        let field = BoardRenameTextField()
+        field.text = model.renameText
+        // A tap can collapse the initial selection. Command-A must select it again before typing.
+        field.selectedTextRange = field.textRange(from: field.endOfDocument, to: field.endOfDocument)
+        let command = try XCTUnwrap(field.keyCommands?.first { $0.input == "a" && $0.modifierFlags == .command })
+        XCTAssertTrue(command.wantsPriorityOverSystemBehavior)
+        _ = field.perform(command.action, with: command)
+        let selected = try XCTUnwrap(field.selectedTextRange)
+        XCTAssertEqual(field.text(in: selected), model.renameText)
+        field.insertText("Canvas navigation board")
+        XCTAssertEqual(field.text, "Canvas navigation board")
+        XCTAssertTrue(coordinator.textFieldShouldReturn(field))
+        await fulfillment(of: [saved], timeout: 5)
+        XCTAssertFalse(h.session.isEditingText)
+        XCTAssertNil(model.renaming)
+        h.app.workspace.close(Fixtures.whiteboardID)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).page(Fixtures.boardID)?.title,
+                       "Canvas navigation board")
+        XCTAssertEqual(try boardItems(h).map(\.id), [Fixtures.boardShapeID])
+    }
+
+    func testCancelRenameRestoresTextFocusWithoutChangingBoard() throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        let board = try XCTUnwrap(model.boards.first)
+        for wasEditing in [false, true] {
+            h.session.isEditingText = wasEditing
+            model.beginRename(board)
+            model.renameText = "Uncommitted"
+            model.cancelRename()
+            model.cancelRename() // teardown may also cancel; it must not clear another editor's focus
+            XCTAssertEqual(h.session.isEditingText, wasEditing)
+            XCTAssertNil(model.renaming)
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), 0)
+        XCTAssertEqual(model.boards.first?.title, board.title)
+    }
+
     // MARK: Board limit (D-030)
 
     /// A board holding exactly `NibLimits.boardItemLimit` items refuses a template, and its minimap takes the touches

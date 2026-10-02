@@ -28,6 +28,20 @@ final class QAStateProbe: UIView {
             let items = doc.flatMap { d in session.page.flatMap { try? app.workspace.items(d, page: $0) } } ?? []
             let canvas = findCanvas(in: shell.view)
             let offset = canvas?.contentOffset ?? .zero
+            let receiptPages = NibUITestMode.scenario == .unseenBoards && content?.meta.kind == .whiteboard
+                ? content?.livePages ?? [] : []
+            let receiptPrefix = receiptPages.isEmpty ? nil : doc.map { "collabpresence.seen." + $0.raw }
+            let baseline = receiptPrefix.flatMap { app.settings.json($0)?.stringValue }.flatMap(Rev.init(string:))
+            let receipts: [String: JSONValue] = Dictionary(uniqueKeysWithValues: receiptPages.map { page in
+                let mark = receiptPrefix.flatMap { app.settings.json($0 + "." + page.id.raw)?.stringValue }
+                return (page.id.raw, mark.map(JSONValue.string) ?? .null)
+            })
+            // These are the seeded remote page-record changes, not a substitute for F108's unseen item tracker.
+            let unseenFixturePages = receiptPages.filter { page in
+                guard let baseline else { return false }
+                let own = receipts[page.id.raw]?.stringValue.flatMap(Rev.init(string:)) ?? baseline
+                return page.rev.device != app.clock.device && page.rev.effective() > max(baseline.effective(), own.effective())
+            }.map { JSONValue.string($0.id.raw) }
             let state: JSONValue = [
                 "screen": .string(UITestFixture.failure != nil ? "fixtureError" : !UITestFixture.isReady ? "loading" : doc == nil ? "library" : "document"),
                 "document": doc.map { .string($0.raw) } ?? .null,
@@ -43,7 +57,15 @@ final class QAStateProbe: UIView {
                 "redoAvailable": .bool(UndoRoute.resolve(redo: true, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
                 "openPanels": .array(session.openPanels.sorted().map(JSONValue.string)),
                 "paletteDock": canvas == nil ? .null : session.toolOptions["nib.qa.paletteDock"] ?? .null,
-                "fixtureError": UITestFixture.failure.map(JSONValue.string) ?? .null
+                "fixtureError": UITestFixture.failure.map(JSONValue.string) ?? .null,
+                "fixtureScenario": .string(NibUITestMode.scenario.rawValue),
+                "boardReadReceipts": .object(receipts),
+                "boardSeenBaseline": baseline.map { .string($0.description) } ?? .null,
+                "unseenFixturePages": .array(unseenFixturePages),
+                "renderFailureCount": .number(Double(UITestFixture.renderer?.failureCount ?? 0)),
+                "rendererCachePurgeCount": .number(Double(UITestFixture.renderer?.cachePurgeCount ?? 0)),
+                "memoryWarningCount": .number(Double(UITestFixture.memoryWarningCount)),
+                "cachedPageCount": .number(Double(doc.map { app.workspace.cachedPages($0).count } ?? 0))
             ]
             return state.jsonString()
         }

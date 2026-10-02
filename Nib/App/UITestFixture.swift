@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import NibContracts
 
 /// Uses the same command-driven seed path as onboarding's SampleNotebook, with real package persistence.
@@ -6,6 +7,9 @@ import NibContracts
 enum UITestFixture {
     static var isReady = false
     static var failure: String?
+    static var renderer: NibUITestRenderer?
+    static var memoryWarningCount = 0
+    private static var backgroundObserver: NSObjectProtocol?
 
     static func defaults() -> UserDefaults {
         guard NibUITestMode.isEnabled else { return .standard }
@@ -47,13 +51,26 @@ enum UITestFixture {
         }
         let folder = try await run("folder.create", ["title": "Semester Notes"])
         _ = try await create("notebook", "Lecture notes", folder: folder["ref"]?.stringValue)
-        let physics = try await create("notebook", "Physics — Motion", pages: 4)
+        let scenario = NibUITestMode.scenario
+        let physics = try await create("notebook", "Physics — Motion", pages: scenario.notebookPageCount)
         let paper = try page(physics)
         try await run("text.createBox", ["page": paper, "frame": [72, 64, 350, 48], "text": "Motion and forces"])
         try await run("shape.create", ["page": paper, "shape": "rectangle", "frame": [100, 200, 160, 90]])
         try await run("sticky.create", ["page": paper, "at": [400, 120], "text": "Remember F = ma"])
         try await run("ink.addStrokes", ["page": paper, "strokes": [["fmt": "xy", "pts": [72, 140, 112, 145, 152, 138, 192, 143]]]])
-        let board = try await create("whiteboard", "Concept map")
+        let board: JSONValue
+        if scenario == .unseenBoards {
+            guard let library = app.services.library else { throw NibError.unavailable("library") }
+            let content = NibUITestScenario.unseenBoardContent(localDevice: app.clock.device)
+            let doc = try library.createDocument(content, title: "Concept map", in: nil)
+            // A saved remote fixture, opened and scanned by the ordinary collaboration implementation. No live
+            // session or fake command result is involved. This setting is confined to the disposable fixture suite.
+            app.settings.setJSON("collabpresence.seen." + doc.raw, .string(Rev.zero.description))
+            board = ["ref": .string(NodeRef.document(doc).description),
+                     "pages": .array(content.livePages.map { .string(NodeRef.page(doc, $0.id).description) })]
+        } else {
+            board = try await create("whiteboard", "Concept map")
+        }
         let boardPage = try page(board)
         try await run("shape.create", ["page": boardPage, "shape": "ellipse", "frame": [0, 0, 200, 120], "text": "Motion"])
         try await run("sticky.create", ["page": boardPage, "at": [260, 40], "text": "Acceleration"])
@@ -69,5 +86,26 @@ enum UITestFixture {
             throw NibError.invalid("Fixture is missing from library.list: " + listing.jsonString())
         }
         for doc in app.workspace.loadedDocuments { app.bus.history.clear(doc) }
+        if scenario == .failedRender || scenario == .largeDocument {
+            guard let base = app.services.renderer,
+                  let raw = paper.stringValue, case let .page(doc, page)? = NodeRef(raw) else {
+                throw NibError.invalid("Canvas fixture requires a renderer and a notebook page")
+            }
+            let decorated = NibUITestRenderer(base: base, failingPage: scenario == .failedRender ? (doc, page) : nil)
+            renderer = decorated
+            app.services.renderer = decorated
+        }
+        if scenario == .largeDocument {
+            // Deliver the same notification as UIKit; F100 still decides what to flush, evict and purge. This is a
+            // deterministic recovery test, not a claim that the OS actually put the process under memory pressure.
+            backgroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated {
+                    memoryWarningCount += 1
+                    NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+                }
+            }
+        }
     }
 }

@@ -1,0 +1,3745 @@
+{
+  "areas": [
+    {
+      "key": "library",
+      "title": "Library browser and organisation",
+      "owners": [
+        "F002",
+        "F018",
+        "F019",
+        "F020",
+        "F021",
+        "F025",
+        "F027",
+        "F056",
+        "F070",
+        "F071",
+        "F074",
+        "F080",
+        "F108"
+      ],
+      "controls": [
+        {
+          "id": "library.documents",
+          "control": "Documents and folder navigation",
+          "trigger": "Library > Documents; tap folder or breadcrumb",
+          "expected": "Correct children and title appear; document remains null."
+        },
+        {
+          "id": "library.tabs",
+          "control": "Favourites, Shared, Recents, Study Sets, Gallery, Trash",
+          "trigger": "Tap each library sidebar row; compact: root navigation list",
+          "expected": "Each destination shows its matching items and empty state."
+        },
+        {
+          "id": "library.folderDisclosure",
+          "control": "Expand and collapse Folders",
+          "trigger": "Library sidebar > Folders disclosure",
+          "expected": "Nested folders expand/collapse without opening documents."
+        },
+        {
+          "id": "library.layout",
+          "control": "Grid and List",
+          "trigger": "Library > view options > Grid/List",
+          "expected": "Same items appear in chosen layout; choice survives reopening folder."
+        },
+        {
+          "id": "library.sort",
+          "control": "Modified/Created newest or oldest, Name A–Z/Z–A, Type, Manual",
+          "trigger": "Library > Sort > each of eight orders",
+          "expected": "Visible order matches criterion; per-folder choice persists; Manual restores saved order."
+        },
+        {
+          "id": "library.filter",
+          "control": "All items / Documents / Folders filter",
+          "trigger": "Library filter menu > All items/Documents/Folders",
+          "expected": "Only chosen node type appears; All restores both folders and documents."
+        },
+        {
+          "id": "library.select",
+          "control": "Enter/exit Select; toggle items; Select All",
+          "trigger": "Library > Select; tap covers; ⌘A; Escape/Done",
+          "expected": "Checkmarks and batch bar match selection; exit clears selection."
+        },
+        {
+          "id": "library.openSelection",
+          "control": "Open selected library item",
+          "trigger": "Select one item; Return",
+          "expected": "Folder opens or probe screen=document and document matches selection."
+        },
+        {
+          "id": "doc.open",
+          "control": "Open notebook, board, text document, study set",
+          "trigger": "Tap labelled cmd.doc.open cover/row",
+          "expected": "Correct editor and title appear; probe document changes."
+        },
+        {
+          "id": "library.context",
+          "control": "Item context menu",
+          "trigger": "Long-press/right-click document and folder",
+          "expected": "Applicable registered actions appear with correct enabled states."
+        },
+        {
+          "id": "library.rename",
+          "control": "Rename document or folder",
+          "trigger": "Item menu > Rename; edit name; confirm/cancel",
+          "expected": "New name appears and persists; invalid names rejected; Cancel preserves name."
+        },
+        {
+          "id": "library.move",
+          "control": "Move one or multiple documents/folders",
+          "trigger": "Item menu or selection bar > Move; choose destination",
+          "expected": "Only chosen items relocate; destination and breadcrumb update."
+        },
+        {
+          "id": "library.movePicker",
+          "control": "Move picker navigation and new folder",
+          "trigger": "Move Items sheet > parent/child folders; New Folder; Move/Cancel",
+          "expected": "Destination validated; new folder appears; Cancel makes no move."
+        },
+        {
+          "id": "library.duplicate",
+          "control": "Duplicate document/folder selection",
+          "trigger": "Item menu or selection bar > Duplicate",
+          "expected": "Independent copies include content and descendants; originals remain."
+        },
+        {
+          "id": "doc.setFavorite",
+          "control": "Favourite/unfavourite documents",
+          "trigger": "Item menu or selection bar > Add/Remove Favourites",
+          "expected": "Star and Favourites membership change for chosen documents."
+        },
+        {
+          "id": "folder.setStyle",
+          "control": "Folder colour, icon/emoji and favourite",
+          "trigger": "Folder menu > Customise Folder",
+          "expected": "Preview and folder tile reflect saved style; favourite changes membership."
+        },
+        {
+          "id": "folder.create",
+          "control": "New folder and subfolder",
+          "trigger": "+ New > New Folder; ⌃⌘N",
+          "expected": "Folder appears in current parent with entered title/style; Cancel creates nothing."
+        },
+        {
+          "id": "library.trash",
+          "control": "Delete documents/folders",
+          "trigger": "Item menu or batch bar > Delete/Move to Trash; confirm/cancel",
+          "expected": "Confirm removes chosen items from browser and adds Trash entries; Cancel preserves them."
+        },
+        {
+          "id": "library.reorder",
+          "control": "Drag reorder covers/folders",
+          "trigger": "Hold 0.3 s; drag into sibling gap; drop",
+          "expected": "New order persists; sort becomes Manual; Undo restores old order."
+        },
+        {
+          "id": "library.reorderAccessible",
+          "control": "Move earlier/later",
+          "trigger": "VoiceOver cover actions > Move earlier/Move later",
+          "expected": "One position changes; boundaries do not corrupt order."
+        },
+        {
+          "id": "library.dragFolder",
+          "control": "File items by drag",
+          "trigger": "Drag cover(s) onto folder tile or sidebar folder",
+          "expected": "Items move to target; toast Undo restores original location."
+        },
+        {
+          "id": "doc.merge",
+          "control": "Combine notebooks by drag",
+          "trigger": "Hold cover over notebook centre, then confirm combine",
+          "expected": "Target gains source pages; source goes to Trash; other documents unchanged."
+        },
+        {
+          "id": "library.dropImport",
+          "control": "Import dropped external files",
+          "trigger": "Drag supported Files payload into library/folder",
+          "expected": "Imported documents appear in intended folder; progress/error is visible."
+        },
+        {
+          "id": "library.newMenu",
+          "control": "Open and dismiss + New",
+          "trigger": "Tap + New; tap outside",
+          "expected": "Notebook, QuickNote, Whiteboard, Text Document, Study Set, Import and Scan actions reachable."
+        },
+        {
+          "id": "library.searchEntry",
+          "control": "Library search entry",
+          "trigger": "cmd.search.open magnifier; iPhone pull-down; ⌘F/⌘O",
+          "expected": "Library search field focuses and results surface opens."
+        },
+        {
+          "id": "library.appMenu",
+          "control": "Settings, Templates, Cloud & Backup, Trash, About",
+          "trigger": "Library app/gear menu > each destination",
+          "expected": "Corresponding settings page or registered panel opens."
+        },
+        {
+          "id": "library.emptyActions",
+          "control": "Empty library/folder actions",
+          "trigger": "Empty state > New Notebook or Import",
+          "expected": "Creation sheet or system file picker opens in current folder."
+        },
+        {
+          "id": "organize.favourites",
+          "control": "Favourites tab actions",
+          "trigger": "Favourites > open, unstar, context menu",
+          "expected": "Correct document/folder opens; removed favourite disappears from tab."
+        },
+        {
+          "id": "organize.trash",
+          "control": "Browse/search/select Trash",
+          "trigger": "Trash tab > document/folder/page rows; selection controls",
+          "expected": "Trashed content is listed separately and selection matches actions."
+        },
+        {
+          "id": "trash.recover",
+          "control": "Restore to original/chosen folder",
+          "trigger": "Trash > Recover/Move; choose destination",
+          "expected": "Restored item leaves Trash and appears at destination with content intact."
+        },
+        {
+          "id": "trash.deletePermanently",
+          "control": "Permanently delete selected trash",
+          "trigger": "Trash > Delete Permanently; confirm/cancel",
+          "expected": "Confirm removes selected entries permanently; Cancel preserves them."
+        },
+        {
+          "id": "trash.empty",
+          "control": "Empty Trash",
+          "trigger": "Trash > Empty Trash; confirm/cancel",
+          "expected": "Confirm empties document/folder/page trash; empty state appears."
+        },
+        {
+          "id": "library.syncBadge",
+          "control": "Document and library sync status",
+          "trigger": "Tap sync row or item menu > Cloud & Backup",
+          "expected": "Status details correspond to selected library/document."
+        }
+      ]
+    },
+    {
+      "key": "create",
+      "title": "Document creation and templates",
+      "owners": [
+        "F002",
+        "F005",
+        "F019",
+        "F021",
+        "F044",
+        "F045",
+        "F047",
+        "F049",
+        "F052",
+        "F075",
+        "F087",
+        "F093"
+      ],
+      "controls": [
+        {
+          "id": "create.newNotebook",
+          "control": "New Notebook sheet",
+          "trigger": "+ New > Notebook; ⌥⌘N; panel create.newNotebook",
+          "expected": "Sheet opens; no document created before Create."
+        },
+        {
+          "id": "create.type",
+          "control": "Notebook/Whiteboard/Text document/Study set type",
+          "trigger": "New document sheet > Type segmented control",
+          "expected": "Fields and primary action match type; draft title retained."
+        },
+        {
+          "id": "create.title",
+          "control": "Enter title; use suggested title",
+          "trigger": "New document > Title; Use suggestion when offered",
+          "expected": "Entered/accepted title appears in preview and created document."
+        },
+        {
+          "id": "create.cover",
+          "control": "Choose cover or No cover",
+          "trigger": "New notebook > cover strip",
+          "expected": "Selection ring/live preview update; resulting first page/cover matches."
+        },
+        {
+          "id": "create.paper",
+          "control": "Paper groups and template thumbnails",
+          "trigger": "New notebook > Basic/Lined/Grid/Planners/Music/From plugins",
+          "expected": "Group filters tiles; selected paper appears in preview and new pages."
+        },
+        {
+          "id": "create.size",
+          "control": "A4, Letter, B5, Legal, Square, Custom size",
+          "trigger": "New notebook > Size; enter custom dimensions",
+          "expected": "Preview/page dimensions match; invalid custom sizes prevent creation."
+        },
+        {
+          "id": "create.orientation",
+          "control": "Portrait and Landscape",
+          "trigger": "New notebook > Orientation",
+          "expected": "Preview and created page rotate dimensions correctly."
+        },
+        {
+          "id": "create.paperColor",
+          "control": "Paper colour",
+          "trigger": "New notebook > colour swatches/custom colour",
+          "expected": "Preview and created paper use selected colour."
+        },
+        {
+          "id": "create.applyPattern",
+          "control": "All pages / Every other",
+          "trigger": "SPEC GAP: DESIGN §14.6 Apply to All pages/Every other; no creation control found",
+          "expected": "Multi-page result uses selected template distribution."
+        },
+        {
+          "id": "create.defaults",
+          "control": "Default paper, cover, size and cover enabled",
+          "trigger": "Template/settings default controls; reopen New Notebook",
+          "expected": "New draft starts with saved defaults without changing existing documents."
+        },
+        {
+          "id": "doc.create",
+          "control": "Create and open document",
+          "trigger": "New document > Create; cmd.doc.create where exposed",
+          "expected": "Exactly one document appears; probe screen=document, document non-null; correct editor/content."
+        },
+        {
+          "id": "create.cancel",
+          "control": "Cancel/dismiss creation",
+          "trigger": "Cancel, sheet dismissal, Escape",
+          "expected": "Returns to previous screen; no document or empty package appears."
+        },
+        {
+          "id": "whiteboard.create",
+          "control": "Whiteboard creation options",
+          "trigger": "+ New > Whiteboard; ⇧⌘W",
+          "expected": "Title, background/grid and recognition language retained; infinite board opens on Create."
+        },
+        {
+          "id": "create.textDocument",
+          "control": "New Text Document entry",
+          "trigger": "+ New > Text Document; ⇧⌘T in library",
+          "expected": "Text editor opens with editable first block; DESIGN sheet route also covered by create.type."
+        },
+        {
+          "id": "create.studySet",
+          "control": "New Study Set entry",
+          "trigger": "+ New > Study Set",
+          "expected": "Card editor opens with front/back inputs; DESIGN sheet route also covered by create.type."
+        },
+        {
+          "id": "doc.quickNote",
+          "control": "QuickNote",
+          "trigger": "+ New > QuickNote; double-tap + New; ⇧⌘N",
+          "expected": "Untitled notebook with default paper opens immediately."
+        },
+        {
+          "id": "quicknote.save",
+          "control": "Save QuickNote on exit",
+          "trigger": "Write in QuickNote; Back > Save; enter title",
+          "expected": "Named notebook remains in library; exit completes."
+        },
+        {
+          "id": "quicknote.keep",
+          "control": "Keep editing/cancel QuickNote exit",
+          "trigger": "QuickNote exit prompt > keep/back/cancel",
+          "expected": "Same document and ink remain; no duplicate created."
+        },
+        {
+          "id": "quicknote.combine",
+          "control": "Combine QuickNote with notebook",
+          "trigger": "Exit prompt > Combine to a Document; pick target",
+          "expected": "Target gains QuickNote pages; source is handled once; target content preserved."
+        },
+        {
+          "id": "quicknote.delete",
+          "control": "Delete QuickNote on exit",
+          "trigger": "Exit prompt > Delete QuickNote",
+          "expected": "QuickNote exits and is removed as specified; unrelated notes remain."
+        },
+        {
+          "id": "audio.quickRecord",
+          "control": "Quick Record",
+          "trigger": "+ New > Quick Record; allow microphone",
+          "expected": "New text document opens and recording HUD timer advances."
+        },
+        {
+          "id": "calendar.newPlanner",
+          "control": "New Event Planner",
+          "trigger": "+ New > Event Planner",
+          "expected": "Calendar/date/template choices create planner with linked events."
+        },
+        {
+          "id": "calendar.createNote",
+          "control": "Create meeting/event note",
+          "trigger": "Calendar tab > event > Create Note",
+          "expected": "Note appears in event folder and links to selected event."
+        },
+        {
+          "id": "calendar.openNote",
+          "control": "Open existing event note",
+          "trigger": "Calendar tab > linked event note",
+          "expected": "Existing note opens without creating a duplicate."
+        }
+      ]
+    },
+    {
+      "key": "canvas",
+      "title": "Canvas navigation and zoom",
+      "owners": [
+        "F004",
+        "F005",
+        "F006",
+        "F017",
+        "F022",
+        "F038",
+        "F044",
+        "F073",
+        "F100",
+        "F101"
+      ],
+      "controls": [
+        {
+          "id": "canvas.scroll",
+          "control": "Finger scroll/pan",
+          "trigger": "Swipe nib.canvas vertically/horizontally with Pencil-only mode",
+          "expected": "Probe contentOffset changes; no new strokes; current page updates across pages."
+        },
+        {
+          "id": "canvas.pinch",
+          "control": "Pinch zoom",
+          "trigger": "Two-finger pinch on nib.canvas",
+          "expected": "Probe zoom changes within limits; focal content remains anchored."
+        },
+        {
+          "id": "canvas.doubleTap",
+          "control": "Double-tap zoom",
+          "trigger": "Double-tap empty canvas twice",
+          "expected": "Zoom toggles between fit and twice-fit without creating items."
+        },
+        {
+          "id": "view.zoom.in",
+          "control": "Zoom In",
+          "trigger": "⌘+ or ⌘=; minimap +",
+          "expected": "Probe zoom increases to next allowed step."
+        },
+        {
+          "id": "view.zoom.out",
+          "control": "Zoom Out",
+          "trigger": "⌘−; minimap −",
+          "expected": "Probe zoom decreases to next allowed step."
+        },
+        {
+          "id": "view.zoom.fit",
+          "control": "Fit / fit width / board fit content",
+          "trigger": "⌘0; whiteboard Fit All Content",
+          "expected": "Notebook fits page width; board bounds fit visible viewport; probe zoom/offset update."
+        },
+        {
+          "id": "view.zoom.actual",
+          "control": "Actual Size",
+          "trigger": "⌥⌘0",
+          "expected": "Probe zoom=1 where allowed; page renders at 100%."
+        },
+        {
+          "id": "canvas.fitPageGap",
+          "control": "Separate Fit Page and Fit Width controls",
+          "trigger": "SPEC GAP: no distinct full-page fit selector found; view.zoom fit is width",
+          "expected": "Required distinct commands must expose and visibly apply their stated fit mode before passing."
+        },
+        {
+          "id": "view.scrollBy",
+          "control": "Keyboard pan",
+          "trigger": "⌥↑/↓/←/→ with canvas focused",
+          "expected": "Probe contentOffset changes in requested direction; selection/content unchanged."
+        },
+        {
+          "id": "doc.setScrollDirection",
+          "control": "Vertical continuous / horizontal paged layout",
+          "trigger": "More > Vertical/Horizontal",
+          "expected": "Pages lay out in chosen direction; horizontal paging snaps; persisted per document."
+        },
+        {
+          "id": "canvas.singlePage",
+          "control": "Single-page layout boundary",
+          "trigger": "Navigate notebook in both directions",
+          "expected": "One-page-wide layout; no unsupported two-page spread control expected."
+        },
+        {
+          "id": "view.goToPage",
+          "control": "Go to Page/Board",
+          "trigger": "More > Go to Page; ⌥⌘G; enter valid number",
+          "expected": "Probe page matches target; invalid/out-of-range number disables Go."
+        },
+        {
+          "id": "canvas.pageHUD",
+          "control": "Page indicator and navigator",
+          "trigger": "Tap page HUD / cmd.sidebar.toggle",
+          "expected": "Pages navigator opens; displayed page/count match probe page/pageCount."
+        },
+        {
+          "id": "canvas.scrub",
+          "control": "Scrub pages",
+          "trigger": "Drag page HUD/scroll scrubber; VoiceOver increment/decrement",
+          "expected": "Current page and page indicator follow gesture without editing content."
+        },
+        {
+          "id": "canvas.pullAddPage",
+          "control": "Pull beyond final page to add",
+          "trigger": "Pull past notebook end and release past threshold",
+          "expected": "Exactly one page added; pageCount increments; Undo removes it."
+        },
+        {
+          "id": "canvas.deviceRotation",
+          "control": "Rotate device / resize window",
+          "trigger": "Portrait↔landscape; Split View/Stage Manager resize",
+          "expected": "Current page/content retained; zoom and chrome remain usable; no clipped final line."
+        },
+        {
+          "id": "page.rotate.canvas",
+          "control": "Rotate page view",
+          "trigger": "More > Rotate Page / Rotate All Pages",
+          "expected": "Page and content rotate coherently; coordinates and selection remain aligned."
+        },
+        {
+          "id": "whiteboard.world",
+          "control": "Infinite canvas and adaptive dots",
+          "trigger": "Pan through negative/positive space; pinch",
+          "expected": "Content remains anchored; dot density adapts; no artificial page boundary."
+        },
+        {
+          "id": "whiteboard.minimap",
+          "control": "Show/hide minimap",
+          "trigger": "Whiteboard minimap button",
+          "expected": "Minimap expands/collapses; content and viewport rect represented."
+        },
+        {
+          "id": "whiteboard.minimapNavigate",
+          "control": "Navigate via minimap",
+          "trigger": "Tap map; drag viewport rectangle",
+          "expected": "Probe contentOffset changes to chosen world region."
+        },
+        {
+          "id": "board.add",
+          "control": "Add board",
+          "trigger": "Add Page > Add Board; Boards > +",
+          "expected": "New board appears; pageCount increases; board becomes active."
+        },
+        {
+          "id": "board.rename",
+          "control": "Rename board",
+          "trigger": "Boards > board name/menu > Rename",
+          "expected": "New title appears in board list and persists."
+        },
+        {
+          "id": "board.insertTemplate",
+          "control": "Insert board framework",
+          "trigger": "Whiteboard Templates > brainstorm/kanban/SWOT/retro/mind map/timeline/meeting/flowchart",
+          "expected": "Editable framework items appear; itemCountOnPage increases; undo removes group."
+        },
+        {
+          "id": "doc.convertToWhiteboard",
+          "control": "Convert notebook to whiteboard",
+          "trigger": "Notebook library menu > Convert to Whiteboard",
+          "expected": "Pages become side-by-side board content with assets preserved."
+        },
+        {
+          "id": "zoom.toggle",
+          "control": "Open/close Zoom Window",
+          "trigger": "Palette > Zoom Window; page long-press > Zoom; ⌥⌘Z",
+          "expected": "Target box and writing pane appear/disappear without content edits."
+        },
+        {
+          "id": "zoom.setBox",
+          "control": "Move/resize target box and margins",
+          "trigger": "Drag zoom box/body/handles; adjust Margin controls",
+          "expected": "Magnified pane follows target; limits/margins persist for session."
+        },
+        {
+          "id": "zoom.scale",
+          "control": "Zoom Window magnification",
+          "trigger": "Pane zoom slider",
+          "expected": "Pane magnification changes independently of document navigation."
+        },
+        {
+          "id": "zoom.newLine",
+          "control": "Return/New Line",
+          "trigger": "Zoom Window > Return/New Line; ⌥Return",
+          "expected": "Target advances to left margin of next writing line."
+        },
+        {
+          "id": "zoom.setReturnHeight",
+          "control": "Return height",
+          "trigger": "Zoom Window > Return height",
+          "expected": "Next-line distance reflects page-specific setting."
+        },
+        {
+          "id": "zoom.autoAdvance",
+          "control": "Automatic writing advance",
+          "trigger": "Enable Auto advance; write through pane advance zone",
+          "expected": "Target progresses and wraps at margins; strokes map to correct page coordinates."
+        },
+        {
+          "id": "zoom.write",
+          "control": "Write/erase through Zoom Window",
+          "trigger": "Draw and erase in magnified pane",
+          "expected": "Main page shows same edit; probe strokeCountOnPage changes; Undo works."
+        },
+        {
+          "id": "canvas.renderRecovery",
+          "control": "Retry failed page / restore backup",
+          "trigger": "Induce render failure > Try Again / Restore from Backup",
+          "expected": "Retry reloads page or restore flow opens; error remains actionable."
+        },
+        {
+          "id": "canvas.largeDocument",
+          "control": "Large document memory recovery",
+          "trigger": "Navigate large PDF/board; background/foreground after memory pressure",
+          "expected": "Visible pages reload; saved ink remains; navigation stays responsive without content loss."
+        },
+        {
+          "id": "whiteboard.boardActions",
+          "control": "Board selection and batch actions",
+          "trigger": "Boards > Select/Select All; Duplicate/Move to Whiteboard/Export/Trash/Open in New Window/Mark as Seen",
+          "expected": "Chosen board scope honored; counts/content correct; cancelling preserves boards."
+        },
+        {
+          "id": "zoom.returnPresets",
+          "control": "Zoom Window return presets and margin reset",
+          "trigger": "Pane > Match Template/Match Zoom Box; Increase/Decrease Return Height; Set Left/Right Margin; Reset Margins",
+          "expected": "New Line uses chosen return height; advance wraps within chosen/reset margins."
+        }
+      ]
+    },
+    {
+      "key": "ink",
+      "title": "Ink tools and presets",
+      "owners": [
+        "F004",
+        "F007",
+        "F008",
+        "F009",
+        "F010",
+        "F015",
+        "F016",
+        "F030",
+        "F043",
+        "F101"
+      ],
+      "controls": [
+        {
+          "id": "pen",
+          "control": "Pen",
+          "trigger": "tool.pen; P; draw on canvas",
+          "expected": "Probe tool=pen; strokeCountOnPage increases; stroke persists after reopen."
+        },
+        {
+          "id": "pencil",
+          "control": "Graphite pencil",
+          "trigger": "tool.pencil; Pen settings > Pencil; key 2 subject to live shortcut arbitration",
+          "expected": "Probe tool=pencil; graphite stroke visible and undoable."
+        },
+        {
+          "id": "pen.styles",
+          "control": "Fountain / Ball / Brush",
+          "trigger": "Selected pen > settings > type grid",
+          "expected": "New strokes use selected style; pressure/tip controls enabled appropriately."
+        },
+        {
+          "id": "pen.pressure",
+          "control": "Pressure sensitivity",
+          "trigger": "Pen settings > Pressure sensitivity slider; pressure-capable Pencil",
+          "expected": "New stroke width responds to setting/pressure; Ball remains constant-width."
+        },
+        {
+          "id": "pen.tip",
+          "control": "Tip sharpness and flatness",
+          "trigger": "Pen settings > each tip slider",
+          "expected": "Applicable fountain/brush geometry changes in new strokes."
+        },
+        {
+          "id": "pen.rotation",
+          "control": "React to Pen Rotation",
+          "trigger": "Fountain settings toggle; roll Pencil Pro while writing",
+          "expected": "Nib angle responds when enabled; stable without roll-capable hardware."
+        },
+        {
+          "id": "pen.stabilization",
+          "control": "Pen/pencil stabilisation",
+          "trigger": "Tool settings > Stabilisation",
+          "expected": "Stroke smoothing changes; endpoints remain responsive."
+        },
+        {
+          "id": "pen.latency",
+          "control": "Reduce Latency",
+          "trigger": "Pen settings > Reduce Latency",
+          "expected": "Wet ink tracks input; final stroke commits once, no duplicate predicted segments."
+        },
+        {
+          "id": "pen.fingerDrawing",
+          "control": "Disconnect Stylus / finger drawing",
+          "trigger": "Pen settings > Disconnect Stylus; draw finger stroke",
+          "expected": "Any-input mode draws; reconnect restores finger navigation."
+        },
+        {
+          "id": "highlighter",
+          "control": "Highlighter",
+          "trigger": "tool.highlighter; H; draw",
+          "expected": "Probe tool=highlighter; translucent stroke added beneath pen ink."
+        },
+        {
+          "id": "highlighter.straight",
+          "control": "Straight line",
+          "trigger": "Highlighter settings > Straight line; curved drag",
+          "expected": "Straight stroke when enabled; freehand when disabled."
+        },
+        {
+          "id": "highlighter.settings",
+          "control": "Width, colour, stabilisation and Draw & Hold",
+          "trigger": "Highlighter settings; choose 8/14/20 pt or slider, six colours/custom",
+          "expected": "Subsequent highlight uses chosen values; options persist."
+        },
+        {
+          "id": "preset.select.color",
+          "control": "Quick inks and colour slots",
+          "trigger": "Tool options > swatch; keys 1–9 and 0 subject to live shortcut arbitration",
+          "expected": "Selected swatch updates; next stroke uses it; presets remain per tool."
+        },
+        {
+          "id": "preset.select.width",
+          "control": "Thickness presets",
+          "trigger": "Tool options > width slot; [ and ]",
+          "expected": "Selected width changes; next stroke thickness matches."
+        },
+        {
+          "id": "preset.setWidth",
+          "control": "Edit width and line pattern",
+          "trigger": "Width popover > slider; Solid/Dashed/Dotted",
+          "expected": "Slot persists; new strokes show chosen width/pattern."
+        },
+        {
+          "id": "preset.setSwatch",
+          "control": "Edit colour slot",
+          "trigger": "Swatch long-press > Change Colour; palette/HEX/wheel",
+          "expected": "Slot and subsequent stroke use valid chosen colour; invalid HEX rejected."
+        },
+        {
+          "id": "preset.eyedropper",
+          "control": "Eyedropper from page/system picker",
+          "trigger": "Colour editor > From Page or system eyedropper; tap pixel",
+          "expected": "Sampled colour selected; no ink/object created while sampling."
+        },
+        {
+          "id": "preset.addSwatch",
+          "control": "Add Colour",
+          "trigger": "Colour editor > Add Colour",
+          "expected": "New slot appears until 12-slot limit; existing slots preserved."
+        },
+        {
+          "id": "preset.removeSwatch",
+          "control": "Remove Colour",
+          "trigger": "Swatch menu > Remove Colour",
+          "expected": "Chosen slot removed; at least one slot retained."
+        },
+        {
+          "id": "preset.moveSwatch",
+          "control": "Rearrange Colours",
+          "trigger": "Swatch menu > Rearrange Colours; drag slots; Done",
+          "expected": "New slot order persists; active colour remains coherent."
+        },
+        {
+          "id": "preset.reset",
+          "control": "Restore Default Presets",
+          "trigger": "Preset menu > Restore Defaults; confirm/cancel",
+          "expected": "Confirm restores tool defaults only; Cancel keeps custom presets."
+        },
+        {
+          "id": "eraser",
+          "control": "Eraser",
+          "trigger": "tool.eraser; E",
+          "expected": "Probe tool=eraser; eraser options appear."
+        },
+        {
+          "id": "ink.erase.precision",
+          "control": "Precision eraser",
+          "trigger": "Eraser > Precision; cross middle of stroke",
+          "expected": "Only touched geometry removed; surviving fragments visible and undoable."
+        },
+        {
+          "id": "ink.erase.standard",
+          "control": "Standard eraser",
+          "trigger": "Eraser > Standard; cross stroke",
+          "expected": "Intersected stroke segments removed; untouched content preserved."
+        },
+        {
+          "id": "ink.erase.stroke",
+          "control": "Whole-stroke eraser",
+          "trigger": "Eraser > Whole stroke; touch one stroke",
+          "expected": "Entire touched stroke disappears; strokeCountOnPage decreases."
+        },
+        {
+          "id": "eraser.size",
+          "control": "Eraser presets and custom size",
+          "trigger": "Eraser options > each size and slider",
+          "expected": "Eraser cursor/removed area follows selected diameter."
+        },
+        {
+          "id": "eraser.filters",
+          "control": "Pen/Pencil/Highlighter/Tape filters",
+          "trigger": "Eraser settings > toggle each chip; erase mixed fixture",
+          "expected": "Only enabled ink kinds erased; disabled kinds preserved."
+        },
+        {
+          "id": "eraser.autoDeselect",
+          "control": "Auto-deselect",
+          "trigger": "Enable setting; erase once",
+          "expected": "Probe tool returns to previous tool; disabled setting keeps eraser."
+        },
+        {
+          "id": "page.clear",
+          "control": "Clear Page",
+          "trigger": "Eraser settings/More/thumbnail menu > Clear Page; confirm/cancel",
+          "expected": "Confirm removes page items but keeps page; Undo restores; Cancel preserves."
+        },
+        {
+          "id": "page.deleteItems",
+          "control": "Delete Specific Items",
+          "trigger": "More > Delete Specific Items; choose kinds and page/document scope",
+          "expected": "Only chosen kinds/scope removed; other pages/items remain."
+        },
+        {
+          "id": "ink.scribbleErase",
+          "control": "Scribble to Erase",
+          "trigger": "Enable Pen gestures; scribble over existing handwriting",
+          "expected": "Covered ink erased instead of retaining gesture; Undo restores."
+        },
+        {
+          "id": "selection.fromLoop",
+          "control": "Circle to Lasso",
+          "trigger": "Enable Pen gestures; draw loop then hold inside within three seconds",
+          "expected": "Loop removed; enclosed items selected; probe selectionCount increases."
+        },
+        {
+          "id": "shape.drawHold",
+          "control": "Draw and Hold",
+          "trigger": "Enable Draw & Hold; draw rough line/arrow/arc/curve/rectangle/ellipse/triangle/polygon; hold",
+          "expected": "Recognised shape preview replaces rough stroke on commit; one undo step."
+        },
+        {
+          "id": "shape.holdAdjust",
+          "control": "Adjust held shape and snap neighbours",
+          "trigger": "While holding recognised shape, move tip near neighbour",
+          "expected": "Geometry adjusts/snaps when enabled; no premature commit."
+        },
+        {
+          "id": "drawShape",
+          "control": "Draw Shape / AutoShape",
+          "trigger": "tool.drawShape; D; draw with require-hold on/off",
+          "expected": "Shape created according to recognition mode; unrecognised path handled without lost input."
+        },
+        {
+          "id": "shape.recognitionSettings",
+          "control": "Draw & Hold, Require Hold, Snap to Other Shapes",
+          "trigger": "Settings > Writing > Shape Recognition",
+          "expected": "Each toggle changes subsequent recognition/snapping and persists."
+        },
+        {
+          "id": "edit.undo",
+          "control": "Undo strokes",
+          "trigger": "cmd.edit.undo; ⌘Z; two-finger double-tap when enabled",
+          "expected": "Last stroke/edit removed; undoAvailable/redoAvailable update."
+        },
+        {
+          "id": "edit.redo",
+          "control": "Redo strokes",
+          "trigger": "cmd.edit.redo; ⇧⌘Z; three-finger double-tap when enabled",
+          "expected": "Last undone edit restored; counts and redoAvailable update."
+        },
+        {
+          "id": "undo.history",
+          "control": "History panel and selective revert",
+          "trigger": "Open undo.history; select group > Revert",
+          "expected": "Correct user/AI/plugin/bridge group reverses while unrelated later edits remain."
+        },
+        {
+          "id": "ink.palmRejection",
+          "control": "Palm and concurrent touch routing",
+          "trigger": "Rest palm while drawing with Pencil; add navigation fingers",
+          "expected": "Palm creates no marks; one committed stroke; valid navigation remains usable."
+        },
+        {
+          "id": "pencil.hover",
+          "control": "Pencil Hover preview",
+          "trigger": "Hover supported Pencil over page and tool palette",
+          "expected": "Preview position/style matches tool; no persisted marks."
+        },
+        {
+          "id": "pencil.gesture",
+          "control": "Pencil double-tap and squeeze bindings",
+          "trigger": "Settings > Apple Pencil; bind and perform each gesture",
+          "expected": "Selected tool/action/palette executes in active window; no extra stroke."
+        },
+        {
+          "id": "pencil.palette",
+          "control": "Pencil tools/colours/attributes palette",
+          "trigger": "Squeeze or ⌃⌘P; select item; dismiss",
+          "expected": "Customised tool/preset choice applies; palette closes cleanly."
+        },
+        {
+          "id": "pencil.haptics",
+          "control": "Alignment and tool feedback",
+          "trigger": "Supported Pencil Pro; snap shape, transform, change tool",
+          "expected": "Configured haptic accompanies action; disable suppresses it."
+        }
+      ]
+    },
+    {
+      "key": "selection",
+      "title": "Selection, object actions and transforms",
+      "owners": [
+        "F003",
+        "F011",
+        "F012",
+        "F013",
+        "F014",
+        "F026",
+        "F034",
+        "F035",
+        "F041",
+        "F057",
+        "F058",
+        "F060",
+        "F073",
+        "F104",
+        "F105"
+      ],
+      "controls": [
+        {
+          "id": "lasso",
+          "control": "Freehand lasso",
+          "trigger": "tool.lasso; V; enclose items",
+          "expected": "Probe tool=lasso; matching items selected; selectionCount correct."
+        },
+        {
+          "id": "selection.fromRect",
+          "control": "Rectangular lasso",
+          "trigger": "Lasso settings > Rectangle; drag rect",
+          "expected": "Intersecting allowed items selected; marquee matches bounds."
+        },
+        {
+          "id": "lasso.filters",
+          "control": "Included in Selection",
+          "trigger": "Lasso settings > Handwriting/Highlighter/Tape/Shapes/Images/Text/Sticky notes/Comments/Maths",
+          "expected": "Each kind can be excluded independently; only enabled kinds selected."
+        },
+        {
+          "id": "selection.tapAt",
+          "control": "Quick object selection",
+          "trigger": "Finger tap non-ink object with selection enabled",
+          "expected": "Topmost eligible object selected; excluded/locked behavior respected."
+        },
+        {
+          "id": "selection.clear",
+          "control": "Deselect",
+          "trigger": "Tap empty canvas; Escape",
+          "expected": "selectionCount=0; handles/menu disappear."
+        },
+        {
+          "id": "selection.selectAll",
+          "control": "Select all on active layer",
+          "trigger": "⌘A with canvas focused",
+          "expected": "All eligible active-layer items selected; other layers excluded."
+        },
+        {
+          "id": "smartink.edit",
+          "control": "Word-level handwriting selection",
+          "trigger": "Object menu > Edit Handwriting; tool.smartink.edit; tap recognised word",
+          "expected": "Word strokes selected without unrelated words."
+        },
+        {
+          "id": "selection.objectMenu",
+          "control": "Universal object menu",
+          "trigger": "Tap selection / long-press selected object",
+          "expected": "Cut, Copy, Duplicate, Colour, Convert, More and applicable extensions appear."
+        },
+        {
+          "id": "menu.showAt",
+          "control": "Page long-press/right-click menu",
+          "trigger": "Long-press blank page or pointer right-click",
+          "expected": "Context menu anchors at point with Paste, Screenshot and insertion actions."
+        },
+        {
+          "id": "item.transform.move",
+          "control": "Move selection",
+          "trigger": "Drag selection body; Shift-drag for axis constraint",
+          "expected": "Selected content moves; attached labels/children/connectors follow; Undo restores."
+        },
+        {
+          "id": "item.transform.scale",
+          "control": "Scale selection",
+          "trigger": "Drag corner; exercise modifier constraints",
+          "expected": "All selected geometry scales around correct origin; aspect constraint respected."
+        },
+        {
+          "id": "item.transform.resize",
+          "control": "Resize one axis",
+          "trigger": "Drag edge handles with modifier variants",
+          "expected": "Chosen dimension changes; orthogonal dimension stable where constrained."
+        },
+        {
+          "id": "item.transform.rotate",
+          "control": "Rotate selection",
+          "trigger": "Drag rotation bead",
+          "expected": "Content rotates around intended origin; hit targets stay aligned."
+        },
+        {
+          "id": "selection.nudge",
+          "control": "Nudge selected items",
+          "trigger": "Arrow keys; Shift+arrows",
+          "expected": "Small/large movement only in requested direction; Undo restores."
+        },
+        {
+          "id": "selection.snap",
+          "control": "Align objects, grid and spacing guides",
+          "trigger": "Enable each snapping option; drag near peer/grid",
+          "expected": "Visible guides appear; final geometry snaps; toggles off disable snapping."
+        },
+        {
+          "id": "item.moveToPage",
+          "control": "Move/copy selection across pages",
+          "trigger": "Drag selection onto another page/window; copy modifier",
+          "expected": "Destination shows items; move removes source, copy retains it; linked undo works."
+        },
+        {
+          "id": "item.duplicate",
+          "control": "Duplicate selection",
+          "trigger": "Object menu > Duplicate; ⌘D; duplicate-drag gesture",
+          "expected": "New independent items appear offset; originals remain."
+        },
+        {
+          "id": "clipboard.copy",
+          "control": "Copy objects",
+          "trigger": "Object menu > Copy; ⌘C",
+          "expected": "Paste creates equivalent items; source unchanged; rich fragment/image/text representations usable."
+        },
+        {
+          "id": "clipboard.cut",
+          "control": "Cut objects",
+          "trigger": "Object menu > Cut; ⌘X",
+          "expected": "Selected items removed and available to Paste; Undo restores."
+        },
+        {
+          "id": "clipboard.paste",
+          "control": "Paste objects/images/rich text",
+          "trigger": "Page menu > Paste; ⌘V",
+          "expected": "Items appear at target; itemCountOnPage increases; assets survive cross-document paste."
+        },
+        {
+          "id": "clipboard.matchStyle",
+          "control": "Paste and Match Style",
+          "trigger": "Page menu > Paste and Match Style",
+          "expected": "Text adopts destination style; ordinary Paste retains source styling."
+        },
+        {
+          "id": "clipboard.externalDrag",
+          "control": "Drag content out/in",
+          "trigger": "Drag selection to another app/window; drop text/image/Nib fragment on page",
+          "expected": "Destination receives suitable content; handwriting text export recognised; no source loss on copy."
+        },
+        {
+          "id": "item.delete",
+          "control": "Delete selection",
+          "trigger": "Object menu > Delete; Delete key",
+          "expected": "Selected items removed; itemCountOnPage decreases; Undo restores."
+        },
+        {
+          "id": "item.recolor",
+          "control": "Colour selection",
+          "trigger": "Object menu > Colour; choose colour",
+          "expected": "Supported ink/shapes/text/stickies recoloured without geometry changes."
+        },
+        {
+          "id": "item.arrange.front",
+          "control": "Bring to Front",
+          "trigger": "Object menu > Arrange > Bring to Front; ⇧⌥⌘]",
+          "expected": "Selection renders above all peers."
+        },
+        {
+          "id": "item.arrange.forward",
+          "control": "Bring Forward",
+          "trigger": "Arrange > Bring Forward; ⌥⌘]",
+          "expected": "Selection advances one z-order step."
+        },
+        {
+          "id": "item.arrange.backward",
+          "control": "Send Backward",
+          "trigger": "Arrange > Send Backward; ⌥⌘[",
+          "expected": "Selection retreats one z-order step."
+        },
+        {
+          "id": "item.arrange.back",
+          "control": "Send to Back",
+          "trigger": "Arrange > Send to Back; ⇧⌥⌘[",
+          "expected": "Selection renders below all peers."
+        },
+        {
+          "id": "item.setLocked",
+          "control": "Lock and unlock objects",
+          "trigger": "Object menu > Lock/Unlock; ⌘L/⇧⌘L",
+          "expected": "Locked item cannot be accidentally transformed; unlocking restores editing."
+        },
+        {
+          "id": "selection.screenshot",
+          "control": "Screenshot selection/page region",
+          "trigger": "Object menu or page menu > Take Screenshot; drag region",
+          "expected": "Shareable PNG contains chosen region including PDF background; document unchanged."
+        },
+        {
+          "id": "objectmenu.style",
+          "control": "Style inspector",
+          "trigger": "Object menu > More > Style",
+          "expected": "objectmenu.style opens appropriate text/shape/image/custom inspector."
+        },
+        {
+          "id": "ink.setStyle",
+          "control": "Restyle existing stroke appearance",
+          "trigger": "Selected ink > Colour/Style",
+          "expected": "Chosen tool/pen/width/pattern/colour updates selected strokes only."
+        },
+        {
+          "id": "handwriting.reflow",
+          "control": "Reflow handwriting",
+          "trigger": "Edit Handwriting tool > resize text width",
+          "expected": "Words reflow into lines; original stroke shapes preserved."
+        },
+        {
+          "id": "handwriting.straighten",
+          "control": "Straighten handwritten lines",
+          "trigger": "Object menu > Straighten Lines",
+          "expected": "Baselines straighten; unrelated items unchanged."
+        },
+        {
+          "id": "handwriting.align",
+          "control": "Align handwriting left/centre/right",
+          "trigger": "Edit Handwriting options > alignment",
+          "expected": "Lines align to chosen edge/centre without rewriting content."
+        },
+        {
+          "id": "handwriting.insertSpace",
+          "control": "Insert space between lines",
+          "trigger": "Page long-press > Insert Space; adjust height",
+          "expected": "Ink below insertion moves down; content above unchanged."
+        },
+        {
+          "id": "handwriting.restyle",
+          "control": "Neaten or handwriting-font restyle",
+          "trigger": "Object menu > Neaten Handwriting / font; ⇧⌥⌘N",
+          "expected": "Selected handwriting regularised or re-synthesised; text meaning preserved; undoable."
+        },
+        {
+          "id": "selection.convert",
+          "control": "Convert submenu",
+          "trigger": "Select handwriting > Convert > Text/Maths",
+          "expected": "Correct preview/editor opens; selection preserved until commit/cancel."
+        },
+        {
+          "id": "layer.moveItems",
+          "control": "Move selection between layers",
+          "trigger": "Object menu > layer destination",
+          "expected": "Selected items belong to target layer; visibility/active-layer filtering reflects move."
+        },
+        {
+          "id": "selection.provenance",
+          "control": "Assistant provenance",
+          "trigger": "Select AI-created item > object menu",
+          "expected": "Made by Assistant attribution shown; ordinary user item not mislabelled."
+        }
+      ]
+    },
+    {
+      "key": "insert",
+      "title": "Text, objects, media, links, comments and audio",
+      "owners": [
+        "F014",
+        "F024",
+        "F026",
+        "F028",
+        "F029",
+        "F031",
+        "F032",
+        "F033",
+        "F034",
+        "F035",
+        "F036",
+        "F037",
+        "F042",
+        "F052",
+        "F053",
+        "F054",
+        "F065",
+        "F089"
+      ],
+      "controls": [
+        {
+          "id": "text",
+          "control": "Insert text box",
+          "trigger": "tool.text; T; tap/drag canvas",
+          "expected": "Editable text box appears; itemCountOnPage increases after commit."
+        },
+        {
+          "id": "text.setText",
+          "control": "Edit text and labels",
+          "trigger": "Double-tap text/sticky/shape; object menu > Edit Text",
+          "expected": "Typed rich text persists; only intended item changes."
+        },
+        {
+          "id": "text.format",
+          "control": "Character formatting",
+          "trigger": "Text options > font/system font picker, size, B/I/U/S, colour, highlight",
+          "expected": "Selected range uses chosen attributes; unselected text unchanged."
+        },
+        {
+          "id": "text.setParagraph",
+          "control": "Paragraph/list formatting",
+          "trigger": "Text options > alignment, bullets, numbered 1./1), checklist, indent/outdent, spacing",
+          "expected": "Paragraph layout and nested list markers update correctly."
+        },
+        {
+          "id": "text.autoLists",
+          "control": "Automatic lists",
+          "trigger": "Type list prefix then space/Return",
+          "expected": "List starts/continues; empty Return exits; Tab/Shift-Tab changes level."
+        },
+        {
+          "id": "text.setBoxStyle",
+          "control": "Textbox style",
+          "trigger": "Style > fill, border, corner, padding, shadow, Fit Height to Text",
+          "expected": "Box appearance and auto-size/clipping reflect each option."
+        },
+        {
+          "id": "text.saveDefaultStyle",
+          "control": "Default and named text styles",
+          "trigger": "Text style > Save; name; Set as Default",
+          "expected": "Style appears in picker and applies to new text; existing text preserved."
+        },
+        {
+          "id": "text.stylePresets",
+          "control": "Title, Heading, Body, Caption",
+          "trigger": "Text settings > each style preset",
+          "expected": "Font/size/paragraph style match chosen preset."
+        },
+        {
+          "id": "text.pin",
+          "control": "Keep Text Tool Selected",
+          "trigger": "Text settings > Keep Text Tool Selected; finish editing",
+          "expected": "Enabled keeps tool=text; disabled returns to remembered tool."
+        },
+        {
+          "id": "text.scribbleStickers",
+          "control": "Scribble and system stickers",
+          "trigger": "Pencil Scribble in native text field; insert system sticker",
+          "expected": "Recognised text/sticker retained; input does not draw on underlying page."
+        },
+        {
+          "id": "text.startPageText",
+          "control": "Full-page typing",
+          "trigger": "Page long-press > Start Typing; contextual ⌥⌘T",
+          "expected": "Page text editor respects template margins; resumes existing page text."
+        },
+        {
+          "id": "pagetext.settings",
+          "control": "Full-page text presets/constraints",
+          "trigger": "Full-page typing formatting and layout controls",
+          "expected": "Preset/font/column constraints apply without duplicate full-page boxes."
+        },
+        {
+          "id": "shape",
+          "control": "Insert predefined shape",
+          "trigger": "tool.shape; S; choose line/arrow/rectangle/rounded rectangle/ellipse/diamond/triangle/star/polygon/curve",
+          "expected": "Native editable shape appears at drag bounds."
+        },
+        {
+          "id": "shape.setStyle",
+          "control": "Shape stroke/fill/corners/arrowheads",
+          "trigger": "Shape settings or Style inspector",
+          "expected": "Colour, width, pattern, no-stroke, no-fill, corner and arrow choices visibly apply."
+        },
+        {
+          "id": "shape.setKind",
+          "control": "Change shape type",
+          "trigger": "Selected shape > Style > kind",
+          "expected": "Shape type changes while retaining frame."
+        },
+        {
+          "id": "shape.setPoints",
+          "control": "Edit shape control points",
+          "trigger": "Selected shape > point handles; drag vertices/control points",
+          "expected": "Geometry changes with handles; Undo restores."
+        },
+        {
+          "id": "shape.tapAt",
+          "control": "Type inside shape",
+          "trigger": "Double-tap closed shape; Edit Text",
+          "expected": "Label editor opens; text remains attached during transforms."
+        },
+        {
+          "id": "connector.create",
+          "control": "Connect objects",
+          "trigger": "Select shapes > Connect; connector tool choice",
+          "expected": "Connector anchors to chosen shapes and follows their movement."
+        },
+        {
+          "id": "connector.setPath",
+          "control": "Straight/elbow/curved connectors and bends",
+          "trigger": "Connector menu > route; drag/add/remove bends",
+          "expected": "Path/anchors update; Remove Bends clears intermediate bends."
+        },
+        {
+          "id": "diagram.addConnected",
+          "control": "Quick diagramming",
+          "trigger": "Selected shape > add connected shape on each side",
+          "expected": "New shape and connector appear on requested side."
+        },
+        {
+          "id": "diagram.create",
+          "control": "Native diagram insertion",
+          "trigger": "Diagram/AI action > tree/flow/timeline/mind map with style",
+          "expected": "Editable nodes/edges fit target area; one undo reverses insertion."
+        },
+        {
+          "id": "image",
+          "control": "Image insertion tool",
+          "trigger": "tool.image; I; tap page",
+          "expected": "Image source menu opens at insertion point."
+        },
+        {
+          "id": "image.pick",
+          "control": "Photos, Camera, Files, Paste, Scan, Image Playground",
+          "trigger": "Image menu > each source; complete/cancel system picker",
+          "expected": "Chosen media inserted once; Cancel/permission denial creates nothing; unsupported source explains availability."
+        },
+        {
+          "id": "image.insert",
+          "control": "Static image and animated GIF",
+          "trigger": "Choose static image/GIF from Files, Photos or URL",
+          "expected": "Image/GIF visible at target; correct aspect/animation; assets persist."
+        },
+        {
+          "id": "image.crop",
+          "control": "Rectangle/freehand crop",
+          "trigger": "Selected image > Crop; choose mode; Done/Cancel",
+          "expected": "Correct region/mask applied; Cancel keeps original; Undo restores."
+        },
+        {
+          "id": "image.flip",
+          "control": "Horizontal/vertical flip",
+          "trigger": "Image menu > Flip Horizontally/Vertically",
+          "expected": "Image mirrors on selected axis without changing frame."
+        },
+        {
+          "id": "image.replace",
+          "control": "Replace image",
+          "trigger": "Image menu > Replace Image; choose replacement",
+          "expected": "New asset uses original frame; Cancel retains original."
+        },
+        {
+          "id": "image.saveToPhotos",
+          "control": "Save to Photos",
+          "trigger": "Image menu > Save to Photos; permit/deny",
+          "expected": "Exported image appears in Photos or actionable permission result."
+        },
+        {
+          "id": "image.playgroundOutbound",
+          "control": "Send selection to Image Playground",
+          "trigger": "Object menu > Image Playground on supported device",
+          "expected": "Selection seeds system generation; insert/cancel behaves correctly."
+        },
+        {
+          "id": "elements",
+          "control": "Browse/search element collections",
+          "trigger": "tool.elements; M; collections scroller and search",
+          "expected": "Matching thumbnails appear; empty search and loading/error states usable."
+        },
+        {
+          "id": "element.insert",
+          "control": "Insert/drag element",
+          "trigger": "Tap element or drag thumbnail onto canvas",
+          "expected": "Grouped editable content appears and is selected; assets copied."
+        },
+        {
+          "id": "element.create",
+          "control": "Create Element from Selection",
+          "trigger": "Object menu or Elements > Create Element from Selection",
+          "expected": "Reusable element saved in chosen/user collection; source remains."
+        },
+        {
+          "id": "element.collection.create",
+          "control": "New collection",
+          "trigger": "Elements > New Collection; name/Create",
+          "expected": "New editable collection appears; Cancel creates nothing."
+        },
+        {
+          "id": "element.collection.update",
+          "control": "Rename/reorder collection",
+          "trigger": "Collection menu > Rename; drag collection order",
+          "expected": "Title/order persists; pack-owned restrictions respected."
+        },
+        {
+          "id": "element.collection.delete",
+          "control": "Delete collection",
+          "trigger": "Collection menu > Delete Collection; confirm/cancel",
+          "expected": "Only selected collection removed on confirm."
+        },
+        {
+          "id": "element.rename",
+          "control": "Rename element",
+          "trigger": "Element menu > Rename Element",
+          "expected": "Thumbnail title changes and persists."
+        },
+        {
+          "id": "element.delete",
+          "control": "Delete element",
+          "trigger": "Element menu > Delete Element; confirm/cancel",
+          "expected": "Only selected element removed from collection."
+        },
+        {
+          "id": "element.import",
+          "control": "Import collection",
+          "trigger": "Elements > Import Collection; pick .nibcollection",
+          "expected": "Collection/assets imported; malformed file reports error."
+        },
+        {
+          "id": "element.export",
+          "control": "Export collection",
+          "trigger": "Collection menu > Export",
+          "expected": "Shareable .nibcollection produced and reimports with contents."
+        },
+        {
+          "id": "gif.search",
+          "control": "GIPHY search, stickers/GIFs, pagination",
+          "trigger": "Elements > GIF search; enter query; Show More/Try Again",
+          "expected": "Matching results load; pagination appends; failure retries without losing query."
+        },
+        {
+          "id": "gif.local",
+          "control": "GIF from Files or Link",
+          "trigger": "Elements > Add GIF from Files/Add GIF from a Link",
+          "expected": "Valid GIF inserted; invalid URL shows error without blank item."
+        },
+        {
+          "id": "gif.key",
+          "control": "Save/remove GIPHY API key",
+          "trigger": "Settings > Elements and GIFs > secure key field",
+          "expected": "Key saved/removed; search availability updates; value stays masked."
+        },
+        {
+          "id": "sticky",
+          "control": "Sticky note insertion and seven colours",
+          "trigger": "tool.sticky; N; tap page; choose colour",
+          "expected": "Note appears with author/text and chosen colour; itemCountOnPage increases."
+        },
+        {
+          "id": "sticky.setCollapsed",
+          "control": "Collapse/expand sticky",
+          "trigger": "Object menu > Collapse Note/Expand Note; tap collapsed note",
+          "expected": "Compact/expanded representation toggles; contents retained."
+        },
+        {
+          "id": "sticky.resolve",
+          "control": "Resolve/reopen sticky",
+          "trigger": "Sticky menu > Resolve/Reopen",
+          "expected": "Resolved state changes; note text retained."
+        },
+        {
+          "id": "sticky.setColor",
+          "control": "Recolour sticky",
+          "trigger": "Sticky colour palette/inspector",
+          "expected": "Selected note changes colour; other notes unchanged."
+        },
+        {
+          "id": "tape",
+          "control": "Draw masking tape",
+          "trigger": "tool.tape; A; drag over text",
+          "expected": "Tape strip hides underlying content and persists."
+        },
+        {
+          "id": "tape.settings",
+          "control": "Tape colours, width, pattern, straightness, orientation",
+          "trigger": "Tape settings > each control",
+          "expected": "New strip uses selection; Straight tape and follows-stroke modes differ visibly."
+        },
+        {
+          "id": "tape.setRevealed",
+          "control": "Reveal/hide tape",
+          "trigger": "Tap tape; object action reveal/hide",
+          "expected": "Underlying content toggles; no undo entry added for reveal state."
+        },
+        {
+          "id": "tape.removeAll",
+          "control": "Remove All Tape",
+          "trigger": "Tape settings > Remove All Tape",
+          "expected": "All page tape removed; other items preserved; Undo restores."
+        },
+        {
+          "id": "tape.importPattern",
+          "control": "Import custom tape pattern",
+          "trigger": "Tape pattern picker > custom image import",
+          "expected": "New pattern appears and can be drawn."
+        },
+        {
+          "id": "tape.deletePattern",
+          "control": "Delete custom pattern",
+          "trigger": "Custom pattern menu > Delete",
+          "expected": "Selected custom pattern removed; built-ins preserved."
+        },
+        {
+          "id": "tape.clearHistory",
+          "control": "Clear pattern history",
+          "trigger": "Tape settings > pattern History > Clear",
+          "expected": "Recent patterns clear; installed patterns remain."
+        },
+        {
+          "id": "link.set",
+          "control": "Add/edit URL, page or audio-time link",
+          "trigger": "Select text/object > Add Link/Link; ⌘K in text context",
+          "expected": "Link target saved on selected range/object; preview reflects destination."
+        },
+        {
+          "id": "link.remove",
+          "control": "Remove link",
+          "trigger": "Link editor/menu > Remove Link",
+          "expected": "Link removed while text remains."
+        },
+        {
+          "id": "link.autodetect",
+          "control": "Automatic typed/pasted URL link",
+          "trigger": "Type/paste URL and finish editing",
+          "expected": "URL becomes tappable without changing text."
+        },
+        {
+          "id": "link.follow",
+          "control": "Follow text/PDF links",
+          "trigger": "Tap in read-only; long-press in edit",
+          "expected": "Correct URL/document/page/audio time opens; return history recorded."
+        },
+        {
+          "id": "link.back",
+          "control": "Return to Page",
+          "trigger": "Return to Page pill or More > Return to Page",
+          "expected": "Probe document/page restore prior location; repeated returns traverse history."
+        },
+        {
+          "id": "clipboard.copyText",
+          "control": "Copy link/text",
+          "trigger": "Document/page/audio/comment menu > Copy Link; text menu > Copy",
+          "expected": "Clipboard contains correct text/deep link; opening link resolves target."
+        },
+        {
+          "id": "comment.add",
+          "control": "Add page/object comment",
+          "trigger": "Page/object menu > Add Comment; enter text/Send",
+          "expected": "Numbered anchor and thread appear; correct page/object attached."
+        },
+        {
+          "id": "comment.tapAt",
+          "control": "Open comment thread",
+          "trigger": "Tap comment badge; Comments sidebar row",
+          "expected": "comments thread opens at selected anchor."
+        },
+        {
+          "id": "comment.reply",
+          "control": "Reply",
+          "trigger": "Thread > Message > Send",
+          "expected": "Reply appears in correct thread with author/time."
+        },
+        {
+          "id": "comment.edit",
+          "control": "Edit comment message",
+          "trigger": "Message menu > Edit; Save/Cancel",
+          "expected": "Saved text replaces only chosen message; Cancel preserves."
+        },
+        {
+          "id": "comment.deleteMessage",
+          "control": "Delete message/thread",
+          "trigger": "Message > Delete; thread > Delete Thread; confirm",
+          "expected": "Target removed; last-message deletion removes thread/anchor."
+        },
+        {
+          "id": "comment.resolve",
+          "control": "Resolve/reopen and Show Resolved",
+          "trigger": "Thread > Resolve/Reopen; Comments > Show Resolved",
+          "expected": "Resolved threads filtered/unfiltered correctly; reopen returns active list."
+        },
+        {
+          "id": "comment.reveal",
+          "control": "Show comment on page",
+          "trigger": "Comment menu > Show on Page",
+          "expected": "Correct anchor scrolled into view; probe page changes if needed."
+        },
+        {
+          "id": "audio.record",
+          "control": "Start/pause/resume/stop recording",
+          "trigger": "Record Audio; ⇧⌘R; HUD controls",
+          "expected": "Timer/waveform/state update; one clip saved; mic denial handled visibly."
+        },
+        {
+          "id": "audio.background",
+          "control": "Cross-document/background recording",
+          "trigger": "Start recording; change document/background and return; Show",
+          "expected": "Recording persists where supported; Show returns to owning note; ink timestamps align."
+        },
+        {
+          "id": "audio.play",
+          "control": "Play/pause/close playback",
+          "trigger": "Audio row Play; playback bar; ⌥⌘P; close",
+          "expected": "Playback/progress toggles; close unloads bar; later clips advance in order."
+        },
+        {
+          "id": "audio.seek",
+          "control": "Scrub/skip audio",
+          "trigger": "Playback position slider; skip controls/shortcuts",
+          "expected": "Elapsed time and audio seek to chosen position within clip."
+        },
+        {
+          "id": "audio.setPlayback",
+          "control": "Speed, Skip Silence, Reduce Noise",
+          "trigger": "Playback bar > each speed 0.5–2× and toggles",
+          "expected": "Playback changes audibly; displayed settings match."
+        },
+        {
+          "id": "audio.rename",
+          "control": "Rename recording",
+          "trigger": "Audio row > Rename; Save/Cancel",
+          "expected": "Clip name changes without changing audio."
+        },
+        {
+          "id": "audio.delete",
+          "control": "Delete recording",
+          "trigger": "Audio row > Delete Recording; confirm/cancel",
+          "expected": "Confirm removes clip/file; Cancel retains playable clip."
+        },
+        {
+          "id": "audio.export",
+          "control": "Share individual audio file",
+          "trigger": "Audio row > Share Audio File",
+          "expected": "Playable audio asset/share sheet produced."
+        },
+        {
+          "id": "replay.setMode",
+          "control": "Spotlight/reveal/static replay",
+          "trigger": "More > Replay mode or Replay Options",
+          "expected": "Stroke visibility follows chosen replay mode at current audio time."
+        },
+        {
+          "id": "replay.seekToItem",
+          "control": "Seek recording from handwriting",
+          "trigger": "Tap timestamped ink during replay; Replay Handwriting",
+          "expected": "Audio seeks to stroke time; correct page/ink highlighted."
+        },
+        {
+          "id": "transcript.panel",
+          "control": "Transcript/search/follow playback",
+          "trigger": "Audio bar/More > Transcript; search; Follow playback",
+          "expected": "Timestamped text appears; matching lines filter; active segment follows audio."
+        },
+        {
+          "id": "transcript.seek",
+          "control": "Timestamp jump",
+          "trigger": "Tap transcript timestamp/line",
+          "expected": "Audio seeks; associated most-edited page revealed."
+        },
+        {
+          "id": "transcript.editSegment",
+          "control": "Correct transcript",
+          "trigger": "Line menu > Edit; Save/Cancel",
+          "expected": "Chosen segment text updates; Cancel preserves."
+        },
+        {
+          "id": "transcript.regenerate",
+          "control": "Regenerate transcript",
+          "trigger": "Transcript > Regenerate; choose on-device/cloud",
+          "expected": "Transcript updates or reports availability/error; recording preserved."
+        },
+        {
+          "id": "transcript.insert",
+          "control": "Insert/copy/drag transcript text",
+          "trigger": "Line menu > Insert on Page/Copy; drag line onto page",
+          "expected": "Correct text box/clipboard text created; original transcript retained."
+        }
+      ]
+    },
+    {
+      "key": "pages",
+      "title": "Pages, outline, bookmarks and templates",
+      "owners": [
+        "F005",
+        "F010",
+        "F017",
+        "F022",
+        "F023",
+        "F024",
+        "F034",
+        "F044",
+        "F045",
+        "F046",
+        "F064",
+        "F065",
+        "F087"
+      ],
+      "controls": [
+        {
+          "id": "sidebar.pages",
+          "control": "Pages sidebar and full-window navigator",
+          "trigger": "cmd.sidebar.toggle; page HUD; Pages tab",
+          "expected": "sidebar.pages visible; current thumbnail matches probe page."
+        },
+        {
+          "id": "sidebar.select",
+          "control": "Select/toggle/select-all/swipe thumbnails",
+          "trigger": "Pages > Select; tap/drag across thumbnails",
+          "expected": "Checkmarks match selection; Move/Copy/Export/Delete enabled accordingly."
+        },
+        {
+          "id": "sidebar.navigate",
+          "control": "Navigate from thumbnail",
+          "trigger": "Tap page thumbnail",
+          "expected": "Probe page changes; page visible and ring moves."
+        },
+        {
+          "id": "page.add.current",
+          "control": "Add page using current template",
+          "trigger": "Add Page > Before/After/End > Current Template",
+          "expected": "pageCount increments; new page inserted at chosen location/template."
+        },
+        {
+          "id": "page.add.template",
+          "control": "Add page using chosen template",
+          "trigger": "Add Page > Choose Template; select and confirm/cancel",
+          "expected": "New page matches picker; Cancel adds nothing."
+        },
+        {
+          "id": "page.add.media",
+          "control": "Add pages from PDF/image/camera/scan",
+          "trigger": "Add Page > Import/Image/Take Photo/Scan Document",
+          "expected": "New pages inserted at chosen position; media and page count correct."
+        },
+        {
+          "id": "page.duplicate",
+          "control": "Duplicate page(s)",
+          "trigger": "Page/selection/More menu > Duplicate",
+          "expected": "Copies retain ink, objects, backgrounds/assets; pageCount increases."
+        },
+        {
+          "id": "page.copy",
+          "control": "Copy page(s)",
+          "trigger": "Thumbnail/selection > Copy; contextual ⌘C",
+          "expected": "Page clipboard populated without changing source."
+        },
+        {
+          "id": "page.paste",
+          "control": "Paste pages",
+          "trigger": "Add Page > Paste Pages",
+          "expected": "Copies inserted in chosen position with content; Undo removes them."
+        },
+        {
+          "id": "page.moveTo",
+          "control": "Move pages to another document",
+          "trigger": "Selected pages > Move; pages.movePages sheet",
+          "expected": "Target gains pages; source loses them; correct assets and linked undo."
+        },
+        {
+          "id": "page.reorder",
+          "control": "Reorder thumbnails",
+          "trigger": "Long-press/drag page(s) into gap",
+          "expected": "Page order and numbering update; no merge; Undo restores order."
+        },
+        {
+          "id": "page.dragWindows",
+          "control": "Drag pages between windows",
+          "trigger": "Drag selected thumbnail(s) into other notebook sidebar",
+          "expected": "Destination inserts correct pages; source copy/move semantics respected."
+        },
+        {
+          "id": "page.dragImage",
+          "control": "Thumbnail to image",
+          "trigger": "Drag thumbnail onto canvas",
+          "expected": "Page render inserted as image; original page remains."
+        },
+        {
+          "id": "page.rotate",
+          "control": "Rotate selected/all pages",
+          "trigger": "Page menu > Rotate; More > Rotate All Pages",
+          "expected": "Selected scope rotates; page count unchanged; Undo restores."
+        },
+        {
+          "id": "page.trash",
+          "control": "Delete pages",
+          "trigger": "Thumbnail/selection/More > Move to Trash",
+          "expected": "Chosen pages leave live list; pageCount decreases; recoverable in Trash."
+        },
+        {
+          "id": "page.restore",
+          "control": "Restore trashed page",
+          "trigger": "Trash > page > Recover",
+          "expected": "Page/content restored and live page count increases."
+        },
+        {
+          "id": "page.purge",
+          "control": "Permanently delete trashed page",
+          "trigger": "Trash > page > Delete Permanently; confirm",
+          "expected": "Page removed from Trash; Cancel preserves it."
+        },
+        {
+          "id": "page.setBookmarked",
+          "control": "Add/remove bookmarks",
+          "trigger": "cmd.page.setBookmarked; thumbnail/selection Bookmark/Remove",
+          "expected": "Bookmark glyph/list updates for correct pages."
+        },
+        {
+          "id": "outline.tab",
+          "control": "Outline and Bookmarks tabs",
+          "trigger": "Navigator > Outline/Bookmarks",
+          "expected": "PDF/custom outline groups or bookmark rows shown; empty states accurate."
+        },
+        {
+          "id": "outline.navigate",
+          "control": "Navigate outline/bookmark",
+          "trigger": "Tap custom/PDF outline or bookmark row",
+          "expected": "Target page revealed; probe page matches."
+        },
+        {
+          "id": "outline.add",
+          "control": "Add page to outline",
+          "trigger": "Outline > Add entry; More/thumbnail > Add to Outline",
+          "expected": "Named entry points to correct page."
+        },
+        {
+          "id": "outline.rename",
+          "control": "Rename outline entry",
+          "trigger": "Outline entry > Rename",
+          "expected": "Title changes; page link preserved."
+        },
+        {
+          "id": "outline.move",
+          "control": "Reorder/nest outline",
+          "trigger": "Entry menu/drag > Move/Indent/Outdent",
+          "expected": "Hierarchy/order changes up to three levels; navigation remains valid."
+        },
+        {
+          "id": "outline.delete",
+          "control": "Delete outline entry",
+          "trigger": "Entry menu/swipe > Delete",
+          "expected": "Entry removed; page retained."
+        },
+        {
+          "id": "outline.sortByPage",
+          "control": "Sort outline by page number",
+          "trigger": "Outline > Sort by Page Number",
+          "expected": "Entries follow current page order."
+        },
+        {
+          "id": "page.setTemplate",
+          "control": "Change paper for this/selected/all pages",
+          "trigger": "More/thumbnail > Change Template; Apply to",
+          "expected": "Chosen pages use paper, size, orientation, colour; other pages unchanged."
+        },
+        {
+          "id": "page.changeCover",
+          "control": "Change/remove cover",
+          "trigger": "More > Change Cover",
+          "expected": "First-page cover and cover-enabled state update consistently."
+        },
+        {
+          "id": "template.choose",
+          "control": "Template picker controls",
+          "trigger": "Paper/Cover picker > categories, sizes, colour, orientation, Choose/Cancel",
+          "expected": "Preview/result agree; Cancel leaves original pages untouched."
+        },
+        {
+          "id": "templateui.manage",
+          "control": "Manage templates",
+          "trigger": "App menu > Templates; ⇧⌥⌘T",
+          "expected": "templateui.manage opens with built-in/custom paper and covers."
+        },
+        {
+          "id": "template.import",
+          "control": "Import custom paper/cover",
+          "trigger": "Manage Templates > Import PDF/Image",
+          "expected": "Custom entry uses first PDF page/image and can be selected."
+        },
+        {
+          "id": "template.group",
+          "control": "Create/rename/delete template group",
+          "trigger": "Manage Templates > group actions",
+          "expected": "Group and contained custom templates update; confirmation/cancel respected."
+        },
+        {
+          "id": "template.delete",
+          "control": "Delete custom template",
+          "trigger": "Custom template > Delete",
+          "expected": "Entry removed; other templates remain available."
+        },
+        {
+          "id": "template.setHidden",
+          "control": "Hide/restore built-in template",
+          "trigger": "Built-in template menu > Hide/Restore",
+          "expected": "Picker visibility changes; built-in can be restored."
+        },
+        {
+          "id": "template.fromPage",
+          "control": "Save page as template",
+          "trigger": "Thumbnail > Create Template from Page",
+          "expected": "Named flattened template appears and recreates page appearance."
+        }
+      ]
+    },
+    {
+      "key": "chrome",
+      "title": "Editor chrome, panels and accessories",
+      "owners": [
+        "F006",
+        "F015",
+        "F016",
+        "F017",
+        "F018",
+        "F027",
+        "F039",
+        "F040",
+        "F041",
+        "F042",
+        "F062",
+        "F063",
+        "F073",
+        "F085",
+        "F091",
+        "F108"
+      ],
+      "controls": [
+        {
+          "id": "window.showLibrary",
+          "control": "Back to Library",
+          "trigger": "cmd.window.showLibrary",
+          "expected": "Probe screen=library and document=null; prior document retained."
+        },
+        {
+          "id": "chrome.title",
+          "control": "Document title menu",
+          "trigger": "menu.title",
+          "expected": "Rename, Move, language, collaborators and Close Other Tabs reachable."
+        },
+        {
+          "id": "chrome.menus",
+          "control": "Add Page, Share and More menus",
+          "trigger": "menu.addPage; menu.share; menu.more",
+          "expected": "Correct registered actions appear; outside tap dismisses; no accidental command."
+        },
+        {
+          "id": "chrome.compact",
+          "control": "Compact navigation overflow",
+          "trigger": "Narrow window/iPhone > More",
+          "expected": "Actions moved off nav bar remain reachable and operate on current document."
+        },
+        {
+          "id": "chrome.assistant",
+          "control": "Assistant droplet toggle",
+          "trigger": "Assistant labelled cmd.panel.open/close",
+          "expected": "openPanels adds/removes aichat.panel; selection/document unchanged."
+        },
+        {
+          "id": "chrome.options",
+          "control": "Active-tool options and settings",
+          "trigger": "Tap selected tool; menu.toolSettings; select another tool",
+          "expected": "Correct tool options/settings open; one popover at a time; dismissal works."
+        },
+        {
+          "id": "chrome.moreTools",
+          "control": "More tools",
+          "trigger": "Palette > More; choose each occasional tool/accessory",
+          "expected": "Selected tool/action runs; probe tool matches when applicable."
+        },
+        {
+          "id": "chrome.scrubTools",
+          "control": "Scrub selected-tool bead",
+          "trigger": "Drag along palette tool axis",
+          "expected": "Active tool changes to hovered slot; palette does not dock accidentally."
+        },
+        {
+          "id": "toolbar.dock.left",
+          "control": "Dock palette left",
+          "trigger": "iPad: drag palette body to left edge; toolbar.dock left",
+          "expected": "Probe paletteDock.edge=left; vertical tools remain tappable; saved after reopen."
+        },
+        {
+          "id": "toolbar.dock.right",
+          "control": "Dock palette right",
+          "trigger": "iPad: drag body to right edge; toolbar.dock right",
+          "expected": "Probe paletteDock.edge=right; settings open inward and remain usable."
+        },
+        {
+          "id": "toolbar.dock.top",
+          "control": "Dock palette top",
+          "trigger": "Drag/fling body to top edge; toolbar.dock top",
+          "expected": "Probe paletteDock.edge=top; horizontal palette/options usable."
+        },
+        {
+          "id": "toolbar.dock.bottom",
+          "control": "Dock palette bottom",
+          "trigger": "Drag/fling body to bottom edge; toolbar.dock bottom",
+          "expected": "Probe paletteDock.edge=bottom; last page line scrolls clear of palette."
+        },
+        {
+          "id": "toolbar.dock.return",
+          "control": "Invalid dock drop and phone restrictions",
+          "trigger": "Drop mid-page; on iPhone attempt side docks",
+          "expected": "Palette returns to allowed dock; phone supports top/bottom only; content unchanged."
+        },
+        {
+          "id": "toolbar.dock.undo",
+          "control": "Undo dock movement",
+          "trigger": "With empty document undo history, move palette; ⌘Z then ⇧⌘Z",
+          "expected": "Window dock undo restores/reapplies paletteDock.edge/along; document undo takes priority when nonempty."
+        },
+        {
+          "id": "toolbar.setVisible",
+          "control": "Hide/show tools",
+          "trigger": "More > Hide/Show Tools; W; pull down page",
+          "expected": "Palette/options collapse and restore; canvas remains usable."
+        },
+        {
+          "id": "toolbar.setLayout",
+          "control": "Customise order/show/hide",
+          "trigger": "More > Customise Toolbar; drag handles; −/+",
+          "expected": "Layout persists; Lasso cannot be hidden and stays first; plugin tools included."
+        },
+        {
+          "id": "toolbar.reset",
+          "control": "Reset toolbar/writing tools/accessories",
+          "trigger": "Customise > each Reset action",
+          "expected": "Only selected layout portion returns to defaults."
+        },
+        {
+          "id": "toolbar.saveLayout",
+          "control": "Save named layout",
+          "trigger": "Customise > name > Save Layout",
+          "expected": "Named layout appears; invalid/duplicate handling visible."
+        },
+        {
+          "id": "toolbar.applyLayout",
+          "control": "Apply saved layout",
+          "trigger": "Customise > saved layout",
+          "expected": "Palette order/visibility matches saved layout."
+        },
+        {
+          "id": "toolbar.deleteLayout",
+          "control": "Delete saved layout",
+          "trigger": "Saved layout > Delete",
+          "expected": "Only chosen saved layout removed; current tools still usable."
+        },
+        {
+          "id": "panel.open",
+          "control": "Open registered panels",
+          "trigger": "Sidebar tabs/menu routes named in other rows",
+          "expected": "Correct panel appears; probe openPanels includes its ID when session-tracked."
+        },
+        {
+          "id": "panel.close",
+          "control": "Close/dismiss panel or sheet",
+          "trigger": "Panel Close; cmd.panel.close; sheet.dismiss; Escape",
+          "expected": "Panel disappears; tracked ID removed; editor focus restored."
+        },
+        {
+          "id": "chrome.panelPlacement",
+          "control": "Panel left/right/floating placement",
+          "trigger": "Panel position/docking controls; Settings > sidebar position",
+          "expected": "Panel moves and insets canvas appropriately; state persists per panel/window."
+        },
+        {
+          "id": "chrome.tabs",
+          "control": "Enable tabs and overflow",
+          "trigger": "Settings > Editing > Tabs; open >5 documents",
+          "expected": "Tab strip/overflow reachable; no document lost when hidden."
+        },
+        {
+          "id": "tab.select",
+          "control": "Switch document tab",
+          "trigger": "Tap tab/overflow; ⌘1–8; ⌘9 last tab",
+          "expected": "Probe document/page reflect chosen tab; per-tab state retained."
+        },
+        {
+          "id": "tab.close",
+          "control": "Close current/all tabs",
+          "trigger": "Tab menu > Close Tab; ⌘W; ⌥⌘W all",
+          "expected": "Correct tabs close; last closure returns library without deleting files."
+        },
+        {
+          "id": "tab.closeOthers",
+          "control": "Close other tabs",
+          "trigger": "Title/tab menu > Close Other Tabs",
+          "expected": "Chosen document remains; other tabs close only."
+        },
+        {
+          "id": "window.open",
+          "control": "New window/document/page window",
+          "trigger": "⌘N; document/tab/page/board menu > Open in New Window",
+          "expected": "New scene opens correct target; edits/window navigation remain independent."
+        },
+        {
+          "id": "windows.restore",
+          "control": "Restore session",
+          "trigger": "Reopen app/window after tab/page changes",
+          "expected": "Tabs and last document/page restore; unsaved edits retained."
+        },
+        {
+          "id": "view.setReadOnly",
+          "control": "Enter/leave Read Only",
+          "trigger": "cmd.view.setReadOnly; ⌥⌘R; title > Edit",
+          "expected": "Palette retracts; subtitle Read only; drawing/mutation blocked; Edit restores tools."
+        },
+        {
+          "id": "pdf.textActions",
+          "control": "Select PDF text",
+          "trigger": "Long-press PDF text",
+          "expected": "Text selection with Highlight, Strikethrough, Define, Speak, Copy appears."
+        },
+        {
+          "id": "pdf.markSelection",
+          "control": "Highlight/strike PDF text",
+          "trigger": "PDF selection > Highlight/Strikethrough",
+          "expected": "Annotation appears over correct range; undoable; PDF background unchanged."
+        },
+        {
+          "id": "pdf.copyDefineSpeak",
+          "control": "Copy/Define/Speak PDF text",
+          "trigger": "PDF selection > each action",
+          "expected": "Clipboard/dictionary/speech contains selected PDF text."
+        },
+        {
+          "id": "layer.panel",
+          "control": "Layers and experimental enable",
+          "trigger": "Settings > Layers; More > Layers; ⌥⌘L",
+          "expected": "layers panel available when enabled; active/visible layer states shown."
+        },
+        {
+          "id": "layer.setActive",
+          "control": "Active layer",
+          "trigger": "Layers > layer; ⌥⌘1–layer number",
+          "expected": "New content goes to selected layer; selection scopes correctly."
+        },
+        {
+          "id": "layer.setVisible",
+          "control": "Show/hide layer",
+          "trigger": "Layers > visibility control",
+          "expected": "Only target layer visibility changes for this viewer; stored content preserved."
+        },
+        {
+          "id": "layer.rename",
+          "control": "Rename layer",
+          "trigger": "Layers > Rename",
+          "expected": "Name updates in panel/menu without moving content."
+        },
+        {
+          "id": "laser",
+          "control": "Laser pointer",
+          "trigger": "tool.laser; L; point/drag canvas",
+          "expected": "Transient pointer/trail visible; item/stroke counts and undo stack unchanged."
+        },
+        {
+          "id": "laser.setMode",
+          "control": "Dot/Trail, colour and trail length",
+          "trigger": "Laser settings > each option",
+          "expected": "Pointer appearance/fade reflects choice; no persisted ink."
+        },
+        {
+          "id": "ruler.set",
+          "control": "Show/hide ruler",
+          "trigger": "Palette Ruler; R",
+          "expected": "Ruler/angle HUD toggles without creating document items."
+        },
+        {
+          "id": "ruler.transform",
+          "control": "Move/rotate ruler and snap",
+          "trigger": "Two-finger move/rotate; angle control",
+          "expected": "Ruler follows; snaps at 0/45/90 degrees; ink guided along edge."
+        },
+        {
+          "id": "ruler.options",
+          "control": "Ruler units, digits and position",
+          "trigger": "Ruler options",
+          "expected": "Tick labels/precision/location match choice."
+        },
+        {
+          "id": "timer.panel",
+          "control": "Time Keeper panel/HUD",
+          "trigger": "Palette/More > Time Keeper; K",
+          "expected": "timekeeper opens/toggles; running session preserved when hidden."
+        },
+        {
+          "id": "timer.start",
+          "control": "Countdown presets/custom timer",
+          "trigger": "Time Keeper > preset or duration/label > Start Timer",
+          "expected": "Countdown advances; named session associated with document."
+        },
+        {
+          "id": "timer.control",
+          "control": "Pause/resume/end/save/discard/restart",
+          "trigger": "Timer HUD/panel; ⇧⌘K pause/resume",
+          "expected": "Correct state/time; save adds history, discard does not; Start Again resets duration."
+        },
+        {
+          "id": "stopwatch.start",
+          "control": "Stopwatch",
+          "trigger": "Time Keeper > Start Stopwatch",
+          "expected": "Elapsed time advances; pause/resume retains elapsed duration."
+        },
+        {
+          "id": "stopwatch.lap",
+          "control": "Stopwatch laps",
+          "trigger": "Lap; ⌥⌘K",
+          "expected": "Lap row/time appended without resetting elapsed clock."
+        },
+        {
+          "id": "timer.modes",
+          "control": "Save/delete custom timer mode",
+          "trigger": "Time Keeper > Save Mode / Delete Mode",
+          "expected": "Preset list persists changes; existing history retained."
+        },
+        {
+          "id": "timer.history",
+          "control": "Past sessions",
+          "trigger": "Time Keeper > History; open entry/load more",
+          "expected": "Name/document/duration/laps correct; no duplicate sessions."
+        },
+        {
+          "id": "present.setMode",
+          "control": "Mirror, presenter page, full page",
+          "trigger": "Share > Presentation mode with external display",
+          "expected": "External screen uses selected mode; page-only modes omit chrome/selection."
+        },
+        {
+          "id": "present.controls",
+          "control": "Blank, Laser, Stop and page navigation",
+          "trigger": "Presenter HUD > each control; scroll pages",
+          "expected": "External display blanks/unblanks, shows laser and stops; local document intact."
+        },
+        {
+          "id": "chrome.status",
+          "control": "Presence and bridge status pills",
+          "trigger": "Tap presence/bridge status after document title",
+          "expected": "Participant/bridge details open; compact status remains reachable."
+        }
+      ]
+    },
+    {
+      "key": "search",
+      "title": "Search and handwriting recognition",
+      "owners": [
+        "F024",
+        "F055",
+        "F056",
+        "F057",
+        "F058",
+        "F104"
+      ],
+      "controls": [
+        {
+          "id": "search.open.library",
+          "control": "Global search",
+          "trigger": "Library magnifier; ⌘F in library; ⌘O",
+          "expected": "Search field focused; library results surface visible."
+        },
+        {
+          "id": "search.open.document",
+          "control": "In-document search",
+          "trigger": "cmd.search.open; ⌘F in document",
+          "expected": "Search scoped to current document; query field focused."
+        },
+        {
+          "id": "search.text",
+          "control": "Search titles, folders, handwriting, typed/PDF/OCR text, audio and cards",
+          "trigger": "Enter fixture query in each scope",
+          "expected": "Matching sections/snippets appear; unrelated/locked content excluded."
+        },
+        {
+          "id": "search.filters",
+          "control": "All/Handwriting/Typed/PDF/Audio/Cards",
+          "trigger": "Search filter chips",
+          "expected": "Results narrow to selected source and recover under All."
+        },
+        {
+          "id": "search.recents",
+          "control": "Recent queries and documents",
+          "trigger": "Open empty search; tap recent chip/document; clear recents when offered",
+          "expected": "Chosen query reruns or document opens; cleared history disappears."
+        },
+        {
+          "id": "search.result",
+          "control": "Open search result",
+          "trigger": "Tap result from each source section",
+          "expected": "Correct document/page/block/card/audio target opens; match visibly highlighted."
+        },
+        {
+          "id": "search.step.next",
+          "control": "Next match",
+          "trigger": "Next; ⌘G",
+          "expected": "Next match revealed; counter and page/viewport update."
+        },
+        {
+          "id": "search.step.previous",
+          "control": "Previous match",
+          "trigger": "Previous; ⇧⌘G",
+          "expected": "Previous match revealed; counter and page/viewport update."
+        },
+        {
+          "id": "search.clearClose",
+          "control": "Clear and close search",
+          "trigger": "Clear field; Close/Escape",
+          "expected": "Query clears or search dismisses; document content unchanged."
+        },
+        {
+          "id": "search.states",
+          "control": "Empty query, no results, indexing and failure",
+          "trigger": "Search missing term; search during indexing; induce error",
+          "expected": "Accurate no-results/indexing message; existing results remain usable; retry works where offered."
+        },
+        {
+          "id": "doc.setLanguage",
+          "control": "Recognition language",
+          "trigger": "Title > Recognition Language; convert.language",
+          "expected": "Selected language persists and re-indexing refreshes recognition/search."
+        },
+        {
+          "id": "index.settings",
+          "control": "Index handwriting and OCR images",
+          "trigger": "Settings > Handwriting Recognition",
+          "expected": "Toggle each option; enabled sources become searchable after indexing."
+        },
+        {
+          "id": "index.rebuild",
+          "control": "Rebuild document/library index",
+          "trigger": "Recognition/repair settings > Re-index",
+          "expected": "Progress completes; known fixture terms return correct hits."
+        },
+        {
+          "id": "recognize.items",
+          "control": "Recognise selected handwriting",
+          "trigger": "Select ink > Convert > Text",
+          "expected": "convert.preview contains recognised text and editable corrections."
+        },
+        {
+          "id": "handwriting.toText",
+          "control": "Convert selection to text",
+          "trigger": "Conversion preview > correct text > Convert",
+          "expected": "Text box contains corrected text and replaces selected ink; Undo restores. Keep-ink variant is API-only unless a UI selector is added."
+        },
+        {
+          "id": "handwriting.toTextPages",
+          "control": "Convert pages to text",
+          "trigger": "SPEC GAP: handwriting.toTextPages exists; no page-conversion menu registration found",
+          "expected": "Each targeted page gains recognised text; scope respected; undoable."
+        },
+        {
+          "id": "convert.cancel",
+          "control": "Copy or cancel recognition preview",
+          "trigger": "Convert preview > Copy Text (⇧⌘C) / Cancel",
+          "expected": "Copied text matches preview; Cancel preserves original ink."
+        },
+        {
+          "id": "convert.recovery",
+          "control": "Reload/retry recognition and Undo Conversion",
+          "trigger": "Preview > Reload Preview/Retry Recognition; receipt/toast > Undo Conversion",
+          "expected": "Stale/error preview refreshes; history.revertGroup reverses conversion without unrelated later edits."
+        },
+        {
+          "id": "search.pagination",
+          "control": "Load more search results",
+          "trigger": "Search > Load more results",
+          "expected": "Additional matching results append without duplicates or lost query/filter."
+        }
+      ]
+    },
+    {
+      "key": "share",
+      "title": "Import, export, print, backup and sync",
+      "owners": [
+        "F001",
+        "F002",
+        "F024",
+        "F025",
+        "F048",
+        "F051",
+        "F064",
+        "F065",
+        "F066",
+        "F067",
+        "F068",
+        "F069",
+        "F070",
+        "F071",
+        "F074"
+      ],
+      "controls": [
+        {
+          "id": "export.present",
+          "control": "Export/share options",
+          "trigger": "Share > Export; library/page selection > Export; ⇧⌘E",
+          "expected": "Correct documents/pages preselected; options sheet/popover opens."
+        },
+        {
+          "id": "export.format",
+          "control": "PDF, PNG/JPEG images, Nib file, Text, CSV",
+          "trigger": "Export > each applicable format",
+          "expected": "Export produces readable selected format; unsupported kind/format disabled or explained."
+        },
+        {
+          "id": "export.scope",
+          "control": "This page/board, Selected, All, folders/multiple documents",
+          "trigger": "Export > Pages/scope",
+          "expected": "Output contains precisely selected pages/documents in correct order."
+        },
+        {
+          "id": "export.options",
+          "control": "Backgrounds, annotations, flatten, searchable text, comments, audio, visible layers",
+          "trigger": "Toggle each export option independently",
+          "expected": "Output includes/excludes selected content; flattened/editable PDF and searchability match settings."
+        },
+        {
+          "id": "export.whiteboard",
+          "control": "Whiteboard crop/tiling",
+          "trigger": "Board Export > Tile board onto paper pages",
+          "expected": "Output bounds/tiles include board content at chosen scale."
+        },
+        {
+          "id": "export.share",
+          "control": "Share exported output",
+          "trigger": "Export > Share",
+          "expected": "System share sheet receives valid output; cancel returns safely."
+        },
+        {
+          "id": "export.files",
+          "control": "Save to Files and completion action",
+          "trigger": "Export > Save to Files; choose destination; Show in Files",
+          "expected": "File saved at destination; completion opens correct location."
+        },
+        {
+          "id": "export.progress",
+          "control": "Long export progress/cancel/error",
+          "trigger": "Export large fixture; cancel or induce destination error",
+          "expected": "Progress remains visible; cancellation/error leaves original document intact and allows retry."
+        },
+        {
+          "id": "export.locked",
+          "control": "Unlock to export",
+          "trigger": "Export locked document > Unlock document",
+          "expected": "Password/Face ID gate appears; denied unlock exposes no content."
+        },
+        {
+          "id": "export.saveToSource",
+          "control": "Save changes to source PDF",
+          "trigger": "Share > Save changes to source; confirm/cancel",
+          "expected": "Confirm updates bookmarked source with annotations; denial/unavailable source handled; Cancel preserves source."
+        },
+        {
+          "id": "print.present",
+          "control": "Print selected/all pages",
+          "trigger": "Export > Print; ⌘P",
+          "expected": "AirPrint preview contains selected scope and options; Cancel changes no content."
+        },
+        {
+          "id": "import.pick",
+          "control": "Import Files",
+          "trigger": "+ New > Import Files; complete/cancel document picker",
+          "expected": "Supported files imported in selected folder; Cancel creates nothing."
+        },
+        {
+          "id": "import.formats",
+          "control": "PDF, images, Office, Nib packages, ZIP, CSV/TSV/TXT, plugins, collections",
+          "trigger": "Import fixtures of each supported type",
+          "expected": "Correct document/content installer opens; malformed/unsupported files report useful errors."
+        },
+        {
+          "id": "import.intoDocument",
+          "control": "Import into current document",
+          "trigger": "Add Page > Import/Import Pages; choose file and position",
+          "expected": "Correct page insertion/count; original pages preserved."
+        },
+        {
+          "id": "import.external",
+          "control": "Open in Nib, AirDrop, Finder/Files and share extension",
+          "trigger": "Open supported file externally; share text/image/URL; Safari Reader PDF",
+          "expected": "Import routes to correct flow; App Group or pasteboard handoff retains content."
+        },
+        {
+          "id": "import.restore",
+          "control": "Restore library backup",
+          "trigger": "Backup > Restore from ZIP; select backup",
+          "expected": "Documents/folders/assets restored without silently overwriting unrelated notes."
+        },
+        {
+          "id": "import.source",
+          "control": "Import in place",
+          "trigger": "Pick PDF through Files provider; annotate/export",
+          "expected": "Save-back route remembers source; permissions/errors handled visibly."
+        },
+        {
+          "id": "scan.documents",
+          "control": "Scan documents with OCR",
+          "trigger": "+ New/Add Page/Image > Scan Document",
+          "expected": "Captured/cropped scans become pages in intended scope; OCR searchable after indexing."
+        },
+        {
+          "id": "scan.qr",
+          "control": "QR reader",
+          "trigger": "+ New/More > Scan QR Code",
+          "expected": "Valid link opens correct route; cancel/denial leaves notes unchanged."
+        },
+        {
+          "id": "backup.manual",
+          "control": "Whole-library ZIP backup",
+          "trigger": "Settings > Backup > Create Library Backup",
+          "expected": "ZIP saved to chosen location and can restore full library."
+        },
+        {
+          "id": "backup.configure",
+          "control": "Automatic backup destination/format/frequency/exclusions",
+          "trigger": "Settings > Backup; Files/WebDAV, subfolder, nib/pdf/both, frequency, exclusion fields; Save",
+          "expected": "Configuration persists; next backup respects format and exclusions."
+        },
+        {
+          "id": "backup.chooseFolder",
+          "control": "Choose backup folder",
+          "trigger": "Backup > Choose Folder",
+          "expected": "System picker grants chosen destination; Cancel keeps previous folder."
+        },
+        {
+          "id": "backup.now",
+          "control": "Back Up Now",
+          "trigger": "Backup/Cloud & Backup > Back Up Now; ⇧⌥⌘B",
+          "expected": "Queue processes; last-run/result changes; expected output files appear."
+        },
+        {
+          "id": "backup.status",
+          "control": "Backup queue/status",
+          "trigger": "Backup status section",
+          "expected": "Pending documents, last run and errors match current work; failures actionable."
+        },
+        {
+          "id": "backup.clearQueue",
+          "control": "Clear pending backups",
+          "trigger": "Backup > Clear Pending Backups",
+          "expected": "Queue clears; library and prior backups remain."
+        },
+        {
+          "id": "syncui.panel",
+          "control": "Cloud & Backup status",
+          "trigger": "Library sync row/app menu > Cloud & Backup",
+          "expected": "syncui.panel shows location, per-document state, pending/error details."
+        },
+        {
+          "id": "sync.now",
+          "control": "Check for changes / Sync Now",
+          "trigger": "App menu > Check for Changes; status > Sync Now",
+          "expected": "External fixture edits merge; local edits retained; status settles."
+        },
+        {
+          "id": "library.chooseFolder",
+          "control": "Choose library folder",
+          "trigger": "App menu/Sync/About > Choose Library Folder",
+          "expected": "Selected external folder loads; cancel preserves active library."
+        },
+        {
+          "id": "library.relocate",
+          "control": "Move/copy library",
+          "trigger": "Sync > Move Library/Copy Library To",
+          "expected": "Requested copy/move completes with content/assets; active location behavior matches action."
+        },
+        {
+          "id": "library.switch",
+          "control": "Switch known libraries",
+          "trigger": "App menu > saved library location",
+          "expected": "Correct folder contents load; prior library preserved."
+        },
+        {
+          "id": "library.repair",
+          "control": "Repair library/catalogue/index",
+          "trigger": "Cloud & Backup > Repair Library / Repair Library and Search Index",
+          "expected": "Catalog rebuilt; readable notes remain; requested index refresh completes."
+        },
+        {
+          "id": "sync.verify",
+          "control": "Verify duplicate/conflict copies",
+          "trigger": "Sync warning > Duplicate and Verify/Open Copy to Verify/Resolve",
+          "expected": "Correct copy/comparison shown; chosen resolution preserves intended content."
+        },
+        {
+          "id": "sync.offline",
+          "control": "Offline/reconnect and format gate",
+          "trigger": "Disconnect provider; edit; reconnect; open newer-format fixture",
+          "expected": "Local edits persist; status explains offline/error; newer format remains read-only."
+        },
+        {
+          "id": "webdav.configure",
+          "control": "WebDAV server/account/folder/certificate policy",
+          "trigger": "Settings > WebDAV; secure password and configuration; Save",
+          "expected": "Valid configuration persists; password masked; invalid endpoint/cert policy reports error."
+        },
+        {
+          "id": "webdav.syncNow",
+          "control": "Sync WebDAV Now",
+          "trigger": "WebDAV/status > Sync Now",
+          "expected": "Pending work completes or actionable error appears; remote fixture edits merge."
+        },
+        {
+          "id": "webdav.status",
+          "control": "WebDAV status/retry",
+          "trigger": "Settings > WebDAV > status/retry",
+          "expected": "Last sync, pending and errors update accurately."
+        },
+        {
+          "id": "study.exportCSV",
+          "control": "Export study set CSV",
+          "trigger": "Study set Share & Export > CSV",
+          "expected": "CSV contains correct front/back values and escaping; reimport succeeds."
+        },
+        {
+          "id": "table.exportCSV",
+          "control": "Export table CSV",
+          "trigger": "Table/Share & Export > CSV",
+          "expected": "Rows/columns and quoted multiline cells export correctly."
+        },
+        {
+          "id": "webdav.disconnect",
+          "control": "Disconnect WebDAV",
+          "trigger": "WebDAV settings > Disconnect; confirm/cancel",
+          "expected": "Confirmed disconnect stops mirror configuration; local library retained; cancel keeps connection."
+        }
+      ]
+    },
+    {
+      "key": "study_ai",
+      "title": "Study, text documents, AI, plugins, collaboration and settings",
+      "owners": [
+        "F003",
+        "F015",
+        "F026",
+        "F027",
+        "F043",
+        "F047",
+        "F048",
+        "F049",
+        "F050",
+        "F051",
+        "F059",
+        "F060",
+        "F061",
+        "F071",
+        "F072",
+        "F073",
+        "F074",
+        "F075",
+        "F076",
+        "F077",
+        "F078",
+        "F079",
+        "F080",
+        "F081",
+        "F082",
+        "F083",
+        "F084",
+        "F085",
+        "F086",
+        "F087",
+        "F088",
+        "F089",
+        "F090",
+        "F091",
+        "F092",
+        "F093",
+        "F094",
+        "F095",
+        "F096",
+        "F098",
+        "F099",
+        "F102",
+        "F103",
+        "F104",
+        "F105",
+        "F106",
+        "F107",
+        "F108",
+        "F109",
+        "F110"
+      ],
+      "controls": [
+        {
+          "id": "card.add",
+          "control": "Add card",
+          "trigger": "Study editor > New Card; ⌘Return",
+          "expected": "New card appears; front/back fields focus correctly."
+        },
+        {
+          "id": "card.update",
+          "control": "Edit front/back text, image and freeform ink",
+          "trigger": "Card editor > each input mode; type, choose/remove photo, draw/erase/clear/paste",
+          "expected": "Both sides persist content; mode changes preserve intended content."
+        },
+        {
+          "id": "card.navigate",
+          "control": "Navigate and select cards",
+          "trigger": "Previous/Next card; list row; Select/Done",
+          "expected": "Preview/fields show chosen card; multi-selection checkmarks accurate."
+        },
+        {
+          "id": "card.move",
+          "control": "Reorder cards",
+          "trigger": "Drag card; card menu > Move Up/Down",
+          "expected": "Card order persists; no side content lost."
+        },
+        {
+          "id": "card.duplicate",
+          "control": "Duplicate card",
+          "trigger": "Card menu > Duplicate",
+          "expected": "Independent copy appears with both sides intact."
+        },
+        {
+          "id": "card.moveTo",
+          "control": "Move cards to another set",
+          "trigger": "Select cards > Move To; pick study set",
+          "expected": "Destination gains cards; source loses selected cards only."
+        },
+        {
+          "id": "card.delete",
+          "control": "Delete cards",
+          "trigger": "Card menu or selection bar > Delete",
+          "expected": "Selected cards removed; Undo restores where supported."
+        },
+        {
+          "id": "studyeditor.scratch",
+          "control": "Scratch Paper",
+          "trigger": "Study editor/session > Open Scratchpad; draw/erase/Clear Paper/Done",
+          "expected": "Temporary drawing works; closing returns to card without overwriting it."
+        },
+        {
+          "id": "studysession.practice",
+          "control": "Practice",
+          "trigger": "Study editor > Practice",
+          "expected": "Practice session opens with progress and first card."
+        },
+        {
+          "id": "studysession.smartLearn",
+          "control": "Smart Learn",
+          "trigger": "Study editor > Smart Learn",
+          "expected": "Due-card session opens; empty/done state accurate."
+        },
+        {
+          "id": "study.session.flip",
+          "control": "Flip card",
+          "trigger": "Tap card/Flip Card; Space",
+          "expected": "Front/back toggles; reduced motion uses accessible transition."
+        },
+        {
+          "id": "study.session.navigate",
+          "control": "Previous/next card",
+          "trigger": "Buttons; ←/→",
+          "expected": "Correct card/progress displayed; boundary handling safe."
+        },
+        {
+          "id": "study.session.grade",
+          "control": "Again/Hard/Good/Easy",
+          "trigger": "Tap each grade; keys 1–4; swipe card",
+          "expected": "Session advances; interval/progress updates for chosen grade; SRS grading not undoable."
+        },
+        {
+          "id": "study.session.end",
+          "control": "End session and summary",
+          "trigger": "Finish deck or Return to Study Set",
+          "expected": "Reviewed/due/hardest statistics shown; returning opens same set."
+        },
+        {
+          "id": "study.resetProgress",
+          "control": "Reset progress",
+          "trigger": "Study options > Reset Progress; confirm/Keep Progress",
+          "expected": "Confirm resets SRS; cancel retains history."
+        },
+        {
+          "id": "study.setReminders",
+          "control": "Review reminders",
+          "trigger": "Study options > Review reminders; allow/deny notification prompt",
+          "expected": "Reminder state persists; denial explained without blocking study."
+        },
+        {
+          "id": "study.setTheme",
+          "control": "Card/background appearance",
+          "trigger": "Study options > card/background colours",
+          "expected": "Preview/session appearance updates and persists per set."
+        },
+        {
+          "id": "study.speak",
+          "control": "Read Aloud and voice language",
+          "trigger": "Study options > Read Aloud; Voice language",
+          "expected": "Correct side spoken in chosen available voice; stop/navigation behaves coherently."
+        },
+        {
+          "id": "study.importText",
+          "control": "Import CSV/TSV/TXT/Anki/Quizlet",
+          "trigger": "Import study text/file",
+          "expected": "Escaped term/definition pairs create expected cards; invalid rows reported."
+        },
+        {
+          "id": "block.insert",
+          "control": "Insert blocks/slash menu",
+          "trigger": "Text document > / or Insert Block; select paragraph/H1–H3/bullet/numbered/todo/quote/code/divider/table/image/video/plugin block",
+          "expected": "Chosen editable block appears at caret; focus and order correct."
+        },
+        {
+          "id": "block.update",
+          "control": "Type/edit block and title from first line",
+          "trigger": "Text editor; enter multiline text, caption or video URL",
+          "expected": "Content persists; auto-title follows rules without overwriting explicit title."
+        },
+        {
+          "id": "block.turnInto",
+          "control": "Turn Into block kind",
+          "trigger": "Block handle > Turn Into; choose each eligible kind",
+          "expected": "Block kind/style changes; text preserved where valid."
+        },
+        {
+          "id": "block.format",
+          "control": "Inline formatting",
+          "trigger": "Select text > B/I/U/strike/code/highlight/super/subscript/colour/Clear Formatting",
+          "expected": "Only selected range changes; Undo restores."
+        },
+        {
+          "id": "block.indent",
+          "control": "Indent/outdent and lists",
+          "trigger": "Formatting bar > indent/outdent; Tab/Shift-Tab",
+          "expected": "Nesting and list numbering update correctly."
+        },
+        {
+          "id": "block.todo",
+          "control": "Toggle to-do",
+          "trigger": "Checkbox; block menu Mark Done/Not Done; ⇧⌘Return",
+          "expected": "Checked state toggles without changing text."
+        },
+        {
+          "id": "block.move",
+          "control": "Reorder blocks",
+          "trigger": "Drag block handle; Move Up/Down; ⌥⌘↑/↓",
+          "expected": "Block moves with content and comments intact."
+        },
+        {
+          "id": "block.duplicate",
+          "control": "Duplicate block",
+          "trigger": "Block menu > Duplicate; ⌘D",
+          "expected": "Independent block copy inserted with content preserved."
+        },
+        {
+          "id": "block.delete",
+          "control": "Delete blocks",
+          "trigger": "Block menu > Delete; ⇧⌘Delete",
+          "expected": "Selected blocks removed; Undo restores."
+        },
+        {
+          "id": "block.media",
+          "control": "Image/video captions and replacement",
+          "trigger": "Media block > Add/Replace; edit caption",
+          "expected": "Correct media/caption stored; cancel/discard leaves original."
+        },
+        {
+          "id": "block.outline",
+          "control": "Heading outline/collapse",
+          "trigger": "Text-document Outline > heading; expand/collapse",
+          "expected": "Heading hierarchy tracks edits; navigation reveals correct block."
+        },
+        {
+          "id": "block.comment",
+          "control": "Comment on selected text",
+          "trigger": "Selection > Add Comment; ⇧⌘M",
+          "expected": "Comment anchors to intended range; thread/sidebar visible."
+        },
+        {
+          "id": "block.commentManage",
+          "control": "Reply/edit/delete/resolve/reopen text comments",
+          "trigger": "Text Comments panel/message actions",
+          "expected": "Correct thread updates; Open/Resolved filters and Show in Document work."
+        },
+        {
+          "id": "table.cells",
+          "control": "Edit cells and keyboard traversal",
+          "trigger": "Table cell; type; Tab/Shift-Tab/Return",
+          "expected": "Correct cell edited; focus crosses cells safely."
+        },
+        {
+          "id": "table.rowsColumns",
+          "control": "Insert/delete/move rows and columns",
+          "trigger": "Table cell/block menu > each row/column action",
+          "expected": "Grid dimensions/order update; surviving content preserved."
+        },
+        {
+          "id": "table.mergeSplit",
+          "control": "Merge/split cells",
+          "trigger": "Select cells > Merge; merged cell > Split",
+          "expected": "Spans change correctly; content preserved by defined behavior."
+        },
+        {
+          "id": "table.style",
+          "control": "Cell background/borders/column width",
+          "trigger": "Table controls > colour, Cell Borders; drag width handle",
+          "expected": "Selected cells/borders/width update; readable layout retained."
+        },
+        {
+          "id": "table.clipboard",
+          "control": "Copy/cut/paste cells",
+          "trigger": "Table cell selection > Copy/Cut/Paste",
+          "expected": "Tabular data transfers correctly; Cut is undoable."
+        },
+        {
+          "id": "aichat.panel",
+          "control": "Open Assistant from all contexts",
+          "trigger": "Assistant droplet; object/block/library Ask AI; shortcut from directory",
+          "expected": "aichat.panel shows correct selection/page/document/library context."
+        },
+        {
+          "id": "ai.chat.configure.mode",
+          "control": "Ask/Edit mode",
+          "trigger": "Assistant > Ask/Edit",
+          "expected": "Ask does not mutate notes; Edit permits reviewed changes."
+        },
+        {
+          "id": "ai.chat.configure.context",
+          "control": "Add/remove context and attachments",
+          "trigger": "Context chips +/remove; Selection/Page/Document/Library; screenshot/image",
+          "expected": "Visible chips disclose included data; removal excludes it from next request."
+        },
+        {
+          "id": "ai.chat.configure.presentation",
+          "control": "Sidebar/floating/window assistant",
+          "trigger": "Assistant display-mode menu; drag/dock panel",
+          "expected": "Same conversation persists; canvas/panel layout adapts; separate window works."
+        },
+        {
+          "id": "ai.chat.send",
+          "control": "Compose, dictate and send",
+          "trigger": "Type prompt; Dictate; Send",
+          "expected": "Send enabled only with text; streaming answer/trace appears; provider/model identified."
+        },
+        {
+          "id": "ai.chat.stop",
+          "control": "Stop generation",
+          "trigger": "Stop generating",
+          "expected": "Request stops; partial conversation retained; composer becomes usable."
+        },
+        {
+          "id": "ai.chat.error",
+          "control": "No provider/offline/retry/trimmed context",
+          "trigger": "Open without provider; failed request > Retry; large context",
+          "expected": "Correct setup/error/trim notice; retry preserves conversation."
+        },
+        {
+          "id": "ai.chat.inspect",
+          "control": "Tool trace and citations",
+          "trigger": "Show/Hide tool calls; tap citation",
+          "expected": "Raw calls expand; citation reveals correct source and highlight."
+        },
+        {
+          "id": "ai.chat.new",
+          "control": "New/select conversation",
+          "trigger": "Assistant menu > New conversation/Conversations; choose row",
+          "expected": "Correct thread opens; other conversations retained."
+        },
+        {
+          "id": "ai.chat.rename",
+          "control": "Rename conversation",
+          "trigger": "Conversations > Rename > Save name",
+          "expected": "Title updates persistently."
+        },
+        {
+          "id": "ai.chat.delete",
+          "control": "Delete conversation",
+          "trigger": "Conversations > Delete; confirm/cancel",
+          "expected": "Confirm removes chosen thread; Cancel preserves it."
+        },
+        {
+          "id": "ai.chat.feedback",
+          "control": "Thumbs up/down",
+          "trigger": "Answer > each rating",
+          "expected": "Selected rating persists for correct message."
+        },
+        {
+          "id": "ai.chat.draft",
+          "control": "Modify/insert/discard generated draft or image",
+          "trigger": "Answer > Use as draft; Modify; Insert/Discard",
+          "expected": "Modify previews revision; Insert creates intended content once; Discard changes nothing."
+        },
+        {
+          "id": "ai.chat.dropAnswer",
+          "control": "Drag/insert answer onto document",
+          "trigger": "Drag answer onto page/block insertion target",
+          "expected": "Native text/blocks inserted in requested location; undoable."
+        },
+        {
+          "id": "ai.chat.proposal",
+          "control": "Per-change inclusion and On page preview",
+          "trigger": "Proposal card > each include toggle; On page eye",
+          "expected": "Only enabled proposals preview; document counts/content unchanged before acceptance."
+        },
+        {
+          "id": "ai.chat.acceptProposals",
+          "control": "Accept/review proposal changes",
+          "trigger": "Proposal > Accept N; Review large/cross-page changes",
+          "expected": "Only approved non-destructive changes commit; one undo group; count/receipt accurate."
+        },
+        {
+          "id": "ai.chat.proposalDelete",
+          "control": "Explicit destructive proposal action",
+          "trigger": "Proposal destructive row > Delete; confirm/deny",
+          "expected": "Delete happens only after explicit approval; Accept does not silently include it."
+        },
+        {
+          "id": "ai.chat.confirm",
+          "control": "Allow once / Allow for turn / Deny",
+          "trigger": "Inline Gateway confirmation",
+          "expected": "Chosen scope honored; denied operation makes no change; conversation continues."
+        },
+        {
+          "id": "ai.chat.proposalDiscard",
+          "control": "Discard proposals",
+          "trigger": "Proposal > Discard",
+          "expected": "Ghosts/badges disappear; original content unchanged."
+        },
+        {
+          "id": "ai.chat.undo",
+          "control": "Receipt Undo/Show",
+          "trigger": "Applied receipt > Undo / Show",
+          "expected": "Correct AI group reverts; Show reveals affected region without unrelated edits."
+        },
+        {
+          "id": "aiactions.summarize",
+          "control": "Summarize document/selection",
+          "trigger": "Assistant quick actions > Summarize / Summarize selection",
+          "expected": "Scoped summary with source citations; no document edit."
+        },
+        {
+          "id": "aiactions.visualSummary",
+          "control": "Visual summary",
+          "trigger": "Quick actions > Visual summary",
+          "expected": "New page with editable summary created after review; original pages intact."
+        },
+        {
+          "id": "aiactions.questions",
+          "control": "Suggest questions and Explain",
+          "trigger": "Quick actions > Suggest questions / Explain",
+          "expected": "Scoped response appears without modifying source."
+        },
+        {
+          "id": "ai.quiz",
+          "control": "Quiz me / Create quiz study set",
+          "trigger": "Quick actions > Quiz me / Create quiz study set",
+          "expected": "Requested questions or new populated study set generated with correct scope."
+        },
+        {
+          "id": "aiactions.translate",
+          "control": "Translate, replace or insert translation",
+          "trigger": "Quick actions > Translate / Translate and replace / Insert translation",
+          "expected": "Chosen language honored; replace touches selection only; insert preserves source on canvas/blocks."
+        },
+        {
+          "id": "aiactions.diagrams",
+          "control": "Mind map, flowchart, timeline",
+          "trigger": "Quick actions > each diagram action",
+          "expected": "Editable native nodes/connectors created from scoped content after review."
+        },
+        {
+          "id": "aiactions.generate",
+          "control": "Generate template/table/draft/report outline",
+          "trigger": "Quick actions > each named action",
+          "expected": "Appropriate native page/blocks/table/outline produced after review."
+        },
+        {
+          "id": "outline.generate",
+          "control": "Generate notebook outline",
+          "trigger": "Quick actions > Generate outline",
+          "expected": "Reviewed entries link to correct source pages."
+        },
+        {
+          "id": "doc.suggestTitle",
+          "control": "Suggest document title",
+          "trigger": "Creation/AI title suggestion > Use",
+          "expected": "Suggested single-line title applied only on acceptance."
+        },
+        {
+          "id": "aiactions.rewrite",
+          "control": "Concise/professional/improve flow",
+          "trigger": "Block AI menu > each action",
+          "expected": "Only targeted blocks rewritten after review; formatting/source scope respected."
+        },
+        {
+          "id": "aiactions.user",
+          "control": "Create/edit/delete user quick actions",
+          "trigger": "SPEC GAP: settings-backed aiactions.user.* actions exist; no action-editing UI registration found",
+          "expected": "Saved prompt/action appears and runs with chosen mode/scope; removal removes it."
+        },
+        {
+          "id": "ai.generateImage",
+          "control": "Generate image",
+          "trigger": "Assistant > Generate image",
+          "expected": "Configured image provider/system flow produces preview; Modify/Insert/Discard work."
+        },
+        {
+          "id": "ai.provider.save",
+          "control": "Add/edit provider",
+          "trigger": "Settings > AI > Add provider; preset/protocol/URL/model/key/headers/capabilities/token limits",
+          "expected": "Saved provider matches input; keys stay secure; invalid fields rejected."
+        },
+        {
+          "id": "ai.provider.models",
+          "control": "Load/select provider model",
+          "trigger": "Provider editor > Load models/Available models",
+          "expected": "Available models listed or useful error; selected model saved."
+        },
+        {
+          "id": "ai.provider.test",
+          "control": "Test connection",
+          "trigger": "Provider editor > Test connection",
+          "expected": "Success or specific connection/auth error displayed; no note changes."
+        },
+        {
+          "id": "ai.provider.activate",
+          "control": "Use provider",
+          "trigger": "AI settings > Use this provider",
+          "expected": "Active provider/model updates Assistant; old provider retained."
+        },
+        {
+          "id": "ai.provider.delete",
+          "control": "Delete provider and key",
+          "trigger": "Provider editor > Delete; confirm/cancel",
+          "expected": "Confirm removes provider/key; cancel preserves; no secret displayed."
+        },
+        {
+          "id": "ai.settingsPolicy",
+          "control": "Confirmation policy, max steps and direct tools",
+          "trigger": "Settings > AI > each control; Add/Remove/Restore default tools",
+          "expected": "User policy/tool list persists and affects subsequent requests."
+        },
+        {
+          "id": "math.convert",
+          "control": "Convert handwritten mathematics",
+          "trigger": "Selected ink > Convert > Maths; edit recognised LaTeX; Convert",
+          "expected": "Typeset maths replaces selected ink while original retained for copy; Undo restores."
+        },
+        {
+          "id": "math.setLatex",
+          "control": "Edit LaTeX",
+          "trigger": "Maths object > Edit LaTeX",
+          "expected": "Rendered equation reflects valid lines; invalid input reports error."
+        },
+        {
+          "id": "math.copy",
+          "control": "Copy/share LaTeX, PNG or original ink",
+          "trigger": "Maths object > each Copy/Share format",
+          "expected": "Clipboard/share data matches equation and requested representation."
+        },
+        {
+          "id": "math.assist",
+          "control": "Inline equation answer",
+          "trigger": "Write equation ending =; tap glow > answer; ⇧⌘=",
+          "expected": "Checked result inserted as ink; source retained; Undo removes answer."
+        },
+        {
+          "id": "math.assistOptions",
+          "control": "Answer format and recognition correction",
+          "trigger": "Math Assist glow/options > fraction/mixed/decimal; edit recognition",
+          "expected": "Preview/result follows corrected expression and format."
+        },
+        {
+          "id": "math.evaluate",
+          "control": "On-device calculation",
+          "trigger": "Math Assist with variables/functions/systems/matrices/calculus fixtures",
+          "expected": "Correct supported result or explicit unsupported/error state; no invented answer."
+        },
+        {
+          "id": "math.solve",
+          "control": "Solve and Teach Me",
+          "trigger": "Maths/AI action > Solve / Teach Me",
+          "expected": "Steps or sequential hints appear; numeric checks and provider errors visible."
+        },
+        {
+          "id": "math.graph.create",
+          "control": "Insert interactive graph",
+          "trigger": "Insert Graph; page menu; ⌃⌘G",
+          "expected": "mathgraph.editor opens; accepted expressions create graph item."
+        },
+        {
+          "id": "math.graph.setViewport",
+          "control": "Pan/zoom/edit graph",
+          "trigger": "Drag/pinch graph; graph editor expression/range controls",
+          "expected": "Graph viewport/curves update; page viewport not accidentally moved."
+        },
+        {
+          "id": "doc.setWritingAids",
+          "control": "Spellcheck and Math Assist per document",
+          "trigger": "More or Pen settings > each Writing Aid toggle",
+          "expected": "Only chosen document behavior changes; existing content preserved."
+        },
+        {
+          "id": "spellcheck.tapAt",
+          "control": "Handwriting spelling correction",
+          "trigger": "Tap underlined word; choose replacement/ignore",
+          "expected": "Corrected word ink matches context; unrelated ink unchanged."
+        },
+        {
+          "id": "dictionary.add",
+          "control": "Add personal dictionary word",
+          "trigger": "Spelling suggestions > Add to Dictionary",
+          "expected": "Word no longer flagged; dictionary lists it."
+        },
+        {
+          "id": "dictionary.remove",
+          "control": "Remove dictionary word",
+          "trigger": "Writing Aids > personal dictionary > Remove",
+          "expected": "Word removed and eligible for checking again."
+        },
+        {
+          "id": "meeting.summarize",
+          "control": "Live/regenerated meeting summary",
+          "trigger": "Audio/More > Summary; Summarise/Regenerate",
+          "expected": "Summary derives from transcript; timeline/quality flags visible."
+        },
+        {
+          "id": "meeting.generateNotes",
+          "control": "Generate/enhance meeting notes",
+          "trigger": "Recording menu > Generate Notes/Enhance Notes",
+          "expected": "Native notes added/appended below source after review; original preserved."
+        },
+        {
+          "id": "meeting.settings",
+          "control": "Live summary, cloud engine and translation language",
+          "trigger": "Settings > Meeting AI/Recording Settings; switch language mid-meeting",
+          "expected": "Subsequent transcript/summary uses chosen engine/language; availability explained."
+        },
+        {
+          "id": "pluginmanager.manager",
+          "control": "Plugin manager and details",
+          "trigger": "Settings > Plugins; open plugin row",
+          "expected": "Name/version/author/permissions/contributions/source shown accurately."
+        },
+        {
+          "id": "plugin.install",
+          "control": "Install File/URL/Gallery",
+          "trigger": "Plugins > Install from; select package/URL/gallery item",
+          "expected": "Consent shows source/hash/permissions; Install adds plugin only after approval."
+        },
+        {
+          "id": "plugin.installConsent",
+          "control": "Hash and install cancellation",
+          "trigger": "Consent > Show full hash; Cancel/Install",
+          "expected": "Full hash readable; Cancel installs nothing; approved hash matches installed grant."
+        },
+        {
+          "id": "plugin.update",
+          "control": "Update/replacement permission review",
+          "trigger": "Plugin detail/gallery > Review Update/Replacement",
+          "expected": "Permission diff displayed; approval required; update preserves valid user settings."
+        },
+        {
+          "id": "plugin.review",
+          "control": "Review synced/changed plugin",
+          "trigger": "Plugin detail > Review Permissions",
+          "expected": "Unreviewed code stays inactive until approved; denial keeps disabled."
+        },
+        {
+          "id": "plugin.enable",
+          "control": "Enable/disable plugin",
+          "trigger": "Plugin switch or detail Enable/Disable",
+          "expected": "Contributions appear/disappear immediately; no stale tool/menu/panel."
+        },
+        {
+          "id": "pluginmanager.permission",
+          "control": "Grant/revoke individual permission",
+          "trigger": "Plugin detail > permission toggles",
+          "expected": "Revoked capability fails safely; unrelated grants retained."
+        },
+        {
+          "id": "plugin.uninstall",
+          "control": "Remove plugin",
+          "trigger": "Plugin detail > Remove Plugin; confirm/Keep",
+          "expected": "Plugin/grant/contributions removed on confirm; cancel preserves."
+        },
+        {
+          "id": "plugin.reload",
+          "control": "Reload plugin/crashed panel",
+          "trigger": "Detail > Reload Plugin; crashed panel > Reload",
+          "expected": "Plugin restarts; panel recovers or shows actionable failure."
+        },
+        {
+          "id": "plugin.panels",
+          "control": "HTML plugin panel controls and report",
+          "trigger": "Open fixture plugin panel; interact; Close; crash > Report",
+          "expected": "Declared controls call commands; tokens/accessibility adapt; error report reachable."
+        },
+        {
+          "id": "plugin.contributions",
+          "control": "Plugin tool/options/menu/inspector/block/import/export/Pencil/action controls",
+          "trigger": "Install fixture packs; visit each declared contribution",
+          "expected": "Each registered contribution appears in proper context and executes; disabled plugin removes it."
+        },
+        {
+          "id": "gallery.list",
+          "control": "Gallery search/category/creator/saved items",
+          "trigger": "Library > Gallery; search/filter/save row",
+          "expected": "Matching entries appear; saved state persists; no-result/error retry usable."
+        },
+        {
+          "id": "plugin.galleries",
+          "control": "Add/remove gallery index",
+          "trigger": "Gallery > Add Gallery; edit configured indexes",
+          "expected": "Valid index contributes entries; invalid URL/error handled; removal removes source."
+        },
+        {
+          "id": "pluginmanager.console",
+          "control": "Developer console",
+          "trigger": "Plugin detail > Open Developer Console",
+          "expected": "pluginmanager.console opens with plugin selector/logs."
+        },
+        {
+          "id": "pluginmanager.evaluate",
+          "control": "Run JavaScript and tail logs",
+          "trigger": "Console > choose plugin; enter script; Run; Tail Logs",
+          "expected": "Result/errors/logs visible for chosen plugin only."
+        },
+        {
+          "id": "pluginmanager.new",
+          "control": "New plugin template",
+          "trigger": "Console > New Plugin; name/create",
+          "expected": "Valid editable starter plugin generated; consent still applies."
+        },
+        {
+          "id": "pluginmanager.export",
+          "control": "Export plugin and SDK types",
+          "trigger": "Detail > Export .nibplugin; Console > Export nib.d.ts",
+          "expected": "Valid package/types shareable; SDK reflects live commands."
+        },
+        {
+          "id": "plugin.settings",
+          "control": "Plugin declared settings",
+          "trigger": "Settings > Plugins > plugin settings > Save Setting",
+          "expected": "Schema-valid values persist; invalid values rejected visibly."
+        },
+        {
+          "id": "collab.host",
+          "control": "Share Live",
+          "trigger": "Share > Share live; choose transport/role",
+          "expected": "collab.share displays join code/QR and participants."
+        },
+        {
+          "id": "collab.join",
+          "control": "Join live session",
+          "trigger": "+ New > Join Live Session; enter/scan code",
+          "expected": "Approval flow starts; accepted document opens with synced content."
+        },
+        {
+          "id": "collab.approve",
+          "control": "Approve/decline join request",
+          "trigger": "Host Share Live > request > Approve/Decline",
+          "expected": "Only approved participant joins; denied client informed."
+        },
+        {
+          "id": "collab.setRole",
+          "control": "Can edit/Can view role",
+          "trigger": "Host participant > role",
+          "expected": "Client edit permission changes; viewer cannot mutate notes."
+        },
+        {
+          "id": "collab.revoke",
+          "control": "Remove participant",
+          "trigger": "Host participant > Remove",
+          "expected": "Client disconnects/loses access; host content remains."
+        },
+        {
+          "id": "collab.leave",
+          "control": "Leave/stop sharing",
+          "trigger": "Share Live > Leave/Stop",
+          "expected": "Live session ends as requested; local document retained."
+        },
+        {
+          "id": "collab.follow",
+          "control": "Follow/stop following participant",
+          "trigger": "Presence bead or title menu > Follow; Stop HUD",
+          "expected": "Viewport follows selected person then becomes independent on Stop."
+        },
+        {
+          "id": "collab.followMe",
+          "control": "Follow Me",
+          "trigger": "Title/teacher controls > Follow Me on/off",
+          "expected": "Permitted participants follow host viewport; stop restores control."
+        },
+        {
+          "id": "collab.markSeen",
+          "control": "Mark page/selection/all/shared changes seen",
+          "trigger": "Thumbnail/library/More > Mark as Seen/Mark All",
+          "expected": "Correct unseen badges disappear; content unchanged."
+        },
+        {
+          "id": "collab.shared",
+          "control": "Shared tab management",
+          "trigger": "Library > Shared; open session/document/menu",
+          "expected": "Correct shared items/session status; reopen navigates correctly."
+        },
+        {
+          "id": "collab.settings",
+          "control": "Presence/name/cursor/notification settings",
+          "trigger": "Settings > Collaboration",
+          "expected": "Chosen visibility/notification behavior persists and appears to peers."
+        },
+        {
+          "id": "relay.configure",
+          "control": "Relay URL and token",
+          "trigger": "Settings > Collaboration Relay; secure token; Save",
+          "expected": "Valid relay used for next session; invalid/unreachable server reported."
+        },
+        {
+          "id": "bridge.setEnabled",
+          "control": "MCP bridge on/off",
+          "trigger": "Settings > Bridge > MCP bridge",
+          "expected": "Listening status/address changes; off stops service; failure visible."
+        },
+        {
+          "id": "bridge.network",
+          "control": "Port, address and allowed networks",
+          "trigger": "Bridge > address, port/default, allowlist/default networks",
+          "expected": "Valid user settings apply; malformed values rejected; displayed endpoint accurate."
+        },
+        {
+          "id": "bridge.pair",
+          "control": "Pairing code/token/QR/client configuration",
+          "trigger": "Bridge > Show/Hide/Copy Token, QR, Claude Code/JSON, shell selector",
+          "expected": "Correct connection material displayed/copied; hidden token masked."
+        },
+        {
+          "id": "bridge.rotate",
+          "control": "Rotate token",
+          "trigger": "Bridge > Rotate Token; confirm/cancel",
+          "expected": "Old credentials stop working after confirm; Cancel preserves credentials."
+        },
+        {
+          "id": "bridge.clients",
+          "control": "Connected clients/scopes/last call",
+          "trigger": "Bridge > clients; title status pill",
+          "expected": "Current client/scopes/activity shown accurately."
+        },
+        {
+          "id": "bridge.policy",
+          "control": "Confirmation policy and keep awake",
+          "trigger": "Bridge > Always/Deletions/Never; Keep screen awake",
+          "expected": "Confirmed policy persists; incoming commands honor it; awake behavior follows switch."
+        },
+        {
+          "id": "bridge.proposals",
+          "control": "External-agent proposals",
+          "trigger": "Paired fixture agent proposes edits; use review controls",
+          "expected": "Client-labelled proposals use same preview/accept/deny/undo behavior as Assistant."
+        },
+        {
+          "id": "settings.open",
+          "control": "Settings navigation/search/dismiss",
+          "trigger": "Library gear; ⌘,; each section; Search settings; Done",
+          "expected": "Correct page found including keyword matches; Done returns to prior screen."
+        },
+        {
+          "id": "settings.profile",
+          "control": "Local author name",
+          "trigger": "General > Profile > Your name",
+          "expected": "Name persists and appears on new comments/stickies/collaboration."
+        },
+        {
+          "id": "settings.language",
+          "control": "App/default recognition language",
+          "trigger": "General > Language",
+          "expected": "Available language selection persists; new-document recognition default updates."
+        },
+        {
+          "id": "settings.notifications",
+          "control": "Notification status/system settings",
+          "trigger": "General > Notifications > Open Notification Settings",
+          "expected": "System settings opens; returning refreshes status."
+        },
+        {
+          "id": "settings.editing",
+          "control": "Scroll direction, tabs, undo side, status bar, sidebar side",
+          "trigger": "Editing > each setting",
+          "expected": "New/current applicable editor chrome matches saved value."
+        },
+        {
+          "id": "settings.stylus",
+          "control": "Pencil-only/Any input; palm sensitivity; handedness/posture",
+          "trigger": "Stylus & Palm Rejection > each option",
+          "expected": "Input policy/palm rejection changes; settings persist."
+        },
+        {
+          "id": "settings.writing",
+          "control": "Writing Aid defaults and Smart Ink",
+          "trigger": "Writing > Writing Aids/Smart Ink",
+          "expected": "Defaults affect new documents; disabled aids do not modify ink."
+        },
+        {
+          "id": "settings.undo",
+          "control": "Gesture enable and Undo/Redo position",
+          "trigger": "Editing > Undo and Redo",
+          "expected": "Two-/three-finger gestures respect enable setting; buttons move to configured side."
+        },
+        {
+          "id": "settings.appearance",
+          "control": "Full/Calm/Off liquid and system appearance",
+          "trigger": "General > Appearance > Liquid; change light/dark/tinted in system UI",
+          "expected": "Liquid choice persists; system theme/icon variants update; paper/ink never invert. No in-app theme override."
+        },
+        {
+          "id": "settings.a11y",
+          "control": "Accessibility/page contents/language support",
+          "trigger": "General > Accessibility; More > Page Contents",
+          "expected": "a11y.pageContents lists/spoken summary reflects page; item navigation works."
+        },
+        {
+          "id": "settings.keyboard",
+          "control": "Shortcut directory, search, single-key switch",
+          "trigger": "General > Keyboard and Pointer",
+          "expected": "Search finds keys; disabling single keys prevents tool changes while modified keys still work."
+        },
+        {
+          "id": "keyboard.routing",
+          "control": "Shortcut scope and active-window routing",
+          "trigger": "Run registered shortcuts in library/canvas/text/study and second window",
+          "expected": "Only context winner runs once; typing characters never selects canvas tools."
+        },
+        {
+          "id": "keyboard.tools",
+          "control": "Tool/accessory/preset shortcut coverage",
+          "trigger": "P, 2, H/E/V/S/T/D/I/A/M/N/L/R/K/W, 1–9/0, [ and ]; test live shortcut winner",
+          "expected": "Selected tool, accessory visibility, swatch or width matches live directory."
+        },
+        {
+          "id": "keyboard.edit",
+          "control": "Undo/redo/cut/copy/paste/duplicate/select/delete",
+          "trigger": "⌘Z/⇧⌘Z/⌘X/C/V/D/A, Delete, Escape",
+          "expected": "Appropriate text/object/card/page action executes in focused context."
+        },
+        {
+          "id": "keyboard.text",
+          "control": "Text-format and block shortcuts",
+          "trigger": "⌘B/I/U, ⇧⌘X/H, ⌘E/T, ⌃⌘0–8/=/−, Tab/Shift-Tab",
+          "expected": "Matching formatting/kind/indent applies; source text not lost."
+        },
+        {
+          "id": "keyboard.navigation",
+          "control": "File/find/view/tab and discoverability keys",
+          "trigger": "Hold ⌘; run listed creation/open/export/print/find/page/zoom/sidebar/tab/window keys",
+          "expected": "Directory/discoverability matches live routing and correct target window."
+        },
+        {
+          "id": "keyboard.pointer",
+          "control": "Pointer hover/right-click/⌘scroll",
+          "trigger": "Hover chrome; right-click canvas; ⌘scroll or trackpad pinch",
+          "expected": "Hover actionable; context menu opens; zoom anchors to pointer."
+        },
+        {
+          "id": "commandbar.specGap",
+          "control": "Command bar search/run/arguments/recents",
+          "trigger": "SPEC GAP: DESIGN §14.16 More > Commands / ⌘K lacks discovered UI registration",
+          "expected": "Required fuzzy command list, source/key hints, Return execution and Tab arguments must work; text ⌘K remains Add Link."
+        },
+        {
+          "id": "lock.setup",
+          "control": "Password, hint and Face ID setup/change",
+          "trigger": "Settings > Password Protection",
+          "expected": "Credentials/hint saved through secure UI; invalid confirmation rejected."
+        },
+        {
+          "id": "doc.setLocked",
+          "control": "Lock/remove lock",
+          "trigger": "Library/document menu > Lock/Remove Lock",
+          "expected": "Locked content gated; removal requires authentication; visible status updates."
+        },
+        {
+          "id": "doc.unlock",
+          "control": "Unlock locked note",
+          "trigger": "Open locked note > Face ID/password",
+          "expected": "Success reveals content; failure/cancel leaves content hidden and unsearchable."
+        },
+        {
+          "id": "onboarding.folder",
+          "control": "Choose external library or keep inside Nib",
+          "trigger": "First launch > Choose Folder / Keep Notes in Nib",
+          "expected": "Chosen library loads; internal-storage warning and cancellation respected."
+        },
+        {
+          "id": "onboarding.pencil",
+          "control": "Pencil practice and gesture choices",
+          "trigger": "Onboarding Pencil step; draw; Clear Lines; choose bindings",
+          "expected": "Practice ink/clear works; chosen bindings persist."
+        },
+        {
+          "id": "onboarding.ai",
+          "control": "Optional AI onboarding",
+          "trigger": "Provider rows or Skip",
+          "expected": "Settings route handles keys; Skip proceeds without provider."
+        },
+        {
+          "id": "onboarding.complete",
+          "control": "Back/Skip Setup/sample note/Done",
+          "trigger": "Onboarding controls; confirm skip if requested",
+          "expected": "Navigation preserves choices; optional sample created once; Done opens QuickNote."
+        },
+        {
+          "id": "calendar.settings",
+          "control": "Calendar permission/accounts/reminders",
+          "trigger": "Settings > Calendar; Calendar tab date/event controls",
+          "expected": "EventKit access state clear; chosen events/reminders reflected in planner."
+        },
+        {
+          "id": "calendar.events",
+          "control": "Sync calendar page",
+          "trigger": "Planner page/More > Sync Calendar Events",
+          "expected": "Updated events shown without duplicating linked notes."
+        },
+        {
+          "id": "diagnostics.export",
+          "control": "Export diagnostics/report issue",
+          "trigger": "Advanced > Troubleshooting > Export/Report",
+          "expected": "Sanitised diagnostics share sheet or issue tracker opens; notes/keys excluded."
+        },
+        {
+          "id": "diagnostics.safeMode",
+          "control": "Feature enable/safe mode/experimental",
+          "trigger": "Troubleshooting > feature toggles; relaunch",
+          "expected": "Only selected features disabled/enabled; safe-mode recovery remains usable."
+        },
+        {
+          "id": "about.panel",
+          "control": "About/privacy/parity/project links",
+          "trigger": "Settings/About > each page; parity search/filter; project link",
+          "expected": "Accurate content and search results; external links open intended destination."
+        },
+        {
+          "id": "app.deleteAllData",
+          "control": "Delete all Nib data, optional library",
+          "trigger": "About > Privacy & Data > Also delete my library; Delete; confirm/cancel",
+          "expected": "Confirm resets selected scope; unchecked library retained; Cancel deletes nothing."
+        },
+        {
+          "id": "app.openURL",
+          "control": "Deep links",
+          "trigger": "Open nib:// document/page/audio/search/new/quicknote/plugin/pairing fixture URLs",
+          "expected": "Correct flow/target opens; malformed link reports error without data loss."
+        },
+        {
+          "id": "app.quickAction",
+          "control": "Home-screen actions, widgets and Control Center",
+          "trigger": "Long-press app; QuickNote/favourite/widget/control",
+          "expected": "Correct creation/open action; unsupported App Group path has defined fallback."
+        },
+        {
+          "id": "app.intents",
+          "control": "Siri/Shortcuts actions",
+          "trigger": "Run QuickNote/open/create folder/open document/search/append text intent",
+          "expected": "Correct target/content created or opened once; permission/cancel respected."
+        },
+        {
+          "id": "answerZone.create",
+          "control": "Add/make answer zone",
+          "trigger": "Page/object menu > Add/Make Answer Zone",
+          "expected": "Editable zone appears on requested rect with optional score widget."
+        },
+        {
+          "id": "answerZone.score",
+          "control": "Scores and points",
+          "trigger": "Zone controls > lower/raise/clear score, points, add/remove score box",
+          "expected": "Correct zone score/maximum/widget state persists."
+        },
+        {
+          "id": "answerZone.hints",
+          "control": "Edit/reveal/reset hints",
+          "trigger": "Zone > Edit Hints; add/remove; Show Next Hint; Reset Hint Usage",
+          "expected": "Ordered hints and recorded usage update correctly."
+        },
+        {
+          "id": "lesson.create",
+          "control": "Class folder, sample lesson and student copies",
+          "trigger": "Teacher Toolkit > Create/Load Class; source/roster > Create Lesson/Create Sample Lesson",
+          "expected": "Correct class folder and per-student copies appear."
+        },
+        {
+          "id": "lesson.importRoster",
+          "control": "Import roster CSV",
+          "trigger": "Toolkit > paste CSV/Choose Roster File > Import",
+          "expected": "Valid students loaded; malformed rows reported; no accidental duplicate class."
+        },
+        {
+          "id": "lesson.setState",
+          "control": "Prep/Present/Feedback and assignment states",
+          "trigger": "Toolkit/navigator > mode; Publish/Submit/Return/Resubmit",
+          "expected": "Correct layers/student copy/state shown and persisted."
+        },
+        {
+          "id": "lesson.quick",
+          "control": "Quick Lesson and co-teaching",
+          "trigger": "Share > Start Quick Lesson; join/manage participants; Follow Me",
+          "expected": "Live lesson connects with expected permissions and viewport behavior."
+        },
+        {
+          "id": "lesson.archive",
+          "control": "Filter/sort/archive class",
+          "trigger": "Toolkit > assignment filter, class folder sort, Archive destination",
+          "expected": "Matching copies shown; archive relocates class without data loss."
+        },
+        {
+          "id": "lesson.collect",
+          "control": "Review class answers",
+          "trigger": "Review Class Answers > Collect; By Page/By Question; previous/next student",
+          "expected": "Correct answer renders/copy shown; render retry works."
+        },
+        {
+          "id": "lesson.cluster",
+          "control": "Compare model/group similar answers",
+          "trigger": "Class Insights > model answer/Compare/Group Similar",
+          "expected": "Suggested clusters reviewable; source submissions untouched."
+        },
+        {
+          "id": "lesson.setClusters",
+          "control": "Manual clusters/review/save/discard/undo",
+          "trigger": "Add/rename/remove cluster; move answer; score cluster; Save/Discard/Undo",
+          "expected": "Only reviewed grouping/scores saved; cancel/undo preserves prior state."
+        },
+        {
+          "id": "lock.changeDisable",
+          "control": "Verify/change/replace/turn off password",
+          "trigger": "Password Protection > Current password/Verify; Change/Replace/Turn Off Password; confirm/cancel",
+          "expected": "Only authenticated changes apply; locked documents remain protected after failed/cancelled verification."
+        },
+        {
+          "id": "diagnostics.controls",
+          "control": "Diagnostic export options, feature search and system settings",
+          "trigger": "Troubleshooting > Include document titles; Find a feature; Hide Features That Are On; Open Nib in Settings; Latest copy",
+          "expected": "Export privacy choice honored; filters work; system diagnostic setting and latest report reachable."
+        },
+        {
+          "id": "transcription.settings",
+          "control": "Speech permissions, engine and recognition language",
+          "trigger": "Recording Settings > Live transcription/Cloud transcription/Enable Speech Recognition; language search",
+          "expected": "Settings persist; system availability/download guidance accurate; denied permissions leave audio intact."
+        },
+        {
+          "id": "about.library",
+          "control": "About library location and contents",
+          "trigger": "About > Library Folder/Copy Library Path/Contents/Choose Another Folder",
+          "expected": "Correct path copied; correct Files location or picker opens; cancellation preserves library."
+        },
+        {
+          "id": "keyboard.accessories",
+          "control": "Accessory and specialised shortcuts",
+          "trigger": "Use directory: ⇧⌘R recording, ⌥⌘P playback, ⌥⌘arrow audio seek, ⌥⌘Z zoom window, ⌥Return New Line, ⌥⌘L layers, ⇧⌥⌘1–3 replay, ⇧⌘K timer pause, ⌥⌘K lap, ⌃⌘P Pencil palette",
+          "expected": "Each live shortcut invokes its named control once; ambiguous keys follow context/registry priority."
+        }
+      ]
+    }
+  ],
+  "notes": "Static functional inventory from docs/ARCHITECTURE.md §6.5/§13, DESIGN.md §14, FEATURES.md, CONTRACTS.md, forge-spec.json, NibContracts and feature registrations/UI source. Saved as tools/qa/matrix.json; no commit, build or UI execution performed. Owners are forge F### IDs. Each explicitly listed option, source, mode, gesture and shortcut is a separate test variant, even when one row groups variants of the same control. Paths use visible English labels; cmd.<command> selectors must be scoped by label/container because several controls share an ID. Tool IDs come from feature CanvasToolDescriptor registrations; no central ToolIDs enum was found. Probe means JSON accessibilityValue of nib.qa.state in UI-test mode: screen, document, page, pageCount, tool, zoom, contentOffset{x,y}, itemCountOnPage, strokeCountOnPage, selectionCount, undoAvailable, redoAvailable, openPanels, paletteDock{edge,along}, fixtureError. Use visible UI/output files for properties absent from probe; library panels/sheets are not all session-tracked. Wait for fixtureError=null and screen ready, then eventual visible/probe state rather than fixed delays. For each applicable mutation verify undo/redo and reopen persistence; settings/session-only actions must not create document undo entries; palette docking has window undo when document history is empty. Test destructive confirmations both ways, picker cancellation, invalid inputs, empty/disabled states, read-only/locked restrictions and current-window isolation. Run regular/compact iPad, iPhone, portrait/landscape, light/dark, accessibility text sizes, VoiceOver and Reduce Motion where relevant. Pencil pressure/hover/squeeze/roll/haptics, camera, Face ID, speech, external display, external apps, notifications and multi-device/provider flows require supported hardware or controlled fixtures; simulator limitations are not passes. SPEC GAP rows are unimplemented/unverified routes, not assertions of working UI. Runtime uses ⌘9 for last tab and ⌥⌘0 for Actual Size; view.zoom fit means notebook width/board content, not a separate full-page-fit command. DESIGN command bar was not found; ⌘K is registered for text links. Core query/node/asset/render APIs are not standalone buttons; their user-visible consumers are covered. FEATURES n/a account/store/paywall/server-only products are excluded; documented local substitutes are included. F097 managed configuration and F100 metrics have no settings UI; their backend APIs are not invented as controls. Additional SPEC GAP rows retain required creation/AI/conversion functionality whose UI route was not found. Tests were not changed."
+}

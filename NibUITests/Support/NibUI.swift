@@ -18,6 +18,14 @@ struct QAState: Decodable {
     let openPanels: [String]
     let paletteDock: Dock?
     let fixtureError: String?
+    let fixtureScenario: String?
+    let boardReadReceipts: [String: String?]?
+    let boardSeenBaseline: String?
+    let unseenFixturePages: [String]?
+    let renderFailureCount: Int?
+    let rendererCachePurgeCount: Int?
+    let memoryWarningCount: Int?
+    let cachedPageCount: Int?
 }
 
 /// All coordinates are normalized to the real canvas viewport, not the whole device screen.
@@ -27,8 +35,12 @@ final class NibUI {
     var probe: XCUIElement { app.descendants(matching: .any)["nib.qa.state"].firstMatch }
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
-    func launchFixture() throws {
+    /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
+    enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards }
+
+    func launchFixture(scenario: FixtureScenario = .standard) throws {
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
         XCUIDevice.shared.orientation = .portrait
         app.launch()
         _ = try waitForState { $0.screen == "library" }

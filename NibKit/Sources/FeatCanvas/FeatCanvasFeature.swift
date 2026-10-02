@@ -24,6 +24,21 @@ public enum FeatCanvasFeature: NibFeature {
         app.commands.register(ViewReveal.self)
         app.commands.register(CanvasDecorate.self)
         app.commands.register(CanvasClearDecorations.self)
+        app.commands.register(CanvasDoubleTapZoom.self)
+        app.content.tapHandlers.register(TapHandlerDescriptor(
+            id: CanvasDoubleTapZoom.descriptor.id, owner: id, gesture: .doubleTap,
+            command: CanvasDoubleTapZoom.descriptor.id, order: Int.max, worksInReadOnly: true))
+
+        for (mode, title) in [("page", String(localized: "Fit Page")), ("width", String(localized: "Fit Width"))] {
+            app.ui.menus.register(MenuItemDescriptor(
+                id: "canvas.fit." + mode, title: title, location: .documentMore,
+                order: mode == "page" ? 370 : 371, owner: id, command: CommandIDs.viewZoom,
+                params: { _ in ["fitMode": .string(mode)] },
+                isVisible: { context in
+                    guard let doc = context.doc ?? context.session?.document else { return false }
+                    return (try? context.app.workspace.content(doc).meta.kind) == .notebook
+                }))
+        }
 
         let store = DecorationStore()
         app.services.set(store, for: DecorationStore.serviceKey)

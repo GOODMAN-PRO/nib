@@ -236,6 +236,102 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertNil(model.floating.anchors["library.new"], "A removed control must not retain a stale source")
     }
 
+    func testClosedLibraryMenusLetTouchesReachDocuments() async throws {
+        for mode in [NibLiquidMode.full, .off] {
+            let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+            for location in [MenuLocation.libraryNew, .appMenu] {
+                h.app.ui.menus.register(MenuItemDescriptor(
+                    id: "hit-test." + location.rawValue, title: "Menu action", location: location, order: 0,
+                    owner: FeatLibraryUIFeature.id, command: CommandIDs.librarySetView,
+                    params: { _ in ["menu": "none"] }))
+            }
+            let document = UIButton(type: .custom)
+            let anchor = CGRect(x: 700, y: 24, width: 44, height: 44)
+            model.updateMenuAnchors(from: Dictionary(uniqueKeysWithValues:
+                ["new", "app", "sort"].map { ("anchor.library." + $0, anchor) }))
+            let view = ZStack {
+                LibraryHitTestDocument(button: document)
+                NibDropletContainer {
+                    ForEach(["new", "app", "sort"], id: \.self) { menu in
+                        Color.clear.frame(width: anchor.width, height: anchor.height)
+                            .nibBudAnchor("library." + menu)
+                            .position(x: anchor.midX, y: anchor.midY)
+                            .allowsHitTesting(false)
+                    }
+                    LibraryBuds(model: model)
+                    NibFloatingLayer(host: model.floating)
+                }
+            }.nibLiquidMode(mode)
+                .environment(\.scenePhase, .active)
+                .ignoresSafeArea()
+            let host = UIHostingController(rootView: view)
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+
+            func settle() async throws {
+                for _ in 0..<30 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+            }
+            func assertDocumentsAreHittable(file: StaticString = #filePath, line: UInt = #line) {
+                // Cover the full area occupied by each menu's native scroll view,
+                // including the card location from the failed canvas test.
+                for y in stride(from: 100, through: Int(host.view.bounds.maxY) - 50, by: 100) {
+                    for x in stride(from: 100, through: Int(host.view.bounds.maxX) - 50, by: 100) {
+                        let hit = host.view.hitTest(CGPoint(x: x, y: y), with: nil)
+                        XCTAssertTrue(hit === document || hit?.isDescendant(of: document) == true,
+                                      "Closed menus intercepted (\(x), \(y)): \(String(describing: hit))",
+                                      file: file, line: line)
+                    }
+                }
+            }
+
+            try await settle()
+            assertDocumentsAreHittable()
+            for menu in ["new", "app", "sort"] {
+                model.menu = menu
+                try await settle()
+                let hit = host.view.hitTest(CGPoint(x: anchor.midX, y: anchor.maxY + 110), with: nil)
+                XCTAssertNotNil(hit)
+                XCTAssertFalse(hit === document || hit?.isDescendant(of: document) == true,
+                               "An open \(menu) menu must accept interaction")
+                model.menu = nil
+                try await settle()
+                assertDocumentsAreHittable()
+            }
+            // A pending request without its source geometry must also pass through.
+            model.updateMenuAnchors(from: [:])
+            model.menu = "sort"
+            try await settle()
+            assertDocumentsAreHittable()
+
+            // SelectionUITests opens a notebook after rotating the library. Keep the
+            // same menu hosts alive across the resize, including loss/republication
+            // of their source geometry, rather than testing a fresh landscape host.
+            model.menu = nil
+            for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+                window.frame = CGRect(origin: .zero, size: size)
+                host.view.frame = window.bounds
+                model.updateMenuAnchors(from: [:])
+                try await settle()
+                assertDocumentsAreHittable()
+                model.updateMenuAnchors(from: Dictionary(uniqueKeysWithValues:
+                    ["new", "app", "sort"].map { ("anchor.library." + $0, anchor) }))
+                try await settle()
+                assertDocumentsAreHittable()
+            }
+            // The centre of Physics — Motion in both reported setup failures.
+            let hit = host.view.hitTest(CGPoint(x: 906, y: 549.75), with: nil)
+            XCTAssertTrue(hit === document || hit?.isDescendant(of: document) == true,
+                          "Hidden library menus must not intercept the notebook-opening tap")
+        }
+    }
+
     func testLibraryRootChromeSnapshots() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
@@ -1151,6 +1247,12 @@ private struct LibraryChromeFieldProbe: View {
                 if ready, let field { capture(field) }
             }
     }
+}
+
+private struct LibraryHitTestDocument: UIViewRepresentable {
+    let button: UIButton
+    func makeUIView(context: Context) -> UIButton { button }
+    func updateUIView(_ uiView: UIButton, context: Context) {}
 }
 
 @MainActor

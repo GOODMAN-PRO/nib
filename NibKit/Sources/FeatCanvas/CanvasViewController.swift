@@ -1045,6 +1045,64 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         return fitZoom
     }
 
+    /// Explicit fit controls use the current paper, independently of the scrolling direction.
+    func fitPaper(widthOnly: Bool) {
+        guard let page = currentPage, let size = livePages.first(where: { $0.id == page })?.size else {
+            setZoom(currentFitZoom(), anchor: nil, centreFit: true)
+            return
+        }
+        let target = ZoomRules.fit(page: size, viewport: scrollView.bounds.size, insets: scrollView.chromeInsets,
+                                   direction: widthOnly ? .vertical : .horizontal, compact: isCompact)
+        setZoom(target, anchor: nil, centreFit: true)
+        if !widthOnly, let frame = host.pageFrame(page) {
+            // Fit Page includes the blank header; the normal opening position may skip it.
+            let centre = visibleCentre
+            setOffset(CGPoint(x: frame.midX - centre.x, y: frame.midY - centre.y))
+            requestedPage = page
+            finishViewChange(bake: true)
+            flushSessionState()
+        }
+    }
+
+    /// Canvas navigation remains in the responder chain even when an input/keyboard attachment holds focus.
+    override var keyCommands: [UIKeyCommand]? {
+        let live = Set(livePanCommands.map(\.id))
+        return CanvasKeys.pans.compactMap { pan -> UIKeyCommand? in
+            guard live.contains(pan.id), let descriptor = app.content.keyCommands.get(pan.id),
+                  let input = ["up": UIKeyCommand.inputUpArrow, "down": UIKeyCommand.inputDownArrow,
+                               "left": UIKeyCommand.inputLeftArrow, "right": UIKeyCommand.inputRightArrow][pan.key]
+            else { return nil }
+            let command = UIKeyCommand(title: descriptor.title, action: #selector(panFromKeyboard(_:)),
+                                       input: input, modifierFlags: .alternate, propertyList: pan.id)
+            command.wantsPriorityOverSystemBehavior = true
+            return command
+        }
+    }
+
+    @objc func panFromKeyboard(_ command: UIKeyCommand) {
+        guard let id = command.propertyList as? String,
+              let descriptor = livePanCommands.first(where: { $0.id == id }) else { return }
+        app.perform(descriptor.command, descriptor.resolvedParams(for: session), session: session)
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(panFromKeyboard(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        guard let id = (sender as? UIKeyCommand)?.propertyList as? String else { return false }
+        return livePanCommands.contains { $0.id == id }
+    }
+
+    private var livePanCommands: [KeyCommandDescriptor] {
+        guard !isClosed, session.editor === self, session.document == documentID else { return [] }
+        func textHasFocus(_ view: UIView) -> Bool {
+            if view.isFirstResponder, view is UIKeyInput { return true }
+            return view.subviews.contains(where: textHasFocus)
+        }
+        let typing = session.isEditingText || viewIfLoaded?.window.map(textHasFocus) == true
+        let context = KeyCommandContext(docKind: kind, isEditingText: typing)
+        let ids = Set(CanvasKeys.pans.map(\.id))
+        return KeyCommandRouting.active(app.content.keyCommands.all, in: context).filter { ids.contains($0.id) }
+    }
+
     /// Grows the board world when the window nears its edge (once a drag or zoom has settled), keeping everything
     /// where it is on screen.
     private func growBoardIfNeeded() {
@@ -1153,6 +1211,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
         requestedPage = nil
+        // Chrome/layout changes during the pinch must preserve its anchor instead of restoring fit.
+        isAtFit = false
+        hasManualPan = true
         self.scrollView.isZoomingNow = true
         hudLingerTask?.cancel()
         hud.setPinching(true)
@@ -1164,6 +1225,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         host.layoutOverlay()
         hud.setZoom(ZoomRules.percent(self.scrollView.zoom))
         self.scrollView.updateVisiblePages()
+        scheduleSessionFlush()
         canvasDidChange()
         layoutFixedViews()
     }
