@@ -162,7 +162,10 @@ final class CreateUITests: XCTestCase {
         let paperPreview = try previewPixels()
         try tap("Carbon")
         try scrollTo(ui.app.textFields["Title"], name: "Title")
-        try wait("create.cover must update the live preview") { (try? self.previewPixels()) != paperPreview }
+        try wait("create.cover must update the live preview") {
+            guard let pixels = try? self.previewPixels() else { return false }
+            return pixels != paperPreview
+        }
         try assertPreviewColour(0x2A2D33)
         XCTAssertTrue(ui.app.buttons["Carbon"].firstMatch.isSelected, "Selected cover must expose the selection ring's state")
         let id = try create()
@@ -244,7 +247,10 @@ final class CreateUITests: XCTestCase {
         try scrollTap("Landscape")
         XCTAssertTrue(ui.app.buttons["Landscape"].isSelected)
         try scrollTo(ui.app.textFields["Title"], name: "Title")
-        try wait("create.orientation must update the preview") { (try? self.previewPixels()) != portraitPreview }
+        try wait("create.orientation must update the preview") {
+            guard let pixels = try? self.previewPixels() else { return false }
+            return pixels != portraitPreview
+        }
         try assertSize(try create(), width: 792, height: 612)
         try ui.tapCommand("window.showLibrary")
         try notebook("Portrait notebook")
@@ -261,7 +267,10 @@ final class CreateUITests: XCTestCase {
         try scrollTap("Ivory")
         XCTAssertTrue(ui.app.buttons["Ivory"].isSelected)
         try scrollTo(ui.app.textFields["Title"], name: "Title")
-        try wait("create.paperColor must update the preview") { (try? self.previewPixels()) != whitePreview }
+        try wait("create.paperColor must update the preview") {
+            guard let pixels = try? self.previewPixels() else { return false }
+            return pixels != whitePreview
+        }
         try assertPreviewColour(0xFBF8F1)
         let page = try XCTUnwrap(livePages(try create()).first)
         let params = (page["background"] as? [String: Any])?["template"] as? [String: Any]
@@ -929,16 +938,7 @@ final class CreateUITests: XCTestCase {
         calendar.tap() // Triggers the interruption monitor for first-launch system prompts.
         let continueButton = calendar.buttons["Continue"]
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
-        let add = calendar.buttons.matching(NSPredicate(
-            format: "label IN {'Add', 'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
-        if add.waitForExistence(timeout: 3) {
-            add.tap()
-        } else {
-            // iOS 26's iPad Calendar can omit the visible + button's label from automation.
-            // This point is the + in its landscape toolbar (captured on the dedicated iPad simulator).
-            // The required Title field below verifies that the gesture really opened event creation.
-            calendar.coordinate(withNormalizedOffset: CGVector(dx: 0.152, dy: 0.04)).tap()
-        }
+        try NibSystemCalendar.openNewEvent(in: calendar)
         let title = calendar.textFields["Title"]
         try replace(title, with: eventTitle)
         calendar.buttons["Add"].tap()

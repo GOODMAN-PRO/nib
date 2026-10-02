@@ -13,14 +13,20 @@ final class SyntheticSource: AudioSampleSource {
     private var phase = 0.0
     private(set) var starts = 0
     private(set) var closed = false
+    var onPrepare: (() throws -> Void)?
+    var onStart: (() throws -> Void)?
 
     init(sampleRate: Double = 44_100) {
         self.sampleRate = sampleRate
     }
 
-    func prepare() throws -> Double { sampleRate }
+    func prepare() throws -> Double {
+        try onPrepare?()
+        return sampleRate
+    }
 
     func start(_ deliver: @escaping (AVAudioPCMBuffer) -> Void) throws {
+        try onStart?()
         self.deliver = deliver
         starts += 1
     }
@@ -272,6 +278,61 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(events.map { $0.state }, ["recording", "stopped"])
         XCTAssertEqual(events.last?.clip, ref)
         XCTAssertEqual(events.last?.duration ?? 0, 2.5, accuracy: 0.001)
+    }
+
+    func testMicrophoneStartupKeepsTheMainActorFreeAndRejectsASecondStart() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        let preparing = expectation(description: "microphone preparation began")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        source.onPrepare = {
+            preparing.fulfill()
+            guard !Thread.isMainThread else {
+                throw NibError(.internalError, "microphone preparation must not block the main thread")
+            }
+            guard release.wait(timeout: .now() + 10) == .success else {
+                throw NibError(.internalError, "the main actor could not run during microphone preparation")
+            }
+        }
+        source.onStart = { XCTAssertFalse(Thread.isMainThread, "engine startup also makes audio RPCs") }
+        audio.makeSource = { source }
+        let start = Task { try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start"]) }
+        await fulfillment(of: [preparing], timeout: 15)
+        XCTAssertTrue(audio.starting)
+        XCTAssertNil(audio.recording)
+        await assertThrows(.conflict) {
+            _ = try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start"])
+        }
+        release.signal()
+        let result = try await start.value
+        XCTAssertEqual(result["state"]?.stringValue, "recording")
+        XCTAssertEqual(source.starts, 1)
+        XCTAssertFalse(audio.starting)
+        source.feed(seconds: 0.25)
+        _ = try await h.run("audio.record", ["action": "stop"])
+    }
+
+    func testFailedMicrophonePreparationOrStartCleansUpAndAllowsRetry() async throws {
+        for failsDuringPrepare in [true, false] {
+            let (h, audio) = try harness()
+            let source = SyntheticSource()
+            let fail: () throws -> Void = { throw NibError(.unavailable, "The microphone is busy") }
+            if failsDuringPrepare { source.onPrepare = fail } else { source.onStart = fail }
+            audio.makeSource = { source }
+            await assertThrows(.unavailable) {
+                _ = try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start", "id": "FAILEDSTART"])
+            }
+            XCTAssertTrue(source.closed, "release the session even when prepare fails")
+            XCTAssertFalse(audio.starting)
+            XCTAssertNil(audio.recorder)
+            XCTAssertNil(audio.recording)
+            XCTAssertFalse(exists(try file(h, "audio/FAILEDSTART.aac")))
+            XCTAssertFalse(try h.app.workspace.content(Fixtures.docID).audio.contains { $0.id.raw == "FAILEDSTART" })
+            let retry = SyntheticSource()
+            audio.makeSource = { retry }
+            _ = try await record(h, retry, seconds: 0.25)
+        }
     }
 
     func testPauseFillsTheGapSoTheRecordingMatchesTheWallClock() async throws {
@@ -821,6 +882,7 @@ final class FeatAudioTests: XCTestCase {
         // doc.create belongs to the library feature; a stand-in keeps these tests to FeatAudio.
         h.app.commands.register(CommandDescriptor(id: "doc.create", title: "Create", summary: "Test stand-in.",
                                                   effect: .library, target: .library)) { params, _ in
+            XCTAssertEqual(params["kind"]?.stringValue, "textDocument")
             let id = NibID(params["id"]?.stringValue ?? NibID.make().raw)
             _ = try library.createDocument(DocumentContent(meta: DocumentMeta(id: id, kind: .textDocument)),
                                            title: params["title"]?.stringValue ?? "", in: nil)
@@ -833,16 +895,37 @@ final class FeatAudioTests: XCTestCase {
         let (h, audio) = try harness()
         let source = SyntheticSource()
         audio.makeSource = { source }
-        audio.clock = { 1_800_000_000 }
+        var now = 1_800_000_000.0
+        audio.clock = { now }
+        h.session.document = nil
+        h.session.page = nil
         standInDocCreate(h)
+        var opened: [DocumentID] = []
+        h.app.commands.register(CommandDescriptor(id: "doc.open", title: "Open", summary: "Test stand-in.",
+                                                  effect: .session, target: .app)) { params, ctx in
+            XCTAssertTrue(ctx.session === h.session, "open in the window that invoked Quick Record")
+            let ref = try XCTUnwrap(params["doc"]?.stringValue)
+            let doc = NodeRef.documentID(from: ref)
+            let content = try ctx.workspace.content(doc)
+            XCTAssertEqual(content.meta.kind, .textDocument)
+            XCTAssertTrue(content.livePages.isEmpty)
+            h.session.document = doc
+            opened.append(doc)
+            return [:]
+        }
         let result = try await h.run("audio.quickRecord", ["id": "QUICKDOC0001"])
         XCTAssertEqual(result["ref"]?.stringValue, "doc:QUICKDOC0001")
+        XCTAssertEqual(opened, [NibID("QUICKDOC0001")])
+        XCTAssertEqual(h.session.document, NibID("QUICKDOC0001"))
         let clipRef = try XCTUnwrap(result["clip"]?.stringValue)
         XCTAssertEqual(audio.recording?.doc, NibID("QUICKDOC0001"))
         XCTAssertNil(try clip(h, clipRef).page, "a text document has no pages")
         let title = try XCTUnwrap(h.library.node(NibID("QUICKDOC0001"))?.title)
         XCTAssertFalse(title.contains(":"), "a title is a file name")
         XCTAssertEqual(overlays(h, kind: .textDocument), ["audio.recorder"], "the HUD shows the recording")
+        source.feed(seconds: 1.25)
+        now += 1.25
+        XCTAssertEqual(audio.recordingStatus?.duration ?? 0, 1.25, accuracy: 0.001, "the HUD timer advances")
         _ = try await h.run("audio.record", ["action": "stop"])
     }
 

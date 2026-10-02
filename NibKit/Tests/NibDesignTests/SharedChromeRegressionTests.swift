@@ -8,6 +8,64 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testPlannerFormAdaptsToAConstrainedViewportWithoutLosingDateAndWeekControls() async throws {
+        // A keyboard, landscape phone or resized iPad window supplies a finite height,
+        // unlike the ideal-size query below. The default must not force a 640 pt form
+        // outside that viewport, and the list must still scroll to its lower controls.
+        for size in [CGSize(width: 720, height: 320), CGSize(width: 390, height: 460)] {
+            let host = UIHostingController(rootView: SheetViewportFixture().modifier(NibSheetChrome())
+                .ignoresSafeArea())
+            let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            func list(in view: UIView) -> UIScrollView? {
+                if let scroll = view as? UIScrollView { return scroll }
+                return view.subviews.lazy.compactMap { list(in: $0) }.first
+            }
+            for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let scroll = try XCTUnwrap(list(in: host.view))
+            let frame = scroll.convert(scroll.bounds, to: host.view)
+            XCTAssertGreaterThan(frame.height, 200, "Planner controls need more than a single-row viewport")
+            XCTAssertGreaterThanOrEqual(frame.minY, 60, "Scrolling content must clear the sheet header")
+            XCTAssertLessThanOrEqual(frame.maxY, size.height + 1)
+            XCTAssertGreaterThan(scroll.contentSize.height, 0)
+            let bottom = max(-scroll.adjustedContentInset.top,
+                             scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+            scroll.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(scroll.contentOffset.y, bottom, accuracy: 1,
+                           "The date and count rows must remain reachable in the constrained form")
+        }
+    }
+
+    func testClosedPopoverDoesNotCoverAnEditableTextView() async throws {
+        // A retained native popover used to consume a tap even after its SwiftUI
+        // content had disappeared. Exercise the underlying input hit target too.
+        let host = UIHostingController(rootView:
+            NibPopoverPanel(title: "Menu") { Button("Action") {} }
+                .budsFrom("source", isPresented: .constant(false)))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func list(in view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { list(in: $0) }.first
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let scroll = try XCTUnwrap(list(in: host.view))
+        XCTAssertNil(scroll.hitTest(CGPoint(x: scroll.bounds.midX, y: scroll.bounds.midY), with: nil),
+                     "A closed menu must not claim the text editor's touch")
+        let input = UITextView(frame: CGRect(x: 20, y: 300, width: 400, height: 80))
+        host.view.addSubview(input)
+        XCTAssertTrue(input.becomeFirstResponder())
+        input.insertText("First block title")
+        XCTAssertTrue(input.isFirstResponder)
+        XCTAssertEqual(input.text, "First block title")
+    }
+
     func testFormSheetLeavesAUsableViewportForANativeList() async throws {
         // Package tests have no UIWindowScene to present a modal. Exercise the same ideal
         // size query used by presentationSizing, with a real hosted native list instead.

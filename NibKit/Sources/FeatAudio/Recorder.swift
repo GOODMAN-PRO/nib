@@ -21,7 +21,7 @@ protocol AudioSampleSource: AnyObject {
 final class MicrophoneSource: AudioSampleSource {
     // Build the graph only after prepare() has activated the recording session. Constructing it
     // under the previous category can initialise I/O against the route we are about to replace.
-    private lazy var engine = AVAudioEngine()
+    private var engine: AVAudioEngine?
     private var tapped = false
     private var observer: NSObjectProtocol?
     /// The input changed under a running tap (headset in or out): the controller restarts capture.
@@ -41,12 +41,15 @@ final class MicrophoneSource: AudioSampleSource {
         } catch {
             throw Self.busy(error)
         }
+        let engine = AVAudioEngine()
+        self.engine = engine
         let format = engine.inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw NibError.unavailable("a microphone") }
         return format.sampleRate
     }
 
     func start(_ deliver: @escaping (AVAudioPCMBuffer) -> Void) throws {
+        guard let engine else { throw NibError.unavailable("a prepared microphone") }
         // After an interruption (a call) iOS has deactivated the session: activate it again before the engine starts.
         do {
             try AVAudioSession.sharedInstance().setActive(true)
@@ -77,6 +80,7 @@ final class MicrophoneSource: AudioSampleSource {
     }
 
     func stop() {
+        guard let engine else { return }
         if tapped {
             engine.inputNode.removeTap(onBus: 0)
             tapped = false
