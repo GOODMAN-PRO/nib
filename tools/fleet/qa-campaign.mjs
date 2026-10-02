@@ -27,26 +27,48 @@ const STATE = `${LOGS}/qa-state.json`
 const state = fs.existsSync(STATE) ? JSON.parse(fs.readFileSync(STATE, 'utf8')) : {}
 const save = () => fs.writeFileSync(STATE, JSON.stringify(state, null, 1))
 
-const PREAMBLE = `You are GPT-6 Astra running as Codex CLI (non-interactive, full access) on the user's Mac, doing one step of the Nib build (native iPadOS/iOS note app, GoodNotes-class; docs/DESIGN.md, docs/ARCHITECTURE.md, docs/CONTRACTS.md and docs/forge-spec.json are binding). Repo worktree: ${DIR} (branch ${BR}). Long commands (builds, simulator UI tests) take a long time: use long timeouts or background + poll. Never skip, weaken, comment out or delete tests to get green; a test may only change when it contradicts the spec, and then say so explicitly. Work autonomously to completion, then answer with the JSON object the output schema asks for.\n\n`
+const PREAMBLE = `You are GPT-6 Astra running as Codex CLI (non-interactive, full access) on the user's Mac, doing one step of the Nib build (native iPadOS/iOS note app, GoodNotes-class; docs/DESIGN.md, docs/ARCHITECTURE.md, docs/CONTRACTS.md and docs/forge-spec.json are binding). Repo worktree: ${DIR} (branch ${BR}). Long commands (builds, simulator UI tests) take a long time: use long timeouts or background + poll. Never skip, weaken, comment out or delete tests to get green; a test may only change when it contradicts the spec, and then say so explicitly. Shared machine rules: never create, delete or edit anything under ~/Projects/Nib-locks, never kill/stop/continue processes you did not start, and never run UI tests outside the nib-build.sh uitest command — the lanes are shared with other jobs. The disk is nearly full: never copy result bundles or export attachments into /tmp; if you must export, use ${LOGS}/scratch-<your job> and delete it before you answer. Work autonomously to completion, then answer with the JSON object the output schema asks for.\n\n`
 const BUILD = `Unit/package build: \`${TOOLS} full ${DIR}\` (waits for a build slot; 30-90 min; log ${LOGS}/local-integration-full.log, exit code in the .exit file).`
 const uiTag = (filter) => (filter || 'all').replace(/NibUITests\//g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/-$/, '').slice(0, 60)
-const UIRUN = (filter, budget) => `UI tests: \`${TOOLS} uitest ${DIR}${filter ? ` "${filter}"` : ''}\` (xcodegen + XCUITest on a dedicated iPad simulator; ONE UI run at a time machine-wide, so it may queue behind other jobs; log ${LOGS}/local-integration-uitest-${uiTag(filter)}.log, exit code in the matching .exit file, result bundle ${LOGS}/ui-${uiTag(filter)}.xcresult — read failures with \`xcrun xcresulttool get test-results tests --path ${LOGS}/ui-${uiTag(filter)}.xcresult\`). Every UI test file compiles into one target: if the run fails to COMPILE because of another file, report that in notes instead of editing it.${budget ? ` HARD BUDGET: this job may start at most ${budget} UI run(s) (the tool refuses more), so make each one count — write and review the whole file before running.` : ''}`
+const UIRUN = (filter, budget) => `UI tests: \`${TOOLS} uitest ${DIR}${filter ? ` "${filter}"` : ''}\` (xcodegen + XCUITest; the machine has TWO simulator lanes that run two UI runs IN PARALLEL by design — that is correct and expected, do not try to make your run exclusive or serial; your run may queue for a free lane; log ${LOGS}/local-integration-uitest-${uiTag(filter)}.log, exit code in the matching .exit file, result bundle ${LOGS}/ui-${uiTag(filter)}.xcresult — read failures with \`xcrun xcresulttool get test-results tests --path ${LOGS}/ui-${uiTag(filter)}.xcresult\`). Every UI test file compiles into one target: if the run fails to COMPILE because of another file, report that in notes instead of editing it.${budget ? ` HARD BUDGET: this job may start at most ${budget} UI run(s) (the tool refuses more), so make each one count — write and review the whole file before running.` : ''}`
 
-async function codex (name, prompt, schema, effort = 'high', uiMax = 0) {
+async function codex (name, prompt, schema, effort = 'high', uiMax = 0, retried = false) {
   const id = `${TAG}-${name}`
   const pfile = `${PROMPTS}/${id}.md`
   fs.writeFileSync(pfile, PREAMBLE + prompt)
+  // A job that already finished in an earlier orchestrator run is reused, never re-run (nib-codex.sh would restart it).
+  const base = `${LOGS}/codex-${id}`
+  if (!alive(id) && fs.existsSync(`${base}.exit`) && fs.readFileSync(`${base}.exit`, 'utf8').trim() === '0') {
+    try { return JSON.parse(fs.readFileSync(`${base}.json`, 'utf8')) } catch {}
+  }
   const env = { ...process.env, NIB_UI_MAX: uiMax ? String(uiMax) : '' }
+  if (!alive(id)) fs.writeFileSync(`${LOGS}/uiruns-${id}`, '0')   // fresh job -> fresh UI-run budget
   let { stdout } = await sh(CX, ['run', id, DIR, pfile, schema, effort], { maxBuffer: 1 << 24, env })
   while (stdout.startsWith('RUNNING')) ({ stdout } = await sh(CX, ['wait', id], { maxBuffer: 1 << 24 }).catch((e) => ({ stdout: e.stdout || 'CODEX_FAILED wait error' })))
   if (stdout.startsWith('RESULT ')) return JSON.parse(stdout.slice(7))
+  if (!retried) {   // infrastructure deaths (disk full, OOM, killed) get one fresh attempt
+    say(`  ${name}: ${stdout.trim().slice(0, 160)} — retrying once`)
+    fs.rmSync(`${base}.exit`, { force: true })
+    return codex(name, prompt, schema, effort, uiMax, true)
+  }
   throw new Error(`${name}: ${stdout.trim().slice(0, 300)}`)
 }
+const alive = (id) => { try { process.kill(Number(fs.readFileSync(`${LOGS}/codex-${id}.pid`, 'utf8')), 0); return !fs.existsSync(`${LOGS}/codex-${id}.exit`) } catch { return false } }
 const git = (...a) => sh('git', ['-C', DIR, ...a]).then((r) => r.stdout.trim())
-async function commit (msg) {
-  if (!(await git('status', '--porcelain'))) return null
-  await git('add', '-A'); await git('commit', '-q', '-m', msg, '-m', TRAILER)
-  return git('log', '-1', '--format=%h')
+let commitChain = Promise.resolve()
+function commit (msg) {   // serialized: several areas commit into the same worktree
+  const run = async () => {
+    // Never commit into someone else's in-progress merge (a Codex merge job), and never commit conflict markers.
+    for (let i = 0; i < 240 && await git('rev-parse', '-q', '--verify', 'MERGE_HEAD').then(() => true, () => false); i++) await new Promise((r) => setTimeout(r, 15000))
+    if (await git('rev-parse', '-q', '--verify', 'MERGE_HEAD').then(() => true, () => false)) return 'skipped: merge in progress'
+    if (!(await git('status', '--porcelain'))) return null
+    await git('add', '-A')
+    const markers = await git('diff', '--cached', '-G', '^(<<<<<<< |>>>>>>> )', '--name-only').catch(() => '')
+    if (markers) { await git('reset', '-q'); return `skipped: conflict markers in ${markers.split('\n').join(', ')}` }
+    await git('commit', '-q', '-m', msg, '-m', TRAILER)
+    return git('log', '-1', '--format=%h')
+  }
+  const p = commitChain.then(run, run); commitChain = p.catch(() => null); return p.catch((e) => `commit failed: ${e.message.slice(0, 120)}`)
 }
 const normOwner = (o) => (/F\d{3}/.exec(o || '') || ['shared'])[0]
 async function pool (items, n, fn) {
@@ -82,104 +104,173 @@ For each control: id (command/tool id or a stable slug), control (what the user 
     state.matrix = m; save()
   }
 
-  // ---------------------------------------------------------------- write
-  state.written ||= {}
-  const areas = state.matrix.areas.filter((a) => !state.written[a.key])
-  if (areas.length) {
-    say(`write: UI tests for ${areas.map((a) => a.key).join(', ')}`)
-    await pool(areas, A.maxWriters || 4, async (a) => {
-      const cls = a.key.replace(/(^|_)(\w)/g, (_, __, c) => c.toUpperCase()) + 'UITests'
-      const exists = fs.existsSync(`${DIR}/NibUITests/${cls}.swift`)
-      const r = await codex(`write-${a.key}`, `${exists ? `NibUITests/${cls}.swift already exists from an earlier, interrupted writer: keep its good tests, add whatever controls below are still missing, delete any placeholder test that only XCTFails for "DEVICE COVERAGE" (device-only checks go in notes instead), then run it. ` : ''}Write the XCUITest coverage for area "${a.title}" (key ${a.key}). File: NibUITests/${cls}.swift (only this file; use the helpers in NibUITests/Support and the "nib.qa.state" probe; do not edit app code, other test files or project.yml — other writers work in parallel).
+  // ---------------------------------------------------------------- write -> fix -> verify, pipelined per area
+  // Each area flows on its own: its UI tests are written and run, then its failures go straight to owner fixers and a
+  // targeted verify run, while other areas are still being written. Same-owner fixers serialize via nib-codex.sh locks.
+  state.written ||= {}; state.fixed ||= {}
+  const qual = (r, f) => { const t = String(f.test || ''); if (t.includes('/')) return t.startsWith('NibUITests/') ? t : `NibUITests/${t}`; const c = (r.file || '').match(/(\w+UITests)\.swift/)?.[1]; return c ? `NibUITests/${c}/${t}` : t }
+  const clsOf = (key) => key.replace(/(^|_)(\w)/g, (_, __, c) => c.toUpperCase()) + 'UITests'
+
+  const writeArea = async (a) => {
+    const cls = clsOf(a.key)
+    const exists = fs.existsSync(`${DIR}/NibUITests/${cls}.swift`)
+    if (state.written[a.key] && !state.written[a.key].tests) fs.rmSync(`${LOGS}/codex-${TAG}-write-${a.key}.exit`, { force: true })   // rerun an unrun writer
+    const r = await codex(`write-${a.key}`, `${exists ? `NibUITests/${cls}.swift already exists from an earlier writer whose UI run never executed: keep its good tests, add whatever controls below are still missing (quickly), delete any placeholder test that only XCTFails for "DEVICE COVERAGE" (device-only checks go in notes instead), then RUN it — the run is the point of this job. ` : ''}Write the XCUITest coverage for area "${a.title}" (key ${a.key}). File: NibUITests/${cls}.swift (only this file; use the helpers in NibUITests/Support and the "nib.qa.state" probe; do not edit app code, other test files or project.yml — other jobs work in parallel).
 Cover EVERY control in this list with at least one test that performs the real user action (tap the button / menu item, perform the gesture, draw the stroke) and asserts the observable expected result (state probe fields, visible UI, undo/redo where applicable). Pen/ink tools must actually draw strokes and check stroke counts; zoom must check the zoom value changes and is bounded; buttons must check their effect, not just that they exist.
 Controls:\n${JSON.stringify(a.controls)}
 Things XCUITest on the simulator genuinely cannot do (Apple Pencil pressure/tilt/hover/squeeze/double-tap, camera, VoiceOver audio, real hardware keyboards beyond typeKey) are NOT tests: list them in notes as device-only; never add XCTFail placeholders for them.
-Time box: about 60 minutes in total. Then run ${UIRUN(`NibUITests/${cls}`, 2)} If a test fails because the TEST is wrong (wrong identifier, timing, wrong expectation vs the spec), fix the test. If it fails because the APP is wrong (button missing/not wired, wrong behaviour, crash, zoom/pen broken), keep the test as the spec says and report it as a failure with owner (feature id from docs/forge-spec.json whose files implement it, or "shared"), problem and evidence (assertion message / screenshot attachment name). Do not commit. Answer status "green" (all pass) or "red", file, tests, passed, failed, failures, notes.`, 'uiwrite', 'high', 2)
-      say(`  write ${a.key}: ${r.status} ${r.passed ?? '?'}/${r.tests ?? '?'} pass, ${r.failed ?? '?'} fail`)
-      state.written[a.key] = r; save()
-    })
-    say(`write: committed ${await commit('QA: UI test coverage for every area')}`)
+Spend at most ~45 minutes writing. The UI run may wait in a queue for a long time: wait for it to finish however long it takes (never give up on a queued run). Then run ${UIRUN(`NibUITests/${cls}`, 2)} If a test fails because the TEST is wrong (wrong identifier, timing, wrong expectation vs the spec), fix the test. If it fails because the APP is wrong (button missing/not wired, wrong behaviour, crash, zoom/pen broken), keep the test as the spec says and report it as a failure with owner (feature id from docs/forge-spec.json whose files implement it, or "shared"), problem and evidence (assertion message / screenshot attachment name). Do not commit. Answer status "green" (all pass) or "red", file, tests, passed, failed, failures, notes.`, 'uiwrite', 'high', 2)
+    say(`  write ${a.key}: ${r.status} ${r.passed ?? '?'}/${r.tests ?? '?'} pass, ${r.failed ?? '?'} fail`)
+    state.written[a.key] = r; save()
+    return r
   }
 
-  // ---------------------------------------------------------------- early library fix lane (qa-fix worktree) -> integration
-  if (A.earlyFix && !state.earlyFixMerged) {
-    say('fix: waiting for the early library fix lane')
+  const mergeEarly = async () => {
+    say('library: waiting for the early library fix lane')
     let ef; let { stdout } = await sh(CX, ['wait', A.earlyFix.job], { maxBuffer: 1 << 24 }).catch((e) => ({ stdout: e.stdout || '' }))
     while (stdout.startsWith('RUNNING')) ({ stdout } = await sh(CX, ['wait', A.earlyFix.job], { maxBuffer: 1 << 24 }).catch((e) => ({ stdout: e.stdout || '' })))
     if (stdout.startsWith('RESULT ')) ef = JSON.parse(stdout.slice(7))
-    say(`fix: early lane ${ef ? `${ef.status} ${ef.passed}/${ef.tests} pass, ${ef.failed} fail` : 'gave no result'}`)
-    const ahead = await git('rev-list', '--count', `HEAD..${A.earlyFix.branch}`).catch(() => '0')
-    if (Number(ahead) > 0) { await git('merge', '--no-ff', '-q', A.earlyFix.branch, '-m', 'QA: library fixes (early lane)', '-m', TRAILER); say(`fix: merged ${A.earlyFix.branch} (${ahead} commit(s))`) }
+    say(`library: early lane ${ef ? `${ef.status} ${ef.passed}/${ef.tests} pass, ${ef.failed} fail` : 'gave no result'}`)
+    const mergeJob = `${TAG}-merge-earlyfix`
+    const mergeStarted = alive(mergeJob) || fs.existsSync(`${LOGS}/codex-${mergeJob}.exit`)
+    if (!mergeStarted) await commit('QA: work in progress before merging the library lane')
+    const ahead = Number(await git('rev-list', '--count', `HEAD..${A.earlyFix.branch}`).catch(() => '0'))
+    if (ahead > 0) {
+      const ok = mergeStarted ? false : await git('merge', '--no-ff', '-q', A.earlyFix.branch, '-m', 'QA: library fixes (early lane)', '-m', TRAILER).then(() => true, async () => { await git('merge', '--abort').catch(() => {}); return false })
+      if (!ok) {
+        const m = await codex('merge-earlyfix', `Merge branch ${A.earlyFix.branch} (library fixes) into ${BR} in ${DIR}: git merge --no-ff ${A.earlyFix.branch}, then resolve every conflict keeping BOTH sides' intent (e.g. integration's idle/parking fixes in NibDesign/Liquid AND the library lane's fixes), never dropping either. Other jobs edit files in this worktree concurrently: touch only conflicted files. Check it compiles: \`${TOOLS} targets ${DIR} "<test targets of the conflicted modules>"\`. Commit the merge with message "QA: library fixes (early lane)" (${TRAILER_RULE}). Answer status "ok" or "red", details = how each conflict was resolved.`, 'result', 'high')
+        say(`library: merge via Codex ${m.status}`)
+      } else say(`library: merged ${A.earlyFix.branch} (${ahead} commit(s))`)
+    }
     const lf = `${A.earlyFix.wt}/NibUITests/LibraryUITests.swift`
     if (fs.existsSync(lf)) fs.copyFileSync(lf, `${DIR}/NibUITests/LibraryUITests.swift`)
+    state.earlyFixMerged = true
     if (ef) state.written.library = ef
-    state.earlyFixMerged = true; save()
-    say(`fix: committed ${await commit('QA: library UI tests after the early fix lane')}`)
+    save()
+    return ef || state.written.library
   }
 
-  // ---------------------------------------------------------------- fix loop
-  state.rounds ||= []
-  const qual = (r, f) => { const t = String(f.test || ''); if (t.includes('/')) return t.startsWith('NibUITests/') ? t : `NibUITests/${t}`; const c = (r.file || '').match(/(\w+UITests)\.swift/)?.[1]; return c ? `NibUITests/${c}/${t}` : t }
-  let failures = Object.values(state.written).flatMap((r) => (r.failures || []).map((f) => ({ ...f, test: qual(r, f) })))
-  for (let round = state.rounds.length + 1; round <= (A.fixRounds || 4); round++) {
-    if (!failures.length) break
-    if (minutesUntil(A.shipBy) < 150 || minutesUntil(A.designBy) < 110) { say(`fix: stopping before round ${round} — polish phase starts by ${A.designBy}, ship by ${A.shipBy}`); break }
-    const groups = {}
-    for (const f of failures) (groups[normOwner(f.owner)] ||= []).push(`${f.test}: ${f.problem} [evidence: ${f.evidence}]`)
-    say(`fix round ${round}: ${failures.length} failure(s) across ${Object.keys(groups).join(', ')}`)
-    await Promise.allSettled(Object.keys(groups).map((o) => codex(`fix-${round}-${o}`, `Fix these functional bugs found by the UI tests (round ${round}). Edit ONLY files owned by ${o === 'shared' ? 'no feature (Nib/App shell, NibDesign, NibContracts, NibUITests/Support, project.yml; keep changes backward compatible)' : o + ' (docs/forge-spec.json files/tests)'}; other Codex jobs are fixing other owners' files right now; do NOT run git commit/stash/checkout/reset or any build/test.
+  const fixArea = async (a, r) => {
+    const cls = clsOf(a.key)
+    const st = (state.fixed[a.key] ||= { rounds: [] })
+    let failures = st.rounds.length ? (st.remaining || []) : (r.failures || []).map((f) => ({ ...f, test: qual(r, f) }))
+    for (let round = st.rounds.length + 1; round <= (A.fixRounds || 3); round++) {
+      if (!failures.length) break
+      const roundGate = a.key === 'ink' && round === 1 ? 45 : 150   // pen is the top priority: ink always gets its first fix round
+      if (minutesUntil(A.shipBy) < roundGate) { say(`fix ${a.key}: no time for round ${round} (final verify + ship by ${A.shipBy})`); break }
+      const groups = {}
+      for (const f of failures) (groups[normOwner(f.owner)] ||= []).push(`${f.test}: ${f.problem} [evidence: ${f.evidence}]`)
+      say(`fix ${a.key} r${round}: ${failures.length} failure(s) -> ${Object.keys(groups).join(', ')}`)
+      await pool(Object.keys(groups), 2, (o) => codex(`fix-${a.key}-${round}-${o}`, `Fix these functional bugs found by the ${cls} UI tests (round ${round}). Edit ONLY files owned by ${o === 'shared' ? 'no feature (Nib/App shell, NibDesign, NibContracts, NibUITests/Support, project.yml; keep changes backward compatible)' : o + ' (docs/forge-spec.json files/tests)'}; other Codex jobs edit other files and run UI tests from this same worktree right now, so keep the code compiling at every moment (make each file edit complete and self-consistent) and NEVER run git add/commit/stash/checkout/reset.
 Failures:\n${groups[o].join('\n')}
-Find the root cause in the app (button not wired to its command, command failing, gesture not reaching the canvas, zoom limits, pen/stroke pipeline, state not updating, crash) and fix it per the spec. Add/extend unit tests in the owner's test files for the logic you fix. Only if a UI test itself is wrong per the spec may you correct that test (say which and why). Answer status "ok", details = root cause + fix per failure.`, 'result', 'high')))
-    say(`fix round ${round}: committed ${await commit(`QA fix round ${round}`)}`)
-    const ids = [...new Set(failures.map((f) => String(f.test || '')).filter((t) => /^NibUITests\/\w+UITests\/\w+$/.test(t)))]
-    const classes = [...new Set(Object.values(state.written).map((r) => (r.file || '').match(/(\w+UITests)\.swift/)?.[1]).filter(Boolean))]
-    const target = ids.length && ids.length === failures.length ? ids.join(' ') : classes.map((c) => `NibUITests/${c}`).join(' ')
-    const v = await codex(`verify-${round}`, `Verify fix round ${round}. 1) ${BUILD} — if it fails, fix the regressions at the root and repeat until LOCAL BUILD OK, committing on ${BR} (${TRAILER_RULE}). 2) ${UIRUN(target, 3)} (the UI tests that failed before this round${ids.length && ids.length === failures.length ? '' : ' — the failing classes'}; identifiers are NibUITests/<Class>/<testMethod>). For every failing UI test decide: test wrong per spec -> fix the test and rerun it; app wrong -> report it (do not fix app code in this step). Commit test fixes on ${BR}. Answer status "green" (unit build OK and every UI test passes) or "red", file "NibUITests", tests/passed/failed for the UI suite, failures (test = "<Class>/<testMethod>", owner = feature id or "shared", problem, evidence), notes.`, 'uiwrite', 'high', 3)
-    say(`verify round ${round}: ${v.status} — UI ${v.passed}/${v.tests} pass, ${v.failed} fail`)
-    state.rounds.push({ round, failures: failures.length, after: v.failed, status: v.status }); save()
-    failures = (v.failures || []).map((f) => ({ ...f, test: qual(v, f) }))
-    if (v.status === 'green') break
+The tests live in NibUITests/${cls}.swift (read them to see exactly what the user action and expectation are). Find the root cause in the app (button not wired to its command, command failing, gesture not reaching the canvas, keyboard shortcut not routed to the focused scene, zoom limits, pen/stroke pipeline, state not updating, crash) and fix it per the spec — for real users, not just for the test. Add/extend unit tests in the owner's test files for the logic you fix and check them with \`${TOOLS} targets ${DIR} "<the owner's test targets>"\` (waits for a build slot). If the root cause provably sits in another owner's files (e.g. the shared canvas input / wet-ink path, the shell's focus or scene routing), make the minimal root-cause fix there too and say exactly which file and why — never answer "blocked" just because of the ownership boundary. Only if a UI test itself is wrong per the spec may you correct that test (say which and why). Do not run UI tests (the verify step does). Answer status "ok", details = root cause + fix per failure.`, 'result', 'high').catch((e) => ({ status: 'blocked', details: [e.message] })))
+      say(`fix ${a.key} r${round}: committed ${await commit(`QA: ${a.key} fixes, round ${round}`)}`)
+      const ids = [...new Set(failures.map((f) => String(f.test || '')).filter((t) => /^NibUITests\/\w+UITests\/\w+$/.test(t)))]
+      // If the area's first run executed only part of the class (queue kills, time boxes), verify the WHOLE class.
+      const declared = (fs.readFileSync(`${DIR}/NibUITests/${cls}.swift`, 'utf8').match(/func test\w+\s*\(/g) || []).length
+      const lastTests = round === 1 ? (r.tests || 0) : (st.lastTests ?? 0)
+      const partial = lastTests < declared * 0.8
+      const target = ids.length && !partial ? ids.join(' ') : `NibUITests/${cls}`
+      if (minutesUntil(A.shipBy) < 150) { say(`verify ${a.key} r${round}: skipped — out of time; the final verify covers the critical classes`); st.remaining = failures; save(); break }
+      const verifyPrompt = `Verify the ${a.key} fixes (round ${round}). Run ${UIRUN(target, 2)} (${target.includes('/test') ? `the ${cls} tests that failed before the fixes` : `the WHOLE ${cls} class — most of it has never run yet`}; identifiers are NibUITests/<Class>/<testMethod>). If the build fails, report the compile errors as a failure with the owning feature. For every failing test decide: test wrong per spec -> fix the test in NibUITests/${cls}.swift (and rerun once if budget allows); app wrong -> report it (do not change app code here). Never git add/commit/stash/checkout/reset. Answer status "green" (all those tests pass) or "red", file "NibUITests/${cls}.swift", tests/passed/failed, failures (test = "${cls}/<testMethod>", owner = feature id or "shared", problem, evidence), notes.`
+      let v = await codex(`verify-${a.key}-${round}`, verifyPrompt, 'uiwrite', 'high', 2).catch((e) => ({ status: 'blocked', failures, notes: e.message }))
+      if (!v.tests && minutesUntil(A.shipBy) > 150) {   // nothing executed (build broken by a concurrent edit, runner death): run the verify again
+        say(`verify ${a.key} r${round}: no tests executed — running the verify again`)
+        v = await codex(`verify-${a.key}-${round}b`, verifyPrompt, 'uiwrite', 'high', 2).catch((e) => ({ status: 'blocked', failures, notes: e.message }))
+      }
+      say(`verify ${a.key} r${round}: ${v.status} — ${v.passed ?? '?'}/${v.tests ?? '?'} pass, ${v.failed ?? '?'} fail`)
+      failures = (v.failures || []).map((f) => ({ ...f, test: qual(v, f) }))
+      st.lastTests = v.tests || 0
+      st.rounds.push({ round, before: Object.values(groups).flat().length, after: failures.length, status: v.status }); st.remaining = failures; save()
+      if (v.status === 'green') break
+    }
+    st.remaining = failures; save()
+    say(`area ${a.key}: done, ${failures.length} failure(s) left`)
   }
-  state.remainingFailures = failures; save()
 
-  // ---------------------------------------------------------------- polish (mandatory, time-boxed)
-  if (!state.design && minutesUntil(A.shipBy) > 150) {
-    say('polish: capture + 4-lens review + fix everything (incl. minor)')
+  const todo = state.matrix.areas.filter((a) => !(state.fixed[a.key] && state.fixed[a.key].done))
+  // Order: writers already running, then areas whose results are in (straight to fixing), then the library lane, then the rest.
+  const PRIORITY = ['ink', 'chrome', 'pages', 'search', 'share', 'study_ai']   // pen + toolbar buttons first
+  const rank = (a) => alive(`${TAG}-write-${a.key}`) ? 0 : (state.written[a.key]?.tests ? 1 : (a.key === 'library' ? 2 : 3 + (PRIORITY.indexOf(a.key) + 1 || 9)))
+  todo.sort((x, y) => rank(x) - rank(y))
+  if (todo.length) say(`areas: ${todo.map((a) => a.key).join(', ')}`)
+  const areasP = pool(todo, A.maxWriters || 3, async (a) => {
+    let r = state.written[a.key]
+    if (a.key === 'library' && A.earlyFix && !state.earlyFixMerged) r = await mergeEarly()
+    else if (!r || !r.tests) {
+      if (minutesUntil(A.shipBy) < 210 && !alive(`${TAG}-write-${a.key}`)) {   // a new area needs ~3.5 h for write + fix + verify
+        say(`area ${a.key}: NOT COVERED — no time left to write, fix and verify it before ${A.shipBy}`)
+        state.fixed[a.key] = { rounds: [], remaining: [], done: true, notCovered: true }; save(); return
+      }
+      r = await writeArea(a)
+    }
+    await fixArea(a, r)
+    state.fixed[a.key].done = true; save()
+  })
+
+  // ---------------------------------------------------------------- polish, concurrently with the area pipeline
+  const polishP = (async () => {
+    if (state.design?.done) return
     const shots = `${ROOT}-design/qa-final`
-    await codex('capture', `Capture the real app for the final polish review. Build and run the app on the iPad Pro 13-inch simulator (and an iPhone 17 Pro) with the "-NibUITestFixture" launch argument; drive states with the NibUITests helpers, the MCP bridge or simctl, and verify each state through the nib.qa.state probe before capturing. Save PNGs to ${shots}/<n>-<screen>-<light|dark>-<orientation>.png for: library grid/list/folder, library search, new menu, new-notebook sheet, canvas with the palette docked left/top/bottom/right, options bar, each tool's options (pen, highlighter, eraser, lasso, shapes, text), lasso selection with object menu, page sidebar, outline, document search with matches, AI assistant, plugin manager, settings (2-3 screens), export sheet, whiteboard, text document, study session, presentation mode, tabs with 3 documents, an empty folder, an error/empty state — light and dark, iPad portrait + landscape, plus iPhone portrait + landscape for library, canvas and search. Write ${shots}/index.md. Delete ${ROOT}-dd-sim afterwards. Answer status "ok", details = file list.`, 'result', 'medium')
+    say('polish: capture through XCUITest + 4-lens review + fix everything (incl. minor)')
+    const pngs = () => { try { return fs.readdirSync(shots).filter((f) => f.endsWith('.png')).length } catch { return 0 } }
+    let cap = { status: 'blocked', details: [] }
+    for (const name of ['capture', 'capture-2', 'capture-3']) {
+      if (pngs() > 0) break
+      cap = await codex(name, `Capture the real app for the final polish review, through the UI-test lanes (no extra simulators: the Mac is out of memory).
+1. Write (or, if it already exists, finish and reuse) NibUITests/CaptureUITests.swift (only this file, plus — if missing — a fixture-only launch argument "-NibUITestAppearance light|dark" in the app's UI-test fixture code that sets the windows' overrideUserInterfaceStyle). One test per screen group: drive the real app into each state with the NibUITests/Support helpers (verify via the nib.qa.state probe), then attach XCTAttachment(screenshot: XCUIScreen.main.screenshot()) named "<nn>-<screen>-<light|dark>-<portrait|landscape>" with lifetime .keepAlways. Screens: library grid, list and an open folder; library search; new menu; new-notebook sheet; canvas with the palette docked left, top and bottom; the options bar; each tool's options (pen, highlighter, eraser, lasso, shapes, text); a lasso selection with its object menu; page sidebar; outline; document search with matches; AI assistant; plugin manager; settings (2-3 screens); export sheet; whiteboard; text document; study session; presentation mode; tabs with 3 documents; an empty folder; an empty/error state. Light AND dark, portrait AND landscape (XCUIDevice.shared.orientation). A capture test should not fail on cosmetic details — only when a state cannot be reached.
+2. Run ${UIRUN('NibUITests/CaptureUITests', 2)}
+3. Export: xcrun xcresulttool export attachments --path ${LOGS}/ui-CaptureUITests.xcresult --output-path ${shots} ; rename each exported file to its attachment name (the export's manifest.json maps them) as .png; write ${shots}/index.md listing each file, screen and state, and any state you could not reach and why.
+Answer status "ok", details = the file list (or "blocked" with the reason).`, 'result', 'high', 2).catch((e) => ({ status: 'blocked', details: [e.message] }))
+      say(`polish: ${name} ${cap.status}, ${pngs()} screenshot(s)`)
+    }
+    if (!pngs()) { say('polish: NO screenshots could be captured — skipping the visual review (reported as not done)'); state.design = { done: true, issues: 0, noScreenshots: true }; save(); return }
     const LENSES = [
       ['glass', 'MATERIAL + LIQUID GLASS: DESIGN.md §2, §7, §10 and the glass lines of §16 — rims, refraction, doubled edges, shading, glass bodies behind every floating control, dark-mode legibility, iOS 26 glass vs fallbacks.'],
-      ['layout', 'LAYOUT + TYPOGRAPHY + COLOUR: DESIGN.md §3-§6 and §14 per screen — spacing grid, alignment, radii, type scale, truncation, colour tokens light AND dark, overlaps between chrome/panels and page content or ink, iPad vs iPhone, portrait vs landscape.'],
+      ['layout', 'LAYOUT + TYPOGRAPHY + COLOUR: DESIGN.md §3-§6 and §14 per screen — spacing grid, alignment, radii, type scale, truncation, colour tokens light AND dark, overlaps between chrome/panels and page content or ink, portrait vs landscape.'],
       ['slop', 'SLOP + ACCESSIBILITY: every line of DESIGN.md §16 and §12 — 44 pt targets, Dynamic Type, contrast, VoiceOver labels, Reduce Motion/Transparency; anything templated, generic, cluttered, duplicated or stray.'],
       ['ux', 'UX + COPY + STATES: the product feel — empty states, error and confirmation messages, button and menu wording (consistent, specific, sentence case, no jargon), loading/progress states, disabled states, selection feedback, consistency of icons and terminology across screens, anything that feels unfinished.'],
     ]
-    const reviews = await Promise.all(LENSES.map(([key, lens]) => codex(`polish-review-${key}`, `Final polish review of the real Nib app. Read docs/DESIGN.md fully, open EVERY screenshot in ${shots} (index.md explains each). Lens: ${lens}
+    const reviews = await Promise.all(LENSES.map(([key, lens]) => codex(`polish-review-${key}`, `Final polish review of the real Nib app. Read docs/DESIGN.md fully, open EVERY screenshot in ${shots} with your image viewer (index.md explains each). Lens: ${lens}
 Report every real, visible problem — blocker, major AND minor polish — each with screen, owner (feature id from docs/forge-spec.json whose files draw it, or "shared"), problem and the concrete fix. No speculation. Do not change files.`, 'review', 'high').catch(() => ({ issues: [] }))))
     const issues = reviews.flatMap((r) => r.issues || [])
     say(`polish: ${issues.length} issue(s) (${issues.filter((i) => i.severity !== 'minor').length} blocker/major)`)
-    if (issues.length) {
-      const groups = {}
-      for (const i of issues) (groups[normOwner(i.owner)] ||= []).push(`[${i.severity}] ${i.screen}: ${i.problem} -> ${i.fix}`)
-      await Promise.allSettled(Object.keys(groups).map((o) => codex(`polish-fix-${o}`, `Polish fixes. Edit ONLY files owned by ${o === 'shared' ? 'no feature (NibDesign, NibContracts, Nib/App, docs)' : o}; others edit other owners' files now; no git commit/stash/checkout/reset, no builds or tests.\nFindings (fix ALL of them, including minor):\n${groups[o].join('\n')}\nFix each at the root per docs/DESIGN.md with NibDesign tokens/components; keep copy consistent with the rest of the app; update/add tests for changed behaviour. Answer status "ok", details.`, 'result', 'high')))
-      say(`polish: committed ${await commit('QA: final polish')}`)
-      const v = await codex('polish-verify', `${BUILD} — fix regressions until LOCAL BUILD OK. Then ${UIRUN('', 2)} (the WHOLE NibUITests suite, every area); fix any UI test the polish changes broke (test wrong per spec -> fix the test; app wrong -> fix the app at the root). Repeat until both are green, committing on ${BR} (${TRAILER_RULE}). Answer status "green"/"red", file "NibUITests", tests/passed/failed, failures, notes.`, 'uiwrite', 'high', 2)
-      say(`polish verify: ${v.status} — UI ${v.passed}/${v.tests}`)
-      state.remainingFailures = v.failures || state.remainingFailures
-    }
-    state.design = { issues: issues.length }; save()
+    const groups = {}
+    for (const i of issues) (groups[normOwner(i.owner)] ||= []).push(`[${i.severity}] ${i.screen}: ${i.problem} -> ${i.fix}`)
+    await pool(Object.keys(groups), 3, (o) => codex(`polish-fix-${o}`, `Polish fixes. Edit ONLY files owned by ${o === 'shared' ? 'no feature (NibDesign, NibContracts, Nib/App, docs; keep changes backward compatible)' : o + ' (docs/forge-spec.json)'}; other jobs edit other files and run UI tests from this worktree right now, so keep the code compiling at every moment and never run git add/commit/stash/checkout/reset.
+Findings (fix ALL of them, including minor):
+${groups[o].join('\n')}
+Fix each at the root per docs/DESIGN.md with NibDesign tokens/components; keep copy consistent with the rest of the app; update/add unit tests for changed behaviour and check them with \`${TOOLS} targets ${DIR} "<the owner's test targets>"\`. Do not run UI tests. Answer status "ok", details = what you changed per finding.`, 'result', 'high').catch((e) => ({ status: 'blocked', details: [e.message] })))
+    say(`polish: committed ${await commit('QA: final polish')}`)
+    state.design = { done: true, issues: issues.length, majors: issues.filter((i) => i.severity !== 'minor').length }; save()
+  })()
+
+  await Promise.all([areasP, polishP])
+  say(`areas + polish: committed ${await commit('QA: UI test coverage for every area')}`)
+  const failures = Object.values(state.fixed).flatMap((f) => f.remaining || [])
+  state.remainingFailures = failures; save()
+  const notCovered = Object.entries(state.fixed).filter(([k, f]) => f.notCovered || !(state.written[k]?.tests)).map(([k]) => k)
+  if (notCovered.length) say(`not covered by UI tests: ${notCovered.join(', ')}`)
+
+  // ---------------------------------------------------------------- final verify (unit suite + critical UI classes)
+  if (!state.finalVerify) {
+    const v = await codex('final-verify', `Final verification before shipping (the unit/package suite runs on GitHub CI during the ship step, so do NOT run the local full build). The critical UI regression set — start BOTH runs at the same time in the background (they take the two simulator lanes): ${UIRUN('NibUITests/SmokeUITests NibUITests/InkUITests', 3)} and \`${TOOLS} uitest ${DIR} "NibUITests/CanvasUITests"\` (log ${LOGS}/local-integration-uitest-CanvasUITests.log, bundle ${LOGS}/ui-CanvasUITests.xcresult). Before running, make sure the worktree compiles (no half-finished edits are expected now; if the UI build fails, fix the compile error at the root). Fix anything the recent fixes or the polish broke (test wrong per spec -> fix the test; app wrong -> fix the app at the root), within the UI-run budget, and commit on ${BR} (${TRAILER_RULE}). Answer status "green"/"red", file "NibUITests", tests/passed/failed, failures (test = "<Class>/<testMethod>", owner, problem, evidence), notes.`, 'uiwrite', 'high', 3).catch((e) => ({ status: 'blocked', failures: [], notes: e.message }))
+    say(`final verify: ${v.status} — UI ${v.passed}/${v.tests} pass`)
+    state.finalVerify = v; save()
   }
 
   // ---------------------------------------------------------------- ship
   say(`ship: CI on ${BR}, merge to main, main CI, IPA, tag ${A.rcTag}`)
   const ship = await codex('ship', `Ship the QA campaign.
-1. In ${DIR}: git push origin ${BR}; run and watch the full CI on ${BR} (gh workflow run ios.yml --repo ${REPO} --ref ${BR}; find the workflow_dispatch run for HEAD; gh run watch <id> --repo ${REPO} --exit-status --interval 60). If red, fix root causes on ${BR} (${BUILD}) and repeat (max 4 rounds).
-2. When green: in the main clone ${ROOT}: git fetch origin && git checkout -q main && git pull -q --ff-only origin main && git merge --no-ff origin/${BR} -m "QA campaign: every control tested, bugs fixed" (${TRAILER_RULE}) && python3 Scripts/lint.py && git push origin main.
-3. Watch main's CI for that SHA (test + ipa) to green (fix on main if red, max 3 rounds). Download the IPA: gh run download <id> --repo ${REPO} -n Nib-unsigned-ipa -D ${ROOT}-dist/<short-sha>/.
+Time is short (midnight deadline), so main's CI is the single gate — do not run a separate CI pass on ${BR}.
+1. In ${DIR}: commit anything left (${TRAILER_RULE}), python3 Scripts/lint.py must pass, git push origin ${BR}.
+2. In the main clone ${ROOT} (it may have unrelated uncommitted tool files under tools/ — leave them alone): git fetch origin && git checkout -q main && git pull -q --ff-only origin main && git merge --no-ff origin/${BR} -m "QA campaign: functional fixes and polish" (${TRAILER_RULE}) && git push origin main.
+3. Watch main's CI for that SHA (gh run list --repo ${REPO} --branch main; gh run watch <id> --repo ${REPO} --exit-status --interval 60). If red: read the failing log (gh run view <id> --log-failed), fix the root cause on main (commit, push) and watch again — max 3 rounds; never skip or weaken tests. Download the IPA from the green run: gh run download <id> --repo ${REPO} -n Nib-unsigned-ipa -D ${ROOT}-dist/<short-sha>/ (also the no-extensions variant if the run has it).
 4. Tag: git tag ${A.rcTag} <sha> && git push origin ${A.rcTag}.
 Answer status "green", sha, runUrl, details = IPA path(s).`, 'result', 'high')
   say(`ship: ${ship.status} ${ship.sha || ''} ${ship.runUrl || ''}`)
   state.ship = ship; save()
-  return { rounds: state.rounds, remainingFailures: (state.remainingFailures || []).length, design: state.design, ship }
+  return { areas: state.fixed, remainingFailures: (state.remainingFailures || []).length, design: state.design, ship }
 }
 
 main().then((r) => { say('DONE ' + JSON.stringify(r)); process.exit(0) }, (e) => { say('FAILED ' + e.message); process.exit(1) })

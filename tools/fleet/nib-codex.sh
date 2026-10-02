@@ -40,6 +40,10 @@ for i in $(seq 1 54); do
     fi
     echo "CODEX_FAILED rc=$rc: $(grep -iE 'error|limit|quota|unauthor' "$BASE.log" | tail -3 | tr '\n' ' ' | cut -c1-400)"; exit 1
   fi
+  # The job died without recording an exit code (e.g. the disk filled up): report it instead of waiting forever.
+  if [ -f "$BASE.pid" ] && ! kill -0 "$(cat "$BASE.pid")" 2>/dev/null && [ ! -f "$BASE.exit" ]; then
+    sleep 5; [ -f "$BASE.exit" ] || { echo 1 > "$BASE.exit"; echo "CODEX_FAILED job process died without an exit code: $(tail -3 "$BASE.log" | tr '\n' ' ' | cut -c1-300)"; exit 1; }
+  fi
   sleep 10
 done
 echo "RUNNING $NAME ($(( ($(date +%s) - start) / 60 )) min)"

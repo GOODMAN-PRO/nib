@@ -17,12 +17,18 @@
 set -uo pipefail
 MODE="${1:?mode}"; WTREE="$(cd "${2:?worktree}" && pwd)"; ARG="${3:-}"
 BASE="$HOME/Projects"
-LOCKS="$BASE/Nib-locks"; LOGS="$BASE/Nib-ci-logs"; SLOTS="${NIB_SLOTS:-2}"
+LOCKS="$BASE/Nib-locks"; LOGS="$BASE/Nib-ci-logs"; SLOTS=1; UI_LANES=$(cat "$BASE/Nib-locks/ui-lanes" 2>/dev/null || echo 2)   # set by the planner/monitor only (disk valve), never by jobs
 mkdir -p "$LOCKS" "$LOGS"
 NAME="$(basename "$WTREE")"
 UITAG=""
 if [ "$MODE" = uitest ]; then
   UITAG="$(echo "${ARG:-all}" | sed -E 's#NibUITests/##g; s#[^A-Za-z0-9]+#-#g; s#-$##')"; UITAG="${UITAG:0:60}"
+  # The local UI lane can be closed (the planner creates Nib-locks/ui-closed) once GitHub Actions takes over UI runs.
+  if [ -f "$LOCKS/ui-closed" ] && [ -n "${NIB_JOB:-}" ]; then
+    echo "LOCAL UI LANE CLOSED: UI tests now run on GitHub Actions (parallel per class, ~60-90 min, no local queue). Run instead:"
+    echo "  $HOME/Projects/Nib-tools/ui-ci.sh $NIB_JOB \"${ARG}\""
+    echo "(it snapshots HEAD + NibUITests/Support + the named classes' files, runs them on CI and prints 'FAIL <Class>/<method>: <message>' lines plus local xcresult paths; exit 0 all passed, 1 test failures, 2 infrastructure error). Pass any app files you changed as extra arguments after the identifiers so the snapshot includes them."; exit 3
+  fi
   # Hard per-job budget (set by the orchestrator through nib-codex.sh): a Codex job may start at most NIB_UI_MAX UI runs.
   if [ -n "${NIB_JOB:-}" ] && [ -n "${NIB_UI_MAX:-}" ]; then
     cf="$LOGS/uiruns-$NIB_JOB"; n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
@@ -39,6 +45,12 @@ say() { echo "$*" | tee -a "$LOG"; }
 
 # ---- acquire a slot (atomic mkdir; stale when the owning pid is gone) --------------------------------------------
 SLOT=""
+# A lock dir is stale when its owner is gone, or when it has had no pid for over 2 minutes (owner died between mkdir and echo).
+stale_lock() {
+  local d="$1" p; p="$(cat "$d/pid" 2>/dev/null || true)"
+  if [ -n "$p" ]; then kill -0 "$p" 2>/dev/null || rm -rf "$d"
+  elif [ -d "$d" ] && [ -n "$(find "$d" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rm -rf "$d"; fi
+}
 acquire() {
   local pref=""
   [ -f "$LOCKS/affinity-$(basename "$WTREE")" ] && pref="$(cat "$LOCKS/affinity-$(basename "$WTREE")")"
@@ -46,8 +58,7 @@ acquire() {
     for s in $pref $(seq 1 "$SLOTS"); do
       local d="$LOCKS/slot$s"
       if mkdir "$d" 2>/dev/null; then echo $$ > "$d/pid"; SLOT=$s; return; fi
-      local p; p="$(cat "$d/pid" 2>/dev/null || true)"
-      if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$d"; fi
+      stale_lock "$d"
     done
     sleep 15
   done
@@ -55,12 +66,20 @@ acquire() {
 UILOCK=""
 release() { [ -n "$SLOT" ] && rm -rf "$LOCKS/slot$SLOT"; [ -n "$UILOCK" ] && [ "$(cat "$UILOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$UILOCK"; }
 trap 'release' EXIT INT TERM
+UILANE=""
 if [ "$MODE" = uitest ]; then
-  # One UI run machine-wide. Take the UI lock BEFORE a build slot so queued UI runs never hold slots other jobs need.
-  say "== waiting for the UI simulator lane"
-  UILOCK="$LOCKS/ui"
-  until mkdir "$UILOCK" 2>/dev/null; do p=$(cat "$UILOCK/pid" 2>/dev/null); [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null && rm -rf "$UILOCK"; sleep 15; done
-  echo $$ > "$UILOCK/pid"
+  # NIB_UI_LANES simulator lanes (lock ui = sim Nib-ui-ipad, lock ui2 = sim Nib-ui-ipad2, ...). Take a lane BEFORE a build
+  # slot; the slot is only held for build-for-testing, then the products are copied to the lane and the slot is released.
+  say "== waiting for a UI simulator lane ($UI_LANES max)"
+  while [ -z "$UILANE" ]; do
+    for n in $(seq 1 "$UI_LANES"); do
+      d="$LOCKS/ui"; [ "$n" -gt 1 ] && d="$LOCKS/ui$n"
+      if mkdir "$d" 2>/dev/null; then echo $$ > "$d/pid"; UILOCK="$d"; UILANE=$n; break; fi
+      stale_lock "$d"
+    done
+    [ -z "$UILANE" ] && sleep 15
+  done
+  say "== UI lane $UILANE"
 fi
 say "== waiting for a build slot ($SLOTS max)"
 acquire
@@ -84,7 +103,7 @@ if [ -n "$simid" ]; then
   simgb=$(du -sg "$HOME/Library/Developer/CoreSimulator/Devices/$simid" 2>/dev/null | awk '{print $1}')
   if [ "${simgb:-0}" -gt 2 ]; then say "== slot simulator ${simgb} GB: erasing"; xcrun simctl shutdown "$simid" >/dev/null 2>&1; xcrun simctl erase "$simid" >/dev/null 2>&1; fi
 fi
-while [ "$(freegb)" -lt 4 ]; do say "== waiting: only $(freegb) GB free"; sleep 60; done
+while [ "$(freegb)" -lt 2 ]; do say "== waiting: only $(freegb) GB free"; sleep 60; done
 
 # ---- per-slot simulator (a clone of the device pick_sim.py chooses) ----------------------------------------------
 sim() {
@@ -165,7 +184,7 @@ archive_app() {
 }
 
 ui_tests() { # $1 = optional space-separated -only-testing identifiers (e.g. "NibUITests/PenUITests")
-  local name="Nib-ui-ipad" udid
+  local name="Nib-ui-ipad" udid; [ "$UILANE" -gt 1 ] && name="Nib-ui-ipad$UILANE"
   udid="$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next((x['udid'] for v in d.values() for x in v if x['name']=='$name'),''))")"
   if [ -z "$udid" ]; then
     local rt; rt="$(xcrun simctl list runtimes -j | python3 -c "import json,sys;r=[x for x in json.load(sys.stdin)['runtimes'] if x['isAvailable'] and x['platform']=='iOS'];print(sorted(r,key=lambda x:x['version'])[-1]['identifier'])")"
@@ -175,12 +194,50 @@ ui_tests() { # $1 = optional space-separated -only-testing identifiers (e.g. "Ni
   local only=""; for t in $1; do only="$only -only-testing:$t"; done
   local RB="$LOGS/ui-$UITAG.xcresult"; rm -rf "$RB" "$LOGS/ui-latest.xcresult"
   echo "== result bundle $RB" >> "$LOG"
-  gen_project && ( cd "$WTREE" && xcodebuild test -project Nib.xcodeproj -scheme NibUITests -destination "id=$udid" \
-      -derivedDataPath "$DD" -clonedSourcePackagesDirPath "$SPM" -skipPackagePluginValidation $only \
-      -resultBundlePath "$RB" CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO ) >> "$LOG" 2>&1
-  local rc=$?
+  local G="$LOCKS/gen-$NAME"
+  until mkdir "$G" 2>/dev/null; do p=$(cat "$G/pid" 2>/dev/null); [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null && rm -rf "$G"; sleep 3; done
+  echo $$ > "$G/pid"
+  local rc=1 b
+  # Other jobs edit app and test files in this worktree concurrently, so a compile error is often someone's half-finished
+  # edit. Retry the build a few minutes later before calling it a failure (does not count against the job's UI budget).
+  for b in 1 2 3 4; do
+    gen_project; rc=$?
+    [ $rc -eq 0 ] && { ( cd "$WTREE" && xcodebuild build-for-testing -project Nib.xcodeproj -scheme NibUITests -destination "id=$udid" \
+        -derivedDataPath "$DD" -clonedSourcePackagesDirPath "$SPM" -skipPackagePluginValidation \
+        CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO ) >> "$LOG" 2>&1 || rc=$?; }
+    [ $rc -eq 0 ] && break
+    [ $b -lt 4 ] && { say "== build failed (attempt $b): $(grep -E ' error: ' "$LOG" | tail -2 | sed 's#.*/##' | tr '\n' ' ' | cut -c1-200) — retrying in 3 min (concurrent edits)"; rm -rf "$G"; sleep 180; until mkdir "$G" 2>/dev/null; do sleep 3; done; echo $$ > "$G/pid"; }
+  done
+  rm -rf "$G"
+  local LD="$BASE/Nib-ui-lane$UILANE" run=""
+  if [ $rc -eq 0 ]; then
+    rm -rf "$LD"; mkdir -p "$LD"
+    ditto "$DD/Build/Products/Debug-iphonesimulator" "$LD/Debug-iphonesimulator" && run="$(ls -t "$DD"/Build/Products/NibUITests_*.xctestrun | head -1)" && cp "$run" "$LD/" && run="$LD/$(basename "$run")" || rc=1
+  fi
+  [ -n "$SLOT" ] && rm -rf "$LOCKS/slot$SLOT"; SLOT=""   # free the build slot for other jobs while the simulator runs the tests
+  if [ $rc -eq 0 ]; then
+    local attempt
+    for attempt in 1 2; do
+      rc=0; rm -rf "$RB"
+      xcodebuild test-without-building -xctestrun "$run" -destination "id=$udid" $only \
+        -resultBundlePath "$RB" >> "$LOG" 2>&1 || rc=$?
+      # An overloaded Mac can make the runner miss its startup window before any test runs. That is infrastructure,
+      # not a test result: reboot the simulator and retry once inside the same invocation.
+      if [ $rc -ne 0 ] && [ $attempt -eq 1 ] && tail -400 "$LOG" | grep -qE "failed to initialize for UI testing|Timed out while loading Accessibility|Failed to launch app with identifier|Test runner never began executing"; then
+        say "== runner failed to start (machine overloaded): rebooting the simulator and retrying once"
+        xcrun simctl shutdown "$udid" >/dev/null 2>&1; sleep 5; xcrun simctl boot "$udid" >/dev/null 2>&1; sleep 20
+        continue
+      fi
+      break
+    done
+  fi
+
   ln -sfn "$RB" "$LOGS/ui-latest.xcresult"
   xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true
+  # Disk: a lane simulator accumulates installs/recordings; result bundles are ~0.5 GB each. Keep both bounded.
+  local sgb; sgb=$(du -sg "$HOME/Library/Developer/CoreSimulator/Devices/$udid" 2>/dev/null | awk '{print $1}')
+  [ "${sgb:-0}" -gt 2 ] && xcrun simctl erase "$udid" >/dev/null 2>&1
+  find "$LOGS" -maxdepth 1 -name '*.xcresult' -type d -mmin +150 -exec rm -rf {} + 2>/dev/null
   return $rc
 }
 
