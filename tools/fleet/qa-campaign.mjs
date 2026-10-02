@@ -243,7 +243,8 @@ Report every real, visible problem — blocker, major AND minor polish — each 
     say(`polish: ${issues.length} issue(s) (${issues.filter((i) => i.severity !== 'minor').length} blocker/major)`)
     const groups = {}
     for (const i of issues) (groups[normOwner(i.owner)] ||= []).push(`[${i.severity}] ${i.screen}: ${i.problem} -> ${i.fix}`)
-    await pool(Object.keys(groups), 3, (o) => codex(`polish-fix-${o}`, `Polish fixes. Edit ONLY files owned by ${o === 'shared' ? 'no feature (NibDesign, NibContracts, Nib/App, docs; keep changes backward compatible)' : o + ' (docs/forge-spec.json)'}; other jobs edit other files and run UI tests from this worktree right now, so keep the code compiling at every moment and never run git add/commit/stash/checkout/reset.
+    state.polishSkipped = []
+    await pool(Object.keys(groups), 3, (o) => minutesUntil(A.shipBy) < 35 ? (state.polishSkipped.push(o), save(), Promise.resolve({ status: 'skipped' })) : codex(`polish-fix-${o}`, `Polish fixes. Edit ONLY files owned by ${o === 'shared' ? 'no feature (NibDesign, NibContracts, Nib/App, docs; keep changes backward compatible)' : o + ' (docs/forge-spec.json)'}; other jobs edit other files and run UI tests from this worktree right now, so keep the code compiling at every moment and never run git add/commit/stash/checkout/reset.
 Findings (fix ALL of them, including minor):
 ${groups[o].join('\n')}
 This is the last change before shipping tonight: keep every fix low-risk and visual/copy-level (tokens, spacing, wording, states, accessibility labels) — no behaviour or navigation changes; if a finding would need a risky change, skip it and say so.
