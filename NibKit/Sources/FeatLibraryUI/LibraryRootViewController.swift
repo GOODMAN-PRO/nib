@@ -1312,7 +1312,7 @@ struct LibrarySidebarPlace: Identifiable {
 }
 
 struct LibraryStorageNotice: View {
-    static var message: String { String(localized: "Reinstalls can lose notes.") }
+    static var message: String { String(localized: "Risk of note loss.") }
     let move: () -> Void
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var body: some View {

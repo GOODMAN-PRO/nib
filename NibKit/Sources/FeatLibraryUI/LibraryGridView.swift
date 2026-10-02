@@ -74,7 +74,7 @@ struct LibraryGridView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : NibMetrics.libraryGutter) {
                         if usesRows { list }
-                        else { grid }
+                        else if contentWidth > 0 { grid }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .nibReflowSpace(model.reflow)
@@ -158,7 +158,7 @@ struct LibraryGridView: View {
                     .font(compactHeight ? NibFont.footnoteEmphasis : NibFont.title3).foregroundStyle(NibColor.label)
                 LazyVGrid(columns: coverColumns, alignment: .leading, spacing: 0) {
                     ForEach(documents) { row in
-                        cell(row).frame(height: model.renaming == row.ref ? nil : rowPitch, alignment: .top)
+                        cell(row).frame(width: coverWidth, height: model.renaming == row.ref ? nil : rowPitch, alignment: .topLeading)
                     }
                 }
             }

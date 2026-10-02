@@ -222,21 +222,27 @@ final class ChatAnswerDropAttachment: NSObject, CanvasAttachment, UIDropInteract
 struct ChatHistoricalImage: View {
     let url: URL?
     @State private var image: UIImage?
+    @State private var isLoading = true
     var body: some View {
         Group {
             if let image {
                 Image(uiImage: image).resizable().scaledToFit()
                     .frame(maxHeight: NibMetrics.floatingPanelSize.height / 2)
                     .accessibilityLabel(String(localized: "Conversation attachment"))
+            } else if isLoading {
+                NibTraceRow(String(localized: "Loading attachment…"), phase: .running)
             } else {
                 Label(String(localized: "Attachment unavailable on this device"), systemImage: NibSymbol.image.name)
                     .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
             }
         }.task(id: url) {
-            guard let url else { image = nil; return }
+            image = nil
+            isLoading = true
+            guard let url else { isLoading = false; return }
             let data = await Task.detached { try? Data(contentsOf: url) }.value
             guard !Task.isCancelled else { return }
             image = data.flatMap(UIImage.init(data:))
+            isLoading = false
         }
     }
 }

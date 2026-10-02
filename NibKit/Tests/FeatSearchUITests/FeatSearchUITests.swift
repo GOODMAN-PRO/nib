@@ -77,6 +77,90 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertFalse(SearchFilter.pdf.includes(hit()))
     }
 
+    func testTitleMatchesShowOneHighlightedHeadingAndDocumentMetadata() {
+        var result = hit(kind: "title", docKind: "studySet")
+        result.title = "Café notes: CAFÉ revision"
+        result.snippet = result.title
+        let heading = result.heading(query: "cafe")
+        XCTAssertEqual(String(heading.characters), result.title)
+        let highlights = heading.runs.filter { $0.backgroundColor == NibColor.accentWash }
+        XCTAssertEqual(highlights.map { String(heading[$0.range].characters) }, ["Café", "CAFÉ"])
+        XCTAssertNil(result.detailSnippet, "A title match must not repeat its heading as a snippet")
+        XCTAssertEqual(result.documentKindLabel, "Study set")
+
+        result.kind = "typed"
+        result.snippet = "Notes from the café"
+        XCTAssertEqual(result.detailSnippet, "Notes from the café")
+        XCTAssertTrue(result.heading(query: "cafe").runs.allSatisfy { $0.backgroundColor == nil },
+            "Content matches highlight the snippet, not the document heading")
+    }
+
+    func testTitleIdentityUsesDocumentKindAndSafeUnknownFallback() {
+        let cases: [(String, NibSymbol, String, String)] = [
+            ("notebook", .notebook, "Untitled notebook", "Notebook"),
+            ("whiteboard", .whiteboard, "Untitled whiteboard", "Whiteboard"),
+            ("textDocument", .textDocument, "Untitled text document", "Text document"),
+            ("studySet", .studySets, "Untitled study set", "Study set"),
+            ("unknown", .library, "Untitled document", "Document")
+        ]
+        for (kind, symbol, fallback, metadata) in cases {
+            var result = hit(kind: "title", docKind: kind)
+            XCTAssertEqual(result.symbol, symbol)
+            XCTAssertEqual(result.documentKindLabel, metadata)
+            XCTAssertEqual(result.displayTitle, "Fixture")
+            for title in ["", " \n "] {
+                result.title = title
+                XCTAssertEqual(result.displayTitle, fallback)
+                XCTAssertNil(result.detailSnippet)
+            }
+        }
+        XCTAssertEqual(hit(kind: "pdf").symbol, .pdf)
+        XCTAssertEqual(hit(kind: "ink").symbol, .pen)
+        XCTAssertEqual(hit(kind: "typed", docKind: "textDocument").symbol, .text)
+    }
+
+    func testSearchFieldPromptFollowsScope() {
+        let state = SearchState()
+        for scope in ["lib", "folder:FOLDER01"] {
+            state.scope = scope
+            XCTAssertEqual(state.searchPrompt, "Search your notes")
+        }
+        for scope in ["document", NodeRef.document(Fixtures.docID).description,
+                      NodeRef.page(Fixtures.docID, Fixtures.page1).description] {
+            state.scope = scope
+            XCTAssertEqual(state.searchPrompt, "Find in this document")
+        }
+    }
+
+    func testMatchControlsDisableForEmptyPendingFailedAndFilteredResults() {
+        let state = SearchState()
+        state.scope = NodeRef.document(Fixtures.docID).description
+        XCTAssertFalse(state.canStepMatches)
+        state.query = "Hello"
+        XCTAssertFalse(state.canStepMatches)
+        state.matches = [hit()]
+        state.reconcileSelection()
+        XCTAssertTrue(state.canStepMatches, "A single result can still be revealed by the existing command")
+        state.loading = true
+        XCTAssertFalse(state.canStepMatches)
+        state.loading = false
+        state.error = "Search unavailable"
+        XCTAssertFalse(state.canStepMatches)
+        state.error = nil
+        state.filter = .pdf
+        XCTAssertFalse(state.canStepMatches)
+        state.filter = .all
+        XCTAssertTrue(state.canStepMatches)
+        state.query = " \n "
+        XCTAssertFalse(state.canStepMatches)
+        state.query = "Hello"
+        state.matches.append(hit(Fixtures.page2))
+        for result in state.matches {
+            state.selectedID = result.id
+            XCTAssertTrue(state.canStepMatches, "Navigation wraps at both ends")
+        }
+    }
+
     func testCountLabelResolvesInflectionForZeroOneAndMultipleMatches() {
         let state = SearchState()
         for (count, expected) in [(0, "0 matches"), (1, "1 match"), (3, "3 matches")] {

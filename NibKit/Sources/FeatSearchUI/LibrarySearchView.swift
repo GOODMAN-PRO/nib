@@ -10,7 +10,7 @@ struct LibrarySearchView: View {
     @ObservedObject var state: SearchState
     var body: some View {
         PhoneSearchContent(app: app, session: session, state: state,
-            prompt: String(localized: "Search your notes"))
+            prompt: state.searchPrompt)
     }
 }
 
@@ -35,6 +35,9 @@ struct PhoneSearchContent: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, NibSpacing.s)
                 .padding(.top, NibSpacing.s)
+            if !state.isLibraryScope {
+                SearchCounter(app: app, session: session, state: state, usesHUD: false)
+            }
             SearchResults(app: app, session: session, state: state)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -195,11 +198,11 @@ struct SearchInput: View {
     @FocusState private var focused: Bool
     var body: some View {
         NibSearchField(text: searchBinding(app: app, session: session, state: state),
-            prompt: String(localized: "Search your notes"), style: style, onSubmit: {
+            prompt: state.searchPrompt, style: style, onSubmit: {
                 app.perform(CommandIDs.searchStep, ["direction": "next"], session: session)
             })
             .focused($focused)
-            .accessibilityLabel(String(localized: "Search your notes"))
+            .accessibilityLabel(state.searchPrompt)
             .onAppear { focused = true }
             .onChange(of: state.focusGeneration) { _, _ in focused = true }
     }
@@ -341,8 +344,8 @@ struct SearchResultRow: View {
         } label: {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
-                    Image(nib: hit.group.symbol).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
-                    Text(hit.title.isEmpty ? String(localized: "Untitled notebook") : hit.title).font(NibFont.bodyEmphasis)
+                    Image(nib: hit.symbol).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
+                    Text(hit.heading(query: state.query)).font(NibFont.bodyEmphasis)
                     Spacer(minLength: NibSpacing.s)
                     if state.selectedID == hit.id {
                         Image(nib: .checkmark).foregroundStyle(NibColor.accent).accessibilityHidden(true)
@@ -364,10 +367,16 @@ struct SearchResultRow: View {
                         .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail))
                         .accessibilityHidden(true)
                 }
-                Text(highlighted(hit.snippet, query: state.query))
-                    .font(NibFont.callout)
-                    .lineLimit(typeSize.isAccessibilitySize ? nil : 3)
-                    .multilineTextAlignment(.leading)
+                if let snippet = hit.detailSnippet {
+                    Text(highlighted(snippet, query: state.query))
+                        .font(NibFont.callout)
+                        .lineLimit(typeSize.isAccessibilitySize ? nil : 3)
+                        .multilineTextAlignment(.leading)
+                } else {
+                    Text(hit.documentKindLabel)
+                        .font(NibFont.caption1)
+                        .foregroundStyle(NibColor.labelSecondary)
+                }
                 if let index = hit.pageIndex {
                     Text(String(localized: "Page \(index + 1)")).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                 }
@@ -385,7 +394,7 @@ struct SearchResultRow: View {
         .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow)))
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(state.selectedID == hit.id ? .isSelected : [])
-        .accessibilityHint(String(localized: "Open the matching page"))
+        .accessibilityHint(hit.isTitleMatch ? String(localized: "Open the document") : String(localized: "Open the matching page"))
         .task(id: hit.id + String(Double(displayScale))) { await loadSnippet() }
     }
     private var snippetRegion: Rect? {
@@ -414,6 +423,12 @@ struct SearchResultRow: View {
             // The recognised text remains a complete accessible result when a page render is unavailable.
             snippetImage = nil
         }
+    }
+}
+
+extension SearchMatch {
+    func heading(query: String) -> AttributedString {
+        isTitleMatch ? highlighted(displayTitle, query: query) : AttributedString(displayTitle)
     }
 }
 

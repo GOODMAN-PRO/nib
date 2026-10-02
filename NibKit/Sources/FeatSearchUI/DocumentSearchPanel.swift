@@ -147,7 +147,7 @@ struct DocumentSearchSheet: View {
     @ObservedObject var state: SearchState
     var body: some View {
         PhoneSearchContent(app: app, session: session, state: state,
-            prompt: String(localized: "Find in this document"))
+            prompt: state.searchPrompt)
         .onAppear {
             if !state.isPresented || state.isLibraryScope {
                 app.perform(CommandIDs.searchOpen, ["scope": "document", "instant": true], session: session)
@@ -186,21 +186,44 @@ struct SearchCounter: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
+    var usesHUD = true
     var body: some View {
-        NibHUDGroup(id: "searchui.matchCounter") {
-            NibIconButton(.back, label: String(localized: "Find previous")) {
-                app.perform(CommandIDs.searchStep, ["direction": "previous"], session: session)
+        Group {
+            if usesHUD {
+                NibHUDGroup(id: "searchui.matchCounter") { controls }
+            } else {
+                HStack(spacing: NibSpacing.s) { controls }
+                    .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget)
+                    .padding(.horizontal, NibSpacing.l)
+                    .accessibilityElement(children: .contain)
             }
-            .accessibilityIdentifier("cmd." + CommandIDs.searchStep)
-            .nibShortcutHint(KeyboardShortcut("g", modifiers: [.command, .shift]))
-            NibHUDText(state.countLabel)
-                .accessibilityLabel(String(localized: "Search result \(state.countLabel)"))
-            NibIconButton(.forward, label: String(localized: "Find next")) {
-                app.perform(CommandIDs.searchStep, ["direction": "next"], session: session)
-            }
-            .accessibilityIdentifier("cmd." + CommandIDs.searchStep)
-            .nibShortcutHint(KeyboardShortcut("g", modifiers: [.command]))
         }
+    }
+    @ViewBuilder private var controls: some View {
+        NibIconButton(.back, label: String(localized: "Find previous")) {
+            app.perform(CommandIDs.searchStep, ["direction": "previous"], session: session)
+        }
+        .disabled(!state.canStepMatches)
+        .accessibilityIdentifier("cmd." + CommandIDs.searchStep)
+        .nibShortcutHint(KeyboardShortcut("g", modifiers: [.command, .shift]))
+        Group {
+            if usesHUD {
+                NibHUDText(state.countLabel)
+            } else {
+                Text(state.countLabel)
+                    .font(NibFont.callout)
+                    .monospacedDigit()
+                    .foregroundStyle(NibColor.label)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityLabel(String(localized: "Search result \(state.countLabel)"))
+        NibIconButton(.forward, label: String(localized: "Find next")) {
+            app.perform(CommandIDs.searchStep, ["direction": "next"], session: session)
+        }
+        .disabled(!state.canStepMatches)
+        .accessibilityIdentifier("cmd." + CommandIDs.searchStep)
+        .nibShortcutHint(KeyboardShortcut("g", modifiers: [.command]))
     }
 }
 

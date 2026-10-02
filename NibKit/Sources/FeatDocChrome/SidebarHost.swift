@@ -18,13 +18,14 @@ struct SidebarPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if chrome.drawsHeader(selected) {
-                header
-            }
+            // §14.4: tabs lead every navigator, including panels that embed their own header.
             if selected.id != PanelIDs.assistant { tabStrip }
             Rectangle()
                 .fill(NibColor.separatorSoft)
                 .frame(height: NibStroke.hairline)
+            if chrome.drawsHeader(selected) {
+                header
+            }
             selected.makeView(chrome.panelContext(selected.id, presentation: presentation))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(selected.id)

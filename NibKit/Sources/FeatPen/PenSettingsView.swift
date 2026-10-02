@@ -153,6 +153,11 @@ struct PenSettingsView: View {
         _model = StateObject(wrappedValue: PenOptions(app: app, session: session, pencil: pencil, observesWritingAids: true))
     }
 
+    init(model: PenOptions) {
+        _session = ObservedObject(wrappedValue: model.session)
+        _model = StateObject(wrappedValue: model)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xl) {
             typeGrid

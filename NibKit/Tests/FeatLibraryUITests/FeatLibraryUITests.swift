@@ -979,15 +979,18 @@ final class FeatLibraryUITests: XCTestCase {
         for width: CGFloat in [520, 656] {
             for variant in [NibSnapshot.Variant.light, .dark] {
                 var frames: [String: CGRect] = [:]
+                var viewportWidth: CGFloat = 0
                 let view = LibraryGridView(model: model, compactHeight: true)
                     .environment(\.horizontalSizeClass, .compact)
                     .onPreferenceChange(LibraryFrames.self) { frames = $0 }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewportWidth = $0 }
                 _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 393), variant: variant)
+                XCTAssertEqual(viewportWidth, width, accuracy: 0.5, "The grid must receive the available viewport")
                 let folderFrame = try XCTUnwrap(frames[folder.ref])
                 let documentFrames = try documents.map { try XCTUnwrap(frames[$0.ref]) }.sorted { $0.minX < $1.minX }
                 for frame in documentFrames {
                     XCTAssertGreaterThanOrEqual(frame.minY, folderFrame.maxY + NibSpacing.s)
-                    XCTAssertEqual(frame.minY, documentFrames[0].minY, accuracy: 0.5, "All three covers must share the first document row")
+                    XCTAssertEqual(frame.minY, documentFrames[0].minY, accuracy: 0.5, "All three covers must share the first document row; viewport \(viewportWidth), folder \(folderFrame), documents \(documentFrames)")
                     XCTAssertEqual(frame.width, NibMetrics.coverSizeCompact.width, accuracy: 0.5)
                     XCTAssertGreaterThan(frame.height, NibMetrics.coverSizeCompact.height, "Keep title and metadata below the complete cover")
                     XCTAssertLessThanOrEqual(frame.maxY, 393, "The cover, title and metadata must fit initially")
@@ -1050,7 +1053,7 @@ final class FeatLibraryUITests: XCTestCase {
                 _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 100), variant: variant)
                 let message = try XCTUnwrap(frames["storage.message"])
                 let action = try XCTUnwrap(frames["storage.action"])
-                XCTAssertLessThanOrEqual(message.height, 2 * NibUIFont.callout.lineHeight + 1)
+                XCTAssertLessThanOrEqual(message.height, 2 * NibUIFont.callout.lineHeight + 1, "Viewport \(width), message \(message), action \(action)")
                 XCTAssertGreaterThanOrEqual(action.minX, message.maxX + NibSpacing.s - 0.5)
                 XCTAssertEqual(action.midY, message.midY, accuracy: 0.5)
                 XCTAssertGreaterThanOrEqual(action.height, NibMetrics.hitTarget)

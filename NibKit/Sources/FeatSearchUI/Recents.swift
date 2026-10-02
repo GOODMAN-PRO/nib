@@ -20,6 +20,37 @@ struct SearchMatch: Codable, Equatable, Identifiable {
     var alternative: String?
     var time: Double?
     var score: Double
+    var isTitleMatch: Bool { kind == "title" }
+    var displayTitle: String {
+        guard title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return title }
+        switch DocumentKind(rawValue: docKind) {
+        case .notebook: return String(localized: "Untitled notebook")
+        case .whiteboard: return String(localized: "Untitled whiteboard")
+        case .textDocument: return String(localized: "Untitled text document")
+        case .studySet: return String(localized: "Untitled study set")
+        case nil: return String(localized: "Untitled document")
+        }
+    }
+    var documentKindLabel: String {
+        switch DocumentKind(rawValue: docKind) {
+        case .notebook: return String(localized: "Notebook")
+        case .whiteboard: return String(localized: "Whiteboard")
+        case .textDocument: return String(localized: "Text document")
+        case .studySet: return String(localized: "Study set")
+        case nil: return String(localized: "Document")
+        }
+    }
+    var symbol: NibSymbol {
+        guard isTitleMatch else { return group.symbol }
+        switch DocumentKind(rawValue: docKind) {
+        case .notebook: return .notebook
+        case .whiteboard: return .whiteboard
+        case .textDocument: return .textDocument
+        case .studySet: return .studySets
+        case nil: return .library
+        }
+    }
+    var detailSnippet: String? { isTitleMatch ? nil : snippet }
     var id: String {
         // Exact duplicate hits share an id; every field, including geometry, participates.
         let encoder = JSONEncoder()
@@ -176,6 +207,13 @@ final class SearchState: ObservableObject {
     var visibleMatches: [SearchMatch] { matches.filter { filter.includes($0) } }
     var selectedIndex: Int? { visibleMatches.firstIndex { $0.id == selectedID } }
     var isLibraryScope: Bool { scope == "lib" || scope.hasPrefix("folder:") }
+    var searchPrompt: String {
+        isLibraryScope ? String(localized: "Search your notes") : String(localized: "Find in this document")
+    }
+    var canStepMatches: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !loading && error == nil && !visibleMatches.isEmpty
+    }
     var remainingPages: Int { max(0, progress?.pending ?? 0) }
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
     var emptyPresentation: SearchEmptyPresentation? {

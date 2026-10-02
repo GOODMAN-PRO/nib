@@ -30,3 +30,5 @@ Preserve proper names and acronyms in the same screens. No navigation or command
 `NibDesignTests` covers contrast, layout growth/reflow, chip bounds and selection cue, and UIKit rim/fallback rendering. The old frame test expected the retired (1.1, 1.5) offset; its assertion is replaced because it contradicts DESIGN.md §10.9. No tests are skipped, weakened, commented out, or deleted. No UI tests are run by this job.
 
 Validated with `nib-build.sh targets /Users/Nice/Projects/Nib-wt/integration "NibDesignTests"`: 154 tests passed, zero failures (2026-10-02). The new trait test uses a window-attached hierarchy to exercise real UIKit inheritance and live updates.
+
+The unsigned Debug app build also passed via `nib-build.sh app /Users/Nice/Projects/Nib-wt/integration`, including the app-shell trait propagation. `git diff --check` passed.

@@ -126,6 +126,19 @@ final class InsertUITests: XCTestCase {
     private func replace(_ field: XCUIElement, with text: String) {
         field.tap(); key("a"); field.typeText(text)
     }
+    private func pasteText(into field: XCUIElement) throws -> String {
+        // Observe Copy through the user's Paste action. Reading UIPasteboard.string
+        // in the background runner can block indefinitely on cross-app authorization.
+        field.tap(); key("v")
+        try wait("Paste must insert the copied text") {
+            guard let text = field.value as? String else { return false }
+            return !text.isEmpty && text != field.placeholderValue
+        }
+        return try XCTUnwrap(field.value as? String)
+    }
+    private func clearText(_ field: XCUIElement) {
+        field.tap(); key("a"); key(XCUIKeyboardKey.delete.rawValue, [])
+    }
     private func toggle(_ name: String, to value: Bool) throws {
         let element = try control(name, .switch, scroll: true)
         if (element.value as? String == "1") != value { element.tap() }
@@ -987,7 +1000,9 @@ final class InsertUITests: XCTestCase {
     }
     func testCopyTextUsesActualSelectedText() throws {
         try beginText("Copied rich text"); key("a"); key("c")
-        try wait("Copy must put the selected text on the system clipboard") { UIPasteboard.general.string == "Copied rich text" }
+        let editor = try control("Text box", .textView)
+        clearText(editor)
+        XCTAssertEqual(try pasteText(into: editor), "Copied rich text", "Copy and Paste must retain the actual selected text")
         try finish(); try counts(5, strokes: 1)
     }
 
@@ -1013,7 +1028,9 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(posted.label.contains("Anonymous"), "Reply retains the current author")
         XCTAssertTrue(posted.label.contains(":"), "Reply displays its timestamp")
         posted.press(forDuration: 0.8); try tap("Copy Text")
-        try wait("Comment Copy Text returns the chosen reply") { UIPasteboard.general.string == "Use metres per second" }
+        let composer = try control("Reply")
+        XCTAssertEqual(try pasteText(into: composer), "Use metres per second", "Comment Copy Text returns the chosen reply")
+        clearText(composer)
         try counts(5)
     }
     func testObjectCommentAnchorsSelectedShapeAndCopiesDeepLink() throws {
@@ -1027,10 +1044,11 @@ final class InsertUITests: XCTestCase {
         }
         try XCTUnwrap(more, "Thread must expose its actions").tap(); try tap("Copy Link")
         let state = try ui.state()
-        try wait("Copied comment link must identify the current document and comment") {
-            guard let link = UIPasteboard.general.string else { return false }
-            return link.hasPrefix("nib:") && link.contains(state.document ?? "missing")
-        }
+        let composer = try control("Reply")
+        let link = try pasteText(into: composer)
+        XCTAssertTrue(link.hasPrefix("nib:") && link.contains(state.document ?? "missing"),
+                      "Copied comment link must identify the current document and comment")
+        clearText(composer)
         XCTAssertTrue(try message("Shape annotation").exists)
     }
     func testCommentEditCancelSaveAndDeleteFinalMessageRemovesAnchor() throws {
@@ -1280,7 +1298,9 @@ final class InsertUITests: XCTestCase {
         let line = try control("Corrected motion lecture")
         XCTAssertTrue(query("Measure distance and time.").firstMatch.exists, "Correcting one segment must retain the other segment")
         line.press(forDuration: 0.8); try tap("Copy")
-        try wait("Transcript Copy preserves corrected text") { UIPasteboard.general.string == "Corrected motion lecture" }
+        let search = try control("Search transcript", .textField)
+        XCTAssertEqual(try pasteText(into: search), "Corrected motion lecture", "Transcript Copy preserves corrected text")
+        clearText(search)
         let count = try ui.state().itemCountOnPage
         line.press(forDuration: 0.8); try tap("Insert on Page"); try counts(count + 1)
         XCTAssertTrue(query("Corrected motion lecture").firstMatch.exists, "Inserting text must retain source transcript")

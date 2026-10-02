@@ -12,6 +12,75 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(FeatDocChromeFeature.id, "chrome")
     }
 
+    func testSingleLineDocumentTitlesKeepAFullHeightTarget() throws {
+        let chrome = try makeWindow(Harness(features: [FeatDocChromeFeature.self]))
+        for kind in [DocumentKind.whiteboard, .textDocument] {
+            for size in [DynamicTypeSize.large, .accessibility3] {
+                let bar = NavBarView(chrome: chrome, items: NavBarItems(leading: [], trailing: []),
+                                    title: "Notes", kind: kind, subtitle: nil, readOnly: false,
+                                    titleHasMenu: true, compact: false, sidebarMode: .sidebar,
+                                    openMenu: .constant(nil))
+                let host = UIHostingController(rootView: bar.titleLabel.environment(\.dynamicTypeSize, size))
+                let measured = host.sizeThatFits(in: CGSize(width: 240, height: 0))
+                XCTAssertGreaterThanOrEqual(measured.height, NibMetrics.hitTarget)
+                XCTAssertGreaterThan(measured.width, 0)
+            }
+        }
+    }
+
+    func testNavHintsUseActiveRegistryWinnersAndResolvedTargets() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let context = KeyCommandContext(docKind: .notebook)
+        let commands = [("edit.undo", KeyShortcut("z", [.command])),
+                        ("edit.redo", KeyShortcut("z", [.command, .shift])),
+                        ("search.open", KeyShortcut("f", [.command]))]
+        for (command, shortcut) in commands {
+            let params: JSONValue = command == "search.open" ? ["scope": "document"] : ["doc": "doc:FIXTUREDOC01"]
+            let item = NavItem(id: command, title: command, symbol: .search, order: 0,
+                               action: .command(command, params))
+            var key = KeyCommandDescriptor(id: command, title: command, shortcut: shortcut,
+                                           command: command, scope: .document, owner: "tests")
+            key.sessionParams = { _ in params.merging(["instant": true]) }
+            h.app.content.keyCommands.register(key)
+            let generation = h.app.content.keyCommands.generation
+            XCTAssertEqual(NavShortcutHint.resolve(item, descriptors: h.app.content.keyCommands.all,
+                                                   context: context, session: h.session), shortcut)
+            XCTAssertEqual(h.app.content.keyCommands.generation, generation, "Hints never register commands.")
+            XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [key],
+                                                context: KeyCommandContext(docKind: nil), session: h.session))
+            var rival = key
+            rival.id = "rival"
+            rival.command = "other.action"
+            rival.docKinds = [.notebook]
+            XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [key, rival], context: context, session: h.session),
+                         "A shortcut routed to another action must not be advertised here.")
+        }
+        let search = NavItem(id: "search", title: "Search", symbol: .search, order: 0,
+                             action: .command("search.open", ["scope": "document"]))
+        let libraryKey = KeyCommandDescriptor(id: "library", title: "Search Library",
+            shortcut: KeyShortcut("f", [.command]), command: "search.open", params: ["scope": "lib"],
+            scope: .global, owner: "tests")
+        XCTAssertNil(NavShortcutHint.resolve(search, descriptors: [libraryKey], context: context, session: h.session))
+    }
+
+    func testAssistantHintUsesItsFeatureShortcutWithoutMatchingOtherPanels() {
+        let context = KeyCommandContext(docKind: .notebook)
+        let shortcut = KeyShortcut("a", [.option, .command])
+        let key = KeyCommandDescriptor(id: "assistant", title: "Assistant", shortcut: shortcut,
+                                       command: "ai.chat.open", scope: .global, owner: "tests")
+        let item = NavItem(id: NavBarModel.assistant, title: "Assistant", symbol: .assistant, order: 0,
+                           action: .command("panel.open", ["id": .string(PanelIDs.assistant)]))
+        XCTAssertEqual(NavShortcutHint.resolve(item, descriptors: [key], context: context, session: nil), shortcut)
+        let other = KeyCommandDescriptor(id: "other", title: "Other Panel", shortcut: shortcut,
+            command: "panel.open", params: ["id": "other.panel"], scope: .document, owner: "tests")
+        XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [other], context: context, session: nil))
+        XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [], context: context, session: nil))
+        XCTAssertEqual(NavShortcutHint.keyboardShortcut(shortcut)?.key, KeyEquivalent("a"))
+        XCTAssertEqual(NavShortcutHint.keyboardShortcut(shortcut)?.modifiers, [.option, .command])
+        XCTAssertEqual(NavShortcutHint.keyboardShortcut(KeyShortcut("escape"))?.key, .escape)
+        XCTAssertNil(NavShortcutHint.keyboardShortcut(KeyShortcut("unsupported")))
+    }
+
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatDocChromeFeature.self])
         XCTAssertEqual(problems, [])
