@@ -59,6 +59,10 @@ final class SharedChromeRegressionTests: XCTestCase {
                 XCTAssertFalse(hit?.isDescendant(of: current) == true,
                                "A native host refresh must not resurrect a closed menu's hit target")
                 current.isUserInteractionEnabled = false
+            } else {
+                let point = current.convert(CGPoint(x: current.bounds.midX, y: current.bounds.midY), to: host.view)
+                XCTAssertTrue(host.view.hitTest(point, with: nil)?.isDescendant(of: current) == true,
+                              "Reopening must restore actual interaction with preferences")
             }
             XCTAssertEqual(current.contentOffset.y, 180, accuracy: 1)
         }
