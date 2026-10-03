@@ -246,6 +246,12 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
         var clear: () -> Void = {}
         private weak var alert: ConfirmationAlert?
 
+        override func loadView() {
+            view = UIView()
+            view.backgroundColor = .clear
+            view.isUserInteractionEnabled = false
+        }
+
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
             schedulePresentation()
@@ -258,7 +264,7 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
                 alert?.dismiss(animated: false)
                 return
             }
-            guard alert == nil, viewIfLoaded?.window != nil else { return }
+            guard alert == nil, let window = viewIfLoaded?.window else { return }
             let prompt = ConfirmationAlert(title: String(localized: "Clear this page?"),
                 message: String(localized: "Everything on this page is removed. You can undo this."),
                 preferredStyle: .alert)
@@ -277,8 +283,12 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
             var owner: UIViewController = self
             while let parent = owner.parent { owner = parent }
             guard owner.presentedViewController == nil else { return }
+            // A visible secondary window can still be non-key (for example after
+            // another document held keyboard focus). System alerts need a key
+            // presenting window to attach their actions and complete transitions.
+            if !window.isKeyWindow { window.makeKeyAndVisible() }
             alert = prompt
-            owner.present(prompt, animated: view.window?.windowScene?.activationState == .foregroundActive)
+            owner.present(prompt, animated: window.windowScene?.activationState == .foregroundActive)
         }
     }
 
