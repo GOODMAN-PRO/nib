@@ -629,6 +629,14 @@ public extension KeyCommandDescriptor {
 /// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
 /// hands UIKit one command per shortcut, so two features mapping the same keys never race).
 public enum KeyCommandRouting {
+    /// Commands advertised to UIKit must omit the shortcuts owned by a focused
+    /// text input. Merely lowering priority still leaves a competing selector in
+    /// the responder chain (notably Select All in embedded SwiftUI form fields).
+    public static func nativeCommands(_ descriptors: [KeyCommandDescriptor],
+                                      in context: KeyCommandContext) -> [KeyCommandDescriptor] {
+        active(descriptors, in: context).filter { overridesSystemKeys($0, in: context) }
+    }
+
     /// Fallback for a hardware press UIKit delivered without invoking its
     /// UIKeyCommand (for example through an embedded SwiftUI hosting tree).
     /// Use the same winner and text-input priority rules as the command table.

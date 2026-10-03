@@ -327,6 +327,89 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertNil(KeyCommandRouting.unhandledPress(KeyShortcut("n", .command), descriptors: [folder], in: library))
     }
 
+    func testFocusedLibraryResponderRoutesGlobalSelectionAndWindowUndoKeys() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let controller = try XCTUnwrap(controllers.last as? LibraryRootViewController)
+        var searched = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.searchOpen, title: "Search",
+            summary: "Record library search", effect: .session, target: .app)) { _, _ in searched = true; return [:] }
+        for (id, shortcut, command) in [
+            ("test.open", KeyShortcut("o", .command), CommandIDs.searchOpen),
+            ("test.undo", KeyShortcut("z", .command), CommandIDs.undo)
+        ] {
+            h.app.content.keyCommands.register(KeyCommandDescriptor(id: id, title: id,
+                shortcut: shortcut, command: command, scope: .global, owner: "test"))
+        }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        await model.appear()
+        controller.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        let keyboard = try XCTUnwrap(descendants(controller.view).compactMap { $0 as? LibraryKeyboardResponder }.first)
+        keyboard.resignFirstResponder()
+        XCTAssertTrue(controller.becomeFirstResponder(), "The shell's focus request must reach the library's native responder")
+        XCTAssertTrue(keyboard.isFirstResponder)
+        XCTAssertTrue(keyboard.performShortcut(KeyShortcut("o", .command)))
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertTrue(searched)
+        model.selection.isSelecting = true
+        XCTAssertTrue(keyboard.performShortcut(KeyShortcut("a", .command)))
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(model.selection.refs, Set(model.visibleRefs))
+        XCTAssertTrue(keyboard.performShortcut(KeyShortcut("escape")))
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertFalse(model.selection.isSelecting)
+        let previous = model.visibleRefs
+        let manager = try XCTUnwrap(window.undoManager, "A live library must have a window undo manager")
+        manager.groupsByEvent = false
+        manager.beginUndoGrouping()
+        let first = try XCTUnwrap(model.documentRefs.first)
+        _ = try await h.app.bus.execute(CommandIDs.libraryReorder, ["refs": [.string(first)]], session: h.session)
+        manager.endUndoGrouping()
+        XCTAssertNotEqual(model.visibleRefs, previous)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "folder:FIXTUREFLD01"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "lib"], session: h.session)
+        XCTAssertTrue(keyboard.performShortcut(KeyShortcut("z", .command)))
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(model.visibleRefs, previous)
+        let field = UITextField(frame: CGRect(x: 0, y: 0, width: 200, height: 44))
+        controller.view.addSubview(field)
+        field.becomeFirstResponder()
+        keyboard.restoreFocus()
+        XCTAssertTrue(field.isFirstResponder, "The library must not take focus from name or colour editors")
+        XCTAssertFalse(keyboard.performShortcut(KeyShortcut("a", .command)))
+    }
+
+    func testLibraryHardwarePressPreservesSeparatelyDeliveredModifiersAndNavigationKeys() {
+        XCTAssertEqual(LibraryKeyboardResponder.shortcut(code: .keyboardA, characters: "a", flags: [],
+            held: [.keyboardLeftGUI]), KeyShortcut("a", .command))
+        XCTAssertEqual(LibraryKeyboardResponder.shortcut(code: .keyboardN, characters: "n", flags: .command,
+            held: [.keyboardRightControl]), KeyShortcut("n", [.command, .control]))
+        XCTAssertEqual(LibraryKeyboardResponder.shortcut(code: .keyboardReturnOrEnter, characters: "", flags: []), KeyShortcut("return"))
+        XCTAssertEqual(LibraryKeyboardResponder.shortcut(code: .keyboardEscape, characters: "", flags: []), KeyShortcut("escape"))
+    }
+
+    func testExternalImportDestinationUsesHoveredFolderThenCurrentFolderAndRejectsTabs() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let controller = try XCTUnwrap(controllers.last as? LibraryRootViewController)
+        await model.appear()
+        let background = CGPoint(x: 700, y: 400)
+        XCTAssertEqual(controller.libraryImportDestination(at: background)?.description, "lib")
+        model.dropTargets = ["folder:FIXTUREFLD01": CGRect(x: 340, y: 240, width: 180, height: 80)]
+        XCTAssertEqual(controller.libraryImportDestination(at: CGPoint(x: 400, y: 280))?.description, "folder:FIXTUREFLD01")
+        model.folder = Fixtures.folderID
+        model.dropTargets = [:]
+        XCTAssertEqual(controller.libraryImportDestination(at: background)?.description, "folder:FIXTUREFLD01")
+        model.tab = LibraryPanel(id: "trash", params: [:], presentation: .libraryTab)
+        XCTAssertNil(controller.libraryImportDestination(at: background))
+        model.tab = nil
+        model.isVisible = false
+        XCTAssertNil(controller.libraryImportDestination(at: background))
+    }
+
     func testNewMenuNativeScrollStopsInterceptingAfterDismissalAndReattaches() {
         let scroll = UIScrollView()
         let content = UIView()
@@ -1494,8 +1577,8 @@ final class FeatLibraryUITests: XCTestCase {
         let combine = LibraryConfirmation.combineMessage(names: ["Physics", "Chemistry"], destination: "Revision")
         for name in ["Physics", "Chemistry", "Revision"] { XCTAssertTrue(combine.contains(name)) }
         XCTAssertTrue(combine.contains("source documents will move to Trash"))
-        XCTAssertEqual(LibrarySort.modified.title, "Modified, newest first")
-        XCTAssertEqual(LibrarySort.created.title, "Created, newest first")
+        XCTAssertEqual(LibrarySort.modified.title, "Date modified")
+        XCTAssertEqual(LibrarySort.created.title, "Date created")
     }
 
     func testWrappingTitlesKeepCoverOriginsOnTheSameRowPitch() async throws {
@@ -1765,6 +1848,31 @@ final class FeatLibraryUITests: XCTestCase {
         for _ in 0..<30 { await Task.yield() }
         XCTAssertTrue(manager.canUndo)
         XCTAssertEqual(h.app.settings.json(LibraryOrder.key(nil)), after)
+    }
+    func testFolderDropToastUndoRestoresOriginalParentAndMembership() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryMove, title: "Move",
+            summary: "Move through the library service", effect: .library, target: .library)) { params, ctx in
+            let parent = try LibraryModels.folder(params["folder"]?.stringValue)
+            for ref in params["refs"]?.arrayValue?.compactMap(\.stringValue) ?? [] {
+                guard case .document(let id)? = NodeRef(ref) else { throw NibError.invalid("Expected document") }
+                try h.library.move(id, to: parent)
+            }
+            ctx.events.emit(NibEventType.libraryChanged, principal: ctx.principal, payload: [:])
+            return [:]
+        }
+        await model.appear()
+        model.moveDrop(refs: ["doc:FIXTUREDOC01"], destination: "folder:FIXTUREFLD01")
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertEqual(h.library.node(Fixtures.docID)?.parent, Fixtures.folderID)
+        XCTAssertFalse(model.documentRefs.contains("doc:FIXTUREDOC01"))
+        let undo = try XCTUnwrap(model.floating.toast?.action)
+        XCTAssertEqual(undo.title, "Undo")
+        undo.handler()
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertNil(h.library.node(Fixtures.docID)?.parent)
+        XCTAssertTrue(model.documentRefs.contains("doc:FIXTUREDOC01"))
+        XCTAssertFalse(h.library.children(of: Fixtures.folderID).contains { $0.id == Fixtures.docID })
     }
     func testPanelsPreserveParamsSelectTabAndClose() async throws {
         let h = harness()

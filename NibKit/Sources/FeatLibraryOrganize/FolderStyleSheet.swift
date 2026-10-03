@@ -319,7 +319,7 @@ struct FolderStyleSheet: View {
                     }
                 }
                 Section {
-                    NibToggle(String(localized: "Show in Favourites"), isOn: $draft.favorite)
+                    favouriteRow
                 }
             }
             .listStyle(.insetGrouped)
@@ -344,6 +344,22 @@ struct FolderStyleSheet: View {
     }
 
     // MARK: Sections
+
+    private var favouriteRow: some View {
+        let title = String(localized: "Show in Favourites")
+        return HStack(spacing: NibSpacing.m) {
+            Text(title)
+                .font(NibFont.body)
+                .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                .contentShape(Rectangle())
+                .nibNativeAction { draft.favorite.toggle() }
+                .accessibilityHidden(true)
+            // Keep the system switch's tap, thumb drag and accessibility action.
+            // Its accessible hit area must be the control, not the inert row gap.
+            NibToggle(title, isOn: $draft.favorite)
+                .labelsHidden()
+        }
+    }
 
     private var preview: some View {
         VStack(spacing: NibSpacing.s) {

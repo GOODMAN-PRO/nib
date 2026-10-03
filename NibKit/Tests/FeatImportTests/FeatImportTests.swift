@@ -11,6 +11,37 @@ final class FeatImportTests: XCTestCase {
 
     private func harness() -> Harness { Harness(features: [FeatImportFeature.self]) }
 
+    func testExternalDropImportsIntoCapturedLibraryFolderAndRevealsItsDocument() async throws {
+        let h = harness()
+        let nav = StubNavigator()
+        h.app.services.sessions.add(nav.session)
+        var opened: String?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Record reveal",
+            params: .obj(["doc": .ref], required: ["doc"]),
+            effect: .session, target: .app)) { params, ctx in
+                XCTAssertTrue(ctx.activeSession === nav.session)
+                XCTAssertTrue(ctx.navigator === nav)
+                opened = params["doc"]?.stringValue
+                return [:]
+            }
+        let folder = Fixtures.folderID
+        let original = Set(h.app.services.library!.children(of: folder).map(\.id))
+        let file = try writePNG("Dropped.png", in: tempDir())
+        let provider = NSItemProvider()
+        provider.suggestedName = "Dropped.png"
+        provider.registerFileRepresentation(forTypeIdentifier: "public.png", fileOptions: [], visibility: .all) { completion in
+            completion(file, false, nil)
+            return nil
+        }
+        await ImportDropTarget.importDrop([provider], app: h.app, navigator: nav, destination: .folder(folder))
+        let imported = h.app.services.library!.children(of: folder).filter { !original.contains($0.id) }
+        XCTAssertEqual(imported.count, 1)
+        let document = try XCTUnwrap(imported.first)
+        XCTAssertEqual(document.parent, folder)
+        XCTAssertEqual(try h.app.workspace.content(document.id).livePages.count, 1)
+        XCTAssertEqual(opened, NodeRef.document(document.id).description)
+    }
+
     private func tempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("FeatImportTests-" + UUID().uuidString,
                                                                                isDirectory: true)
