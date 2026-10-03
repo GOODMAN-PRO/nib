@@ -228,6 +228,9 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         var pendingNativeContact: ObjectIdentifier?
         var awaitingContact = false
         var nativeCaptureID: UUID?
+        // Touch observation can finish before PencilKit admits a short first stroke. Keep
+        // that one contact's metadata until native admission, without admitting no-ink taps.
+        var unrecognisedCapture: Capture?
         var toolEnded = false
         var active = true
         var replacingDrawing = false
@@ -426,6 +429,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             surface.pendingNativeContact = nil
             surface.awaitingContact = false
             surface.nativeCaptureID = nil
+            surface.unrecognisedCapture = nil
             surface.toolEnded = false
             return
         }
@@ -624,6 +628,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 // A completed native contact still belongs to this capture; startedContact
                 // alone cannot identify it because native end clears that live-contact gate.
                 if let surface = surface {
+                    surface.unrecognisedCapture = nil
                     let pendingNative = surface.awaitingContact
                         && (surface.pendingNativeContact == nil || surface.pendingNativeContact == contact)
                     let nativeStarted = surface.startedContact == contact || pendingNative
@@ -731,6 +736,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         if tracks.isEmpty { navigating = false }
         if let capture = track.capture, let surface = capture.surface {
             surface.ledger.end(capture.id, pendingGesture: capture.gesturePending)
+            if !capture.cancelled,
+               surface.ledger.captures.contains(where: { $0.id == capture.id && !$0.nativeStarted }) {
+                surface.unrecognisedCapture = capture
+            }
         }
         for surface in surfaces {
             process(surface)
@@ -856,6 +865,27 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             surface.nativeCaptureID = capture.id
             surface.pendingNativeContact = nil
             surface.awaitingContact = false
+        }
+        if surface.awaitingContact {
+            // Let an observer begin from this same UIKit delivery claim native admission
+            // first. If it already lifted, recover only its retained, actually hit contact.
+            // A native-first NEXT contact must never inherit the preceding no-ink tap.
+            Task { @MainActor [weak self, weak surface] in
+                await Task.yield()
+                guard let self, let surface, !self.closing, surface.awaitingContact,
+                      let capture = surface.unrecognisedCapture, !capture.cancelled,
+                      surface.pendingNativeContact == nil || surface.pendingNativeContact == capture.contact else { return }
+                surface.unrecognisedCapture = nil
+                surface.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
+                                        nativeStarted: true, nativeEnded: surface.toolEnded)
+                surface.ledger.end(capture.id, pendingGesture: capture.gesturePending)
+                surface.nativeCaptureID = capture.id
+                surface.startedContact = surface.toolEnded ? nil : capture.contact
+                surface.pendingNativeContact = nil
+                surface.awaitingContact = false
+                self.process(surface)
+                self.removeReady(surface)
+            }
         }
     }
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
@@ -1034,6 +1064,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             surface.pendingNativeContact = nil
             surface.awaitingContact = false
             surface.nativeCaptureID = nil
+            surface.unrecognisedCapture = nil
             surface.toolEnded = false
             surface.ledger.discardUnproduced()
             removeReady(surface)

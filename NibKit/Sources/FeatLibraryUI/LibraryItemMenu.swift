@@ -212,46 +212,52 @@ struct LibraryBuds: View {
     @ObservedObject var model: LibraryViewModel
     var body: some View {
         ZStack {
-            LibraryNewMenuPopover(model: model, isPresented: binding("new"))
-                .allowsHitTesting(isPresented("new"))
-                .accessibilityHidden(!isPresented("new"))
-            NibBudPopover(id: "library.app.menu", source: "library.app", isPresented: binding("app"), title: String(localized: "Nib")) {
-                LibraryMenuEntries(model: model, location: .appMenu)
-                    .background(LibraryMenuScrollInteraction(isPresented: isPresented("app")))
+            if isPresented("new") {
+                LibraryNewMenuPopover(model: model, isPresented: binding("new"))
+                    .allowsHitTesting(isPresented("new"))
+                    .accessibilityHidden(!isPresented("new"))
             }
-            .allowsHitTesting(isPresented("app"))
-            .accessibilityHidden(!isPresented("app"))
-            NibBudPopover(id: "library.sort.menu", source: "library.sort", isPresented: binding("sort"), title: String(localized: "Sort and View")) {
-                VStack(alignment: .leading, spacing: NibSpacing.s) {
-                    NibSegmentedControl(selection: Binding(get: { model.layout }, set: {
-                        model.setView(["layout": .string($0.rawValue)])
-                    }), options: LibraryLayout.allCases) {
-                        $0 == .grid ? String(localized: "Grid") : String(localized: "List")
-                    }
-                    ForEach(LibrarySort.allCases, id: \.self) { sort in
-                        LibraryMenuChoice(title: sort.title, selected: model.sort == sort) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
-                        .accessibilityIdentifier("cmd.library.setView")
-                    }
-                    Divider()
-                    ForEach(LibraryFilter.allCases, id: \.self) { filter in
-                        LibraryMenuChoice(title: filter.title, selected: model.filter == filter) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
-                        .accessibilityIdentifier("cmd.library.setView")
-                    }
+            if isPresented("app") {
+                NibBudPopover(id: "library.app.menu", source: "library.app", isPresented: binding("app"), title: String(localized: "Nib")) {
+                    LibraryMenuEntries(model: model, location: .appMenu)
+                        .background(LibraryMenuScrollInteraction(isPresented: isPresented("app")))
                 }
-                .background(LibraryMenuScrollInteraction(isPresented: isPresented("sort")))
+                .allowsHitTesting(isPresented("app"))
+                .accessibilityHidden(!isPresented("app"))
             }
-            .allowsHitTesting(isPresented("sort"))
-            .accessibilityHidden(!isPresented("sort"))
+            if isPresented("sort") {
+                NibBudPopover(id: "library.sort.menu", source: "library.sort", isPresented: binding("sort"), title: String(localized: "Sort and View")) {
+                    VStack(alignment: .leading, spacing: NibSpacing.s) {
+                        NibSegmentedControl(selection: Binding(get: { model.layout }, set: {
+                            model.setView(["layout": .string($0.rawValue)])
+                        }), options: LibraryLayout.allCases) {
+                            $0 == .grid ? String(localized: "Grid") : String(localized: "List")
+                        }
+                        ForEach(LibrarySort.allCases, id: \.self) { sort in
+                            LibraryMenuChoice(title: sort.title, selected: model.sort == sort) { model.setView(["sort": .string(sort.rawValue), "menu": "none"]) }
+                            .accessibilityIdentifier("cmd.library.setView")
+                        }
+                        Divider()
+                        ForEach(LibraryFilter.allCases, id: \.self) { filter in
+                            LibraryMenuChoice(title: filter.title, selected: model.filter == filter) { model.setView(["filter": .string(filter.rawValue), "menu": "none"]) }
+                            .accessibilityIdentifier("cmd.library.setView")
+                        }
+                    }
+                    .background(LibraryMenuScrollInteraction(isPresented: isPresented("sort")))
+                }
+                .allowsHitTesting(isPresented("sort"))
+                .accessibilityHidden(!isPresented("sort"))
+            }
         }
         // The full-window host is also an overlay. Keep it out of hit testing and
         // accessibility while no menu is open, including during scene/size changes.
-        // Leave its children mounted so an outgoing bud can finish retracting.
+        // Native scroll hosts can survive the SwiftUI visibility gates in the
+        // accessibility tree. Unmount inactive menus at their ownership boundary.
         .allowsHitTesting(hasPresentedMenu)
         .accessibilityHidden(!hasPresentedMenu)
     }
     private var hasPresentedMenu: Bool { ["new", "app", "sort"].contains(where: isPresented) }
-    // Buds stay mounted for their retract animation. Gate the entire geometry/scroll
-    // host, not just the animated droplet: a closed menu must not cover library cards.
+    // A pending request without an anchor must not mount a native menu host.
     private func isPresented(_ menu: String) -> Bool {
         model.menu == menu && model.menuAnchors["library." + menu] != nil
     }
@@ -332,8 +338,8 @@ struct LibraryNewMenuPopover: View {
     }
 }
 
-/// The New menu retains its scroll view during retraction. SwiftUI's hit-testing
-/// flag alone does not disable that native scroll view on every OS version.
+/// Defend the native viewport while a requested menu is mounted. SwiftUI's
+/// hit-testing flag alone does not disable that scroll view on every OS version.
 struct LibraryMenuScrollInteraction: UIViewRepresentable {
     let isPresented: Bool
     func makeUIView(context: Context) -> Probe {

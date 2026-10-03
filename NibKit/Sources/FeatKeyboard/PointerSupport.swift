@@ -271,7 +271,9 @@ final class CanvasKeyboardResponder: UIView {
     func attach(to host: CanvasHost) {
         self.host = host
         shortcuts = Set(GlobalShortcuts.catalog(app: host.app, owner: FeatKeyboardFeature.id)
-            .filter { $0.docKinds == ShortcutContext.canvasKinds }
+            // The Assistant is available in every document kind, but its shortcut must also reach
+            // the canvas responder below SwiftUI's hosting boundary after a panel closes.
+            .filter { $0.docKinds == ShortcutContext.canvasKinds || $0.command == "ai.chat.open" }
             .map { ShortcutRules.normalized($0.shortcut) })
         host.canvasView.addSubview(self)
         let bag = NotificationBag()

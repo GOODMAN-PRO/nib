@@ -130,7 +130,9 @@ enum LibrarySorting {
         let needle = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let rows = input.filter {
             (filter == .all || (filter == .folders ? $0.isFolder : !$0.isFolder)) &&
-            (needle.isEmpty || $0.name.localizedStandardContains(needle))
+            // Literal matches already satisfy the search; reserve locale-aware
+            // comparison for case/diacritic variants in large libraries.
+            (needle.isEmpty || $0.name.contains(needle) || $0.name.localizedStandardContains(needle))
         }
         return rows.sorted { a, b in
             // Folders and notebooks occupy separate sections, including in Manual.

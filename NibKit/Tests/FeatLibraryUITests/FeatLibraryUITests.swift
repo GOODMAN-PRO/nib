@@ -700,6 +700,10 @@ final class FeatLibraryUITests: XCTestCase {
                 }
             }
             func assertDocumentsAreHittable(file: StaticString = #filePath, line: UInt = #line) {
+                func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+                XCTAssertFalse(descendants(host.view).contains { $0 is UIScrollView },
+                               "Closed menus must remove their native scroll hosts, not merely hide them",
+                               file: file, line: line)
                 // Cover the full area occupied by each menu's native scroll view,
                 // including the card location from the failed canvas test.
                 for y in stride(from: 100, through: Int(host.view.bounds.maxY) - 50, by: 100) {
@@ -864,11 +868,15 @@ final class FeatLibraryUITests: XCTestCase {
 
     func testPortraitSidebarAndMenusReleaseTheRealGridWhenClosed() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "portrait.hit-test", title: "Menu action", location: .libraryNew, order: 0,
+            owner: FeatLibraryUIFeature.id, command: CommandIDs.librarySetView,
+            params: { _ in ["menu": "none"] }))
         await model.appear()
         let controller = UIHostingController(rootView: LibraryRootView(model: model, idiom: .pad)
             .environment(\.scenePhase, .active))
         model.controller = controller
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1032, height: 1376))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 500, height: 800))
         window.rootViewController = controller
         window.isHidden = false
         defer { window.isHidden = true; window.rootViewController = nil }
@@ -887,8 +895,11 @@ final class FeatLibraryUITests: XCTestCase {
             return (probe.convert(CGPoint(x: probe.bounds.midX, y: probe.bounds.midY), to: controller.view),
                     try XCTUnwrap(ancestor as? UIScrollView))
         }
+        // Opening a menu deliberately removes the cell's drag recognizer. Keep
+        // its measured card point and the stable grid scroll host across that change.
+        var measuredTarget: (CGPoint, UIScrollView)?
         func assertGridReceivesTouches(_ receives: Bool, file: StaticString = #filePath, line: UInt = #line) throws {
-            let (point, scroll) = try gridTarget()
+            let (point, scroll) = try XCTUnwrap(measuredTarget, file: file, line: line)
             XCTAssertTrue(controller.view.bounds.contains(point), file: file, line: line)
             let hit = controller.view.hitTest(point, with: nil)
             XCTAssertEqual(hit === scroll || hit?.isDescendant(of: scroll) == true, receives,
@@ -898,15 +909,29 @@ final class FeatLibraryUITests: XCTestCase {
                 XCTAssertFalse(scroll.accessibilityElementsHidden, file: file, line: line)
             }
         }
+        controller.view.frame = window.bounds
+        try await settle()
+        XCTAssertTrue(model.sidebarVisible, "Compact navigation starts at its root list")
+        // A window may attach with compact bounds before its first portrait iPad
+        // layout. Both layouts have no inline sidebar, but only the latter is an overlay.
+        window.frame = CGRect(x: 0, y: 0, width: 1032, height: 1376)
+        controller.view.frame = window.bounds
         for mode in [NibLiquidMode.full, .off] {
             model.liquidMode = mode
             try await settle()
             XCTAssertFalse(model.sidebarVisible, "Portrait starts with the sidebar collapsed")
+            measuredTarget = try gridTarget()
             try assertGridReceivesTouches(true)
             for _ in 0..<2 {
                 _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sidebar": true], session: h.session)
                 try await settle()
-                try assertGridReceivesTouches(false)
+                XCTAssertTrue(model.sidebarVisible, "The overlay must remain open until dismissed")
+                let sidebarHit = controller.view.hitTest(
+                    CGPoint(x: NibMetrics.sidebarWidth / 2, y: controller.view.bounds.midY), with: nil)
+                let scroll = try XCTUnwrap(measuredTarget?.1)
+                XCTAssertNotNil(sidebarHit)
+                XCTAssertFalse(sidebarHit === scroll || sidebarHit?.isDescendant(of: scroll) == true,
+                               "The open sidebar must receive interaction within its frame")
                 _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sidebar": false], session: h.session)
                 try await settle()
                 try assertGridReceivesTouches(true)
@@ -914,7 +939,22 @@ final class FeatLibraryUITests: XCTestCase {
             for menu in ["new", "sort"] {
                 _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": .string(menu)], session: h.session)
                 try await settle()
-                try assertGridReceivesTouches(false)
+                XCTAssertEqual(model.menu, menu)
+                XCTAssertNotNil(model.menuAnchors["library." + menu])
+                let menuProbes = descendants(controller.view).compactMap { $0 as? LibraryMenuScrollInteraction.Probe }
+                XCTAssertEqual(menuProbes.count, 1, "Only the requested menu may own a native scroll host")
+                let menuProbe = try XCTUnwrap(menuProbes.first)
+                XCTAssertTrue(menuProbe.isPresented)
+                var ancestor = menuProbe.superview
+                while let view = ancestor, !(view is UIScrollView) { ancestor = view.superview }
+                let menuScroll = try XCTUnwrap(ancestor as? UIScrollView)
+                // A short menu's padding is not its native scroll viewport.
+                // Measure the actual viewport instead of guessing from its source.
+                let menuPoint = menuScroll.convert(CGPoint(x: menuScroll.bounds.midX, y: menuScroll.bounds.midY),
+                                                   to: controller.view)
+                let menuHit = controller.view.hitTest(menuPoint, with: nil)
+                XCTAssertTrue(menuHit === menuScroll || menuHit?.isDescendant(of: menuScroll) == true,
+                              "The presented menu viewport must receive interaction")
                 _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": "none"], session: h.session)
                 try await settle()
                 try assertGridReceivesTouches(true)

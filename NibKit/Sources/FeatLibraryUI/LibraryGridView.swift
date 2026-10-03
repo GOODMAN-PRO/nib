@@ -258,8 +258,13 @@ struct LibraryCell: View {
     private var visibleSubtitle: String? { isLocked ? nil : subtitle }
     private var itemButton: some View {
         Button(action: activate) {
-            if list { LibraryListRow(row: row, model: model, subtitle: visibleSubtitle) }
-            else { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+            if list {
+                LibraryListRow(row: row, model: model, subtitle: visibleSubtitle)
+                    .accessibilityHidden(true)
+            } else {
+                LibraryCard(row: row, model: model, subtitle: visibleSubtitle)
+                    .accessibilityHidden(true)
+            }
         }
         // Attach identity and actions to the actual Button, before the reflow and
         // context-menu hosts. Otherwise accessibility exposes a second command

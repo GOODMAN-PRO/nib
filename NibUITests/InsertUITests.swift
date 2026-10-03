@@ -141,7 +141,12 @@ final class InsertUITests: XCTestCase {
     }
     private func toggle(_ name: String, to value: Bool) throws {
         let element = try control(name, .switch, scroll: true)
-        if (element.value as? String == "1") != value { element.tap() }
+        // DESIGN §1.7 uses native switches. UIKit can expose the whole labeled row
+        // as a switch as well as its actual switch child; the row's centre is text.
+        let nativeSwitch = element.descendants(matching: .switch).firstMatch
+        if (element.value as? String == "1") != value {
+            (nativeSwitch.exists ? nativeSwitch : element).tap()
+        }
         try wait("\(name) must change to \(value)") { (element.value as? String == "1") == value }
     }
     private func more() throws {
@@ -717,6 +722,9 @@ final class InsertUITests: XCTestCase {
         let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
         if visible("Add") { try tap("Add") }
+        // F034 replaces an existing item, so its unchanged count is not a completion
+        // signal. Let the native picker finish before querying the canvas hierarchy.
+        try wait("Replacing an image must dismiss Photos", timeout: 15) { !photo.exists }
         try counts(5)
         let after = try item("image")
         XCTAssertNotEqual(json(after["asset"]), json(before["asset"]), "Replacement must actually change image bytes")
@@ -735,9 +743,27 @@ final class InsertUITests: XCTestCase {
 
     // MARK: collections, elements and GIF controls
 
-    private func elements() throws { try ui.selectTool("elements"); try tap("tool.elements") }
+    private func elements() throws {
+        try ui.selectTool("elements")
+        // F035's popover may remain open after a native share/picker sheet returns.
+        // Tapping the selected tool again would close the surface we intend to use.
+        if !visible("Stickers") { try tap("tool.elements") }
+    }
+    private func collectionPrompt(_ text: String, fieldName: String = "Collection name", action: String) throws {
+        // DESIGN §1.7 requires native alerts. Address their input and action through
+        // the alert, so XCTest does not treat it as an interruption and press Cancel.
+        let alert = ui.app.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 8), "Collection naming must present its native alert")
+        let field = alert.textFields.matching(NSPredicate(
+            format: "identifier == %@ OR label == %@", fieldName, fieldName)).firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3))
+        field.tap(); field.typeKey("a", modifierFlags: .command); field.typeText(text)
+        let button = alert.buttons[action]
+        XCTAssertTrue(button.waitForExistence(timeout: 3))
+        button.tap()
+    }
     private func collection(_ name: String) throws {
-        try tap("New Collection"); replace(try control("Collection name", .textField), with: name); try tap("Create")
+        try tap("New Collection"); try collectionPrompt(name, action: "Create")
         XCTAssertTrue(query(name).firstMatch.waitForExistence(timeout: 8))
     }
     func testElementsSearchMatchingEmptyAndInsertThumbnail() throws {
@@ -761,11 +787,11 @@ final class InsertUITests: XCTestCase {
     }
     func testCollectionCreateCancelRenameReorderDeleteConfirm() throws {
         try elements(); try tap("New Collection")
-        replace(try control("Collection name", .textField), with: "Cancelled Collection"); try tap("Cancel")
+        try collectionPrompt("Cancelled Collection", action: "Cancel")
         XCTAssertFalse(query("Cancelled Collection").firstMatch.exists)
         try collection("Lab Collection")
         try tap("Collection Options"); try tap("Rename Collection")
-        replace(try control("Collection name", .textField), with: "Renamed Lab"); try tap("Rename")
+        try collectionPrompt("Renamed Lab", action: "Rename")
         XCTAssertTrue(query("Renamed Lab").firstMatch.waitForExistence(timeout: 8))
         let collectionLabels: Set<String> = ["Stickers", "Labels", "Arrows", "Planner", "Renamed Lab"]
         let before = ui.app.buttons.allElementsBoundByIndex.map(\.label).filter { collectionLabels.contains($0) }
@@ -784,7 +810,7 @@ final class InsertUITests: XCTestCase {
         let cells = ui.app.buttons.matching(NSPredicate(format: "label == 'Element' OR label == 'Rectangle' OR label == 'Untitled Element' OR label == 'Element 1'"))
         let element = try XCTUnwrap(cells.allElementsBoundByIndex.first { $0.isHittable }, "Created element must expose its title")
         element.press(forDuration: 0.8); try tap("Rename")
-        replace(try control("Element name", .textField), with: "Lab Node"); try tap("Rename")
+        try collectionPrompt("Lab Node", fieldName: "Element name", action: "Rename")
         try tap("Lab Node"); try counts(6)
         try elements(); try tap("My Objects", scroll: true)
         try control("Lab Node").press(forDuration: 0.8); try tap("Delete"); try tap("Cancel")

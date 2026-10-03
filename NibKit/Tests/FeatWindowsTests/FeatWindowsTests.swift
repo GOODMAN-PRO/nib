@@ -807,12 +807,12 @@ final class FeatWindowsTests: XCTestCase {
         let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
         let page = try XCTUnwrap(h.app.ui.settingsPages.get("windows.settings.tabs"))
         let hosting = UIHostingController(rootView: page.makeView(h.app))
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
-        window.rootViewController = hosting
-        window.isHidden = false
+        let settingsWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        settingsWindow.rootViewController = hosting
+        settingsWindow.isHidden = false
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
+            settingsWindow.isHidden = true
+            settingsWindow.rootViewController = nil
         }
         func nativeSwitch(in view: UIView) -> UISwitch? {
             if let control = view as? UISwitch { return control }
@@ -824,9 +824,26 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertFalse(control.isOn)
         XCTAssertFalse(model.isVisible)
 
+        func enableNativeSwitch() {
+            control.setOn(true, animated: false)
+            // ARCHITECTURE §15.10: package tests are hostless. sendActions(for:) needs
+            // UIApplicationMain, so deliver the control's real registered action directly.
+            var deliveredChange = false
+            control.enumerateEventHandlers { action, targetAction, events, _ in
+                guard events.contains(.valueChanged) else { return }
+                if let action {
+                    control.sendAction(action)
+                    deliveredChange = true
+                } else if let (target, selector) = targetAction, let receiver = target as? NSObject {
+                    _ = receiver.perform(selector, with: control)
+                    deliveredChange = true
+                }
+            }
+            XCTAssertTrue(deliveredChange, "Native switch must have a registered value-change action")
+        }
+
         // DESIGN §10.13 uses the native switch. Activate the control, not its enclosing labelled row.
-        control.setOn(true, animated: false)
-        control.sendActions(for: .valueChanged)
+        enableNativeSwitch()
         try await waitUntil { h.app.settings.get(WindowSettings.showTabs) && model.isVisible }
         XCTAssertTrue(h.app.settings.get(WindowSettings.showTabs))
         XCTAssertTrue(model.isVisible)
@@ -838,8 +855,7 @@ final class FeatWindowsTests: XCTestCase {
         try await waitUntil { !control.isOn && !model.isVisible }
         XCTAssertFalse(control.isOn)
         XCTAssertFalse(model.isVisible)
-        control.setOn(true, animated: false)
-        control.sendActions(for: .valueChanged)
+        enableNativeSwitch()
         try await waitUntil { h.app.settings.get(WindowSettings.showTabs) && model.isVisible }
         XCTAssertTrue(h.app.settings.get(WindowSettings.showTabs))
         XCTAssertTrue(model.isVisible)

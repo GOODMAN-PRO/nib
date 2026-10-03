@@ -1129,7 +1129,20 @@ final class FeatBridgeUITests: XCTestCase {
 
         for enabled in [true, false] {
             control.setOn(enabled, animated: false)
-            control.sendActions(for: .valueChanged)
+            // ARCHITECTURE §15.10: package tests have no UIApplicationMain to dispatch
+            // sendActions(for:). Deliver the native control's registered change action.
+            var deliveredChange = false
+            control.enumerateEventHandlers { action, targetAction, events, _ in
+                guard events.contains(.valueChanged) else { return }
+                if let action {
+                    control.sendAction(action)
+                    deliveredChange = true
+                } else if let (target, selector) = targetAction, let receiver = target as? NSObject {
+                    _ = receiver.perform(selector, with: control)
+                    deliveredChange = true
+                }
+            }
+            XCTAssertTrue(deliveredChange, "the native switch must register a value-change action")
             let updated = await eventually {
                 host.view.layoutIfNeeded()
                 return bridge.enabled == enabled && monitor.snapshot?.enabled == enabled

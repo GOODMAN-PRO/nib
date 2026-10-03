@@ -621,7 +621,11 @@ final class FeatCanvasTests: XCTestCase {
         h.session.tool = tool.id
         let install = try XCTUnwrap(CanvasInputHooks.install)
         let vc = try makeCanvas(h, input: install, size: CGSize(width: 1376, height: 1032))
-        defer { vc.closeCanvas() }
+        let window = UIWindow(frame: vc.view.frame)
+        window.rootViewController = vc
+        window.isHidden = false
+        vc.view.layoutIfNeeded()
+        defer { vc.closeCanvas(); window.isHidden = true }
         for reopening in [false, true] {
             if reopening {
                 vc.closeCanvas()
@@ -630,7 +634,7 @@ final class FeatCanvasTests: XCTestCase {
             }
             let point = CGPoint(x: vc.view.bounds.width * 0.4, y: vc.view.bounds.height * 0.65)
             XCTAssertNotNil(vc.host.pagePoint(vc.view.convert(point, to: vc.scrollView)))
-            let hit = try XCTUnwrap(vc.view.hitTest(point, with: nil))
+            let hit = try XCTUnwrap(window.hitTest(vc.view.convert(point, to: window), with: nil))
             var ancestor: UIView? = hit
             while ancestor != nil, !(ancestor is PKCanvasView) { ancestor = ancestor?.superview }
             let ink = try XCTUnwrap(ancestor as? PKCanvasView,
@@ -639,6 +643,47 @@ final class FeatCanvasTests: XCTestCase {
             XCTAssertEqual(ink.drawingPolicy, .anyInput)
             XCTAssertTrue(ink.drawingGestureRecognizer.isEnabled)
         }
+    }
+
+    func testInkCommitsWhenNativeBeginArrivesAfterObservedLift() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+        h.app.settings.set(NibSettings.stylusMode, .anyInput)
+        registerInkStandIn(h)
+        let tool = NavigationInkTool()
+        tool.commits = true
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+        h.session.tool = tool.id
+        let vc = try makeCanvas(h, input: XCTUnwrap(CanvasInputHooks.install))
+        defer { vc.closeCanvas() }
+        let input = try XCTUnwrap(vc.host.inputController as? WetInkController)
+        let before = try h.snapshot()
+        let count = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count
+        let start = CanvasSample(page: Fixtures.page1, location: Point(160, 420), timestamp: 1,
+                                 isPencil: false, touchID: 1)
+        let end = CanvasSample(page: Fixtures.page1, location: Point(360, 440), timestamp: 1.35,
+                               isPencil: false, touchID: 1)
+        let contact = NSObject()
+        let canvas = try XCTUnwrap(input.acceptContact(ObjectIdentifier(contact), sample: start))
+        let ink = PKBridge.pkStroke(stroke())
+        input.begin(start, screenPoint: start.location, route: .tool(tool),
+                    contact: ObjectIdentifier(contact), startedAt: ink.path.creationDate)
+        input.move([end], screenPoint: end.location, id: 1)
+        input.end(end)
+        // UIKit's observer and PencilKit's delegate are independent delivery paths. A short
+        // first stroke must survive native recognition arriving after the observing stream lifted.
+        input.canvasViewDidBeginUsingTool(canvas)
+        canvas.drawing = PKDrawing(strokes: [ink])
+        input.canvasViewDrawingDidChange(canvas)
+        input.canvasViewDidEndUsingTool(canvas)
+        await waitUntil("late native stroke committed") {
+            (try? h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count) == count + 1
+        }
+        XCTAssertEqual(tool.finished, 1)
+        let after = try h.snapshot()
+        _ = try await h.run("edit.undo", ["doc": .string(Fixtures.docID.raw)])
+        XCTAssertEqual(try h.snapshot(), before)
+        _ = try await h.run("edit.redo", ["doc": .string(Fixtures.docID.raw)])
+        XCTAssertEqual(try h.snapshot(), after)
     }
 
     func testDoubleTapThroughInputHandlerTogglesInAnyInputWithoutCommittingDots() async throws {
@@ -2009,8 +2054,12 @@ private final class NavigationInkTool: CanvasTool {
     let id = "test.navigationInk"
     var inputMode: CanvasInputMode { .pencilKit }
     var finished = 0
+    var commits = false
     func inkStyle(_ host: CanvasHost) -> InkStyle? { .defaultPen }
-    func strokeFinished(_ stroke: Stroke, page: PageID, host: CanvasHost) { finished += 1 }
+    func strokeFinished(_ stroke: Stroke, page: PageID, host: CanvasHost) {
+        finished += 1
+        if commits { host.commitStroke(stroke, page: page) }
+    }
 }
 
 @MainActor

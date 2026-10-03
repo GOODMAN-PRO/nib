@@ -599,6 +599,7 @@ final class FeatKeyboardTests: XCTestCase {
         h.session.selection = Selection(doc: doc, page: Fixtures.page1, items: [Fixtures.strokeID])
         let selection = h.session.selection
         let content = try h.app.workspace.content(doc)
+        let history = h.undoDepths()
         var sessions: [EditorSession?] = []
         var commands: [String] = []
         let opened = expectation(description: "Assistant opened in the canvas window")
@@ -636,6 +637,7 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertEqual(other.openPanels, [PanelIDs.assistant])
         XCTAssertEqual(h.session.selection, selection)
         XCTAssertEqual(try h.app.workspace.content(doc), content)
+        XCTAssertEqual(h.undoDepths(), history)
         // Closing restores Escape's ordinary page-selection behavior in this same window.
         let recorder = stand(in: h, for: [CommandIDs.selectionClear])
         try await press(h, "deselect")

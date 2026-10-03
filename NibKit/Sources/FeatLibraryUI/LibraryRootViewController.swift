@@ -652,9 +652,11 @@ struct LibraryRootView: View {
             } message: {
                 if let message = model.confirmation?.message { Text(message) }
             }
-            .onChange(of: inlineSidebar, initial: true) { _, inline in
-                // An inline sidebar becoming an overlay must not cover the library until requested.
-                if !inline && !compact && model.sidebarVisible { model.setView(["sidebar": false]) }
+            .onChange(of: !inlineSidebar && !compact, initial: true) { _, overlay in
+                // Both compact and overlay layouts have inlineSidebar == false.
+                // Observe entering overlay mode itself, including the first real
+                // iPad layout after a compact/zero-sized hosting-controller layout.
+                if overlay && model.sidebarVisible { model.setView(["sidebar": false]) }
             }
             .onAppear { searchText = model.search }
             .onChange(of: model.rows.count, initial: true) { _, _ in
