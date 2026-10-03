@@ -128,6 +128,115 @@ final class FeatToolbarTests: XCTestCase {
         ToolbarEntry(id: id, title: id, group: group, toolID: id, command: nil, hideable: hideable, isPlugin: plugin)
     }
 
+    func testEraserSelectionAfterCommitAndCommandHandBackReleasePreviousOptions() async throws {
+        let h = harness()
+        let penPopover = PopoverFlag()
+        let eraserPopover = PopoverFlag()
+        for (tool, flag) in [("pen", penPopover), ("eraser", eraserPopover)] {
+            var menu = ToolMenuDescriptor(tool: tool, owner: TestToolsFeature.id) { _ in AnyView(EmptyView()) }
+            menu.makePopover = { _ in
+                ToolMenuPopover(source: tool + ".size", isPresented: flag.binding, title: "Size") { EmptyView() }
+            }
+            h.app.ui.toolMenus.register(menu)
+        }
+        var eraser = try XCTUnwrap(h.app.ui.toolbar.get("eraser.item"))
+        eraser.settings = { _ in AnyView(Text("Eraser settings")) }
+        h.app.ui.toolbar.register(eraser)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let host = FakeCanvasHost(h)
+
+        for autoDeselect in [true, false] {
+            try await h.run(CommandIDs.toolSelect, ["tool": "pen"])
+            try await h.run(TestTouch.descriptor.id)
+            model.refresh()
+            XCTAssertNotNil(model.toolOptions(for: "pen"))
+            let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+            let item = try XCTUnwrap(model.shown.first { $0.id == "eraser" })
+            XCTAssertEqual(item.accessibilityID, "tool.eraser")
+            XCTAssertTrue(item.isEnabled)
+
+            penPopover.isOpen = true
+            model.select(item.id)
+            XCTAssertFalse(penPopover.isOpen, "The tap releases old options before asynchronous command dispatch")
+            try await waitUntil("Eraser is selected in the invoking window") { h.session.tool == "eraser" }
+            XCTAssertEqual(model.tool, "eraser")
+            XCTAssertEqual(h.session.previousTool, "pen")
+            XCTAssertEqual(other.tool, "pen")
+            XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before)
+            model.openSettings()
+            XCTAssertTrue(model.settingsOpen, "The newly selected tool can immediately open settings")
+            model.settingsOpen = false
+
+            XCTAssertNotNil(model.toolOptions(for: "eraser"))
+            eraserPopover.isOpen = true
+            host.finishToolUse(TestTool(id: "eraser", isSticky: !autoDeselect))
+            XCTAssertEqual(h.session.tool, autoDeselect ? "pen" : "eraser")
+            XCTAssertEqual(model.tool, h.session.tool)
+            XCTAssertEqual(eraserPopover.isOpen, !autoDeselect,
+                           "Hand-back must release the old tool's modal input without a rendered view")
+            // A shortcut also bypasses the palette's selection binding.
+            try await h.run(CommandIDs.toolSelect, ["tool": "pen"])
+            XCTAssertFalse(eraserPopover.isOpen)
+        }
+        withExtendedLifetime(model) {}
+    }
+
+    func testEraserHitTargetSurvivesInkingAndRetainedPopoverLayout() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.settings = { _ in AnyView(Text("Pen settings").frame(height: 700)) }
+        h.app.ui.toolbar.register(pen)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let inking = NibInkingState()
+        var field: DropletField?
+        let host = UIHostingController(rootView:
+            NibDropletContainer(inking: inking) {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+                    .background(ToolbarFieldProbe { field = $0 })
+            }
+            .environment(\.scenePhase, .active))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        try await waitUntil("Eraser has a laid-out palette slot") {
+            host.view.layoutIfNeeded()
+            return field?.anchorRect("toolbar.palette.eraser") != nil
+        }
+        // Keep the settings content mounted, as in the production palette, then draw.
+        model.openSettings()
+        try await waitUntil("Pen settings accepts input") {
+            host.view.layoutIfNeeded()
+            return self.scrollViews(in: host.view).contains { $0.bounds.height > 400 && $0.isUserInteractionEnabled }
+        }
+        model.settingsOpen = false
+        inking.isInking = true
+        try await h.run(TestTouch.descriptor.id)
+        inking.isInking = false
+        model.refresh()
+        try await waitUntil("Retained popovers release input after inking") {
+            host.view.layoutIfNeeded()
+            let panels = self.scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+            return panels.count >= 2 && panels.allSatisfy { !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden }
+        }
+        let slot = try XCTUnwrap(field?.anchorRect("toolbar.palette.eraser"))
+        let point = host.view.convert(CGPoint(x: slot.midX, y: slot.midY), to: window)
+        let hit = try XCTUnwrap(window.hitTest(point, with: nil))
+        for scroll in scrollViews(in: host.view) {
+            XCTAssertFalse(hit === scroll || hit.isDescendant(of: scroll),
+                           "Eraser's visible centre must not route to a retained settings, More or options scroller")
+        }
+        model.select("eraser")
+        try await waitUntil("Eraser selects after the ink commit") { h.session.tool == "eraser" }
+        XCTAssertEqual(h.session.previousTool, "pen")
+    }
+
     /// Pencil defaults to More. Retained pen settings must release input when More opens, and selecting
     /// its pencil item must target this window and dismiss the overflow without changing document content.
     func testPencilInMoreAfterPenSettingsRemainsInteractiveAndSelectsItsWindow() async throws {
@@ -434,6 +543,35 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).width, resized.width, accuracy: 1e-9)
         XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).height, resized.height, accuracy: 1e-9)
         field.unregister(id)
+    }
+
+    func testMoreOpeningCatchesUpAfterADelayedDisplayFrame() throws {
+        let field = DropletField()
+        field.setActive(false)
+        let id = "toolbar.palette.more"
+        let rest = CGRect(x: 92, y: 320, width: 312, height: 236)
+        field.setWorldAnchor("more.source", CGRect(x: 16, y: 400, width: 56, height: 56))
+        field.setRest(id, rest, style: .popover)
+        field.setBud(id, source: "more.source", presented: true, instant: false, dismiss: {})
+        var steps: [TimeInterval] = []
+        let driver = DisplayLinkDriver { dt in
+            steps.append(dt)
+            _ = field.tick(dt)
+            return true
+        }
+        driver.start()
+        defer { driver.stop(); field.unregister(id) }
+        driver.advance(at: 10)
+        driver.advance(at: 11)
+        XCTAssertEqual(steps.last, 1, "A delayed frame must advance the full elapsed animation time")
+        let frame = try XCTUnwrap(field.visualFrame(id))
+        XCTAssertEqual(frame.midX, rest.midX, accuracy: 0.5,
+                       "More must reach its own hit targets after a stalled frame")
+        XCTAssertEqual(frame.midY, rest.midY, accuracy: 0.5)
+        XCTAssertEqual(frame.width, rest.width, accuracy: 0.5)
+        XCTAssertEqual(frame.height, rest.height, accuracy: 0.5)
+        driver.advance(at: 20)
+        XCTAssertEqual(steps.last, 1, "Long stalls stay within the spring integrator's safe bound")
     }
 
     func testConformance() async {
@@ -1350,6 +1488,15 @@ final class FeatToolbarTests: XCTestCase {
 final class PopoverFlag {
     var isOpen = false
     var binding: Binding<Bool> { Binding(get: { self.isOpen }, set: { self.isOpen = $0 }) }
+}
+
+private struct ToolbarFieldProbe: View {
+    @Environment(DropletField.self) private var field: DropletField?
+    let capture: (DropletField?) -> Void
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0).onAppear { capture(field) }
+    }
 }
 
 /// A toolbar item's live state, owned by the feature that registers it.

@@ -397,8 +397,8 @@ private struct LibraryNewTapTarget: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(single: single, double: double) }
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
-        let one = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.once))
-        let two = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.twice))
+        let one = LibraryNewTapRecognizer(target: context.coordinator, action: #selector(Coordinator.once))
+        let two = LibraryNewTapRecognizer(target: context.coordinator, action: #selector(Coordinator.twice))
         two.numberOfTapsRequired = 2; one.require(toFail: two)
         view.addGestureRecognizer(one); view.addGestureRecognizer(two)
         return view
@@ -409,5 +409,16 @@ private struct LibraryNewTapTarget: UIViewRepresentable {
         init(single: @escaping () -> Void, double: @escaping () -> Void) { self.single = single; self.double = double }
         @objc func once() { single() }
         @objc func twice() { double() }
+    }
+}
+
+/// SwiftUI's surrounding touch bridge can recognise at touch-down. It must not
+/// cancel the native tap pair before UIKit has classified a single/double tap.
+/// Native taps still arbitrate with one another; movement fails a tap normally
+/// and remains available to the droplet's drag gesture.
+final class LibraryNewTapRecognizer: UITapGestureRecognizer {
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        if state == .possible, !(preventingGestureRecognizer is UITapGestureRecognizer) { return false }
+        return super.canBePrevented(by: preventingGestureRecognizer)
     }
 }

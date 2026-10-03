@@ -29,8 +29,10 @@ struct WetInkLedger<Payload, Ink> {
     var isEmpty: Bool { captures.isEmpty && entries.isEmpty }
     var hasLiveCapture: Bool { captures.contains { !$0.ended } }
 
-    mutating func register(id: UUID, startedAt: Date, payload: Payload, nativeStarted: Bool = false) {
-        captures.append(Capture(id: id, startedAt: startedAt, payload: payload, nativeStarted: nativeStarted))
+    mutating func register(id: UUID, startedAt: Date, payload: Payload, nativeStarted: Bool = false,
+                           nativeEnded: Bool = false) {
+        captures.append(Capture(id: id, startedAt: startedAt, payload: payload,
+                                nativeStarted: nativeStarted, nativeEnded: nativeStarted && nativeEnded))
     }
     mutating func nativeBegin(_ id: UUID) {
         if let i = captures.firstIndex(where: { $0.id == id }) { captures[i].nativeStarted = true }
@@ -223,6 +225,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         var ledger = WetInkLedger<Capture, PKStroke>()
         var acceptedContacts: Set<ObjectIdentifier> = []
         var startedContact: ObjectIdentifier?
+        var pendingNativeContact: ObjectIdentifier?
         var awaitingContact = false
         var nativeCaptureID: UUID?
         var toolEnded = false
@@ -420,6 +423,9 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             surface.active = true
             surface.acceptedContacts.removeAll()
             surface.startedContact = nil
+            surface.pendingNativeContact = nil
+            surface.awaitingContact = false
+            surface.nativeCaptureID = nil
             surface.toolEnded = false
             return
         }
@@ -614,15 +620,22 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             track.capture = capture
             if tool.inputMode == .pencilKit {
                 capture.surface = surface
-                // PencilKit can begin before our observing recognizer receives touchesBegan.
-                // Bind that native begin only when the actual contact is admitted, never at hit-test time.
-                if let surface = surface, surface.awaitingContact {
-                    surface.startedContact = contact
-                    surface.awaitingContact = false
+                // Native callbacks and the observing recognizer can arrive in either order.
+                // A completed native contact still belongs to this capture; startedContact
+                // alone cannot identify it because native end clears that live-contact gate.
+                if let surface = surface {
+                    let pendingNative = surface.awaitingContact
+                        && (surface.pendingNativeContact == nil || surface.pendingNativeContact == contact)
+                    let nativeStarted = surface.startedContact == contact || pendingNative
+                    if pendingNative {
+                        surface.startedContact = surface.toolEnded ? nil : contact
+                        surface.pendingNativeContact = nil
+                        surface.awaitingContact = false
+                    }
+                    surface.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
+                                            nativeStarted: nativeStarted, nativeEnded: surface.toolEnded)
+                    if nativeStarted { surface.nativeCaptureID = capture.id }
                 }
-                surface?.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
-                                         nativeStarted: surface?.startedContact == capture.contact)
-                if surface?.startedContact == capture.contact { surface?.nativeCaptureID = capture.id }
             }
             beginInking(capture)
         }
@@ -835,10 +848,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         guard let surface = surfaces.first(where: { $0.canvas === canvasView }) else { return }
         surface.toolEnded = false
         surface.startedContact = surface.acceptedContacts.first
-        surface.awaitingContact = surface.startedContact == nil
+        surface.pendingNativeContact = surface.startedContact
+        surface.awaitingContact = true
+        surface.nativeCaptureID = nil
         if let capture = surface.ledger.captures.first(where: { $0.payload.contact == surface.startedContact }) {
             surface.ledger.nativeBegin(capture.id)
             surface.nativeCaptureID = capture.id
+            surface.pendingNativeContact = nil
+            surface.awaitingContact = false
         }
     }
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
@@ -1014,6 +1031,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         for surface in surfaces {
             surface.acceptedContacts.removeAll()
             surface.startedContact = nil
+            surface.pendingNativeContact = nil
+            surface.awaitingContact = false
+            surface.nativeCaptureID = nil
+            surface.toolEnded = false
             surface.ledger.discardUnproduced()
             removeReady(surface)
         }

@@ -229,7 +229,7 @@ final class FeatCreateTests: XCTestCase {
         h.persistence.pageItems[doc, default: [:]][page.id] = [item]
     }
 
-    private static func ruled(owner: String = "test") -> TemplateDefinition {
+    private static func ruled(owner: String = "builtin") -> TemplateDefinition {
         TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: owner,
                            params: [TemplateParam(name: TemplateParamNames.paper, title: "Paper", kind: "color"),
                                     TemplateParam(name: TemplateParamNames.line, title: "Line", kind: "color")]) { p, size, _ in
@@ -240,7 +240,7 @@ final class FeatCreateTests: XCTestCase {
     }
 
     private static func dots() -> TemplateDefinition {
-        TemplateDefinition(id: TemplateIDs.dots, title: "Dots", category: "Essentials", owner: "test") { _, _, _ in
+        TemplateDefinition(id: TemplateIDs.dots, title: "Dots", category: "Essentials", owner: "builtin") { _, _, _ in
             TemplateRender(paper: .white)
         }
     }
@@ -568,6 +568,119 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(model.papersInGroup.map(\.id), [TemplateIDs.dots])
         model.group = "From plugins"
         XCTAssertEqual(model.papersInGroup.map(\.id), [plugin.id])
+    }
+
+    func testNativePlannerWithoutBuiltinIDDoesNotAppearAsPluginPaper() {
+        let h = harness()
+        // Register under an installed feature owner, just as Calendar registers planner.events.
+        var planner = Self.ruled(owner: FeatCreateFeature.id)
+        planner.id = "planner.events"
+        planner.category = "Planners"
+        h.app.content.templates.register(planner)
+        var model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.group = "From plugins"
+        XCTAssertTrue(model.papersInGroup.isEmpty)
+        model.group = "Planners"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [planner.id])
+
+        // A plugin cannot acquire native provenance by choosing a builtin-looking ID or category.
+        var plugin = planner
+        plugin.owner = "org.example.paper"
+        plugin.id = "builtin.pluginPlanner"
+        h.app.content.templates.register(plugin)
+        model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.group = "From plugins"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [plugin.id])
+    }
+
+    func testLegalSizeAndIvoryColourRemainIndependentThroughCreation() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Ivory Legal"
+        model.draft.hasCover = false
+        model.sizeSelection = "Legal"
+        model.draft.orientation = .portrait
+        model.draft.paperColour = .ivory
+        XCTAssertEqual(model.draft.pageSize, PageSize(612, 1008))
+        let params = model.draft.request(id: NibID("LEGALIVORY"), folder: nil,
+                                        templates: h.app.content.templates).docCreateParams(.template)
+        XCTAssertEqual(params["size"], [612, 1008])
+        XCTAssertEqual(params["template"]?["params"]?["paper"], "#FBF8F1FF")
+        var dismissed = false
+        let created = await model.create { dismissed = true }
+        XCTAssertTrue(created)
+        XCTAssertTrue(dismissed)
+        XCTAssertNil(model.message)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Ivory Legal" })
+        let page = try XCTUnwrap(h.app.workspace.content(node.id).livePages.first)
+        XCTAssertEqual(page.size, PageSize(612, 1008))
+        XCTAssertEqual(page.background.template?.params[TemplateParamNames.paper], "#FBF8F1FF")
+        let next = NotebookDraft.initial(settings: h.app.settings)
+        XCTAssertEqual(next.size.name, "Legal")
+        XCTAssertEqual(next.paperColour, .ivory)
+        XCTAssertEqual(NotebookDraft.paperSwatch(.legal).name, "Legal paper colour")
+        XCTAssertEqual(NotebookDraft.paperSwatch(.ivory).name, "Ivory")
+        XCTAssertTrue(Set(NotebookDraft.paperColours.map { NotebookDraft.paperSwatch($0).name })
+            .isDisjoint(with: Set(PageSizeChoice.presets.compactMap(\.name))),
+                      "Size and colour controls need unambiguous spoken names")
+    }
+
+    func testCreationSheetKeepsTitleAndHeaderInsideKeyboardReducedViewport() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        for kind in [NewDocumentKind.notebook, .textDocument] {
+            var sheetFrame = CGRect.zero
+            let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: kind, session: h.session,
+                                         navigator: nil, onDone: {})
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { sheetFrame = $0 }
+            let host = UIHostingController(rootView: sheet)
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            // Reproduce the finite safe-area proposal supplied when the native keyboard appears.
+            host.additionalSafeAreaInsets.bottom = 340
+            for _ in 0..<5 {
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let viewport = host.view.safeAreaLayoutGuide.layoutFrame
+            XCTAssertGreaterThan(sheetFrame.height, 0)
+            XCTAssertGreaterThanOrEqual(sheetFrame.minY, viewport.minY - 1)
+            XCTAssertLessThanOrEqual(sheetFrame.maxY, viewport.maxY + 1,
+                                     "The keyboard must shrink the form instead of pushing its header out of bounds")
+            func fields(in view: UIView) -> [UITextField] {
+                (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { fields(in: $0) }
+            }
+            let title = try XCTUnwrap(fields(in: host.view).first)
+            let titleFrame = title.convert(title.bounds, to: host.view)
+            XCTAssertTrue(viewport.contains(titleFrame), "Title must remain reachable above the keyboard")
+            XCTAssertTrue(title.canBecomeFirstResponder)
+            let hit = host.view.hitTest(CGPoint(x: titleFrame.midX, y: titleFrame.midY), with: nil)
+            XCTAssertTrue(hit === title || hit?.isDescendant(of: title) == true,
+                          "The visible Title field must receive the tap")
+            XCTAssertTrue(title.becomeFirstResponder())
+            try await Task.sleep(for: .milliseconds(20))
+            XCTAssertTrue(title.isFirstResponder, "Title must retain keyboard focus after the layout update")
+            title.resignFirstResponder()
+
+            func scrolls(in view: UIView) -> [UIScrollView] {
+                (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrolls(in: $0) }
+            }
+            let scroll = try XCTUnwrap(scrolls(in: host.view).first)
+            for offset in [max(0, scroll.contentSize.height - scroll.bounds.height), 0] {
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: offset), animated: false)
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+                let createPoint = CGPoint(x: sheetFrame.maxX - 50, y: sheetFrame.minY + 30)
+                let headerHit = try XCTUnwrap(host.view.hitTest(createPoint, with: nil))
+                XCTAssertFalse(headerHit === scroll || headerHit.isDescendant(of: scroll),
+                               "Scrolled paper controls must not intercept the pinned Create button")
+            }
+        }
     }
 
     func testCarbonSwatchSelectsCarbonCoverAndReopensFromDefaults() async throws {

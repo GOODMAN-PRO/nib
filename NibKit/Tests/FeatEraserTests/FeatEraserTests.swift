@@ -253,6 +253,55 @@ final class FeatEraserTests: XCTestCase {
 
     // MARK: page.clear
 
+    func testClearPageConfirmationKeepsCancelVisibleOnIPadWithoutChangingThePage() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let before = try h.snapshot()
+        let host = UIHostingController(rootView: NibDropletContainer {
+            NibBudPopover(id: "test.eraser.settings", source: "test.eraser",
+                          isPresented: .constant(true), title: "Eraser") {
+                EraserSettingsView(app: h.app, session: h.session, confirmingClear: true)
+            }
+        })
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            host.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func presentedAlert(_ controller: UIViewController) -> UIAlertController? {
+            if let alert = controller as? UIAlertController { return alert }
+            if let presented = controller.presentedViewController,
+               let alert = presentedAlert(presented) { return alert }
+            return controller.children.lazy.compactMap { presentedAlert($0) }.first
+        }
+        host.view.layoutIfNeeded()
+        await eventually { presentedAlert(host) != nil }
+        let alert = try XCTUnwrap(presentedAlert(host))
+        await eventually { alert.view.window === window && !alert.isBeingPresented }
+        XCTAssertEqual(alert.preferredStyle, .alert,
+                       "An iPad action sheet hides Cancel and leaves this nested prompt dependent on outside dismissal")
+        let cancel = try XCTUnwrap(alert.actions.first { $0.style == .cancel })
+        XCTAssertEqual(cancel.title, "Cancel")
+        XCTAssertTrue(cancel.isEnabled)
+        XCTAssertEqual(alert.actions.filter { $0.style == .destructive }.map(\.title), ["Clear Page"])
+        alert.view.layoutIfNeeded()
+        func cancelLabels(_ view: UIView) -> [UILabel] {
+            if let label = view as? UILabel, label.text == "Cancel" { return [label] }
+            return view.subviews.flatMap(cancelLabels)
+        }
+        XCTAssertTrue(cancelLabels(alert.view).contains {
+            !$0.isHidden && $0.alpha > 0 && !$0.bounds.isEmpty && $0.window === window
+        }, "Cancel must actually be rendered, not only registered as an action suppressed by an iPad popover")
+        XCTAssertEqual(try h.snapshot(), before, "Opening confirmation must not clear any items")
+        host.dismiss(animated: false)
+        await eventually { presentedAlert(host) == nil }
+        XCTAssertNil(presentedAlert(host), "Dismissing confirmation must release the editor")
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "Dismissal must not create an edit or undo entry")
+    }
+
     func testClearPageRemovesEveryItemKeepsThePageAndUndoes() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
         let before = try h.snapshot()

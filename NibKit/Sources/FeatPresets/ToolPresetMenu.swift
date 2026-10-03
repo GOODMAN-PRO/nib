@@ -500,22 +500,14 @@ struct ToolPresetMenu: View {
                 if i < presets.swatches.count - 1 { model.move(i, i + 1) }
             }
         } else {
-            SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry) {
+            SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry,
+                       menu: PresetSwatchMenu.make(model: model, index: i) { confirmReset = true }) {
                 model.tapSwatch(i)
             }
             .accessibilityIdentifier("cmd.preset.select")
             // In compact width the selected swatch remains the source while the popover adds a colour or
             // edits another saved slot: those controls no longer live in the bar.
             .presetPopoverSource(tool, isColourSource(i))
-            .contextMenu {
-                Button(String(localized: "Change Colour")) { model.open(.colour(.slot(i))) }
-                Button(String(localized: "Rearrange Colours")) { model.beginArranging() }
-                if removable {
-                    Button(String(localized: "Remove Colour"), role: .destructive) { model.remove(i) }
-                        .accessibilityIdentifier("cmd.preset.removeSwatch")
-                }
-                Button(String(localized: "Restore Default Presets"), role: .destructive) { confirmReset = true }
-            }
             .accessibilityAction(named: Text(String(localized: "Change Colour"))) { model.open(.colour(.slot(i))) }
             .accessibilityAction(named: Text(String(localized: "Rearrange Colours"))) { model.beginArranging() }
         }
@@ -640,6 +632,7 @@ struct SwatchSlot: View {
     let name: String
     let isSelected: Bool
     let registry: Registry<TapePatternDescriptor>?
+    var menu: UIMenu? = nil
     let action: () -> Void
     @State private var pattern: NibSwatchPattern?
 
@@ -648,8 +641,15 @@ struct SwatchSlot: View {
 
     var body: some View {
         let colour = PresetColour.display(swatch.color, tool: tool)
-        NibPenSwatch(PresetColour.swatch(colour, id: swatch.color.hex, name: name), pattern: pattern, isSelected: isSelected,
-                     size: .palette, action: action)
+        let display = PresetColour.swatch(colour, id: swatch.color.hex, name: name, pattern: pattern)
+        Group {
+            if let menu {
+                PresetSwatchControl(swatch: display, isSelected: isSelected, menu: menu, action: action)
+                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            } else {
+                NibPenSwatch(display, isSelected: isSelected, size: .palette, action: action)
+            }
+        }
             .task(id: patternID) {
                 guard let id = patternID, let registry else {
                     pattern = nil
@@ -657,6 +657,62 @@ struct SwatchSlot: View {
                 }
                 pattern = await TapePatternCache.pattern(id, registry: registry)
             }
+    }
+}
+
+/// Keep the primary action and the long-press menu on the same native control. A SwiftUI
+/// contextMenu around the styled swatch inside the scrolling options bar can lose to its
+/// button gesture, opening the selected colour's editor when the user holds for a menu.
+struct PresetSwatchControl: UIViewRepresentable {
+    let swatch: NibSwatch
+    let isSelected: Bool
+    let menu: UIMenu
+    let action: () -> Void
+
+    func makeUIView(context: Context) -> PresetSwatchNativeButton { PresetSwatchNativeButton() }
+
+    func updateUIView(_ button: PresetSwatchNativeButton, context: Context) {
+        button.configure(swatch: swatch, isSelected: isSelected, menu: menu, action: action)
+    }
+}
+
+final class PresetSwatchNativeButton: UIButton {
+    private var tap: (() -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        showsMenuAsPrimaryAction = false
+        isPointerInteractionEnabled = true
+        addTarget(self, action: #selector(activate), for: .touchUpInside)
+        accessibilityIdentifier = "cmd.preset.select"
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(swatch: NibSwatch, isSelected: Bool, menu: UIMenu, action: @escaping () -> Void) {
+        tap = action
+        self.menu = menu
+        self.isSelected = isSelected
+        setImage(.nibSwatch(swatch, size: .palette, isSelected: isSelected), for: .normal)
+        accessibilityLabel = swatch.pattern?.name.map { "\(swatch.name), \($0)" } ?? swatch.name
+        accessibilityTraits = isSelected ? [.button, .selected] : [.button]
+    }
+
+    @objc private func activate() { tap?() }
+}
+
+@MainActor
+enum PresetSwatchMenu {
+    static func make(model: PresetMenuModel, index: Int, restore: @escaping () -> Void) -> UIMenu {
+        var actions = [
+            UIAction(title: String(localized: "Change Colour")) { _ in model.open(.colour(.slot(index))) },
+            UIAction(title: String(localized: "Rearrange Colours")) { _ in model.beginArranging() }
+        ]
+        if model.presets.swatches.count > 1 {
+            actions.append(UIAction(title: String(localized: "Remove Colour"), attributes: .destructive) { _ in model.remove(index) })
+        }
+        actions.append(UIAction(title: String(localized: "Restore Default Presets"), attributes: .destructive) { _ in restore() })
+        return UIMenu(children: actions)
     }
 }
 

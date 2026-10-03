@@ -26,6 +26,58 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testNewButtonTapPairSurvivesHostingBridgeAndReattachment() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let host = UIHostingController(rootView: LibraryNewButton(model: model, compact: false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 300, height: 100))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+
+        for compact in [false, true, false] {
+            window.rootViewController = nil
+            host.rootView = LibraryNewButton(model: model, compact: compact)
+            window.rootViewController = host
+            host.view.frame = window.bounds
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(100))
+            let taps = descendants(host.view).flatMap { $0.gestureRecognizers ?? [] }
+                .compactMap { $0 as? LibraryNewTapRecognizer }
+            XCTAssertEqual(taps.count, 2)
+            XCTAssertEqual(Set(taps.map(\.numberOfTapsRequired)), [1, 2])
+            for tap in taps {
+                let nativeView = try XCTUnwrap(tap.view)
+                XCTAssertTrue(nativeView.isUserInteractionEnabled)
+                XCTAssertTrue(nativeView.hitTest(CGPoint(x: nativeView.bounds.midX, y: nativeView.bounds.midY), with: nil) === nativeView)
+                XCTAssertFalse(tap.canBePrevented(by: UIGestureRecognizer()),
+                               "The hosting touch bridge must not cancel New before touch-up")
+                let otherTap = try XCTUnwrap(taps.first { $0 !== tap })
+                XCTAssertTrue(tap.canBePrevented(by: otherTap),
+                              "The native single/double tap pair must retain UIKit arbitration")
+            }
+        }
+    }
+
+    func testReflowMeasurementCannotSwallowDocumentTapAfterReattachment() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 300, height: 300))
+        window.isHidden = false
+        defer { window.isHidden = true }
+        let document = UIButton(frame: window.bounds)
+        window.addSubview(document)
+        let probe = NibReflowTouchTarget<String>.Probe(frame: window.bounds)
+        for _ in 0..<3 {
+            window.addSubview(probe)
+            // A native host may re-enable its representable when reused. Geometry
+            // must stay transparent independently of that mutable UIView flag.
+            probe.isUserInteractionEnabled = true
+            let point = CGPoint(x: 150, y: 150)
+            XCTAssertNil(probe.hitTest(point, with: nil))
+            XCTAssertTrue(window.hitTest(point, with: nil) === document)
+            probe.removeFromSuperview()
+        }
+    }
+
     func testLiftCannotBeCancelledByTouchDownBridgeBeforeIntentIsKnown() {
         let target = NibReflowTouchTarget(id: "cover", reflow: NibReflow<String>(),
                                          order: ["cover"], onDrop: { _ in })

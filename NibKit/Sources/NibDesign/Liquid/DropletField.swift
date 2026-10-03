@@ -1150,7 +1150,10 @@ final class DisplayLinkDriver: NSObject {
 
     func advance(at now: CFTimeInterval) {
         guard isRunning else { return }
-        let dt = last == 0 ? 1.0 / 120 : min(max(now - last, 1.0 / 240), 1.0 / 30)
+        // Springs already integrate in stable 1/240 s substeps. Discarding time below
+        // 30 Hz leaves an opening menu over its source instead of its hit targets.
+        // Bound catch-up to the integrator's one-second limit, not one rendered frame.
+        let dt = last == 0 ? 1.0 / 120 : min(max(now - last, 1.0 / 240), 1)
         last = now
         if !onTick(dt) { stop() }
     }

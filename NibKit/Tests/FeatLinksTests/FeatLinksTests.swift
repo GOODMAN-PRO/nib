@@ -315,7 +315,15 @@ final class FeatLinksTests: XCTestCase {
         XCTAssertTrue(field.isEnabled)
         XCTAssertEqual(field.keyboardType, .URL)
         field.text = "https://example.com/lab"
-        field.sendActions(for: .editingChanged)
+        // Package tests are hostless: UIControl.sendActions requires UIApplicationMain. Exercise the
+        // actual registered editing action directly, including the control-to-coordinator wiring.
+        let editingActions = field.allTargets.compactMap { $0.base as? NSObject }.flatMap { target in
+            (field.actions(forTarget: target, forControlEvent: .editingChanged) ?? []).map {
+                (target, NSSelectorFromString($0))
+            }
+        }
+        XCTAssertFalse(editingActions.isEmpty, "The field must wire its editing event to the draft")
+        for (target, action) in editingActions { _ = target.perform(action, with: field) }
         XCTAssertEqual(model.url, "https://example.com/lab")
         XCTAssertEqual(field.accessibilityLabel, "Website address", "The name must survive replacement of the placeholder")
         let saved = expectation(description: "Return saves the address")

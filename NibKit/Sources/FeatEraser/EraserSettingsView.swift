@@ -177,10 +177,11 @@ struct EraserSettingsView: View {
     @StateObject private var model: EraserOptions
     @State private var confirmingClear = false
 
-    init(app: NibApp, session: EditorSession) {
+    init(app: NibApp, session: EditorSession, confirmingClear: Bool = false) {
         self.app = app
         self._session = ObservedObject(wrappedValue: session)
         self._model = StateObject(wrappedValue: EraserOptions(app: app))
+        self._confirmingClear = State(initialValue: confirmingClear)
     }
 
     var body: some View {
@@ -210,10 +211,12 @@ struct EraserSettingsView: View {
                 confirmingClear = true
             }
             .disabled(session.document == nil || session.page == nil || session.readOnly)
-            .confirmationDialog(String(localized: "Clear this page?"), isPresented: $confirmingClear,
-                                titleVisibility: .visible) {
+            // An iPad confirmationDialog hides Cancel and relies on outside taps while another
+            // popover (the retained eraser settings bud) already owns outside dismissal. Use a
+            // system alert so cancellation is an explicit, accessible action on every device.
+            .alert(String(localized: "Clear this page?"), isPresented: $confirmingClear) {
                 Button(String(localized: "Clear Page"), role: .destructive) { clearPage() }
-                Button(String(localized: "Cancel"), role: .cancel) {}
+                Button(String(localized: "Cancel"), role: .cancel) { confirmingClear = false }
             } message: {
                 Text(String(localized: "Everything on this page is removed. You can undo this."))
             }

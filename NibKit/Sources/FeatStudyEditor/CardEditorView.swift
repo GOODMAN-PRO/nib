@@ -386,7 +386,7 @@ struct SideCell: View {
                     .focused(focus, equals: field)
                     .disabled(model.readOnly || model.selecting)
                     .frame(minHeight: NibMetrics.hitTarget)
-                    .accessibilityLabel(side.title)
+                    .accessibilityLabel(field.accessibilityLabel)
             } else {
                 Button {
                     model.current = card.id
@@ -748,7 +748,7 @@ struct CardEditorPane: View {
                 .disabled(model.readOnly)
                 .padding(NibSpacing.x3)
                 .frame(width: size.width, height: size.height)
-                .accessibilityLabel(side.title)
+                .accessibilityLabel(CardField(card: card.id, side: side, inPane: true).accessibilityLabel)
         case .image:
             if face.kind == .image, let asset = face.asset {
                 CardPicture(model: model, asset: asset, maxPixels: Int(CardLayout.cardWidth * max(displayScale, 1)))

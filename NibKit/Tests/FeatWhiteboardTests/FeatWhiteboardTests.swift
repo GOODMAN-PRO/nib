@@ -49,6 +49,28 @@ private final class MinimapTestFloatingHost: FloatingHosting {
 }
 
 @MainActor
+private final class WhiteboardDeferredPersistence: DocumentPersistence {
+    let saved = InMemoryPersistence()
+    var pending: [DocumentID: DocumentContent] = [:]
+    var flushed: [DocumentID] = []
+
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try saved.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try saved.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        if let head { pending[doc] = head }
+        saved.didChange(doc, head: nil, pages: pages)
+    }
+    func flush(_ doc: DocumentID) {
+        flushed.append(doc)
+        if let head = pending.removeValue(forKey: doc) { saved.heads[doc] = head }
+    }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
+        try saved.fileURL(doc, relativePath: relativePath)
+    }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
+}
+
+@MainActor
 private final class WhiteboardDeferredDismissalController: UIViewController {
     let presenter = UIViewController()
     var isPresented = true
@@ -920,6 +942,12 @@ final class FeatWhiteboardTests: XCTestCase {
             openedID = params["doc"]?.stringValue
             return [:]
         }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docSetLanguage, title: "Language", summary: "Stand-in.",
+                                                  effect: .edit)) { params, _ in
+            XCTAssertEqual(params["doc"]?.stringValue, createdID.map { "doc:" + $0 })
+            XCTAssertEqual(params["language"], "fr-FR")
+            return [:]
+        }
         let creation = Task { @MainActor in
             try await WhiteboardCreator.create(WhiteboardDraft(language: "fr-FR"), folder: nil,
                                                 app: h.app, session: h.session) {
@@ -937,6 +965,71 @@ final class FeatWhiteboardTests: XCTestCase {
         let id = try await creation.value
         XCTAssertEqual(createdID, id.raw)
         XCTAssertEqual(openedID, NodeRef.document(id).description)
+    }
+
+    func testCreationPersistsSelectedLanguageBeforeDismissalAndNavigation() async throws {
+        let h = harness()
+        let persistence = WhiteboardDeferredPersistence()
+        h.app.workspace.persistence = persistence
+        // A creation flow must address the new board, even when another document is active in this window.
+        h.session.document = Fixtures.docID
+        var created: DocumentID?
+        var opened = false
+        var languageEdits = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { params, _ in
+            let id = DocumentID(try XCTUnwrap(params["id"]?.stringValue))
+            created = id
+            let template = try XCTUnwrap(params["template"]).decode(TemplateRef.self)
+            let page = PageRecord(id: "CREATEDBOARD", order: "V", size: nil,
+                                  background: .ofTemplate(template.id, params: template.params))
+            persistence.saved.heads[id] = DocumentContent(
+                meta: DocumentMeta(id: id, kind: .whiteboard, language: "en-US"), pages: [page])
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docSetLanguage, title: "Language", summary: "Stand-in.",
+                                                  effect: .edit)) { params, ctx in
+            let id = try XCTUnwrap(created)
+            XCTAssertEqual(params["doc"]?.stringValue, NodeRef.document(id).description)
+            languageEdits += 1
+            try ctx.mutate { tx in
+                var meta = try tx.content(id).meta
+                meta.language = try XCTUnwrap(params["language"]?.stringValue)
+                try tx.putMeta(meta)
+            }
+            XCTAssertEqual(try persistence.loadHead(id).meta.language, "en-US", "The edit is still pending on disk")
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Stand-in.",
+                                                  effect: .session)) { params, _ in
+            let id = try XCTUnwrap(created)
+            XCTAssertEqual(params["doc"]?.stringValue, NodeRef.document(id).description)
+            XCTAssertEqual(try persistence.loadHead(id).meta.language, "fr-FR")
+            opened = true
+            return [:]
+        }
+        h.app.content.templates.register(TemplateDefinition(
+            id: TemplateIDs.whiteboardGrid, title: "Grid", category: "Whiteboard", owner: "test",
+            params: [TemplateParam(name: "paper", title: "Paper", kind: "color")]) { _, _, _ in
+                TemplateRender(paper: .white, display: DisplayList(ops: []))
+            })
+        var draft = WhiteboardDraft(language: "fr-FR")
+        draft.title = "Board options"
+        draft.pattern = .grid
+        draft.paper = .ivory
+        var savedLanguageAtDismissal: String?
+        let id = try await WhiteboardCreator.create(draft, folder: nil, app: h.app, session: h.session) {
+            savedLanguageAtDismissal = created.flatMap { try? persistence.loadHead($0).meta.language }
+        }
+        XCTAssertEqual(savedLanguageAtDismissal, "fr-FR")
+        XCTAssertTrue(opened)
+        XCTAssertEqual(languageEdits, 1)
+        XCTAssertEqual(persistence.flushed, [id])
+        XCTAssertTrue(persistence.pending.isEmpty)
+        let board = try XCTUnwrap(persistence.loadHead(id).livePages.first)
+        XCTAssertNil(board.size)
+        XCTAssertEqual(board.background.template?.id, TemplateIDs.whiteboardGrid)
+        XCTAssertEqual(board.background.template?.params["paper"], "#FBF8F1FF")
     }
 
     func testFailedCreationKeepsDraftOpenAndDoesNotNavigate() async {
@@ -968,6 +1061,35 @@ final class FeatWhiteboardTests: XCTestCase {
         presentation.controller = sheet
         await presentation.dismiss()
         XCTAssertNil(sheet.dismissalCompletion)
+    }
+
+    func testWhiteboardKeyboardShortcutOnlyOpensOptionsInInvokingSession() async throws {
+        let h = harness()
+        h.session.document = nil
+        let shortcut = KeyShortcut("w", [.command, .shift])
+        let keys = KeyCommandRouting.active(h.app.content.keyCommands.all, in: KeyCommandContext(docKind: nil))
+            .filter { $0.shortcut == shortcut }
+        XCTAssertEqual(keys.count, 1)
+        let key = try XCTUnwrap(keys.first)
+        XCTAssertEqual(key.command, CommandIDs.panelOpen)
+        XCTAssertEqual(key.resolvedParams(for: h.session)["id"]?.stringValue, Whiteboard.createPanel)
+        var presented = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Panel", summary: "Stand-in.",
+                                                  effect: .session)) { params, ctx in
+            XCTAssertTrue(ctx.activeSession === h.session)
+            XCTAssertEqual(params["id"]?.stringValue, Whiteboard.createPanel)
+            presented = true
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { _, _ in
+            XCTFail("A keyboard shortcut must wait for the user to confirm the board options")
+            return [:]
+        }
+        _ = try await h.app.bus.execute(Invocation(command: key.command, params: key.resolvedParams(for: h.session),
+                                                 principal: .user, session: h.session))
+        XCTAssertTrue(presented)
+        XCTAssertNil(h.session.document)
     }
 
     /// New Whiteboard is one sheet: the folder it creates in travels as a `panel.open` param.

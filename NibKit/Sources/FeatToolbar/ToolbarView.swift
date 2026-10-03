@@ -360,6 +360,10 @@ final class ToolbarModel: ObservableObject {
 
     /// `$tool` publishes before the session stores the value: everything here uses `t`.
     private func toolDidChange(_ t: String) {
+        // Shortcuts and a non-sticky tool's hand-back bypass select(_:). Release the old
+        // options popover before publishing the new tool, rather than waiting for the
+        // palette's next rendered frame to remove its modal input surface.
+        closeOptionsPopovers()
         tool = t
         settingsOpen = false
         moreOpen = false

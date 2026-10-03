@@ -178,6 +178,14 @@ struct NotebookDraft: Equatable {
     static let paperColours: [NibPaper] = [.white, .ivory, .legal, .grey, .slate, .night]
     static let boardColours: [NibPaper] = [.white, .ivory, .grey, .board, .slate, .night]
 
+    /// Legal also names a page size in this form. VoiceOver must distinguish the two actions.
+    static func paperSwatch(_ paper: NibPaper) -> NibSwatch {
+        let swatch = NibSwatch(paper: paper)
+        return NibSwatch(id: swatch.id, color: swatch.color,
+                         name: paper == .legal ? String(localized: "Legal paper colour") : swatch.name,
+                         ringsLight: swatch.ringsLight, ringsDark: swatch.ringsDark)
+    }
+
     /// The colour swatches a kind shows (nil = none: text documents and study sets keep the choice for later).
     static func colours(for kind: NewDocumentKind) -> [NibPaper]? {
         switch kind {
@@ -658,7 +666,7 @@ final class NewNotebookModel: ObservableObject {
         var draft = NotebookDraft.initial(settings: app.settings, kind: kind)
         let all = app.content.templates.all
         func option(_ d: TemplateDefinition) -> TemplateOption {
-            TemplateOption(id: d.id, title: d.title, category: Self.paperGroup(d), definition: d)
+            TemplateOption(id: d.id, title: d.title, category: Self.paperGroup(d, nativeOwners: app.featureIDs), definition: d)
         }
         let isBoard: (TemplateDefinition) -> Bool = { d in
             d.category == NewNotebookModel.whiteboardCategory
@@ -668,7 +676,7 @@ final class NewNotebookModel: ObservableObject {
         if !papers.contains(where: { $0.id == draft.paper.id }) {
             let d = app.content.templates.get(draft.paper.id)
             papers.insert(TemplateOption(id: draft.paper.id, title: d?.title ?? String(localized: "Default paper"),
-                                         category: d.map(Self.paperGroup) ?? Self.paperGroups[0], definition: d), at: 0)
+                                         category: d.map { Self.paperGroup($0, nativeOwners: app.featureIDs) } ?? Self.paperGroups[0], definition: d), at: 0)
         }
         var covers = all.filter(\.isCover).map(option)
         if !covers.contains(where: { $0.id == draft.cover.id }) {
@@ -699,8 +707,9 @@ final class NewNotebookModel: ObservableObject {
     static let paperGroups = [String(localized: "Basic"), String(localized: "Lined"), String(localized: "Grid"),
                               String(localized: "Planners"), String(localized: "Music"), String(localized: "From plugins")]
 
-    static func paperGroup(_ template: TemplateDefinition) -> String {
-        guard template.id.hasPrefix("builtin.") else { return paperGroups[5] }
+    static func paperGroup(_ template: TemplateDefinition, nativeOwners: [String]) -> String {
+        // IDs are not provenance: native features also contribute names such as planner.events.
+        guard template.owner == "builtin" || nativeOwners.contains(template.owner) else { return paperGroups[5] }
         if [TemplateIDs.dots, TemplateIDs.grid, TemplateIDs.graph, TemplateIDs.isometric].contains(template.id) {
             return paperGroups[2]
         }
@@ -950,6 +959,8 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
         .nibFadeBottomEdge()
+        // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
+        .contentShape(Rectangle())
     }
 }
 
@@ -1048,6 +1059,7 @@ struct NewNotebookSheet: View {
                 .disabled(model.isWorking)
                 // The shared header supplies 20 pt; align its phone content to the scroll view's 16 pt margin.
                 .padding(.horizontal, contentInset - NibSpacing.xl)
+                .zIndex(1)
             if !compact, let message = model.actionMessage {
                 NibBanner(message, style: .warning)
                     .padding(.horizontal, contentInset)
@@ -1097,7 +1109,10 @@ struct NewNotebookSheet: View {
         }
         .background(NibColor.backgroundSecondary)
         // nibSheet fits its content; idealWidth alone lets the system keep its narrower default form size.
-        .frame(width: compact ? nil : sheetSize.width, height: compact ? nil : sheetSize.height)
+        .frame(width: compact ? nil : sheetSize.width)
+        // Keep the preferred form height, but honour the smaller proposal above the keyboard.
+        .frame(minHeight: 0, idealHeight: compact ? nil : sheetSize.height,
+               maxHeight: compact ? .infinity : sheetSize.height)
         .background {
             NewNotebookWindowReader(onController: { model.presentationController = $0 }, onChange: { windowSize = $0 })
                 .allowsHitTesting(false)
@@ -1108,6 +1123,8 @@ struct NewNotebookSheet: View {
     }
 
     private func create() {
+        titleFocused = false
+        focusedDimension = nil
         Task { @MainActor in
             _ = await model.create {
                 await model.dismissPresentation()
@@ -1164,6 +1181,8 @@ struct NewNotebookSheet: View {
                 .frame(minHeight: NibMetrics.hitTarget)
                 .background(NibColor.backgroundTertiary,
                             in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
+                .contentShape(Rectangle())
+                .onTapGesture { titleFocused = true }
                 .accessibilityLabel(String(localized: "Title"))
         }
     }
@@ -1311,7 +1330,7 @@ struct NewNotebookSheet: View {
     }
 
     private func paperColours(_ papers: [NibPaper]) -> some View {
-        NibSwatchGrid(swatches: papers.map { NibSwatch(paper: $0) },
+        NibSwatchGrid(swatches: papers.map(NotebookDraft.paperSwatch),
                       selection: Binding(get: { model.draft.paperColour?.rawValue },
                                          set: { model.draft.paperColour = $0.flatMap(NibPaper.init(rawValue:)) }),
                       columns: compact ? swatchColumns(count: papers.count + 1) : papers.count + 1,

@@ -42,7 +42,11 @@ public struct NibPopoverPanel<Content: View>: View {
                 content
             }
             .padding(NibSpacing.l)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                // A native viewport can round the same content to adjacent fractional
+                // heights. Feeding that noise into its own frame restarts layout forever.
+                if abs(height - contentHeight) > 0.5 { contentHeight = height }
+            }
             .background(PopoverScrollInteraction(isPresented: isPresented))
         }
         // Gate the native scroll host at its source, not only the animated droplet around it.

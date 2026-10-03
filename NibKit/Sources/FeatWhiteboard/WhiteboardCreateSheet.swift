@@ -111,10 +111,13 @@ enum WhiteboardCreator {
         let id = NibID.make()
         let template = draft.template(in: app.content.templates)
         try await run(app, CommandIDs.docCreate, draft.createParams(id: id, folder: folder, template: template), session)
-        if let current = (try? app.workspace.content(id))?.meta.language, current != draft.language {
+        if (try? app.workspace.content(id))?.meta.language != draft.language {
             await follow(app, CommandIDs.docSetLanguage,
                          ["doc": .string(NodeRef.document(id).description), "language": .string(draft.language)], session)
         }
+        // doc.create saves the initial package immediately, but doc.setLanguage is a debounced edit.
+        // Finish saving the chosen options before publishing the board to its editor (or other file readers).
+        app.workspace.persistence.flush(id)
         // Keep the presenting library attached until its creation sheet has finished dismissing.
         await beforeOpen()
         await follow(app, CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)], session)

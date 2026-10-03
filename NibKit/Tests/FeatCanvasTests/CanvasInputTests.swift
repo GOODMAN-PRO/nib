@@ -637,6 +637,87 @@ final class CanvasInputTests: XCTestCase {
         }
     }
 
+    func testNativeEndBeforeObserverAdmissionCommitsOnceAndSupportsUndoRedo() async throws {
+        for style in [InkStyle.defaultPen, .defaultHighlighter] {
+            for acceptedFirst in [false, true] {
+                for drawingFirst in [false, true] {
+                    let tool = Tool(); tool.inputMode = .pencilKit; tool.style = style
+                    let (harness, editor, input) = try installed(tool, stylusMode: .anyInput)
+                    defer { editor.closeCanvas() }
+                    var received: [Stroke] = []
+                    harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Add Ink", summary: "Adds test ink.",
+                        params: .obj(["page": .ref, "strokes": .arr(.anything())], required: ["page", "strokes"]), examples: [], effect: .edit)) { params, ctx in
+                            guard case let .page(doc, page)? = NodeRef(params["page"]?.stringValue ?? "") else { throw NibError.notFound("page") }
+                            let strokes = try (params["strokes"] ?? []).decode([Stroke].self)
+                            received += strokes
+                            var refs: [JSONValue] = []
+                            try ctx.mutate("Add Ink") { tx in
+                                for stroke in strokes {
+                                    let item = try tx.put(Item(id: NibID.make(), kind: .stroke, stroke: stroke), doc: doc, page: page)
+                                    refs.append(.string(NodeRef.item(doc, page, item.id).description))
+                                }
+                            }
+                            return ["refs": .array(refs)]
+                        }
+                    let before = try harness.snapshot()
+                    let canvas = try XCTUnwrap(canvases(editor.host.wetInkContainer).first { $0.isUserInteractionEnabled })
+                    // Follow a completed native-first stroke with a normal one on the same surface:
+                    // completion must survive admission, but must not leak into the next contact.
+                    for index in 0..<2 {
+                        let contact = NSObject()
+                        let start = event(editor.host, id: 201 + index, pencil: index == 1,
+                                          point: Point(140 + Double(index) * 50, 220))
+                        var end = start; end.location.x += 30; end.timestamp += 0.1
+                        let pk = PKBridge.pkStroke(Stroke(style: style,
+                            points: [StrokePoint(x: Float(start.location.x), y: 220),
+                                     StrokePoint(x: Float(end.location.x), y: 220, t: 0.1)],
+                            t0: Date().timeIntervalSince1970 + Double(index)))
+                        if acceptedFirst { XCTAssertTrue(input.acceptContact(ObjectIdentifier(contact), sample: start) === canvas) }
+                        input.canvasViewDidBeginUsingTool(canvas)
+                        if index == 0 {
+                            if drawingFirst {
+                                canvas.drawing = PKDrawing(strokes: [pk])
+                                input.canvasViewDrawingDidChange(canvas)
+                            }
+                            input.canvasViewDidEndUsingTool(canvas)
+                            await Task.yield()
+                            XCTAssertEqual(tool.finished, 0, "Native completion must wait for the observed contact")
+                        }
+                        if !acceptedFirst { XCTAssertTrue(input.acceptContact(ObjectIdentifier(contact), sample: start) === canvas) }
+                        input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(contact))
+                        input.move([end], screenPoint: end.location, id: start.touchID)
+                        if index == 1 || !drawingFirst {
+                            canvas.drawing = PKDrawing(strokes: [pk])
+                            input.canvasViewDrawingDidChange(canvas)
+                        }
+                        input.end(end)
+                        if index == 1 {
+                            XCTAssertEqual(tool.finished, 1, "The next stroke still needs its own native end")
+                            input.canvasViewDidEndUsingTool(canvas)
+                        }
+                        input.canvasViewDrawingDidChange(canvas)
+                        input.canvasViewDrawingDidChange(canvas)
+                        XCTAssertEqual(tool.finished, index + 1, "A native end before admission must not strand retained ink")
+                        for _ in 0..<200 {
+                            if received.count == index + 1 && canvas.drawing.strokes.isEmpty { break }
+                            try await Task.sleep(nanoseconds: 10_000_000)
+                        }
+                        XCTAssertEqual(received.count, index + 1)
+                        XCTAssertTrue(canvas.drawing.strokes.isEmpty, "Retire only after the committed stroke renders")
+                        XCTAssertFalse(harness.session.inking.isInking)
+                    }
+                    XCTAssertEqual(received.map(\.style), [style, style])
+                    let after = try harness.snapshot()
+                    XCTAssertNotEqual(after, before)
+                    for _ in 0..<2 { _ = try await harness.run("edit.undo", ["doc": .string(Fixtures.docID.raw)]) }
+                    XCTAssertEqual(try harness.snapshot(), before)
+                    for _ in 0..<2 { _ = try await harness.run("edit.redo", ["doc": .string(Fixtures.docID.raw)]) }
+                    XCTAssertEqual(try harness.snapshot(), after)
+                }
+            }
+        }
+    }
+
     func testLedgerMatchesNativeStrokeIdentityAcrossMissingAndOverlappingCaptures() {
         var ledger = WetInkLedger<String, String>()
         let missing = UUID(), first = UUID(), second = UUID()

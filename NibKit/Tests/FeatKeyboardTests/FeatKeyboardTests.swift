@@ -326,9 +326,15 @@ final class FeatKeyboardTests: XCTestCase {
             XCTAssertFalse(command.title.isEmpty)
             XCTAssertTrue(keyboard.canPerformAction(action, withSender: nil), "UIKit's discovery probe needs a target")
             XCTAssertTrue(keyboard.canPerformAction(action, withSender: command))
+            // ARCHITECTURE §15.10: package tests have no application host/scene to
+            // route UIApplication's nil-target sendAction. Start at the actual
+            // focused responder, as UIKit does when discovering hardware keys.
+            let focused = try XCTUnwrap(CanvasKeyboardFocus.firstResponder(in: window))
+            let target = try XCTUnwrap(focused.target(forAction: action, withSender: command) as? UIResponder)
+            XCTAssertTrue(target === keyboard)
             let ran = expectation(description: expected)
             recorder.onCall = { if $0 == expected { ran.fulfill() } }
-            XCTAssertTrue(UIApplication.shared.sendAction(action, to: nil, from: command, for: nil))
+            _ = target.perform(action, with: command)
             await fulfillment(of: [ran], timeout: 3)
             recorder.onCall = nil
             XCTAssertTrue(h.app.ui.activeNavigator === root)

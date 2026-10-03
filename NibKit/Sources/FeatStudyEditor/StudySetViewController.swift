@@ -29,6 +29,13 @@ struct CardField: Hashable {
     var inPane = false
 
     var key: SideKey { SideKey(card: card, side: side) }
+
+    /// The list and the preview can edit the same face at the same time. Give the preview a distinct spoken
+    /// name so switching sides does not make a list field's accessibility target resolve to the preview instead.
+    var accessibilityLabel: String {
+        guard inPane else { return side.title }
+        return side == .front ? String(localized: "Term, card preview") : String(localized: "Definition, card preview")
+    }
 }
 
 extension CardFaceKind {

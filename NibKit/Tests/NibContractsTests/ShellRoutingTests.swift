@@ -6,6 +6,31 @@ import NibTesting
 /// and its ⌘Z / ⇧⌘Z fallback to the window's UndoManager (`UndoRoute`).
 @MainActor
 final class ShellRoutingTests: XCTestCase {
+    func testModalOwnsFocusDuringPresentationEvenBeforeItsFieldIsReady() {
+        for document in [false, true] {
+            for focused in [false, true] {
+                XCTAssertFalse(ShellFocusPolicy.shouldReclaim(isKeyWindow: true, shellHasFocus: false,
+                    hasModal: true, isEditingText: false, showsDocument: document, hasFocusedResponder: focused),
+                    "A sheet must be able to acquire its first responder without the shell taking it")
+            }
+            XCTAssertFalse(ShellFocusPolicy.shouldReclaim(isKeyWindow: true, shellHasFocus: false,
+                hasModal: false, isEditingText: true, showsDocument: document, hasFocusedResponder: true))
+            XCTAssertFalse(ShellFocusPolicy.shouldReclaim(isKeyWindow: false, shellHasFocus: false,
+                hasModal: false, isEditingText: false, showsDocument: document, hasFocusedResponder: false),
+                "Another scene must never take the active scene's keyboard")
+        }
+    }
+
+    func testFocusRecoveryResumesAfterSheetDismissalWithoutDisplacingDocumentEditor() {
+        XCTAssertTrue(ShellFocusPolicy.shouldReclaim(isKeyWindow: true, shellHasFocus: false,
+            hasModal: false, isEditingText: false, showsDocument: true, hasFocusedResponder: false))
+        XCTAssertFalse(ShellFocusPolicy.shouldReclaim(isKeyWindow: true, shellHasFocus: false,
+            hasModal: false, isEditingText: false, showsDocument: true, hasFocusedResponder: true))
+        XCTAssertTrue(ShellFocusPolicy.shouldReclaim(isKeyWindow: true, shellHasFocus: false,
+            hasModal: false, isEditingText: false, showsDocument: false, hasFocusedResponder: true),
+            "Library buttons still hand registered shortcuts back to the shell")
+    }
+
     private let library = KeyCommandContext(docKind: nil)
     private let notebook = KeyCommandContext(docKind: .notebook)
     private let textDocument = KeyCommandContext(docKind: .textDocument)

@@ -400,12 +400,15 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// Library controls can take non-text focus without providing the shell's registered keys.
     /// Keep the shell focused there; a text input, sheet, or document editor keeps its own responder.
     private func reclaimKeyFocusIfNeeded() {
-        guard let window = viewIfLoaded?.window, window.isKeyWindow, !isFirstResponder else { return }
-        if showsDocument {
-            guard !ShellFocus.hasFocus(in: window) else { return }
-        } else {
-            guard presentedViewController == nil, !ShellFocus.isEditingText(in: window) else { return }
+        guard let window = viewIfLoaded?.window else { return }
+        // SwiftUI may present from a child host. During the transition no field
+        // has focus yet; claiming it here would take the new dialog's keyboard.
+        func hasModal(_ controller: UIViewController) -> Bool {
+            controller.presentedViewController != nil || controller.children.contains(where: hasModal)
         }
+        guard ShellFocusPolicy.shouldReclaim(isKeyWindow: window.isKeyWindow, shellHasFocus: isFirstResponder,
+            hasModal: hasModal(self), isEditingText: ShellFocus.isEditingText(in: window),
+            showsDocument: showsDocument, hasFocusedResponder: ShellFocus.hasFocus(in: window)) else { return }
         #if DEBUG
         NSLog("%@", "[Library key diagnostic] reclaim from \(String(describing: ShellFocus.firstResponder()))")
         #endif

@@ -437,6 +437,41 @@ final class FeatStudyEditorTests: XCTestCase {
 
     // MARK: Editor model
 
+    func testListAndPreviewKeepDistinctAccessibleFieldNamesWhenSidesChange() {
+        let listFields = CardSide.allCases.map { CardField(card: Fixtures.card1, side: $0) }
+        let listLabels = Set(listFields.map(\.accessibilityLabel))
+        XCTAssertEqual(listLabels, Set([String(localized: "Term"), String(localized: "Definition")]))
+        for field in listFields {
+            let preview = CardField(card: field.card, side: field.side, inPane: true)
+            XCTAssertFalse(listLabels.contains(preview.accessibilityLabel),
+                           "Showing a face in the preview must not add another match for a list field's spoken name")
+            XCTAssertEqual(field.key, preview.key, "Both inputs still edit the same card face")
+        }
+    }
+
+    func testDefinitionKeepsFocusAndTypedTextAsPreviewFollowsTheList() async throws {
+        let h = harness()
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        let term = CardField(card: Fixtures.card1, side: .front)
+        let definition = CardField(card: Fixtures.card1, side: .back)
+        model.focus = term
+        model.setText("Typed front", for: term)
+        await model.flush()
+        model.focus = nil // Dismiss the keyboard between fields, as in the creation flow.
+        model.focus = definition
+        XCTAssertEqual(model.side, .back, "The preview follows the newly focused list field")
+        XCTAssertEqual(model.focus, definition, "Showing Definition in the preview must keep focus in the list")
+        XCTAssertTrue(h.session.isEditingText)
+        model.setText("Typed back", for: definition)
+        await model.flush()
+        model.reload()
+        XCTAssertEqual(model.focus, definition, "Command-driven refresh must preserve the editing field")
+        let card = try XCTUnwrap(model.currentCard)
+        XCTAssertEqual(card.front.text?.plainText, "Typed front")
+        XCTAssertEqual(card.back.text?.plainText, "Typed back")
+        XCTAssertEqual(model.text(definition.key, in: card), "Typed back")
+    }
+
     func testOpeningNewSetProvidesEditableFacesAndPreservesTitleOnReopen() async throws {
         let h = harness()
         let doc = DocumentID("NEWSTUDYSET01")

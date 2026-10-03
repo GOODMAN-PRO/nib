@@ -1005,6 +1005,10 @@ final class FeatAudioTests: XCTestCase {
             let content = try ctx.workspace.content(doc)
             XCTAssertEqual(content.meta.kind, .textDocument)
             XCTAssertTrue(content.livePages.isEmpty)
+            XCTAssertEqual(audio.recording?.doc, doc, "Quick Record must be recording before presenting its editor")
+            XCTAssertEqual(content.liveAudio.count, 1, "The recording clip must be persisted before opening")
+            XCTAssertEqual(self.overlays(h, kind: .textDocument), ["audio.recorder"],
+                           "The editor's initial chrome must include the recording HUD")
             h.session.document = doc
             opened.append(doc)
             return [:]
@@ -1025,10 +1029,60 @@ final class FeatAudioTests: XCTestCase {
         _ = try await h.run("audio.record", ["action": "stop"])
     }
 
+    func testQuickRecordWaitsForLiveRecordingBeforeOpeningTheEditor() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        let preparing = expectation(description: "Quick Record is preparing input")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        source.onPrepare = {
+            preparing.fulfill()
+            guard release.wait(timeout: .now() + 30) == .success else {
+                throw NibError(.internalError, "Quick Record startup was not released")
+            }
+        }
+        audio.makeSource = { source }
+        var now = 100.0
+        audio.clock = { now }
+        h.session.document = nil
+        h.session.page = nil
+        standInDocCreate(h)
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: "doc.open", title: "Open", summary: "Test stand-in.",
+                                                  effect: .session, target: .app)) { params, _ in
+            h.session.document = NodeRef.documentID(from: try XCTUnwrap(params["doc"]?.stringValue))
+            opened = true
+            return [:]
+        }
+        let start = Task { try await h.run("audio.quickRecord", ["id": "QUICKDELAYED"]) }
+        await fulfillment(of: [preparing], timeout: 15)
+        XCTAssertTrue(audio.starting)
+        XCTAssertNil(audio.recording)
+        XCTAssertFalse(opened, "Slow microphone startup must not present an editor without a recording HUD")
+        XCTAssertNil(h.session.document, "Keep the invoking library visible until recording is live")
+        release.signal()
+        let result = try await start.value
+        XCTAssertEqual(result["ref"]?.stringValue, "doc:QUICKDELAYED")
+        XCTAssertTrue(opened)
+        XCTAssertEqual(h.session.document, NibID("QUICKDELAYED"))
+        XCTAssertEqual(audio.recording?.doc, h.session.document)
+        XCTAssertEqual(overlays(h, kind: .textDocument), ["audio.recorder"])
+        source.feed(seconds: 1)
+        now += 1
+        XCTAssertEqual(audio.elapsed, 1, accuracy: 0.001, "The presented HUD reads the live recording clock")
+        _ = try await h.run("audio.record", ["action": "stop"])
+    }
+
     func testQuickRecordLeavesNoEmptyDocumentWhenItCannotRecord() async throws {
         let (h, audio) = try harness()
         var created: [String] = []
         standInDocCreate(h) { created.append($0) }
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: "doc.open", title: "Open", summary: "Test stand-in.",
+                                                  effect: .session, target: .app)) { _, _ in
+            opened = true
+            return [:]
+        }
         // No microphone (hostless, no source): refused before any document is made.
         await assertThrows(.unavailable) { try await h.run("audio.quickRecord", ["id": "QUICKDOC0002"]) }
         XCTAssertEqual(created, [])
@@ -1045,6 +1099,7 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(created, ["QUICKDOC0003"])
         XCTAssertEqual(trashed, [["doc:QUICKDOC0003"]])
         XCTAssertNil(audio.recording)
+        XCTAssertFalse(opened, "A microphone failure must not leave a trashed Quick Record open")
     }
 
     // MARK: Pure logic

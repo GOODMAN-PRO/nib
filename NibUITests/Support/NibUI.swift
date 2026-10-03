@@ -94,14 +94,25 @@ final class NibUI {
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
         app.launch()
-        _ = try waitForState { $0.screen == "library" }
+        // Cold package creation and service startup share the machine with builds.
+        // Keep the readiness assertion, but do not give launch the short deadline
+        // used for an already-running command.
+        _ = try waitForState(timeout: 120) { $0.screen == "library" }
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
-        if XCUIDevice.shared.orientation != .landscapeLeft { XCUIDevice.shared.orientation = .landscapeLeft }
+        app.activate()
+        // Device orientation may already say landscape after tearDown rotated
+        // SpringBoard. Deliver the request to this scene too.
+        XCUIDevice.shared.orientation = .landscapeLeft
         let landscape = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            app.frame.width > app.frame.height
+            // The application's union frame includes transient system windows.
+            // Validate the main app window using one fresh snapshot per poll.
+            let window = app.windows.firstMatch
+            guard window.exists else { return false }
+            let frame = window.frame
+            return frame.width > frame.height && frame.height > 0
         }, object: nil)
-        guard XCTWaiter.wait(for: [landscape], timeout: 15) == .completed else {
+        guard XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
             throw Failure.message("Nib's launched scene did not reach landscape")
         }
         _ = try waitForState { $0.screen == "library" }

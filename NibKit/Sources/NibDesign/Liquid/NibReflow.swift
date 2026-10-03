@@ -607,6 +607,9 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
 
     final class Probe: UIView {
         var changedWindow: ((Probe) -> Void)?
+        // This is geometry for a window-level recogniser, never a touch surface.
+        // Hosting/reuse may restore interaction when the library reattaches.
+        override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
         override func didMoveToWindow() { super.didMoveToWindow(); changedWindow?(self) }
     }
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {

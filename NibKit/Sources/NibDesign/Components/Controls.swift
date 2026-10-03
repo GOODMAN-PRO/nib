@@ -403,7 +403,10 @@ public struct NibField: View {
     }
 
     public var body: some View {
-        TextField(prompt, text: $text, axis: .vertical)
+        // A one-line form entry needs native single-line focus and submit behaviour.
+        // The vertical variant embeds a scrolling text view even at 1...1 lines
+        // and uses multiline return handling. Keep it for growing composers.
+        TextField(prompt, text: $text, axis: lines.upperBound == 1 ? .horizontal : .vertical)
             .lineLimit(lines)
             .font(NibFont.chat)
             .padding(.horizontal, 14)

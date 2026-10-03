@@ -375,6 +375,87 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertNil(model.popover)
     }
 
+    func testColourSlotsHostNativeLongPressMenusAndKeepTapSeparate() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        let host = UIHostingController(rootView: ToolPresetMenu(model: model)
+            .environment(\.horizontalSizeClass, .regular))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 900, height: 300))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func buttons(_ view: UIView) -> [PresetSwatchNativeButton] {
+            (view as? PresetSwatchNativeButton).map { [$0] } ?? view.subviews.flatMap(buttons)
+        }
+        for _ in 0..<100 where buttons(host.view).count != model.presets.swatches.count {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let slots = buttons(host.view)
+        XCTAssertEqual(slots.count, model.presets.swatches.count)
+        let selected = try XCTUnwrap(slots.first(where: \.isSelected))
+        XCTAssertTrue(selected.isContextMenuInteractionEnabled, "UIKit must own the long press on the swatch itself")
+        XCTAssertFalse(selected.showsMenuAsPrimaryAction, "a short tap keeps the existing select/edit behaviour")
+        let interaction = try XCTUnwrap(selected.contextMenuInteraction)
+        XCTAssertNotNil(selected.contextMenuInteraction(interaction, configurationForMenuAtLocation:
+            CGPoint(x: selected.bounds.midX, y: selected.bounds.midY)))
+        XCTAssertNil(model.popover, "requesting the long-press menu must not run the tap action")
+        XCTAssertEqual(selected.accessibilityLabel, PresetColour.name(model.presets.color))
+        XCTAssertTrue(selected.accessibilityTraits.contains(.selected))
+        let change = try XCTUnwrap(selected.menu?.children.compactMap { $0 as? UIAction }
+            .first { $0.title == "Change Colour" })
+        selected.sendAction(change)
+        XCTAssertEqual(model.popover, .colour(.slot(0)), "the menu edits the held slot")
+        model.close()
+        selected.sendActions(for: .touchUpInside)
+        XCTAssertEqual(model.popover, .colour(.slot(0)), "a short tap still opens the selected slot")
+        selected.sendActions(for: .touchUpInside)
+        XCTAssertNil(model.popover, "and another short tap closes it")
+    }
+
+    func testNativeColourMenuEditsHeldSlotAndPreservesOtherActionsForEveryTool() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        for tool in NibSettings.presetTools {
+            let model = PresetMenuModel(app: h.app, session: h.session, tool: tool)
+            let button = PresetSwatchNativeButton()
+            let original = model.presets
+            var askedToRestore = false
+            let menu = PresetSwatchMenu.make(model: model, index: 1) { askedToRestore = true }
+            let actions = menu.children.compactMap { $0 as? UIAction }
+            XCTAssertEqual(actions.map(\.title), ["Change Colour", "Rearrange Colours", "Remove Colour", "Restore Default Presets"])
+            button.sendAction(actions[0])
+            XCTAssertEqual(model.popover, .colour(.slot(1)), tool)
+            XCTAssertEqual(model.presets.selectedSwatch, original.selectedSwatch, "holding another slot must not select it")
+            let picked = try XCTUnwrap(model.pick(vermilion))
+            let succeeded = await picked.value
+            XCTAssertTrue(succeeded)
+            model.reload()
+            XCTAssertEqual(model.presets.swatches.count, original.swatches.count)
+            XCTAssertEqual(model.presets.swatches[0], original.swatches[0])
+            XCTAssertEqual(PresetColour.rgbHex(model.presets.swatches[1].color), PresetColour.rgbHex(vermilion))
+            try await h.run("preset.select", ["tool": .string(tool), "swatch": 1])
+            XCTAssertEqual(PresetColour.rgbHex(presets(h, tool).color), PresetColour.rgbHex(vermilion),
+                           "the next stroke uses the changed colour after selecting that slot")
+            button.sendAction(actions[1])
+            XCTAssertTrue(model.arranging)
+            button.sendAction(actions[3])
+            XCTAssertTrue(askedToRestore)
+            XCTAssertNotEqual(presets(h, tool), original, "Restore still requires confirmation")
+            XCTAssertTrue(actions[2].attributes.contains(.destructive))
+            button.sendAction(actions[2])
+            for _ in 0..<100 where presets(h, tool).swatches.count == original.swatches.count {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertEqual(presets(h, tool).swatches.count, original.swatches.count - 1)
+            while presets(h, tool).swatches.count > 1 {
+                try await h.run("preset.removeSwatch", ["tool": .string(tool), "index": 0])
+            }
+            model.reload()
+            let lastSlotMenu = PresetSwatchMenu.make(model: model, index: 0) {}
+            XCTAssertFalse(lastSlotMenu.children.contains { $0.title == "Remove Colour" }, "the last colour cannot be removed")
+        }
+    }
+
     // MARK: Commands
 
     func testSelectChecksBounds() async throws {
