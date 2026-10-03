@@ -99,12 +99,12 @@ final class InsertUITests: XCTestCase {
                 : [type]
             for kind in types {
                 let matches = query(name, kind)
-                if let found = matches.allElementsBoundByIndex.first(where: {
+                if let found = matches.allElementsBoundByAccessibilityElement.first(where: {
                     !$0.frame.isEmpty && $0.isEnabled && $0.isHittable
                 }) { return found }
             }
             if attempt == 0 { _ = q.firstMatch.waitForExistence(timeout: 3) }
-            if scroll, let panel = (ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex).first(where: {
+            if scroll, let panel = (ui.app.scrollViews.allElementsBoundByAccessibilityElement + ui.app.collectionViews.allElementsBoundByAccessibilityElement + ui.app.tables.allElementsBoundByAccessibilityElement).first(where: {
                 $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.height > 150 && $0.frame.width > 200
             }) {
                 panel.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.80)).press(forDuration: 0.01,
@@ -115,7 +115,9 @@ final class InsertUITests: XCTestCase {
     }
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
     private func visible(_ name: String) -> Bool { query(name).allElementsBoundByIndex.contains { $0.isHittable } }
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) { ui.app.typeKey(value, modifierFlags: modifiers) }
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) {
+        ui.app.nibTypeKey(value, modifierFlags: modifiers)
+    }
     private func outside() { ui.coordinate(CGPoint(x: 0.93, y: 0.83)).tap() }
     private func finish() throws {
         if visible("Finish Editing") { try tap("Finish Editing") }
@@ -719,7 +721,7 @@ final class InsertUITests: XCTestCase {
         try counts(5); try selectAt()
         let before = try item("image")
         try menu("Replace Image")
-        let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
+        let photo = ui.app.images.matching(NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH[c] 'Photo'")).firstMatch
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
         if visible("Add") { try tap("Add") }
         // F034 replaces an existing item, so its unchanged count is not a completion
@@ -736,7 +738,7 @@ final class InsertUITests: XCTestCase {
         try image(); try menu("Save to Photos")
         try allowSystemPermissionIfPresented()
         outside(); try ui.selectTool("image"); ui.coordinate(CGPoint(x: 0.63, y: 0.8)).tap(); try tap("Photos")
-        let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
+        let photo = ui.app.images.matching(NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH[c] 'Photo'")).firstMatch
         XCTAssertTrue(photo.waitForExistence(timeout: 10), "Saved image must be available in Photos, or a useful permission error must be shown")
         try tap("Cancel"); try counts(5)
     }
@@ -757,7 +759,9 @@ final class InsertUITests: XCTestCase {
         let field = alert.textFields.matching(NSPredicate(
             format: "identifier == %@ OR label == %@", fieldName, fieldName)).firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 3))
-        field.tap(); field.typeKey("a", modifierFlags: .command); field.typeText(text)
+        field.tap()
+        field.nibTypeKey("a", modifierFlags: .command)
+        field.typeText(text)
         let button = alert.buttons[action]
         XCTAssertTrue(button.waitForExistence(timeout: 3))
         button.tap()
@@ -783,7 +787,9 @@ final class InsertUITests: XCTestCase {
         star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: ui.coordinate(end))
         try counts(5)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount > 0 }
-        XCTAssertTrue(try selectedBounds().insetBy(dx: -20, dy: -20).contains(ui.coordinate(end).screenPoint))
+        let bounds = try selectedBounds(), drop = ui.coordinate(end).screenPoint
+        XCTAssertTrue(bounds.insetBy(dx: -20, dy: -20).contains(drop),
+                      "Selected bounds \(bounds) must contain drop \(drop); canvas \(ui.canvas.frame)")
     }
     func testCollectionCreateCancelRenameReorderDeleteConfirm() throws {
         try elements(); try tap("New Collection")
@@ -840,17 +846,29 @@ final class InsertUITests: XCTestCase {
     func testCollectionExportSaveAndReimportRetainsElementsAndAssets() throws {
         try elements(); try tap("Collection Options"); try tap("Export Collection")
         try tap("Save to Files", scroll: true)
-        if visible("On My iPad") { try tap("On My iPad") }
+        try openLocalFilesFolder()
         try tap("Save")
         if visible("Replace") { try tap("Replace") }
         try ui.dismissSheets(); try elements(); try tap("Collection Options"); try tap("Import Collection")
-        if visible("Recents") { try tap("Recents") }
-        let file = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Stickers' AND (elementType == %d OR elementType == %d)", XCUIElement.ElementType.cell.rawValue, XCUIElement.ElementType.button.rawValue)).firstMatch
+        // Saving does not add a document to Files' Recents. Reopen the chosen folder,
+        // and select a file cell, never the obscured collection chip in the app.
+        try openLocalFilesFolder()
+        let file = ui.app.cells.matching(NSPredicate(format: "label BEGINSWITH 'Stickers'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 10), "Exported Stickers.nibcollection must be selectable in Files")
         file.tap()
+        if visible("Open") { try tap("Open") }
         try tap("Heart"); try counts(5)
         try all(); XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
         XCTAssertNotNil(try item("image")["asset"])
+    }
+    private func openLocalFilesFolder() throws {
+        if visible("Browse") { try tap("Browse") }
+        let local = ui.app.cells["DOC.sidebar.item.On My iPad"]
+        XCTAssertTrue(local.waitForExistence(timeout: 10), "Files must expose its local provider")
+        local.tap()
+        let nib = ui.app.cells["Nib, Container"]
+        XCTAssertTrue(nib.waitForExistence(timeout: 10), "Files must expose Nib's documents folder")
+        nib.tap()
     }
     func testGIFLocalInvalidLinkReportsErrorAndFilesCancelInsertsNothing() throws {
         try elements(); try tap("GIFs"); try tap("Add GIF from a Link")
@@ -929,6 +947,8 @@ final class InsertUITests: XCTestCase {
     func testTapeDrawHideRevealDoesNotAddUndoAndRemoveAllRestores() throws {
         try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: 2)
         try drawTape(); try counts(6, strokes: 3)
+        try ui.tapCommand("edit.undo"); try counts(5, strokes: 2)
+        try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
         let masked = try canvasPixels()
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
         try wait("Reveal tape must visibly expose underlying pen ink") {
@@ -941,8 +961,15 @@ final class InsertUITests: XCTestCase {
             return self.changedPixels(masked, current) < 20
         }
         try counts(6, strokes: 3)
-        try ui.tapCommand("edit.undo"); try counts(5, strokes: 2)
-        try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
+        // CONTRACTS.md §G4 explicitly treats non-undoable tape reveal writes as later
+        // revisions. Undo skips that revised record; it must not erase its persisted state.
+        // The insertion's undo/redo behavior is checked above, before either reveal write.
+        try ui.tapCommand("edit.undo"); try counts(6, strokes: 3)
+        try wait("Undo must preserve the tape's newer non-undoable hidden state") {
+            guard let current = try? self.canvasPixels() else { return false }
+            return self.changedPixels(masked, current) < 20
+        }
+        XCTAssertFalse(try ui.state().redoAvailable, "A revision-conflicted undo has no inverse to redo (§G4)")
         try tap("tool.tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
         try counts(6, strokes: 3)
         try tap("Remove All Tape", scroll: true); try tap("Remove All Tape")
@@ -991,7 +1018,7 @@ final class InsertUITests: XCTestCase {
     func testTapeImportedPhotoPatternCanBeDrawnAndDeleted() throws {
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); outside()
         try ui.selectTool("tape"); try tap("tool.tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
-        let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
+        let photo = ui.app.images.matching(NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH[c] 'Photo'")).firstMatch
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])
@@ -1050,6 +1077,9 @@ final class InsertUITests: XCTestCase {
     }
     private func message(_ text: String) throws -> XCUIElement {
         let q = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", text))
+        try wait("Thread must show message \(text)") {
+            q.allElementsBoundByIndex.contains { $0.isHittable && $0.frame.height > 15 }
+        }
         return try XCTUnwrap(q.allElementsBoundByIndex.first { $0.isHittable && $0.frame.height > 15 }, "Thread must show message \(text)")
     }
     func testCommentAddOpenBadgeReplyAndCopyText() throws {
@@ -1105,6 +1135,11 @@ final class InsertUITests: XCTestCase {
         try message("Check the units").tap(); try tap("Reopen Thread")
         try message("Check the units").press(forDuration: 0.8)
         if visible("Cancel") { try tap("Cancel") }
+        else {
+            // DESIGN §13 uses native context menus, which have no Cancel row on iPad.
+            // Dismiss the menu before operating the panel behind its modal backdrop.
+            outside()
+        }
         try tap("cmd.panel.close"); try goToSecondPage(); try panel("Comments")
         try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page }
@@ -1210,6 +1245,10 @@ final class InsertUITests: XCTestCase {
         try wait("Playing clip exposes Pause") { self.visible("Pause") }
         try tap("Pause")
         let position = try control("Playback position", .slider)
+        // Establish a distinct starting position: natural playback may already be at 75%.
+        position.adjust(toNormalizedSliderPosition: 0.25)
+        let initialSeek = try playbackTimes()
+        XCTAssertEqual(initialSeek.position, initialSeek.duration * 0.25, accuracy: 1.5)
         let before = position.value as? String
         position.adjust(toNormalizedSliderPosition: 0.75)
         try wait("Scrub must change bounded playback position") { position.value as? String != before }
@@ -1242,7 +1281,7 @@ final class InsertUITests: XCTestCase {
         let duration = row.value as? String
         row.press(forDuration: 0.8); try tap("Share Audio File")
         XCTAssertTrue(query("Save to Files").firstMatch.waitForExistence(timeout: 10), "Share must expose a real audio file")
-        try ui.dismissSheets(); try control("Motion lecture").tap(); try tap("Pause")
+        try ui.dismissSheets(); try panel("Audio"); try control("Motion lecture").tap(); try tap("Pause")
         try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try tap("Cancel")
         XCTAssertTrue(query("Playback position").firstMatch.exists)
         XCTAssertEqual(try control("Motion lecture").value as? String, duration)

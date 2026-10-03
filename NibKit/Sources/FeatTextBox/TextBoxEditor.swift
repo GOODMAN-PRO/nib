@@ -102,6 +102,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private var hiddenIDs: [PageID: Set<ElementID>] = [:]
     private var keyboardFrame: CGRect?
     private var keyboardInset: CGFloat = 0
+    private var keyboardOriginalOffset: CGPoint?
+    private var keyboardAdjustedOffset: CGPoint?
+    private var keyboardAdjustedZoom: CGFloat?
     private var isRendering = false
     private var adjustingSelection = false
     private var needsNormalize = false
@@ -832,18 +835,29 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             host.session.editor?.reveal(page: st.page, rect: st.box.frame.rect, animated: false)
             return
         }
+        if keyboardOriginalOffset == nil {
+            keyboardOriginalOffset = scroll.contentOffset
+        }
         if keyboardInset < covered.height {
             scroll.contentInset.bottom += covered.height - keyboardInset
             keyboardInset = covered.height
         }
         scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: scroll.contentOffset.y + overlap), animated: false)
+        keyboardAdjustedOffset = scroll.contentOffset
+        keyboardAdjustedZoom = scroll.zoomScale
     }
 
     private func removeKeyboardInset() {
-        if keyboardInset > 0, let scroll = host?.canvasView as? UIScrollView {
-            scroll.contentInset.bottom = max(0, scroll.contentInset.bottom - keyboardInset)
+        if let scroll = host?.canvasView as? UIScrollView {
+            let restore = NibTextKeyboardAvoidance.canRestore(current: scroll.contentOffset, adjusted: keyboardAdjustedOffset) && scroll.zoomScale == keyboardAdjustedZoom
+            if keyboardInset > 0 { scroll.contentInset.bottom -= keyboardInset }
+            // Return the page to its pre-keyboard position only if the user has not panned or zoomed since.
+            if restore, let offset = keyboardOriginalOffset { scroll.setContentOffset(offset, animated: false) }
         }
         keyboardInset = 0
+        keyboardOriginalOffset = nil
+        keyboardAdjustedOffset = nil
+        keyboardAdjustedZoom = nil
     }
 
     // MARK: Popovers
@@ -908,10 +922,17 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             return false
         }
         st.popover.contentHeight = height
+        st.popover.viewportHeight = max(0, anchor.minY - NibMetrics.popoverGap)
         st.popover.onClose = { [weak self, weak st] in
             // Back to typing (the popover's own fields may have had the keyboard).
-            guard let self = self, let st = st, self.state === st, !st.textView.isFirstResponder else { return }
-            st.textView.becomeFirstResponder()
+            guard let self = self, let st = st, self.state === st else { return }
+            if !st.textView.isFirstResponder { st.textView.becomeFirstResponder() }
+            // Retire the inactive native scroll host after its closing fade. Keeping it mounted
+            // can intercept the next accessory tap even though the bud is no longer visible.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak st] in
+                guard let self, let st, self.state === st, !st.popover.isPresented else { return }
+                self.floating?.dismiss(TextPopoverIDs.popover)
+            }
         }
         if !floating.isPresenting(TextPopoverIDs.popover) {
             floating.present(TextPopoverIDs.popover, content: AnyView(TextFormatPopover(state: st.popover, model: st.model)))
@@ -1190,7 +1211,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         s.removeAttribute(TextLayout.trailingParagraphKey, range: range)
         let ns = s.string as NSString
         for i in range.location..<NSMaxRange(range) where ns.character(at: i) != TextLayout.attachmentCharacter {
-            s.removeAttribute(TextLayout.assetKey, range: NSRange(location: i, length: 1))
+            let character = NSRange(location: i, length: 1)
+            s.removeAttribute(TextLayout.assetKey, range: character)
+            s.removeAttribute(.attachment, range: character)
+            if #available(iOS 18.0, *) { s.removeAttribute(.adaptiveImageGlyph, range: character) }
         }
         s.endEditing()
     }
@@ -1230,6 +1254,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         var typing = tv.typingAttributes
         typing[.nibListMarker] = nil
         typing[TextLayout.assetKey] = nil
+        typing[.attachment] = nil
+        if #available(iOS 18.0, *) { typing[.adaptiveImageGlyph] = nil }
         typing[TextLayout.trailingParagraphKey] = nil
         let s = tv.textStorage
         let location = tv.selectedRange.location
@@ -1336,6 +1362,8 @@ final class TextBoxTextView: UITextView {
         TextBoxTextView.command(String(localized: "Align Left"), "{", .command, #selector(TextBoxTextView.alignTextLeft(_:))),
         TextBoxTextView.command(String(localized: "Align Centre"), "|", .command, #selector(TextBoxTextView.alignTextCentre(_:))),
         TextBoxTextView.command(String(localized: "Align Right"), "}", .command, #selector(TextBoxTextView.alignTextRight(_:))),
+        TextBoxTextView.command(String(localized: "Indent"), TextBoxTextView.tab, [],
+                                #selector(TextBoxTextView.indentList(_:))),
         TextBoxTextView.command(String(localized: "Outdent"), TextBoxTextView.tab, .shift,
                                 #selector(TextBoxTextView.outdentList(_:))),
         TextBoxTextView.command(String(localized: "Finish Editing"), UIKeyCommand.inputEscape, [],
@@ -1360,6 +1388,9 @@ final class TextBoxTextView: UITextView {
     @objc func alignTextLeft(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .left) }
     @objc func alignTextCentre(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .center) }
     @objc func alignTextRight(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .right) }
+    @objc func indentList(_ sender: UIKeyCommand) {
+        if editor?.indent(outdent: false) != true { insertText("\t") }
+    }
     @objc func outdentList(_ sender: UIKeyCommand) { editor?.indent(outdent: true) }
     @objc func finishEditing(_ sender: UIKeyCommand) { editor?.endEditing() }
 }

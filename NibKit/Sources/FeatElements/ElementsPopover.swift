@@ -117,6 +117,7 @@ final class ElementsModel: ObservableObject {
     @Published private(set) var matches: [ElementInfo] = []
     @Published private(set) var hasSelection = false
     @Published private(set) var catalog: ElementCatalog
+    @Published var failure: String?
 
     @Published var gifQuery = ""
     @Published private(set) var gifKind: GiphyKind = .gifs
@@ -325,6 +326,7 @@ final class ElementsModel: ObservableObject {
     // MARK: Collections and elements
 
     func ask(_ p: Prompt) {
+        failure = nil
         switch p {
         case .newCollection, .gifLink: promptText = ""
         case .renameCollection(let c): promptText = c.title
@@ -572,10 +574,13 @@ final class ElementsModel: ObservableObject {
         }
     }
 
-    /// Failures show as the shell's toast, like `app.perform`.
+    /// Keep failures on the invoking surface: a native prompt can still be dismissing
+    /// when the shell's short-lived command-failure toast appears.
     private func report(_ command: String, _ error: Error) {
+        let error = NibError.wrap(error)
+        failure = error.message
         NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                        userInfo: ["command": command, "error": NibError.wrap(error)])
+                                        userInfo: ["command": command, "error": error])
     }
 }
 
@@ -611,6 +616,9 @@ struct ElementsPopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
             NibSegmentedControl(selection: $model.tab, options: ElementsModel.Tab.allCases) { $0.title }
+            if let failure = model.failure {
+                NibBanner(failure, action: NibAction(String(localized: "Dismiss"), handler: { model.failure = nil }))
+            }
             switch model.tab {
             case .stickers:
                 ElementsStickersPane(model: model)
@@ -621,7 +629,7 @@ struct ElementsPopover: View {
         .task { await model.start() }
         .onDisappear { model.stop() }
         .background(ElementsPromptPresenter(model: model).allowsHitTesting(false))
-        .confirmationDialog(model.deletion?.title ?? "", isPresented: $model.showsDeletion, titleVisibility: .visible,
+        .alert(model.deletion?.title ?? "", isPresented: $model.showsDeletion,
                             presenting: model.deletion) { deletion in
             Button(deletion.action, role: .destructive) { Task { await model.confirm(deletion) } }
             Button(String(localized: "Cancel"), role: .cancel) {}
@@ -968,15 +976,21 @@ struct ElementsCollectionBar: View {
 
     var body: some View {
         HStack(spacing: NibSpacing.xs) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NibSpacing.s) {
-                    ForEach(model.collections) { c in
-                        NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
-                            .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
-                            .accessibilityValue(ElementCopy.count(c.count))
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: NibSpacing.s) {
+                        ForEach(model.collections) { c in
+                            NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
+                                .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
+                                .accessibilityValue(ElementCopy.count(c.count))
+                                .id(c.id)
+                        }
                     }
+                    .padding(.vertical, NibSpacing.s)
                 }
-                .padding(.vertical, NibSpacing.s)                 // the chips' 44 pt hit areas stay inside the scroller
+                // Creating, importing, or reopening a collection must keep its selected tab in reach.
+                .onChange(of: model.current, initial: true) { _, current in proxy.scrollTo(current, anchor: .center) }
+                .onChange(of: model.collections.map(\.id)) { _, _ in proxy.scrollTo(model.current, anchor: .center) }
             }
             NibIconButton(.plus, label: String(localized: "New Collection"), size: .panel) { model.ask(.newCollection) }
             Menu {
@@ -1493,11 +1507,48 @@ enum ElementsSettingsPage {
     static let id = "elements.settings"
 }
 
+/// Do not erase a typed secret or claim deletion until the secure store confirms it.
+@MainActor
+final class GiphyKeySettingsModel: ObservableObject {
+    @Published var draft = ""
+    @Published private(set) var hasKey: Bool
+    @Published private(set) var failure: String?
+    private let load: () -> String?
+    private let save: (String?) -> Bool
+
+    init(load: @escaping () -> String? = GiphyKey.load,
+         save: @escaping (String?) -> Bool = GiphyKey.save) {
+        self.load = load
+        self.save = save
+        hasKey = load() != nil
+    }
+
+    func saveDraft() {
+        let key = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        guard save(key), load() == key else {
+            failure = String(localized: "Couldn't save the key in Keychain. Your entry is still here. Try Save Key again.")
+            return
+        }
+        hasKey = true
+        draft = ""
+        failure = nil
+    }
+
+    func remove() {
+        guard save(nil), load() == nil else {
+            failure = String(localized: "Couldn't remove the key from Keychain. Try Remove Key again.")
+            return
+        }
+        hasKey = false
+        failure = nil
+    }
+}
+
 /// Settings › Editing › Elements and GIFs: the GIPHY key (Keychain, this device only) and collection import.
 struct ElementsSettingsView: View {
     let app: NibApp
-    @State private var draftKey = ""
-    @State private var hasKey = GiphyKey.load() != nil
+    @StateObject private var key = GiphyKeySettingsModel()
     @State private var importing = false
     @State private var status: String?
 
@@ -1508,22 +1559,22 @@ struct ElementsSettingsView: View {
     var body: some View {
         List {
             Section {
-                if hasKey {
+                if key.hasKey {
                     NibRow(String(localized: "GIPHY API key"), subtitle: String(localized: "Saved in this device's Keychain"),
                            icon: .key) {
                         Button(String(localized: "Remove Key"), role: .destructive) {
-                            GiphyKey.save(nil)
-                            hasKey = false
+                            key.remove()
                         }
                         .font(NibFont.body)
                     }
                 } else {
-                    ElementsSecureField(text: $draftKey, prompt: String(localized: "Paste your GIPHY API key"), onSubmit: saveKey)
-                    Button(String(localized: "Save Key"), action: saveKey)
+                    ElementsSecureField(text: $key.draft, prompt: String(localized: "Paste your GIPHY API key"), onSubmit: key.saveDraft)
+                    Button(String(localized: "Save Key"), action: key.saveDraft)
                         .font(NibFont.body)
                         .frame(minHeight: NibMetrics.hitTarget)
-                        .disabled(draftKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(key.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+                if let failure = key.failure { Text(failure).font(NibFont.footnote) }
                 if let signUp = URL(string: "https://developers.giphy.com/dashboard/") {
                     Link(String(localized: "Get a Free Key from GIPHY"), destination: signUp)
                         .font(NibFont.body)
@@ -1555,13 +1606,6 @@ struct ElementsSettingsView: View {
         .fileImporter(isPresented: $importing, allowedContentTypes: ElementFiles.collectionTypes) { result in
             Task { await importPicked(result) }
         }
-    }
-
-    private func saveKey() {
-        let key = draftKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return }
-        hasKey = GiphyKey.save(key) && GiphyKey.load() != nil
-        draftKey = ""
     }
 
     private func importPicked(_ result: Result<URL, Error>) async {
