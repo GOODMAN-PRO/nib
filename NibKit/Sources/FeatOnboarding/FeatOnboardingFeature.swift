@@ -53,7 +53,8 @@ enum OnboardingNames {
 @MainActor
 enum OnboardingScreen {
     static func shouldShow(_ app: NibApp) -> Bool {
-        !NibUITestMode.isEnabled && !app.settings.get(OnboardingSettings.done)
+        (!NibUITestMode.isEnabled || ProcessInfo.processInfo.arguments.contains("-NibUITestOnboarding"))
+            && !app.settings.get(OnboardingSettings.done)
     }
 
     static func make(app: NibApp, navigator: SceneNavigator) -> UIViewController? {
