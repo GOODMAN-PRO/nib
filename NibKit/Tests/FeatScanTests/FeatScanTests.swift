@@ -276,8 +276,9 @@ final class FeatScanTests: XCTestCase {
         XCTAssertEqual(newQR.command, "scan.qr")
         XCTAssertEqual(newQR.icon, "qrcode")
         XCTAssertEqual(h.app.ui.menus.get("scan.more.qr")?.location, .documentMore)
-        // Hostless tests have no camera, so every entry hides itself.
-        XCTAssertFalse(new.isVisible(MenuContext(app: h.app)))
+        // DESIGN §14.1 keeps Scan Document discoverable in New. The command
+        // reports unavailable hardware; contextual camera tools still hide.
+        XCTAssertTrue(new.isVisible(MenuContext(app: h.app)))
         XCTAssertFalse(add.isVisible(onPage2))
         XCTAssertFalse(newQR.isVisible(MenuContext(app: h.app)))
     }
