@@ -77,7 +77,7 @@ public struct NibPopoverPanel<Content: View>: View {
 
 /// SwiftUI can keep a hidden popover's native scroll view above neighbouring controls.
 /// Disable that UIKit hit target as well as the droplet's SwiftUI gestures, retaining its closing animation.
-private struct PopoverScrollInteraction: UIViewRepresentable {
+struct PopoverScrollInteraction: UIViewRepresentable {
     let isPresented: Bool
     func makeUIView(context: Context) -> Probe {
         let view = Probe()
@@ -88,17 +88,78 @@ private struct PopoverScrollInteraction: UIViewRepresentable {
         view.isPresented = isPresented
         view.updateScrollView()
     }
+    static func dismantleUIView(_ view: Probe, coordinator: ()) {
+        view.retire()
+    }
     final class Probe: UIView {
+        private static let owners = NSMapTable<UIScrollView, Probe>.weakToWeakObjects()
         var isPresented = true
+        private var retired = false
+        private weak var scrollHost: UIScrollView?
+        private var hideAfterFade: DispatchWorkItem?
         override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
         override func layoutSubviews() { super.layoutSubviews(); updateScrollView() }
         override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+        func retire() {
+            // Removing a floating entry can detach the probe before its closing
+            // task fires. Retire the native container while we still own it;
+            // SwiftUI may retain it for a transition after the content is gone.
+            retired = true
+            isPresented = false
+            hideAfterFade?.cancel()
+            hideAfterFade = nil
+            guard let scrollHost, Self.owners.object(forKey: scrollHost) === self else { return }
+            scrollHost.endEditing(true)
+            scrollHost.isUserInteractionEnabled = false
+            scrollHost.accessibilityElementsHidden = true
+            scrollHost.isHidden = true
+        }
         func updateScrollView() {
+            guard !retired else { return }
             var ancestor = superview
             while let view = ancestor {
                 if let scroll = view as? UIScrollView {
+                    // SwiftUI can temporarily reuse one native scroll container
+                    // across retained buds during rotation or replacement. A
+                    // closing probe must not reclaim it from the visible bud.
+                    if !isPresented, let owner = Self.owners.object(forKey: scroll),
+                       owner !== self, owner.isPresented { return }
+                    if scrollHost !== scroll {
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scrollHost = scroll
+                    }
+                    Self.owners.setObject(self, forKey: scroll)
+                    // A retained closing popover must also release its text
+                    // responder, so subsequent hardware keys reach the editor.
+                    if !isPresented { scroll.endEditing(true) }
                     scroll.isUserInteractionEnabled = isPresented
                     scroll.accessibilityElementsHidden = !isPresented
+                    if !isPresented && (scroll.bounds.isEmpty || scroll.frame.isInfinite || scroll.frame.isNull) {
+                        // A collapsed native host has no visible fade to preserve.
+                        // Hide it before accessibility asks UIKit for an invalid hit point.
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scroll.isHidden = true
+                    }
+                    if isPresented {
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scroll.isHidden = false
+                    } else if !scroll.isHidden, hideAfterFade == nil {
+                        // accessibilityElementsHidden hides children, but UIKit can
+                        // still expose the scroll container itself after the bud's
+                        // transform collapses its frame. Retain the view/offset and
+                        // the 120 ms closing fade (DESIGN §10.6), then hide it natively.
+                        let work = DispatchWorkItem { [weak self, weak scroll] in
+                            guard let self, let scroll, !self.isPresented,
+                                  Self.owners.object(forKey: scroll) === self else { return }
+                            scroll.isHidden = true
+                            self.hideAfterFade = nil
+                        }
+                        hideAfterFade = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+                    }
                     return
                 }
                 ancestor = view.superview
@@ -156,6 +217,15 @@ public enum NibBudPlacement: Sendable {
         }
     }
 
+    /// Geometry measurement arrives after layout. Fit the cached measurement
+    /// before positioning too, so a newly shown keyboard cannot push a focused
+    /// popover below its smaller scrolling viewport for that first layout.
+    func fittedSize(_ measured: CGSize, beside anchor: CGRect, gap: CGFloat, in bounds: CGRect) -> CGSize {
+        let available = availableSize(beside: anchor, gap: gap, in: bounds)
+        let measured = NibGeometry.size(measured)
+        return CGSize(width: min(measured.width, available.width), height: min(measured.height, available.height))
+    }
+
     /// Prefer the requested side, flip when it cannot fit, then clamp both axes to the chrome inset.
     func centre(size: CGSize, beside anchor: CGRect, gap: CGFloat, in bounds: CGRect,
                 alignment: Alignment = .top) -> CGPoint {
@@ -197,6 +267,7 @@ public struct NibBudPopover<Content: View>: View {
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var size = CGSize(width: NibMetrics.popoverWidth, height: 200)
+    @State private var keyboardFrame: CGRect?
 
     public init(id: String, source: String, isPresented: Binding<Bool>, title: String, subtitle: String? = nil,
                 width: CGFloat = NibMetrics.popoverWidth, placement: NibBudPlacement = .below,
@@ -217,11 +288,14 @@ public struct NibBudPopover<Content: View>: View {
             let anchor = field?.anchorRect(source) ?? .zero
             let frame = proxy.frame(in: NibLiquid.space)
             let safe = proxy.safeAreaInsets
-            let bounds = CGRect(x: frame.minX + safe.leading, y: frame.minY + safe.top,
+            let safeBounds = CGRect(x: frame.minX + safe.leading, y: frame.minY + safe.top,
                                 width: max(0, frame.width - safe.leading - safe.trailing),
                                 height: max(0, frame.height - safe.top - safe.bottom))
+            let bounds = PopoverKeyboardViewport.available(in: safeBounds,
+                keyboard: keyboardFrame?.offsetBy(dx: frame.minX, dy: frame.minY))
             let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
-            let centre = placement.centre(size: size, beside: anchor, gap: gap, in: bounds)
+            let fitted = placement.fittedSize(size, beside: anchor, gap: gap, in: bounds)
+            let centre = placement.centre(size: fitted, beside: anchor, gap: gap, in: bounds)
             NibPopoverPanel(title: title, subtitle: subtitle, width: min(width, available.width),
                             maxHeight: available.height) { content }
                 .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
@@ -229,6 +303,7 @@ public struct NibBudPopover<Content: View>: View {
                 .budsFrom(source, isPresented: $isPresented)
                 .position(x: centre.x - frame.minX, y: centre.y - frame.minY)
         }
+        .background(PopoverKeyboardOcclusionReader(frame: $keyboardFrame))
         .allowsHitTesting(isPresented)
         .accessibilityHidden(!isPresented)
     }
@@ -270,6 +345,7 @@ public struct NibInspectorSection<Content: View>: View {
                     }
                     .buttonStyle(.plain)
                     .nibCommand(action.command)
+                    .nibNativeAction(action.handler)
                 }
             }
             content
@@ -641,5 +717,59 @@ public struct NibPluginPanelChrome<Content: View>: View {
         .frame(width: NibMetrics.panelWidth(typeSize))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "\(name) plugin", bundle: .module))
+    }
+}
+
+// Keep popover geometry and its UIKit reader together with their host.
+private enum PopoverKeyboardViewport {
+    static func available(in bounds: CGRect, keyboard: CGRect?) -> CGRect {
+        // UIKit can send an absent/invalid frame while moving a floating
+        // keyboard between scenes. It must not collapse every open popover.
+        guard let keyboard, !keyboard.isNull, !keyboard.isInfinite, !keyboard.isEmpty,
+              keyboard.minX.isFinite, keyboard.minY.isFinite,
+              keyboard.width.isFinite, keyboard.height.isFinite,
+              keyboard.intersects(bounds) else { return bounds }
+        return CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width,
+                      height: max(0, min(bounds.maxY, keyboard.minY) - bounds.minY))
+    }
+}
+
+/// Keyboard occlusion in the containing view's coordinates, including windowed iPad scenes.
+private struct PopoverKeyboardOcclusionReader: UIViewRepresentable {
+    @Binding var frame: CGRect?
+
+    func makeUIView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.changed = { frame = $0 }
+        return probe
+    }
+    func updateUIView(_ view: Probe, context: Context) { view.changed = { frame = $0 } }
+
+    final class Probe: UIView {
+        var changed: ((CGRect?) -> Void)?
+        private var screenFrame: CGRect?
+        private var reported: CGRect?
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            NotificationCenter.default.addObserver(self, selector: #selector(updateKeyboard(_:)),
+                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+            NotificationCenter.default.addObserver(self, selector: #selector(hideKeyboard(_:)),
+                name: UIResponder.keyboardWillHideNotification, object: nil)
+        }
+        required init?(coder: NSCoder) { nil }
+        override func layoutSubviews() { super.layoutSubviews(); report() }
+        @objc private func updateKeyboard(_ notification: Notification) {
+            screenFrame = (notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+            report()
+        }
+        @objc private func hideKeyboard(_ notification: Notification) { screenFrame = nil; report() }
+        private func report() {
+            guard let window else { return }
+            let next = screenFrame.map { convert(window.convert($0, from: window.screen.coordinateSpace), from: window) }
+            guard reported != next else { return }
+            reported = next
+            DispatchQueue.main.async { [weak self] in self?.changed?(next) }
+        }
     }
 }

@@ -118,7 +118,7 @@ struct ProviderListView: View {
                 }
                 if model.providers.isEmpty && !model.busy {
                     NibRow(String(localized: "Connect a model to use the assistant."),
-                           subtitle: String(localized: "Choose a hosted provider or a server you control."), icon: .assistant)
+                           subtitle: String(localized: "Use your Claude or ChatGPT subscription, or add another provider."), icon: .assistant)
                 }
                 NavigationLink {
                     ProviderEditorView(app: app)
