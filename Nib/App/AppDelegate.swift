@@ -35,7 +35,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 do {
                     try await UITestFixture.seed(app)
                     UITestFixture.isReady = true
-                    app.ui.activeNavigator?.showLibrary(folder: nil)
+                    if let shell = app.ui.activeNavigator as? ShellViewController {
+                        shell.showInitialScreen()
+                    } else {
+                        app.ui.activeNavigator?.showLibrary(folder: nil)
+                    }
                 } catch {
                     UITestFixture.failure = String(describing: error)
                 }

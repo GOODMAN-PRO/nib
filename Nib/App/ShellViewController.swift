@@ -59,6 +59,11 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
             Task { @MainActor in self?.toastIfActive(message) }
         }
+        showInitialScreen()
+    }
+
+    /// Re-evaluate first run after asynchronous fixture/library preparation finishes.
+    func showInitialScreen() {
         if NibUITestMode.isEnabled && !UITestFixture.isReady {
             display(FallbackEditorViewController(message: "Preparing test fixture…"))
         } else if let onboarding = app.ui.screens.onboarding?(app, self) {

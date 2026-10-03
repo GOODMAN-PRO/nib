@@ -41,7 +41,7 @@ enum UITestFixture {
                 }
             }
         }
-        app.settings.setJSON("onboarding.done", true)
+        app.settings.setJSON("onboarding.done", .bool(!ProcessInfo.processInfo.arguments.contains("-NibUITestOnboarding")))
         app.settings.set(NibSettings.stylusMode, .anyInput)
         app.settings.set(NibSettings.liquidMode, "off")
     }
@@ -69,6 +69,11 @@ enum UITestFixture {
         }
         let folder = try await run("folder.create", ["title": "Semester Notes"])
         _ = try await create("notebook", "Lecture notes", folder: folder["ref"]?.stringValue)
+        if ProcessInfo.processInfo.arguments.contains("-NibUITestAgent") {
+            // Only the model boundary is stubbed: the real agent, chat store, context
+            // collection and assistant UI still execute the complete production turn.
+            app.services.set(CaptureAgentProviderStore(), for: ServiceKeys.aiProviders)
+        }
         let scenario = NibUITestMode.scenario
         let physics = try await create("notebook", "Physics — Motion", pages: scenario.notebookPageCount)
         let paper = try page(physics)
@@ -125,5 +130,42 @@ enum UITestFixture {
                 }
             }
         }
+    }
+}
+
+/// Deterministic model boundary for the explicitly opted-in design tour. No network,
+/// credentials, production preferences or user subscription is used by this fixture.
+@MainActor
+private final class CaptureAgentProviderStore: AIProviderStore {
+    var configs = [AIProviderConfig(name: "Nib Agent (capture fixture)", kind: .nibHTTP,
+        baseURL: URL(string: "http://127.0.0.1:7332/")!, model: "claude-sonnet",
+        extraHeaders: ["X-Nib-Subscription": "1"])]
+    var activeID: UUID?
+    init() { activeID = configs.first?.id }
+    func save(_ config: AIProviderConfig, apiKey: String?) throws {
+        configs.removeAll { $0.id == config.id }; configs.append(config)
+    }
+    func delete(_ id: UUID) { configs.removeAll { $0.id == id } }
+    func provider(_ id: UUID?) -> AIProvider? {
+        configs.first { $0.id == (id ?? activeID) }.map(CaptureAgentProvider.init)
+    }
+}
+
+private final class CaptureAgentProvider: AIProvider {
+    let config: AIProviderConfig
+    init(config: AIProviderConfig) { self.config = config }
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.yield(.textDelta("Velocity is displacement per unit time. Acceleration is the change in velocity per unit time. Newton’s second law relates force, mass, and acceleration: F = ma."))
+            continuation.yield(.stop(reason: "end_turn"))
+            continuation.finish()
+        }
+    }
+    func listModels() async throws -> [String] { [config.model] }
+    func transcribe(audio: URL, language: String?) async throws -> [TranscriptSegment] {
+        throw NibError(.unsupported, "The capture agent does not transcribe audio")
+    }
+    func generateImage(prompt: String) async throws -> Data {
+        throw NibError(.unsupported, "The capture agent does not generate images")
     }
 }

@@ -342,11 +342,12 @@ final class DropletField {
         if e.reshape != .gathering { e.dyn.size.target = CGPoint(x: rect.width, y: rect.height) }
         e.dyn.corner.target = cornerTarget(e.style, rect.size)
         e.rest = rect
-        // Reduced-motion buds fade at their final position (§12). Their source and content
-        // measurements can settle after presentation; those corrections must not add a flight.
-        // An inactive scene has no display-link ticks to finish a FLIP. Apply its
-        // new layout immediately, including when Stage Manager resizes it in the background.
-        if !e.isDragging && (!isActive || (physicsOff && e.bud?.presented == true)) {
+        // Reduced-motion surfaces cross-fade at their new layout (§12), including
+        // docked palettes. Carrying the previous drag's FLIP offset into a changed
+        // axis translates the newly laid-out controls outside their dock. A parked
+        // display link (inking or an inactive scene) cannot finish that correction.
+        // The component owns the cross-fade; publish the final geometry atomically.
+        if !e.isDragging && (!isActive || physicsOff) {
             e.dyn.offset.snap(to: .zero)
             e.dyn.size.snap(to: CGPoint(x: rect.width, y: rect.height))
             e.dyn.corner.snap(to: cornerTarget(e.style, rect.size))
@@ -670,6 +671,15 @@ final class DropletField {
         e.dyn.lift.target = 1
         e.dyn.offset.target = .zero
         e.dyn.anchor.target = .zero
+        if physicsOff || !isActive {
+            // A rejected drop can keep exactly the same rest frame, so setRest
+            // will not run. Finish the reduced-motion release here as well as
+            // at relayout; hit targets must not retain the finger's transform.
+            e.dyn.offset.snap(to: .zero)
+            e.dyn.anchor.snap(to: .zero)
+            e.dyn.lift.snap(to: 1)
+            e.landing = nil
+        }
         entries[id] = e
         wake()
         return released

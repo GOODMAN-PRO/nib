@@ -10,8 +10,8 @@ enum ProviderPreset: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .claudeSubscription: return String(localized: "Claude — your subscription")
-        case .chatGPTSubscription: return String(localized: "ChatGPT — your subscription")
+        case .claudeSubscription: return String(localized: "Use my Claude subscription")
+        case .chatGPTSubscription: return String(localized: "Use my ChatGPT subscription")
         case .anthropic: return "Anthropic"
         case .openAI: return "OpenAI"
         case .openRouter: return "OpenRouter"
