@@ -285,6 +285,7 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var recent: [String] = []
     @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 412)
     @State private var moreSize = CGSize(width: NibMetrics.popoverWidth, height: 124)
+    @State private var keyboardFrame: CGRect?
     /// A released drag on its way to its dock: the one plip plays when it arrives (DESIGN.md §10.11).
     @State private var landing: DockLanding?
     /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
@@ -487,7 +488,7 @@ public struct NibToolPalette<Settings: View>: View {
             let origin = NibGeometry.point(proxy.frame(in: NibLiquid.space).origin)
             let d = current
             let c = centre(d, in: r)
-            let bounds = CGRect(origin: .zero, size: proxy.size)
+            let bounds = NibKeyboardViewport.available(in: CGRect(origin: .zero, size: proxy.size), keyboard: keyboardFrame)
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
@@ -526,6 +527,7 @@ public struct NibToolPalette<Settings: View>: View {
                 }
             }
             .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
+            .background(NibKeyboardOcclusionReader(frame: $keyboardFrame))
             .onChange(of: AnchorKey(dock: d, slots: map), initial: true) { _, key in
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
@@ -717,7 +719,8 @@ public struct NibToolPalette<Settings: View>: View {
     private func popover(for tool: NibTool, anchor: CGRect, placement: NibBudPlacement, bounds: CGRect) -> some View {
         let gap = compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
         let width = popoverWidth(bounds)
-        return NibPopoverPanel(title: tool.label, width: width) { settings(tool.id) }
+        let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
+        return NibPopoverPanel(title: tool.label, width: min(width, available.width), maxHeight: available.height) { settings(tool.id) }
             .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
                 // Native glass rounds fractional sizes during placement. Do not feed that
                 // subpixel noise back into the placement cache and start another layout pass.
@@ -732,7 +735,9 @@ public struct NibToolPalette<Settings: View>: View {
 
     private func moreGrid(_ tools: [NibTool], anchor: CGRect, placement: NibBudPlacement, bounds: CGRect) -> some View {
         let gap = compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
-        return NibPopoverPanel(title: String(localized: "More tools", bundle: .module), width: NibMetrics.popoverWidth) {
+        let available = placement.availableSize(beside: anchor, gap: gap, in: bounds)
+        return NibPopoverPanel(title: String(localized: "More tools", bundle: .module),
+                               width: min(NibMetrics.popoverWidth, available.width), maxHeight: available.height) {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6) {
                 ForEach(tools) { tool in
                     Button {

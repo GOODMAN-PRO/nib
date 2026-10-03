@@ -112,6 +112,15 @@ final class FakePlaybackEngine: PlaybackEngine {
 
 @MainActor
 final class FeatAudioTests: XCTestCase {
+    func testRecordingRenameInputKeepsAccessibleNameWithExistingTitle() throws {
+        let prompt = AudioRenamePrompt(isPresented: .constant(true), text: .constant("Recording 1"), confirm: {})
+        let controller = AudioRenamePrompt.Controller(prompt: prompt)
+        let field = try XCTUnwrap(controller.makeAlert().textFields?.first)
+        XCTAssertEqual(field.text, "Recording 1")
+        XCTAssertEqual(field.accessibilityLabel, "Name")
+        XCTAssertEqual(field.accessibilityIdentifier, "Name")
+    }
+
     private let fixtureClip = "audio:FIXTUREDOC01/FIXTUREAUD01"
     private let fixtureDoc = "doc:FIXTUREDOC01"
 

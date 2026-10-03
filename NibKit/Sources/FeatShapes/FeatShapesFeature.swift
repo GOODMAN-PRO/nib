@@ -69,7 +69,7 @@ enum ShapeSettings {
     /// "#RRGGBB" fill for new closed shapes; empty = no fill.
     static let fill = SettingKey("shapes.fill", default: "", synced: true)
     static let fillOpacity = SettingKey("shapes.fillOpacity", default: 0.35, synced: true)
-    static let cornerRadius = SettingKey("shapes.cornerRadius", default: 6.0, synced: true)
+    static let cornerRadius = SettingKey("shapes.cornerRadius", default: 0.0, synced: true)
     static let outline = SettingKey("shapes.outline", default: true, synced: true)
 
     static func declare(_ s: SettingsStore, owner: String) {

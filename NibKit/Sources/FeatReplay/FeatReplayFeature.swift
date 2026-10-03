@@ -105,6 +105,13 @@ struct ReplayOptionsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.l) {
+                HStack {
+                    Text(String(localized: "Note Replay")).font(NibFont.headline)
+                    Spacer()
+                    NibButton(String(localized: "Done"), kind: .plain) {
+                        app.perform(CommandIDs.panelClose, ["id": "replay.options"], session: session)
+                    }
+                }
                 NibToggle(String(localized: "Replay handwriting"), isOn: binding(\.enabled, param: "enabled"))
                 VStack(spacing: NibSpacing.xs) {
                     ForEach(ReplayMode.allCases, id: \.self) { mode in

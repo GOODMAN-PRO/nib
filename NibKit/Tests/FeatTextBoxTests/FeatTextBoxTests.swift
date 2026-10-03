@@ -651,6 +651,41 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testTypingAfterInlineImageDoesNotInheritTheAttachment() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        editor.beginNewBox(page: Fixtures.page2, at: Point(100, 100))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        let image = NSTextAttachment()
+        tv.attributedText = NSAttributedString(attachment: image)
+        tv.selectedRange = NSRange(location: 1, length: 0)
+        tv.typingAttributes[.attachment] = image
+        editor.textViewDidChangeSelection(tv)
+        XCTAssertNil(tv.typingAttributes[.attachment])
+        typeText(" plain", into: tv, editor)
+        XCTAssertEqual(tv.text, "\u{FFFC} plain")
+        XCTAssertNotNil(tv.textStorage.attribute(.attachment, at: 0, effectiveRange: nil))
+        XCTAssertNil(tv.textStorage.attribute(.attachment, at: 1, effectiveRange: nil))
+        editor.detach(from: host)
+        await editor.flush()
+    }
+
+    func testTypingAfterExitingNestedListRemainsPlain() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        editor.beginNewBox(page: Fixtures.page2, at: Point(100, 100))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        for character in "- first\n\tnested\n" { typeText(String(character), into: tv, editor) }
+        XCTAssertTrue(editor.indent(outdent: true))
+        for character in "last\n\nplain" { typeText(String(character), into: tv, editor) }
+        let paragraphs = editor.currentRichText().paragraphs
+        XCTAssertEqual(paragraphs.map(\.plainText), ["first", "nested", "last", "plain"])
+        XCTAssertEqual(paragraphs.map(\.list), [.bullet, .bullet, .bullet, .plain])
+        XCTAssertEqual(paragraphs.map(\.indent), [0, 1, 0, 0])
+        editor.detach(from: host)
+        await editor.flush()
+    }
+
     func testTheSessionFollowsTheTextBeingEdited() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let (host, editor) = self.editor(h)
@@ -754,6 +789,8 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertEqual(floating.anchors[TextPopoverIDs.source], more.bounds)
         XCTAssertTrue(st.popover.isPresented)
         XCTAssertGreaterThanOrEqual(st.popover.contentHeight, TextFormatPopover.minimumHeight)
+        XCTAssertLessThan(st.popover.viewportHeight, floating.offset,
+                          "The inspector's usable viewport must end above its keyboard accessory anchor")
         st.popover.isPresented = false   // a tap outside
         editor.presentInspector(from: more)
         XCTAssertEqual(floating.presented, [TextPopoverIDs.popover], "the popover is presented once per editing session")
@@ -805,6 +842,12 @@ final class FeatTextBoxTests: XCTestCase {
             XCTAssertTrue(choice.isSelected(in: state.model.state))
             state.popover.isPresented = false
         }
+        let styleButton = try XCTUnwrap(buttons(bar).first { $0.accessibilityLabel == "Text Style" })
+        XCTAssertFalse(styleButton.showsMenuAsPrimaryAction)
+        styleButton.sendActions(for: .primaryActionTriggered)
+        XCTAssertTrue(state.popover.isPresented)
+        XCTAssertEqual(state.popover.panel, .styles)
+        state.popover.isPresented = false
         state.model.indent(1)
         editor.endEditing()
         await editor.flush()
