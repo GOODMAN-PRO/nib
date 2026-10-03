@@ -755,7 +755,7 @@ enum TextPopoverIDs {
 /// Paragraph pickers use the same above-keyboard presentation as More. Native UIButton menus
 /// in an input accessory can be positioned underneath the keyboard's separate window.
 enum TextFormatPanel {
-    case inspector, alignment, list, lineSpacing
+    case inspector, alignment, list, lineSpacing, styles
 
     var title: String {
         switch self {
@@ -763,12 +763,13 @@ enum TextFormatPanel {
         case .alignment: return String(localized: "Alignment")
         case .list: return String(localized: "List")
         case .lineSpacing: return String(localized: "Line Spacing")
+        case .styles: return String(localized: "Text Style")
         }
     }
 
     var choices: [TextParagraphChoice] {
         switch self {
-        case .inspector: return []
+        case .inspector, .styles: return []
         case .alignment: return TextFormatOptions.alignments.map(TextParagraphChoice.alignment)
         case .list: return ListKind.allCases.map(TextParagraphChoice.list)
         case .lineSpacing: return LineSpacingOption.allCases.map(TextParagraphChoice.spacing)
@@ -812,6 +813,25 @@ struct TextFormatPanelContent: View {
     var body: some View {
         if panel == .inspector {
             TextFormatInspector(model: model)
+        } else if panel == .styles {
+            VStack(alignment: .leading, spacing: NibSpacing.xs) {
+                ForEach(TextPresets.ids, id: \.self) { id in
+                    NibButton(TextPresets.title(id), kind: .plain) {
+                        model.applyPreset(id)
+                        onChoose()
+                    }
+                }
+                ForEach(model.styleNames, id: \.self) { name in
+                    NibButton(name, kind: .plain) {
+                        model.applyNamed(name)
+                        onChoose()
+                    }
+                }
+                NibButton(String(localized: "Set as Default for New Text"), kind: .plain) {
+                    model.saveAsDefault()
+                    onChoose()
+                }
+            }
         } else {
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 ForEach(panel.choices, id: \.self) { choice in
@@ -836,6 +856,8 @@ final class TextPopoverState: ObservableObject {
     }
     /// Available content height above the keyboard; the editor uses this budget to select its presentation.
     @Published var contentHeight: CGFloat = NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight
+    /// The usable window ends above the accessory, even when the floating host ignores keyboard safe areas.
+    @Published var viewportHeight: CGFloat = NibMetrics.popoverMaxHeight
     var onClose: (() -> Void)?
 }
 
@@ -857,6 +879,8 @@ struct TextFormatPopover: View {
             // here traps edge drags in the outer panel and strands the lower box controls.
             TextFormatPanelContent(panel: state.panel, model: model) { state.isPresented = false }
         }
+        .frame(height: state.viewportHeight)
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -1138,7 +1162,6 @@ final class TextKeyboardBar: UIInputView {
     private let scroll = UIScrollView()
     private let stack = UIStackView()
     private var toggles: [TextBoxEditor.Toggle: UIButton] = [:]
-    private var styleButton: UIButton?
     private var fontButton: UIButton?
     private var smallerButton: UIButton?
     private var largerButton: UIButton?
@@ -1155,7 +1178,6 @@ final class TextKeyboardBar: UIInputView {
         allowsSelfSizing = true
         build()
         model.$state.sink { [weak self] s in self?.update(s) }.store(in: &cancellables)
-        model.$styleNames.sink { [weak self] _ in self?.updateStyleMenu() }.store(in: &cancellables)
     }
 
     required init?(coder: NSCoder) {
@@ -1173,8 +1195,7 @@ final class TextKeyboardBar: UIInputView {
         scroll.addSubview(stack)
 
         let style = button(symbol: .text, label: String(localized: "Text Style"))
-        style.showsMenuAsPrimaryAction = true
-        styleButton = style
+        routeParagraphButton(style, to: .styles)
         let font = button(title: model.state.family, label: String(localized: "Font"))
         font.showsMenuAsPrimaryAction = true
         fontButton = font
@@ -1240,7 +1261,6 @@ final class TextKeyboardBar: UIInputView {
             stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)
         ])
         update(model.state)
-        updateStyleMenu()
     }
 
     private func button(symbol: NibSymbol? = nil, title: String? = nil, label: String,
@@ -1334,18 +1354,4 @@ final class TextKeyboardBar: UIInputView {
         }, for: .primaryActionTriggered)
     }
 
-    private func updateStyleMenu() {
-        let presets = TextPresets.ids.map { id in
-            UIAction(title: TextPresets.title(id)) { [weak self] _ in self?.model.applyPreset(id) }
-        }
-        let named = model.styleNames.map { name in
-            UIAction(title: name) { [weak self] _ in self?.model.applyNamed(name) }
-        }
-        var children: [UIMenuElement] = [UIMenu(options: .displayInline, children: presets)]
-        if !named.isEmpty { children.append(UIMenu(options: .displayInline, children: named)) }
-        children.append(UIAction(title: String(localized: "Set as Default for New Text")) { [weak self] _ in
-            self?.model.saveAsDefault()
-        })
-        styleButton?.menu = UIMenu(children: children)
-    }
 }

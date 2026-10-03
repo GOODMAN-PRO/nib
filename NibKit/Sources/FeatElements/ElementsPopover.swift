@@ -968,15 +968,21 @@ struct ElementsCollectionBar: View {
 
     var body: some View {
         HStack(spacing: NibSpacing.xs) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NibSpacing.s) {
-                    ForEach(model.collections) { c in
-                        NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
-                            .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
-                            .accessibilityValue(ElementCopy.count(c.count))
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: NibSpacing.s) {
+                        ForEach(model.collections) { c in
+                            NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
+                                .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
+                                .accessibilityValue(ElementCopy.count(c.count))
+                                .id(c.id)
+                        }
                     }
+                    .padding(.vertical, NibSpacing.s)
                 }
-                .padding(.vertical, NibSpacing.s)                 // the chips' 44 pt hit areas stay inside the scroller
+                // Creating, importing, or reopening a collection must keep its selected tab in reach.
+                .onChange(of: model.current, initial: true) { _, current in proxy.scrollTo(current, anchor: .center) }
+                .onChange(of: model.collections.map(\.id)) { _, _ in proxy.scrollTo(model.current, anchor: .center) }
             }
             NibIconButton(.plus, label: String(localized: "New Collection"), size: .panel) { model.ask(.newCollection) }
             Menu {

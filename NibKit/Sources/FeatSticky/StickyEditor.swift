@@ -369,6 +369,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     /// Writes run one after another: a placed note's create, then its text saves, then closing the overlay.
     private var writes: Task<Void, Never>?
     private var pendingWrites = 0
+    private var keyboardAvoidance: NibTextKeyboardAvoidance?
 
     private init(host: CanvasHost) {
         self.host = host
@@ -480,6 +481,9 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
             .sink { _ in finish() }.store(in: &observers)
 
+        if let scroll = host.canvasView as? UIScrollView {
+            keyboardAvoidance = NibTextKeyboardAvoidance(textView: view.textView, scrollView: scroll)
+        }
         view.textView.becomeFirstResponder()
         view.textView.selectedRange = NSRange(location: view.textView.attributedText.length, length: 0)
         publishRange(view.textView)
@@ -498,6 +502,8 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             autosave = nil
         }
         editing = nil
+        keyboardAvoidance?.stop()
+        keyboardAvoidance = nil
         observers.removeAll()
         e.view.textView.delegate = nil
         e.view.textView.onDone = nil
@@ -587,6 +593,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     }
 
     func textViewDidChangeSelection(_ textView: UITextView) {
+        keyboardAvoidance?.revealCaret()
         publishRange(textView)
     }
 

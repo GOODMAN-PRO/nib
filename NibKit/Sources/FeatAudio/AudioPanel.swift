@@ -45,11 +45,7 @@ struct AudioPanelView: View {
         }
         .onAppear { model.start() }
         .onDisappear { model.stop() }
-        .alert(String(localized: "Rename Recording"), isPresented: $renameShown) {
-            TextField(String(localized: "Name"), text: $renameText)
-            Button(String(localized: "Rename")) { commitRename() }
-            Button(String(localized: "Cancel"), role: .cancel) { renaming = nil }
-        }
+        .background(AudioRenamePrompt(isPresented: $renameShown, text: $renameText, confirm: commitRename))
         .confirmationDialog(confirming?.title ?? "", isPresented: confirmBinding, titleVisibility: .visible,
                             presenting: confirming) { pending in
             Button(pending.button, role: .destructive) { execute(pending.command, pending.params) }
@@ -276,6 +272,72 @@ struct AudioPanelView: View {
 
     private var confirmBinding: Binding<Bool> {
         Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })
+    }
+}
+
+/// A native alert whose input keeps its accessible name after the placeholder is replaced.
+struct AudioRenamePrompt: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
+    @Binding var text: String
+    let confirm: () -> Void
+
+    func makeUIViewController(context: Context) -> Controller { Controller(prompt: self) }
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.prompt = self
+        controller.updatePrompt()
+    }
+    static func dismantleUIViewController(_ controller: Controller, coordinator: ()) {
+        controller.alert?.dismiss(animated: false)
+    }
+
+    final class Controller: UIViewController {
+        var prompt: AudioRenamePrompt
+        weak var alert: UIAlertController?
+        init(prompt: AudioRenamePrompt) {
+            self.prompt = prompt
+            super.init(nibName: nil, bundle: nil)
+        }
+        required init?(coder: NSCoder) { nil }
+        override func loadView() { view = UIView(); view.isUserInteractionEnabled = false }
+        override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); updatePrompt() }
+
+        func makeAlert() -> UIAlertController {
+            let dialog = UIAlertController(title: String(localized: "Rename Recording"), message: nil,
+                                           preferredStyle: .alert)
+            dialog.addTextField { [prompt] field in
+                field.text = prompt.text
+                field.placeholder = String(localized: "Name")
+                field.accessibilityLabel = String(localized: "Name")
+                field.accessibilityIdentifier = "Name"
+            }
+            dialog.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { [weak self] _ in
+                self?.alert = nil
+                self?.prompt.isPresented = false
+            })
+            dialog.addAction(UIAlertAction(title: String(localized: "Rename"), style: .default) { [weak self, weak dialog] _ in
+                guard let self else { return }
+                prompt.text = dialog?.textFields?.first?.text ?? ""
+                alert = nil
+                prompt.isPresented = false
+                prompt.confirm()
+            })
+            return dialog
+        }
+
+        func updatePrompt() {
+            guard prompt.isPresented else {
+                alert?.dismiss(animated: true)
+                alert = nil
+                return
+            }
+            guard viewIfLoaded?.window != nil, alert == nil else { return }
+            let dialog = makeAlert()
+            alert = dialog
+            var presenter: UIViewController = self
+            while let parent = presenter.parent { presenter = parent }
+            while let presented = presenter.presentedViewController { presenter = presented }
+            presenter.present(dialog, animated: true)
+        }
     }
 }
 
@@ -604,10 +666,10 @@ struct AudioPlaybackBar: View {
                           size: .bar) {
                 toggle(clips, loaded: loaded)
             }
-            NibSlider(value: positionBinding(timeline, loaded: loaded), in: 0...max(timeline.total, 0.01),
-                      label: String(localized: "Playback position"), detents: timeline.markPositions)
+            NibTimelineSlider(value: positionBinding(timeline, loaded: loaded), in: 0...max(timeline.total, 0.01),
+                      label: String(localized: "Playback position"),
+                      spokenValue: String(localized: "\(AudioText.spoken(current)) of \(AudioText.spoken(timeline.total))"))
                 .overlay { ClipStartMarks(fractions: timeline.marks) }
-                .accessibilityValue(String(localized: "\(AudioText.spoken(current)) of \(AudioText.spoken(timeline.total))"))
             NibHUDText(AudioText.clock(current), secondary: "/ " + AudioText.clock(timeline.total))
                 .accessibilityHidden(true)
             optionsMenu(settings, timeline: timeline, loaded: loaded)

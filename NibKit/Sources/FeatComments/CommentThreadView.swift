@@ -528,7 +528,9 @@ struct CommentThreadView: View {
                 .font(NibFont.caption1Emphasis)
                 .foregroundStyle(NibColor.labelSecondary)
             if isEditing {
-                NibField(text: $editText, prompt: String(localized: "Message"), lines: 1...8)
+                NibField(text: $editText, prompt: String(localized: "Message"), lines: 1...8,
+                         accessibilityName: String(localized: "Message"))
+                    .accessibilityLabel(String(localized: "Message"))
                     .onKeyPress(.return, phases: .down) { press in
                         guard press.modifiers.contains(.command) else { return .ignored }
                         saveEdit(message.id)

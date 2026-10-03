@@ -593,6 +593,10 @@ final class PhotosPickerSession: NSObject, PHPickerViewControllerDelegate, UIAda
         config.selectionLimit = limit
         config.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: config)
+        // The Photos sidebar and its navigation bar can overlap in a form sheet
+        // presented from an object popover. Give the system picker the scene's
+        // full width so Cancel and the photo grid remain independently reachable.
+        picker.modalPresentationStyle = .fullScreen
         picker.delegate = self
         return await withCheckedContinuation { c in
             continuation = c
