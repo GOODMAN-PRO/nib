@@ -19,7 +19,7 @@ public struct NibButton: View {
     public enum Kind: Sendable {
         case primary, secondary, destructive, plain
         /// v2: `destructive` text with no fill, for a destructive action that is not the surface's button row (the
-        /// eraser's "Clear Page", always followed by a system confirmation).
+        /// eraser's "Clear Page", always followed by an explicit confirmation).
         case destructivePlain
     }
 

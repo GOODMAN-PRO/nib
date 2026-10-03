@@ -211,12 +211,9 @@ struct EraserSettingsView: View {
                 confirmingClear = true
             }
             .disabled(session.document == nil || session.page == nil || session.readOnly)
-            // An iPad confirmationDialog hides Cancel and relies on outside taps while another
-            // popover (the retained eraser settings bud) already owns outside dismissal. Use a
-            // system alert so cancellation is an explicit, accessible action on every device.
         }
         .background(ClearPageConfirmation(isPresented: $confirmingClear, clear: clearPage))
-        .onDisappear { model.flushSizeWrite() }
+        .onDisappear { confirmingClear = false; model.flushSizeWrite() }
     }
 
     private func clearPage() {
@@ -225,16 +222,16 @@ struct EraserSettingsView: View {
     }
 }
 
-/// Keep the native alert outside the moving bud's SwiftUI presentation modifiers.
-/// The controller waits for window attachment, and dismissal clears the binding
-/// even when the presenting editor is dismissed programmatically.
-private struct ClearPageConfirmation: UIViewControllerRepresentable {
+/// Mount above the moving bud, directly in the editor. Child containment and window attachment work in
+/// package tests too, where UIKit has no application in which to complete a modal presentation.
+struct ClearPageConfirmation: UIViewControllerRepresentable {
     @Binding var isPresented: Bool
     let clear: () -> Void
 
     func makeUIViewController(context: Context) -> Presenter { Presenter() }
     func updateUIViewController(_ controller: Presenter, context: Context) {
-        controller.requested = isPresented
+        guard isPresented else { controller.tearDown(); return }
+        controller.requested = true
         controller.dismissed = { isPresented = false }
         controller.clear = clear
         controller.schedulePresentation()
@@ -245,9 +242,9 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
 
     final class Presenter: UIViewController {
         var requested = false
-        var dismissed: () -> Void = {}
-        var clear: () -> Void = {}
-        private weak var alert: ConfirmationAlert?
+        var dismissed: (() -> Void)?
+        var clear: (() -> Void)?
+        private var panel: NibConfirmationPanel?
         private var appeared = false
 
         override func loadView() {
@@ -264,69 +261,59 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
         override func viewDidDisappear(_ animated: Bool) {
             super.viewDidDisappear(animated)
             appeared = false
+            finish(confirmed: false)
         }
         func tearDown() {
             requested = false
-            let prompt = alert
-            alert = nil
-            prompt?.finish()
-            prompt?.dismiss(animated: false)
-            dismissed = {}
-            clear = {}
+            panel?.invalidate()
+            panel?.removeFromSuperview()
+            panel = nil
+            dismissed = nil
+            clear = nil
+        }
+        private func finish(confirmed: Bool) {
+            let action = confirmed ? clear : nil
+            // Native glass can host the same settings content more than once. Finish every bridge in
+            // this editor together, so its retained copy cannot reopen a second prompt after Cancel.
+            var owner: UIViewController = self
+            while let parent = owner.parent { owner = parent }
+            func close(_ controller: UIViewController) {
+                if let presenter = controller as? Presenter {
+                    let dismiss = presenter.dismissed
+                    presenter.tearDown()
+                    dismiss?()
+                }
+                for child in controller.children { close(child) }
+            }
+            close(owner)
+            action?()
         }
         func schedulePresentation() {
             DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
         }
         private func updatePresentation() {
-            guard requested else {
-                alert?.dismiss(animated: false)
-                return
-            }
-            // Window attachment precedes the hosting controller's appearance.
-            // Wait for the editor's own appearance and transition to complete.
-            guard appeared, alert == nil, let window = viewIfLoaded?.window else { return }
+            guard requested, appeared, panel == nil, viewIfLoaded?.window != nil else { return }
             var owner: UIViewController = self
             while let parent = owner.parent { owner = parent }
-            guard owner.presentedViewController == nil, !owner.isBeingDismissed else { return }
-            if let transition = owner.transitionCoordinator {
-                transition.animate(alongsideTransition: nil) { [weak self] _ in self?.schedulePresentation() }
-                return
-            }
-            let prompt = ConfirmationAlert(title: String(localized: "Clear this page?"),
+            // SwiftUI owns the hosting view's subviews and may replace them during a glass update.
+            // Keep this editor-owned overlay above that view in its existing container instead.
+            guard let container = owner.view.superview,
+                  !container.subviews.contains(where: { $0 is NibConfirmationPanel }) else { return }
+            let prompt = NibConfirmationPanel(title: String(localized: "Clear this page?"),
                 message: String(localized: "Everything on this page is removed. You can undo this."),
-                preferredStyle: .alert)
-            prompt.finished = { [weak self] in
-                guard let self else { return }
-                self.requested = false
-                self.alert = nil
-                self.dismissed()
-            }
-            prompt.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { [weak prompt] _ in
-                prompt?.finish()
-            })
-            prompt.addAction(UIAlertAction(title: String(localized: "Clear Page"), style: .destructive) { [weak self, weak prompt] _ in
-                prompt?.finish()
-                self?.clear()
-            })
-            // A visible secondary window can still be non-key (for example after
-            // another document held keyboard focus). System alerts need a key
-            // presenting window to attach their actions and complete transitions.
-            if !window.isKeyWindow { window.makeKeyAndVisible() }
-            alert = prompt
-            owner.present(prompt, animated: window.windowScene?.activationState == .foregroundActive)
-        }
-    }
-
-    final class ConfirmationAlert: UIAlertController {
-        var finished: (() -> Void)?
-        func finish() {
-            let callback = finished
-            finished = nil
-            callback?()
-        }
-        override func viewDidDisappear(_ animated: Bool) {
-            super.viewDidDisappear(animated)
-            finish()
+                confirmTitle: String(localized: "Clear Page")) { [weak self] confirmed in
+                    self?.finish(confirmed: confirmed)
+                }
+            prompt.accessibilityIdentifier = "eraser.clearPage.confirmation"
+            prompt.traitOverrides.preferredContentSizeCategory = traitCollection.preferredContentSizeCategory
+            prompt.traitOverrides.userInterfaceStyle = traitCollection.userInterfaceStyle
+            prompt.traitOverrides.accessibilityContrast = traitCollection.accessibilityContrast
+            prompt.frame = owner.view.convert(owner.view.bounds, to: container)
+            prompt.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            container.addSubview(prompt)
+            panel = prompt
+            prompt.becomeFirstResponder()
+            UIAccessibility.post(notification: .screenChanged, argument: prompt)
         }
     }
 }

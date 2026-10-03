@@ -270,36 +270,145 @@ final class FeatEraserTests: XCTestCase {
             window.isHidden = true
             window.rootViewController = nil
         }
-        func presentedAlert(_ controller: UIViewController) -> UIAlertController? {
-            if let alert = controller as? UIAlertController { return alert }
-            if let presented = controller.presentedViewController,
-               let alert = presentedAlert(presented) { return alert }
-            return controller.children.lazy.compactMap { presentedAlert($0) }.first
-        }
         host.view.layoutIfNeeded()
-        await eventually { presentedAlert(host) != nil }
-        let alert = try XCTUnwrap(presentedAlert(host))
-        await eventually { alert.view.window === window && !alert.isBeingPresented }
-        XCTAssertEqual(alert.preferredStyle, .alert,
-                       "An iPad action sheet hides Cancel and leaves this nested prompt dependent on outside dismissal")
-        let cancel = try XCTUnwrap(alert.actions.first { $0.style == .cancel })
-        XCTAssertEqual(cancel.title, "Cancel")
+        await eventually { self.confirmation(in: window) != nil }
+        let panel = try XCTUnwrap(confirmation(in: window))
+        panel.layoutIfNeeded()
+        XCTAssertNil(host.presentedViewController, "Confirmation must render without a modal UIKit presentation")
+        XCTAssertTrue(panel.accessibilityViewIsModal, "VoiceOver must stay inside the confirmation")
+        let cancel = try confirmationButton("confirmation.cancel", in: panel)
+        let clear = try confirmationButton("confirmation.confirm", in: panel)
+        XCTAssertEqual(cancel.titleLabel?.text, "Cancel")
         XCTAssertTrue(cancel.isEnabled)
-        XCTAssertEqual(alert.actions.filter { $0.style == .destructive }.map(\.title), ["Clear Page"])
-        alert.view.layoutIfNeeded()
-        func cancelLabels(_ view: UIView) -> [UILabel] {
-            if let label = view as? UILabel, label.text == "Cancel" { return [label] }
-            return view.subviews.flatMap(cancelLabels)
-        }
-        XCTAssertTrue(cancelLabels(alert.view).contains {
-            !$0.isHidden && $0.alpha > 0 && !$0.bounds.isEmpty && $0.window === window
-        }, "Cancel must actually be rendered, not only registered as an action suppressed by an iPad popover")
+        XCTAssertEqual(clear.titleLabel?.text, "Clear Page")
+        XCTAssertTrue(clear.isEnabled)
+        XCTAssertEqual(clear.configuration?.baseForegroundColor, NibUIColor.destructive)
+        assertRendered(cancel, in: window)
+        assertRendered(clear, in: window)
         XCTAssertEqual(try h.snapshot(), before, "Opening confirmation must not clear any items")
-        host.dismiss(animated: false)
-        await eventually { presentedAlert(host) == nil }
-        XCTAssertNil(presentedAlert(host), "Dismissing confirmation must release the editor")
+        cancel.sendActions(for: .touchUpInside)
+        await eventually { self.confirmation(in: window) == nil }
+        XCTAssertNil(confirmation(in: window), "Dismissing confirmation must release the editor")
+        XCTAssertNil(panel.superview)
+        XCTAssertNil(panel.window)
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "Dismissal must not create an edit or undo entry")
+    }
+
+    private func confirmation(in view: UIView) -> NibConfirmationPanel? {
+        if let panel = view as? NibConfirmationPanel { return panel }
+        return view.subviews.lazy.compactMap { self.confirmation(in: $0) }.first
+    }
+
+    private func confirmationButton(_ identifier: String, in view: UIView) throws -> UIButton {
+        func buttons(_ view: UIView) -> [UIButton] {
+            (view as? UIButton).map { [$0] } ?? view.subviews.flatMap(buttons)
+        }
+        return try XCTUnwrap(buttons(view).first { $0.accessibilityIdentifier == identifier })
+    }
+
+    private func assertRendered(_ button: UIButton, in window: UIWindow,
+                                file: StaticString = #filePath, line: UInt = #line) {
+        button.layoutIfNeeded()
+        let label = button.titleLabel
+        XCTAssertTrue(label.map {
+            !$0.isHidden && $0.alpha > 0 && !$0.bounds.isEmpty && $0.window === window
+        } ?? false, "The action must actually be rendered, not only registered", file: file, line: line)
+        let rect = button.convert(button.bounds, to: window)
+        XCTAssertTrue(window.bounds.contains(rect), "The entire action must be visible", file: file, line: line)
+        let hit = window.hitTest(CGPoint(x: rect.midX, y: rect.midY), with: nil)
+        XCTAssertTrue(hit === button || hit?.isDescendant(of: button) == true,
+                      "The visible action must receive taps, got \(String(describing: hit))", file: file, line: line)
+        XCTAssertGreaterThanOrEqual(button.bounds.height, NibMetrics.hitTarget, file: file, line: line)
+    }
+
+    func testClearPageConfirmationRendersInCompactAndAccessibleLayoutsAndClearsOnce() async throws {
+        let layouts: [(String, CGSize, UIContentSizeCategory, UIUserInterfaceStyle, UIAccessibilityContrast)] = [
+            ("Compact", CGSize(width: 390, height: 844), .large, .light, .normal),
+            ("Light", CGSize(width: 1376, height: 1032), .large, .light, .normal),
+            ("Dark", CGSize(width: 1376, height: 1032), .large, .dark, .normal),
+            ("Increase Contrast", CGSize(width: 1376, height: 1032), .large, .light, .high),
+            ("AX3", CGSize(width: 1376, height: 1032), .accessibilityExtraExtraExtraLarge, .light, .normal)
+        ]
+        for (name, size, category, style, contrast) in layouts {
+            let h = Harness(features: [FeatEraserFeature.self])
+            let before = try h.snapshot()
+            let host = UIHostingController(rootView: EraserSettingsView(app: h.app, session: h.session,
+                                                                        confirmingClear: true))
+            host.traitOverrides.preferredContentSizeCategory = category
+            let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+            window.traitOverrides.userInterfaceStyle = style
+            window.traitOverrides.accessibilityContrast = contrast
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.layoutIfNeeded()
+            await eventually { self.confirmation(in: window) != nil }
+            let panel = try XCTUnwrap(confirmation(in: window))
+            panel.layoutIfNeeded()
+            let cancel = try confirmationButton("confirmation.cancel", in: panel)
+            let clear = try confirmationButton("confirmation.confirm", in: panel)
+            assertRendered(cancel, in: window)
+            assertRendered(clear, in: window)
+            let buttonFont = UIFont.systemFont(ofSize: NibUIFont.button.pointSize, weight: .semibold)
+            let expectedButtonSize = UIFontMetrics(forTextStyle: .subheadline)
+                .scaledFont(for: buttonFont, compatibleWith: panel.traitCollection).pointSize
+            XCTAssertEqual(cancel.titleLabel?.font.pointSize ?? 0, expectedButtonSize, accuracy: 0.5)
+            XCTAssertEqual(clear.titleLabel?.font.pointSize ?? 0, expectedButtonSize, accuracy: 0.5)
+            let snapshot = UIGraphicsImageRenderer(bounds: window.bounds).image { window.layer.render(in: $0.cgContext) }
+            let attachment = XCTAttachment(image: snapshot)
+            attachment.name = "Clear Page confirmation - " + name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            XCTAssertEqual(try h.snapshot(), before)
+            clear.sendActions(for: .touchUpInside)
+            clear.sendActions(for: .touchUpInside)
+            await eventually { (try? self.items(h).isEmpty) == true }
+            XCTAssertNil(confirmation(in: window))
+            XCTAssertNil(panel.window)
+            XCTAssertTrue(try items(h).isEmpty)
+            XCTAssertNotNil(try h.app.workspace.content(Fixtures.docID).livePages.first { $0.id == Fixtures.page1 })
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+        }
+    }
+
+    func testClearPageConfirmationReleasesEditorCallbacksOnEveryExit() async throws {
+        for exit in ["confirmation.cancel", "confirmation.confirm", "escape", "disappear", "dismantle"] {
+            let presenter = ClearPageConfirmation.Presenter()
+            var editor: UIViewController? = UIViewController()
+            weak var retainedEditor = editor
+            presenter.requested = true
+            presenter.clear = { [editor] in _ = editor?.view }
+            presenter.dismissed = { [editor] in _ = editor?.view }
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+            editor?.addChild(presenter)
+            editor?.view.addSubview(presenter.view)
+            presenter.didMove(toParent: editor)
+            window.rootViewController = editor
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            presenter.schedulePresentation()
+            await eventually { self.confirmation(in: window) != nil }
+            let panel = try XCTUnwrap(confirmation(in: window))
+            switch exit {
+            case "escape": XCTAssertTrue(panel.accessibilityPerformEscape())
+            case "disappear":
+                presenter.beginAppearanceTransition(false, animated: false)
+                presenter.endAppearanceTransition()
+            case "dismantle": ClearPageConfirmation.dismantleUIViewController(presenter, coordinator: ())
+            default: try confirmationButton(exit, in: panel).sendActions(for: .touchUpInside)
+            }
+            XCTAssertNil(panel.superview, exit)
+            XCTAssertNil(presenter.clear, exit)
+            XCTAssertNil(presenter.dismissed, exit)
+            window.isHidden = true
+            window.rootViewController = nil
+            editor = nil
+            await eventually { retainedEditor == nil }
+            XCTAssertNil(retainedEditor, "Dismissing confirmation must release the editor: \(exit)")
+        }
     }
 
     func testClearPageRemovesEveryItemKeepsThePageAndUndoes() async throws {
