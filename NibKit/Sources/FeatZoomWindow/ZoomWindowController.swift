@@ -540,7 +540,8 @@ final class ZoomWindowController: ObservableObject {
             optionsDismissal = nil
             optionsPresented = true
             // A quick reopen during retraction needs a fresh native scroll host too.
-            floating.present(Self.optionsID) { ZoomOptions(controller: self, state: state).id(UUID()) }
+            let presentation = UUID()
+            floating.present(Self.optionsID) { ZoomOptions(controller: self, state: state).id(presentation) }
         }
     }
 
@@ -683,6 +684,7 @@ struct ZoomPane: View {
         NibIconButton(.more, label: String(localized: "Zoom Window options"), size: .round) {
             controller.toggleOptions()
         }
+        .nibNativeAction { controller.toggleOptions() }
         .nibBudAnchor(ZoomWindowController.optionsAnchor)
     }
 }
@@ -755,10 +757,11 @@ final class ZoomOptionsKeyView: UIControl {
 
     init() {
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        isUserInteractionEnabled = true
         accessibilityElementsHidden = true
     }
     required init?(coder: NSCoder) { nil }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
     override var canBecomeFirstResponder: Bool { true }
 
     override func didMoveToWindow() {

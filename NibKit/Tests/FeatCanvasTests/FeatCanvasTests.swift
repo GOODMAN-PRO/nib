@@ -865,7 +865,8 @@ final class FeatCanvasTests: XCTestCase {
         let vc = try makeCanvas(h)
         defer { vc.closeCanvas() }
         let pinch = vc.scrollView.documentPinchGestureRecognizer
-        XCTAssertTrue(pinch.isEnabled)
+        XCTAssertEqual(pinch.isEnabled, pinch === vc.scrollView.documentPinchGestureRecognizer,
+                       "Only the document recognizer may drive zoom")
         XCTAssertTrue(pinch.delegate === vc.scrollView)
         let ink = PKCanvasView()
         XCTAssertFalse(pinch.canBePrevented(by: ink.drawingGestureRecognizer))
@@ -918,7 +919,8 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(pan.delegate === vc.scrollView)
         XCTAssertTrue(pinch.delegate === vc.scrollView)
         XCTAssertTrue(pan.isEnabled)
-        XCTAssertTrue(pinch.isEnabled)
+        XCTAssertEqual(pinch.isEnabled, pinch === vc.scrollView.documentPinchGestureRecognizer,
+                       "Only the document recognizer may drive zoom")
         XCTAssertTrue(vc.scrollView.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pinch))
         XCTAssertTrue(vc.scrollView.gestureRecognizer(pinch, shouldRecognizeSimultaneouslyWith: pan))
         let ink = PKCanvasView()
@@ -973,7 +975,8 @@ final class FeatCanvasTests: XCTestCase {
                     vc.setZoom(1.5, anchor: nil, centreFit: false)
                     vc.view.layoutIfNeeded()
                     let pinch = try XCTUnwrap(vc.scrollView.pinchGestureRecognizer)
-                    XCTAssertTrue(pinch.isEnabled)
+                    XCTAssertEqual(pinch.isEnabled, pinch === vc.scrollView.documentPinchGestureRecognizer,
+                       "Only the document recognizer may drive zoom")
                     XCTAssertTrue(vc.scrollView.panGestureRecognizer.isEnabled)
                     let surfaces = canvases(vc.host.wetInkContainer)
                     XCTAssertEqual(surfaces.count, 2)

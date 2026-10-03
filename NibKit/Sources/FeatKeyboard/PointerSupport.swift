@@ -427,6 +427,12 @@ final class CanvasKeyboardResponder: UIView {
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var unhandled = presses
         for press in presses {
+            #if DEBUG
+            if let key = press.key {
+                NSLog("[Canvas keyboard] code=%ld keyFlags=%lu eventFlags=%lu first=%d commands=%ld", key.keyCode.rawValue,
+                      key.modifierFlags.rawValue, event?.modifierFlags.rawValue ?? 0, isFirstResponder ? 1 : 0, descriptors.count)
+            }
+            #endif
             guard let key = press.key,
                   performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
             unhandled.remove(press)
