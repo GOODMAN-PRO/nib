@@ -4,6 +4,8 @@
 
 // Dynamic lookup keeps SDK-private classes out of the app and gives a clear failure if XCTest changes its SPI.
 @interface NSObject (NibXCTestTouchSPI)
++ (id)sharedSession;
+- (BOOL)useLegacyEventCoordinateTransformationPath;
 - (instancetype)initForTouchAtPoint:(CGPoint)point offset:(NSTimeInterval)offset;
 - (instancetype)initWithName:(NSString *)name interfaceOrientation:(NSInteger)orientation;
 - (void)moveToPoint:(CGPoint)point atOffset:(NSTimeInterval)offset;
@@ -33,9 +35,17 @@
         completion([NSError errorWithDomain:@"NibUITests" code:2 userInfo:@{NSLocalizedDescriptionKey: @"XCTest event synthesizer unavailable"}]);
         return;
     }
-    // Use XCTest screen points with the interface orientation corresponding to the device orientation.
-    NSInteger orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
-        device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    // Modern XCTest transforms screen points in the daemon. Supplying the
+    // interface rotation as well rotates them twice (a landscape centre becomes
+    // the portrait centre). Only the legacy event path needs that rotation.
+    NSInteger orientation = UIInterfaceOrientationPortrait;
+    Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
+    id session = [sessionClass respondsToSelector:@selector(sharedSession)] ? [sessionClass sharedSession] : nil;
+    if ([session respondsToSelector:@selector(useLegacyEventCoordinateTransformationPath)] &&
+        [session useLegacyEventCoordinateTransformationPath]) {
+        orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
+            device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    }
     id record = [[recordClass alloc] initWithName:@"Nib touch path" interfaceOrientation:orientation];
     NSTimeInterval settle = paths.count > 1 ? 0.1 : 0;
     NSUInteger finger = 0;

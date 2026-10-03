@@ -435,7 +435,9 @@ final class CanvasInputTests: XCTestCase {
                     XCTAssertEqual(Double(canvas.zoomScale), editor.host.zoomScale, accuracy: 0.001)
                 }
                 XCTAssertTrue(editor.scrollView.panGestureRecognizer.isEnabled)
-                XCTAssertTrue(try XCTUnwrap(editor.scrollView.pinchGestureRecognizer).isEnabled)
+                XCTAssertTrue(editor.scrollView.documentPinchGestureRecognizer.isEnabled)
+                XCTAssertFalse(try XCTUnwrap(editor.scrollView.pinchGestureRecognizer).isEnabled,
+                               "Only the document pinch may apply focal compensation")
             }
         }
     }

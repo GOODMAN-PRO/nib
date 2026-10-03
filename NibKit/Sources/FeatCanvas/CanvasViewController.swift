@@ -633,6 +633,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.isZoomingNow = false
         finishViewChange(bake: true)
         growBoardIfNeeded()
+        if mode.isWorld { for page in scrollView.pageViews.values { page.invalidateAccessibility() } }
         flushSessionState()
         host.inputController?.canvasDidEndZooming(host)
     }
@@ -1382,6 +1383,13 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         // subtracting contentOffset there can feed the last correction back into
         // the next sample and move the focal content.
         let point = gesture.location(in: view)
+        #if DEBUG
+        if gesture.state == .began {
+            NSLog("[Canvas pinch] view=%@ window=%@ bounds=%@ scroll=%@", NSStringFromCGPoint(point),
+                  NSStringFromCGPoint(gesture.location(in: view.window)), NSStringFromCGRect(view.bounds),
+                  NSStringFromCGRect(scrollView.frame))
+        }
+        #endif
         updatePinch(state: gesture.state, scale: Double(gesture.scale),
                     centroid: CGPoint(x: point.x - scrollView.frame.minX, y: point.y - scrollView.frame.minY))
     }

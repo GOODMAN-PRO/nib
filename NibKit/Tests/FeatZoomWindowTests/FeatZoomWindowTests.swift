@@ -502,6 +502,25 @@ final class FeatZoomWindowTests: XCTestCase {
         func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
     }
 
+    func testOptionsPresentedBeforeHostingWindowAttachesRetainsEscapeFocus() async throws {
+        let root = UIViewController()
+        let options = ZoomOptionsKeyView()
+        options.setPresented(true)
+        root.view.addSubview(options) // didMoveToWindow sees nil during offscreen mounting
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        await Task.yield()
+        XCTAssertTrue(options.isFirstResponder, "An open popover must acquire focus when its host reaches the window")
+        let action = #selector(ZoomOptionsKeyView.dismissFromKeyboard(_:))
+        XCTAssertTrue(options.canPerformAction(action, withSender: nil), "UIKit discovers the live Escape action without a sender")
+        let escape = try XCTUnwrap(options.keyCommands?.first)
+        XCTAssertTrue(options.canPerformAction(action, withSender: escape))
+        options.dismissFromKeyboard(escape)
+        XCTAssertFalse(options.canPerformAction(action, withSender: escape), "A closed popover cannot consume another Escape")
+    }
+
     func testOptionsEscapeOwnsFocusThenRestoresCanvasResponder() throws {
         final class CanvasFocus: UIView {
             override var canBecomeFirstResponder: Bool { true }
@@ -520,6 +539,8 @@ final class FeatZoomWindowTests: XCTestCase {
         options.onDismiss = { dismissals += 1 }
         options.setPresented(true)
         XCTAssertTrue(options.isFirstResponder, "Escape must reach the options before canvas Deselect")
+        XCTAssertTrue(options.isUserInteractionEnabled, "UIKit discards key events on a disabled responder")
+        XCTAssertFalse(options.point(inside: .zero, with: nil), "Keyboard focus must not intercept pane touches")
         let escape = try XCTUnwrap(options.keyCommands?.first)
         XCTAssertEqual(escape.input, UIKeyCommand.inputEscape)
         XCTAssertEqual(escape.modifierFlags, [])
@@ -1050,6 +1071,44 @@ final class FeatZoomWindowTests: XCTestCase {
         await fulfillment(of: [failed], timeout: 1)
         XCTAssertTrue(host.committed.isEmpty)
         overlay.detach(from: host)
+    }
+
+    func testWritingSurfaceCommitsCompleteStrokeOnlyAfterToolEnd() async throws {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 600, height: 176))
+        var captured: [Stroke] = []
+        view.onStroke = { captured.append(PKBridge.stroke(from: $0, style: .defaultPen)); return true }
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(190, 195))])
+        view.canvasViewDrawingDidChange(view.canvas)
+        XCTAssertTrue(captured.isEmpty, "A provisional path must not commit or arm auto-advance")
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(190, 280))])
+        view.canvasViewDrawingDidChange(view.canvas)
+        XCTAssertTrue(captured.isEmpty, "Even advance-zone ink must wait for the lift")
+        view.canvasViewDidEndUsingTool(view.canvas)
+        await Task.yield()
+        view.canvasViewDrawingDidChange(view.canvas)
+        XCTAssertEqual(captured.count, 1)
+        XCTAssertEqual(try XCTUnwrap(Rect.bounding(captured[0].polyline)).maxX, 280, accuracy: 0.01)
+        view.canvasViewDrawingDidChange(view.canvas)
+        XCTAssertEqual(captured.count, 1, "Final drawing notifications must not commit twice")
+    }
+
+    func testRemovingLandedInkDoesNotConsumeAnUnfinishedPaneStroke() async throws {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 600, height: 176))
+        var captured = 0
+        view.onStroke = { _ in captured += 1; return true }
+        let first = PKBridge.pkStroke(stroke(120, 150))
+        let next = PKBridge.pkStroke(stroke(190, 280))
+        view.canvas.drawing = PKDrawing(strokes: [first])
+        view.canvasViewDrawingDidChange(view.canvas)
+        XCTAssertEqual(captured, 1)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        view.canvas.drawing = PKDrawing(strokes: [first, next])
+        view.dropWet(1)
+        view.canvasViewDidEndUsingTool(view.canvas)
+        await Task.yield()
+        view.canvasViewDrawingDidChange(view.canvas)
+        XCTAssertEqual(captured, 2, "A dry-render swap must preserve the next stroke's pending commit")
     }
 
     func testPaneEraserUsesTheEraserToolsSettings() async throws {
