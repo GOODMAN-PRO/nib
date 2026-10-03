@@ -862,7 +862,7 @@ final class ZoomKeyboardView: UIView {
         self.app = app
         self.session = session
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        isUserInteractionEnabled = true
         accessibilityElementsHidden = true
         for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
                      UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
@@ -873,6 +873,7 @@ final class ZoomKeyboardView: UIView {
     }
 
     required init?(coder: NSCoder) { nil }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
     override var canBecomeFirstResponder: Bool { true }
     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
     override var next: UIResponder? {
@@ -907,6 +908,12 @@ final class ZoomKeyboardView: UIView {
         }
         let responder = ZoomKeyboardRouting.firstResponder(in: window)
         if let responder {
+            // F073 already advertises the feature's keys together with zoom/pan
+            // and presets. Keep that complete native route rather than inserting
+            // a two-command responder through a noninteractive SwiftUI overlay.
+            if responder.keyCommands?.contains(where: {
+                $0.input == "z" && $0.modifierFlags == [.command, .alternate]
+            }) == true { return }
             guard !(responder is UIControl), !(responder is ZoomOptionsKeyView) else { return }
             let view = (responder as? UIView) ?? (responder as? UIViewController)?.viewIfLoaded
             guard let view, view.isDescendant(of: canvas) || canvas.isDescendant(of: view)

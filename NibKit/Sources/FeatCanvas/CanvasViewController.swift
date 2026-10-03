@@ -49,6 +49,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var fitZoom: Double = 1
     private(set) var zoomLimits: ClosedRange<Double> = ZoomRules.notebookRange
     private var isAtFit = true
+    private var pinchStartZoom: Double?
+    private var pinchAnchor: (page: PageID, point: Point, window: CGPoint)?
     /// A pan at fit width is a reading position, not a request to keep the page's top fitted.
     private var hasManualPan = false
     private(set) var didInitialLayout = false
@@ -127,6 +129,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.frame = view.bounds
         scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         scrollView.delegate = self
+        scrollView.documentPinchGestureRecognizer.addTarget(self, action: #selector(pinched(_:)))
         scrollView.host = self
         scrollView.accessibilityIdentifier = "nib.canvas"
         view.addSubview(scrollView)
@@ -1233,6 +1236,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        // setZoomScale may finish a UIKit transform inside our continuing pinch.
+        guard pinchStartZoom == nil else { return }
         isAtFit = abs(self.scrollView.zoom - fitZoom) <= fitZoom * 0.005
         endZoom()
         hudLingerTask?.cancel()
@@ -1369,6 +1374,39 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     // MARK: Input
+
+    @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
+        let point = gesture.location(in: scrollView)
+        updatePinch(state: gesture.state, scale: Double(gesture.scale),
+                    centroid: CGPoint(x: point.x - scrollView.bounds.minX, y: point.y - scrollView.bounds.minY))
+    }
+
+    /// Centroid is in viewport coordinates; retain one page point for the whole
+    /// gesture, including centroid translation and zoom clamping at either limit.
+    func updatePinch(state: UIGestureRecognizer.State, scale: Double, centroid: CGPoint) {
+        guard didInitialLayout, !isClosed else { return }
+        switch state {
+        case .began:
+            pinchStartZoom = zoom
+            pinchAnchor = anchor(atWindow: centroid)
+            scrollViewWillBeginZooming(scrollView, with: scrollView.contentView)
+            fallthrough
+        case .changed:
+            guard let start = pinchStartZoom, scale.isFinite, scale > 0 else { return }
+            applyZoom(start * scale)
+            if var anchor = pinchAnchor {
+                anchor.window = centroid
+                keep(anchor)
+            }
+            scrollViewDidZoom(scrollView)
+        case .ended, .cancelled, .failed:
+            guard pinchStartZoom != nil else { return }
+            pinchStartZoom = nil
+            pinchAnchor = nil
+            scrollViewDidEndZooming(scrollView, with: scrollView.contentView, atScale: scrollView.zoomScale)
+        default: break
+        }
+    }
 
     @objc private func doubleTapped(_ g: UITapGestureRecognizer) {
         guard g.state == .ended else { return }

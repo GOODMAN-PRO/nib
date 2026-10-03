@@ -426,6 +426,24 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertNil(model.popover, "and another short tap closes it")
     }
 
+    func testColourMenuRemainsStableAcrossChromeRefreshUntilDismissed() async throws {
+        let button = PresetSwatchNativeButton()
+        let original = UIMenu(title: "Original", children: [UIAction(title: "Change Colour") { _ in }])
+        let refreshed = UIMenu(title: "Refreshed", children: [UIAction(title: "Change Colour") { _ in }])
+        let swatch = PresetColour.swatch(.black, id: "black", name: "Black")
+        button.configure(swatch: swatch, isSelected: true, menu: original, action: {})
+        let interaction = UIContextMenuInteraction(delegate: button)
+        let configuration = UIContextMenuConfiguration(identifier: nil, previewProvider: nil)
+        button.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: nil)
+        button.configure(swatch: swatch, isSelected: true, menu: refreshed, action: {})
+        XCTAssertEqual(button.menu?.title, "Original", "Refreshing chrome must not replace the menu being touched")
+        button.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        XCTAssertEqual(button.menu?.title, "Refreshed", "The next interaction uses the latest actions")
+    }
+
     func testNativeColourMenuEditsHeldSlotAndPreservesOtherActionsForEveryTool() async throws {
         let h = Harness(features: [FeatPresetsFeature.self])
         for tool in NibSettings.presetTools {

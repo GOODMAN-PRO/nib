@@ -293,19 +293,20 @@ struct LibraryCell: View {
             LibraryItemTapTarget(action: {
                 guard !LibraryCarrierVisibility.hides(row.ref, in: reflow) else { return }
                 activate()
-            }, pressed: { isPressed = $0 })
+            }, pressed: { isPressed = $0 }, menu: {
+                var entries = LibraryMenus.nativeItems(model, rows: [row])
+                if model.collection == .documents {
+                    entries += [UIAction(title: String(localized: "Move earlier")) { _ in step(-1) },
+                                UIAction(title: String(localized: "Move later")) { _ in step(1) }]
+                }
+                return UIMenu(children: entries)
+            }, preview: { UIHostingController(rootView: LibraryCard(row: row, model: model, subtitle: visibleSubtitle)) })
             .accessibilityHidden(true)
         }
         .scaleEffect(isPressed ? 0.96 : 1)
         .animation(NibMotion.tap.animation, value: isPressed)
         .modifier(LibraryItemReflow(row: row, model: model))
-        .contextMenu {
-            LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
-            if model.collection == .documents {
-                Button("Move earlier") { step(-1) }
-                Button("Move later") { step(1) }
-            }
-        } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+
     }
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
@@ -344,9 +345,13 @@ struct LibraryCell: View {
 struct LibraryItemTapTarget: UIViewRepresentable {
     var action: () -> Void
     var pressed: (Bool) -> Void
+    var menu: () -> UIMenu
+    var preview: () -> UIViewController
 
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+    func makeUIView(context: Context) -> LibraryItemTouchView {
+        let view = LibraryItemTouchView()
+        view.menu = menu
+        view.preview = preview
         let tap = LibraryItemTapRecognizer(target: nil, action: nil)
         tap.action = action
         tap.pressed = pressed
@@ -354,10 +359,29 @@ struct LibraryItemTapTarget: UIViewRepresentable {
         view.addGestureRecognizer(tap)
         return view
     }
-    func updateUIView(_ view: UIView, context: Context) {
-        guard let tap = view.gestureRecognizers?.first as? LibraryItemTapRecognizer else { return }
+    func updateUIView(_ view: LibraryItemTouchView, context: Context) {
+        view.menu = menu
+        view.preview = preview
+        guard let tap = view.gestureRecognizers?.compactMap({ $0 as? LibraryItemTapRecognizer }).first else { return }
         tap.action = action
         tap.pressed = pressed
+    }
+}
+
+/// One native touch surface owns both opening and the context menu. A SwiftUI
+/// contextMenu wrapper above a separate tap overlay can consume the opening tap.
+final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
+    var menu: (() -> UIMenu)?
+    var preview: (() -> UIViewController)?
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        addInteraction(UIContextMenuInteraction(delegate: self))
+    }
+    required init?(coder: NSCoder) { nil }
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
+                                   actionProvider: { [weak self] _ in self?.menu?() })
     }
 }
 
@@ -374,8 +398,11 @@ final class LibraryItemTapRecognizer: UITapGestureRecognizer {
         pressed(false)
     }
     override func canBePrevented(by other: UIGestureRecognizer) -> Bool {
-        if state == .possible, !(other is UITapGestureRecognizer),
-           !(other is UIPanGestureRecognizer), !(other is UILongPressGestureRecognizer) { return false }
+        // Ancestor SwiftUI tap/hosting recognizers are not competing user actions.
+        // Only a real scroll, context-menu hold or active reflow may cancel opening.
+        if !(other is UIPanGestureRecognizer), !(other is UILongPressGestureRecognizer) {
+            return false
+        }
         return super.canBePrevented(by: other)
     }
 }

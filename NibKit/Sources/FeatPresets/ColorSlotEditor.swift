@@ -127,6 +127,7 @@ struct ColourEditor: View {
                         }
                         if model.presets.swatches.count < ToolPresets.maxSwatches {
                             NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
+                                .nibNativeAction { model.addColour() }
                         }
                     }
                 }
@@ -142,6 +143,7 @@ struct ColourEditor: View {
             }
             HStack(spacing: NibSpacing.s) {
                 NibButton(String(localized: "Custom"), symbol: .customColour, size: .compact) { model.openPicker() }
+                    .nibNativeAction { model.openPicker() }
                     .accessibilityLabel(String(localized: "Custom Colour"))
                 if model.canPickFromPage {
                     NibButton(String(localized: "From Page"), symbol: .eyedropper, size: .compact) { model.pickFromPage() }
@@ -329,7 +331,19 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
 enum PresetPresenter {
     static func present(_ viewController: UIViewController, app: NibApp, session: EditorSession) {
         if let navigator = app.ui.activeNavigator, navigator.session === session {
-            navigator.presentModal(viewController)
+            // A colour command may arrive while UIKit retracts the swatch's
+            // context menu. Present only after that transition has released its
+            // controller; otherwise UIKit silently drops the picker presentation.
+            let root = navigator.rootViewController
+            var top = root
+            while let presented = top?.presentedViewController { top = presented }
+            if let transition = top?.transitionCoordinator ?? root?.transitionCoordinator {
+                transition.animate(alongsideTransition: nil) { _ in
+                    navigator.presentModal(viewController)
+                }
+            } else {
+                navigator.presentModal(viewController)
+            }
             return
         }
         var top = (session.editor as? UIViewController) ?? session.editor?.canvasHost?.canvasView.window?.rootViewController

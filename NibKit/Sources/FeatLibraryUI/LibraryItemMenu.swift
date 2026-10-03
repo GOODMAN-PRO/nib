@@ -55,6 +55,36 @@ enum LibraryMenus {
             }
         }
     }
+    static func activate(_ entry: MenuItemDescriptor, context: MenuContext,
+                         model: LibraryViewModel, rows: [LibraryRow]) {
+        if entry.destructive {
+            model.confirmation = LibraryConfirmation(title: entry.resolvedTitle(for: context), command: entry.command,
+                params: entry.params(context), message: entry.command == CommandIDs.libraryTrash
+                    ? LibraryConfirmation.trashMessage(names: rows.map(\.name)) : nil)
+            model.setView(["menu": "none"])
+        } else {
+            model.activateMenu(command: entry.command, params: entry.params(context))
+        }
+    }
+
+    static func nativeItems(_ model: LibraryViewModel, rows: [LibraryRow]) -> [UIMenuElement] {
+        let context = context(model, location: .libraryItem, rows: rows)
+        let entries = model.app.ui.menuItems(.libraryItem, context)
+        func action(_ entry: MenuItemDescriptor) -> UIAction {
+            let action = UIAction(title: entry.resolvedTitle(for: context), image: entry.icon.flatMap(UIImage.init(systemName:)),
+                attributes: entry.destructive ? .destructive : [], state: entry.isChecked?(context) == true ? .on : .off) { _ in
+                activate(entry, context: context, model: model, rows: rows)
+            }
+            action.accessibilityIdentifier = "cmd." + entry.command
+            return action
+        }
+        var result: [UIMenuElement] = entries.filter { $0.submenu == nil }.map(action)
+        for title in Set(entries.compactMap(\.submenu)).sorted() {
+            result.append(UIMenu(title: title, children: entries.filter { $0.submenu == title }.map(action)))
+        }
+        return result
+    }
+
     static func refs(_ context: MenuContext) -> [String] {
         guard let session = context.session else { return context.nodes.map(\.raw) }
         let model = LibraryModels.get(context.app).model(session)
@@ -140,15 +170,9 @@ struct LibraryMenuEntries: View {
     }
 
     private func activate(_ entry: MenuItemDescriptor, _ context: MenuContext) {
-        if entry.destructive {
-            model.confirmation = LibraryConfirmation(title: entry.resolvedTitle(for: context), command: entry.command, params: entry.params(context),
-                message: entry.command == CommandIDs.libraryTrash ? LibraryConfirmation.trashMessage(names: rows.map(\.name)) : nil)
-            model.setView(["menu": "none"])
-        } else { run(entry, context) }
+        LibraryMenus.activate(entry, context: context, model: model, rows: rows)
     }
-    private func run(_ entry: MenuItemDescriptor, _ context: MenuContext) {
-        model.activateMenu(command: entry.command, params: entry.params(context))
-    }
+
 }
 
 /// One row layout for New, app, item, selection, sort and filter menus.

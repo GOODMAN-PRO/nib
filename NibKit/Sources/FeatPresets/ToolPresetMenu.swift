@@ -430,6 +430,7 @@ struct ToolPresetMenu: View {
                 swatchStrip(arranging: false)
                 if presets.swatches.count < ToolPresets.maxSwatches {
                     NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
+                        .nibNativeAction { model.addColour() }
                         .presetPopoverSource(tool, model.shown == .colour(.add))
                 }
             }
@@ -691,6 +692,7 @@ struct PresetSwatchControl: UIViewRepresentable {
 final class PresetSwatchNativeButton: UIButton {
     private var tap: (() -> Void)?
     private var menuOwnsInteraction = false
+    private var pendingMenu: UIMenu?
 
     init() {
         super.init(frame: .zero)
@@ -714,10 +716,21 @@ final class PresetSwatchNativeButton: UIButton {
     }
 
     override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willDisplayMenuFor configuration: UIContextMenuConfiguration,
+                                         animator: UIContextMenuInteractionAnimating?) {
+        menuOwnsInteraction = true
+        super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                          willEndFor configuration: UIContextMenuConfiguration,
                                          animator: UIContextMenuInteractionAnimating?) {
         super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
-        let finished: () -> Void = { [weak self] in self?.menuOwnsInteraction = false }
+        let finished: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.menuOwnsInteraction = false
+            if let pendingMenu = self.pendingMenu { self.menu = pendingMenu; self.pendingMenu = nil }
+        }
         if let animator {
             animator.addCompletion(finished)
         } else {
@@ -728,7 +741,9 @@ final class PresetSwatchNativeButton: UIButton {
 
     func configure(swatch: NibSwatch, isSelected: Bool, menu: UIMenu, action: @escaping () -> Void) {
         tap = action
-        self.menu = menu
+        // UIKit dismisses/rebuilds an open menu if its button's menu is replaced.
+        // Session/chrome updates must leave the user's current interaction intact.
+        if menuOwnsInteraction { pendingMenu = menu } else { self.menu = menu }
         self.isSelected = isSelected
         setImage(.nibSwatch(swatch, size: .palette, isSelected: isSelected), for: .normal)
         accessibilityLabel = swatch.pattern?.name.map { "\(swatch.name), \($0)" } ?? swatch.name

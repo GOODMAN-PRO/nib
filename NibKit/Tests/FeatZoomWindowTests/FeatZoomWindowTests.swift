@@ -322,6 +322,42 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session), "the chrome follows the live registry")
     }
 
+    func testZoomFallbackDoesNotTakeFocusFromCompleteCanvasKeyboardRoute() async throws {
+        final class CanvasKeys: UIView {
+            override var canBecomeFirstResponder: Bool { true }
+            @objc func toggle(_ sender: UIKeyCommand) {}
+            override var keyCommands: [UIKeyCommand]? {
+                [UIKeyCommand(input: "z", modifierFlags: [.command, .alternate], action: #selector(toggle(_:)))]
+            }
+        }
+        let h = harness()
+        registerRuled(h, returnHeight: 24.7)
+        let (host, overlay) = try await openWindow(h)
+        let root = UIViewController()
+        root.view.addSubview(host.canvasView)
+        let canvasKeys = CanvasKeys()
+        host.canvasView.addSubview(canvasKeys)
+        let fallback = ZoomKeyboardView(app: h.app, session: h.session)
+        root.view.addSubview(fallback)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { fallback.restorePreviousFocus(); overlay.detach(from: host); window.isHidden = true }
+        XCTAssertTrue(canvasKeys.becomeFirstResponder())
+        fallback.takeFocus()
+        XCTAssertTrue(canvasKeys.isFirstResponder, "Keep the route that also owns zoom, pan and colour keys")
+        XCTAssertFalse(fallback.isFirstResponder)
+    }
+
+    func testZoomKeyboardAcceptsHardwareEventsWithoutTakingCanvasTouches() throws {
+        let h = harness()
+        let keyboard = ZoomKeyboardView(app: h.app, session: h.session)
+        XCTAssertTrue(keyboard.isUserInteractionEnabled, "A disabled first responder drops hardware keys")
+        XCTAssertFalse(keyboard.point(inside: .zero, with: nil))
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get("zoomwindow.keyboard"))
+        XCTAssertFalse(overlay.isInteractive, "The keyboard overlay must not block canvas touches")
+    }
+
     func testNativeZoomShortcutsDispatchFromResponderChainAndPreserveCanvasFocus() async throws {
         final class CanvasFocus: UIView {
             override var canBecomeFirstResponder: Bool { true }

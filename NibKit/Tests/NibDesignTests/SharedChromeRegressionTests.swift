@@ -8,6 +8,54 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testNativePopoverActionRemainsHittableAndTracksDisabledStateAcrossRefresh() async throws {
+        var count = 0
+        func content(_ enabled: Bool) -> AnyView {
+            AnyView(NibButton("Custom Colour") { count += 1 }
+                .nibNativeAction { count += 1 }
+                .disabled(!enabled))
+        }
+        let host = UIHostingController(rootView: content(true))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func taps(_ view: UIView) -> [NibActionTapRecognizer] {
+            (view.gestureRecognizers ?? []).compactMap { $0 as? NibActionTapRecognizer }
+                + view.subviews.flatMap(taps)
+        }
+        for enabled in [true, false, true] {
+            host.rootView = content(enabled)
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(80))
+            let actions = taps(host.view)
+            XCTAssertEqual(actions.count, 1)
+            let tap = try XCTUnwrap(actions.first)
+            XCTAssertEqual(tap.isEnabled, enabled)
+            if enabled {
+                let target = try XCTUnwrap(tap.view)
+                let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: host.view)
+                let hit = try XCTUnwrap(host.view.hitTest(point, with: nil))
+                XCTAssertTrue(hit.isDescendant(of: target), "The native gesture must receive the control's touches")
+                let before = count
+                tap.activate()
+                XCTAssertEqual(count, before + 1)
+            }
+        }
+    }
+
+    func testPaletteTouchOwnershipSurvivesHostingButYieldsToScrollingAndHolds() {
+        let tap = NibActionTapRecognizer()
+        XCTAssertFalse(tap.canBePrevented(by: UIGestureRecognizer()))
+        XCTAssertFalse(tap.canBePrevented(by: UITapGestureRecognizer()))
+        XCTAssertTrue(tap.canBePrevented(by: UIPanGestureRecognizer()))
+        XCTAssertTrue(tap.canBePrevented(by: UILongPressGestureRecognizer()))
+        var count = 0
+        tap.action = { count += 1 }
+        tap.activate()
+        XCTAssertEqual(count, 1)
+    }
+
     func testRetainedPopoverStopsNativeScrollingAndHitTestingAcrossRelayouts() async throws {
         func panel(_ presented: Bool, width: CGFloat) -> some View {
             NibPopoverPanel(title: "Apple Pencil", width: width, maxHeight: 220) {

@@ -320,6 +320,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
         host.canvasView.addGestureRecognizer(navigationGate)
         host.scrollView.panGestureRecognizer.require(toFail: navigationGate)
+        host.scrollView.documentPinchGestureRecognizer.require(toFail: navigationGate)
         attachPinchGate()
         host.doubleTapZoomRecognizer.isEnabled = false
         surfaceContainer.backgroundColor = .clear
@@ -568,6 +569,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         guard touchTap.enteringBegan, let host = host else { return false }
         let claimed = tracks.values.contains { if case .attachment = $0.route { return true }; return false }
         return claimed && (other === host.scrollView.panGestureRecognizer || other === host.scrollView.pinchGestureRecognizer
+            || other === host.scrollView.documentPinchGestureRecognizer
             || surfaces.contains { other === $0.canvas.drawingGestureRecognizer })
     }
 

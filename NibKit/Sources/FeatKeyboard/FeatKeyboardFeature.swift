@@ -135,7 +135,7 @@ final class LibraryCreationKeyboardResponder: UIView {
     init(context: ChromeContext) {
         self.context = context
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        isUserInteractionEnabled = true
         isAccessibilityElement = false
         accessibilityElementsHidden = true
         for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
@@ -148,6 +148,7 @@ final class LibraryCreationKeyboardResponder: UIView {
     }
 
     required init?(coder: NSCoder) { nil }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
     override var canBecomeFirstResponder: Bool { true }
     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 

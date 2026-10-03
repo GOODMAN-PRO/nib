@@ -753,6 +753,55 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(vc.zoom, initial, "An earlier handled item gesture must not also zoom")
     }
 
+    func testDocumentOwnedPinchKeepsItsFocalPointAndClampsWithoutEditing() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let pinch = vc.scrollView.documentPinchGestureRecognizer
+        XCTAssertTrue(pinch.isEnabled)
+        XCTAssertTrue(pinch.delegate === vc.scrollView)
+        let ink = PKCanvasView()
+        XCTAssertFalse(pinch.canBePrevented(by: ink.drawingGestureRecognizer))
+        let focal = CGPoint(x: 500, y: 350)
+        let initial = vc.zoom
+        let pagePoint = try XCTUnwrap(vc.host.pagePoint(CGPoint(
+            x: focal.x + vc.scrollView.bounds.minX, y: focal.y + vc.scrollView.bounds.minY)))
+        let depth = h.undoDepth(Fixtures.docID)
+        vc.updatePinch(state: .began, scale: 1, centroid: focal)
+        vc.updatePinch(state: .changed, scale: 1.5, centroid: focal)
+        XCTAssertEqual(vc.zoom, initial * 1.5, accuracy: 0.001)
+        let location = vc.host.viewPoint(pagePoint.point, page: pagePoint.page)
+        XCTAssertEqual(location.x - vc.scrollView.bounds.minX, focal.x, accuracy: 1)
+        XCTAssertEqual(location.y - vc.scrollView.bounds.minY, focal.y, accuracy: 1)
+        XCTAssertTrue(vc.scrollView.isZoomingNow)
+        vc.updatePinch(state: .changed, scale: 100, centroid: focal)
+        XCTAssertEqual(vc.zoom, 8, accuracy: 0.001)
+        vc.updatePinch(state: .changed, scale: 0.001, centroid: focal)
+        XCTAssertEqual(vc.zoom, 0.5, accuracy: 0.001)
+        vc.updatePinch(state: .ended, scale: 0.001, centroid: focal)
+        XCTAssertFalse(vc.scrollView.isZoomingNow)
+        XCTAssertEqual(h.session.zoom, vc.zoom, accuracy: 0.001)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+    }
+
+    func testHostingTouchRecognitionCannotCancelDocumentNavigation() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let hosting = UIView(frame: vc.view.bounds)
+        hosting.addSubview(vc.view)
+        let bridge = UIGestureRecognizer()
+        hosting.addGestureRecognizer(bridge)
+        for navigation in [vc.scrollView.panGestureRecognizer, vc.scrollView.pinchGestureRecognizer].compactMap({ $0 }) {
+            XCTAssertTrue(navigation.delegate?.gestureRecognizer?(navigation,
+                shouldRecognizeSimultaneouslyWith: bridge) == true)
+        }
+        let attachment = UIPanGestureRecognizer()
+        vc.scrollView.addGestureRecognizer(attachment)
+        XCTAssertFalse(vc.scrollView.gestureRecognizer(vc.scrollView.panGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith: attachment))
+    }
+
     func testNativeNavigationRecognizersCoexistAndPublishPinchZoom() throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)

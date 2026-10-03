@@ -126,6 +126,17 @@ final class FeatKeyboardTests: XCTestCase {
 
     // MARK: Acceptance: no shortcut is registered twice
 
+    func testHardwareOnlyInputDoesNotSuppressCanvasNavigation() {
+        final class HardwareInput: UIView, UIKeyInput {
+            var hasText: Bool { false }
+            func insertText(_ text: String) {}
+            func deleteBackward() {}
+        }
+        XCTAssertFalse(CanvasKeyboardFocus.isTextInput(HardwareInput()))
+        XCTAssertTrue(CanvasKeyboardFocus.isTextInput(UITextField()))
+        XCTAssertTrue(CanvasKeyboardFocus.isTextInput(UITextView()))
+    }
+
     func testNoShortcutIsRegisteredTwice() async throws {
         let catalog = GlobalShortcuts.catalog(app: nil, owner: FeatKeyboardFeature.id)
         XCTAssertTrue(ShortcutRules.conflicts(in: catalog).isEmpty, "\(ShortcutRules.conflicts(in: catalog))")

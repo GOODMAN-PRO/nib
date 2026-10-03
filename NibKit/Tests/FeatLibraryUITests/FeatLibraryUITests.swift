@@ -26,6 +26,14 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testCardOpeningTapSurvivesHostingTapButYieldsToNavigationAndMenu() {
+        let opening = LibraryItemTapRecognizer()
+        XCTAssertFalse(opening.canBePrevented(by: UITapGestureRecognizer()))
+        XCTAssertFalse(opening.canBePrevented(by: UIGestureRecognizer()))
+        XCTAssertTrue(opening.canBePrevented(by: UIPanGestureRecognizer()))
+        XCTAssertTrue(opening.canBePrevented(by: UILongPressGestureRecognizer()))
+    }
+
     func testCardNativeTapDispatchesOnceAfterReattachmentInGridAndList() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         await model.appear()

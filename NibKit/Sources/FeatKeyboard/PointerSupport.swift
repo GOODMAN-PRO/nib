@@ -515,7 +515,9 @@ enum CanvasKeyboardFocus {
     static func isTextInput(_ responder: UIResponder?) -> Bool {
         if let text = responder as? UITextView { return text.isEditable }
         if let field = responder as? UITextField { return field.isEnabled }
-        return responder is UIKeyInput
+        // Hosting and drawing views can implement UIKeyInput to receive hardware
+        // events without editing text. Only a text editor suppresses canvas keys.
+        return responder is UITextInput
     }
 
     static func mayReplace(_ responder: UIResponder?, canvas: UIView) -> Bool {

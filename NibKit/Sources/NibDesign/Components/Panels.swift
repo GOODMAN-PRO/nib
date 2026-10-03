@@ -91,6 +91,8 @@ private struct PopoverScrollInteraction: UIViewRepresentable {
     final class Probe: UIView {
         var isPresented = true
         override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
+        override func layoutSubviews() { super.layoutSubviews(); updateScrollView() }
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
         func updateScrollView() {
             var ancestor = superview
             while let view = ancestor {
