@@ -322,7 +322,7 @@ struct OnboardingView: View {
     /// The presets live in F086's editor; this step names them and opens Settings once ("Set Up AI" in the footer).
     @ViewBuilder private var assistantStep: some View {
         headline(String(localized: "Bring your own AI."))
-        bodyText(String(localized: "Optional. Use Claude, GPT or any model on OpenRouter with your own key, a model on your own computer with Ollama or LM Studio, or your own server. Nib sends a note to your provider only when you ask."))
+        bodyText(String(localized: "Optional. Use your Claude or ChatGPT subscription through Nib Agent on your Mac. Other providers can use an API key or a local model. Nib sends notes only when you ask."))
         note(String(localized: "Keys are entered in Settings, never here."))
         if !model.providers.isEmpty {
             VStack(spacing: 0) {
