@@ -124,6 +124,21 @@ final class FeatSidebarTests: XCTestCase {
 
     // MARK: Layout
 
+    func testPageNavigationPreservesWindowModeAndDismissesCompactSheets() async throws {
+        let h = harness(), log = CallLog()
+        stub(h, [CommandIDs.viewGoToPage, CommandIDs.sidebarToggle], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        for presentation in [PanelPresentation.window, .sidebar, .sheet] {
+            let dismiss = await model.navigate(p2, presentation: presentation, compact: false)
+            XCTAssertEqual(dismiss, presentation == .sheet)
+        }
+        let dismissCompact = await model.navigate(p1, presentation: .window, compact: true)
+        XCTAssertTrue(dismissCompact)
+        XCTAssertEqual(log.calls.map(\.command), Array(repeating: CommandIDs.viewGoToPage, count: 4),
+                       "Selecting a page must not silently change the navigator presentation")
+        XCTAssertEqual(log.calls.first?.params["page"]?.stringValue, ref(p2))
+    }
+
     /// The chrome's `PanelContext.presentation` alone picks the layout (contracts-v2 G16), whatever width it gives.
     func testWindowPresentationIsTheFullWindowGrid() {
         XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .window, compact: false), .grid)
