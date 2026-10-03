@@ -120,7 +120,6 @@ struct StickyToolSettings: View {
     @State private var colour: RGBA
     @State private var custom: Color
     @State private var author: String
-    @FocusState private var authorFocused: Bool
     @State private var authorSave: Task<Void, Never>?
     @State private var customSave: Task<Void, Never>?
 
@@ -145,14 +144,9 @@ struct StickyToolSettings: View {
                 }
             }
             NibInspectorSection(String(localized: "Sign notes as")) {
-                NibField(text: $author, prompt: String(localized: "Your name"))
-                    .accessibilityLabel(String(localized: "Author name on new notes"))
-                    .focused($authorFocused)
-                    .submitLabel(.done)
-                    .onSubmit {
-                        saveAuthor()
-                        authorFocused = false
-                    }
+                NibField(text: $author, prompt: String(localized: "Your name"),
+                    accessibilityName: String(localized: "Author name on new notes"),
+                    onCommit: { saveAuthor($0) })
             }
         }
         .onChange(of: custom) { _, new in
@@ -173,21 +167,18 @@ struct StickyToolSettings: View {
                 if !Task.isCancelled { saveAuthor() }
             }
         }
-        .onChange(of: authorFocused) { _, focused in
-            if !focused { saveAuthor() }
-        }
         .onDisappear { saveAuthor() }
         .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)) { _ in
             colour = StickySettings.currentColour(app.settings)
         }
     }
 
-    private func saveAuthor() {
+    private func saveAuthor(_ submitted: String? = nil) {
         // Submission, focus loss and closing the popover flush the latest name immediately.
         // A delayed write must not outlive the field and overwrite a later author change.
         authorSave?.cancel()
         authorSave = nil
-        let name = author.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (submitted ?? author).trimmingCharacters(in: .whitespacesAndNewlines)
         guard name != app.settings.get(NibSettings.authorName) else { return }
         app.perform(CommandIDs.settingsSet, ["name": .string(NibSettings.authorName.name), "value": .string(name)])
     }

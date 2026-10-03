@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Switch. iOS 26: the system switch (its thumb is already Liquid Glass). iOS 17–25: the thumb squashes
 /// 27 → 35 → 27 pt over 0.32 s, the only liquid in Settings.
@@ -395,24 +396,84 @@ public struct NibField: View {
     @Binding var text: String
     let prompt: String
     let lines: ClosedRange<Int>
+    let accessibilityName: String?
+    let onCommit: ((String) -> Void)?
 
-    public init(text: Binding<String>, prompt: String, lines: ClosedRange<Int> = 1...1) {
+    public init(text: Binding<String>, prompt: String, lines: ClosedRange<Int> = 1...1,
+                accessibilityName: String? = nil, onCommit: ((String) -> Void)? = nil) {
         self._text = text
         self.prompt = prompt
         self.lines = lines
+        self.accessibilityName = accessibilityName
+        self.onCommit = onCommit
     }
 
     public var body: some View {
         // A one-line form entry needs native single-line focus and submit behaviour.
         // The vertical variant embeds a scrolling text view even at 1...1 lines
         // and uses multiline return handling. Keep it for growing composers.
-        TextField(prompt, text: $text, axis: lines.upperBound == 1 ? .horizontal : .vertical)
-            .lineLimit(lines)
+        Group {
+            if lines.upperBound == 1, let onCommit {
+                NibCommitTextField(text: $text, prompt: prompt,
+                    accessibilityName: accessibilityName ?? prompt, onCommit: onCommit)
+            } else {
+                TextField(prompt, text: $text, axis: lines.upperBound == 1 ? .horizontal : .vertical)
+                    .lineLimit(lines)
+            }
+        }
             .font(NibFont.chat)
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
             .frame(minHeight: NibMetrics.hitTarget)
             .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.composer, style: .continuous))
+    }
+}
+
+/// Name fields commit the native buffer before resigning focus. Submission must
+/// not depend on a later SwiftUI binding update or on focus-change ordering.
+private struct NibCommitTextField: UIViewRepresentable {
+    @Binding var text: String
+    let prompt: String
+    let accessibilityName: String
+    let onCommit: (String) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.font = NibUIFont.chat
+        field.adjustsFontForContentSizeCategory = true
+        field.textColor = NibUIColor.label
+        field.returnKeyType = .done
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .editingChanged)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return field
+    }
+    func updateUIView(_ field: UITextField, context: Context) {
+        context.coordinator.parent = self
+        if !field.isFirstResponder, field.text != text { field.text = text }
+        field.placeholder = prompt
+        field.accessibilityLabel = accessibilityName
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextField, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? uiView.intrinsicContentSize.width,
+               height: uiView.intrinsicContentSize.height)
+    }
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: NibCommitTextField
+        init(_ parent: NibCommitTextField) { self.parent = parent }
+        @objc func changed(_ field: UITextField) { parent.text = field.text ?? "" }
+        func textFieldShouldReturn(_ field: UITextField) -> Bool {
+            commit(field)
+            field.resignFirstResponder()
+            return true
+        }
+        func textFieldDidEndEditing(_ field: UITextField) { commit(field) }
+        private func commit(_ field: UITextField) {
+            let value = field.text ?? ""
+            parent.text = value
+            parent.onCommit(value)
+        }
     }
 }
 

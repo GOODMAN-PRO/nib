@@ -214,19 +214,80 @@ struct EraserSettingsView: View {
             // An iPad confirmationDialog hides Cancel and relies on outside taps while another
             // popover (the retained eraser settings bud) already owns outside dismissal. Use a
             // system alert so cancellation is an explicit, accessible action on every device.
-            .alert(String(localized: "Clear this page?"), isPresented: $confirmingClear) {
-                Button(String(localized: "Clear Page"), role: .destructive) { clearPage() }
-                Button(String(localized: "Cancel"), role: .cancel) { confirmingClear = false }
-            } message: {
-                Text(String(localized: "Everything on this page is removed. You can undo this."))
-            }
         }
+        .background(ClearPageConfirmation(isPresented: $confirmingClear, clear: clearPage))
         .onDisappear { model.flushSizeWrite() }
     }
 
     private func clearPage() {
         guard let doc = session.document, let page = session.page else { return }
         app.perform(CommandIDs.pageClear, ["page": .string(NodeRef.page(doc, page).description)], session: session)
+    }
+}
+
+/// Keep the native alert outside the moving bud's SwiftUI presentation modifiers.
+/// The controller waits for window attachment, and dismissal clears the binding
+/// even when the presenting editor is dismissed programmatically.
+private struct ClearPageConfirmation: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
+    let clear: () -> Void
+
+    func makeUIViewController(context: Context) -> Presenter { Presenter() }
+    func updateUIViewController(_ controller: Presenter, context: Context) {
+        controller.requested = isPresented
+        controller.dismissed = { isPresented = false }
+        controller.clear = clear
+        controller.schedulePresentation()
+    }
+
+    final class Presenter: UIViewController {
+        var requested = false
+        var dismissed: () -> Void = {}
+        var clear: () -> Void = {}
+        private weak var alert: ConfirmationAlert?
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            schedulePresentation()
+        }
+        func schedulePresentation() {
+            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+        }
+        private func updatePresentation() {
+            guard requested else {
+                alert?.dismiss(animated: false)
+                return
+            }
+            guard alert == nil, viewIfLoaded?.window != nil else { return }
+            let prompt = ConfirmationAlert(title: String(localized: "Clear this page?"),
+                message: String(localized: "Everything on this page is removed. You can undo this."),
+                preferredStyle: .alert)
+            prompt.finished = { [weak self] in
+                guard let self else { return }
+                self.requested = false
+                self.dismissed()
+            }
+            prompt.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { [weak prompt] _ in
+                prompt?.finished()
+            })
+            prompt.addAction(UIAlertAction(title: String(localized: "Clear Page"), style: .destructive) { [weak self, weak prompt] _ in
+                prompt?.finished()
+                self?.clear()
+            })
+            var owner: UIViewController = self
+            while let parent = owner.parent { owner = parent }
+            guard owner.presentedViewController == nil else { return }
+            alert = prompt
+            owner.present(prompt, animated: view.window?.windowScene?.activationState == .foregroundActive)
+        }
+    }
+
+    final class ConfirmationAlert: UIAlertController {
+        var finished: () -> Void = {}
+        override func viewDidDisappear(_ animated: Bool) {
+            super.viewDidDisappear(animated)
+            finished()
+        }
     }
 }
 

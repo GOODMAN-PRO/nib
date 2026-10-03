@@ -145,7 +145,7 @@ struct LibrarySetView: NibCommand {
         if let panel = p.panel {
             if panel == "documents" {
                 model.closeTab(); model.collection = .documents
-                model.folder = nil; model.selection.clear()
+                model.folder = targetFolder; model.selection.clear()
             }
             else {
                 if p.close == true { model.closePanel(panel) }

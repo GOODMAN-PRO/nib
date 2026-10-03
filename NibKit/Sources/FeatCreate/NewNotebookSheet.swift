@@ -1001,7 +1001,7 @@ struct NewNotebookPaperChooser<Groups: View, Chips: View, Papers: View>: View {
     }
 
     private var grid: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.fixed(NibMetrics.paperTileSize.width), spacing: NibSpacing.m),
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(NibMetrics.paperTileSize.width), spacing: NibSpacing.m, alignment: .top),
                                  count: columnCount), alignment: .leading, spacing: NibSpacing.l) {
             papers
         }
