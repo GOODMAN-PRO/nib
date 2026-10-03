@@ -166,7 +166,9 @@ jobs:
           args = ['xcodebuild', 'test', '-project', 'Nib.xcodeproj', '-scheme', 'NibUITests',
                   '-destination', 'id=' + os.environ['UDID'], '-derivedDataPath', 'build/DerivedData',
                   '-clonedSourcePackagesDirPath', 'build/SourcePackages', '-skipPackagePluginValidation',
-                  '-parallel-testing-enabled', 'NO', *json.loads(os.environ['ONLY_ARGS']),
+                  '-parallel-testing-enabled', 'NO', '-test-timeouts-enabled', 'YES',
+                  '-default-test-execution-time-allowance', '180', '-maximum-test-execution-time-allowance', '300',
+                  *json.loads(os.environ['ONLY_ARGS']),
                   '-resultBundlePath', 'ui.xcresult', 'CODE_SIGN_IDENTITY=-', 'CODE_SIGNING_REQUIRED=NO']
           start = time.time()
           test_start = None
