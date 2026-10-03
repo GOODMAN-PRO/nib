@@ -59,6 +59,17 @@ private final class DeferredDismissalController: UIViewController {
 
 @MainActor
 final class FeatCreateTests: XCTestCase {
+    func testQuickNoteExitSheetKeepsAccessibilityInsideItsChoices() {
+        let h = harness()
+        let model = QuickNoteExitModel(doc: Fixtures.docID, app: h.app, session: h.session)
+        let controller = QuickNotePresenter.controller(for: model)
+        XCTAssertEqual(controller.modalPresentationStyle, .formSheet)
+        XCTAssertTrue(controller.view.accessibilityViewIsModal,
+                      "Combine targets must not compete with document cards in the library behind the sheet")
+        XCTAssertNotNil(model.dismiss)
+        XCTAssertNotNil(model.presentationDelegate)
+    }
+
     func testCustomDimensionErrorsIdentifyFirstFieldAndClearAfterCorrection() async {
         let h = harness()
         let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
@@ -1932,8 +1943,27 @@ final class FeatCreateTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(coverFrame.height, 116)
                 XCTAssertGreaterThanOrEqual(previewFrame.minY, 0)
                 XCTAssertGreaterThan(coverFrame.minY, previewFrame.maxY)
+                // DESIGN §4.2 requires sheets to scale fully to AX5. At accessibility
+                // sizes the cover's multiline name may exceed a short viewport;
+                // it must remain reachable by scrolling, not by shrinking its text.
+                if variant.dynamicTypeSize.isAccessibilitySize {
+                    func scrolls(in view: UIView) -> [UIScrollView] {
+                        (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrolls(in: $0) }
+                    }
+                    let scroll = try XCTUnwrap(scrolls(in: host.view).first {
+                        $0.contentSize.height > $0.bounds.height
+                    })
+                    let reveal = max(0, coverFrame.maxY - size.height + NibSpacing.l + 1)
+                    scroll.setContentOffset(CGPoint(x: 0, y: reveal), animated: false)
+                    for _ in 0..<5 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                    XCTAssertGreaterThanOrEqual(coverFrame.minY, 0, "Scrolling must reveal the entire cover choice")
+                }
                 XCTAssertLessThan(coverFrame.maxY, size.height - NibSpacing.l,
-                                  "Cover choices and their names must be visible on opening, before the fade")
+                                  "Cover choices and their names must be visible before the fade, scrolling at AX sizes")
                 XCTAssertGreaterThan(paperFrame.minY, coverFrame.maxY,
                                      "Paper must follow the cover strip in the same content flow")
             }

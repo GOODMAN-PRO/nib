@@ -254,7 +254,7 @@ final class CanvasKeyboardResponder: UIView {
     private weak var host: CanvasHost?
     private var observers: NotificationBag?
     private var focusScheduled = false
-    private var shortcuts: Set<KeyShortcut> = []
+    private var heldModifiers = CanvasHeldModifiers()
     private let hardwareInputView = UIView(frame: .zero)
 
     // Navigation advertises key commands without accepting text insertion.
@@ -284,11 +284,6 @@ final class CanvasKeyboardResponder: UIView {
 
     func attach(to host: CanvasHost) {
         self.host = host
-        shortcuts = Set(GlobalShortcuts.catalog(app: host.app, owner: FeatKeyboardFeature.id)
-            // The Assistant is available in every document kind, but its shortcut must also reach
-            // the canvas responder below SwiftUI's hosting boundary after a panel closes.
-            .filter { $0.docKinds == ShortcutContext.canvasKinds || $0.command == "ai.chat.open" }
-            .map { ShortcutRules.normalized($0.shortcut) })
         host.canvasView.addSubview(self)
         let bag = NotificationBag()
         observers = bag
@@ -358,15 +353,10 @@ final class CanvasKeyboardResponder: UIView {
 
     private var descriptors: [KeyCommandDescriptor] {
         guard let host, host.session.document == host.documentID else { return [] }
-        return KeyCommandRouting.active(host.app.content.keyCommands.all, in: context).filter {
-            if shortcuts.contains(ShortcutRules.normalized($0.shortcut)) { return true }
-            // Feature-owned page shortcuts (e.g. the Pencil palette) also need a target below the
-            // SwiftUI hosting boundary. Read the live registry so late registrations/replacements
-            // work; the keyboard feature's catalog is not the complete set of canvas commands.
-            guard $0.scope == .document || $0.scope == .canvas,
-                  let kinds = $0.docKinds, !kinds.isEmpty else { return false }
-            return kinds.isSubset(of: ShortcutContext.canvasKinds)
-        }
+        // The registry has already resolved scope, kind, text focus and conflicts.
+        // Requiring an explicit kind here loses document-wide commands such as
+        // Sidebar and tab switching at the SwiftUI hosting boundary.
+        return KeyCommandRouting.active(host.app.content.keyCommands.all, in: context)
     }
 
     override var keyCommands: [UIKeyCommand]? {
@@ -425,13 +415,36 @@ final class CanvasKeyboardResponder: UIView {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.begin(key.keyCode) } }
         var unhandled = presses
         for press in presses {
+            #if DEBUG
+            if let key = press.key {
+                NSLog("[Canvas keyboard] code=%ld keyFlags=%lu eventFlags=%lu first=%d commands=%ld", key.keyCode.rawValue,
+                      key.modifierFlags.rawValue, event?.modifierFlags.rawValue ?? 0, isFirstResponder ? 1 : 0, descriptors.count)
+            }
+            #endif
             guard let key = press.key,
-                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+                  performUnhandledPress(heldModifiers.shortcut(key, event: event)) else { continue }
             unhandled.remove(press)
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.end(key.keyCode) } }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.end(key.keyCode) } }
+        super.pressesCancelled(presses, with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { heldModifiers = CanvasHeldModifiers() }
+        return resigned
     }
 
     /// UIKit delivers only presses that did not invoke a UIKeyCommand here. Handle them
@@ -480,13 +493,38 @@ final class CanvasKeyboardResponder: UIView {
     }
 }
 
+/// Modifier down/up events can be forwarded separately from the printable press.
+/// Retain only physical modifiers, never infer a chord from the requested action.
+struct CanvasHeldModifiers {
+    private(set) var keys: Set<UIKeyboardHIDUsage> = []
+
+    mutating func begin(_ code: UIKeyboardHIDUsage) {
+        switch code {
+        case .keyboardLeftGUI, .keyboardRightGUI, .keyboardLeftAlt, .keyboardRightAlt,
+             .keyboardLeftShift, .keyboardRightShift, .keyboardLeftControl, .keyboardRightControl:
+            keys.insert(code)
+        default: break
+        }
+    }
+
+    mutating func end(_ code: UIKeyboardHIDUsage) { keys.remove(code) }
+
+    /// Focus can move before UIKit delivers the corresponding key-up events.
+    mutating func reset() { keys.removeAll() }
+
+    @MainActor
+    func shortcut(_ key: UIKey, event: UIPressesEvent?) -> KeyShortcut {
+        CanvasKeyPress.shortcut(key, event: event, heldKeys: Array(keys))
+    }
+}
+
 /// A forwarded key can carry its chord on the event rather than the individual key.
 /// Preserve both, and use HID codes for navigation keys whose characters are private Unicode.
 @MainActor
 enum CanvasKeyPress {
-    static func shortcut(_ key: UIKey, event: UIPressesEvent?) -> KeyShortcut {
-        let held = event?.allPresses.filter { $0.phase != .ended && $0.phase != .cancelled }
-            .compactMap { $0.key?.keyCode } ?? []
+    static func shortcut(_ key: UIKey, event: UIPressesEvent?, heldKeys: [UIKeyboardHIDUsage] = []) -> KeyShortcut {
+        let held = heldKeys + (event?.allPresses.filter { $0.phase != .ended && $0.phase != .cancelled }
+            .compactMap { $0.key?.keyCode } ?? [])
         return shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
                         keyFlags: key.modifierFlags, eventFlags: event?.modifierFlags ?? [], heldKeys: held)
     }
@@ -499,7 +537,7 @@ enum CanvasKeyPress {
         case .keyboardReturnOrEnter, .keypadEnter: input = "return"
         case .keyboardEscape: input = "escape"
         case .keyboardTab: input = "tab"
-        case .keyboardDeleteOrBackspace: input = "delete"
+        case .keyboardDeleteOrBackspace, .keyboardDeleteForward: input = "delete"
         case .keyboardUpArrow: input = "up"
         case .keyboardDownArrow: input = "down"
         case .keyboardLeftArrow: input = "left"

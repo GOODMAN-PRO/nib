@@ -90,6 +90,8 @@ private struct PopoverScrollInteraction: UIViewRepresentable {
     }
     final class Probe: UIView {
         var isPresented = true
+        private weak var scrollHost: UIScrollView?
+        private var hideAfterFade: DispatchWorkItem?
         override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
         override func layoutSubviews() { super.layoutSubviews(); updateScrollView() }
         override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
@@ -97,8 +99,30 @@ private struct PopoverScrollInteraction: UIViewRepresentable {
             var ancestor = superview
             while let view = ancestor {
                 if let scroll = view as? UIScrollView {
+                    if scrollHost !== scroll {
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scrollHost = scroll
+                    }
                     scroll.isUserInteractionEnabled = isPresented
                     scroll.accessibilityElementsHidden = !isPresented
+                    if isPresented {
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scroll.isHidden = false
+                    } else if !scroll.isHidden, hideAfterFade == nil {
+                        // accessibilityElementsHidden hides children, but UIKit can
+                        // still expose the scroll container itself after the bud's
+                        // transform collapses its frame. Retain the view/offset and
+                        // the 120 ms closing fade (DESIGN §10.6), then hide it natively.
+                        let work = DispatchWorkItem { [weak self, weak scroll] in
+                            guard let self, !self.isPresented else { return }
+                            scroll?.isHidden = true
+                            self.hideAfterFade = nil
+                        }
+                        hideAfterFade = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+                    }
                     return
                 }
                 ancestor = view.superview
