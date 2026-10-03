@@ -349,6 +349,7 @@ struct PencilSettingsView: View {
                     }
                 }
                 .accessibilityIdentifier("cmd." + CommandIDs.settingsSet)
+                .accessibilityValue(gesture.title)
                 .accessibilityAddTraits(selected ? .isSelected : [])
             }
         } header: {

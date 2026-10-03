@@ -100,6 +100,9 @@ final class PresetMenuModel {
     private(set) var shown: PresetPopover = .width(1)
     /// Remove and reorder colour slots, restore the defaults (a mode of the bar itself).
     private(set) var arranging = false
+    /// Drag ownership belongs to the window's menu, not a transient SwiftUI
+    /// rendering of it. Glass hosting may retain/rebuild the bar during a drag.
+    @ObservationIgnored var draggedSwatch: Int?
     /// The thickness slider (0…1 on the tool's logarithmic scale) of the thickness slot `shown` names.
     private(set) var widthPosition: Double = 0
 
@@ -187,11 +190,13 @@ final class PresetMenuModel {
 
     func beginArranging() {
         close()
+        draggedSwatch = nil
         arranging = true
         UIAccessibility.post(notification: .layoutChanged, argument: nil)
     }
 
     func endArranging() {
+        draggedSwatch = nil
         arranging = false
         UIAccessibility.post(notification: .layoutChanged, argument: nil)
     }
@@ -378,7 +383,6 @@ struct ToolPresetMenu: View {
     let model: PresetMenuModel
 
     @State private var confirmReset = false
-    @State private var dragged: Int?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var presets: ToolPresets { model.presets }
@@ -393,7 +397,6 @@ struct ToolPresetMenu: View {
             }
         }
         .onAppear { model.reload() }
-        .onChange(of: model.arranging) { _, _ in dragged = nil }
         .confirmationDialog(String(localized: "Restore the default colours and thicknesses?"),
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button(String(localized: "Restore Defaults"), role: .destructive) { model.reset() }
@@ -492,20 +495,13 @@ struct ToolPresetMenu: View {
         let registry = model.app?.content.tapePatterns
         if arranging {
             SwatchSlot(tool: tool, swatch: swatch, name: removable ? String(localized: "Remove \(name)") : name,
-                       isSelected: false, registry: registry) {
+                       isSelected: false, registry: registry, reorder: PresetSwatchReorder(model: model, index: i)) {
                 if removable { model.remove(i) }
             }
             .accessibilityIdentifier("cmd.preset.removeSwatch")
             .overlay(alignment: .topTrailing) {
                 if removable { RemoveBadge() }
             }
-            .onDrag {
-                dragged = i
-                return NSItemProvider(object: SwatchDropDelegate.payload(i) as NSString)
-            }
-            .onDrop(of: [UTType.plainText], delegate: SwatchDropDelegate(index: i, dragged: $dragged) { from, to in
-                model.move(from, to)
-            })
             .accessibilityAction(named: Text(String(localized: "Move Left"))) {
                 if i > 0 { model.move(i, i - 1) }
             }
@@ -625,6 +621,7 @@ struct LineSampleButton: View {
         .accessibilityValue(value ?? "")
         .accessibilityHint(hint ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .nibNativeAction(action)
     }
 }
 
@@ -646,6 +643,7 @@ struct SwatchSlot: View {
     let isSelected: Bool
     let registry: Registry<TapePatternDescriptor>?
     var menu: UIMenu? = nil
+    var reorder: PresetSwatchReorder? = nil
     let action: () -> Void
     @State private var pattern: NibSwatchPattern?
 
@@ -656,8 +654,8 @@ struct SwatchSlot: View {
         let colour = PresetColour.display(swatch.color, tool: tool)
         let display = PresetColour.swatch(colour, id: swatch.color.hex, name: name, pattern: pattern)
         Group {
-            if let menu {
-                PresetSwatchControl(swatch: display, isSelected: isSelected, menu: menu, action: action)
+            if menu != nil || reorder != nil {
+                PresetSwatchControl(swatch: display, isSelected: isSelected, menu: menu, reorder: reorder, action: action)
                     .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
             } else {
                 NibPenSwatch(display, isSelected: isSelected, size: .palette, action: action)
@@ -679,30 +677,58 @@ struct SwatchSlot: View {
 struct PresetSwatchControl: UIViewRepresentable {
     let swatch: NibSwatch
     let isSelected: Bool
-    let menu: UIMenu
+    let menu: UIMenu?
+    var reorder: PresetSwatchReorder? = nil
     let action: () -> Void
 
     func makeUIView(context: Context) -> PresetSwatchNativeButton { PresetSwatchNativeButton() }
 
     func updateUIView(_ button: PresetSwatchNativeButton, context: Context) {
-        button.configure(swatch: swatch, isSelected: isSelected, menu: menu, action: action)
+        button.configure(swatch: swatch, isSelected: isSelected, menu: menu, reorder: reorder, action: action)
     }
 }
 
-final class PresetSwatchNativeButton: UIButton {
+/// Local drag ownership excludes foreign text, other tools and other document windows.
+@MainActor
+struct PresetSwatchReorder {
+    let model: PresetMenuModel
+    let index: Int
+
+    func accepts(_ source: PresetSwatchReorder) -> Bool {
+        model === source.model && model.arranging && model.draggedSwatch == source.index &&
+        model.presets.swatches.indices.contains(index) && model.presets.swatches.indices.contains(source.index)
+    }
+
+    @discardableResult
+    func perform(_ source: PresetSwatchReorder) -> Bool {
+        guard accepts(source) else { return false }
+        model.draggedSwatch = nil
+        if source.index != index { model.move(source.index, index) }
+        return true
+    }
+}
+
+final class PresetSwatchNativeButton: UIButton, UIDragInteractionDelegate, UIDropInteractionDelegate {
     private var tap: (() -> Void)?
     private var menuOwnsInteraction = false
     private var pendingMenu: UIMenu?
+    private var hasPendingMenu = false
+    private var reorder: PresetSwatchReorder?
+    private var dragOwnsInteraction = false
+    private lazy var swatchDrag = UIDragInteraction(delegate: self)
 
     init() {
         super.init(frame: .zero)
         showsMenuAsPrimaryAction = false
         isPointerInteractionEnabled = true
+        swatchDrag.isEnabled = false
+        addInteraction(swatchDrag)
+        addInteraction(UIDropInteraction(delegate: self))
         // UIButton can forward touchUpInside to its primary action even after a menu
         // long press. Keep that release from toggling the editor behind the menu.
         addAction(UIAction { [weak self] _ in self?.menuOwnsInteraction = true }, for: .menuActionTriggered)
         addAction(UIAction { [weak self] _ in
-            guard let self, !self.menuOwnsInteraction else { return }
+            guard let self, !self.menuOwnsInteraction, !self.dragOwnsInteraction else { return }
             self.tap?()
         }, for: .primaryActionTriggered)
         accessibilityIdentifier = "cmd.preset.select"
@@ -729,7 +755,11 @@ final class PresetSwatchNativeButton: UIButton {
         let finished: () -> Void = { [weak self] in
             guard let self else { return }
             self.menuOwnsInteraction = false
-            if let pendingMenu = self.pendingMenu { self.menu = pendingMenu; self.pendingMenu = nil }
+            if self.hasPendingMenu {
+                self.menu = self.pendingMenu
+                self.pendingMenu = nil
+                self.hasPendingMenu = false
+            }
         }
         if let animator {
             animator.addCompletion(finished)
@@ -739,16 +769,55 @@ final class PresetSwatchNativeButton: UIButton {
         }
     }
 
-    func configure(swatch: NibSwatch, isSelected: Bool, menu: UIMenu, action: @escaping () -> Void) {
+    func configure(swatch: NibSwatch, isSelected: Bool, menu: UIMenu?, reorder: PresetSwatchReorder? = nil,
+                   action: @escaping () -> Void) {
         tap = action
+        self.reorder = reorder
+        swatchDrag.isEnabled = reorder != nil
+        accessibilityIdentifier = reorder == nil ? "cmd.preset.select" : "cmd.preset.removeSwatch"
         // UIKit dismisses/rebuilds an open menu if its button's menu is replaced.
         // Session/chrome updates must leave the user's current interaction intact.
-        if menuOwnsInteraction { pendingMenu = menu } else { self.menu = menu }
+        if menuOwnsInteraction {
+            pendingMenu = menu
+            hasPendingMenu = true
+        } else {
+            self.menu = menu
+        }
         self.isSelected = isSelected
         setImage(.nibSwatch(swatch, size: .palette, isSelected: isSelected), for: .normal)
         accessibilityLabel = swatch.pattern?.name.map { "\(swatch.name), \($0)" } ?? swatch.name
         accessibilityTraits = isSelected ? [.button, .selected] : [.button]
     }
+
+    func dragInteraction(_ interaction: UIDragInteraction, itemsForBeginning session: UIDragSession) -> [UIDragItem] {
+        guard let reorder, reorder.model.arranging else { return [] }
+        dragOwnsInteraction = true
+        reorder.model.draggedSwatch = reorder.index
+        let item = UIDragItem(itemProvider: NSItemProvider(object: SwatchDropDelegate.payload(reorder.index) as NSString))
+        item.localObject = reorder
+        return [item]
+    }
+
+    func dragInteraction(_ interaction: UIDragInteraction, sessionDidEnd session: UIDragSession) {
+        reorder?.model.draggedSwatch = nil
+        DispatchQueue.main.async { [weak self] in self?.dragOwnsInteraction = false }
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+        guard session.localDragSession != nil,
+              let source = session.items.first?.localObject as? PresetSwatchReorder else { return false }
+        return reorder?.accepts(source) == true
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+        UIDropProposal(operation: dropInteraction(interaction, canHandle: session) ? .move : .cancel)
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+        guard let source = session.items.first?.localObject as? PresetSwatchReorder else { return }
+        reorder?.perform(source)
+    }
+
 }
 
 @MainActor
