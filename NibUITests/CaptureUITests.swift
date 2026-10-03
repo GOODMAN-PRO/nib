@@ -9,6 +9,7 @@ final class CaptureUITests: XCTestCase {
     private var ui: NibUI!
     private var appearance = "light"
     private var orientation = "portrait"
+    private var windowed = false
     private let notebook = "Physics — Motion"
 
     override func setUpWithError() throws {
@@ -29,14 +30,20 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func variants(scenario: NibUI.FixtureScenario = .standard, onboarding: Bool = false, agent: Bool = false,
+                          emptyLibrary: Bool = false, windowed: Bool = false,
                           styles: [String] = ["light", "dark"],
                           _ body: () throws -> Void) {
         for style in styles {
             for direction in ["portrait", "landscape"] {
                 appearance = style
                 orientation = direction
+                self.windowed = windowed
                 ui = NibUI()
                 do {
+                    // On iPadOS 26 rotating a floating scene does not resize its
+                    // window. Use the public Settings mode before launching the
+                    // full-screen tour; windowed coverage is captured separately.
+                    try NibUIMultitasking.setWindowed(windowed)
                     // NibUI.launchFixture owns its launch arguments, so compose the same
                     // explicit fixture launch here and use its probe/navigation helpers.
                     ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
@@ -44,6 +51,7 @@ final class CaptureUITests: XCTestCase {
                                               "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
                     if onboarding { ui.app.launchArguments.append("-NibUITestOnboarding") }
                     if agent { ui.app.launchArguments.append("-NibUITestAgent") }
+                    if emptyLibrary { ui.app.launchArguments.append("-NibUITestEmptyLibrary") }
                     ui.app.launch()
                     if onboarding {
                         try wait("First-run fixture must finish preparing", timeout: 120) {
@@ -57,6 +65,7 @@ final class CaptureUITests: XCTestCase {
                     // delivering another orientation. The application's union frame can
                     // contain stale keyboard/system windows after a previous variant.
                     try rotate(to: direction)
+                    if !windowed { try NibUIMultitasking.assertFullScreen(ui.app) }
                     if !onboarding { try showDocuments() }
                     try body()
                 } catch {
@@ -77,6 +86,12 @@ final class CaptureUITests: XCTestCase {
         let reached: () -> Bool = {
             let window = self.ui.app.windows.firstMatch
             guard window.exists else { return false }
+            // A windowed scene is allowed its own aspect ratio. The variant
+            // describes device orientation, verified from the real screenshot.
+            if self.windowed {
+                let size = XCUIScreen.main.screenshot().image.size
+                return direction == "portrait" ? size.height > size.width : size.width > size.height
+            }
             let frame = window.frame
             return frame.width > 0 && frame.height > 0 &&
                 (direction == "portrait" ? frame.height > frame.width : frame.width > frame.height)
@@ -234,7 +249,7 @@ final class CaptureUITests: XCTestCase {
             _ = try self.require("List")
             try self.libraryCapture(10, "library-sort-view-menu")
             try self.tap("List")
-            self.ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
+            self.ui.app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
             _ = try self.require(self.notebook)
             try self.libraryCapture(8, "library-list")
             try self.folder("Semester Notes")
@@ -287,7 +302,7 @@ final class CaptureUITests: XCTestCase {
         case "top": destination = CGVector(dx: 0.5, dy: 0.12)
         default: destination = CGVector(dx: 0.5, dy: 0.94)
         }
-        start.press(forDuration: 0.15, thenDragTo: ui.app.coordinate(withNormalizedOffset: destination),
+        start.press(forDuration: 0.15, thenDragTo: ui.app.windows.firstMatch.coordinate(withNormalizedOffset: destination),
                     withVelocity: .slow, thenHoldForDuration: 0.3)
         _ = try ui.waitForState(timeout: 30) { $0.paletteDock?.edge == edge }
     }
@@ -985,6 +1000,28 @@ final class CaptureUITests: XCTestCase {
             self.ui.app.typeKey("t", modifierFlags: .command)
             _ = try self.require("Turn Into")
             try self.documentCapture(83, "text-document-turn-into")
+        }
+    }
+
+    func test56EmptyLibrary() {
+        variants(emptyLibrary: true) {
+            _ = try self.require("No notebooks yet")
+            _ = try self.reachable("New Notebook")
+            try self.libraryCapture(130, "library-empty")
+        }
+    }
+
+    func test57WindowedLibraryAndEditor() {
+        // iPhone has no Windowed Apps mode. Its compact full-screen routes are
+        // already captured above; never label those as windowed variants.
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return }
+        variants(windowed: true) {
+            _ = try self.reachable("New")
+            try self.libraryCapture(131, "library-windowed")
+            try self.openNotebook()
+            _ = try self.reachable("tool.pen")
+            _ = try self.reachable("menu.more")
+            try self.documentCapture(132, "editor-windowed")
         }
     }
 
