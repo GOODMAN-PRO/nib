@@ -249,6 +249,7 @@ public struct NibWidthPresetButton: View {
         .nibTooltip(label)
         .accessibilityLabel(label)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .nibNativeAction(action)
     }
 }
 
@@ -269,14 +270,18 @@ public struct NibSegmentedControl<Value: Hashable>: View {
     @Environment(\.dynamicTypeSize) private var typeSize
 
     public var body: some View {
-        if typeSize.isAccessibilitySize {
-            verticalOptions
-        } else {
-            ViewThatFits(in: .horizontal) {
-                horizontalOptions.fixedSize(horizontal: true, vertical: true)
+        Group {
+            if typeSize.isAccessibilitySize {
                 verticalOptions
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    horizontalOptions.fixedSize(horizontal: true, vertical: true)
+                    verticalOptions
+                }
             }
         }
+        // A caller's group label must not replace every segment's own title.
+        .accessibilityElement(children: .contain)
     }
 
     private var horizontalOptions: some View {
@@ -332,7 +337,11 @@ public struct NibSegmentedControl<Value: Hashable>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
+        .accessibilityLabel(title(option))
         .accessibilityAddTraits(selected ? .isSelected : [])
+        .nibNativeAction {
+            withAnimation(NibMotion.tap.animation) { selection = option }
+        }
     }
 }
 

@@ -52,6 +52,15 @@ final class InkUITests: XCTestCase {
         let predicate = NSPredicate(format: "identifier == %@ OR label == %@", label, label)
         let query = ui.app.descendants(matching: type).matching(predicate)
         for attempt in 0..<(scroll ? 12 : 2) {
+            // Native menus expose transient, same-labelled noninteractive wrappers.
+            // Query the actual control first: inspecting a wrapper's hit point can
+            // fail while UIKit replaces it, although its action remains available.
+            for kind in [XCUIElement.ElementType.button, .switch, .slider, .textField, .segmentedControl]
+                where type == .any || type == kind {
+                let action = ui.app.descendants(matching: kind).matching(predicate).matching(
+                    NSPredicate(format: "NOT identifier BEGINSWITH 'tool.' OR identifier == %@", label)).firstMatch
+                if action.exists && (action.isHittable || !action.isEnabled) { return action }
+            }
             let matches = query.allElementsBoundByIndex.filter {
                 ($0.isHittable || !$0.isEnabled) && (label.hasPrefix("tool.") || !$0.identifier.hasPrefix("tool."))
             }
@@ -83,6 +92,20 @@ final class InkUITests: XCTestCase {
         let element = try control(label, scroll: scroll)
         XCTAssertTrue(element.isEnabled, "\(label) must be enabled")
         element.tap()
+    }
+
+    private func typeKey(_ key: String, modifierFlags: XCUIElement.KeyModifierFlags) {
+        // XCTest's synthetic keyboard survives app relaunches. A complete
+        // modifier down/up cycle synchronizes it with the new scene before the
+        // unchanged chord. Without this, CI delivered plain P and comma with
+        // both UIKey and UIPressesEvent modifier flags zero, even inside perform.
+        let modifiers: [(XCUIElement.KeyModifierFlags, XCUIKeyboardKey)] = [
+            (.command, .command), (.control, .control), (.option, .option), (.shift, .shift)
+        ]
+        for (flag, physicalKey) in modifiers where modifierFlags.contains(flag) {
+            ui.app.typeKey(physicalKey.rawValue, modifierFlags: [])
+        }
+        ui.app.typeKey(key, modifierFlags: modifierFlags)
     }
 
     private func settings(_ tool: String) throws {
@@ -195,7 +218,8 @@ final class InkUITests: XCTestCase {
     }
 
     private func undo(to before: QAState) throws {
-        try ui.tapCommand("edit.undo")
+        let button = try control("cmd.edit.undo", type: .button)
+        button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         _ = try ui.waitForState(timeout: 12) {
             $0.strokeCountOnPage == before.strokeCountOnPage && $0.itemCountOnPage == before.itemCountOnPage && $0.redoAvailable
         }
@@ -207,8 +231,8 @@ final class InkUITests: XCTestCase {
         // The main palette mirrors quick inks using the same command ID. Count/edit only the slots in
         // the active tool's options bar; the mirrored buttons are not additional stored presets.
         let group = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", (names[tool] ?? tool) + " presets")).firstMatch
-        return group.buttons.matching(identifier: "cmd.preset.select").allElementsBoundByIndex
-            .filter { !$0.label.hasPrefix("Thickness ") }
+        return group.buttons.matching(NSPredicate(format:
+            "identifier == 'cmd.preset.select' AND NOT label BEGINSWITH 'Thickness '")).allElementsBoundByIndex
     }
 
     private func width(_ slot: Int, edit: Bool = false) throws {
@@ -235,7 +259,7 @@ final class InkUITests: XCTestCase {
 
     private func closeColourPicker() throws {
         // UIKit labels the colour picker's dismissal Close on current iPadOS, Done on older releases.
-        if let close = ui.app.buttons.matching(identifier: "Close").allElementsBoundByIndex.last(where: { $0.isHittable }) {
+        if let close = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'")).allElementsBoundByIndex.last(where: { $0.isHittable }) {
             close.tap()
         } else {
             try tap("Done")
@@ -264,14 +288,23 @@ final class InkUITests: XCTestCase {
             // UIImage.draw applies the capture's orientation before we address screen-coordinate pixels.
             let source = screenshot.image
             let format = UIGraphicsImageRendererFormat()
-            format.scale = source.scale
+            // XCUIScreenshot can wrap a Retina capture in a scale-1 UIImage.
+            // Preserve its physical pixels: downsampling can erase a sub-point
+            // pen line even though it is present in the original capture.
+            if let pixels = source.cgImage {
+                format.scale = CGFloat(max(pixels.width, pixels.height)) / max(screenSize.width, screenSize.height)
+            } else {
+                format.scale = source.scale
+            }
             let image = UIGraphicsImageRenderer(size: screenSize, format: format).image { _ in
                 source.draw(in: CGRect(origin: .zero, size: screenSize))
             }
             guard let cg = image.cgImage else { throw NibUI.Failure.message("Screen capture has no CGImage") }
             let scale = CGFloat(cg.width) / image.size.width
-            let pixels = CGRect(x: rect.minX * scale, y: rect.minY * scale,
-                                width: rect.width * scale, height: rect.height * scale)
+            // Round origin and extent separately. CGImage's implicit enclosing
+            // rectangle otherwise changes crop dimensions with subpixel phase.
+            let pixels = CGRect(x: (rect.minX * scale).rounded(), y: (rect.minY * scale).rounded(),
+                                width: (rect.width * scale).rounded(), height: (rect.height * scale).rounded())
             guard pixels.width > 0, pixels.height > 0, let crop = cg.cropping(to: pixels) else {
                 throw NibUI.Failure.message("Screen/canvas geometry not ready: screen=\(screenSize), crop=\(pixels), image=\(cg.width)x\(cg.height)")
             }
@@ -288,7 +321,10 @@ final class InkUITests: XCTestCase {
             bytes = buffer
         }
         func changed(from old: Raster) -> Int {
-            guard width == old.width && height == old.height else { return 0 }
+            guard width == old.width && height == old.height else {
+                XCTFail("Cannot compare different raster extents: \(old.width)×\(old.height) → \(width)×\(height)")
+                return 0
+            }
             return stride(from: 0, to: bytes.count, by: 4).filter { i in
                 (0..<3).map { abs(Int(bytes[i + $0]) - Int(old.bytes[i + $0])) }.max()! > 30
             }.count
@@ -305,8 +341,20 @@ final class InkUITests: XCTestCase {
 
     private func raster(_ region: CGRect? = nil) throws -> Raster {
         let r = region ?? inkRegion, f = ui.canvas.frame
-        return try Raster(XCUIScreen.main.screenshot(), screenSize: ui.app.frame.size, rect: CGRect(x: f.minX + r.minX * f.width, y: f.minY + r.minY * f.height,
-                                                           width: r.width * f.width, height: r.height * f.height))
+        return try raster(screenRect: CGRect(x: f.minX + r.minX * f.width, y: f.minY + r.minY * f.height,
+                                            width: r.width * f.width, height: r.height * f.height))
+    }
+
+    private func raster(screenRect: CGRect) throws -> Raster {
+        // Device captures use display coordinates even in a resized iPad window.
+        // Scaling the whole display to the app window moves the measured endpoints.
+        let screen = XCUIApplication(bundleIdentifier: "com.apple.springboard").frame.size
+        // SpringBoard can stay portrait while the foreground scene is landscape.
+        // Use the physical display dimensions in the requested device orientation.
+        let landscape = XCUIDevice.shared.orientation.isLandscape
+        let displaySize = CGSize(width: landscape ? max(screen.width, screen.height) : min(screen.width, screen.height),
+                                 height: landscape ? min(screen.width, screen.height) : max(screen.width, screen.height))
+        return try Raster(XCUIScreen.main.screenshot(), screenSize: displaySize, rect: screenRect)
     }
 
     private func visibleInk(after before: Raster, region: CGRect? = nil) throws -> Raster {
@@ -428,10 +476,15 @@ final class InkUITests: XCTestCase {
             for value: CGFloat in [0.01, 0.99] {
                 try settings(tool); _ = try slider("Stabilisation", to: value); closePopover()
                 let before = try ui.state(), blank = try raster()
+                let endpoints = [zigzag.first!, zigzag.last!].map {
+                    CGRect(x: $0.x - 0.01, y: $0.y - 0.01, width: 0.02, height: 0.02)
+                }
+                let emptyEndpoints = try endpoints.map { try raster($0) }
                 try draw(zigzag); images.append(try visibleInk(after: blank))
-                for p in [zigzag.first!, zigzag.last!] {
-                    let endpoint = CGRect(x: p.x - 0.01, y: p.y - 0.01, width: 0.02, height: 0.02)
-                    XCTAssertGreaterThan(try raster(endpoint).darkPixels, 0, "Stabilisation must retain both endpoints")
+                for (endpoint, empty) in zip(endpoints, emptyEndpoints) {
+                    // F007 uses native graphite. Its translucent tip must leave a mark,
+                    // but need not cross the opaque-ink darkness threshold.
+                    XCTAssertGreaterThan(try raster(endpoint).changed(from: empty), 0, "Stabilisation must retain both endpoints")
                 }
                 try undo(to: before)
             }
@@ -607,7 +660,8 @@ final class InkUITests: XCTestCase {
         try settings("highlighter"); try tap("Custom…")
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
-        let spectrum = try control("Color spectrum")
+        let spectrum = ui.app.otherElements.matching(NSPredicate(format: "label ==[c] 'Color Spectrum'")).firstMatch
+        XCTAssertTrue(spectrum.waitForExistence(timeout: 5) && spectrum.isHittable)
         spectrum.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.35)).tap()
         try closeColourPicker()
         closePopover()
@@ -686,14 +740,14 @@ final class InkUITests: XCTestCase {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
         try tap("Sliders")
         let hex = try hexField()
-        hex.tap(); ui.app.typeKey("a", modifierFlags: .command); hex.typeText("D03080")
+        hex.tap(); typeKey("a", modifierFlags: .command); hex.typeText("D03080")
         try closeColourPicker()
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
         try swatchMenu("Change Colour"); try tap("Custom Colour"); try tap("Sliders")
         let invalid = try hexField()
-        invalid.tap(); ui.app.typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
+        invalid.tap(); typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
         try closeColourPicker(); closePopover()
         XCTAssertEqual(swatches[0].label, valid, "Invalid HEX must not overwrite a valid colour")
         let blank = try raster(); try draw(); _ = try visibleInk(after: blank)
@@ -722,6 +776,9 @@ final class InkUITests: XCTestCase {
     }
 
     func testAddColourPreservesExistingSlotsAndStopsAtTwelve() throws {
+        // This scenario performs nine additions and ten draw/undo cycles. The
+        // generic three-minute CI limit measures XCTest transport, not F008's UI.
+        executionTimeAllowance = 300
         let original = swatches.map(\.label)
         for count in original.count..<12 {
             try tap("Add Colour"); try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
@@ -734,7 +791,7 @@ final class InkUITests: XCTestCase {
         XCTAssertEqual(swatches.count, 12)
         // CONTRACTS KeyCommandRouting: notebook-specific preset keys beat the unrestricted pencil key 2.
         for index in 0..<10 {
-            ui.app.typeKey(index == 9 ? "0" : String(index + 1), modifierFlags: [])
+            typeKey(index == 9 ? "0" : String(index + 1), modifierFlags: [])
             try wait("Digit key must select colour slot \(index + 1)") { self.swatches[index].isSelected }
             XCTAssertEqual(try ui.state().tool, "pen", "Preset arbitration must not unexpectedly select pencil")
             let before = try ui.state(), blank = try raster()
@@ -1085,7 +1142,7 @@ final class InkUITests: XCTestCase {
     }
 
     func testDrawShapeRecognisesOnLiftAndKeepsUnrecognisedInk() throws {
-        ui.app.typeKey("d", modifierFlags: [])
+        typeKey("d", modifierFlags: [])
         _ = try ui.waitForState { $0.tool == "drawShape" }
         try settings("drawShape")
         try toggle("Draw and Hold", to: true); try toggle("Require Hold to Snap", to: false); closePopover()
@@ -1160,24 +1217,24 @@ final class InkUITests: XCTestCase {
 
     func testKeyboardToolWidthColourUndoAndRedoActions() throws {
         try ui.selectTool("lasso")
-        ui.app.typeKey("p", modifierFlags: [])
+        typeKey("p", modifierFlags: [])
         _ = try ui.waitForState { $0.tool == "pen" }
         let before = try ui.state(); try draw()
-        ui.app.typeKey("z", modifierFlags: .command)
+        typeKey("z", modifierFlags: .command)
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.redoAvailable }
-        ui.app.typeKey("z", modifierFlags: [.command, .shift])
+        typeKey("z", modifierFlags: [.command, .shift])
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && !$0.redoAvailable }
-        ui.app.typeKey("h", modifierFlags: [])
+        typeKey("h", modifierFlags: [])
         _ = try ui.waitForState { $0.tool == "highlighter" }
         try width(1)
-        ui.app.typeKey("]", modifierFlags: [])
+        typeKey("]", modifierFlags: [])
         XCTAssertTrue(try control("Thickness 2", type: .button).isSelected)
-        ui.app.typeKey("[", modifierFlags: [])
+        typeKey("[", modifierFlags: [])
         XCTAssertTrue(try control("Thickness 1", type: .button).isSelected)
-        ui.app.typeKey("3", modifierFlags: [])
+        typeKey("3", modifierFlags: [])
         XCTAssertTrue(swatches[2].isSelected)
         try draw()
-        ui.app.typeKey("e", modifierFlags: [])
+        typeKey("e", modifierFlags: [])
         _ = try ui.waitForState { $0.tool == "eraser" }
     }
 
@@ -1196,15 +1253,31 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try draw()
         try draw([CGPoint(x: 0.4, y: 0.72), CGPoint(x: 0.6, y: 0.72)])
-        try ui.tapCommand("sidebar.toggle"); try tap("Panel Options"); try tap("History")
+        // The page counter has the same title. Scope this to paper inside the
+        // canvas; a first match on the whole app can select the stationary HUD.
+        let pages = ui.canvas.descendants(matching: .other).matching(NSPredicate(format: "label == 'Page 1 of 4'"))
+        XCTAssertEqual(pages.count, 1, "The canvas must expose one matching paper page")
+        let page = pages.element(boundBy: 0)
+        let drawnPage = page.frame, drawnCanvas = ui.canvas.frame
+        try tap("cmd.sidebar.toggle"); try tap("Panel Options"); try tap("History")
         _ = try ui.waitForState { $0.openPanels.contains("undo.history") }
         let reverts = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Revert '"))
         try wait("History must offer a Revert action for each stroke") { reverts.count == 2 }
         reverts.element(boundBy: 1).tap() // newest first: choose the older stroke
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
-        try ui.tapCommand("sidebar.toggle")
-        XCTAssertGreaterThan(try raster(CGRect(x: 0.42, y: 0.71, width: 0.16, height: 0.02)).darkPixels, 10, "Later unrelated stroke must survive selective revert")
-        XCTAssertEqual(try raster(CGRect(x: 0.42, y: 0.61, width: 0.16, height: 0.02)).darkPixels, 0, "Chosen earlier stroke must disappear")
+        try tap("cmd.sidebar.toggle")
+        // Sidebar navigation can fold chrome and move paper inside the viewport.
+        // Ink stays in page coordinates, so follow the same piece of paper.
+        func sample(_ y: CGFloat) throws -> Raster {
+            let currentPage = page.frame
+            let sx = currentPage.width / drawnPage.width, sy = currentPage.height / drawnPage.height
+            return try raster(screenRect: CGRect(
+                x: currentPage.minX + (drawnCanvas.minX + 0.42 * drawnCanvas.width - drawnPage.minX) * sx,
+                y: currentPage.minY + (drawnCanvas.minY + y * drawnCanvas.height - drawnPage.minY) * sy,
+                width: 0.16 * drawnCanvas.width * sx, height: 0.02 * drawnCanvas.height * sy))
+        }
+        XCTAssertGreaterThan(try sample(0.71).darkPixels, 10, "Later unrelated stroke must survive selective revert")
+        XCTAssertEqual(try sample(0.61).darkPixels, 0, "Chosen earlier stroke must disappear")
     }
 
     // MARK: Pencil palette and simulator-testable Pencil preferences
@@ -1213,7 +1286,7 @@ final class InkUITests: XCTestCase {
     // The tests below verify settings and direct-touch behavior, never claim those hardware events.
 
     func testPencilPaletteKeyboardChoiceAppliesAndDismissesWithoutMarks() throws {
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        typeKey("p", modifierFlags: [.control, .command])
         let palette = try control("Pencil palette")
         let eraser = palette.buttons["tool.eraser"]
         XCTAssertTrue(eraser.exists); eraser.tap()
@@ -1223,7 +1296,7 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         let desired = try XCTUnwrap(swatches.last?.label)
         let paletteColourFallback = "Colour \(swatches.count)"
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        typeKey("p", modifierFlags: [.control, .command])
         let colours = try control("Pencil palette")
         let thickness = colours.buttons.matching(NSPredicate(format: "label ENDSWITH 'millimetres'")).allElementsBoundByIndex
         let thickest = try XCTUnwrap(thickness.last, "Pencil palette must offer the current tool's thickness attributes")
@@ -1235,14 +1308,14 @@ final class InkUITests: XCTestCase {
         XCTAssertEqual(swatches.first(where: \.isSelected)?.label, desired)
         XCTAssertTrue(try control("Thickness 3", type: .button).isSelected)
         try assertNoNewInk(before); try draw()
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        typeKey("p", modifierFlags: [.control, .command])
         _ = try control("Pencil palette")
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try wait("Escape dismisses the Pencil palette") { !self.ui.app.otherElements["Pencil palette"].exists }
     }
 
     func testSettingsKeyboardShortcutOpensInkPreferences() throws {
-        ui.app.typeKey(",", modifierFlags: .command)
+        typeKey(",", modifierFlags: .command)
         _ = try control("Stylus")
     }
 
@@ -1280,8 +1353,10 @@ final class InkUITests: XCTestCase {
         let first = choices.firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 5)); first.tap()
         XCTAssertTrue(first.isSelected, "Double-tap binding must persist its choice")
-        // Both gesture sections offer the same choices. Select the second section's palette binding.
-        let squeeze = ui.app.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).element(boundBy: 1)
+        // Native lists recycle offscreen rows; the second matching row can become
+        // the first as Double-tap scrolls away. Use its accessible gesture context.
+        let squeeze = ui.app.buttons.matching(NSPredicate(format:
+            "label == 'Show tool palette' AND value == 'Squeeze'")).firstMatch
         for _ in 0..<12 {
             if squeeze.exists && squeeze.isHittable { break }
             let detail = try XCTUnwrap(scrollPanels.max(by: { $0.frame.minX < $1.frame.minX }))

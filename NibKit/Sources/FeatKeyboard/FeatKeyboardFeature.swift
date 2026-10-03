@@ -131,6 +131,7 @@ final class LibraryCreationKeyboardResponder: UIView {
     var context: ChromeContext?
     private let observers = NotificationBag()
     private var focusScheduled = false
+    private var heldModifiers = CanvasHeldModifiers()
 
     init(context: ChromeContext) {
         self.context = context
@@ -138,11 +139,16 @@ final class LibraryCreationKeyboardResponder: UIView {
         isUserInteractionEnabled = true
         isAccessibilityElement = false
         accessibilityElementsHidden = true
-        for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
+        for name in [UIWindow.didBecomeKeyNotification, UIWindow.didResignKeyNotification,
+                     UIApplication.willResignActiveNotification, UIScene.didActivateNotification,
                      UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
                      UIResponder.keyboardDidHideNotification, .nibChromeNeedsUpdate] {
-            observers.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                KeyboardRuntime.onMain { self?.scheduleFocus() }
+            observers.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                KeyboardRuntime.onMain {
+                    guard let self else { return }
+                    self.heldModifiers.focusChanged(note, window: self.window)
+                    self.scheduleFocus()
+                }
             })
         }
     }
@@ -208,6 +214,43 @@ final class LibraryCreationKeyboardResponder: UIView {
         guard let context, let descriptor = descriptors.first(where: { $0.id == command.propertyList as? String }) else { return }
         LibraryCreationShortcuts.perform(descriptor.id, in: context)
     }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // A hosting controller can forward the hardware press without invoking
+        // its UIKeyCommand. Handle it at this focused responder, where the held
+        // modifier keys are still available, just as the canvas responder does.
+        for press in presses { if let key = press.key { heldModifiers.begin(key.keyCode) } }
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key,
+                  performUnhandledPress(heldModifiers.shortcut(key, event: event)) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.end(key.keyCode) } }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.end(key.keyCode) } }
+        super.pressesCancelled(presses, with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { heldModifiers.reset() }
+        return resigned
+    }
+
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard let context, let descriptor = descriptors.first(where: { $0.shortcut == shortcut }) else { return false }
+        LibraryCreationShortcuts.perform(descriptor.id, in: context)
+        return true
+    }
 }
 
 /// Keep native key dispatch inside the document's chrome hosting boundary. Invisible
@@ -216,9 +259,6 @@ final class LibraryCreationKeyboardResponder: UIView {
 @MainActor
 enum CanvasChromeShortcuts {
     static let overlayID = "keyboard.canvasShortcuts"
-    private static let catalogKeys = Set(GlobalShortcuts.catalog(app: nil, owner: FeatKeyboardFeature.id)
-        .filter { $0.docKinds == ShortcutContext.canvasKinds || $0.command == "ai.chat.open" }
-        .map { ShortcutRules.normalized($0.shortcut) })
 
     static func register(_ app: NibApp, owner: String) {
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
@@ -238,11 +278,7 @@ enum CanvasChromeShortcuts {
         } == true
         let keys = KeyCommandContext(docKind: kind, isEditingText: typing, hasTabs: true)
         return KeyCommandRouting.active(context.app.content.keyCommands.all, in: keys).filter {
-            guard KeyCommandRouting.overridesSystemKeys($0, in: keys) else { return false }
-            if catalogKeys.contains(ShortcutRules.normalized($0.shortcut)) { return true }
-            guard $0.scope == .canvas || $0.scope == .document,
-                  let kinds = $0.docKinds, !kinds.isEmpty else { return false }
-            return kinds.isSubset(of: ShortcutContext.canvasKinds)
+            KeyCommandRouting.overridesSystemKeys($0, in: keys)
         }
     }
 
@@ -253,8 +289,8 @@ enum CanvasChromeShortcuts {
         if let window = navigator.rootViewController?.viewIfLoaded?.window, !window.isKeyWindow { return }
         context.app.ui.activeNavigator = navigator
         context.app.services.sessions.activate(context.session)
-        context.app.perform(descriptor.command, descriptor.resolvedParams(for: context.session),
-                            session: context.session)
+        CanvasCommandDispatch.perform(descriptor, app: context.app, session: context.session,
+                                      window: navigator.rootViewController?.viewIfLoaded?.window)
     }
 
     static func shortcut(_ key: KeyShortcut) -> KeyboardShortcut {
@@ -301,6 +337,7 @@ final class CanvasChromeKeyboardResponder: UIView {
     var context: ChromeContext?
     private let observers = NotificationBag()
     private var focusScheduled = false
+    private var heldModifiers = CanvasHeldModifiers()
 
     init(context: ChromeContext) {
         self.context = context
@@ -310,11 +347,16 @@ final class CanvasChromeKeyboardResponder: UIView {
         isUserInteractionEnabled = true
         isAccessibilityElement = false
         accessibilityElementsHidden = true
-        for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
+        for name in [UIWindow.didBecomeKeyNotification, UIWindow.didResignKeyNotification,
+                     UIApplication.willResignActiveNotification, UIScene.didActivateNotification,
                      UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
                      UIResponder.keyboardDidHideNotification, .nibChromeNeedsUpdate, .nibRegistryDidChange] {
-            observers.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                KeyboardRuntime.onMain { self?.scheduleFocus() }
+            observers.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                KeyboardRuntime.onMain {
+                    guard let self else { return }
+                    self.heldModifiers.focusChanged(note, window: self.window)
+                    self.scheduleFocus()
+                }
             })
         }
     }
@@ -405,13 +447,30 @@ final class CanvasChromeKeyboardResponder: UIView {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.begin(key.keyCode) } }
         var unhandled = presses
         for press in presses {
             guard let key = press.key,
-                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+                  performUnhandledPress(heldModifiers.shortcut(key, event: event)) else { continue }
             unhandled.remove(press)
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.end(key.keyCode) } }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldModifiers.end(key.keyCode) } }
+        super.pressesCancelled(presses, with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { heldModifiers = CanvasHeldModifiers() }
+        return resigned
     }
 
     @discardableResult
