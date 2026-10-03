@@ -651,6 +651,7 @@ struct ZoomPane: View {
     private var controls: some View {
         HStack(spacing: NibSpacing.s) {
             NibIconButton(.xmark, label: String(localized: "Close Zoom Window"), size: .round) { controller.close() }
+                .nibNativeAction { controller.close() }
             Text(zoomText)
                 .font(NibFont.hud)
                 .foregroundStyle(NibColor.label)
@@ -660,6 +661,7 @@ struct ZoomPane: View {
                 .accessibilityValue(zoomText)
             Spacer(minLength: 0)
             NibButton(String(localized: "New Line"), kind: .secondary, size: .compact) { controller.newLine() }
+                .nibNativeAction { controller.newLine() }
             options
         }
         .frame(height: NibMetrics.hitTarget)
@@ -1072,6 +1074,8 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         canvas.isOpaque = false
         canvas.overrideUserInterfaceStyle = .light          // ink is never themed (DESIGN.md §3.4)
         canvas.isScrollEnabled = false
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.bounces = false
         canvas.bouncesZoom = false
         canvas.showsVerticalScrollIndicator = false
@@ -1179,6 +1183,9 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
             canvas.minimumZoomScale = mag
             canvas.maximumZoomScale = mag
         }
+        // Setting a zoom limit can lazily create/re-enable UIKit's pinch.
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.contentSize = CGSize(width: CGFloat(pageSize.width) * mag, height: CGFloat(pageSize.height) * mag)
         canvas.contentOffset = CGPoint(x: CGFloat(box.x) * mag, y: CGFloat(box.y) * mag)
     }

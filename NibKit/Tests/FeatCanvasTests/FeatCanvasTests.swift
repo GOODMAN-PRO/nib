@@ -753,6 +753,87 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(vc.zoom, initial, "An earlier handled item gesture must not also zoom")
     }
 
+    func testLazilyCreatedSystemPinchYieldsToDocumentZoomOwner() throws {
+        let scroll = DocumentScrollView(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        scroll.minimumZoomScale = 0.5
+        scroll.maximumZoomScale = 8
+        scroll.zoomDidChange()
+        scroll.layoutIfNeeded()
+        let system = try XCTUnwrap(scroll.pinchGestureRecognizer)
+        let document = scroll.documentPinchGestureRecognizer
+        XCTAssertTrue(system.isEnabled, "Keep UIKit's navigation recognizer available as a fallback")
+        XCTAssertTrue(system.delegate?.gestureRecognizer?(system, shouldRequireFailureOf: document) == true)
+        XCTAssertFalse(scroll.gestureRecognizer(system, shouldRecognizeSimultaneouslyWith: document))
+        XCTAssertFalse(scroll.gestureRecognizer(document, shouldRecognizeSimultaneouslyWith: system))
+        XCTAssertTrue(scroll.gestureRecognizer(scroll.panGestureRecognizer, shouldRecognizeSimultaneouslyWith: document))
+        scroll.minimumZoomScale = 0.05
+        scroll.maximumZoomScale = 4
+        scroll.zoomDidChange()
+        XCTAssertTrue(scroll.gestureRecognizer(try XCTUnwrap(scroll.pinchGestureRecognizer), shouldRequireFailureOf: document))
+    }
+
+    func testPinchPreservesUIKitPageCoordinatesThroughWindowLayout() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let size = CGSize(width: 1376, height: 1032)
+        let vc = try makeCanvas(h, size: size)
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = vc
+        window.makeKeyAndVisible()
+        defer { vc.closeCanvas(); window.isHidden = true; window.rootViewController = nil }
+        vc.view.layoutIfNeeded()
+        let paper = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        let focal = CGPoint(x: paper.convert(CGPoint(x: paper.bounds.midX, y: 0), to: vc.view).x,
+                            y: size.height / 2)
+        let pagePoint = paper.convert(focal, from: vc.view)
+        vc.updatePinch(state: .began, scale: 1, centroid: focal)
+        for scale in [1.1, 1.2, 1.35, 1.5] {
+            vc.updatePinch(state: .changed, scale: scale, centroid: focal)
+            vc.view.layoutIfNeeded()
+            vc.scrollView.layoutIfNeeded()
+            let actual = paper.convert(pagePoint, to: vc.view)
+            XCTAssertEqual(actual.x, focal.x, accuracy: 1)
+            XCTAssertEqual(actual.y, focal.y, accuracy: 1)
+        }
+        vc.updatePinch(state: .ended, scale: 1.5, centroid: focal)
+        vc.view.layoutIfNeeded()
+        XCTAssertEqual(paper.convert(pagePoint, to: vc.view).y, focal.y, accuracy: 1)
+    }
+
+    func testPinchSamplesTheStationaryViewportAfterScrolling() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        final class CentroidProbe: UIPinchGestureRecognizer {
+            var sampledView: UIView?
+            override func location(in view: UIView?) -> CGPoint {
+                sampledView = view
+                return CGPoint(x: 500, y: 350)
+            }
+        }
+        vc.scrollView.contentOffset.y = 170
+        let probe = CentroidProbe()
+        vc.pinched(probe)
+        XCTAssertTrue(probe.sampledView === vc.view, "Read the centroid outside the bounds being changed by zoom compensation")
+    }
+
+    func testPinchOwnsTranslationUntilBothFingersFinish() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let focal = CGPoint(x: 500, y: 350)
+        vc.updatePinch(state: .began, scale: 1, centroid: focal)
+        XCTAssertFalse(vc.scrollView.panGestureRecognizer.isEnabled)
+        let hit = try XCTUnwrap(vc.host.pagePoint(CGPoint(x: focal.x + vc.scrollView.bounds.minX,
+                                                        y: focal.y + vc.scrollView.bounds.minY)))
+        let moved = CGPoint(x: 510, y: 380)
+        vc.updatePinch(state: .changed, scale: 1.5, centroid: moved)
+        let point = vc.host.viewPoint(hit.point, page: hit.page)
+        XCTAssertEqual(point.y - vc.scrollView.bounds.minY, moved.y, accuracy: 1)
+        vc.updatePinch(state: .ended, scale: 1.5, centroid: moved)
+        XCTAssertTrue(vc.scrollView.panGestureRecognizer.isEnabled)
+        XCTAssertEqual(vc.host.viewPoint(hit.point, page: hit.page).y - vc.scrollView.bounds.minY, moved.y, accuracy: 1)
+    }
+
     func testDocumentOwnedPinchKeepsItsFocalPointAndClampsWithoutEditing() throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)

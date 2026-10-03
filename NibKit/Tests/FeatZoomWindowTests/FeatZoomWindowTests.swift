@@ -975,6 +975,19 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(item.isOn?(h.session), false, "open on another document than the one the window shows")
     }
 
+    func testWritingCanvasCannotPanAwayFromItsPageCoordinateBox() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 900, height: 180))
+        let box = Rect(x: 70, y: 240, width: 300, height: 60)
+        view.configure(box: box, pageSize: .a4, tool: PKInkingTool(.pen, color: .black, width: 2),
+                       erasing: false, policy: .anyInput, fingersDraw: true, eraserDiameter: 14, showsZone: false)
+        view.layoutIfNeeded()
+        XCTAssertFalse(view.canvas.panGestureRecognizer.isEnabled)
+        XCTAssertFalse(view.canvas.pinchGestureRecognizer?.isEnabled ?? false, "A fixed-scale canvas may omit its pinch recognizer entirely")
+        XCTAssertEqual(view.canvas.zoomScale, 3, accuracy: 0.001)
+        XCTAssertEqual(view.canvas.contentOffset.x, 210, accuracy: 0.001)
+        XCTAssertEqual(view.canvas.contentOffset.y, 720, accuracy: 0.001)
+    }
+
     func testPaneTakesTheChromesWidthAndSizesItsWritingAreaFromTheBox() async throws {
         let h = harness()
         let (host, overlay) = try await openWindow(h)          // box 200 × 50

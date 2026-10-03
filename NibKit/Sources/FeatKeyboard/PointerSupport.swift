@@ -250,17 +250,28 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
 /// after those transitions. This is a view, not a text input: it never opens a keyboard or intercepts a touch.
 /// Descriptors still come from the registry (including another owner's winning Delete or Go to Page command).
 @MainActor
-final class CanvasKeyboardResponder: UIView {
+final class CanvasKeyboardResponder: UIView, UIKeyInput {
     private weak var host: CanvasHost?
     private var observers: NotificationBag?
     private var focusScheduled = false
     private var shortcuts: Set<KeyShortcut> = []
+    private let hardwareInputView = UIView(frame: .zero)
+
+    // Establish a window-local input session for hardware commands and modifier
+    // tracking across editor/scene changes. The empty input view and assistant
+    // groups keep this command surface from presenting a software keyboard.
+    var hasText: Bool { false }
+    func insertText(_ text: String) {}
+    func deleteBackward() {}
+    override var inputView: UIView? { hardwareInputView }
 
     init() {
         super.init(frame: .zero)
         // UIView drops key events when interaction is disabled, even while it is
         // first responder. Exclude this view from touch hit testing instead.
         isUserInteractionEnabled = true
+        inputAssistantItem.leadingBarButtonGroups = []
+        inputAssistantItem.trailingBarButtonGroups = []
         isAccessibilityElement = false
         accessibilityElementsHidden = true
     }
@@ -320,11 +331,14 @@ final class CanvasKeyboardResponder: UIView {
     }
 
     func restoreFocus() {
+        // Undo and chrome hosts can leave focus in a sibling of the page. Scope
+        // recovery to this window, still yielding to controls, text and modals.
         guard let host, let window, window.isKeyWindow, !isFirstResponder,
               host.session.document == host.documentID, !host.session.isEditingText,
+              !host.session.inking.isInking, !NibHaptics.isInking,
               !CanvasKeyboardFocus.hasModal(window.rootViewController),
               CanvasKeyboardFocus.mayReplace(CanvasKeyboardFocus.firstResponder(in: window),
-                                             canvas: host.canvasView) else { return }
+                                             canvas: window.rootViewController?.viewIfLoaded ?? host.canvasView) else { return }
         var ancestor: UIView? = host.canvasView
         while let view = ancestor {
             guard !view.isHidden, view.alpha > 0 else { return }
@@ -471,13 +485,16 @@ final class CanvasKeyboardResponder: UIView {
 @MainActor
 enum CanvasKeyPress {
     static func shortcut(_ key: UIKey, event: UIPressesEvent?) -> KeyShortcut {
-        shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
-                 keyFlags: key.modifierFlags, eventFlags: event?.modifierFlags ?? [])
+        let held = event?.allPresses.filter { $0.phase != .ended && $0.phase != .cancelled }
+            .compactMap { $0.key?.keyCode } ?? []
+        return shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
+                        keyFlags: key.modifierFlags, eventFlags: event?.modifierFlags ?? [], heldKeys: held)
     }
 
     static func shortcut(code: UIKeyboardHIDUsage, characters: String,
-                         keyFlags: UIKeyModifierFlags, eventFlags: UIKeyModifierFlags) -> KeyShortcut {
-        let input: String
+                         keyFlags: UIKeyModifierFlags, eventFlags: UIKeyModifierFlags,
+                         heldKeys: [UIKeyboardHIDUsage] = []) -> KeyShortcut {
+        var input: String
         switch code {
         case .keyboardReturnOrEnter, .keypadEnter: input = "return"
         case .keyboardEscape: input = "escape"
@@ -490,7 +507,22 @@ enum CanvasKeyPress {
         case .keyboardSpacebar: input = "space"
         default: input = characters.lowercased()
         }
-        let flags = keyFlags.union(eventFlags)
+        var flags = keyFlags.union(eventFlags)
+        for held in heldKeys {
+            switch held {
+            case .keyboardLeftGUI, .keyboardRightGUI: flags.insert(.command)
+            case .keyboardLeftAlt, .keyboardRightAlt: flags.insert(.alternate)
+            case .keyboardLeftShift, .keyboardRightShift: flags.insert(.shift)
+            case .keyboardLeftControl, .keyboardRightControl: flags.insert(.control)
+            default: break
+            }
+        }
+        // '+' is the shifted '=' key on the hardware layout. Preserve the
+        // printable shortcut rather than dispatching a different Shift-= action.
+        if input == "=", flags.contains(.shift) {
+            input = "+"
+            flags.remove(.shift)
+        }
         var modifiers: KeyModifiers = []
         if flags.contains(.command) { modifiers.insert(.command) }
         if flags.contains(.alternate) { modifiers.insert(.option) }

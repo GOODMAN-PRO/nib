@@ -949,6 +949,23 @@ final class FeatPresetsTests: XCTestCase {
     }
 
     /// A slot commits every settled choice; a new slot commits once, when the picker closes; an unchanged colour never.
+    func testPickerCommitsNativeHexCallbackAndFinishWithoutSelectionCallback() {
+        let picker = UIColorPickerViewController()
+        let hex = RGBA(0xD0, 0x30, 0x80)
+        var picks: [RGBA] = []
+        let delegate = SystemColourPicker(initial: .black, commitsOnFinishOnly: false) { picks.append($0) }
+        picker.selectedColor = PresetColour.uiColor(hex)
+        delegate.colorPickerViewControllerDidSelectColor(picker)
+        delegate.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [hex])
+        let finishOnly = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        finishOnly.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [hex, hex])
+        let swipe = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        swipe.presentationControllerDidDismiss(UIPresentationController(presentedViewController: picker, presenting: nil))
+        XCTAssertEqual(picks, [hex, hex, hex], "Interactive dismissal must also read the native final selection")
+    }
+
     func testSystemColourPickerCommitRules() {
         let vc = UIColorPickerViewController()
         let blue = UIColor(red: 0, green: 0, blue: 1, alpha: 1)

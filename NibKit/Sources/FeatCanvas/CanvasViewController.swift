@@ -49,6 +49,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var fitZoom: Double = 1
     private(set) var zoomLimits: ClosedRange<Double> = ZoomRules.notebookRange
     private var isAtFit = true
+    private var pinchPanWasEnabled = true
     private var pinchStartZoom: Double?
     private var pinchAnchor: (page: PageID, point: Point, window: CGPoint)?
     /// A pan at fit width is a reading position, not a request to keep the page's top fitted.
@@ -1099,7 +1100,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private var livePanCommands: [KeyCommandDescriptor] {
         guard !isClosed, session.editor === self, session.document == documentID else { return [] }
         func textHasFocus(_ view: UIView) -> Bool {
-            if view.isFirstResponder, view is UIKeyInput { return true }
+            if view.isFirstResponder, view is UITextInput { return true }
             return view.subviews.contains(where: textHasFocus)
         }
         let typing = session.isEditingText || viewIfLoaded?.window.map(textHasFocus) == true
@@ -1375,10 +1376,14 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // MARK: Input
 
-    @objc private func pinched(_ gesture: UIPinchGestureRecognizer) {
-        let point = gesture.location(in: scrollView)
+    @objc func pinched(_ gesture: UIPinchGestureRecognizer) {
+        // Read the centroid in the stationary viewport. The recognizer's location
+        // in UIScrollView follows its changing bounds during setZoomScale, so
+        // subtracting contentOffset there can feed the last correction back into
+        // the next sample and move the focal content.
+        let point = gesture.location(in: view)
         updatePinch(state: gesture.state, scale: Double(gesture.scale),
-                    centroid: CGPoint(x: point.x - scrollView.bounds.minX, y: point.y - scrollView.bounds.minY))
+                    centroid: CGPoint(x: point.x - scrollView.frame.minX, y: point.y - scrollView.frame.minY))
     }
 
     /// Centroid is in viewport coordinates; retain one page point for the whole
@@ -1389,6 +1394,11 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         case .began:
             pinchStartZoom = zoom
             pinchAnchor = anchor(atWindow: centroid)
+            // The centroid already supplies two-finger translation. A simultaneous
+            // scroll pan would apply that movement a second time, including the
+            // jump when one finger lifts before the other.
+            pinchPanWasEnabled = scrollView.panGestureRecognizer.isEnabled
+            scrollView.panGestureRecognizer.isEnabled = false
             scrollViewWillBeginZooming(scrollView, with: scrollView.contentView)
             fallthrough
         case .changed:
@@ -1403,6 +1413,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             guard pinchStartZoom != nil else { return }
             pinchStartZoom = nil
             pinchAnchor = nil
+            scrollView.panGestureRecognizer.isEnabled = pinchPanWasEnabled
             scrollViewDidEndZooming(scrollView, with: scrollView.contentView, atScale: scrollView.zoomScale)
         default: break
         }

@@ -313,6 +313,7 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     // A nested PKCanvasView participates in UIScrollView's private pinch ownership.
     // This recognizer owns the document gesture; UIKit still applies zoom transforms.
     let documentPinchGestureRecognizer = DocumentPinchGestureRecognizer()
+    private weak var configuredSystemPinch: UIPinchGestureRecognizer?
 
     /// Zoomed; holds the page views in layout space.
     let contentView = UIView()
@@ -353,9 +354,23 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     /// The Pencil never scrolls or zooms the page: it writes. Fingers, trackpads and mice do.
     private func restrictGesturesToFingers() {
         panGestureRecognizer.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
-        pinchGestureRecognizer?.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
         documentPinchGestureRecognizer.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
-        pinchGestureRecognizer?.require(toFail: documentPinchGestureRecognizer)
+        configureSystemPinch()
+    }
+
+    /// UIScrollView creates its pinch lazily when zoom limits first differ.
+    /// Bind it after creation as well as at init; otherwise both recognizers can
+    /// apply a zoom, and UIKit overwrites the document's focal compensation.
+    private func configureSystemPinch() {
+        guard let pinch = pinchGestureRecognizer, pinch !== configuredSystemPinch else { return }
+        pinch.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
+        pinch.require(toFail: documentPinchGestureRecognizer)
+        configuredSystemPinch = pinch
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
+        gestureRecognizer === pinchGestureRecognizer && other === documentPinchGestureRecognizer
     }
 
     /// UIKit uses the scroll view as its navigation recognizers' delegate. Keep that delegate and
@@ -365,6 +380,8 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     /// rejects palms/claimed contacts and its touch stream cancels the provisional stroke.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        if (gestureRecognizer === pinchGestureRecognizer && other === documentPinchGestureRecognizer)
+            || (gestureRecognizer === documentPinchGestureRecognizer && other === pinchGestureRecognizer) { return false }
         let navigation = [panGestureRecognizer, pinchGestureRecognizer, documentPinchGestureRecognizer].compactMap { $0 }
         guard navigation.contains(where: { $0 === gestureRecognizer }) else { return false }
         if navigation.contains(where: { $0 === other }) { return true }
@@ -442,6 +459,7 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
 
     /// Recomputes the content size after a zoom and keeps the content centred when it is smaller than the window.
     func zoomDidChange() {
+        configureSystemPinch()
         let size = layout.size
         let z = Double(zoomScale)
         let target = CGSize(width: size.width * z, height: size.height * z)
@@ -623,6 +641,7 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        configureSystemPinch()
         let content = CGRect(origin: .zero, size: contentSize)
         if wetInkContainer.frame != content { wetInkContainer.frame = content }
         updateVisiblePages()

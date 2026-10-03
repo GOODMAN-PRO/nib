@@ -303,13 +303,24 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
         if !continuously && !commitsOnFinishOnly { commitLatest() }
     }
 
+    // UIKit's HEX field can use the original delegate callback, whereas grid
+    // and spectrum gestures use didSelect:continuously:. Both commit the slot.
+    func colorPickerViewControllerDidSelectColor(_ viewController: UIColorPickerViewController) {
+        colorPickerViewController(viewController, didSelect: viewController.selectedColor, continuously: false)
+    }
+
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
-        // UIKit dismisses its Close button presentation before this callback.
+        viewController.viewIfLoaded?.endEditing(true)
+        if latest == nil { latest = PresetColour.rgba(viewController.selectedColor) }
         finish()
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        finish()
+        if let picker = presentationController.presentedViewController as? UIColorPickerViewController {
+            colorPickerViewControllerDidFinish(picker)
+        } else {
+            finish()
+        }
     }
 
     private func finish() {
