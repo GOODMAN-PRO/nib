@@ -62,7 +62,7 @@ final class ChromeUITests: XCTestCase {
     /// Scroll the containing sheet/popover, never the document, to reach offscreen controls.
     private func reachable(_ name: String) throws -> XCUIElement {
         let q = query(name)
-        if !q.firstMatch.exists { ui.revealFormElement(q.firstMatch) }
+        if !q.firstMatch.exists { revealNativeFormRow(q.firstMatch) }
         _ = try require(name)
         for _ in 0..<12 {
             let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
@@ -78,6 +78,34 @@ final class ChromeUITests: XCTestCase {
             start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy * scroller.frame.height)))
         }
         throw NibUI.Failure.message("Chrome control is not actionable: \(name)\n\(ui.app.debugDescription)")
+    }
+
+    /// DESIGN §14.3 uses a native, virtualized list. A row above the viewport
+    /// need not exist in its accessibility tree; search both ways without
+    /// scrolling the document or assuming every saved row remains mounted.
+    private func revealNativeFormRow(_ target: XCUIElement) {
+        let forms = ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
+        guard let list = forms.last(where: { $0.isHittable }) else { return }
+        for towardTop in [true, false] {
+            for _ in 0..<10 {
+                if target.exists { return }
+                let labels = list.staticTexts.allElementsBoundByIndex.map(\.label)
+                let obstructions = ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
+                    + ui.app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
+                guard let viewport = NibUITestScrollGeometry.viewport(
+                    scroll: list.frame, window: ui.app.frame, obstructions: obstructions) else { return }
+                let origin = ui.app.coordinate(withNormalizedOffset: .zero)
+                let appFrame = ui.app.frame
+                let x = viewport.minX + viewport.width * 0.8 - appFrame.minX
+                let startY = viewport.minY + viewport.height * (towardTop ? 0.2 : 0.8) - appFrame.minY
+                let endY = viewport.minY + viewport.height * (towardTop ? 0.8 : 0.2) - appFrame.minY
+                origin.withOffset(CGVector(dx: x, dy: startY)).press(forDuration: 0.01,
+                    thenDragTo: origin.withOffset(CGVector(dx: x, dy: endY)),
+                    withVelocity: .slow, thenHoldForDuration: 0.15)
+                if target.exists { return }
+                if list.staticTexts.allElementsBoundByIndex.map(\.label) == labels { break }
+            }
+        }
     }
 
     private func tap(_ name: String) throws { try reachable(name).tap() }
@@ -121,7 +149,9 @@ final class ChromeUITests: XCTestCase {
     private func replace(_ name: String, _ text: String) throws {
         let target = try reachable(name)
         target.tap()
-        key("a", .command)
+        // The field owns editing, including inside native alerts. Targeting
+        // the app can make XCTest dismiss that alert as an interruption.
+        target.typeKey("a", modifierFlags: .command)
         target.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
     }
     private func toggle(_ name: String, to on: Bool) throws {

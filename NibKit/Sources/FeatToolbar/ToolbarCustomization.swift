@@ -212,6 +212,16 @@ final class ToolbarCustomizationModel: ObservableObject {
         commit()
     }
 
+    /// The native list reports offsets in the complete section, including its
+    /// fixed lasso prefix. Keep one collection so UIKit can reorder across every
+    /// writing-tool row, then translate the move into the editable suffix.
+    func movePaletteRows(from source: IndexSet, to destination: Int) {
+        let movable = IndexSet(source.filter { $0 >= fixed.count && $0 < fixed.count + shown.count }
+            .map { $0 - fixed.count })
+        guard !movable.isEmpty else { return }
+        move(.palette, from: movable, to: min(shown.count, max(0, destination - fixed.count)))
+    }
+
     /// The VoiceOver equivalent of dragging a row: one place up (−1) or down (+1) within its section.
     func nudge(_ id: String, by delta: Int, in section: Place) {
         let rows = section == .palette ? shown : more
@@ -332,13 +342,12 @@ struct ToolbarCustomizationView: View {
     private var list: some View {
         List {
             Section {
-                ForEach(model.fixed) { row in
-                    itemRow(row, control: nil, section: nil)
+                ForEach(model.fixed + model.shown) { row in
+                    itemRow(row, control: row.hideable ? RowControl.hide : nil,
+                            section: row.hideable ? .palette : nil)
+                        .moveDisabled(!row.hideable)
                 }
-                ForEach(model.shown) { row in
-                    itemRow(row, control: row.hideable ? RowControl.hide : nil, section: .palette)
-                }
-                .onMove { model.move(.palette, from: $0, to: $1) }
+                .onMove { model.movePaletteRows(from: $0, to: $1) }
             } header: {
                 Text(String(localized: "On the Palette"))
             } footer: {
