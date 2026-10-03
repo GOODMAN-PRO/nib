@@ -197,12 +197,17 @@ public struct NibToast: View {
                 .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(2)
             if let action {
-                Button(action.title, action: action.handler).nibCommand(action.command)
-                    .font(NibFont.button)
-                    .foregroundStyle(NibColor.accent)
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, NibSpacing.m)
-                    .frame(minHeight: NibMetrics.hitTarget)
+                Button(action: action.handler) {
+                    Text(action.title)
+                        .font(NibFont.button)
+                        .foregroundStyle(NibColor.accent)
+                        .padding(.horizontal, NibSpacing.m)
+                        .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                        .contentShape(Rectangle())
+                }
+                .nibCommand(action.command)
+                .buttonStyle(.plain)
+                .nibNativeAction(action.handler)
             }
         }
         .padding(.leading, 18)

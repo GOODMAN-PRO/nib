@@ -59,6 +59,11 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
             Task { @MainActor in self?.toastIfActive(message) }
         }
+        showInitialScreen()
+    }
+
+    /// Re-evaluate first run after asynchronous fixture/library preparation finishes.
+    func showInitialScreen() {
         if NibUITestMode.isEnabled && !UITestFixture.isReady {
             display(FallbackEditorViewController(message: "Preparing test fixture…"))
         } else if let onboarding = app.ui.screens.onboarding?(app, self) {
@@ -307,7 +312,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         let context = keyCommandContext
         let generation = app.content.keyCommands.generation
         if let cache = keyCommandCache, cache.generation == generation, cache.context == context { return cache.commands }
-        let commands = KeyCommandRouting.active(app.content.keyCommands.all, in: context).map { d -> UIKeyCommand in
+        let commands = KeyCommandRouting.nativeCommands(app.content.keyCommands.all, in: context).map { d -> UIKeyCommand in
             let command = UIKeyCommand(title: d.title, action: #selector(runKeyCommand(_:)),
                                        input: ShellViewController.keyInput(d.shortcut.key),
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
@@ -343,7 +348,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         // UIKit also probes a selector with a nil/non-command sender when building
         // the hardware-key routing table. Rejecting that probe disables every shortcut.
         guard let command = sender as? UIKeyCommand else {
-            return !KeyCommandRouting.active(app.content.keyCommands.all, in: keyCommandContext).isEmpty
+            return !KeyCommandRouting.nativeCommands(app.content.keyCommands.all, in: keyCommandContext).isEmpty
         }
         guard let d = liveKeyCommand(command) else { return false }
         return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
@@ -363,7 +368,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// The descriptor behind a UIKeyCommand this shell built, when it is still registered and live in this window.
     private func liveKeyCommand(_ command: UIKeyCommand) -> KeyCommandDescriptor? {
         guard let id = command.propertyList as? String, let d = app.content.keyCommands.get(id),
-              d.isActive(in: keyCommandContext) else { return nil }
+              d.isActive(in: keyCommandContext),
+              KeyCommandRouting.overridesSystemKeys(d, in: keyCommandContext) else { return nil }
         return d
     }
 
@@ -409,6 +415,9 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         guard ShellFocusPolicy.shouldReclaim(isKeyWindow: window.isKeyWindow, shellHasFocus: isFirstResponder,
             hasModal: hasModal(self), isEditingText: ShellFocus.isEditingText(in: window),
             showsDocument: showsDocument, hasFocusedResponder: ShellFocus.hasFocus(in: window)) else { return }
+        // A library can supply a native key responder within its SwiftUI host.
+        // Let it recover focus before falling back to the scene's command table.
+        if !showsDocument, content?.becomeFirstResponder() == true { return }
         #if DEBUG
         NSLog("%@", "[Library key diagnostic] reclaim from \(String(describing: ShellFocus.firstResponder()))")
         #endif

@@ -320,6 +320,8 @@ struct FolderStyleSheet: View {
                 }
                 Section {
                     NibToggle(String(localized: "Show in Favourites"), isOn: $draft.favorite)
+                        .frame(minHeight: NibMetrics.hitTarget)
+                        .nibNativeAction { draft.favorite.toggle() }
                 }
             }
             .listStyle(.insetGrouped)
