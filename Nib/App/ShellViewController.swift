@@ -21,6 +21,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     private var shownKind: DocumentKind?
     /// The UIKeyCommands last handed to UIKit, rebuilt when the registry or the window's context changes.
     private var keyCommandCache: (generation: UInt64, context: KeyCommandContext, commands: [UIKeyCommand])?
+    private var heldKeyModifiers = HardwareKeyModifiers()
 
     init(app: NibApp) {
         self.app = app
@@ -38,6 +39,10 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         synchroniseLiquidMode()
         NotificationCenter.default.addObserver(self, selector: #selector(synchroniseLiquidMode),
             name: SettingsStore.didChange, object: app.settings)
+        NotificationCenter.default.addObserver(self, selector: #selector(clearHardwareModifiers),
+            name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(hardwareWindowDidResign(_:)),
+            name: UIWindow.didResignKeyNotification, object: nil)
         let focusTap = UITapGestureRecognizer(target: self, action: #selector(reclaimLibraryKeyFocusAfterTap))
         focusTap.cancelsTouchesInView = false
         focusTap.delaysTouchesBegan = false
@@ -59,6 +64,11 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
             Task { @MainActor in self?.toastIfActive(message) }
         }
+        showInitialScreen()
+    }
+
+    /// Re-evaluate first run after asynchronous fixture/library preparation finishes.
+    func showInitialScreen() {
         if NibUITestMode.isEnabled && !UITestFixture.isReady {
             display(FallbackEditorViewController(message: "Preparing test fixture…"))
         } else if let onboarding = app.ui.screens.onboarding?(app, self) {
@@ -253,6 +263,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         // with this shell as first responder, in documents as well as the library.
         // Replay the same validated route (including scope and text-input priority);
         // never intercept typing or dispatch a recognised shortcut a second time.
+        for press in presses { if let key = press.key { heldKeyModifiers.began(key.keyCode) } }
         var unhandled = presses
         for press in presses {
             guard let key = press.key else { continue }
@@ -272,7 +283,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             // A forwarded press can carry the chord on its event rather than its
             // individual UIKey. Keep both, or Command-D becomes the plain D tool
             // shortcut and Command-Option-0 selects a colour instead of zooming.
-            let flags = key.modifierFlags.union(event?.modifierFlags ?? [])
+            let flags = key.modifierFlags.union(event?.modifierFlags ?? []).union(heldKeyModifiers.flags)
             var modifiers: KeyModifiers = []
             if flags.contains(.command) { modifiers.insert(.command) }
             if flags.contains(.shift) { modifiers.insert(.shift) }
@@ -291,6 +302,28 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
     }
 
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldKeyModifiers.ended(key.keyCode) } }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses { if let key = press.key { heldKeyModifiers.ended(key.keyCode) } }
+        super.pressesCancelled(presses, with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { heldKeyModifiers.reset() }
+        return resigned
+    }
+
+    @objc private func clearHardwareModifiers() { heldKeyModifiers.reset() }
+
+    @objc private func hardwareWindowDidResign(_ notification: Notification) {
+        if notification.object as? UIWindow === viewIfLoaded?.window { heldKeyModifiers.reset() }
+    }
+
     /// What decides which key commands are live in this window: the document kind it shows, whether text has the
     /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
     /// so typing in a search field or a rename alert never switches tools), and whether it has tabs (the tab keys stay
@@ -307,7 +340,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         let context = keyCommandContext
         let generation = app.content.keyCommands.generation
         if let cache = keyCommandCache, cache.generation == generation, cache.context == context { return cache.commands }
-        let commands = KeyCommandRouting.active(app.content.keyCommands.all, in: context).map { d -> UIKeyCommand in
+        let commands = KeyCommandRouting.active(app.content.keyCommands.all, in: context)
+            .filter { KeyCommandRouting.overridesSystemKeys($0, in: context) }.map { d -> UIKeyCommand in
             let command = UIKeyCommand(title: d.title, action: #selector(runKeyCommand(_:)),
                                        input: ShellViewController.keyInput(d.shortcut.key),
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
@@ -343,7 +377,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         // UIKit also probes a selector with a nil/non-command sender when building
         // the hardware-key routing table. Rejecting that probe disables every shortcut.
         guard let command = sender as? UIKeyCommand else {
-            return !KeyCommandRouting.active(app.content.keyCommands.all, in: keyCommandContext).isEmpty
+            return KeyCommandRouting.active(app.content.keyCommands.all, in: keyCommandContext)
+                .contains { KeyCommandRouting.overridesSystemKeys($0, in: keyCommandContext) }
         }
         guard let d = liveKeyCommand(command) else { return false }
         return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
@@ -363,7 +398,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// The descriptor behind a UIKeyCommand this shell built, when it is still registered and live in this window.
     private func liveKeyCommand(_ command: UIKeyCommand) -> KeyCommandDescriptor? {
         guard let id = command.propertyList as? String, let d = app.content.keyCommands.get(id),
-              d.isActive(in: keyCommandContext) else { return nil }
+              d.isActive(in: keyCommandContext),
+              KeyCommandRouting.overridesSystemKeys(d, in: keyCommandContext) else { return nil }
         return d
     }
 
@@ -408,7 +444,15 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         }
         guard ShellFocusPolicy.shouldReclaim(isKeyWindow: window.isKeyWindow, shellHasFocus: isFirstResponder,
             hasModal: hasModal(self), isEditingText: ShellFocus.isEditingText(in: window),
-            showsDocument: showsDocument, hasFocusedResponder: ShellFocus.hasFocus(in: window)) else { return }
+            showsDocument: showsDocument, hasFocusedResponder: ShellFocus.hasFocus(in: window),
+            hasCommandResponder: ShellFocus.hasFocus(in: window) &&
+                ShellFocus.firstResponder()?.keyCommands?.contains(where: { command in
+                    guard let id = command.propertyList as? String else { return false }
+                    return app.content.keyCommands.get(id) != nil
+                }) == true) else { return }
+        // A library can supply a native key responder within its SwiftUI host.
+        // Let it recover focus before falling back to the scene's command table.
+        if !showsDocument, content?.becomeFirstResponder() == true { return }
         #if DEBUG
         NSLog("%@", "[Library key diagnostic] reclaim from \(String(describing: ShellFocus.firstResponder()))")
         #endif
