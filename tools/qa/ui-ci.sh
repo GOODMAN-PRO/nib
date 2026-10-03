@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: tools/qa/ui-ci.sh <name> "<identifiers or empty>" [extra paths...]
+# Usage: [NIB_UI_DEVICE="iPhone 17 Pro"] tools/qa/ui-ci.sh <name> "<identifiers or empty>" [extra paths...]
 # Exit: 0 passed, 1 test failures, 2 build/infrastructure/client error.
 set -euo pipefail
 repo=GOODMAN-PRO/nib
@@ -20,6 +20,8 @@ cleanup() {
     exit "$result"
 }
 trap cleanup EXIT
+# GitHub's API drops connections now and then; retry every network call instead of abandoning a long run.
+retry() { local attempt; for attempt in 1 2 3 4 5 6 7 8; do "$@" && return 0; sleep $((attempt * 15)); done; return 1; }
 trap 'exit 2' HUP INT TERM
 [ "$#" -ge 2 ] || fail 'Usage: tools/qa/ui-ci.sh <name> "<identifiers or empty>" [extra paths...]'
 name=$1
@@ -60,12 +62,15 @@ sha=$(
     tree=$(git write-tree) || exit 2
     git commit-tree "$tree" -p HEAD -m "UI CI snapshot $name" || exit 2
 ) || fail 'Could not create snapshot'
-git push -f origin "$sha:refs/heads/qa-ci/$name" || fail 'Could not push snapshot'
+retry git push -q -f origin "$sha:refs/heads/qa-ci/$name" || fail 'Could not push snapshot'
 echo "UI CI $name: snapshot $sha" >&2
-gh workflow run ui.yml --repo "$repo" --ref "qa-ci/$name" -f "only=$only" -f "label=$name" || fail 'Could not dispatch workflow'
+# NIB_UI_DEVICE picks the simulator (device name prefix, e.g. "iPhone 17 Pro"); unset = the workflow default (iPad Pro 13-inch).
+device_args=()
+if [ -n "${NIB_UI_DEVICE:-}" ]; then device_args=(-f "device=$NIB_UI_DEVICE"); fi
+gh workflow run ui.yml --repo "$repo" --ref "qa-ci/$name" -f "only=$only" -f "label=$name" ${device_args[@]+"${device_args[@]}"} || retry gh workflow run ui.yml --repo "$repo" --ref "qa-ci/$name" -f "only=$only" -f "label=$name" ${device_args[@]+"${device_args[@]}"} || fail 'Could not dispatch workflow'
 attempt=0
 while [ -z "$run_id" ]; do
-    runs=$(gh run list --repo "$repo" --workflow ui.yml --branch "qa-ci/$name" --limit 100 --json databaseId,headSha) || fail 'Could not list runs'
+    runs=$(retry gh run list --repo "$repo" --workflow ui.yml --branch "qa-ci/$name" --limit 100 --json databaseId,headSha) || fail 'Could not list runs'
     run_id=$(python3 -c 'import json,sys; print(next((str(r["databaseId"]) for r in json.load(sys.stdin) if r["headSha"] == sys.argv[1]), ""))' "$sha" <<< "$runs")
     attempt=$((attempt + 1))
     [ -n "$run_id" ] && break
@@ -77,14 +82,15 @@ echo "UI CI $name: watching $url" >&2
 # No timeout: UI suites can take hours. Retry transient watch errors while still active.
 while :; do
     gh run watch "$run_id" --repo "$repo" --interval 60 > /dev/null || true
-    state=$(gh run view "$run_id" --repo "$repo" --json status --jq .status) || fail 'Could not read run status'
+    state=$(retry gh run view "$run_id" --repo "$repo" --json status --jq .status) || fail 'Could not read run status'
     [ "$state" = completed ] && break
     sleep 10
 done
 run_dir="$HOME/Projects/Nib-ci-logs/ui-ci/$name/$run_id"
 mkdir -p "$run_dir"
-gh run view "$run_id" --repo "$repo" --json conclusion,jobs,url,headSha > "$run_dir/run.json" || fail 'Could not read completed run'
-gh run download "$run_id" --repo "$repo" --pattern 'ui-*' --dir "$run_dir" || fail 'Could not download UI artifacts'
+retry gh run view "$run_id" --repo "$repo" --json conclusion,jobs,url,headSha > "$run_dir/run.json" || fail 'Could not read completed run'
+download() { rm -rf "$run_dir"/ui-*; gh run download "$run_id" --repo "$repo" --pattern 'ui-*' --dir "$run_dir"; }
+retry download || fail 'Could not download UI artifacts'
 python3 - "$run_dir" "$name" "$classes" "$url" <<'PY'
 import json, pathlib, subprocess, sys
 root, name, classes, url = pathlib.Path(sys.argv[1]), *sys.argv[2:]
@@ -98,14 +104,11 @@ for cls in classes.split():
         if report['class'] != cls or report['tests'] <= 0 or status['infrastructureError']:
             errors.append(cls + ': missing tests or infrastructure/build error')
         reports.append(report)
-        archive = artifact / 'ui.xcresult.zip'
-        if not archive.is_file():
-            raise ValueError('Missing zipped xcresult')
-        subprocess.run(['ditto', '-x', '-k', str(archive), str(artifact)], check=True)
-        bundle = artifact / 'ui.xcresult'
-        if not bundle.is_dir():
-            raise ValueError('Missing extracted xcresult')
-        bundles.append(str(bundle))
+        shots = artifact / 'shots'
+        if shots.is_dir():
+            bundles.append(f'screenshots {cls}: {shots}')
+        run_id = url.rstrip('/').split('/')[-1]
+        bundles.append(f'full result bundle {cls} (large, only if the screenshots/log are not enough): gh run download {run_id} --repo GOODMAN-PRO/nib -n xcresult-{cls} -D <dir> && ditto -x -k <dir>/ui.xcresult.zip <dir>')
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         errors.append(cls + ': ' + str(error))
 for job in run['jobs']:
