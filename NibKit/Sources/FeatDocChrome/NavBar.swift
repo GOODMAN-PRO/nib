@@ -410,9 +410,11 @@ struct NavBarView: View {
         switch item.action {
         case .library:
             NibToolbarItem(item.symbol, label: item.title) { chrome.goToLibrary() }
+                .nibNativeAction { chrome.goToLibrary() }
                 .accessibilityIdentifier("cmd.window.showLibrary")
         case .menu(let menu):
             NibToolbarItem(item.symbol, label: item.title, isOn: openMenu == menu) { toggle(menu) }
+                .nibNativeAction { toggle(menu) }
                 .nibBudAnchor(menu.anchor)
                 .accessibilityIdentifier("menu." + menu.rawValue)
         case .command(let command, let params):
