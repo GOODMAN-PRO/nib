@@ -912,7 +912,8 @@ final class PagesUITests: XCTestCase {
     }
     private func assetFile(_ page: [String: Any], in id: String? = nil) throws -> URL {
         let name = try XCTUnwrap(background(page)["asset"] as? String, "Page must retain its background asset reference")
-        let file = try package(id).appendingPathComponent(name)
+        // ARCHITECTURE §4.1: background asset references are names within assets/.
+        let file = try package(id).appendingPathComponent("assets", isDirectory: true).appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: file.path) else { throw NibUI.Failure.message("Missing referenced asset: \(name)") }
         return file
     }

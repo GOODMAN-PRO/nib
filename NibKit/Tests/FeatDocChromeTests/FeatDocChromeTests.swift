@@ -945,6 +945,25 @@ final class FeatDocChromeTests: XCTestCase {
 
     // MARK: Commands
 
+    func testRetainedDocumentChromeDoesNotEraseLibraryPanelState() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let store = try XCTUnwrap(h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self))
+        let state = store.state(for: h.session)
+        state.open("test.pages", at: .left)
+        h.session.document = nil
+        h.session.openPanels = [PanelIDs.templates]
+        store.adopt(h.session)
+        XCTAssertEqual(h.session.openPanels, [PanelIDs.templates], "The visible library sheet owns session state")
+        XCTAssertEqual(state.openPanels, ["test.pages"], "The document navigator remains saved for reopening")
+        h.session.openPanels = [PanelIDs.trash]
+        store.adopt(h.session)
+        XCTAssertEqual(h.session.openPanels, [PanelIDs.trash])
+        h.session.openPanels = []
+        store.adopt(h.session)
+        XCTAssertTrue(h.session.openPanels.isEmpty)
+        XCTAssertEqual(state.openPanels, ["test.pages"])
+    }
+
     func testPanelCommandsPlacePanelsWhereTheSettingsSay() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         h.app.ui.panels.register(panel("test.pages", .sidebarTab, kinds: [.notebook]))
