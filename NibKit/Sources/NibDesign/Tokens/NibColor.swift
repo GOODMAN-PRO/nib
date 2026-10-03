@@ -25,7 +25,9 @@ extension UIColor {
 public enum NibUIColor {
     // UI neutrals
     public static let label = UIColor.label
-    public static let labelSecondary = UIColor.secondaryLabel
+    /// Small secondary text must pass 4.5:1 on opaque surfaces and the worst-case Deep body.
+    public static let labelSecondary = UIColor.nib(0x3C3C43, 0.94, dark: 0xEBEBF5, 0.80,
+                                                  contrastLight: 1, contrastDark: 1)
     public static let labelTertiary = UIColor.tertiaryLabel
     public static let labelQuaternary = UIColor.quaternaryLabel
     public static let separator = UIColor.separator

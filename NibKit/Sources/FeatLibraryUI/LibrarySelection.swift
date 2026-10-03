@@ -24,3 +24,10 @@ struct LibrarySelection {
         refs = baseline.union(frames.compactMap { rect.intersects($0.value) ? $0.key : nil })
     }
 }
+
+
+extension LibrarySelection {
+    var statusText: String {
+        refs.isEmpty ? String(localized: "Select items") : String(localized: "\(refs.count) selected")
+    }
+}

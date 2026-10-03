@@ -126,6 +126,7 @@ struct WindowTabsSettingsView: View {
                         app.perform(CommandIDs.settingsSet,
                                     ["name": .string(WindowSettings.showTabs.name), "value": .bool(value)])
                     }))
+                .accessibilityIdentifier("cmd." + CommandIDs.settingsSet)
             } footer: {
                 Text(String(localized: "Show tabs when more than one document is open."))
                     .font(NibFont.footnote)
@@ -307,6 +308,15 @@ struct TabCapsule: View {
     let width: CGFloat
     let model: TabStripModel
 
+    /// Display only: the shell owns the keys. ⌘9 selects the last tab, not the ninth.
+    static func shortcutHint(index: Int, count: Int) -> KeyboardShortcut? {
+        guard index >= 0, index < count else { return nil }
+        if index < 8 {
+            return KeyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+        }
+        return index == count - 1 ? KeyboardShortcut("9", modifiers: .command) : nil
+    }
+
     var body: some View {
         let items = model.menuItems(tab)
         HStack(spacing: 0) {
@@ -324,17 +334,19 @@ struct TabCapsule: View {
                     .contentShape(Rectangle().inset(by: -TabStripLayout.hitOutset))
             }
             .buttonStyle(NibPressStyle(shape: Capsule()))
+            .nibShortcutHint(Self.shortcutHint(index: tab.index, count: count))
             .accessibilityLabel(tab.title)
             .accessibilityValue(String(localized: "Tab \(tab.index + 1) of \(count)"))
             .accessibilityAddTraits(isSelected ? .isSelected : [])
             .accessibilityActions {
                 ForEach(items, id: \.id) { item in
                     Button(item.title) { model.run(item, on: tab) }
+                    .accessibilityIdentifier("cmd." + item.command)
                 }
             }
             .accessibilityShowsLargeContentViewer { Text(tab.title) }
             if isSelected {
-                NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .panel) { model.close(tab) }
+                NibIconButton(.xmark, label: String(localized: "Close Tab"), size: .bar) { model.close(tab) }
                     .frame(width: TabStripLayout.closeWidth, height: TabStripLayout.tabHeight)
             }
         }
@@ -385,6 +397,7 @@ struct TabMenu: View {
                 Text(item.title)
             }
         }
+        .accessibilityIdentifier("cmd." + item.command)
     }
 }
 
@@ -509,7 +522,8 @@ private struct TabStripDocumentView: View {
 /// a long title, Dynamic Type, Split View or Stage Manager leaves no room for a separate tab capsule.
 struct DocumentTabsMenu: View {
     @ObservedObject var model: TabStripModel
-    let placement: TabStripDocumentPresentation
+    // A compact window needs the menu even before the optional floating capsules can be attached.
+    let placement: TabStripDocumentPresentation?
     let compact: Bool
     @Environment(\.layoutDirection) private var layoutDirection
 
@@ -541,18 +555,23 @@ struct DocumentTabsMenu: View {
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .accessibilityLabel(String(localized: "Tabs"))
         .accessibilityValue(String(localized: "\(model.tabs.count) open documents"))
+        .accessibilityIdentifier("windows.tabs.menu")
         .background {
             GeometryReader { proxy in
                 let frame = proxy.frame(in: NibLiquid.space)
                 Color.clear
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { frame in
-                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                    }
+                    .onChange(of: placement.map { ObjectIdentifier($0) }) { _, _ in
+                        // Attaching the capsule host need not move the already-visible menu.
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
                     }
                     .onChange(of: compact) { _, compact in
-                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
                     }
                     .onChange(of: layoutDirection) { _, direction in
-                        placement.updateAnchor(frame, compact: compact, rightToLeft: direction == .rightToLeft)
+                        placement?.updateAnchor(frame, compact: compact, rightToLeft: direction == .rightToLeft)
                     }
             }
             .allowsHitTesting(false)

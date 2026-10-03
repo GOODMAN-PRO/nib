@@ -15,6 +15,19 @@ public struct NibDropletShape: Shape {
     }
 }
 
+/// Concentric Deep frost mask; body and optical layers retain their original bounds.
+struct NibFrostShape: Shape {
+    let shape: NibDropletShape
+
+    func path(in rect: CGRect) -> Path {
+        let inset = NibOptics.frostInset
+        let radius = min(shape.cornerRadius ?? min(rect.width, rect.height) / 2,
+                         min(rect.width, rect.height) / 2)
+        return NibDropletShape(cornerRadius: max(0, radius - inset))
+            .path(in: rect.insetBy(dx: inset, dy: inset))
+    }
+}
+
 /// The four droplet materials (DESIGN.md §2). Nothing else is glass.
 public enum NibGlass: Sendable {
     case clear, deep, tinted, bead
@@ -52,11 +65,10 @@ struct NibNativeGlass<Foreground: View>: View {
         // Capture the app's appearance outside the glass host. Native glass can adapt its foreground to white
         // paper, but our dark contrast underlay still needs the app's light label/icon tokens (DESIGN.md §2.4).
         let appearance = environment.nibChromeAppearance ?? NibChromeAppearance(environment)
-        foreground()
+        material(on: foreground()
             .foregroundStyle(Color(NibColor.label.resolve(in: appearance.environment)))
             .environment(\.nibChromeAppearance, appearance)
-            .environment(\.colorScheme, appearance.colorScheme)
-            .glassEffect(effect, in: shape)
+            .environment(\.colorScheme, appearance.colorScheme))
             // The material needs the same appearance as its foreground. An environment override only
             // before glassEffect reaches the labels, leaving the native effect free to render light glass.
             .environment(\.colorScheme, appearance.colorScheme)
@@ -65,6 +77,29 @@ struct NibNativeGlass<Foreground: View>: View {
             // SwiftUI's environment can leave that host in its previous appearance. Recreate this
             // effect/foreground pair together, without replacing the container's field or glass IDs.
             .id(appearance.colorScheme)
+    }
+
+    /// Give the compositor a native primitive, not an arbitrary Path whose inferred optical mesh can
+    /// facet across a large panel. Underlays still use the matching continuous silhouette.
+    @ViewBuilder private func material<V: View>(on foreground: V) -> some View {
+        if let radius = shape.cornerRadius {
+            foreground.modifier(NibNativeGlassOptics(effect: effect,
+                shape: RoundedRectangle(cornerRadius: NibGeometry.dimension(radius), style: .continuous)))
+        } else {
+            foreground.modifier(NibNativeGlassOptics(effect: effect, shape: Capsule()))
+        }
+    }
+}
+
+/// Preserve the native primitive in the view's type as well as the compositor input. The system glass modifier
+/// erases its shape type, so keeping this typed boundary lets hostless checks verify the actual optical geometry.
+@available(iOS 26.0, *)
+private struct NibNativeGlassOptics<Geometry: Shape>: ViewModifier {
+    let effect: Glass
+    let shape: Geometry
+
+    func body(content: Content) -> some View {
+        content.glassEffect(effect, in: shape)
     }
 }
 
@@ -170,10 +205,9 @@ struct NibGlassModifier: ViewModifier {
             .background {
                 if !sharesNativeBackdrop { systemUnderlay }
             }
-            .anchorPreference(key: NibStaticGlassBackdropKey.self, value: .bounds) { bounds in
+            .anchorPreference(key: NibGlassBackdropKey.self, value: .bounds) { bounds in
                 sharesNativeBackdrop
-                    ? [NibStaticGlassBackdrop(bounds: bounds, shape: shape,
-                        tint: NibGlassBodyTint.systemUnderlay(kind, colorScheme: resolvedScheme, paperShare: paperShare))]
+                    ? [NibGlassBackdrop(bounds: bounds, shape: shape, kind: kind, frozen: frozen)]
                     : []
             }
             .background {
@@ -200,9 +234,9 @@ struct NibGlassModifier: ViewModifier {
     private var paperShare: Double { DropletField.paperShare(restFrame, in: backdrop) }
 
     /// Static nibGlass surfaces can also live inside a container. Hand their neutral body to its backdrop
-    /// layer; identity/opaque surfaces keep their local fallback since they have no native material to sample it.
+    /// layer even while frozen, so a Pencil down never changes its placement. Beads and opaque fallbacks stay local.
     private var sharesNativeBackdrop: Bool {
-        field != nil && renderer == .system && kind != .bead && !frozen
+        field != nil && renderer == .system && kind != .bead
     }
 
     /// The dark-paper contrast body is beneath glass, alongside the frozen, Liquid Off and bead fills.
@@ -243,17 +277,16 @@ struct NibGlassModifier: ViewModifier {
         ZStack {
             NibWaterShadow(shape: shape)
             if kind == .deep && !frozen {
-                shape.fill(.ultraThinMaterial)
+                NibFrostShape(shape: shape).fill(.ultraThinMaterial)
             }
             shape.fill(tint)
             NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: kind == .tinted, tinted: kind == .tinted)
         }
     }
 
-    private var opaque: some View {
+    var opaque: some View {
         shape.fill(kind == .deep ? NibColor.backgroundSecondary : (kind == .tinted ? NibColor.accent : NibColor.chromeOpaque))
-            .overlay { shape.stroke(NibColor.waterLine, lineWidth: 0.8) }
-            .nibElevation(.rest)
+            .overlay { shape.stroke(NibColor.waterLine, lineWidth: NibStroke.outline) }
     }
 }
 

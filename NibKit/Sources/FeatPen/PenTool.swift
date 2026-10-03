@@ -414,6 +414,15 @@ struct PenShapeResult {
         } else {
             let f = shape.frame, rect = CGRect(x: shape.frame.x, y: shape.frame.y, width: shape.frame.w, height: shape.frame.h)
             if shape.shape == .ellipse { p.addEllipse(in: rect) }
+            else if shape.shape == .triangle {
+                p.addLines(between: [CGPoint(x: f.center.x, y: f.y),
+                                     CGPoint(x: f.x + f.w, y: f.y + f.h), CGPoint(x: f.x, y: f.y + f.h)])
+                p.closeSubpath()
+            } else if shape.shape == .diamond {
+                p.addLines(between: [CGPoint(x: f.center.x, y: f.y), CGPoint(x: f.x + f.w, y: f.center.y),
+                                     CGPoint(x: f.center.x, y: f.y + f.h), CGPoint(x: f.x, y: f.center.y)])
+                p.closeSubpath()
+            }
             else { p.addRect(rect) }
             var rotation = CGAffineTransform(translationX: f.center.x, y: f.center.y)
                 .rotated(by: f.rotation).translatedBy(x: -f.center.x, y: -f.center.y)

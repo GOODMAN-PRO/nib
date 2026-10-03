@@ -7,7 +7,7 @@ import NibDesign
 
 // The page long-press / right-click menu (T-084, P-050) and the canvas side of the object menu. One canvas attachment
 // per canvas: it presents the lasso object menu through the window's floating host when the selection becomes
-// non-empty, keeps it beside the selection, shows `MenuLocation.pageLongPress` as the system edit menu at a long-pressed
+// non-empty, keeps it beside the selection, shows `MenuLocation.pageLongPress` as a native menu at a long-pressed
 // point (`menu.showAt`, which is also the long-press tap handler), and answers a right-click (secondary click, or a
 // pointer click-and-hold) with a context menu: the object menu over the selection or an item, the page menu elsewhere.
 // It never claims a touch, so the canvas, the handles and the tools keep every gesture.
@@ -138,6 +138,8 @@ enum ObjectMenuHub {
 final class InputProbe: UIGestureRecognizer {
     private var active: [ObjectIdentifier: UITouch.TouchType] = [:]
     private var secondary = false
+    private var pendingPresentation: (() -> Void)?
+    private var presentationTask: Task<Void, Never>?
 
     /// Passive: never cancels, delays or excludes anyone's touches.
     func makePassive() {
@@ -152,14 +154,36 @@ final class InputProbe: UIGestureRecognizer {
         secondary || !active.values.contains { $0 == .direct || $0 == .pencil }
     }
 
+    /// The canvas hold and UIKit's context-menu recognizer both fire while the finger is down. Even when our
+    /// context-menu delegate declines that finger, UIKit can dismiss an edit menu presented by the hold handler.
+    /// Keep the requested edit menu until this contact finishes and UIKit has unwound its gesture callbacks.
+    func presentWhenIdle(_ present: @escaping () -> Void) {
+        cancelPresentation()
+        guard !active.isEmpty else { present(); return }
+        pendingPresentation = present
+    }
+
+    func cancelPresentation() {
+        pendingPresentation = nil
+        presentationTask?.cancel()
+        presentationTask = nil
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        cancelPresentation()
         for t in touches { active[ObjectIdentifier(t)] = t.type }
         if event.buttonMask.contains(.secondary) { secondary = true }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { end(touches) }
 
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { end(touches) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        cancelPresentation()
+        end(touches)
+    }
 
     private func end(_ touches: Set<UITouch>) {
         for t in touches { active[ObjectIdentifier(t)] = nil }
@@ -170,7 +194,31 @@ final class InputProbe: UIGestureRecognizer {
         super.reset()
         active = [:]
         secondary = false
+        guard let present = pendingPresentation else { return }
+        pendingPresentation = nil
+        presentationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled, let self else { return }
+            self.presentationTask = nil
+            present()
+        }
     }
+}
+
+/// An invisible source for UIKit's vertical menu, positioned at the held page point. It must neither intercept
+/// canvas input nor introduce an empty accessibility control. The menu's actions remain native accessible items.
+final class PageMenuAnchor: UIButton {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        showsMenuAsPrimaryAction = true
+        preferredMenuElementOrder = .fixed
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+    }
+
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
 }
 
 /// "objectmenu.menus": the object menu, the page menu and the right-click menus of one canvas.
@@ -181,6 +229,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     let model: ObjectMenuModel
     private var contextMenu: UIContextMenuInteraction?
     private var editMenu: UIEditMenuInteraction?
+    private let pageMenuAnchor = PageMenuAnchor(frame: .zero)
     private let probe: InputProbe
     private weak var floating: FloatingHosting?
     private var subscriptions: [EventSubscription] = []
@@ -255,10 +304,16 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         subscriptions = []
         reshow?.cancel()
         reshow = nil
+        probe.cancelPresentation()
+        pageMenuAnchor.contextMenuInteraction?.dismissMenu()
+        pageMenuAnchor.menu = nil
+        pageMenuAnchor.removeFromSuperview()
         if let contextMenu { host.canvasView.removeInteraction(contextMenu) }
         if let editMenu { host.canvasView.removeInteraction(editMenu) }
         contextMenu = nil
         editMenu = nil
+        pendingMenu = nil
+        pendingTarget = .null
         host.canvasView.removeGestureRecognizer(probe)
         dismissFloating()
         model.clear()
@@ -360,7 +415,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             return
         }
         // Both this comparison and the overlay's bounds use NibLiquid.space. Canvas coordinates alone miss a
-        // sidebar / safe-area change, while exact equality can keep postponing reshow for subpixel layout noise.
+        // sidebar / safe-area change. Ignore subpixel noise when deciding whether to close secondary popovers.
         let tolerance = 1 / max(host.canvasView.traitCollection.displayScale, 1)
         let moved = !contentChanged && lastContainerRect.map {
             abs($0.minX - rect.minX) > tolerance || abs($0.minY - rect.minY) > tolerance
@@ -368,19 +423,20 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         } == true
         if contentChanged || moved || lastContainerRect == nil { lastContainerRect = rect }
         model.setAnchor(rect)
-        if contentChanged {
-            reshow?.cancel()
-            reshow = nil
-        }
+        // The canvas's safe area reserves the bars, palette and docked panels. Convert that viewport into
+        // the same space as the selection rather than clamping against the whole window behind its chrome.
+        let viewport = ObjectMenuPlacement.viewport(in: host.canvasView)
+        model.setViewport(target.containerRect(viewport, from: host.canvasView))
         if moved {
-            // Scrolling or zooming: out of the way until the page settles (like the system edit menu).
-            model.isShown = false
+            // Close secondary popovers as their source moves, but keep selection actions attached to the ink.
             model.colourOpen = false
             model.styleOpen = false
-            scheduleReshow(restart: true)
-        } else if reshow == nil {
-            show()
         }
+        // A valid anchor is sufficient to show the menu. Layout callbacks must not keep postponing its reveal;
+        // retries are only for missing geometry or a floating host that has not joined the window yet.
+        reshow?.cancel()
+        reshow = nil
+        show()
     }
 
     private func show() {
@@ -401,9 +457,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         reshow = nil
     }
 
-    private func scheduleReshow(restart: Bool = false) {
-        guard restart || reshow == nil else { return }
-        reshow?.cancel()
+    private func scheduleReshow() {
+        guard reshow == nil else { return }
         reshow = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
@@ -440,7 +495,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     // MARK: Page menu
 
-    /// Shows the page menu at `point` of `page` as the system edit menu. False when the page is not on screen here.
+    /// Page actions are a vertical system menu. The text-edit strip pages horizontally and can hide insertion
+    /// actions behind unrelated clipboard entries even on an iPad. Keep that strip only as the pre-17.4 fallback.
     @discardableResult
     func showPageMenu(page: PageID, point: Point) -> Bool {
         guard let host, host.pageFrame(page) != nil else { return false }
@@ -450,15 +506,35 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         let menu = uiMenu(entries.map { ObjectMenuEntry($0, context: context) }, context: context, facts: nil, title: "",
                           shortcuts: false)
         let v = host.viewPoint(point, page: page)
+        if #available(iOS 17.4, *) {
+            guard host.canvasView.window != nil else { return false }
+            probe.presentWhenIdle { [weak self, weak host] in
+                guard let self, let host, self.host === host, host.canvasView.window != nil,
+                      host.session.document == context.doc else { return }
+                self.editMenu?.dismissMenu()
+                self.pendingMenu = menu
+                self.pendingTarget = CGRect(origin: v, size: .zero)
+                self.pageMenuAnchor.frame = CGRect(origin: v, size: CGSize(width: 1, height: 1))
+                self.pageMenuAnchor.menu = self.pendingMenu
+                if self.pageMenuAnchor.superview !== host.canvasView {
+                    host.canvasView.addSubview(self.pageMenuAnchor)
+                }
+                self.pageMenuAnchor.performPrimaryAction()
+            }
+            return true
+        }
         return presentEditMenu(menu, at: v, target: CGRect(origin: v, size: .zero))
     }
 
     @discardableResult
     private func presentEditMenu(_ menu: UIMenu, at point: CGPoint, target: CGRect) -> Bool {
         guard let editMenu, let host, host.canvasView.window != nil else { return false }
-        pendingMenu = menu
-        pendingTarget = target
-        editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        probe.presentWhenIdle { [weak self, weak host, weak editMenu] in
+            guard let self, let host, let editMenu, self.host === host, host.canvasView.window != nil else { return }
+            self.pendingMenu = menu
+            self.pendingTarget = target
+            editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        }
         return true
     }
 
@@ -591,6 +667,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
                               state: e.checked == true ? .on : .off) { [weak self] _ in
             self?.run(e, context: context, facts: facts)
         }
+        action.accessibilityIdentifier = "cmd." + e.descriptor.command
         if shortcuts, let s = e.shortcut { action.subtitle = ObjectMenuKeys.display(s) }
         return action
     }

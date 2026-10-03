@@ -119,7 +119,7 @@ struct OutlineSection: Equatable {
     var rows: [OutlineRow]
 }
 
-/// Builds the Outline tab: "From the PDF" then "Yours" (bold), each honouring its toggle and the collapsed rows.
+/// Builds the Outline tab: "From the PDF" then "Yours", each honouring its toggle and the collapsed rows.
 enum OutlineRowBuilder {
     static func customID(_ id: NibID) -> String { "c:" + id.raw }
 
@@ -366,6 +366,30 @@ final class OutlinePanelModel: ObservableObject {
     var doc: DocumentID? { tracker.doc }
     var app: NibApp { tracker.app }
 
+    private var sourcesHidden: Bool { !showsPDF && !showsCustom }
+
+    var emptyTitle: String {
+        sourcesHidden ? String(localized: "Outline entries hidden") : String(localized: "No outline yet")
+    }
+
+    var emptyMessage: String? {
+        if sourcesHidden {
+            return String(localized: "PDF Outline and Custom Outline are both turned off in the options.")
+        }
+        return canAdd ? String(localized: "Entries take you straight back to a page.") : nil
+    }
+
+    var emptyAction: NibAction? {
+        if sourcesHidden {
+            return NibAction(String(localized: "Show outline"), handler: {
+                self.setOption(OutlineSettings.showPDFOutline, true)
+                self.setOption(OutlineSettings.showCustomOutline, true)
+            })
+        }
+        guard canAdd else { return nil }
+        return NibAction(String(localized: "Add entry"), handler: { self.beginAdd() })
+    }
+
     private func rebuild(_ content: DocumentContent?, switched: Bool) {
         if switched {
             collapsed = []
@@ -566,8 +590,8 @@ struct OutlinePanel: View {
             }
             if model.sections.isEmpty {
                 ScrollView {
-                    NibEmptyState(symbol: .outline, title: String(localized: "No outline yet"), message: emptyMessage,
-                                  primary: emptyAction)
+                    NibEmptyState(symbol: .outline, title: model.emptyTitle, message: model.emptyMessage,
+                                  primary: model.emptyAction)
                         .frame(maxWidth: .infinity)
                 }
             } else {
@@ -588,19 +612,6 @@ struct OutlinePanel: View {
         .disabled(!model.canAdd)
         .accessibilityHint(String(localized: "Adds an outline entry for the current page."))
         .padding(.horizontal, NibSpacing.xs)
-    }
-
-    private var emptyAction: NibAction? {
-        guard model.canAdd else { return nil }
-        let model = self.model
-        return NibAction(String(localized: "Add entry"), handler: { model.beginAdd() })
-    }
-
-    private var emptyMessage: String? {
-        if !model.showsPDF && !model.showsCustom {
-            return String(localized: "PDF Outline and Custom Outline are both turned off in the options.")
-        }
-        return model.canAdd ? String(localized: "Entries take you straight back to a page.") : nil
     }
 
     private var promptTitle: String {
@@ -843,7 +854,7 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
             let image = item.icon.flatMap { NibSymbol(systemName: $0) }.flatMap { UIImage(nib: $0) }
             let action = UIAction(title: item.title, image: image, attributes: item.destructive ? .destructive : []) { [weak self] _ in
                 self?.model.run(item, context)
-            }
+            }.nibCommand(item.command)
             if let title = item.submenu {
                 if let i = submenus.firstIndex(where: { $0.title == title }) {
                     submenus[i].items.append(action)
@@ -994,8 +1005,8 @@ struct OutlineDragItem {
 }
 
 /// One outline row: disclosure, optional thumbnail (`NibPageThumbnailView`, `NibMetrics.rowThumbnailWidth`), title
-/// (your entries in `bodyEmphasis`), page number in `hud`, indented `NibMetrics.outlineIndent` per level. It stays a
-/// UIKit cell for the drag table (`NibOutlineRow` is its SwiftUI twin). The current page's rows sit on the row
+/// (body, with `bodyEmphasis` only for the current page), page number in `hud`, indented `NibMetrics.outlineIndent`
+/// per level. It stays a UIKit cell for the drag table (`NibOutlineRow` is its SwiftUI twin). The current page's rows sit on the row
 /// highlight, carry the accent number and ring their thumbnail, so the state is never colour alone.
 final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
     static let reuseID = "outline.row"
@@ -1099,7 +1110,7 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         disclosure.isUserInteractionEnabled = row.hasChildren
 
         titleLabel.text = row.title
-        titleLabel.font = row.kind == .custom ? NibUIFont.bodyEmphasis : NibUIFont.body
+        titleLabel.font = row.isCurrent ? NibUIFont.bodyEmphasis : NibUIFont.body
         titleLabel.numberOfLines = traitCollection.preferredContentSizeCategory.isAccessibilityCategory ? 0 : 2
         pageLabel.text = row.pageNumber.map { String($0) }
         pageLabel.textColor = row.isCurrent ? NibUIColor.accent : NibUIColor.labelSecondary
@@ -1229,12 +1240,7 @@ struct BookmarksPanel: View {
         } else {
             List {
                 ForEach(model.rows) { row in
-                    Button {
-                        open(row)
-                    } label: {
-                        BookmarkRowView(row: row, image: model.image(row.page))
-                    }
-                    .buttonStyle(.plain)
+                    BookmarkRowButton(row: row, image: model.image(row.page)) { open(row) }
                     .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
                     .hoverEffect(.highlight)
                     .onAppear { model.requestThumbnail(row.page) }
@@ -1273,6 +1279,82 @@ struct BookmarksPanel: View {
     private func open(_ row: BookmarkRow) {
         model.open(row)
         if sizeClass == .compact { dismiss() }
+    }
+}
+
+/// A native row-wide control owns selection. A plain SwiftUI List button can expose the whole row to
+/// accessibility while its hosted label only accepts touches over the rendered thumbnail/text.
+/// Keep the preview decorative so whitespace, the title and the thumbnail all activate the same command.
+struct BookmarkRowButton: UIViewRepresentable {
+    let row: BookmarkRow
+    let image: UIImage?
+    let onOpen: @MainActor () -> Void
+
+    func makeUIView(context: Context) -> BookmarkRowControl {
+        let control = BookmarkRowControl()
+        control.configure(row: row, image: image, onOpen: onOpen)
+        return control
+    }
+
+    func updateUIView(_ control: BookmarkRowControl, context: Context) {
+        control.configure(row: row, image: image, onOpen: onOpen)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: BookmarkRowControl, context: Context) -> CGSize? {
+        uiView.systemLayoutSizeFitting(
+            CGSize(width: proposal.width ?? NibMetrics.navigatorWidth, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required, verticalFittingPriority: .fittingSizeLevel)
+    }
+}
+
+@MainActor
+final class BookmarkRowControl: UIButton {
+    private var preview: (UIView & UIContentView)?
+    private var onOpen: (@MainActor () -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        isPointerInteractionEnabled = true
+        isAccessibilityElement = true
+        addAction(UIAction { [weak self] _ in self?.onOpen?() }, for: .primaryActionTriggered)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(row: BookmarkRow, image: UIImage?, onOpen: @escaping @MainActor () -> Void) {
+        self.onOpen = onOpen
+        let configuration = UIHostingConfiguration {
+            BookmarkRowView(row: row, image: image)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }.margins(.all, 0)
+        if let preview {
+            preview.configuration = configuration
+        } else {
+            let preview = configuration.makeContentView()
+            preview.isUserInteractionEnabled = false
+            preview.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(preview)
+            NSLayoutConstraint.activate([
+                preview.leadingAnchor.constraint(equalTo: leadingAnchor),
+                preview.trailingAnchor.constraint(equalTo: trailingAnchor),
+                preview.topAnchor.constraint(equalTo: topAnchor),
+                preview.bottomAnchor.constraint(equalTo: bottomAnchor),
+                heightAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget)
+            ])
+            self.preview = preview
+        }
+        accessibilityLabel = row.title.map { String(localized: "Page \(row.number), \($0)") }
+            ?? String(localized: "Page \(row.number)")
+        accessibilityValue = row.isCurrent ? String(localized: "Current page") : ""
+        accessibilityTraits = row.isCurrent ? [.button, .selected] : .button
+        invalidateIntrinsicContentSize()
+    }
+
+    override func accessibilityActivate() -> Bool {
+        guard isEnabled else { return false }
+        sendActions(for: .primaryActionTriggered)
+        return true
     }
 }
 

@@ -72,13 +72,17 @@ struct MovePicker: View {
             HStack {
                 TextField(String(localized: "New folder name"), text: $newTitle).font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
                     .onSubmit { Task { await createFolder() } }
+                    .accessibilityIdentifier("cmd.folder.create")
                 NibButton(String(localized: "Create Folder"), symbol: .plus) { Task { await createFolder() } }
+                    .accessibilityIdentifier("cmd.folder.create")
                     .disabled(busy || newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             HStack {
                 NibButton(String(localized: "Cancel"), kind: .plain) { context.dismiss() }
+                .accessibilityIdentifier("cmd.panel.close")
                 Spacer()
-                NibButton(String(localized: "Move Here"), kind: .primary) { Task { await move() } }.disabled(busy || refs.isEmpty)
+                NibButton(String(localized: "Move Here"), kind: .primary) { Task { await move() } }
+                    .accessibilityIdentifier("cmd.library.move").disabled(busy || refs.isEmpty)
             }
         }
         .padding(NibSpacing.xxl).background(NibColor.background).task { searchText = search; newTitle = state["newTitle"]?.stringValue ?? ""; await load() }

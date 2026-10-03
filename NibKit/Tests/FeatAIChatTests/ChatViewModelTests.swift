@@ -6,6 +6,136 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testPageLabelUsesOneBasedScopedPageEvenWhenCanvasMoves() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read the visible canvas context.", effect: .read)) { _, ctx in
+            let index = try ctx.workspace.content(Fixtures.docID).pageIndex(ctx.session?.page ?? Fixtures.page1) ?? 0
+            return ["document": ["kind": "notebook"], "page": ["index": .number(Double(index))]]
+        }
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try model.setScope(.page)
+        let title = try XCTUnwrap(h.app.services.library?.node(Fixtures.docID)?.title)
+        XCTAssertEqual(model.contextLabel, "\(title) · Page 1")
+        h.session.page = Fixtures.page2
+        try await model.loadContext()
+        XCTAssertEqual(model.contextLabel, "\(title) · Page 1")
+        try model.setScope(.page)
+        XCTAssertEqual(model.contextLabel, "\(title) · Page 2")
+        try model.setScope(.selection, refs: ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"])
+        XCTAssertEqual(model.contextLabel, "\(title) · Page 1 · 1 item selected")
+    }
+
+    func testRestoredConversationNamesItsDocumentWithoutNavigating() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatList, title: "List", summary: "List conversations.", effect: .read)) { _, _ in
+            ["chats": [["id": "SAVED", "title": "Earlier conversation", "doc": "doc:FIXTUREDOC02", "updated": 0]], "messages": []]
+        }
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try await model.selectChat("SAVED")
+        XCTAssertEqual(model.scope.doc, Fixtures.textDocID)
+        XCTAssertEqual(model.contextLabel, h.app.services.library?.node(Fixtures.textDocID)?.title)
+        XCTAssertEqual(h.session.document, Fixtures.docID)
+    }
+
+    func testProviderSubtitleReflectsCredentialsAndClearsRemovedConfiguration() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let store = ChatTestProviderStore()
+        h.app.services.set(store, for: ServiceKeys.aiProviders)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        XCTAssertEqual(model.providerLabel, "No model connected")
+        let config = AIProviderConfig(name: "Local server", kind: .openAICompatible,
+            baseURL: URL(string: "http://localhost:11434/v1")!, model: "Notes model")
+        store.configs = [config]; store.activeID = config.id
+        model.refreshProviderLabel()
+        XCTAssertEqual(model.providerLabel, "Notes model · Local server · no API key saved")
+        Keychain.setString("test-key", service: AIProviderConfig.keychainService, account: config.keychainAccount)
+        model.refreshProviderLabel()
+        XCTAssertEqual(model.providerLabel, "Notes model · Local server · your API key")
+        store.activeID = nil
+        model.refreshProviderLabel()
+        XCTAssertEqual(model.providerLabel, "No model connected")
+    }
+
+    func testAvailabilityMatchesGenerationGuardsAndScopePrerequisites() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.services.ai = FakeAIService()
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        XCTAssertTrue(model.canSend)
+        XCTAssertTrue(model.canGenerateImage)
+        XCTAssertTrue(model.canUseHistory)
+        model.isGeneratingImage = true
+        XCTAssertFalse(model.canSend)
+        XCTAssertFalse(model.canGenerateImage)
+        XCTAssertFalse(model.canChangeConversation)
+        XCTAssertEqual(model.progressLabel, "Generating image…")
+        model.isGeneratingImage = false
+        model.isStreaming = true
+        XCTAssertFalse(model.canConfigureContext)
+        XCTAssertFalse(model.canUseHistory)
+        model.isStreaming = false
+        XCTAssertEqual(model.scopeUnavailableReason(.selection), "Select an item first")
+        XCTAssertEqual(model.scopeUnavailableReason(.block), "Select a block first")
+        var invalidations = 0
+        let observation = model.objectWillChange.sink { invalidations += 1 }
+        defer { observation.cancel() }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.textID])
+        XCTAssertGreaterThan(invalidations, 0, "An idle scope menu must update when the canvas selection changes.")
+        XCTAssertNil(model.scopeUnavailableReason(.selection))
+        XCTAssertNotNil(model.scopeUnavailableReason(.block))
+        h.session.document = nil; h.session.page = nil
+        XCTAssertEqual(model.scopeUnavailableReason(.document), "Open a document first")
+        XCTAssertEqual(model.scopeUnavailableReason(.page), "Open a page first")
+        XCTAssertNil(model.scopeUnavailableReason(.library))
+    }
+
+    func testFailedHistoryRenameKeepsDraftAndExposesOperationState() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        var finish: CheckedContinuation<Void, Never>?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatRename, title: "Rename", summary: "Rename a conversation.", effect: .session)) { _, _ in
+            await withCheckedContinuation { finish = $0 }
+            throw NibError.unavailable("Could not save the conversation name.")
+        }
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.showsConversations = true
+        model.renamingChat = "SAVED"; model.renameTitle = "Keep this draft"
+        model.perform(CommandIDs.aiChatRename, ["chat": "SAVED", "title": "Keep this draft"])
+        XCTAssertEqual(model.progressLabel, "Saving conversation name…")
+        XCTAssertFalse(model.canUseHistory)
+        let deadline = Date().addingTimeInterval(5)
+        while finish == nil, Date() < deadline { await Task.yield() }
+        let continuation = try XCTUnwrap(finish)
+        continuation.resume()
+        while model.historyOperationLabel != nil, Date() < deadline { await Task.yield() }
+        XCTAssertNotNil(model.error)
+        XCTAssertNil(model.historyOperationLabel)
+        XCTAssertEqual(model.renameTitle, "Keep this draft")
+        XCTAssertEqual(model.renamingChat, "SAVED")
+        XCTAssertTrue(model.showsConversations)
+        XCTAssertTrue(model.canUseHistory)
+    }
+
+    func testConfirmationExplainsTargetsCountsAndConsequencesWithoutRawParameters() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
+        let descriptor = CommandDescriptor(id: "test.remove", title: "Delete selected content",
+            summary: "Delete refs using raw arrays.", effect: .edit, destructive: true)
+        let pending = ChatConfirmation(request: ConfirmationRequest(principal: .ai("TEST"), command: descriptor,
+            params: ["refs": [.string(ref)], "headers": ["Authorization": "secret-value"]]))
+        pending.summary = ChangeSummary(removed: [ref])
+        pending.labels[ref] = model.confirmationTargetLabel(ref)
+        XCTAssertEqual(pending.targetRefs, [ref])
+        XCTAssertTrue(try XCTUnwrap(pending.labels[ref]).localizedCaseInsensitiveContains("page 1"))
+        XCTAssertTrue(try XCTUnwrap(pending.labels[ref]).contains(try XCTUnwrap(h.app.services.library?.node(Fixtures.docID)?.title)))
+        XCTAssertTrue(pending.consequences.contains("Remove 1 item."), "Unexpected approval copy: \(pending.consequences)")
+        XCTAssertTrue(pending.consequences.contains("This action may delete or replace content."))
+        XCTAssertFalse(pending.actionSummary.contains("refs"))
+        XCTAssertFalse(pending.parameterSummary.contains("secret-value"))
+        let unpreviewed = ChatConfirmation(request: ConfirmationRequest(principal: .ai("TEST"), command: descriptor, params: ["refs": [.string(ref)]]))
+        XCTAssertEqual(unpreviewed.targetRefs, [ref], "Nested reference parameters must be named even without a dry run.")
+        XCTAssertTrue(unpreviewed.consequences.contains { $0.contains("preview is unavailable") })
+    }
+
     func testStreamBecomesMessagesWithScopeAndOneTurnGroup() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let ai = FakeAIService(responses: [.init(text: "The answer cites page:FIXTUREDOC01/FIXTUREPG001.")])
@@ -368,6 +498,10 @@ final class ChatViewModelTests: XCTestCase {
         let model = ChatRuntime.get(h.app).model(for: h.session)
         let a = Task { try await model.selectChat("A") }
         while loads["A"] == nil { await Task.yield() }
+        XCTAssertEqual(model.progressLabel, "Loading conversation…")
+        XCTAssertFalse(model.canSend)
+        XCTAssertFalse(model.canGenerateImage)
+        XCTAssertFalse(model.canUseHistory)
         do { _ = try await model.send(prompt: "Wait", principal: .user, group: "LOAD"); XCTFail("send must wait for load") }
         catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
         let b = Task { try await model.selectChat("B") }
@@ -790,4 +924,13 @@ private final class ScriptedChatService: AIService {
             return imageData
         } catch { imageCancelled = true; throw error }
     }
+}
+
+@MainActor
+private final class ChatTestProviderStore: AIProviderStore {
+    var configs: [AIProviderConfig] = []
+    var activeID: UUID?
+    func save(_ config: AIProviderConfig, apiKey: String?) throws {}
+    func delete(_ id: UUID) { configs.removeAll { $0.id == id } }
+    func provider(_ id: UUID?) -> AIProvider? { nil }
 }

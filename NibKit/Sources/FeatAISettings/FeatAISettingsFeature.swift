@@ -35,6 +35,18 @@ public enum FeatAISettingsFeature: NibFeature {
         }
         page.keywords = ["AI", "providers", "privacy", "API key", "Ollama", "LM Studio", "models"]
         app.ui.settingsPages.register(page)
+        // AI has several pages (subscriptions and other features' settings). Keep provider
+        // creation directly available in that section index as well as the provider list.
+        app.ui.settingsPages.register(SettingsPageDescriptor(id: "settings.ai.addProvider",
+            title: String(localized: "Add provider"), icon: NibSymbol.plus.name, section: .ai, order: 3, owner: id) {
+            AnyView(ProviderEditorView(app: $0))
+        })
+        for (preset, pageID) in [(ProviderPreset.claudeSubscription, "settings.ai.claude"), (.chatGPTSubscription, "settings.ai.chatgpt")] {
+            app.ui.settingsPages.register(SettingsPageDescriptor(id: pageID, title: preset.title,
+                icon: NibSymbol.assistant.name, section: .ai, order: preset == .claudeSubscription ? 1 : 2, owner: id) {
+                AnyView(SubscriptionSetupView(app: $0, preset: preset))
+            })
+        }
     }
 }
 

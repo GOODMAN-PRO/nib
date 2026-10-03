@@ -1070,7 +1070,7 @@ enum ShapeRenderer {
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
             image = drawing.image(from: rect, scale: pxPerPt)
         }
-        guard let cgImage = image?.cgImage else { return true }
+        guard let cgImage = image?.cgImage else { return false }
         cg.saveGState()
         defer { cg.restoreGState() }
         if tool == .highlighter {

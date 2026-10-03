@@ -173,9 +173,18 @@ struct NotebookDraft: Equatable {
     var board: TemplateRef
     /// A custom paper (an imported PDF page or image) picked with `template.choose`; replaces `paper`.
     var custom: Background?
+    var distribution: PaperDistribution = .allPages
 
     static let paperColours: [NibPaper] = [.white, .ivory, .legal, .grey, .slate, .night]
     static let boardColours: [NibPaper] = [.white, .ivory, .grey, .board, .slate, .night]
+
+    /// Legal also names a page size in this form. VoiceOver must distinguish the two actions.
+    static func paperSwatch(_ paper: NibPaper) -> NibSwatch {
+        let swatch = NibSwatch(paper: paper)
+        return NibSwatch(id: swatch.id, color: swatch.color,
+                         name: paper == .legal ? String(localized: "Legal paper colour") : swatch.name,
+                         ringsLight: swatch.ringsLight, ringsDark: swatch.ringsDark)
+    }
 
     /// The colour swatches a kind shows (nil = none: text documents and study sets keep the choice for later).
     static func colours(for kind: NewDocumentKind) -> [NibPaper]? {
@@ -234,6 +243,7 @@ struct NotebookDraft: Equatable {
             r.size = pageSize
             r.cover = hasCover ? coverRef(templates.get(cover.id)) : nil
             r.background = custom
+            r.distribution = distribution
         case .whiteboard:
             r.template = boardRef(templates.get(board.id))
         case .textDocument, .studySet:
@@ -257,6 +267,7 @@ struct NotebookDraft: Equatable {
             out.append((name: NibSettings.defaultPageSize.name, value: size))
         }
         out.append((name: NibSettings.coverByDefault.name, value: .bool(hasCover)))
+        out.append((name: PaperDistribution.setting.name, value: .string(distribution.rawValue)))
         return out
     }
 
@@ -279,6 +290,7 @@ struct NotebookDraft: Equatable {
         case NibSettings.defaultCover.name: return try? JSONValue.from(settings.get(NibSettings.defaultCover))
         case NibSettings.defaultPageSize.name: return try? JSONValue.from(settings.get(NibSettings.defaultPageSize))
         case NibSettings.coverByDefault.name: return .bool(settings.get(NibSettings.coverByDefault))
+        case PaperDistribution.setting.name: return .string(settings.get(PaperDistribution.setting))
         default: return settings.json(name)
         }
     }
@@ -300,7 +312,20 @@ struct NotebookDraft: Equatable {
         return NotebookDraft(kind: kind, title: "", paper: base, paperColour: paperColour,
                              hasCover: settings.get(NibSettings.coverByDefault), cover: coverBase, cloth: cloth,
                              size: size, orientation: orientation, board: TemplateRef(TemplateIDs.whiteboardDots),
-                             custom: nil)
+                             custom: nil,
+                             distribution: PaperDistribution(rawValue: settings.get(PaperDistribution.setting)) ?? .allPages)
+    }
+}
+
+/// Stored on the notebook, so adding pages after reopening keeps the chosen distribution.
+enum PaperDistribution: String, CaseIterable {
+    case allPages, everyOther
+    static let setting = SettingKey<String>("create.paperDistribution", default: "allPages")
+    var title: String {
+        switch self {
+        case .allPages: return String(localized: "All pages")
+        case .everyOther: return String(localized: "Every other")
+        }
     }
 }
 
@@ -320,6 +345,7 @@ struct CreationRequest: Equatable {
     var cover: TemplateRef?
     /// A custom paper applied after creation (`page.setBackground`).
     var background: Background?
+    var distribution: PaperDistribution = .allPages
 
     init(id: DocumentID, kind: DocumentKind, title: String, folder: FolderID? = nil, template: TemplateRef? = nil,
          size: PageSize? = nil, cover: TemplateRef? = nil, background: Background? = nil) {
@@ -370,6 +396,8 @@ enum DocumentBlueprint {
             meta.defaultTemplate = r.template
             let size = r.size ?? .a4
             let paper = r.background ?? Background(kind: .template, template: r.template ?? TemplateRef(TemplateIDs.blank))
+            meta.ext = ["create.paperDistribution": ["pattern": .string(r.distribution.rawValue),
+                                                     "background": (try? JSONValue.from(paper)) ?? .null]]
             var pages: [PageRecord] = []
             let keys = FractionalIndex.sequence(after: nil, count: r.cover == nil ? 1 : 2)
             if let cover = r.cover {
@@ -435,6 +463,20 @@ enum DocumentCreator {
         if applyCustomPaper, let background = r.background,
            let warning = await applyBackground(background, r, runner, workspace, templates: templates) {
             warnings.append(warning)
+        }
+        if r.kind == .notebook, runner.has(CommandIDs.nodeSet) {
+            do {
+                let content = try workspace.content(r.id)
+                if let paper = content.livePages.first(where: { !isCover($0, templates) }) {
+                    let distribution: JSONValue = ["pattern": .string(r.distribution.rawValue),
+                                                    "background": try JSONValue.from(paper.background)]
+                    _ = try await runner.run(CommandIDs.nodeSet,
+                        ["ref": .string(NodeRef.document(r.id).description),
+                         "fields": ["meta": ["ext": ["create.paperDistribution": distribution]]]])
+                }
+            } catch {
+                warnings.append(String(localized: "The notebook was created, but its paper distribution could not be saved: \(NibError.wrap(error).message)"))
+            }
         }
         return warnings
     }
@@ -576,12 +618,32 @@ struct TemplateOption: Identifiable, Hashable {
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
+enum CustomDimension: Hashable {
+    case width, height
+}
+
 @MainActor
 final class NewNotebookModel: ObservableObject {
     @Published var draft: NotebookDraft
     @Published var group: String
     @Published private(set) var isWorking = false
     @Published private(set) var message: String?
+    @Published private(set) var invalidDimension: CustomDimension?
+
+    /// Validation stays beside the size fields; command failures stay beside Create.
+    var actionMessage: String? { invalidDimension == nil ? message : nil }
+    var dimensionMessage: String? { invalidDimension == nil ? nil : message }
+    var createActionTitle: String {
+        isWorking ? String(localized: "Creating…") : draft.kind.createTitle
+    }
+    var firstInvalidDimension: CustomDimension? {
+        guard draft.kind == .notebook, draft.size.isCustom else { return nil }
+        for (field, value) in [(CustomDimension.width, customWidth), (.height, customHeight)] {
+            let points = PageSizeChoice.points(value)
+            if !points.isFinite || !PageSizeChoice.customRange.contains(points) { return field }
+        }
+        return nil
+    }
     /// Custom size fields, in millimetres (portrait).
     @Published var customWidth: Double
     @Published var customHeight: Double
@@ -590,6 +652,7 @@ final class NewNotebookModel: ObservableObject {
     let folder: FolderID?
     let session: EditorSession?
     let navigator: SceneNavigator?
+    weak var presentationController: UIViewController?
     let papers: [TemplateOption]
     let covers: [TemplateOption]
     let boards: [TemplateOption]
@@ -603,7 +666,7 @@ final class NewNotebookModel: ObservableObject {
         var draft = NotebookDraft.initial(settings: app.settings, kind: kind)
         let all = app.content.templates.all
         func option(_ d: TemplateDefinition) -> TemplateOption {
-            TemplateOption(id: d.id, title: d.title, category: d.category, definition: d)
+            TemplateOption(id: d.id, title: d.title, category: Self.paperGroup(d, nativeOwners: app.featureIDs), definition: d)
         }
         let isBoard: (TemplateDefinition) -> Bool = { d in
             d.category == NewNotebookModel.whiteboardCategory
@@ -613,7 +676,7 @@ final class NewNotebookModel: ObservableObject {
         if !papers.contains(where: { $0.id == draft.paper.id }) {
             let d = app.content.templates.get(draft.paper.id)
             papers.insert(TemplateOption(id: draft.paper.id, title: d?.title ?? String(localized: "Default paper"),
-                                         category: d?.category ?? String(localized: "Default"), definition: d), at: 0)
+                                         category: d.map { Self.paperGroup($0, nativeOwners: app.featureIDs) } ?? Self.paperGroups[0], definition: d), at: 0)
         }
         var covers = all.filter(\.isCover).map(option)
         if !covers.contains(where: { $0.id == draft.cover.id }) {
@@ -629,19 +692,34 @@ final class NewNotebookModel: ObservableObject {
         if !boards.contains(where: { $0.id == draft.board.id }), let first = boards.first {
             draft.board = TemplateRef(first.id)
         }
-        var groups: [String] = []
-        for p in papers where !groups.contains(p.category) { groups.append(p.category) }
+        let groups = Self.paperGroups
         self.papers = papers
         self.covers = covers
         self.boards = boards
         self.groups = groups
         self.draft = draft
         self.group = papers.first { $0.id == draft.paper.id }?.category ?? groups.first ?? ""
-        customWidth = PageSizeChoice.millimetres(draft.size.size.width).rounded()
-        customHeight = PageSizeChoice.millimetres(draft.size.size.height).rounded()
+        customWidth = PageSizeChoice.millimetres(draft.size.size.width)
+        customHeight = PageSizeChoice.millimetres(draft.size.size.height)
     }
 
     static let whiteboardCategory = "Whiteboard"
+    static let paperGroups = [String(localized: "Basic"), String(localized: "Lined"), String(localized: "Grid"),
+                              String(localized: "Planners"), String(localized: "Music"), String(localized: "From plugins")]
+
+    static func paperGroup(_ template: TemplateDefinition, nativeOwners: [String]) -> String {
+        // IDs are not provenance: native features also contribute names such as planner.events.
+        guard template.owner == "builtin" || nativeOwners.contains(template.owner) else { return paperGroups[5] }
+        if [TemplateIDs.dots, TemplateIDs.grid, TemplateIDs.graph, TemplateIDs.isometric].contains(template.id) {
+            return paperGroups[2]
+        }
+        switch template.category {
+        case "Writing", "Lined": return paperGroups[1]
+        case "Planners": return paperGroups[3]
+        case "Music": return paperGroups[4]
+        default: return paperGroups[0]
+        }
+    }
 
     var papersInGroup: [TemplateOption] { papers.filter { $0.category == group } }
     var canChooseMore: Bool { app.commands.entry(CreateIDs.templateChoose) != nil }
@@ -661,7 +739,20 @@ final class NewNotebookModel: ObservableObject {
             return
         }
         draft.hasCover = true
-        if option.id != draft.cover.id { draft.cover = TemplateRef(option.id) }
+        if option.id != draft.cover.id {
+            draft.cover = TemplateRef(option.id)
+            draft.cloth = nil
+        }
+    }
+
+    func selectCloth(_ cloth: NibCoverCloth?) {
+        // A named cloth and its cover tile are the same choice, including its persisted template identity.
+        let ids = ["cover.solid", "cover.band", "cover.dots", "cover.kraft", "cover.stripes", "cover.frame", "cover.grid", "cover.split"]
+        if let cloth, let index = NibCoverCloth.allCases.firstIndex(of: cloth),
+           let option = covers.first(where: { $0.id == ids[index] }) {
+            selectCover(option)
+        }
+        draft.cloth = cloth
     }
 
     /// The size picker: a preset name, or `nil` for Custom.
@@ -670,6 +761,10 @@ final class NewNotebookModel: ObservableObject {
         set {
             if let name = newValue, let preset = PageSizeChoice.presets.first(where: { $0.name == name }) {
                 draft.size = preset
+                if invalidDimension != nil {
+                    invalidDimension = nil
+                    message = nil
+                }
             } else {
                 applyCustomSize()
             }
@@ -681,6 +776,10 @@ final class NewNotebookModel: ObservableObject {
         let w = min(max(PageSizeChoice.points(customWidth), range.lowerBound), range.upperBound)
         let h = min(max(PageSizeChoice.points(customHeight), range.lowerBound), range.upperBound)
         draft.size = PageSizeChoice(name: nil, size: PageSizeChoice.portrait(PageSize(w, h)))
+        if invalidDimension != nil {
+            invalidDimension = firstInvalidDimension
+            if invalidDimension == nil { message = nil }
+        }
     }
 
     /// The full template picker (F045, `template.choose {kind: paper, size, color?}` → {background, size}): its choice
@@ -717,15 +816,22 @@ final class NewNotebookModel: ObservableObject {
             draft.size = choice
             draft.orientation = orientation
             if choice.isCustom {
-                customWidth = PageSizeChoice.millimetres(choice.size.width).rounded()
-                customHeight = PageSizeChoice.millimetres(choice.size.height).rounded()
+                customWidth = PageSizeChoice.millimetres(choice.size.width)
+                customHeight = PageSizeChoice.millimetres(choice.size.height)
             }
         }
     }
 
     /// Remembers the choices, creates the document and opens it. True when the sheet can close.
-    func create() async -> Bool {
+    func create(beforeOpen: @MainActor () async -> Void = {}) async -> Bool {
         guard !isWorking else { return false }
+        // The preview may clamp while the user edits, but creation must validate the entered
+        // dimensions, not silently create a different page from a zero/negative value.
+        invalidDimension = firstInvalidDimension
+        if invalidDimension != nil {
+            message = String(localized: "Enter a width and height between 25.4 and 5080 millimetres.")
+            return false
+        }
         isWorking = true
         message = nil
         defer { isWorking = false }
@@ -751,6 +857,8 @@ final class NewNotebookModel: ObservableObject {
             let title = app.services.library?.node(id)?.title ?? request.title
             await PendingCreations.mark(id, PendingCreation(kind: .untitled, title: title), runner: runner)
         }
+        // The presenting library/editor must remain attached until UIKit finishes dismissing its sheet.
+        await beforeOpen()
         await DocumentOpener.open(id, runner: runner, navigator: navigator ?? app.ui.activeNavigator)
         for warning in warnings {
             NotificationCenter.default.post(name: .nibCommandFailed, object: app,
@@ -759,6 +867,13 @@ final class NewNotebookModel: ObservableObject {
         }
         NibHaptics.play(.success)
         return true
+    }
+
+    func dismissPresentation() async {
+        guard let controller = presentationController, controller.presentingViewController != nil else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            controller.dismiss(animated: true) { continuation.resume() }
+        }
     }
 
     /// Writes the remembered notebook choices that changed (`settings.set`, so it is a command like everything else).
@@ -844,6 +959,54 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
         .nibFadeBottomEdge()
+        // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
+        .contentShape(Rectangle())
+    }
+}
+
+/// Paper layout follows the space inside the sheet, independently of the presenting window's size class.
+/// It stays in the form's vertical scroll view, whose bottom fade also covers the scrolling paper rows.
+struct NewNotebookPaperChooser<Groups: View, Chips: View, Papers: View>: View {
+    let availableWidth: CGFloat
+    @ViewBuilder var groups: Groups
+    @ViewBuilder var chips: Chips
+    @ViewBuilder var papers: Papers
+
+    // DESIGN.md §14.6's fixed rail metric; shared tile, gutter and ring metrics come from NibDesign.
+    static var groupRailWidth: CGFloat { 150 }
+    private var ringPadding: CGFloat { NibStroke.ring + NibStroke.ringOutset }
+    private var fourColumnWidth: CGFloat { NibMetrics.paperTileSize.width * 4 + NibSpacing.m * 3 }
+    var showsGroupRail: Bool {
+        availableWidth >= Self.groupRailWidth + NibSpacing.l + fourColumnWidth + ringPadding * 2
+    }
+    private var columnCount: Int {
+        if showsGroupRail { return 4 }
+        // Three columns on a phone, with fewer only when full-size thumbnails and their rings cannot fit.
+        return min(3, max(1, Int((availableWidth - ringPadding * 2 + NibSpacing.m)
+                                / (NibMetrics.paperTileSize.width + NibSpacing.m))))
+    }
+
+    var body: some View {
+        if showsGroupRail {
+            HStack(alignment: .top, spacing: NibSpacing.l) {
+                groups.frame(width: Self.groupRailWidth, alignment: .leading)
+                grid
+            }
+        } else {
+            VStack(alignment: .leading, spacing: NibSpacing.m) {
+                chips
+                grid
+            }
+        }
+    }
+
+    private var grid: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(NibMetrics.paperTileSize.width), spacing: NibSpacing.m),
+                                 count: columnCount), alignment: .leading, spacing: NibSpacing.l) {
+            papers
+        }
+        .padding(ringPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -857,6 +1020,7 @@ struct NewNotebookSheet: View {
     @State private var windowSize: CGSize?
     @Environment(\.dynamicTypeSize) private var typeSize
     @FocusState private var titleFocused: Bool
+    @FocusState private var focusedDimension: CustomDimension?
 
     init(app: NibApp, folder: FolderID?, kind: NewDocumentKind, session: EditorSession?, navigator: SceneNavigator?,
          onDone: @escaping () -> Void) {
@@ -889,21 +1053,31 @@ struct NewNotebookSheet: View {
 
     private var sheetContent: some View {
         VStack(spacing: 0) {
-            NibSheetHeader(draft.kind.sheetTitle, primaryTitle: compact ? nil : String(localized: "Create"),
-                           isPrimaryEnabled: !model.isWorking, onCancel: onDone, onPrimary: create)
+            NibSheetHeader(draft.kind.sheetTitle, primaryTitle: compact ? nil : (model.isWorking ? String(localized: "Creating…") : String(localized: "Create")),
+                           isPrimaryEnabled: !model.isWorking,
+                           onCancel: { if !model.isWorking { onDone() } }, onPrimary: create, primaryCommand: "doc.create")
+                .disabled(model.isWorking)
                 // The shared header supplies 20 pt; align its phone content to the scroll view's 16 pt margin.
                 .padding(.horizontal, contentInset - NibSpacing.xl)
+                .zIndex(1)
+            if !compact, let message = model.actionMessage {
+                NibBanner(message, style: .warning)
+                    .padding(.horizontal, contentInset)
+                    .padding(.bottom, NibSpacing.s)
+            }
             if draft.kind == .notebook {
                 NewNotebookFormViewport(contentInset: contentInset) {
                     VStack(alignment: .leading, spacing: NibSpacing.xl) {
                         formHeading
                         coverSection
                     }
+                    .disabled(model.isWorking)
                 } paper: {
                     VStack(alignment: .leading, spacing: NibSpacing.xl) {
                         paperSection
                         optionsSection
                     }
+                    .disabled(model.isWorking)
                 }
             } else {
                 ScrollView {
@@ -911,6 +1085,7 @@ struct NewNotebookSheet: View {
                         formHeading
                         if draft.kind == .whiteboard { boardSection }
                     }
+                    .disabled(model.isWorking)
                     .padding(.vertical, NibSpacing.xl)
                 }
                 .contentMargins(.horizontal, contentInset, for: .scrollContent)
@@ -919,18 +1094,27 @@ struct NewNotebookSheet: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if compact {
-                NibButton(draft.kind.createTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: create)
-                    .disabled(model.isWorking)
-                    .padding(.horizontal, NibSpacing.l)
-                    .padding(.vertical, NibSpacing.s)
-                    .background(NibColor.backgroundSecondary)
+                VStack(spacing: NibSpacing.s) {
+                    if let message = model.actionMessage {
+                        NibBanner(message, style: .warning)
+                    }
+                    NibButton(model.createActionTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: create)
+                        .accessibilityIdentifier("cmd.doc.create")
+                        .disabled(model.isWorking)
+                }
+                .padding(.horizontal, NibSpacing.l)
+                .padding(.vertical, NibSpacing.s)
+                .background(NibColor.backgroundSecondary)
             }
         }
         .background(NibColor.backgroundSecondary)
         // nibSheet fits its content; idealWidth alone lets the system keep its narrower default form size.
-        .frame(width: compact ? nil : sheetSize.width, height: compact ? nil : sheetSize.height)
+        .frame(width: compact ? nil : sheetSize.width)
+        // Keep the preferred form height, but honour the smaller proposal above the keyboard.
+        .frame(minHeight: 0, idealHeight: compact ? nil : sheetSize.height,
+               maxHeight: compact ? .infinity : sheetSize.height)
         .background {
-            NewNotebookWindowReader { windowSize = $0 }
+            NewNotebookWindowReader(onController: { model.presentationController = $0 }, onChange: { windowSize = $0 })
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
         }
@@ -939,8 +1123,17 @@ struct NewNotebookSheet: View {
     }
 
     private func create() {
+        titleFocused = false
+        focusedDimension = nil
         Task { @MainActor in
-            if await model.create() { onDone() }
+            _ = await model.create {
+                await model.dismissPresentation()
+                onDone()
+            }
+            if let field = model.invalidDimension {
+                titleFocused = false
+                focusedDimension = field
+            }
         }
     }
 
@@ -948,9 +1141,6 @@ struct NewNotebookSheet: View {
 
     @ViewBuilder
     private var formHeading: some View {
-        if let message = model.message {
-            NibBanner(message, style: .warning)
-        }
         kindPicker
         titleRow
     }
@@ -991,6 +1181,8 @@ struct NewNotebookSheet: View {
                 .frame(minHeight: NibMetrics.hitTarget)
                 .background(NibColor.backgroundTertiary,
                             in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
+                .contentShape(Rectangle())
+                .onTapGesture { titleFocused = true }
                 .accessibilityLabel(String(localized: "Title"))
         }
     }
@@ -1009,19 +1201,22 @@ struct NewNotebookSheet: View {
                         NibPaperTile(name: option.title, isSelected: draft.hasCover && draft.cover.id == option.id,
                                      size: NibMetrics.coverStripSize, action: { model.selectCover(option) }) {
                             CoverPreview(definition: option.definition,
-                                         params: draft.coverRef(option.definition).params,
-                                         page: draft.pageSize, cloth: draft.cloth)
+                                         params: draft.cover.id == option.id ? draft.coverRef(option.definition).params : [:],
+                                         page: draft.pageSize, cloth: draft.cover.id == option.id ? draft.cloth : nil)
                         }
                     }
                 }
                 .padding(NibStroke.ring + NibStroke.ringOutset)
             }
             if draft.hasCover && model.coverTakesColour {
-                NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
-                              selection: Binding(get: { model.draft.cloth?.rawValue },
-                                                 set: { model.draft.cloth = $0.flatMap(NibCoverCloth.init(rawValue:)) }),
-                              columns: swatchColumns(count: NibCoverCloth.allCases.count + 1),
-                              noneLabel: String(localized: "Cover's own colour"))
+                NibInspectorSection(String(localized: "Cover colour")) {
+                    NibChip(String(localized: "Use cover's colour"), style: .filter(isSelected: draft.cloth == nil),
+                            action: { model.selectCloth(nil) })
+                    NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
+                                  selection: Binding(get: { model.draft.cloth?.rawValue },
+                                                     set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
+                                  columns: swatchColumns(count: NibCoverCloth.allCases.count))
+                }
             }
         }
     }
@@ -1031,16 +1226,15 @@ struct NewNotebookSheet: View {
     private var paperSection: some View {
         NibInspectorSection(String(localized: "Paper"), value: draft.custom == nil ? nil : String(localized: "Custom"),
                             action: model.canChooseMore ? moreTemplates : nil) {
-            if compact {
-                VStack(alignment: .leading, spacing: NibSpacing.m) {
-                    groupChips
-                    paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
-                }
-            } else {
-                HStack(alignment: .top, spacing: NibSpacing.l) {
-                    groupList
-                    paperGrid.padding(NibStroke.ring + NibStroke.ringOutset)
-                }
+            // Clamp to the window while the first layout is being measured: the grid's minimum width must not
+            // enlarge that measurement and keep a narrow sheet in the rail layout.
+            NewNotebookPaperChooser(availableWidth: min(measuredWidth, windowSize?.width ?? measuredWidth)
+                                    - contentInset * 2) {
+                groupList
+            } chips: {
+                groupChips
+            } papers: {
+                paperTiles
             }
         }
     }
@@ -1048,9 +1242,6 @@ struct NewNotebookSheet: View {
     private var moreTemplates: NibAction {
         NibAction(String(localized: "More Templates…"), handler: { Task { @MainActor in await model.chooseMore() } })
     }
-
-    /// The group list beside the grid (DESIGN.md §14.6 asks for about 150 pt; kept on the 4 pt grid).
-    static let groupListWidth = NibMetrics.paperTileSize.width + NibSpacing.x5
 
     private var groupList: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1064,16 +1255,16 @@ struct NewNotebookSheet: View {
                         .foregroundStyle(NibColor.label)
                         .lineLimit(2)
                         .padding(.horizontal, NibSpacing.m)
-                        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                        .frame(maxWidth: .infinity, minHeight: NibSpacing.x3, alignment: .leading)
                         .background(selected ? NibColor.fill3 : Color.clear,
                                     in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
+                        .frame(minHeight: NibMetrics.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous)))
                 .accessibilityAddTraits(selected ? .isSelected : [])
             }
         }
-        .frame(width: NewNotebookSheet.groupListWidth)
     }
 
     private var groupChips: some View {
@@ -1086,16 +1277,19 @@ struct NewNotebookSheet: View {
         }
     }
 
-    private var paperGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.paperTileSize.width), spacing: NibSpacing.m)],
-                  alignment: .leading, spacing: NibSpacing.l) {
-            ForEach(model.papersInGroup) { option in
-                NibPaperTile(name: option.title, isSelected: draft.custom == nil && draft.paper.id == option.id,
-                             action: { model.selectPaper(option) }) {
-                    TemplatePreview(definition: option.definition,
-                                    params: draft.paperRef(option.definition).params,
-                                    page: draft.pageSize, paper: draft.paperColour ?? .white)
-                }
+    @ViewBuilder
+    private var paperTiles: some View {
+        if model.papersInGroup.isEmpty {
+            Text(String(localized: "Install a template plugin to add paper here."))
+                .font(NibFont.footnote)
+                .foregroundStyle(NibColor.labelSecondary)
+        }
+        ForEach(model.papersInGroup) { option in
+            NibPaperTile(name: option.title, isSelected: draft.custom == nil && draft.paper.id == option.id,
+                         action: { model.selectPaper(option) }) {
+                TemplatePreview(definition: option.definition,
+                                params: draft.paperRef(option.definition).params,
+                                page: draft.pageSize, paper: draft.paperColour ?? .white)
             }
         }
     }
@@ -1107,6 +1301,10 @@ struct NewNotebookSheet: View {
         let layout = compact || measuredWidth < NibMetrics.newDocumentSheetSize.width || typeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: NibSpacing.xl))
             : AnyLayout(HStackLayout(alignment: .top, spacing: NibSpacing.xl))
+        NibInspectorSection(String(localized: "Apply to")) {
+            NibSegmentedControl(selection: $model.draft.distribution, options: PaperDistribution.allCases,
+                                title: { $0.title })
+        }
         layout {
             NibInspectorSection(String(localized: "Size")) {
                 Picker(String(localized: "Size"), selection: Binding(get: { model.sizeSelection },
@@ -1132,7 +1330,7 @@ struct NewNotebookSheet: View {
     }
 
     private func paperColours(_ papers: [NibPaper]) -> some View {
-        NibSwatchGrid(swatches: papers.map { NibSwatch(paper: $0) },
+        NibSwatchGrid(swatches: papers.map(NotebookDraft.paperSwatch),
                       selection: Binding(get: { model.draft.paperColour?.rawValue },
                                          set: { model.draft.paperColour = $0.flatMap(NibPaper.init(rawValue:)) }),
                       columns: compact ? swatchColumns(count: papers.count + 1) : papers.count + 1,
@@ -1145,21 +1343,26 @@ struct NewNotebookSheet: View {
         return min(count, max(1, Int((width - contentInset * 2) / NibMetrics.hitTarget)))
     }
 
+    @ViewBuilder
     private var customSizeFields: some View {
         HStack(spacing: NibSpacing.s) {
-            millimetreField(String(localized: "Width"), value: $model.customWidth)
+            millimetreField(String(localized: "Width"), field: .width, value: $model.customWidth)
             Text(String(localized: "by"))
                 .font(NibFont.footnote)
                 .foregroundStyle(NibColor.labelSecondary)
-            millimetreField(String(localized: "Height"), value: $model.customHeight)
+            millimetreField(String(localized: "Height"), field: .height, value: $model.customHeight)
             Text(String(localized: "mm"))
                 .font(NibFont.footnote)
                 .foregroundStyle(NibColor.labelSecondary)
         }
+        if let message = model.dimensionMessage {
+            NibBanner(message, style: .warning)
+        }
     }
 
-    private func millimetreField(_ label: String, value: Binding<Double>) -> some View {
+    private func millimetreField(_ label: String, field: CustomDimension, value: Binding<Double>) -> some View {
         TextField(label, value: value, format: .number.precision(.fractionLength(0...1)))
+            .focused($focusedDimension, equals: field)
             .keyboardType(.decimalPad)
             .font(NibFont.body)
             .multilineTextAlignment(.trailing)
@@ -1201,21 +1404,25 @@ struct NewNotebookSheet: View {
 
 /// Reads the hosting window, including Split View and Stage Manager resizes, without relying on sheet size classes.
 private struct NewNotebookWindowReader: UIViewRepresentable {
+    var onController: ((UIViewController) -> Void)? = nil
     let onChange: (CGSize) -> Void
 
     func makeUIView(context: Context) -> WindowView {
         let view = WindowView()
         view.onChange = onChange
+        view.onController = onController
         return view
     }
 
     func updateUIView(_ uiView: WindowView, context: Context) {
+        uiView.onController = onController
         uiView.onChange = onChange
         uiView.reportSize()
     }
 
     final class WindowView: UIView {
         var onChange: ((CGSize) -> Void)?
+        var onController: ((UIViewController) -> Void)?
         private var reportedSize: CGSize?
 
         override func didMoveToWindow() {
@@ -1229,6 +1436,15 @@ private struct NewNotebookWindowReader: UIViewRepresentable {
         }
 
         func reportSize() {
+            var responder: UIResponder? = self
+            while let current = responder {
+                if var controller = current as? UIViewController {
+                    while controller.presentingViewController == nil, let parent = controller.parent { controller = parent }
+                    if controller.presentingViewController != nil { onController?(controller) }
+                    break
+                }
+                responder = current.next
+            }
             guard let size = window?.bounds.size, size.width > 0, size.height > 0, size != reportedSize else { return }
             reportedSize = size
             DispatchQueue.main.async { [weak self] in self?.onChange?(size) }

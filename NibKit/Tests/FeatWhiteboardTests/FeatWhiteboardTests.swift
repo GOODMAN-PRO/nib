@@ -2,9 +2,15 @@ import XCTest
 import UIKit
 import SwiftUI
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatWhiteboard
+
+private struct WhiteboardHitTarget: UIViewRepresentable {
+    let control: UIButton
+    func makeUIView(context: Context) -> UIButton { control }
+    func updateUIView(_ view: UIButton, context: Context) {}
+}
 
 /// A renderer that runs `before` on every render, then fails or returns a blank image.
 private final class ScriptedRenderer: PageRenderer {
@@ -40,6 +46,42 @@ private final class MinimapTestFloatingHost: FloatingHosting {
         return rect.offsetBy(dx: origin.x - view.bounds.minX, dy: origin.y - view.bounds.minY)
     }
     func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+}
+
+@MainActor
+private final class WhiteboardDeferredPersistence: DocumentPersistence {
+    let saved = InMemoryPersistence()
+    var pending: [DocumentID: DocumentContent] = [:]
+    var flushed: [DocumentID] = []
+
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try saved.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try saved.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        if let head { pending[doc] = head }
+        saved.didChange(doc, head: nil, pages: pages)
+    }
+    func flush(_ doc: DocumentID) {
+        flushed.append(doc)
+        if let head = pending.removeValue(forKey: doc) { saved.heads[doc] = head }
+    }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
+        try saved.fileURL(doc, relativePath: relativePath)
+    }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
+}
+
+@MainActor
+private final class WhiteboardDeferredDismissalController: UIViewController {
+    let presenter = UIViewController()
+    var isPresented = true
+    var dismissalCompletion: (() -> Void)?
+    var onDismiss: (() -> Void)?
+
+    override var presentingViewController: UIViewController? { isPresented ? presenter : nil }
+    override func dismiss(animated flag: Bool, completion: (() -> Void)? = nil) {
+        dismissalCompletion = completion
+        onDismiss?()
+    }
 }
 
 @MainActor
@@ -92,6 +134,42 @@ final class FeatWhiteboardTests: XCTestCase {
     }
 
     // MARK: Commands
+
+    func testFloatingCoordinateReferenceNeverClaimsBoardControlsAfterReuse() async throws {
+        let floating = NibFloatingHost()
+        let control = UIButton(type: .system)
+        let host = UIHostingController(rootView: ZStack {
+            WhiteboardHitTarget(control: control)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            NibFloatingLayer(host: floating)
+        }.ignoresSafeArea())
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376)] {
+            window.frame = CGRect(origin: .zero, size: size)
+            host.view.frame = window.bounds
+            for _ in 0..<5 {
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let reference = try XCTUnwrap(floating.referenceView)
+            XCTAssertNotNil(floating.containerRect(host.view.bounds, from: host.view))
+            // Native hosting can restore UIView's interaction flag while reusing a
+            // representable. A coordinate-only surface must remain inert itself.
+            reference.isUserInteractionEnabled = true
+            for point in [CGPoint(x: 48, y: 230), CGPoint(x: 186, y: 986),
+                          CGPoint(x: size.width - 290, y: 62), CGPoint(x: 132, y: 570)] {
+                let local = reference.convert(point, from: host.view)
+                XCTAssertNil(reference.hitTest(local, with: nil),
+                             "The floating coordinate reference must never consume Select, Move, Undo or menu taps")
+                let hit = host.view.hitTest(point, with: nil)
+                XCTAssertTrue(hit === control || hit?.isDescendant(of: control) == true,
+                              "Visible controls under the coordinate layer must receive the touch")
+            }
+        }
+    }
 
     /// Descriptor hygiene, examples, and the undo round trip of every edit example (convert included: without a
     /// renderer service the PDF page is drawn from the PDF itself).
@@ -388,6 +466,186 @@ final class FeatWhiteboardTests: XCTestCase {
         }
     }
 
+    func testAddBoardMenuAndSidebarRevealOnlyInInvokingWindow() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let other = EditorSession()
+        other.document = Fixtures.whiteboardID
+        other.page = Fixtures.boardID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        var navigations: [PageID] = []
+        let sidebarNavigated = expectation(description: "sidebar addition revealed")
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Go", summary: "Stand-in.",
+                                                  effect: .session)) { params, ctx in
+            let (doc, page) = try ctx.pageOrSession(params["page"]?.stringValue)
+            XCTAssertTrue(ctx.session === h.session)
+            XCTAssertNotNil(try ctx.workspace.content(doc).page(page), "commit before navigating")
+            ctx.session?.page = page
+            navigations.append(page)
+            if navigations.count == 2 { sidebarNavigated.fulfill() }
+            return [:]
+        }
+        let menu = try XCTUnwrap(h.app.ui.menus.get("whiteboard.addBoard"))
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.whiteboardID)
+        let out = try await h.run(menu.command, menu.params(context))
+        let first = try XCTUnwrap(h.session.page)
+        XCTAssertEqual(out["ref"]?.stringValue, NodeRef.page(Fixtures.whiteboardID, first).description)
+        XCTAssertNotEqual(first, Fixtures.boardID)
+        XCTAssertTrue(try h.app.workspace.items(Fixtures.whiteboardID, page: first).isEmpty)
+
+        let model = BoardsModel(app: h.app, session: h.session)
+        model.add()
+        await fulfillment(of: [sidebarNavigated], timeout: 5)
+        XCTAssertEqual(navigations.count, 2, "each entry point navigates once")
+        XCTAssertNotEqual(h.session.page, first)
+        XCTAssertEqual(other.page, Fixtures.boardID)
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), 2)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).livePages.map(\.id), [Fixtures.boardID, first])
+        XCTAssertTrue(h.app.bus.redo(Fixtures.whiteboardID))
+        // Exercise the command used by the toolbar, including its invoking-window
+        // default, rather than only calling the history implementation directly.
+        let undone = try await h.run(CommandIDs.undo, [:])
+        XCTAssertEqual(undone["done"]?.boolValue, true)
+        XCTAssertEqual(model.boards.map(\.id), [Fixtures.boardID, first])
+        XCTAssertTrue(h.app.bus.history.canRedo(Fixtures.whiteboardID))
+    }
+
+    func testBoardSelectionRoutesSeenMoveDuplicateAndTemplatesWithoutNavigating() async throws {
+        let h = harness()
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04", "id": "BOARD2"])
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04", "id": "BOARD3"])
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        let before = try h.snapshot(Fixtures.whiteboardID)
+        let depth = h.undoDepth(Fixtures.whiteboardID)
+        model.isSelecting = true
+        model.toggle("BOARD2")
+        XCTAssertEqual(WhiteboardCopy.selectedBoards(model.selected.count), "1 board selected")
+        XCTAssertEqual(h.session.page, Fixtures.boardID, "Selecting an unseen board must not open or mark it read")
+
+        let seen = expectation(description: "Only the chosen board is marked seen")
+        let duplicate = expectation(description: "The chosen context-menu board is duplicated")
+        let templates = expectation(description: "Templates panel opens")
+        for command in [CommandIDs.collabMarkSeen, CommandIDs.pageDuplicate, CommandIDs.panelOpen] {
+            h.app.commands.register(CommandDescriptor(id: command, title: command, summary: "Routing receiver.",
+                                                      effect: .session)) { params, ctx in
+                XCTAssertTrue(ctx.session === h.session)
+                if command == CommandIDs.panelOpen {
+                    XCTAssertEqual(params["id"]?.stringValue, Whiteboard.templatesPanel)
+                    templates.fulfill()
+                } else {
+                    XCTAssertEqual(params["pages"], ["page:FIXTUREDOC04/BOARD2"])
+                    if command == CommandIDs.collabMarkSeen { seen.fulfill() } else { duplicate.fulfill() }
+                }
+                return [:]
+            }
+        }
+        model.markSeen(model.selected)
+        let context = model.menuContext(for: "BOARD2")
+        let item = try XCTUnwrap(h.app.ui.menuItems(.board, context).first { $0.command == CommandIDs.pageDuplicate })
+        model.run(item, context)
+        model.showTemplates()
+        await fulfillment(of: [seen, duplicate, templates], timeout: 5)
+        XCTAssertNotNil(h.app.content.boardTemplates.all.first { $0.title == "Flowchart" })
+
+        model.requestMove(model.selected)
+        XCTAssertTrue(model.showsMove, "Choosing Move must expose the destination sheet")
+        XCTAssertEqual(model.moving, [NibID("BOARD2")])
+        model.showsMove = false
+        model.selectAll()
+        model.requestMove(model.selected)
+        XCTAssertFalse(model.showsMove, "The last board must remain in the source whiteboard")
+        XCTAssertEqual(try h.snapshot(Fixtures.whiteboardID), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), depth)
+        XCTAssertEqual(h.session.page, Fixtures.boardID)
+    }
+
+    func testBoardAddDoesNotNavigateForAutomationPreviewOrUnrelatedWindow() async throws {
+        let h = harness()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Go", summary: "Stand-in.",
+                                                  effect: .session)) { _, _ in
+            XCTFail("adding a board must not steal this window's navigation")
+            return [:]
+        }
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04"])
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        _ = try await h.run(CommandIDs.boardAdd, ["doc": "doc:FIXTUREDOC04"], as: .ai("test"))
+        let before = try h.snapshot(Fixtures.whiteboardID)
+        _ = try await h.app.bus.execute(Invocation(command: CommandIDs.boardAdd,
+                                                   params: ["doc": "doc:FIXTUREDOC04"],
+                                                   session: h.session, dryRun: true))
+        XCTAssertEqual(try h.snapshot(Fixtures.whiteboardID), before)
+        _ = try await h.app.bus.execute(Invocation(command: CommandIDs.boardAdd,
+                                                   params: ["doc": "doc:FIXTUREDOC04"]))
+        XCTAssertEqual(h.session.page, Fixtures.boardID)
+    }
+
+    func testRenameCommandAReplacesWholeNameAndPersists() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        model.beginRename(try XCTUnwrap(model.boards.first))
+        XCTAssertTrue(h.session.isEditingText)
+        let canvasSelectAll = KeyCommandDescriptor(id: "test.selectAll", title: "Select All",
+            shortcut: KeyShortcut("a", .command), command: CommandIDs.selectionSelectAll,
+            scope: .canvas, owner: "test")
+        XCTAssertFalse(canvasSelectAll.isActive(in: KeyCommandContext(docKind: .whiteboard,
+            isEditingText: h.session.isEditingText)))
+
+        let saved = expectation(description: "rename saved")
+        let subscription = h.app.bus.observeCommits { changes in
+            if changes.documents.contains(Fixtures.whiteboardID) { saved.fulfill() }
+        }
+        defer { subscription.cancel() }
+        let editor = BoardRenameEditor(text: Binding(get: { model.renameText }, set: { model.renameText = $0 }),
+                                       commit: { model.commitRename() }, cancel: { model.cancelRename() })
+        let coordinator = editor.makeCoordinator()
+        let field = BoardRenameTextField()
+        field.text = model.renameText
+        // A tap can collapse the initial selection. Command-A must select it again before typing.
+        field.selectedTextRange = field.textRange(from: field.endOfDocument, to: field.endOfDocument)
+        let command = try XCTUnwrap(field.keyCommands?.first { $0.input == "a" && $0.modifierFlags == .command })
+        XCTAssertTrue(command.wantsPriorityOverSystemBehavior)
+        _ = field.perform(command.action, with: command)
+        let selected = try XCTUnwrap(field.selectedTextRange)
+        XCTAssertEqual(field.text(in: selected), model.renameText)
+        field.insertText("Canvas navigation board")
+        XCTAssertEqual(field.text, "Canvas navigation board")
+        XCTAssertTrue(coordinator.textFieldShouldReturn(field))
+        await fulfillment(of: [saved], timeout: 5)
+        XCTAssertFalse(h.session.isEditingText)
+        XCTAssertNil(model.renaming)
+        h.app.workspace.close(Fixtures.whiteboardID)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.whiteboardID).page(Fixtures.boardID)?.title,
+                       "Canvas navigation board")
+        XCTAssertEqual(try boardItems(h).map(\.id), [Fixtures.boardShapeID])
+    }
+
+    func testCancelRenameRestoresTextFocusWithoutChangingBoard() throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        let model = BoardsModel(app: h.app, session: h.session)
+        let board = try XCTUnwrap(model.boards.first)
+        for wasEditing in [false, true] {
+            h.session.isEditingText = wasEditing
+            model.beginRename(board)
+            model.renameText = "Uncommitted"
+            model.cancelRename()
+            model.cancelRename() // teardown may also cancel; it must not clear another editor's focus
+            XCTAssertEqual(h.session.isEditingText, wasEditing)
+            XCTAssertNil(model.renaming)
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), 0)
+        XCTAssertEqual(model.boards.first?.title, board.title)
+    }
+
     // MARK: Board limit (D-030)
 
     /// A board holding exactly `NibLimits.boardItemLimit` items refuses a template, and its minimap takes the touches
@@ -658,6 +916,184 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertNil(draft.template(in: templates))
         XCTAssertEqual(WhiteboardDraft(language: "en-GB").resolvedTitle, "Untitled Whiteboard")
         XCTAssertEqual(BoardPaper.board.title, "Board", "the palette names the papers")
+    }
+
+    func testCreationWaitsForSheetDismissalBeforeOpeningBoard() async throws {
+        let h = harness()
+        let sheet = WhiteboardDeferredDismissalController()
+        let presentation = WhiteboardCreationPresentation()
+        presentation.controller = sheet
+        let dismissRequested = expectation(description: "UIKit dismissal requested")
+        sheet.onDismiss = { dismissRequested.fulfill() }
+        var createdID: String?
+        var openedID: String?
+        var languageID: String?
+        var panelClosed = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { params, _ in
+            createdID = params["id"]?.stringValue
+            XCTAssertEqual(params["kind"], "whiteboard")
+            XCTAssertTrue(sheet.isPresented, "Keep the draft visible until creation succeeds")
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Stand-in.",
+                                                  effect: .session)) { params, _ in
+            XCTAssertFalse(sheet.isPresented, "Opening must not detach a still-presented creation sheet")
+            XCTAssertTrue(panelClosed, "Clear the library's panel state before replacing its presenter")
+            openedID = params["doc"]?.stringValue
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docSetLanguage, title: "Language", summary: "Stand-in.",
+                                                  effect: .edit)) { params, _ in
+            languageID = params["doc"]?.stringValue
+            XCTAssertEqual(params["doc"]?.stringValue, createdID.map { "doc:" + $0 })
+            XCTAssertEqual(params["language"], "fr-FR")
+            return [:]
+        }
+        let creation = Task { @MainActor in
+            try await WhiteboardCreator.create(WhiteboardDraft(language: "fr-FR"), folder: nil,
+                                                app: h.app, session: h.session) {
+                await presentation.dismiss()
+                panelClosed = true
+            }
+        }
+        await fulfillment(of: [dismissRequested], timeout: 2)
+        XCTAssertNotNil(createdID)
+        XCTAssertNil(openedID, "Wait for completion, not merely the request to dismiss")
+        XCTAssertFalse(panelClosed)
+        let complete = try XCTUnwrap(sheet.dismissalCompletion)
+        sheet.isPresented = false
+        complete()
+        let id = try await creation.value
+        XCTAssertEqual(createdID, id.raw)
+        XCTAssertEqual(openedID, NodeRef.document(id).description)
+        XCTAssertEqual(languageID, NodeRef.document(id).description,
+                       "A head unavailable to the initial read must not silently skip the chosen language")
+    }
+
+    func testCreationPersistsSelectedLanguageBeforeDismissalAndNavigation() async throws {
+        let h = harness()
+        let persistence = WhiteboardDeferredPersistence()
+        h.app.workspace.persistence = persistence
+        // A creation flow must address the new board, even when another document is active in this window.
+        h.session.document = Fixtures.docID
+        var created: DocumentID?
+        var opened = false
+        var languageEdits = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { params, _ in
+            let id = DocumentID(try XCTUnwrap(params["id"]?.stringValue))
+            created = id
+            let template = try XCTUnwrap(params["template"]).decode(TemplateRef.self)
+            let page = PageRecord(id: "CREATEDBOARD", order: "V", size: nil,
+                                  background: .ofTemplate(template.id, params: template.params))
+            persistence.saved.heads[id] = DocumentContent(
+                meta: DocumentMeta(id: id, kind: .whiteboard, language: "en-US"), pages: [page])
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docSetLanguage, title: "Language", summary: "Stand-in.",
+                                                  effect: .edit)) { params, ctx in
+            let id = try XCTUnwrap(created)
+            XCTAssertEqual(params["doc"]?.stringValue, NodeRef.document(id).description)
+            languageEdits += 1
+            try ctx.mutate { tx in
+                var meta = try tx.content(id).meta
+                meta.language = try XCTUnwrap(params["language"]?.stringValue)
+                try tx.putMeta(meta)
+            }
+            XCTAssertEqual(try persistence.loadHead(id).meta.language, "en-US", "The edit is still pending on disk")
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Stand-in.",
+                                                  effect: .session)) { params, _ in
+            let id = try XCTUnwrap(created)
+            XCTAssertEqual(params["doc"]?.stringValue, NodeRef.document(id).description)
+            XCTAssertEqual(try persistence.loadHead(id).meta.language, "fr-FR")
+            opened = true
+            return [:]
+        }
+        h.app.content.templates.register(TemplateDefinition(
+            id: TemplateIDs.whiteboardGrid, title: "Grid", category: "Whiteboard", owner: "test",
+            params: [TemplateParam(name: "paper", title: "Paper", kind: "color")]) { _, _, _ in
+                TemplateRender(paper: .white, display: DisplayList(ops: []))
+            })
+        var draft = WhiteboardDraft(language: "fr-FR")
+        draft.title = "Board options"
+        draft.pattern = .grid
+        draft.paper = .ivory
+        var savedLanguageAtDismissal: String?
+        let id = try await WhiteboardCreator.create(draft, folder: nil, app: h.app, session: h.session) {
+            savedLanguageAtDismissal = created.flatMap { try? persistence.loadHead($0).meta.language }
+        }
+        XCTAssertEqual(savedLanguageAtDismissal, "fr-FR")
+        XCTAssertTrue(opened)
+        XCTAssertEqual(languageEdits, 1)
+        XCTAssertEqual(persistence.flushed, [id])
+        XCTAssertTrue(persistence.pending.isEmpty)
+        let board = try XCTUnwrap(persistence.loadHead(id).livePages.first)
+        XCTAssertNil(board.size)
+        XCTAssertEqual(board.background.template?.id, TemplateIDs.whiteboardGrid)
+        XCTAssertEqual(board.background.template?.params["paper"], "#FBF8F1FF")
+    }
+
+    func testFailedCreationKeepsDraftOpenAndDoesNotNavigate() async {
+        let h = harness()
+        var dismissed = false
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { _, _ in
+            throw NibError(.unavailable, "Storage unavailable")
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open", summary: "Stand-in.",
+                                                  effect: .session)) { _, _ in
+            opened = true
+            return [:]
+        }
+        await expectError(.unavailable) {
+            _ = try await WhiteboardCreator.create(WhiteboardDraft(language: "en-GB"), folder: nil,
+                                                    app: h.app, session: h.session) { dismissed = true }
+        }
+        XCTAssertFalse(dismissed, "A failed create must preserve the draft for retry")
+        XCTAssertFalse(opened)
+    }
+
+    func testDismissalWithoutAPresentedSheetCompletes() async {
+        let presentation = WhiteboardCreationPresentation()
+        await presentation.dismiss()
+        let sheet = WhiteboardDeferredDismissalController()
+        sheet.isPresented = false
+        presentation.controller = sheet
+        await presentation.dismiss()
+        XCTAssertNil(sheet.dismissalCompletion)
+    }
+
+    func testWhiteboardKeyboardShortcutOnlyOpensOptionsInInvokingSession() async throws {
+        let h = harness()
+        h.session.document = nil
+        let shortcut = KeyShortcut("w", [.command, .shift])
+        let keys = KeyCommandRouting.active(h.app.content.keyCommands.all, in: KeyCommandContext(docKind: nil))
+            .filter { $0.shortcut == shortcut }
+        XCTAssertEqual(keys.count, 1)
+        let key = try XCTUnwrap(keys.first)
+        XCTAssertEqual(key.command, CommandIDs.panelOpen)
+        XCTAssertEqual(key.resolvedParams(for: h.session)["id"]?.stringValue, Whiteboard.createPanel)
+        var presented = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Panel", summary: "Stand-in.",
+                                                  effect: .session)) { params, ctx in
+            XCTAssertTrue(ctx.activeSession === h.session)
+            XCTAssertEqual(params["id"]?.stringValue, Whiteboard.createPanel)
+            presented = true
+            return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
+                                                  effect: .library)) { _, _ in
+            XCTFail("A keyboard shortcut must wait for the user to confirm the board options")
+            return [:]
+        }
+        _ = try await h.app.bus.execute(Invocation(command: key.command, params: key.resolvedParams(for: h.session),
+                                                 principal: .user, session: h.session))
+        XCTAssertTrue(presented)
+        XCTAssertNil(h.session.document)
     }
 
     /// New Whiteboard is one sheet: the folder it creates in travels as a `panel.open` param.

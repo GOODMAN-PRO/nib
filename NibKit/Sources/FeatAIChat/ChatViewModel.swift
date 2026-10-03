@@ -159,16 +159,18 @@ final class ChatViewModel: ObservableObject {
     @Published var showsProposalsOnPage = true
     @Published var proposalsReviewed = false
     @Published private(set) var isApplyingProposals = false
-    private(set) var isStagingProposals = false
+    @Published private(set) var isStagingProposals = false
     let localUndo = UndoManager()
     var proposalApplyGroup: String?
     @Published var confirmation: ChatConfirmation?
-    @Published var providerLabel = String(localized: "Your provider · your API key")
+    @Published var providerLabel = String(localized: "No model connected")
+    @Published private(set) var historyOperationLabel: String?
     @Published var contextLabel = String(localized: "Library")
     @Published var docKind: DocumentKind?
     @Published var needsImagePicker = false
     @Published var retryPrompt: String?
     private var generation: UUID?
+    private var sessionObservation: AnyCancellable?
     var turnToken: UUID? { generation }
     @Published private(set) var isLoadingChat = false
     private var loadToken: UUID?
@@ -183,16 +185,90 @@ final class ChatViewModel: ObservableObject {
         self.session = session
         if let d = session?.document {
             scope = AIScope(kind: .document, doc: d)
-            contextLabel = String(localized: "Document")
         }
+        refreshContextLabel()
+        refreshProviderLabel()
+        // Scope-menu prerequisites follow the canvas selection even when the conversation is idle.
+        sessionObservation = session?.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
     }
 
     static func tokenKey(_ chat: String) -> SettingKey<Int> { SettingKey("aichat.tokens." + chat, default: 0) }
     var tokenCount: Int { totalTokens }
+    static let connectionActions = [String(localized: "Use my Claude subscription"), String(localized: "Use my ChatGPT subscription"), String(localized: "Other providers")]
+    static func connectionPage(for action: String) -> String {
+        if action == connectionActions[0] { return "settings.ai.claude" }
+        if action == connectionActions[1] { return "settings.ai.chatgpt" }
+        return "settings.ai"
+    }
     var settingsPageID: String {
         app?.ui.settingsPages.all.first(where: { $0.owner == "aisettings" })?.id ?? "settings.ai"
     }
     var isConfigured: Bool { app?.services.ai?.isConfigured ?? false }
+    // These mirror existing command guards; presentation must not offer an action the model rejects.
+    var canChangeConversation: Bool { !isStreaming && !isGeneratingImage && !isApplyingProposals && !isStagingProposals }
+    var canStartGeneration: Bool { canChangeConversation && !isLoadingChat }
+    var canSend: Bool { isConfigured && canStartGeneration && proposals.isEmpty }
+    var canGenerateImage: Bool { isConfigured && app?.services.assets != nil && canStartGeneration }
+    var canConfigureContext: Bool { !isStreaming && !isApplyingProposals }
+    var canUseHistory: Bool { canStartGeneration && historyOperationLabel == nil }
+    var progressLabel: String? {
+        if let historyOperationLabel { return historyOperationLabel }
+        if isLoadingChat { return String(localized: "Loading conversation…") }
+        if isGeneratingImage { return String(localized: "Generating image…") }
+        if isApplyingProposals { return String(localized: "Applying changes…") }
+        if isStagingProposals { return String(localized: "Preparing changes…") }
+        if isStreaming { return String(localized: "Generating response…") }
+        return nil
+    }
+
+    func refreshProviderLabel() {
+        guard let store = app?.services.get(ServiceKeys.aiProviders, as: AIProviderStore.self),
+              let config = store.configs.first(where: { $0.id == store.activeID }) else {
+            if providerLabel != String(localized: "No model connected") { providerLabel = String(localized: "No model connected") }
+            return
+        }
+        let hasKey = !(Keychain.getString(service: AIProviderConfig.keychainService, account: config.keychainAccount) ?? "").isEmpty
+        let credentials = config.extraHeaders["X-Nib-Subscription"] == "1"
+            ? String(localized: "your subscription")
+            : (hasKey ? String(localized: "your API key") : String(localized: "no API key saved"))
+        let label = "\(config.model) · \(config.name) · \(credentials)"
+        if providerLabel != label { providerLabel = label }
+    }
+
+    func refreshContextLabel() {
+        guard scope.kind != .library else { contextLabel = String(localized: "Library"); return }
+        let title = scope.doc.flatMap { app?.services.library?.node($0)?.title } ?? String(localized: "Document unavailable")
+        let content = scope.doc.flatMap { try? app?.workspace.content($0) }
+        let page = scope.page.flatMap { content?.pageIndex($0) }.map { String(localized: "Page \($0 + 1)") }
+        var parts = [title]
+        if scope.kind != .document, let page { parts.append(page) }
+        switch scope.kind {
+        case .page: if page == nil { parts.append(String(localized: "Page unavailable")) }
+        case .selection:
+            parts.append(scope.refs.count == 1 ? String(localized: "1 item selected") : String(localized: "\(scope.refs.count) items selected"))
+        case .block:
+            parts.append(scope.refs.count == 1 ? String(localized: "1 block selected") : String(localized: "\(scope.refs.count) blocks selected"))
+        default: break
+        }
+        contextLabel = parts.joined(separator: " · ")
+    }
+
+    func scopeUnavailableReason(_ kind: AIScopeKind) -> String? {
+        switch kind {
+        case .library: return nil
+        case .document: return session?.document == nil ? String(localized: "Open a document first") : nil
+        case .page: return session?.document == nil || session?.page == nil ? String(localized: "Open a page first") : nil
+        case .selection, .block:
+            let selected = session?.selection.refs ?? []
+            let valid = !selected.isEmpty && selected.allSatisfy {
+                if case .block? = NodeRef($0) { return true }
+                if kind == .selection, case .item? = NodeRef($0) { return true }
+                return false
+            }
+            return valid ? nil : (kind == .block ? String(localized: "Select a block first") : String(localized: "Select an item first"))
+        }
+    }
+
     var quickActions: [AIActionDescriptor] {
         app?.content.aiActions.all.filter { action in
             docKind.map { action.docKinds.contains($0) } ?? (action.scope == .library)
@@ -201,9 +277,18 @@ final class ChatViewModel: ObservableObject {
 
     func perform(_ command: String, _ params: JSONValue = [:]) {
         guard let app else { return }
+        let historyOperation: String?
+        switch command {
+        case CommandIDs.aiChatRename: historyOperation = String(localized: "Saving conversation name…")
+        case CommandIDs.aiChatDelete: historyOperation = String(localized: "Deleting conversation…")
+        default: historyOperation = nil
+        }
+        if let historyOperation { historyOperationLabel = historyOperation }
         Task { @MainActor in
+            defer { if historyOperation != nil { historyOperationLabel = nil } }
             do {
                 _ = try await app.bus.execute(command, params, session: session)
+                if historyOperation != nil { error = nil }
                 if command == CommandIDs.aiChatRename { renamingChat = nil }
                 if command == CommandIDs.aiChatRename || command == CommandIDs.aiChatDelete {
                     if command == CommandIDs.aiChatDelete, params["chat"]?.stringValue == chatID { stop(); try newChat() }
@@ -223,13 +308,8 @@ final class ChatViewModel: ObservableObject {
         let result = try await app.bus.execute(CommandIDs.queryContext, [:], principal: principal, session: session)
         let value = result
         docKind = value["document"]?["kind"]?.stringValue.flatMap(DocumentKind.init(rawValue:))
-        if let store = app.services.get(ServiceKeys.aiProviders, as: AIProviderStore.self),
-           let config = store.configs.first(where: { $0.id == store.activeID }) {
-            providerLabel = "\(config.model) · \(config.name) · " + String(localized: "your API key")
-        }
-        if scope.kind == .page, let index = value["page"]?["index"]?.intValue {
-            contextLabel = String(localized: "Page \(index)")
-        }
+        refreshProviderLabel()
+        refreshContextLabel()
     }
 
     func setScope(_ kind: AIScopeKind, refs: [String] = []) throws {
@@ -254,23 +334,20 @@ final class ChatViewModel: ObservableObject {
             scope = AIScope(kind: kind, doc: NodeRef(selected[0])?.documentID,
                             page: NodeRef(selected[0])?.pageID, refs: selected)
         }
-        switch kind {
-        case .selection: contextLabel = String(localized: "Selection · \(selected.count) items")
-        case .block: contextLabel = String(localized: "Block · \(selected.count) selected")
-        case .page: contextLabel = String(localized: "Page")
-        case .document: contextLabel = String(localized: "Document")
-        case .library: contextLabel = String(localized: "Library")
-        }
+        refreshContextLabel()
     }
 
     func refreshChats(principal: Principal = .user) async throws {
         guard let app else { throw NibError.unavailable("assistant is closed") }
+        let previousOperation = historyOperationLabel
+        if previousOperation == nil { historyOperationLabel = String(localized: "Loading conversations…") }
+        defer { historyOperationLabel = previousOperation }
         let result = try await app.bus.execute(CommandIDs.aiChatList, ["all": true], principal: principal, session: session)
         conversations = try result.decode(ChatListResult.self).chats
     }
 
     func selectChat(_ id: String, principal: Principal = .user) async throws {
-        guard !isStreaming, !isGeneratingImage, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "stop this turn before switching conversations") }
+        guard canChangeConversation else { throw NibError(.conflict, "stop this turn before switching conversations") }
         guard let app else { throw NibError.unavailable("assistant is closed") }
         let token = UUID()
         loadToken = token
@@ -290,8 +367,8 @@ final class ChatViewModel: ObservableObject {
         for i in entries.indices { resolveEntryCitations(i) }
         if let owner = list.chats.first(where: { $0.id == id })?.doc, let ref = NodeRef(owner), let doc = ref.documentID {
             scope = AIScope(kind: .document, doc: doc)
-            contextLabel = String(localized: "Document")
-        } else { scope = AIScope(kind: .library); contextLabel = String(localized: "Library") }
+        } else { scope = AIScope(kind: .library) }
+        refreshContextLabel()
         showsConversations = false
         composer = ""
         attachments = []
@@ -301,7 +378,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func newChat() throws {
-        guard !isStreaming, !isGeneratingImage, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "stop this turn before starting a conversation") }
+        guard canChangeConversation else { throw NibError(.conflict, "stop this turn before starting a conversation") }
         loadToken = nil
         isLoadingChat = false
         chatID = nil
@@ -324,7 +401,7 @@ final class ChatViewModel: ObservableObject {
         guard let app, let ai = app.services.ai, ai.isConfigured else {
             throw NibError(.unavailable, "Connect a model to use the assistant.", hint: "open Settings › AI")
         }
-        guard !isStreaming, !isGeneratingImage, !isLoadingChat, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "a turn or conversation load is already running") }
+        guard canStartGeneration else { throw NibError(.conflict, "a turn or conversation load is already running") }
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("enter a question or instruction", path: "$.prompt") }
         let images = retry ? retryImages : attachments
@@ -526,7 +603,7 @@ final class ChatViewModel: ObservableObject {
         guard let app, let ai = app.services.ai, ai.isConfigured, let assets = app.services.assets else {
             throw NibError.unavailable("connect a model and an asset store first")
         }
-        guard !isStreaming, !isGeneratingImage, !isLoadingChat, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "a turn or conversation load is already running") }
+        guard canStartGeneration else { throw NibError(.conflict, "a turn or conversation load is already running") }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NibError.invalid("describe an image", path: "$.prompt") }
         let token = UUID()
         generation = token
@@ -582,6 +659,14 @@ final class ChatViewModel: ObservableObject {
         var entry = entries[index]
         entry.resolveCitations(citationLabel)
         entries[index] = entry
+    }
+
+    func confirmationTargetLabel(_ raw: String) -> String {
+        let label = citationLabel(raw)
+        guard let ref = NodeRef(raw), let doc = ref.documentID,
+              let title = app?.services.library?.node(doc)?.title else { return label }
+        if case .document = ref { return title }
+        return "\(title) · \(label)"
     }
 
     func citationLabel(_ raw: String) -> String {
@@ -908,7 +993,7 @@ extension ChatViewModel {
 
     func applyProposals(id: String?, context: CommandContext) async throws -> JSONValue {
         guard context.principal.isUser else { throw NibError(.permissionDenied, "only the user may accept proposals") }
-        guard !isStreaming, !isGeneratingImage, !isLoadingChat, !isApplyingProposals, !isStagingProposals else { throw NibError(.conflict, "wait for the current turn") }
+        guard canStartGeneration else { throw NibError(.conflict, "wait for the current turn") }
         guard !proposalNeedsReview else { throw NibError(.conflict, "review these changes before accepting") }
         let selected = proposals.filter { row in id.map { $0 == row.id } ?? (row.included && !row.destructive) }
         guard !selected.isEmpty else { throw NibError(.unavailable, "include a proposal before accepting") }

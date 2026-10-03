@@ -231,7 +231,7 @@ public struct NibBanner: View {
 
     @ViewBuilder private var actionButton: some View {
         if let action {
-            Button(action.title, action: action.handler)
+            Button(action.title, action: action.handler).nibCommand(action.command)
                 .font(NibFont.button)
                 .foregroundStyle(NibColor.accent)
                 .buttonStyle(.plain)

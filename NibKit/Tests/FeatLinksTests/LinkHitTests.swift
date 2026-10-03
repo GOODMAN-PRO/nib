@@ -77,6 +77,33 @@ final class LinkHitTests: XCTestCase {
         XCTAssertNil(LinkHitTester.link(at: point, in: fixed, content: content))
     }
 
+    func testSmallLinkHasAFingerSizedTargetAtEveryZoom() throws {
+        let item = box(linked("Go", NSRange(location: 0, length: 2), site),
+                       Frame(x: 100, y: 200, w: 200, h: 28))
+        let rect = try firstRect(item)
+        for zoom in [0.5, 1, 1.2767101196075796, 8] {
+            // A tap 20 screen points below the centre must work even outside the box's frame.
+            let point = Point(Double(rect.midX), Double(rect.midY) + 20 / zoom)
+            XCTAssertTrue(LinkHitTester.mayHit(point, item, content: content, zoom: zoom))
+            XCTAssertEqual(LinkHitTester.link(at: point, in: item, content: content, zoom: zoom), site)
+            let far = Point(Double(rect.midX), Double(rect.maxY) + 60 / zoom)
+            XCTAssertNil(LinkHitTester.link(at: far, in: item, content: content, zoom: zoom))
+        }
+    }
+
+    func testOverlappingFingerTargetsChooseTheNearestLink() throws {
+        let other = TextLink(url: "https://nib.example/other")
+        let text = RichText(paragraphs: [Paragraph(runs: [TextRun("A", TextAttributes(link: site)),
+                                                        TextRun(" "), TextRun("B", TextAttributes(link: other))])])
+        let item = box(text, Frame(x: 100, y: 200, w: 200, h: 28))
+        let regions = LinkHitTester.regions(of: item, content: content)
+        let first = try XCTUnwrap(regions.first?.rects.first)
+        let second = try XCTUnwrap(regions.last?.rects.first)
+        XCTAssertTrue(LinkHitTester.hitRect(first).intersects(LinkHitTester.hitRect(second)))
+        XCTAssertEqual(LinkHitTester.link(at: Point(Double(first.midX), Double(first.midY)), in: item, content: content), site)
+        XCTAssertEqual(LinkHitTester.link(at: Point(Double(second.midX), Double(second.midY)), in: item, content: content), other)
+    }
+
     func testStickyNotesAreHitOnceTheirFeaturePublishesALayout() throws {
         let text = linked("Visit Nib now", NSRange(location: 0, length: 13), site)
         let sticky = Item(kind: .sticky, sticky: StickyItem(frame: Frame(x: 0, y: 0, w: 200, h: 200), text: text))

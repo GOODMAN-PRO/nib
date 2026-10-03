@@ -219,6 +219,41 @@ enum AudioSettings {
     static let speeds: [Double] = [0.5, 0.75, 1, 1.25, 1.5, 2]
 }
 
+/// UIKit owns Nib's scenes. A SwiftUI scenePhase read inside an embedded hosting controller
+/// is not the application's lifecycle, notably while returning from microphone permission.
+/// Share the real foreground state between microphone startup and the sampled audio chrome.
+@MainActor
+final class AudioForegroundActivity: ObservableObject {
+    static let shared = AudioForegroundActivity(active: UIApplication.shared.applicationState == .active)
+
+    @Published private(set) var isActive: Bool
+    private var cancellables = Set<AnyCancellable>()
+
+    init(active: Bool, notifications: NotificationCenter = .default) {
+        isActive = active
+        notifications.publisher(for: UIApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.isActive = true }
+            .store(in: &cancellables)
+        for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification] {
+            notifications.publisher(for: name)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.isActive = false }
+                .store(in: &cancellables)
+        }
+    }
+
+    /// Permission can complete before UIKit reactivates the app. Do not activate input I/O
+    /// in that gap. The current-value publisher also covers activation before subscription.
+    func waitUntilActive() async throws {
+        for await active in $isActive.values {
+            try Task.checkCancellation()
+            if active { return }
+        }
+        try Task.checkCancellation()
+    }
+}
+
 /// App-wide audio state: the one recording and the one playback, shared by the commands, the chrome overlays and
 /// every window's Audio tab (a service, `serviceKey`). Recording lives in Recorder.swift, playback in Player.swift.
 @MainActor

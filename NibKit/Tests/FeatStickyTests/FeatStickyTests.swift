@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatSticky
@@ -357,6 +358,45 @@ final class FeatStickyTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)                          // placing and typing: one step
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).contains { $0.kind == .sticky })
+    }
+
+    func testAuthorSubmissionDismissesKeyboardAndSignsTheNextNote() async throws {
+        let h = harness()
+        let controller = UIHostingController(rootView: StickyToolSettings(app: h.app))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 540, height: 750))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func fields(_ view: UIView) -> [UITextField] {
+            (view as? UITextField).map { [$0] } ?? view.subviews.flatMap(fields)
+        }
+        controller.view.layoutIfNeeded()
+        try await waitFor {
+            controller.view.layoutIfNeeded()
+            return !fields(controller.view).isEmpty
+        }
+        let field = try XCTUnwrap(fields(controller.view).first)
+        XCTAssertEqual(field.accessibilityLabel, "Author name on new notes")
+        XCTAssertEqual(field.returnKeyType, .done)
+        XCTAssertTrue(field.becomeFirstResponder())
+        // Let SwiftUI observe focus before submitting the native field.
+        await Task.yield()
+        field.text = "  Ada Lovelace  "
+        field.sendActions(for: .editingChanged)
+        _ = field.delegate?.textFieldShouldReturn?(field)
+        try await waitFor {
+            !field.isFirstResponder && h.app.settings.get(NibSettings.authorName) == "Ada Lovelace"
+        }
+
+        h.session.tool = StickyTool.toolID
+        let host = FakeCanvasHost(h)
+        StickyTool().tap(CanvasSample(page: Fixtures.page2, location: Point(300, 400), isPencil: false), host: host)
+        let editor = StickyEditor.editor(for: host)
+        let id = try XCTUnwrap(editor.editingItem)
+        try await waitFor { self.text(h, id, page: Fixtures.page2) != nil }
+        XCTAssertEqual(try note(h, id, page: Fixtures.page2).author, "Ada Lovelace")
+        XCTAssertTrue(h.session.isEditingText)
+        editor.endEditing(save: true)
     }
 
     func testDroppingAnItemOntoANoteAttachesItAndOneUndoRestoresFrameAndAttachment() async throws {

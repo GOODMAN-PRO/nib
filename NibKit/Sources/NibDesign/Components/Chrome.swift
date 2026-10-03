@@ -197,7 +197,7 @@ public struct NibToast: View {
                 .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(2)
             if let action {
-                Button(action.title, action: action.handler)
+                Button(action.title, action: action.handler).nibCommand(action.command)
                     .font(NibFont.button)
                     .foregroundStyle(NibColor.accent)
                     .buttonStyle(.plain)
@@ -209,7 +209,7 @@ public struct NibToast: View {
         .padding(.trailing, NibSpacing.xs)
         .frame(minHeight: 48)
         .frame(maxWidth: 480)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
 

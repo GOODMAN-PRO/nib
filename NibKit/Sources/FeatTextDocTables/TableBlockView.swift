@@ -2468,7 +2468,7 @@ extension TableBlockView: UITextViewDelegate {
         return UIAction { [weak self] _ in
             guard let self = self else { return }
             self.app.perform(CommandIDs.appOpenURL, ["url": .string(url.absoluteString)], session: self.session)
-        }
+        }.nibCommand(CommandIDs.appOpenURL)
     }
 
     /// The edit menu over a cell's text: the system's actions, then the table's.

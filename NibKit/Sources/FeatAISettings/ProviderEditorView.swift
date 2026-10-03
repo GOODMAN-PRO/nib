@@ -6,10 +6,12 @@ import NibContracts
 import NibDesign
 
 enum ProviderPreset: String, CaseIterable, Identifiable {
-    case anthropic, openAI, openRouter, ollama, lmStudio, custom, nibHTTP
+    case claudeSubscription, chatGPTSubscription, anthropic, openAI, openRouter, ollama, lmStudio, custom, nibHTTP
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .claudeSubscription: return String(localized: "Claude — your subscription")
+        case .chatGPTSubscription: return String(localized: "ChatGPT — your subscription")
         case .anthropic: return "Anthropic"
         case .openAI: return "OpenAI"
         case .openRouter: return "OpenRouter"
@@ -20,7 +22,7 @@ enum ProviderPreset: String, CaseIterable, Identifiable {
         }
     }
     var kind: AIProviderKind {
-        switch self { case .anthropic: return .anthropic; case .nibHTTP: return .nibHTTP; default: return .openAICompatible }
+        switch self { case .anthropic: return .anthropic; case .nibHTTP, .claudeSubscription, .chatGPTSubscription: return .nibHTTP; default: return .openAICompatible }
     }
     var baseURL: String {
         switch self {
@@ -29,7 +31,7 @@ enum ProviderPreset: String, CaseIterable, Identifiable {
         case .openRouter: return "https://openrouter.ai/api/v1"
         case .ollama: return "http://localhost:11434/v1"
         case .lmStudio: return "http://localhost:1234/v1"
-        case .custom, .nibHTTP: return ""
+        case .custom, .nibHTTP, .claudeSubscription, .chatGPTSubscription: return ""
         }
     }
 }
@@ -59,7 +61,10 @@ struct ProviderDraft {
     mutating func apply(_ preset: ProviderPreset) {
         name = preset.title; kind = preset.kind; baseURL = preset.baseURL; model = ""
         transcriptionModel = ""; imageModel = ""
-        headers = preset == .openRouter ? "HTTP-Referer: https://github.com/GOODMAN-PRO/nib\nX-Title: Nib" : ""
+        if preset == .claudeSubscription { model = "claude-sonnet" }
+        if preset == .chatGPTSubscription { model = "chatgpt" }
+        headers = preset == .openRouter ? "HTTP-Referer: https://github.com/GOODMAN-PRO/nib\nX-Title: Nib"
+            : ([ProviderPreset.claudeSubscription, .chatGPTSubscription].contains(preset) ? "X-Nib-Subscription: 1" : "")
     }
     func config() throws -> AIProviderConfig {
         guard let url = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
@@ -207,7 +212,7 @@ struct ProviderEditorView: View {
             if isNew && savedConfig == nil {
                 Section {
                     Picker(String(localized: "Preset"), selection: $preset) {
-                        ForEach(ProviderPreset.allCases) { Text($0.title).tag($0) }
+                        ForEach(ProviderPreset.allCases.filter { $0 != .claudeSubscription && $0 != .chatGPTSubscription }) { Text($0.title).tag($0) }
                     }
                     .frame(minHeight: NibMetrics.hitTarget)
                     .onChange(of: preset) { _, value in draft.apply(value); models = [] }

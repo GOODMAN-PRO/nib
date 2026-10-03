@@ -204,8 +204,18 @@ final class LinkNavigator: ObservableObject {
 /// on PDF-backed pages (`services.pdf.links`, placed with `PageRecord.backgroundTransform`).
 @MainActor
 enum LinkHitTester {
-    /// Fingertip reach around a link's glyphs, in page points: a finger slightly off the text still follows it.
+    /// Fingertip reach around a link's target, in view points: a finger slightly off the text still follows it.
     static let slop: CGFloat = 6
+
+    /// Small glyphs still need a finger-sized target (DESIGN §5). Convert view points to page points so
+    /// zooming out does not shrink the control. Keep the existing fingertip tolerance around that target.
+    static func hitRect(_ rect: CGRect, zoom: Double = 1) -> CGRect {
+        let scale = CGFloat(zoom.isFinite && zoom > 0 ? zoom : 1)
+        let minimum = NibMetrics.hitTarget / scale
+        return rect.insetBy(dx: -max(0, (minimum - rect.width) / 2),
+                            dy: -max(0, (minimum - rect.height) / 2))
+            .insetBy(dx: -slop / scale, dy: -slop / scale)
+    }
 
     struct Region {
         var link: TextLink
@@ -286,17 +296,19 @@ enum LinkHitTester {
     static func grows(_ item: Item) -> Bool { item.kind == .text && (item.text?.style.autoGrow ?? false) }
 
     /// The link of an item under a page point. Rotation is undone about the centre of the text container as drawn.
-    static func link(at point: Point, in item: Item, content: ContentRegistries) -> TextLink? {
+    static func link(at point: Point, in item: Item, content: ContentRegistries, zoom: Double = 1) -> TextLink? {
         guard let placed = placed(item, content: content) else { return nil }
         let box = placed.box
         let centre = Point(Double(box.midX), Double(box.midY))
         let local = Affine.rotation(-placed.rotation, about: centre).apply(point)
         let p = CGPoint(x: local.x - Double(box.minX), y: local.y - Double(box.minY))
-        let reach = CGRect(origin: .zero, size: box.size).insetBy(dx: -slop, dy: -slop)
-        guard reach.contains(p) else { return nil }
+        let visible = CGRect(origin: .zero, size: box.size)
         var best: (link: TextLink, distance: CGFloat)?
         for region in placed.regions {
-            for rect in region.rects where rect.insetBy(dx: -slop, dy: -slop / 2).contains(p) {
+            for glyphRect in region.rects {
+                // Enlarge only visible text; a fixed-height container must not expose clipped links.
+                let rect = glyphRect.intersection(visible)
+                guard !rect.isNull, !rect.isEmpty, hitRect(rect, zoom: zoom).contains(p) else { continue }
                 let d = distance(p, rect)
                 if best == nil || d < best!.distance { best = (region.link, d) }
             }
@@ -306,10 +318,11 @@ enum LinkHitTester {
 
     /// A cheap test that skips laying out items the point cannot be in. An auto-growing box may be drawn taller than
     /// its container, so only its sides and top bound it (a rotated container is always laid out).
-    static func mayHit(_ point: Point, _ item: Item, content: ContentRegistries) -> Bool {
+    static func mayHit(_ point: Point, _ item: Item, content: ContentRegistries, zoom: Double = 1) -> Bool {
         guard ItemText.text(of: item) != nil, let info = content.textLayout(for: item) else { return false }
         let c = info.container
-        let s = Double(slop)
+        let scale = zoom.isFinite && zoom > 0 ? zoom : 1
+        let s = Double(NibMetrics.hitTarget / 2 + slop) / scale
         guard c.rotation == 0 else { return true }
         guard point.x >= c.x - s, point.x <= c.x + c.w + s, point.y >= c.y - s else { return false }
         return grows(item) || point.y <= c.y + c.h + s
@@ -317,10 +330,10 @@ enum LinkHitTester {
 
     /// The topmost visible item's link under a page point.
     static func link(at point: Point, doc: DocumentID, page: PageID, workspace: Workspace, content: ContentRegistries,
-                     hiddenLayers: Set<Int>) throws -> TextLink? {
+                     hiddenLayers: Set<Int>, zoom: Double = 1) throws -> TextLink? {
         for item in try workspace.items(doc, page: page).reversed() where !hiddenLayers.contains(item.layer) {
-            guard mayHit(point, item, content: content) else { continue }
-            if let link = link(at: point, in: item, content: content) { return link }
+            guard mayHit(point, item, content: content, zoom: zoom) else { continue }
+            if let link = link(at: point, in: item, content: content, zoom: zoom) { return link }
         }
         return nil
     }
@@ -436,6 +449,7 @@ struct ReturnToPagePill: View {
             .frame(minHeight: NibMetrics.hudHeight)
             .contentShape(Capsule())
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.linkBack)
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .accessibilityLabel(title)
         .accessibilityHint(String(localized: "Goes back to where you were before you followed the link."))

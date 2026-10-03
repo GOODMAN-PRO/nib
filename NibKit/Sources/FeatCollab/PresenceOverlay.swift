@@ -772,6 +772,7 @@ struct PresenceBeadsView: View {
             })) {
                 Text(String(localized: "Follow Me"))
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.collabFollowMe)
         }
         Button {
             hub.run(CommandIDs.panelOpen, ["id": .string(CollabIDs.sharePanel)], session: context.session)
@@ -782,6 +783,7 @@ struct PresenceBeadsView: View {
                 Image(nib: .shared)
             }
         }
+        .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
     }
 
     private func follow(_ p: CollabParticipant?) {

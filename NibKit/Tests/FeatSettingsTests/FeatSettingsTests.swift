@@ -138,7 +138,166 @@ final class FeatSettingsTests: XCTestCase {
         XCTAssertTrue(state.detailPath.isEmpty)
     }
 
+    func testStylusPageRowOpensInputSettingsAlongsideHardwarePage() throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        // The full app registers F043's hardware page in this section too. Testing only F027 would
+        // show the input page directly and miss the page-row navigation used by real iPad users.
+        h.app.ui.settingsPages.register(page("pencilhw.settings", "Apple Pencil", .stylus,
+                                            order: 0, owner: "pencilhw"))
+        let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+        let state = SettingsNavigationState()
+        state.select(.stylus)
+        XCTAssertEqual(catalog.group(.stylus)?.pages.count, 2)
+        XCTAssertTrue(state.detailPath.isEmpty)
+
+        let inputPage = try XCTUnwrap(catalog.page(CoreSettingsPages.stylus))
+        let row = SettingsPageRow(page: inputPage, catalog: catalog, state: state)
+        row.open() // The same action bound to the full-width page button.
+        XCTAssertEqual(state.section, .stylus)
+        XCTAssertEqual(state.detailPath, [SettingsPageLink(id: CoreSettingsPages.stylus)])
+        XCTAssertEqual(state.compactPath, [SettingsPageLink(id: CoreSettingsPages.stylus)])
+
+        // Back, then choose the same page again; section changes must not leave stale destinations.
+        state.detailPath.removeLast()
+        row.open()
+        XCTAssertEqual(state.detailPath, [SettingsPageLink(id: CoreSettingsPages.stylus)])
+        state.select(.general)
+        XCTAssertTrue(state.detailPath.isEmpty)
+    }
+
+    func testSearchPageRowOpensStylusPageInCompactLayoutWhenSectionHasOnlyOnePage() throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+        let state = SettingsNavigationState()
+        state.query = "palm"
+        let result = try XCTUnwrap(catalog.search(state.query).first)
+        SettingsPageRow(page: result, catalog: catalog, state: state,
+                        subtitle: result.section.title).open()
+        XCTAssertEqual(state.section, .stylus)
+        XCTAssertEqual(state.query, "")
+        XCTAssertTrue(state.detailPath.isEmpty, "the regular layout already displays the only page")
+        XCTAssertEqual(state.compactPath, [SettingsPageLink(id: CoreSettingsPages.stylus)],
+                       "the compact layout must still push the page from its index")
+    }
+
+    func testPencilOnlySelectionFromAnyInputPersistsThroughSettingsCommand() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        try await h.run(CommandIDs.settingsSet, ["name": .string(NibSettings.stylusMode.name), "value": "anyInput"])
+        let model = SettingsModel(app: h.app)
+        XCTAssertEqual(model.value(NibSettings.stylusMode), .anyInput)
+        let written = expectation(forNotification: SettingsStore.didChange, object: h.app.settings)
+        model.change(NibSettings.stylusMode, to: .pencilOnly)
+        XCTAssertEqual(model.value(NibSettings.stylusMode), .pencilOnly,
+                       "the selected row updates while the command is in flight")
+        await fulfillment(of: [written], timeout: 2)
+        XCTAssertEqual(h.app.settings.get(NibSettings.stylusMode), .pencilOnly)
+        XCTAssertEqual(SettingsModel(app: h.app).value(NibSettings.stylusMode), .pencilOnly,
+                       "reopening the page must retain the input choice")
+    }
+
     // MARK: settings.open and the app menu
+
+    func testSettingsShortcutInSwiftUIChromeOpensInvokingSceneFromEveryDocumentKind() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(h)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(SettingsChromeShortcut.overlayID))
+        XCTAssertNil(overlay.docKinds, "Settings must also be reachable from the library and text documents")
+        let kinds: [DocumentKind?] = [nil] + DocumentKind.allCases.map { Optional($0) }
+        for kind in kinds {
+            for editing in [false, true] {
+                h.session.document = kind == nil ? nil : Fixtures.docID
+                h.session.isEditingText = editing
+                let context = ChromeContext(app: h.app, session: h.session, navigator: navigator, kind: kind)
+                let descriptor = try XCTUnwrap(SettingsChromeShortcut.descriptor(in: context))
+                XCTAssertEqual(descriptor.shortcut, KeyShortcut(",", .command))
+                let opened = expectation(description: "Settings opened from SwiftUI chrome")
+                navigator.onSettings = { opened.fulfill() }
+                h.app.ui.activeNavigator = nil
+                SettingsChromeShortcut.perform(in: context)
+                await fulfillment(of: [opened], timeout: 2)
+                XCTAssertTrue(h.app.ui.activeNavigator === navigator)
+                XCTAssertTrue(h.app.services.sessions.active === h.session)
+                XCTAssertTrue(navigator.presented is SettingsRootViewController)
+            }
+        }
+    }
+
+    func testSettingsChromeShortcutRevalidatesRegistrySceneAndModal() throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(h)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: navigator, kind: .notebook)
+        let root = SettingsModalStandIn()
+        root.modal = UIViewController()
+        navigator.rootViewController = root
+        h.app.ui.activeNavigator = nil
+        SettingsChromeShortcut.perform(in: context)
+        XCTAssertNil(h.app.ui.activeNavigator, "A background Settings binding must not act through a modal")
+        root.modal = nil
+
+        let other = Harness(features: [FeatSettingsFeature.self])
+        SettingsChromeShortcut.perform(in: ChromeContext(app: h.app, session: other.session,
+                                                         navigator: navigator, kind: .notebook))
+        XCTAssertNil(h.app.ui.activeNavigator, "A stale binding cannot borrow another scene's navigator")
+
+        h.app.content.keyCommands.register(KeyCommandDescriptor(id: "test.comma", title: "Document action",
+            shortcut: AppMenu.settingsShortcut, command: "test.action", scope: .document, owner: "test"))
+        XCTAssertNil(SettingsChromeShortcut.descriptor(in: context), "The registry's narrower route wins")
+        SettingsChromeShortcut.perform(in: context)
+        XCTAssertNil(h.app.ui.activeNavigator)
+        XCTAssertTrue(navigator.requestedPages.isEmpty)
+    }
+
+    func testUnhandledCommandCommaOpensSettingsFromLibraryAndEveryDocumentKind() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(h)
+        h.app.ui.activeNavigator = navigator
+        let contexts = [KeyCommandContext(docKind: nil)] + DocumentKind.allCases.map {
+            KeyCommandContext(docKind: $0)
+        }
+        var expectedPresentations = 0
+        for var context in contexts {
+            for editingText in [false, true] {
+                context.isEditingText = editingText
+                let key = try XCTUnwrap(KeyCommandRouting.unhandledPress(KeyShortcut(",", [.command]),
+                    descriptors: h.app.content.keyCommands.all, in: context))
+                XCTAssertEqual(key.command, CommandIDs.settingsOpen)
+                let out = try await h.run(key.command, key.resolvedParams(for: h.session))
+                expectedPresentations += 1
+                XCTAssertEqual(out["opened"]?.stringValue, "settings")
+                XCTAssertEqual(navigator.requestedPages.count, expectedPresentations)
+                XCTAssertTrue(navigator.presented is SettingsRootViewController)
+                XCTAssertNil(KeyCommandRouting.unhandledPress(KeyShortcut(",", []),
+                    descriptors: h.app.content.keyCommands.all, in: context), "typing a comma never opens Settings")
+            }
+        }
+    }
+
+    func testSettingsOpenedFromDocumentExposesSelectionPagesInEditingAndProvidersInAI() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        // Stand-ins for the pages registered by F012, F041 and F086.
+        h.app.ui.settingsPages.register(page("transform.snapping", "Alignment and snapping", .editing, owner: "transform"))
+        h.app.ui.settingsPages.register(page("layers.settings", "Layers", .editing, owner: "layers"))
+        h.app.ui.settingsPages.register(page("ai.providers", "AI Providers", .ai, owner: "aisettings"))
+        let navigator = RecordingNavigator(h)
+        h.app.ui.activeNavigator = navigator
+        let key = try XCTUnwrap(KeyCommandRouting.unhandledPress(KeyShortcut(",", [.command]),
+            descriptors: h.app.content.keyCommands.all, in: KeyCommandContext(docKind: .notebook)))
+        try await h.run(key.command, key.resolvedParams(for: h.session))
+        let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
+        let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+        XCTAssertEqual(catalog.selected(root.state.section)?.section, .general)
+        root.state.select(.editing)
+        XCTAssertEqual(Set(catalog.selected(root.state.section)?.pages.map(\.id) ?? []),
+                       ["settings.editing", "transform.snapping", "layers.settings"])
+        for id in ["transform.snapping", "layers.settings"] {
+            root.show(page: id)
+            XCTAssertEqual(root.state.section, .editing)
+            XCTAssertEqual(root.state.detailPath.count, 1)
+            XCTAssertEqual(root.state.compactPath.count, 1)
+        }
+        root.state.select(.ai)
+        XCTAssertEqual(catalog.selected(root.state.section)?.pages.map(\.id), ["ai.providers"])
+    }
 
     func testSettingsOpenShowsTheRequestedPage() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
@@ -410,12 +569,19 @@ private final class PanelOpenStandIn {
 /// Stands in for the shell's window: records `showSettings` and builds the screen the way the shell does, and leaves
 /// its document for the library on `showLibrary`, as the shell does.
 @MainActor
+private final class SettingsModalStandIn: UIViewController {
+    var modal: UIViewController?
+    override var presentedViewController: UIViewController? { modal ?? super.presentedViewController }
+}
+
+@MainActor
 private final class RecordingNavigator: SceneNavigator {
     let app: NibApp
     let session: EditorSession
     var openDocuments: [DocumentID] = []
     var activeDocument: DocumentID?
-    var rootViewController: UIViewController? { nil }
+    var rootViewController: UIViewController?
+    var onSettings: (() -> Void)?
     private(set) var requestedPages: [String?] = []
     private(set) var presented: UIViewController?
     private(set) var libraryShown = 0
@@ -434,6 +600,7 @@ private final class RecordingNavigator: SceneNavigator {
     }
 
     func showSettings(page: String?) {
+        defer { onSettings?() }
         requestedPages.append(page)
         presented = app.ui.screens.settingsRoot?(app, self)
     }

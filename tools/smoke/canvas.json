@@ -1,6 +1,6 @@
 {
   "name": "Canvas device smoke",
-  "description": "Drawing latency, palm rejection, sustained 60 fps scrolling, rotation and live accessibility appearance. Device observations stay manual in the run report until verified by a person.",
+  "description": "Drawing latency, palm rejection, sustained 60 fps scrolling, rotation and live accessibility appearance. Device observations stay manual in the run report until verified by a person. Opt-in design capture recipes for library list/folder, lasso and three document tabs are in captureRecipes; see captureGuide for extraction and required screenshot gates.",
   "requires": [
     "doc.create",
     "doc.open",
@@ -162,5 +162,454 @@
       },
       "name": "Move disposable notebook to recoverable Trash"
     }
-  ]
+  ],
+  "captureGuide": {
+    "spec": [
+      "DESIGN.md \u00a714.1",
+      "DESIGN.md \u00a714.2",
+      "DESIGN.md \u00a714.3"
+    ],
+    "usage": [
+      "Extract any recipe by key (libraryList, libraryFolder, lassoSelection, documentTabs):",
+      "python3 -c 'import json,sys; print(json.dumps(json.load(open(\"tools/smoke/canvas.json\"))[\"captureRecipes\"][sys.argv[1]]))' libraryList > /tmp/nib-capture.json",
+      "node tools/smoke/run.mjs /tmp/nib-capture.json",
+      "For libraryFolder add --var folder=folder:ID; for lassoSelection add --var doc=doc:D --var page=page:D/P --var shape=item:D/P/S; for documentTabs add --var doc1=doc:A --var doc2=doc:B --var doc3=doc:C.",
+      "Recipes are opt-in so routine canvas/latency smoke checks remain unchanged. Use an isolated capture simulator/window; documentTabs closes other tabs and leaves both tab settings enabled.",
+      "For automation, execute the same steps via MCP, mapping command to nib_run, and honour every expect and CAPTURE GATE before using simctl screenshot. The stock runner does not perform visual verification or take UI screenshots."
+    ],
+    "matrix": {
+      "devices": [
+        "iPad",
+        "iPhone"
+      ],
+      "appearance": [
+        "light",
+        "dark"
+      ],
+      "orientation": [
+        "portrait",
+        "landscape"
+      ],
+      "priorityRetakes": [
+        "051\u2013052",
+        "110\u2013111",
+        "121\u2013122",
+        "132\u2013133",
+        "128",
+        "139"
+      ]
+    },
+    "protocol": [
+      "Set device, appearance and orientation BEFORE running the recipe. Re-run all state steps after every rotation or appearance change; do not reuse an earlier context response.",
+      "Required command or context failures abort the capture. Recipes intentionally have no requires skip-list and no optional gates. A delay allows layout to settle but is never proof of visible state.",
+      "nib_context exposes document/page/selection/visibleRect/tabs, but does NOT expose library layout, search presentation, object-menu presentation or tab-strip visibility. Check library.setView responses and settings.get as well as context; use the live UI/accessibility tree for the remaining visual gates. Do not invent context fields.",
+      "For lasso, require visibleRect [x,y,w,h] to contain selection.bbox [sx,sy,sw,sh]: x <= sx, y <= sy, x+w >= sx+sw, y+h >= sy+sh. If not, reveal again or reduce zoom and reselect, then fetch fresh context. Wait up to 5 seconds for the object menu; abort if absent.",
+      "Only after all gates pass, capture the entire app window (xcrun simctl io DEVICE_UDID screenshot OUTPUT.png). nib_render and selection.screenshot omit chrome and cannot verify these states.",
+      "Each manifest entry records recipe, device, orientation, appearance, command responses, fresh nib_context, visible checks and filename. Missing/failed/manual/skipped gates are incomplete coverage, even if the runner exits 0 with --no-manual. Never save a screenshot from a manual step that was not actually verified."
+    ],
+    "visibleChecks": {
+      "Library list": [
+        "No search overlay, results, keyboard, modal or sidebar covering content",
+        "Documents title and notebook list rows visible; no cover grid"
+      ],
+      "Library folder": [
+        "No search overlay, results, keyboard or modal",
+        "Requested folder title and its contents visible; not the library root or sidebar"
+      ],
+      "Lasso selection": [
+        "Requested shape fully visible above palette, with dashed selection and rigid handles",
+        "Object menu visible with Copy, Duplicate, Colour and More actions; no keyboard or covering sheet"
+      ],
+      "Document tabs": [
+        "Three distinct open document capsules in the Clear tab droplet",
+        "Active document and page visible; no search or covering sheet"
+      ]
+    }
+  },
+  "captureRecipes": {
+    "libraryList": {
+      "name": "Design capture: library list",
+      "description": "Required state recipe for \u00a714.1 list retakes. Read canvas.json captureGuide before capture.",
+      "steps": [
+        {
+          "command": "search.open",
+          "params": {
+            "scope": "lib",
+            "close": true,
+            "instant": true
+          }
+        },
+        {
+          "command": "window.showLibrary",
+          "params": {}
+        },
+        {
+          "command": "search.open",
+          "params": {
+            "scope": "lib",
+            "close": true,
+            "instant": true
+          }
+        },
+        {
+          "command": "library.setView",
+          "params": {
+            "folder": "lib",
+            "layout": "list",
+            "filter": "all",
+            "sort": "name",
+            "panel": "documents",
+            "search": "",
+            "menu": "none",
+            "selection": "clear",
+            "sidebar": false
+          },
+          "expect": {
+            "json": {
+              "folder": "lib",
+              "layout": "list",
+              "filter": "all",
+              "sort": "name"
+            }
+          }
+        },
+        {
+          "wait": 1
+        },
+        {
+          "name": "Required pre-capture context gate (failure forbids capture)",
+          "tool": "nib_context",
+          "args": {},
+          "expect": {
+            "json": {
+              "document": {
+                "$exists": false
+              },
+              "selection": {
+                "refs": []
+              }
+            }
+          }
+        },
+        {
+          "name": "Verify visible UI, then capture Library list",
+          "manual": "CAPTURE GATE: Library list. Verify the live UI against captureGuide.visibleChecks before saving a full-window screenshot. If anything is missing, answer no; never save or label a substitute state. Record the preceding nib_context output and screenshot path in the manifest. A skipped/manual result is NOT verified capture coverage."
+        }
+      ]
+    },
+    "libraryFolder": {
+      "name": "Design capture: library folder",
+      "description": "Pass --var folder=folder:ID for a populated capture fixture. Read canvas.json captureGuide.",
+      "steps": [
+        {
+          "tool": "nib_get",
+          "args": {
+            "ref": "${folder}"
+          },
+          "expect": {
+            "json": {
+              "ref": "${folder}",
+              "kind": "folder",
+              "children": {
+                "$minLen": 1
+              }
+            }
+          }
+        },
+        {
+          "command": "search.open",
+          "params": {
+            "scope": "lib",
+            "close": true,
+            "instant": true
+          }
+        },
+        {
+          "command": "window.showLibrary",
+          "params": {}
+        },
+        {
+          "command": "search.open",
+          "params": {
+            "scope": "lib",
+            "close": true,
+            "instant": true
+          }
+        },
+        {
+          "command": "library.setView",
+          "params": {
+            "folder": "${folder}",
+            "layout": "grid",
+            "filter": "all",
+            "sort": "name",
+            "panel": "documents",
+            "search": "",
+            "menu": "none",
+            "selection": "clear",
+            "sidebar": false
+          },
+          "expect": {
+            "json": {
+              "folder": "${folder}",
+              "layout": "grid",
+              "filter": "all",
+              "sort": "name"
+            }
+          }
+        },
+        {
+          "wait": 1
+        },
+        {
+          "name": "Required pre-capture context gate (failure forbids capture)",
+          "tool": "nib_context",
+          "args": {},
+          "expect": {
+            "json": {
+              "document": {
+                "$exists": false
+              },
+              "selection": {
+                "refs": []
+              }
+            }
+          }
+        },
+        {
+          "name": "Verify visible UI, then capture Library folder",
+          "manual": "CAPTURE GATE: Library folder. Verify the live UI against captureGuide.visibleChecks before saving a full-window screenshot. If anything is missing, answer no; never save or label a substitute state. Record the preceding nib_context output and screenshot path in the manifest. A skipped/manual result is NOT verified capture coverage."
+        }
+      ]
+    },
+    "lassoSelection": {
+      "name": "Design capture: lasso selection",
+      "description": "Pass doc, page and shape refs from the capture fixture via --var. Reveal before selecting, especially on iPhone landscape. Read canvas.json captureGuide for viewport containment and the bounded menu wait.",
+      "steps": [
+        {
+          "command": "search.open",
+          "params": {
+            "scope": "lib",
+            "close": true,
+            "instant": true
+          }
+        },
+        {
+          "command": "doc.open",
+          "params": {
+            "doc": "${doc}",
+            "page": "${page}"
+          }
+        },
+        {
+          "command": "view.goToPage",
+          "params": {
+            "page": "${page}"
+          }
+        },
+        {
+          "command": "view.zoom",
+          "params": {
+            "scale": 0.5
+          }
+        },
+        {
+          "command": "view.reveal",
+          "params": {
+            "ref": "${shape}",
+            "flash": false,
+            "animated": false
+          },
+          "expect": {
+            "json": {
+              "ref": "${shape}",
+              "page": "${page}"
+            }
+          }
+        },
+        {
+          "command": "tool.select",
+          "params": {
+            "tool": "lasso"
+          }
+        },
+        {
+          "command": "selection.set",
+          "params": {
+            "refs": [
+              "${shape}"
+            ]
+          },
+          "expect": {
+            "json": {
+              "refs": [
+                "${shape}"
+              ],
+              "count": 1
+            }
+          }
+        },
+        {
+          "wait": 1
+        },
+        {
+          "name": "Required pre-capture context gate (failure forbids capture)",
+          "tool": "nib_context",
+          "args": {},
+          "expect": {
+            "json": {
+              "document": {
+                "ref": "${doc}"
+              },
+              "page": {
+                "ref": "${page}"
+              },
+              "tool": "lasso",
+              "selection": {
+                "refs": [
+                  "${shape}"
+                ],
+                "kinds": [
+                  "shape"
+                ],
+                "bbox": [
+                  {
+                    "$type": "number"
+                  },
+                  {
+                    "$type": "number"
+                  },
+                  {
+                    "$gt": 0
+                  },
+                  {
+                    "$gt": 0
+                  }
+                ]
+              },
+              "visibleRect": [
+                {
+                  "$type": "number"
+                },
+                {
+                  "$type": "number"
+                },
+                {
+                  "$gt": 0
+                },
+                {
+                  "$gt": 0
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Verify visible UI, then capture Lasso selection",
+          "manual": "CAPTURE GATE: Lasso selection. Verify the live UI against captureGuide.visibleChecks before saving a full-window screenshot. If anything is missing, answer no; never save or label a substitute state. Record the preceding nib_context output and screenshot path in the manifest. A skipped/manual result is NOT verified capture coverage."
+        }
+      ]
+    },
+    "documentTabs": {
+      "name": "Design capture: three document tabs",
+      "description": "Use an isolated capture window and three DISTINCT fixture refs via --var doc1/doc2/doc3. Enables both tab settings; leaves captured state in place. Read canvas.json captureGuide.",
+      "steps": [
+        {
+          "command": "search.open",
+          "params": {
+            "scope": "lib",
+            "close": true,
+            "instant": true
+          }
+        },
+        {
+          "command": "settings.set",
+          "params": {
+            "name": "editing.showTabs",
+            "value": true
+          }
+        },
+        {
+          "command": "settings.get",
+          "params": {
+            "name": "editing.showTabs"
+          },
+          "expect": {
+            "json": {
+              "name": "editing.showTabs",
+              "value": true
+            }
+          }
+        },
+        {
+          "command": "settings.set",
+          "params": {
+            "name": "editing.openAsTabs",
+            "value": true
+          }
+        },
+        {
+          "command": "settings.get",
+          "params": {
+            "name": "editing.openAsTabs"
+          },
+          "expect": {
+            "json": {
+              "name": "editing.openAsTabs",
+              "value": true
+            }
+          }
+        },
+        {
+          "command": "doc.open",
+          "params": {
+            "doc": "${doc1}",
+            "mode": "replace"
+          }
+        },
+        {
+          "command": "tab.closeOthers",
+          "params": {}
+        },
+        {
+          "command": "doc.open",
+          "params": {
+            "doc": "${doc2}",
+            "mode": "newTab"
+          }
+        },
+        {
+          "command": "doc.open",
+          "params": {
+            "doc": "${doc3}",
+            "mode": "newTab"
+          }
+        },
+        {
+          "wait": 1
+        },
+        {
+          "name": "Required pre-capture context gate (failure forbids capture)",
+          "tool": "nib_context",
+          "args": {},
+          "expect": {
+            "json": {
+              "document": {
+                "ref": "${doc3}"
+              },
+              "tabs": [
+                "${doc1}",
+                "${doc2}",
+                "${doc3}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Verify visible UI, then capture Document tabs",
+          "manual": "CAPTURE GATE: Document tabs. Verify the live UI against captureGuide.visibleChecks before saving a full-window screenshot. If anything is missing, answer no; never save or label a substitute state. Record the preceding nib_context output and screenshot path in the manifest. A skipped/manual result is NOT verified capture coverage."
+        }
+      ]
+    }
+  }
 }

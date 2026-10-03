@@ -12,12 +12,165 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(FeatDocChromeFeature.id, "chrome")
     }
 
+    func testSingleLineDocumentTitlesKeepAFullHeightTarget() throws {
+        let chrome = try makeWindow(Harness(features: [FeatDocChromeFeature.self]))
+        for kind in [DocumentKind.whiteboard, .textDocument] {
+            for size in [DynamicTypeSize.large, .accessibility3] {
+                let bar = NavBarView(chrome: chrome, items: NavBarItems(leading: [], trailing: []),
+                                    title: "Notes", kind: kind, subtitle: nil, readOnly: false,
+                                    titleHasMenu: true, compact: false, sidebarMode: .sidebar,
+                                    openMenu: .constant(nil))
+                let host = UIHostingController(rootView: bar.titleLabel.environment(\.dynamicTypeSize, size))
+                let measured = host.sizeThatFits(in: CGSize(width: 240, height: 0))
+                XCTAssertGreaterThanOrEqual(measured.height, NibMetrics.hitTarget)
+                XCTAssertGreaterThan(measured.width, 0)
+            }
+        }
+    }
+
+    func testNavHintsUseActiveRegistryWinnersAndResolvedTargets() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let context = KeyCommandContext(docKind: .notebook)
+        let commands = [("edit.undo", KeyShortcut("z", [.command])),
+                        ("edit.redo", KeyShortcut("z", [.command, .shift])),
+                        ("search.open", KeyShortcut("f", [.command]))]
+        for (command, shortcut) in commands {
+            let params: JSONValue = command == "search.open" ? ["scope": "document"] : ["doc": "doc:FIXTUREDOC01"]
+            let item = NavItem(id: command, title: command, symbol: .search, order: 0,
+                               action: .command(command, params))
+            var key = KeyCommandDescriptor(id: command, title: command, shortcut: shortcut,
+                                           command: command, scope: .document, owner: "tests")
+            key.sessionParams = { _ in params.merging(["instant": true]) }
+            h.app.content.keyCommands.register(key)
+            let generation = h.app.content.keyCommands.generation
+            XCTAssertEqual(NavShortcutHint.resolve(item, descriptors: h.app.content.keyCommands.all,
+                                                   context: context, session: h.session), shortcut)
+            XCTAssertEqual(h.app.content.keyCommands.generation, generation, "Hints never register commands.")
+            XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [key],
+                                                context: KeyCommandContext(docKind: nil), session: h.session))
+            var rival = key
+            rival.id = "rival"
+            rival.command = "other.action"
+            rival.docKinds = [.notebook]
+            XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [key, rival], context: context, session: h.session),
+                         "A shortcut routed to another action must not be advertised here.")
+        }
+        let search = NavItem(id: "search", title: "Search", symbol: .search, order: 0,
+                             action: .command("search.open", ["scope": "document"]))
+        let libraryKey = KeyCommandDescriptor(id: "library", title: "Search Library",
+            shortcut: KeyShortcut("f", [.command]), command: "search.open", params: ["scope": "lib"],
+            scope: .global, owner: "tests")
+        XCTAssertNil(NavShortcutHint.resolve(search, descriptors: [libraryKey], context: context, session: h.session))
+    }
+
+    func testAssistantHintUsesItsFeatureShortcutWithoutMatchingOtherPanels() {
+        let context = KeyCommandContext(docKind: .notebook)
+        let shortcut = KeyShortcut("a", [.option, .command])
+        let key = KeyCommandDescriptor(id: "assistant", title: "Assistant", shortcut: shortcut,
+                                       command: "ai.chat.open", scope: .global, owner: "tests")
+        let item = NavItem(id: NavBarModel.assistant, title: "Assistant", symbol: .assistant, order: 0,
+                           action: .command("panel.open", ["id": .string(PanelIDs.assistant)]))
+        XCTAssertEqual(NavShortcutHint.resolve(item, descriptors: [key], context: context, session: nil), shortcut)
+        let other = KeyCommandDescriptor(id: "other", title: "Other Panel", shortcut: shortcut,
+            command: "panel.open", params: ["id": "other.panel"], scope: .document, owner: "tests")
+        XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [other], context: context, session: nil))
+        XCTAssertNil(NavShortcutHint.resolve(item, descriptors: [], context: context, session: nil))
+        XCTAssertEqual(NavShortcutHint.keyboardShortcut(shortcut)?.key, KeyEquivalent("a"))
+        XCTAssertEqual(NavShortcutHint.keyboardShortcut(shortcut)?.modifiers, [.option, .command])
+        XCTAssertEqual(NavShortcutHint.keyboardShortcut(KeyShortcut("escape"))?.key, .escape)
+        XCTAssertNil(NavShortcutHint.keyboardShortcut(KeyShortcut("unsupported")))
+    }
+
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatDocChromeFeature.self])
         XCTAssertEqual(problems, [])
     }
 
     // MARK: Layout view model
+
+    func testOptionsMeasurementSettlesRoundingNoiseWithoutLosingRealResize() {
+        let initial = CGSize(width: 385, height: 44)
+        XCTAssertTrue(ChromeOptionsMeasurement.shouldUpdate(initial, previous: nil))
+        var retained = initial
+        var updates = 0
+        // Alternating native measurements must not continuously invalidate the palette/HUD during a press.
+        for index in 0..<100 {
+            let delta = index.isMultiple(of: 2) ? 1.0 / 6.0 : -1.0 / 6.0
+            let measured = CGSize(width: initial.width + delta, height: initial.height - delta)
+            if ChromeOptionsMeasurement.shouldUpdate(measured, previous: retained) {
+                retained = measured
+                updates += 1
+            }
+        }
+        XCTAssertEqual(updates, 0)
+        XCTAssertEqual(retained, initial)
+        // Compare against the retained measurement, not the preceding sample: small real changes accumulate.
+        for delta in [0.1, 0.2, 0.3] {
+            let measured = CGSize(width: initial.width + delta, height: initial.height)
+            if ChromeOptionsMeasurement.shouldUpdate(measured, previous: retained) { retained = measured }
+        }
+        XCTAssertEqual(retained.width, 385.3, accuracy: 0.001)
+        XCTAssertTrue(ChromeOptionsMeasurement.shouldUpdate(CGSize(width: 200, height: 44), previous: retained))
+        XCTAssertTrue(ChromeOptionsMeasurement.shouldUpdate(CGSize(width: 385.3, height: 60), previous: retained))
+        for invalid in [CGSize(width: CGFloat.infinity, height: 44), CGSize(width: 385, height: CGFloat.nan),
+                        CGSize(width: -1, height: 44)] {
+            XCTAssertFalse(ChromeOptionsMeasurement.shouldUpdate(invalid, previous: retained))
+            XCTAssertFalse(ChromeOptionsMeasurement.shouldUpdate(invalid, previous: nil))
+        }
+    }
+
+    func testPortraitNavigatorMovesSidePaletteAndCompleteOptionsAboveTheWritingArea() throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366)] {
+            for side in SidebarSide.allCases {
+                for edge in [NibDock.leading, .trailing] {
+                    for thickness in [NibMetrics.paletteThickness, NibMetrics.paletteThicknessMax] {
+                        var layout = ChromeLayout(size: size,
+                            safeArea: UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0),
+                            left: side == .left ? NibMetrics.navigatorWidth : nil,
+                            right: side == .right ? NibMetrics.navigatorWidth : nil, mode: .sidebar)
+                        let dock = try XCTUnwrap(ChromePalettePolicy.navigatorDockCorrection(
+                            NibPaletteDock(edge: edge, along: 0.8), layout: layout))
+                        XCTAssertEqual(dock, NibPaletteDock(edge: .top, along: 0.5))
+                        let options = CGSize(width: 320, height: NibMetrics.barHeight)
+                        layout.avoidPalette(dock, thickness: thickness, optionsSize: options)
+                        XCTAssertEqual(layout.editor, CGRect(origin: .zero, size: size))
+                        XCTAssertEqual(layout.editorInsets.left + layout.editorInsets.right, 0)
+                        XCTAssertEqual(layout.editorInsets.top,
+                            layout.bar.maxY + NibSpacing.l + thickness + options.height - 1 + NibSpacing.l)
+                        XCTAssertGreaterThanOrEqual(layout.overlayRegion.minY, layout.editorInsets.top)
+                        XCTAssertGreaterThanOrEqual(layout.floatingRegion.minY, layout.editorInsets.top)
+                        XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(dock, layout: layout),
+                                     "The applied correction must settle without another command.")
+                    }
+                }
+            }
+        }
+    }
+
+    func testNavigatorDockCorrectionPreservesHorizontalDocksAndOtherPresentations() {
+        let portrait = CGSize(width: 834, height: 1194)
+        let open = ChromeLayout(size: portrait, safeArea: .zero, left: NibMetrics.navigatorWidth,
+                                right: nil, mode: .sidebar)
+        for edge in [NibDock.top, .bottom] {
+            XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(NibPaletteDock(edge: edge), layout: open))
+        }
+        let unaffected = [
+            ChromeLayout(size: portrait, safeArea: .zero, left: nil, right: nil, mode: .sidebar),
+            ChromeLayout(size: CGSize(width: 1194, height: 834), safeArea: .zero,
+                         left: NibMetrics.navigatorWidth, right: nil, mode: .sidebar),
+            ChromeLayout(size: portrait, safeArea: .zero, left: NibMetrics.navigatorWidth,
+                         right: nil, mode: .window),
+            ChromeLayout(size: CGSize(width: 393, height: 852), safeArea: .zero,
+                         left: NibMetrics.navigatorWidth, right: nil, mode: .sidebar, idiom: .phone),
+            ChromeLayout(size: portrait, safeArea: .zero, left: nil,
+                         right: NibMetrics.panelWidth, mode: .sidebar, assistantTrailing: true)
+        ]
+        for layout in unaffected {
+            for edge in [NibDock.leading, .trailing] {
+                XCTAssertNil(ChromePalettePolicy.navigatorDockCorrection(NibPaletteDock(edge: edge), layout: layout))
+            }
+        }
+    }
 
     func testPortraitSearchSpansBelowBarsRegardlessOfPaletteDockOptionsOrSidebar() throws {
         let safe = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
@@ -198,6 +351,25 @@ final class FeatDocChromeTests: XCTestCase {
                                          size: size, in: region),
                        CGPoint(x: 1006, y: 534))
         XCTAssertEqual(FloatingSnap.initial(index: 1, size: size, in: region), CGPoint(x: 1006, y: 392))
+    }
+
+    func testFloatingCommentViewportKeepsComposerAboveKeyboard() {
+        // The failing iPad run placed the composer at y=620 while the keyboard began at y=534.
+        let original = CGRect(x: 16, y: 100, width: 1344, height: 916)
+        let keyboard = CGRect(x: 0, y: 534, width: 1376, height: 498)
+        let region = ChromeRegion.avoidingKeyboard(keyboard, in: original)
+        let size = CGSize(width: 344, height: min(ChromeLayout.floatingHeight, region.height))
+        for stored in [FloatingSnap.initial(index: 0, size: size, in: region), CGPoint(x: 1188, y: 736)] {
+            let centre = FloatingSnap.rest(centre: stored, size: size, in: region)
+            let contentHeight = FloatingSnap.contentHeight(viewport: size.height, providesHeader: true)
+            let contentBottom = centre.y - size.height / 2 + contentHeight
+            XCTAssertLessThanOrEqual(contentBottom, keyboard.minY - NibSpacing.l)
+            XCTAssertEqual(contentHeight, size.height, "The footer must fit without scrolling the whole thread")
+        }
+        XCTAssertEqual(ChromeRegion.avoidingKeyboard(nil, in: original), original)
+        XCTAssertEqual(FloatingSnap.contentHeight(viewport: 560, providesHeader: true), 560)
+        XCTAssertEqual(FloatingSnap.contentHeight(viewport: 418, providesHeader: false), 560,
+                       "Hosted forms retain their scrollable content")
     }
 
     func testWidePhoneAndCompactHeightPresentPanelsAsSheets() {
@@ -928,6 +1100,31 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(window.assistantPanel(kind: .notebook)?.id, PanelIDs.assistant)
     }
 
+    func testSelfHeadedSidebarDoesNotAddAnEmptyPlacementMenuRow() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let heading = NibPanelHeader(title: "Outline", symbol: .outline, onClose: {}) {
+            NibIconButton(.more, label: "Outline Options", size: .round) {}
+        }
+        var selected = PanelDescriptor(id: "outline.tab", title: "Outline", icon: NibSymbol.outline.name,
+                                       placement: .sidebarTab, order: 0, owner: "tests") { _ in AnyView(heading) }
+        selected.providesHeader = true
+        for scheme in [ColorScheme.light, .dark] {
+            let headerHost = UIHostingController(rootView: heading.environment(\.colorScheme, scheme))
+            let sidebarHost = UIHostingController(rootView:
+                SidebarPanelView(chrome: chrome, side: .left, tabs: [selected], selected: selected,
+                                 mode: .sidebar, presentation: .sidebar)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .environment(\.colorScheme, scheme))
+            let proposal = CGSize(width: NibMetrics.navigatorWidth, height: 0)
+            let headerHeight = headerHost.sizeThatFits(in: proposal).height
+            XCTAssertGreaterThan(headerHeight, 0)
+            XCTAssertEqual(sidebarHost.sizeThatFits(in: proposal).height,
+                           headerHeight + NibStroke.hairline, accuracy: 1,
+                           "A self-headed panel contributes its own More and Close; chrome adds no blank row.")
+        }
+    }
+
     func testSidebarToggleShowsHidesAndSwitchesMode() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         h.app.ui.panels.register(panel("test.pages", .sidebarTab, order: 0))
@@ -951,6 +1148,37 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(r["panel"], "test.outline", "the sidebar comes back on the tab it showed")
 
         await assertCode(.invalidParams) { try await h.run("sidebar.toggle", ["mode": "grid"]) }
+    }
+
+    func testBoardsNavigatorOpensAndRemainsAvailableAfterReopeningWhiteboard() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        // Feature descriptors use the same ids, kinds and ordering as the installed navigator panels.
+        h.app.ui.panels.register(panel("sidebar.pages", .sidebarTab, order: 100, kinds: [.notebook]))
+        h.app.ui.panels.register(panel("outline.tab", .sidebarTab, order: 200, kinds: [.notebook]))
+        h.app.ui.panels.register(panel("whiteboard.boards", .sidebarTab, order: 100, kinds: [.whiteboard]))
+        h.app.ui.panels.register(panel("audio.panel", .sidebarTab, order: 300))
+        h.session.document = Fixtures.whiteboardID
+        let navigator = TestNavigator(session: h.session)
+        let container = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.whiteboardID,
+                                                        app: h.app, navigator: navigator)
+        let state = try chromeState(h)
+        let result = try await h.run("sidebar.toggle")
+        XCTAssertEqual(result["panel"], "whiteboard.boards")
+        XCTAssertEqual(h.session.openPanels, ["whiteboard.boards"])
+        let tabs = PanelResolver.tabs(h.app.ui.panels.all, side: .left, kind: .whiteboard, settings: h.app.settings)
+        XCTAssertTrue(SidebarNavigation.primary(tabs).contains { $0.id == "whiteboard.boards" })
+
+        h.session.document = nil
+        h.session.document = Fixtures.whiteboardID
+        let reopened = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.whiteboardID,
+                                                       app: h.app, navigator: navigator)
+        XCTAssertEqual(state.openPanels, ["whiteboard.boards"], "Reopening retains the Boards navigator")
+        _ = try await h.run("sidebar.toggle")
+        XCTAssertTrue(h.session.openPanels.isEmpty)
+        let shownAgain = try await h.run("sidebar.toggle")
+        XCTAssertEqual(shownAgain["panel"], "whiteboard.boards")
+        XCTAssertEqual(h.session.openPanels, ["whiteboard.boards"])
+        withExtendedLifetime((container, reopened)) {}
     }
 
     func testScrollDirectionIsAnUndoableNotebookEdit() async throws {
@@ -1223,6 +1451,42 @@ final class FeatDocChromeTests: XCTestCase {
     }
 
     // MARK: Container
+
+    func testRenameCancelAndSheetDismissOnlyCloseTheInvokingWindowsPanel() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let original = try h.app.workspace.content(Fixtures.docID)
+        let title = h.library.node(Fixtures.docID)?.title
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        let store = try XCTUnwrap(h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self))
+        let otherState = store.state(for: other)
+        otherState.open(ChromePanels.rename, at: .sheet)
+        h.app.services.sessions.activate(other)
+        let renames = CallLog()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
+                                                  effect: .library, target: .app)) { params, _ in
+            renames.params.append(params)
+            return [:]
+        }
+
+        try await h.run(CommandIDs.panelOpen, ["id": .string(ChromePanels.rename)])
+        // Both the Cancel button and its Escape shortcut receive this exact panel context callback.
+        chrome.panelContext(ChromePanels.rename, presentation: .sheet).dismiss()
+        try await waitUntil { !h.session.openPanels.contains(ChromePanels.rename) }
+        XCTAssertTrue(other.openPanels.contains(ChromePanels.rename))
+
+        try await h.run(CommandIDs.panelOpen, ["id": .string(ChromePanels.rename)])
+        // Interactive dismissal settles the sheet binding immediately, then reports panel.close.
+        chrome.dismissPanel(ChromePanels.rename)
+        XCTAssertFalse(h.session.openPanels.contains(ChromePanels.rename))
+        await Task.yield()
+        XCTAssertTrue(renames.params.isEmpty)
+        XCTAssertEqual(h.library.node(Fixtures.docID)?.title, title)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), original)
+        XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "Cancelling must not add document history")
+    }
 
     func testContainerFollowsTheStatusBarSettingAndBackGoesToTheLibrary() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])

@@ -22,6 +22,7 @@ struct BackupSettingsPage: View {
                 if model.destination == "folder" {
                     NibRow(String(localized: "Files folder"), subtitle: model.status?.folderName.isEmpty == false ? model.status?.folderName : String(localized: "Choose a folder to grant access on this device"), icon: .folder) {
                         NibButton(String(localized: "Choose Folder"), kind: .plain) { model.send(CommandIDs.backupChooseFolder) }
+                        .accessibilityIdentifier("cmd." + CommandIDs.backupChooseFolder)
                     }
                 }
                 if model.destination != "none" {
@@ -57,6 +58,7 @@ struct BackupSettingsPage: View {
                 NibButton(String(localized: "Save Backup Settings"), kind: .primary, expands: sizeClass == .compact) { model.save() }
                     .disabled(model.status?.running == true || (model.destination == "folder" && model.status?.folderChosen != true))
                 NibButton(String(localized: "Back Up Now"), kind: .plain, expands: sizeClass == .compact) { model.send(CommandIDs.backupNow) }
+                .accessibilityIdentifier("cmd." + CommandIDs.backupNow)
                     .disabled(model.status?.running == true || model.status?.configuration.destination.kind == "none")
                 if let status = model.status {
                     NibRow(String(localized: "Pending documents")) {
@@ -74,6 +76,7 @@ struct BackupSettingsPage: View {
                     if let error = status.error { NibBanner(error, style: .warning) }
                     else if !status.running, status.state == "ok" { Text(String(localized: "Backup complete")).font(NibFont.body).foregroundStyle(NibColor.labelSecondary) }
                     NibButton(String(localized: "Clear Pending Backups"), kind: .plain) { model.send(CommandIDs.backupClearQueue) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.backupClearQueue)
                         .disabled(status.queued == 0 && status.error == nil)
                 }
                 if let error = model.error { NibBanner(error, style: .warning) }
@@ -85,12 +88,14 @@ struct BackupSettingsPage: View {
             Section {
                 NibButton(String(localized: "Create Library Backup"), symbol: .backup, kind: .plain, expands: sizeClass == .compact) {
                     model.send(CommandIDs.backupManual)
-                }.disabled(model.status?.running == true)
+                }
+                .accessibilityIdentifier("cmd." + CommandIDs.backupManual).disabled(model.status?.running == true)
                 if let status = model.status, status.running && status.manual {
                     NibProgressBar(value: status.progress).accessibilityLabel(String(localized: "Manual backup progress"))
                     Text(String(localized: "Keep Nib open until the backup finishes.")).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                 }
                 NibButton(String(localized: "Restore from ZIP"), kind: .plain) { model.send(CommandIDs.importPick) }
+                .accessibilityIdentifier("cmd." + CommandIDs.importPick)
                     .disabled(model.status?.running == true)
             } header: { Text(String(localized: "Manual backup and restore")) } footer: {
                 Text(String(localized: "Create a ZIP of your library without caches or locked documents, then save it to Files. Keep Nib in the foreground. An interrupted manual backup restarts from the beginning. Restore imports the ZIP through the library importer. After reinstalling, reopen your existing library folder or import your backup."))

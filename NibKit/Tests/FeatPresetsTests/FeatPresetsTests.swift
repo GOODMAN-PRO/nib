@@ -6,6 +6,38 @@ import NibTesting
 import NibDesign
 @testable import FeatPresets
 
+@MainActor
+private final class PresetTestNavigator: SceneNavigator {
+    let session: EditorSession
+    var openDocuments: [DocumentID] { [] }
+    var activeDocument: DocumentID? { session.document }
+    var rootViewController: UIViewController? { nil }
+    var presented: [UIViewController] = []
+    var onPresent: ((UIViewController) -> Void)?
+
+    init(session: EditorSession) { self.session = session }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {
+        onPresent?(viewController)
+        presented.append(viewController)
+    }
+}
+
+/// Like the toolbar, re-read the feature's descriptor from a SwiftUI body. Constructing
+/// a descriptor once in the test would freeze the Binding's cached value in the root view.
+private struct PresetPopoverTestHost: View {
+    let model: PresetMenuModel
+
+    var body: some View {
+        let popover = model.makePopover()
+        NibPopoverPanel(title: popover.title) { popover.content }
+            .budsFrom(popover.source, isPresented: popover.isPresented, instant: true)
+    }
+}
+
 /// Paints `rect` (page points) in `colour` over white, for the requested region; `scaleFactor` makes it answer with a
 /// different scale than asked, the way a renderer that caps the long edge does.
 final class PaintedRenderer: PageRenderer {
@@ -343,6 +375,100 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertNil(model.popover)
     }
 
+    func testColourSlotsHostNativeLongPressMenusAndKeepTapSeparate() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        let host = UIHostingController(rootView: ToolPresetMenu(model: model)
+            .environment(\.horizontalSizeClass, .regular))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 900, height: 300))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func buttons(_ view: UIView) -> [PresetSwatchNativeButton] {
+            (view as? PresetSwatchNativeButton).map { [$0] } ?? view.subviews.flatMap(buttons)
+        }
+        for _ in 0..<100 where buttons(host.view).count != model.presets.swatches.count {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let slots = buttons(host.view)
+        XCTAssertEqual(slots.count, model.presets.swatches.count)
+        let selected = try XCTUnwrap(slots.first(where: \.isSelected))
+        var ancestor = selected.superview
+        while let view = ancestor {
+            XCTAssertFalse(view is UIScrollView, "colours that fit must not delay the long press in a nested scroll view")
+            ancestor = view.superview
+        }
+        XCTAssertTrue(selected.isContextMenuInteractionEnabled, "UIKit must own the long press on the swatch itself")
+        XCTAssertFalse(selected.showsMenuAsPrimaryAction, "a short tap keeps the existing select/edit behaviour")
+        let interaction = try XCTUnwrap(selected.contextMenuInteraction)
+        let configuration = try XCTUnwrap(selected.contextMenuInteraction(interaction, configurationForMenuAtLocation:
+            CGPoint(x: selected.bounds.midX, y: selected.bounds.midY)))
+        selected.sendActions(for: .menuActionTriggered)
+        selected.sendActions(for: .touchUpInside)
+        XCTAssertNil(model.popover, "requesting the long-press menu must not run the tap action")
+        XCTAssertEqual(selected.accessibilityLabel, PresetColour.name(model.presets.color))
+        XCTAssertTrue(selected.accessibilityTraits.contains(.selected))
+        let change = try XCTUnwrap(selected.menu?.children.compactMap { $0 as? UIAction }
+            .first { $0.title == "Change Colour" })
+        selected.sendAction(change)
+        XCTAssertEqual(model.popover, .colour(.slot(0)), "the menu edits the held slot")
+        selected.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil)
+        selected.sendActions(for: .touchUpInside)
+        XCTAssertEqual(model.popover, .colour(.slot(0)), "the menu's final release must not toggle the editor closed")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        model.close()
+        selected.sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(model.popover, .colour(.slot(0)), "a short tap still opens the selected slot")
+        selected.sendActions(for: .primaryActionTriggered)
+        XCTAssertNil(model.popover, "and another short tap closes it")
+    }
+
+    func testNativeColourMenuEditsHeldSlotAndPreservesOtherActionsForEveryTool() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        for tool in NibSettings.presetTools {
+            let model = PresetMenuModel(app: h.app, session: h.session, tool: tool)
+            let button = PresetSwatchNativeButton()
+            let original = model.presets
+            var askedToRestore = false
+            let menu = PresetSwatchMenu.make(model: model, index: 1) { askedToRestore = true }
+            let actions = menu.children.compactMap { $0 as? UIAction }
+            XCTAssertEqual(actions.map(\.title), ["Change Colour", "Rearrange Colours", "Remove Colour", "Restore Default Presets"])
+            button.sendAction(actions[0])
+            XCTAssertEqual(model.popover, .colour(.slot(1)), tool)
+            XCTAssertEqual(model.presets.selectedSwatch, original.selectedSwatch, "holding another slot must not select it")
+            let picked = try XCTUnwrap(model.pick(vermilion))
+            let succeeded = await picked.value
+            XCTAssertTrue(succeeded)
+            model.reload()
+            XCTAssertEqual(model.presets.swatches.count, original.swatches.count)
+            XCTAssertEqual(model.presets.swatches[0], original.swatches[0])
+            XCTAssertEqual(PresetColour.rgbHex(model.presets.swatches[1].color), PresetColour.rgbHex(vermilion))
+            try await h.run("preset.select", ["tool": .string(tool), "swatch": 1])
+            XCTAssertEqual(PresetColour.rgbHex(presets(h, tool).color), PresetColour.rgbHex(vermilion),
+                           "the next stroke uses the changed colour after selecting that slot")
+            button.sendAction(actions[1])
+            XCTAssertTrue(model.arranging)
+            button.sendAction(actions[3])
+            XCTAssertTrue(askedToRestore)
+            XCTAssertNotEqual(presets(h, tool), original, "Restore still requires confirmation")
+            XCTAssertTrue(actions[2].attributes.contains(.destructive))
+            button.sendAction(actions[2])
+            for _ in 0..<100 where presets(h, tool).swatches.count == original.swatches.count {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertEqual(presets(h, tool).swatches.count, original.swatches.count - 1)
+            while presets(h, tool).swatches.count > 1 {
+                try await h.run("preset.removeSwatch", ["tool": .string(tool), "index": 0])
+            }
+            model.reload()
+            let lastSlotMenu = PresetSwatchMenu.make(model: model, index: 0) {}
+            XCTAssertFalse(lastSlotMenu.children.contains { $0.title == "Remove Colour" }, "the last colour cannot be removed")
+        }
+    }
+
     // MARK: Commands
 
     func testSelectChecksBounds() async throws {
@@ -562,7 +688,61 @@ final class FeatPresetsTests: XCTestCase {
             }
             XCTAssertEqual(WidthScale.width(at: -1, range: range), range.lowerBound)
             XCTAssertEqual(WidthScale.width(at: 2, range: range), range.upperBound)
-            XCTAssertLessThan(WidthScale.slotLineWidth(range.lowerBound, tool: tool), WidthScale.slotLineWidth(range.upperBound, tool: tool))
+            XCTAssertLessThan(WidthScale.position(range.lowerBound, range: range),
+                              WidthScale.position(range.upperBound, range: range))
+        }
+    }
+
+    /// Exercise the actual options row, so replacing its shared width buttons with stroke samples regresses here.
+    func testOptionsWidthsUseDistinctDotsAndRoundedSelectedCellsForEveryTool() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let size = CGSize(width: 600, height: 44)
+        for tool in NibSettings.presetTools {
+            for selected in 0..<3 {
+                var saved = ToolPresets.defaults(for: tool)
+                // Equal saved widths must still produce the three distinct slot dots, even for patterned pens.
+                saved.widths = Array(repeating: saved.widths[1], count: 3)
+                if PresetRules.patternTools.contains(tool) { saved.patterns = [.solid, .dashed, .dotted] }
+                saved.selectedWidth = selected
+                h.app.settings.set(NibSettings.presets(tool), saved)
+                let model = PresetMenuModel(app: h.app, session: h.session, tool: tool)
+                for sizeClass in [UserInterfaceSizeClass.compact, .regular] {
+                    let row = ToolPresetMenu(model: model)
+                        .environment(\.horizontalSizeClass, sizeClass)
+                        .fixedSize()
+                        .frame(width: size.width, height: size.height, alignment: .leading)
+                    for variant in NibSnapshot.Variant.allCases {
+                        let image = try XCTUnwrap(NibSnapshot.image(row, size: size, variant: variant))
+                        let context = "\(tool), selected \(selected), \(sizeClass), \(variant)"
+                        func alpha(_ x: CGFloat, _ y: CGFloat) throws -> UInt8 {
+                            try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: y))).a
+                        }
+                        for (index, diameter) in [CGFloat(5), 8, 12].enumerated() {
+                            let origin = CGFloat(index) * 44
+                            if index == selected {
+                                XCTAssertGreaterThan(try alpha(origin + 22, 4), 0, context)
+                                XCTAssertGreaterThan(try alpha(origin + 22, 40), 0, context)
+                                XCTAssertEqual(try alpha(origin + 22, 1), 0, context)
+                                XCTAssertEqual(try alpha(origin + 22, 43), 0, context)
+                                // Inside the radius-12 rectangle, outside the old circular selection.
+                                XCTAssertGreaterThan(try alpha(origin + 3, 10), 0, context)
+                                XCTAssertEqual(try alpha(origin + 1, 3), 0, context)
+                            } else {
+                                var horizontal: [CGFloat] = [], vertical: [CGFloat] = []
+                                for offset in stride(from: CGFloat(0), to: 44, by: 0.5) {
+                                    if try alpha(origin + offset, 22) > 127 { horizontal.append(offset) }
+                                    if try alpha(origin + 22, offset) > 127 { vertical.append(offset) }
+                                }
+                                let width = try XCTUnwrap(horizontal.last) - XCTUnwrap(horizontal.first) + 0.5
+                                let height = try XCTUnwrap(vertical.last) - XCTUnwrap(vertical.first) + 0.5
+                                XCTAssertEqual(width, diameter, accuracy: 0.5, context)
+                                XCTAssertEqual(height, diameter, accuracy: 0.5, "Dots, never dashes: \(context)")
+                                XCTAssertEqual(try alpha(origin + 3, 10), 0, context)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -603,6 +783,151 @@ final class FeatPresetsTests: XCTestCase {
         let failed = await PresetActions.run(h.app, session: h.session, unknown).value
         XCTAssertFalse(failed, "a failed command reports false")
         XCTAssertEqual(presets(h, "tape"), after)
+    }
+
+    func testColourChoiceReleasesNativePopoverAndKeepsSelectedInk() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.open(.colour(.slot(0)))
+        let host = UIHostingController(rootView: PresetPopoverTestHost(model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+
+        func scrollViews(_ view: UIView) -> [UIScrollView] {
+            (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap(scrollViews)
+        }
+        for _ in 0..<100 where scrollViews(host.view).isEmpty {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let scroll = try XCTUnwrap(scrollViews(host.view).first)
+        XCTAssertTrue(scroll.isUserInteractionEnabled, "the open editor accepts colour choices")
+        let original = presets(h, "pen")
+        let choice = try XCTUnwrap(model.pick(vermilion))
+        let succeeded = await choice.value
+        XCTAssertTrue(succeeded)
+        for _ in 0..<100 where scroll.isUserInteractionEnabled {
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(model.popover)
+        XCTAssertFalse(scroll.isUserInteractionEnabled, "retained native popover content must release canvas input")
+        XCTAssertTrue(scroll.accessibilityElementsHidden)
+        XCTAssertFalse(scroll.isScrollEnabled, "layout must not reactivate the closed scroll host")
+        let changed = presets(h, "pen")
+        XCTAssertEqual(changed.color, vermilion, "the next stroke reads the edited selected slot")
+        XCTAssertEqual(changed.selectedSwatch, original.selectedSwatch)
+        XCTAssertEqual(changed.swatches.count, original.swatches.count)
+        XCTAssertEqual(changed.widths, original.widths)
+
+        model.open(.colour(.slot(1)))
+        for _ in 0..<100 where !scroll.isUserInteractionEnabled || !scroll.isScrollEnabled {
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(scroll.isUserInteractionEnabled, "opening another slot restores its controls")
+        XCTAssertTrue(scroll.isScrollEnabled)
+    }
+
+    func testCustomPickerClosesPopoverBeforePresentationAndRetainsEachWindowDelegate() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.open(.colour(.slot(0)))
+        let initial = model.editedSwatch.color
+        navigator.onPresent = { _ in
+            XCTAssertNil(model.popover, "the popover must give up modal input before presenting UIKit")
+            XCTAssertFalse(model.makePopover().isPresented.wrappedValue)
+        }
+        model.openPicker()
+        let first = try XCTUnwrap(navigator.presented.last as? UIColorPickerViewController)
+        XCTAssertEqual(PresetColour.rgba(first.selectedColor), initial)
+        XCTAssertTrue(first.supportsAlpha)
+        XCTAssertEqual(first.sheetPresentationController?.selectedDetentIdentifier, .large)
+
+        // A second scene can show its picker while the first scene's remains open.
+        let otherSession = EditorSession()
+        h.app.services.sessions.add(otherSession)
+        let otherNavigator = PresetTestNavigator(session: otherSession)
+        h.app.ui.activeNavigator = otherNavigator
+        let other = PresetMenuModel(app: h.app, session: otherSession, tool: "highlighter")
+        other.open(.colour(.slot(0)))
+        other.openPicker()
+        let second = try XCTUnwrap(otherNavigator.presented.last as? UIColorPickerViewController)
+        XCTAssertFalse(second.supportsAlpha)
+        let firstDelegate = try XCTUnwrap(first.delegate as? SystemColourPicker,
+                                         "another window must not release the first picker's weak delegate")
+        XCTAssertFalse(first.delegate === second.delegate)
+        let custom = try XCTUnwrap(RGBA(hex: "#D03080"))
+        firstDelegate.colorPickerViewController(first, didSelect: PresetColour.uiColor(custom), continuously: false)
+        for _ in 0..<100 where presets(h, "pen").color != custom {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(presets(h, "pen").color, custom)
+        XCTAssertEqual(presets(h, "highlighter"), ToolPresets.defaults(for: "highlighter"))
+        await assertInvalid(h, "preset.setSwatch", ["tool": "pen", "index": 0, "color": "#ZZZZZZ"], path: "$.color")
+        XCTAssertEqual(presets(h, "pen").color, custom)
+    }
+
+    func testCustomPickerUsesNativeControllerAndFullSizePresentation() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.open(.colour(.slot(0)))
+        model.openPicker()
+        let picker = try XCTUnwrap(navigator.presented.last as? UIColorPickerViewController)
+        // ARCHITECTURE §15: this target runs without UIApplication. Verify the native
+        // controller and presentation contract here; InkUITests exercises its actual
+        // Grid/Spectrum/Sliders interface in the app, including valid and invalid HEX.
+        XCTAssertEqual(ObjectIdentifier(type(of: picker)), ObjectIdentifier(type(of: UIColorPickerViewController())),
+                       "retain the delegate without substituting a feature subclass for UIKit's picker")
+        XCTAssertEqual(picker.modalPresentationStyle, .formSheet)
+        let sheet = try XCTUnwrap(picker.sheetPresentationController)
+        XCTAssertEqual(sheet.detents.map(\.identifier), [.medium, .large])
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .large)
+        XCTAssertTrue(picker.presentationController?.delegate === picker.delegate)
+        XCTAssertEqual(navigator.presented.count, 1)
+    }
+
+    func testPickerCloseAndSwipeCommitOnlyOnce() {
+        let picker = UIColorPickerViewController()
+        let presentation = UIPresentationController(presentedViewController: picker, presenting: nil)
+        var picks: [RGBA] = []
+        let coordinator = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        coordinator.colorPickerViewController(picker, didSelect: PresetColour.uiColor(vermilion), continuously: true)
+        coordinator.presentationControllerDidDismiss(presentation)
+        XCTAssertEqual(picks, [vermilion], "a swipe must not lose the new colour")
+        coordinator.colorPickerViewControllerDidFinish(picker)
+        coordinator.colorPickerViewController(picker, didSelect: .blue, continuously: false)
+        coordinator.presentationControllerDidDismiss(presentation)
+        XCTAssertEqual(picks, [vermilion], "late delegate callbacks cannot add a second swatch")
+
+        let closed = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        closed.colorPickerViewController(picker, didSelect: PresetColour.uiColor(vermilion), continuously: true)
+        closed.colorPickerViewControllerDidFinish(picker)
+        closed.presentationControllerDidDismiss(presentation)
+        XCTAssertEqual(picks, [vermilion, vermilion], "Close followed by presentation dismissal also commits once")
+    }
+
+    func testNativePickerOwnsItsDelegateOnlyForItsLifetime() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        weak var delegate: SystemColourPicker?
+        try autoreleasepool {
+            SystemColourPicker.present(title: "Pen Colour", initial: .black, supportsAlpha: true,
+                                       commitsOnFinishOnly: false, app: h.app, session: h.session) { _ in }
+            let picker = try XCTUnwrap(navigator.presented.last as? UIColorPickerViewController)
+            delegate = try XCTUnwrap(picker.delegate as? SystemColourPicker)
+            navigator.presented.removeAll()
+            XCTAssertNotNil(delegate, "the native picker must retain its otherwise weak delegate")
+        }
+        XCTAssertNil(delegate, "releasing the picker must release its window-specific coordinator")
     }
 
     /// A slot commits every settled choice; a new slot commits once, when the picker closes; an unchanged colour never.

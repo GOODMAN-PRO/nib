@@ -20,6 +20,8 @@ public enum FeatCreateFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         app.commands.register(DocQuickNote.self)
+        app.settings.declare(PaperDistribution.setting, summary: "Last notebook paper distribution.", owner: id,
+                             schema: .str("Distribution", choices: PaperDistribution.allCases.map(\.rawValue)))
         app.settings.declarePrefix(PendingCreations.prefix, synced: false,
                                    summary: "QuickNotes and untitled notebooks this device created that still get the "
                                        + "leave prompt or a title suggestion ({kind, created, title}); null = done.",

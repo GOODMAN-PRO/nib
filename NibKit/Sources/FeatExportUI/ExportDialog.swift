@@ -234,13 +234,7 @@ struct ExportDialog: View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             if !printing {
                 NibInspectorSection(String(localized: "Format")) {
-                    if formatGroups.count <= 4 && !typeSize.isAccessibilitySize {
-                        NibSegmentedControl(selection: formatGroup, options: formatGroups) { formatTitle($0) }
-                    } else {
-                        Picker(String(localized: "Format"), selection: formatGroup) {
-                            ForEach(formatGroups, id: \.self) { id in Text(formatTitle(id)).tag(id) }
-                        }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
-                    }
+                    ExportFormatPicker(selection: formatGroup, options: formatGroups, title: formatTitle)
                     if formatGroup.wrappedValue == "images" {
                         NibSegmentedControl(selection: $draft.format, options: imageFormats.map(\.id)) { $0.uppercased() }
                     }
@@ -326,12 +320,14 @@ struct ExportDialog: View {
                     NibButton(String(localized: "Save changes to \(selection.documents[0].sourceName ?? String(localized: "source"))…"), symbol: .saveToFiles, kind: .plain, expands: true) {
                         app.perform(CommandIDs.exportSaveToSource, ["doc": .string(selection.documents[0].ref)], session: session)
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.exportSaveToSource)
                 }
                 if app.commands.descriptor(CommandIDs.collabHost) != nil && selection.documents.count == 1 {
                     NibButton(String(localized: "Share live…"), symbol: .share, kind: .plain, expands: true) {
                         app.perform(CommandIDs.collabHost, ["doc": .string(selection.documents[0].ref)], session: session)
                         dismiss()
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.collabHost)
                 }
             }
         }
@@ -400,6 +396,36 @@ struct ExportDialog: View {
     }
 }
 
+/// Keep format selection to one row so the page/board scope is visible on opening the popover.
+/// A segmented control normally falls back to a vertical list; export uses a menu when it cannot fit.
+struct ExportFormatPicker: View {
+    @Binding var selection: String
+    let options: [String]
+    let title: (String) -> String
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    var body: some View {
+        if typeSize.isAccessibilitySize {
+            menu
+        } else {
+            ViewThatFits(in: .horizontal) {
+                NibSegmentedControl(selection: $selection, options: options, title: title)
+                    .fixedSize(horizontal: true, vertical: true)
+                menu
+            }
+        }
+    }
+
+    private var menu: some View {
+        Picker(String(localized: "Format"), selection: $selection) {
+            ForEach(options, id: \.self) { id in Text(title(id)).tag(id) }
+        }
+        .pickerStyle(.menu)
+        .font(NibFont.body)
+        .frame(minHeight: NibMetrics.hitTarget)
+    }
+}
+
 @MainActor
 private struct ExportPageChoice: View {
     let page: ExportPage
@@ -433,22 +459,12 @@ private struct ExportPageChoice: View {
 }
 
 private struct ExportProgress: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var moving = false
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
             Text(String(localized: "Preparing export…")).font(NibFont.caption1)
-            GeometryReader { proxy in
-                NibProgressBar(value: 0.3)
-                    .offset(x: reduceMotion ? 0 : (moving ? proxy.size.width : -proxy.size.width * 0.3))
-            }.frame(height: NibStroke.thick).clipped()
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(String(localized: "Preparing export…"))
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(NibMotion.glide.animation.speed(0.2).repeatForever(autoreverses: false)) { moving = true }
-        }
     }
 }
 
@@ -462,7 +478,7 @@ struct ExportPopover: View {
     let host: FloatingHosting
     let source: String
     /// The registered source rect, in the floating container's coordinate space.
-    let sourceRect: CGRect
+    let sourceRect: CGRect?
     let updateSourceRect: @MainActor () -> CGRect?
     let instant: Bool
     @State private var presented = true
@@ -476,7 +492,9 @@ struct ExportPopover: View {
                 .onTapGesture { close() }.accessibilityHidden(true)
             GeometryReader { geometry in
                 let bounds = geometry.frame(in: NibLiquid.space)
-                let anchor = currentSourceRect ?? sourceRect
+                // The floating layer may attach after the command runs. Keep the options
+                // visible while its UIKit reference view becomes available.
+                let anchor = currentSourceRect ?? sourceRect ?? ExportPopover.fallbackAnchor(in: bounds)
                 let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
                 // NibBudPopover's .below rule: retain the source gap and clamp only horizontally.
                 let inset = bounds.insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
@@ -492,12 +510,18 @@ struct ExportPopover: View {
                     .onGeometryChange(for: CGRect.self) { _ in bounds } action: { _ in
                         currentSourceRect = updateSourceRect()
                     }
+                    .onAppear { currentSourceRect = updateSourceRect() }
             }
         }
         .onChange(of: presented) { _, value in
             // Buds also close through Escape and VoiceOver, so release the outside-touch shield.
             if !value { close() }
         }
+    }
+    static func fallbackAnchor(in bounds: CGRect) -> CGRect {
+        CGRect(x: bounds.maxX - NibMetrics.chromeInset - NibMetrics.hitTarget,
+               y: bounds.minY + NibMetrics.barTopGap,
+               width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
     }
     private var title: String { printing ? String(localized: "Print") : String(localized: "Share & Export") }
     @ViewBuilder private var contents: some View {
@@ -556,6 +580,7 @@ struct LockedExportSheet: View {
                     } catch { unlocking = false; self.error = NibError.wrap(error).message }
                 }
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.docUnlock)
             .disabled(unlocking).padding(.horizontal, NibSpacing.xl)
             Spacer(minLength: 0)
         }.background(NibColor.backgroundSecondary)

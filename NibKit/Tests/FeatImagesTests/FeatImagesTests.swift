@@ -150,6 +150,147 @@ final class FeatImagesTests: XCTestCase {
         }
     }
 
+    func testPickerWaitsForPreviousDismissalBeforePresenting() async {
+        let root = ImagePresentationSpy()
+        let menu = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        root.shown = menu
+        menu.presentedBy = root
+        menu.dismissing = true
+        menu.transition = transition
+        let picker = UIViewController()
+        let presented = expectation(description: "Picker presented after dismissal")
+        root.onPresent = { presented.fulfill() }
+
+        ImagePresenter.present(picker, from: root)
+        XCTAssertTrue(root.presentations.isEmpty, "UIKit still owns the old menu's presentation slot")
+        XCTAssertTrue(menu.presentations.isEmpty, "a disappearing menu must never own the picker")
+        root.shown = nil
+        menu.presentedBy = nil
+        menu.dismissing = false
+        menu.transition = nil
+        transition.complete()
+        await fulfillment(of: [presented], timeout: 5)
+        XCTAssertEqual(root.presentations.count, 1)
+        XCTAssertTrue(root.presentations.first === picker)
+    }
+
+    func testPickerResolvesPresenterAgainAfterCancelledInteractiveDismissal() async {
+        let root = ImagePresentationSpy()
+        let sheet = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        root.shown = sheet
+        sheet.presentedBy = root
+        sheet.dismissing = true
+        sheet.transition = transition
+        let picker = UIViewController()
+        let presented = expectation(description: "Picker presented on retained sheet")
+        sheet.onPresent = { presented.fulfill() }
+
+        ImagePresenter.present(picker, from: sheet)
+        XCTAssertTrue(sheet.presentations.isEmpty)
+        sheet.dismissing = false
+        sheet.transition = nil
+        transition.complete()
+        await fulfillment(of: [presented], timeout: 5)
+        XCTAssertTrue(root.presentations.isEmpty)
+        XCTAssertTrue(sheet.presentations.first === picker, "the retained sheet is now the visible presenter")
+    }
+
+    func testPickerCancellationCompletesOnlyAfterDismissalAndOnlyOnce() {
+        let presenter = UIViewController()
+        let picker = ImagePresentationSpy()
+        picker.presentedBy = presenter
+        let completion = ImagePickerCompletion<[Data]>()
+        var results: [[Data]] = []
+
+        completion.finish([], dismissing: picker) { results.append($0) }
+        XCTAssertEqual(picker.dismissals, 1)
+        XCTAssertTrue(results.isEmpty, "the next image menu must not open during the old picker's dismissal")
+        completion.finish([Fixtures.pngData], dismissing: picker) { results.append($0) }
+        XCTAssertEqual(picker.dismissals, 1, "late selection cannot override Cancel")
+        picker.completeDismissal()
+        completion.finish([], dismissing: nil) { results.append($0) }
+        XCTAssertEqual(results, [[]], "Cancel and the adaptive dismissal callback return no images, once")
+    }
+
+    func testMenuHandoffDuringDismissalRunsOnlyTheFirstSourceChoice() async {
+        let menu = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        menu.dismissing = true
+        menu.transition = transition
+        let handoff = ImagePickerCompletion<Void>()
+        var sources: [String] = []
+        let finished = expectation(description: "First source choice runs after menu dismissal")
+
+        handoff.finish((), dismissing: menu) { _ in sources.append("photos"); finished.fulfill() }
+        handoff.finish((), dismissing: menu) { _ in sources.append("files") }
+        XCTAssertTrue(sources.isEmpty)
+        XCTAssertEqual(menu.dismissals, 0, "a second dismiss call could lose the picker handoff")
+        transition.complete()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(sources, ["photos"])
+    }
+
+    func testChoosingSourceDuringMenuPresentationWaitsForOpeningThenClosing() async {
+        let presenter = UIViewController()
+        let menu = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        menu.presentedBy = presenter
+        menu.transition = transition
+        let handoff = ImagePickerCompletion<Void>()
+        var openedPicker = false
+        let dismissing = expectation(description: "Menu closes after its opening transition")
+        menu.onDismiss = { dismissing.fulfill() }
+
+        handoff.finish((), dismissing: menu) { _ in openedPicker = true }
+        XCTAssertEqual(menu.dismissals, 0, "a fast source tap must not dismiss during the opening animation")
+        XCTAssertFalse(openedPicker)
+        menu.transition = nil
+        transition.complete()
+        await fulfillment(of: [dismissing], timeout: 5)
+        XCTAssertFalse(openedPicker, "the picker still waits for the menu's closing animation")
+        menu.completeDismissal()
+        XCTAssertTrue(openedPicker)
+    }
+
+    func testFilesResultWaitsForSystemDismissalAndPreservesSelectedBytes() async {
+        let picker = ImagePresentationSpy()
+        let transition = ImageTransitionSpy()
+        picker.dismissing = true
+        picker.transition = transition
+        let completion = ImagePickerCompletion<[Data]>()
+        var results: [[Data]] = []
+        let finished = expectation(description: "Files result returned after dismissal")
+        completion.finish([Fixtures.pngData], dismissing: picker) { results.append($0); finished.fulfill() }
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertEqual(picker.dismissals, 0, "Files already started dismissing itself")
+        transition.complete()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(results, [[Fixtures.pngData]])
+    }
+
+    func testPickerSwipeCancellationAndAlreadyDismissedPickerCompleteImmediately() {
+        for controller in [nil, UIViewController()] as [UIViewController?] {
+            let completion = ImagePickerCompletion<[Data]>()
+            var results: [[Data]] = []
+            completion.finish([], dismissing: controller) { results.append($0) }
+            completion.finish([Fixtures.pngData], dismissing: controller) { results.append($0) }
+            XCTAssertEqual(results, [[]])
+        }
+    }
+
+    func testPresentationWithoutTransitionRunsOnceEvenIfUIKitSendsLateCompletion() async {
+        let transition = ImageTransitionSpy()
+        transition.queuesAnimation = false
+        var calls = 0
+        let finished = expectation(description: "Presentation continuation returned once")
+        ImagePresenter.afterTransition(transition) { calls += 1; finished.fulfill() }
+        transition.complete()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(calls, 1)
+    }
+
     func testIconsAreNibSymbolGlyphs() {
         let h = Harness(features: [FeatImagesFeature.self])
         let expected = ["images.crop": "crop",
@@ -616,4 +757,76 @@ final class FeatImagesTests: XCTestCase {
 
     static func isRed(_ p: (r: UInt8, g: UInt8, b: UInt8, a: UInt8)) -> Bool { p.r > 200 && p.b < 60 }
     static func isBlue(_ p: (r: UInt8, g: UInt8, b: UInt8, a: UInt8)) -> Bool { p.b > 200 && p.r < 60 }
+}
+
+/// UIKit lifecycle doubles: no Photos/Files service or simulator UI is opened by these unit tests.
+@MainActor
+private final class ImagePresentationSpy: UIViewController {
+    var shown: UIViewController?
+    weak var presentedBy: UIViewController?
+    var dismissing = false
+    var transition: UIViewControllerTransitionCoordinator?
+    var presentations: [UIViewController] = []
+    var onPresent: (() -> Void)?
+    var dismissals = 0
+    var onDismiss: (() -> Void)?
+    private var didDismiss: (() -> Void)?
+
+    override var presentedViewController: UIViewController? { shown }
+    override var presentingViewController: UIViewController? { presentedBy }
+    override var isBeingDismissed: Bool { dismissing }
+    override var transitionCoordinator: UIViewControllerTransitionCoordinator? { transition }
+    override func present(_ controller: UIViewController, animated: Bool, completion: (() -> Void)? = nil) {
+        presentations.append(controller)
+        onPresent?()
+        completion?()
+    }
+    override func dismiss(animated: Bool, completion: (() -> Void)? = nil) {
+        dismissals += 1
+        didDismiss = completion
+        onDismiss?()
+    }
+    func completeDismissal() {
+        let completion = didDismiss
+        didDismiss = nil
+        presentedBy = nil
+        completion?()
+    }
+}
+
+@MainActor
+private final class ImageTransitionSpy: NSObject, UIViewControllerTransitionCoordinator {
+    var queuesAnimation = true
+    private var completions: [(UIViewControllerTransitionCoordinatorContext) -> Void] = []
+    let isAnimated = true
+    let presentationStyle: UIModalPresentationStyle = .pageSheet
+    let initiallyInteractive = false
+    let isInterruptible = true
+    let isInteractive = false
+    let isCancelled = false
+    let transitionDuration: TimeInterval = 0.3
+    let percentComplete: CGFloat = 0
+    let completionVelocity: CGFloat = 1
+    let completionCurve: UIView.AnimationCurve = .easeInOut
+    let containerView = UIView()
+    let targetTransform = CGAffineTransform.identity
+
+    func animate(alongsideTransition animation: ((UIViewControllerTransitionCoordinatorContext) -> Void)?,
+                 completion: ((UIViewControllerTransitionCoordinatorContext) -> Void)? = nil) -> Bool {
+        if let completion { completions.append(completion) }
+        return queuesAnimation
+    }
+    func animateAlongsideTransition(in view: UIView?, animation: ((UIViewControllerTransitionCoordinatorContext) -> Void)?,
+                                    completion: ((UIViewControllerTransitionCoordinatorContext) -> Void)? = nil) -> Bool {
+        animate(alongsideTransition: animation, completion: completion)
+    }
+    func notifyWhenInteractionChanges(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
+    func notifyWhenInteractionEnds(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
+    func viewController(forKey key: UITransitionContextViewControllerKey) -> UIViewController? { nil }
+    func view(forKey key: UITransitionContextViewKey) -> UIView? { nil }
+    func complete() {
+        let callbacks = completions
+        completions = []
+        callbacks.forEach { $0(self) }
+    }
 }

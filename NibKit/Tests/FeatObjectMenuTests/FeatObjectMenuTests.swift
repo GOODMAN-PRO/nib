@@ -2,8 +2,14 @@ import XCTest
 import UIKit
 import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatObjectMenu
+
+private final class MenuTouch: UITouch {
+    var inputType: UITouch.TouchType = .direct
+    override var type: UITouch.TouchType { inputType }
+}
 
 /// A window's floating host, including transient unavailability and canvas-to-container layout offsets.
 @MainActor
@@ -752,6 +758,62 @@ final class FeatObjectMenuTests: XCTestCase {
                                                in: bounds, top: 60, bottom: 16))
     }
 
+    func testMenuViewportReservesChromeWithoutExcludingPageCentringSpace() {
+        final class Canvas: UIScrollView {
+            override var safeAreaInsets: UIEdgeInsets {
+                UIEdgeInsets(top: 100, left: 80, bottom: 96, right: 24)
+            }
+        }
+        let canvas = Canvas(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        canvas.contentInsetAdjustmentBehavior = .never
+        canvas.contentInset = UIEdgeInsets(top: 240, left: 160, bottom: 240, right: 160)
+        canvas.bounds.origin = CGPoint(x: 32, y: 180)
+        XCTAssertEqual(ObjectMenuPlacement.viewport(in: canvas),
+                       CGRect(x: 112, y: 280, width: 730, height: 998))
+    }
+
+    func testCapsuleFitsTheUnobscuredCanvasInBothOrientationsAndAppearances() throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            let container = CGRect(origin: .zero, size: size)
+            // Leave a leading palette, a trailing panel and the bottom controls outside the usable canvas.
+            let viewport = container.inset(by: UIEdgeInsets(top: 160, left: 96, bottom: 96, right: 344))
+            let available = ObjectMenuPlacement.availableBounds(container: container, viewport: viewport)
+            XCTAssertEqual(available, viewport)
+            for x in [viewport.minX, viewport.midX, viewport.maxX - 40] {
+                let selection = CGRect(x: x, y: 400, width: 40, height: 100)
+                select(h, [Fixtures.shapeID], bounds: Rect(x: Double(x), y: 400, width: 40, height: 100))
+                let limit = ObjectMenuPlacement.quickLimit(width: available.width, compact: false)
+                let split = ObjectMenuComposer.split(attachment.model.entries, maxQuick: limit)
+                XCTAssertEqual(Set((split.quick + split.more).map(\.id)), Set(attachment.model.entries.map(\.id)),
+                               "Overflow must preserve every registered action")
+                let bar = ObjectMenuBar(model: attachment.model, maxQuick: limit)
+                for variant in NibSnapshot.Variant.allCases {
+                    let measured = NibSnapshot.fittingSize(bar, width: available.width, variant: variant)
+                    let placed = try XCTUnwrap(ObjectMenuPlacement.place(bar: measured, selection: selection,
+                                                                         in: available, top: 16, bottom: 16))
+                    let frame = CGRect(x: placed.centre.x - measured.width / 2,
+                                       y: placed.centre.y - measured.height / 2,
+                                       width: measured.width, height: measured.height)
+                    XCTAssertTrue(placed.above, "\(size), \(variant)")
+                    XCTAssertTrue(available.insetBy(dx: 16, dy: 16).contains(frame), "\(frame), \(variant)")
+                    XCTAssertLessThanOrEqual(frame.maxY, selection.minY - ObjectMenuPlacement.gapAbove)
+                    XCTAssertGreaterThanOrEqual(measured.height, NibMetrics.hitTarget)
+                }
+            }
+        }
+        XCTAssertEqual(ObjectMenuPlacement.quickLimit(width: 140, compact: false), 1)
+        XCTAssertEqual(ObjectMenuPlacement.quickLimit(width: 84, compact: true), 0)
+        XCTAssertFalse(ObjectMenuStyle.capsule.refracts)
+    }
+
     func testProvenanceHeader() {
         var made = Item(kind: .stroke, stroke: Stroke(style: .defaultPen, points: []))
         made.createdBy = "ai:chat1"
@@ -771,6 +833,193 @@ final class FeatObjectMenuTests: XCTestCase {
     }
 
     // MARK: menu.showAt
+
+    func testPageMenuWaitsForFingerAndContextGestureToFinish() async throws {
+        let probe = InputProbe(target: nil, action: nil)
+        probe.makePassive()
+        let touch = MenuTouch()
+        let event = UIEvent()
+        probe.touchesBegan([touch], with: event)
+        XCTAssertFalse(probe.allowsContextMenu, "A finger hold belongs to the command tap chain")
+        let competing = UILongPressGestureRecognizer()
+        XCTAssertFalse(probe.canPrevent(competing))
+        XCTAssertFalse(probe.canBePrevented(by: competing), "Keep observing until the finger lifts")
+
+        var presentations = 0
+        probe.presentWhenIdle { presentations += 1 }
+        await Task.yield()
+        XCTAssertEqual(presentations, 0, "Do not present while UIKit is resolving the same long-press")
+        probe.touchesEnded([touch], with: event)
+        // UIKit resets failed recognizers after dispatching the final contact callbacks.
+        probe.reset()
+        XCTAssertEqual(presentations, 0, "Presentation must also wait for gesture callback unwinding")
+        try await waitUntil({ presentations == 1 })
+        probe.reset()
+        await Task.yield()
+        XCTAssertEqual(presentations, 1)
+        XCTAssertTrue(probe.allowsContextMenu)
+    }
+
+    func testCancelledContactAndDetachedMenuDoNotPresentLater() async throws {
+        for cancelledContact in [true, false] {
+            let probe = InputProbe(target: nil, action: nil)
+            let touch = MenuTouch()
+            let event = UIEvent()
+            var presentations = 0
+            probe.touchesBegan([touch], with: event)
+            probe.presentWhenIdle { presentations += 1 }
+            if cancelledContact {
+                probe.touchesCancelled([touch], with: event)
+                probe.reset()
+            } else {
+                probe.touchesEnded([touch], with: event)
+                probe.reset()
+                probe.cancelPresentation() // attachment detached before the deferred presentation
+            }
+            await Task.yield()
+            XCTAssertEqual(presentations, 0)
+        }
+    }
+
+    func testPageMenuOffersCommentAtHeldPointAndTemporaryScreenshotTool() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let savedPasteboard = ObjectMenuEntries.pasteboardHasContent
+        ObjectMenuEntries.pasteboardHasContent = { false }
+        defer { ObjectMenuEntries.pasteboardHasContent = savedPasteboard }
+        // F037 supplies this descriptor in the app; exercise the host without importing another feature.
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.comment", title: "Add Comment", location: .pageLongPress, order: 600,
+            owner: "builtin", command: CommandIDs.commentAdd,
+            params: { ObjectMenuEntries.pageParams($0, pointKey: "at") }))
+        var commentParams: JSONValue?
+        standIn(h, CommandIDs.commentAdd) { commentParams = $0 }
+        h.session.selectTool("lasso")
+        let ctx = PageMenus.context(app: h.app, session: h.session, doc: doc, page: page, point: Point(420, 700))
+        let entries = h.app.ui.menuItems(.pageLongPress, ctx)
+        let attachment = ObjectMenuAttachment()
+        let menu = attachment.uiMenu(entries.map { ObjectMenuEntry($0, context: ctx) }, context: ctx,
+                                     facts: nil, title: "", shortcuts: false)
+        XCTAssertTrue(menu.children.contains { $0.title == "Add Comment" && $0 is UIAction })
+        XCTAssertTrue(menu.children.contains { $0.title == "Take Screenshot" && $0 is UIAction })
+        let comment = try XCTUnwrap(entries.first { $0.command == CommandIDs.commentAdd })
+        try await h.run(comment.command, comment.params(ctx))
+        XCTAssertEqual(commentParams, ["page": "page:FIXTUREDOC01/FIXTUREPG001", "at": [420, 700]])
+        let screenshot = try XCTUnwrap(entries.first { $0.id == ObjectMenuIDs.pageScreenshot })
+        try await h.run(screenshot.command, screenshot.params(ctx))
+        XCTAssertEqual(h.session.tool, ObjectMenuIDs.screenshotTool)
+        XCTAssertEqual(h.session.temporaryReturnTool, "lasso")
+        XCTAssertEqual(h.undoDepth(doc), 0)
+    }
+
+    func testPageMenuWithoutAnActiveContactPresentsImmediately() {
+        let probe = InputProbe(target: nil, action: nil)
+        var presented = false
+        probe.presentWhenIdle { presented = true }
+        XCTAssertTrue(presented, "Command callers without a held touch must not wait for a touch reset")
+    }
+
+    func testShowAtRetainsPageActionsThroughTheHeldContact() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let savedPasteboard = ObjectMenuEntries.pasteboardHasContent
+        ObjectMenuEntries.pasteboardHasContent = { false }
+        defer { ObjectMenuEntries.pasteboardHasContent = savedPasteboard }
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.comment", title: "Add Comment", location: .pageLongPress, order: 600,
+            owner: "builtin", command: CommandIDs.commentAdd))
+        let host = FakeCanvasHost(h)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.addSubview(host.canvasView)
+        window.isHidden = false
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer {
+            attachment.detach(from: host)
+            window.isHidden = true
+        }
+        let probe = try XCTUnwrap(host.canvasView.gestureRecognizers?.compactMap { $0 as? InputProbe }.first)
+        let interaction = try XCTUnwrap(host.canvasView.interactions.compactMap { $0 as? UIEditMenuInteraction }.first)
+        let touch = MenuTouch(), event = UIEvent()
+        probe.touchesBegan([touch], with: event)
+        let out = try await h.run(CommandIDs.menuShowAt, [
+            "page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [420, 700], "gesture": "longPress"
+        ])
+        XCTAssertEqual(out["handled"], true)
+        XCTAssertEqual(out["items"], ["Add Comment", "Take Screenshot"])
+        let configuration = UIEditMenuConfiguration(identifier: nil, sourcePoint: CGPoint(x: 420, y: 700))
+        func menu() -> UIMenu? {
+            attachment.editMenuInteraction(interaction, menuFor: configuration, suggestedActions: [])
+        }
+        XCTAssertNil(menu(), "The hold handler must not race UIKit's native context-menu gesture")
+        probe.touchesEnded([touch], with: event)
+        probe.reset()
+        try await waitUntil({ menu() != nil })
+        XCTAssertEqual(menu()?.children.map { $0.title }, ["Add Comment", "Take Screenshot"])
+        XCTAssertEqual(attachment.editMenuInteraction(interaction, targetRectFor: configuration).origin,
+                       host.viewPoint(Point(420, 700), page: page))
+    }
+
+    func testPageInsertionMenuKeepsActionsAndRoutesTheirHeldPageContext() async throws {
+        guard #available(iOS 17.4, *) else { return }
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let savedPasteboard = ObjectMenuEntries.pasteboardHasContent
+        ObjectMenuEntries.pasteboardHasContent = { true }
+        defer { ObjectMenuEntries.pasteboardHasContent = savedPasteboard }
+        // Include the neighbouring entries that crowded the horizontal edit menu in the app.
+        for (id, title, command, order) in [
+            ("test.graph", "Insert Graph", "math.graph.create", 110),
+            ("test.pasteStyle", "Paste and Match Style", "clipboard.paste", 120),
+            ("test.typing", "Start Typing", CommandIDs.textStartPageText, 150),
+            ("test.comment", "Add Comment", CommandIDs.commentAdd, 600)
+        ] {
+            h.app.ui.menus.register(MenuItemDescriptor(
+                id: id, title: title, location: .pageLongPress, order: order, owner: "builtin", command: command,
+                params: { ObjectMenuEntries.pageParams($0, pointKey: "at") }))
+        }
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.hidden", title: "Hidden", location: .pageLongPress, order: 700, owner: "builtin",
+            command: "test.hidden", isVisible: { _ in false }))
+        var commentParams: JSONValue?, typingParams: JSONValue?
+        standIn(h, CommandIDs.commentAdd) { commentParams = $0 }
+        standIn(h, CommandIDs.textStartPageText) { typingParams = $0 }
+        let host = FakeCanvasHost(h)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 1194))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.addSubview(host.canvasView)
+        window.makeKeyAndVisible()
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer {
+            attachment.detach(from: host)
+            window.isHidden = true
+        }
+        let out = try await h.run(CommandIDs.menuShowAt, [
+            "page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [420, 700]
+        ])
+        XCTAssertEqual(out["handled"], true)
+        let anchor = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? PageMenuAnchor }.first)
+        try await waitUntil({ anchor.isHeld }, "The native vertical menu must actually be presented")
+        XCTAssertEqual(anchor.frame.origin, host.viewPoint(Point(420, 700), page: page))
+        XCTAssertTrue(anchor.showsMenuAsPrimaryAction)
+        XCTAssertEqual(anchor.preferredMenuElementOrder, .fixed)
+        XCTAssertFalse(anchor.point(inside: .zero, with: nil), "The source must not take canvas touches")
+        XCTAssertFalse(anchor.isAccessibilityElement)
+        let actions = try XCTUnwrap(anchor.menu).children.compactMap { $0 as? UIAction }
+        XCTAssertEqual(actions.map(\.title), ["Paste", "Insert Graph", "Paste and Match Style",
+                                             "Start Typing", "Add Comment", "Take Screenshot"])
+        // Invoke the actual native menu actions, including the host's command-dispatch closures.
+        anchor.sendAction(try XCTUnwrap(actions.first { $0.title == "Add Comment" }))
+        anchor.sendAction(try XCTUnwrap(actions.first { $0.title == "Start Typing" }))
+        try await waitUntil({ commentParams != nil && typingParams != nil })
+        let expected: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "at": [420, 700]]
+        XCTAssertEqual(commentParams, expected)
+        XCTAssertEqual(typingParams, expected)
+        attachment.detach(from: host)
+        XCTAssertNil(anchor.superview)
+        XCTAssertNil(anchor.menu, "Detached canvases must release the menu and its context")
+    }
 
     func testShowAtWithoutAWindowReportsTheEntries() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
@@ -964,7 +1213,7 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertLessThan(best, budget * 4, "the cold menu took \(Int(best * 1000)) ms")
     }
 
-    func testTheMenuStepsAsideWhileThePageMoves() async throws {
+    func testTheMenuStaysVisibleWhileThePageMoves() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)
         let floating = FakeFloatingHost()
@@ -976,10 +1225,55 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertTrue(attachment.model.isShown)
         host.zoomScale = 2
         attachment.canvasDidChange(host)
-        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertTrue(attachment.model.isShown, "A valid selection must not wait for a scroll-settling timer")
         XCTAssertEqual(attachment.model.anchor, CGRect(x: 640, y: 960, width: 128, height: 128))
         try await Task.sleep(nanoseconds: 900_000_000)
         XCTAssertTrue(attachment.model.isShown)
+    }
+
+    func testRepeatedLayoutUpdatesCannotStarveSelectionActions() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 320, y: 400, width: 160, height: 90))
+        let rebuilds = attachment.rebuilds
+        for step in 1...12 {
+            // Repeated layout events arrive faster than the former delayed reveal, for longer than its interval.
+            floating.containerOffset = CGPoint(x: CGFloat(step * 2), y: CGFloat(step))
+            attachment.canvasDidChange(host)
+            XCTAssertTrue(attachment.model.isShown)
+            XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
+            XCTAssertEqual(attachment.model.anchor,
+                           CGRect(x: CGFloat(320 + step * 2), y: CGFloat(400 + step), width: 160, height: 90))
+            XCTAssertEqual(attachment.model.viewport,
+                           host.canvasView.bounds.offsetBy(dx: CGFloat(step * 2), dy: CGFloat(step)))
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(attachment.rebuilds, rebuilds)
+        h.session.selection = Selection()
+        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertNil(attachment.model.viewport)
+    }
+
+    func testValidGeometryShowsImmediatelyEvenWithARecoveryPending() {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        floating.conversionAvailable = false
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID])
+        XCTAssertFalse(attachment.model.isShown)
+        floating.conversionAvailable = true
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.model.isShown, "A pending retry must not gate presentation after geometry is ready")
+        XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
     }
 
     func testMenuRetriesUntilTheFloatingLayerCanConvertTheSelection() async throws {
@@ -1116,7 +1410,7 @@ final class FeatObjectMenuTests: XCTestCase {
         }
     }
 
-    func testMenuRecoversWhenGeometryDisappearsDuringReshow() async throws {
+    func testMenuRecoversWhenGeometryDisappearsDuringMovement() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)
         let floating = FakeFloatingHost()
@@ -1127,15 +1421,17 @@ final class FeatObjectMenuTests: XCTestCase {
         select(h, [Fixtures.shapeID])
         host.zoomScale = 2
         attachment.canvasDidChange(host)
-        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertTrue(attachment.model.isShown)
         floating.conversionAvailable = false
+        attachment.canvasDidChange(host)
+        XCTAssertFalse(attachment.model.isShown)
         let attempts = floating.conversionAttempts
         try await waitUntil({ floating.conversionAttempts > attempts })
         floating.conversionAvailable = true
         try await waitUntil({ attachment.model.isShown })
     }
 
-    func testContainerMovementReshowsWithoutRebuildingAndIgnoresSubpixelNoise() async throws {
+    func testContainerMovementKeepsActionsVisibleWithoutRebuilding() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)
         let floating = FakeFloatingHost()
@@ -1147,8 +1443,8 @@ final class FeatObjectMenuTests: XCTestCase {
         let rebuilds = attachment.rebuilds
         floating.containerOffset = CGPoint(x: 80, y: 24)
         attachment.canvasDidChange(host)
-        XCTAssertFalse(attachment.model.isShown, "Container movement matters even if the canvas rect is unchanged")
-        try await waitUntil({ attachment.model.isShown })
+        XCTAssertTrue(attachment.model.isShown, "Container movement must reposition actions without hiding them")
+        XCTAssertEqual(attachment.model.anchor, CGRect(x: 180, y: 224, width: 160, height: 90))
         let noise = 0.25 / max(host.canvasView.traitCollection.displayScale, 1)
         for i in 0..<4 {
             floating.containerOffset.x = 80 + (i.isMultiple(of: 2) ? noise : -noise)

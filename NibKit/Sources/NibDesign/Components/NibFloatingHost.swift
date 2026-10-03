@@ -132,7 +132,7 @@ struct FloatingReference: UIViewRepresentable {
     let host: NibFloatingHost
 
     func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+        let view = CoordinateReferenceView()
         view.isUserInteractionEnabled = false
         view.backgroundColor = .clear
         host.referenceView = view
@@ -140,6 +140,14 @@ struct FloatingReference: UIViewRepresentable {
     }
 
     func updateUIView(_ view: UIView, context: Context) {
+        view.isUserInteractionEnabled = false
         if host.referenceView !== view { host.referenceView = view }
     }
+}
+
+/// This full-window view measures coordinates; it is never an input surface.
+/// Native hosting can restore interaction flags when reattaching representables,
+/// so enforce pass-through at UIKit's hit-test boundary as well as in SwiftUI.
+private final class CoordinateReferenceView: UIView {
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
 }

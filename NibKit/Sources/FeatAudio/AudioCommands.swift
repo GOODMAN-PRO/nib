@@ -597,7 +597,7 @@ struct AudioQuickRecord: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: CommandIDs.audioQuickRecord, title: "Quick Record",
-        summary: "Create a new text document, open it and start recording into it straight away; returns the document ref.",
+        summary: "Create a new text document, start recording and open it with the recording HUD; returns the document ref.",
         params: .obj(["id": .str("your own id for the new document, [A-Za-z0-9_-]{1,64}")]),
         examples: [[:]], effect: .library, target: .library)
 
@@ -614,8 +614,6 @@ struct AudioQuickRecord: NibCommand {
                                                          "id": .string(doc.raw)])
         let ref = NodeRef.document(doc).description
         if ctx.dryRun { return Output(ref: ref, clip: nil) }
-        // No window (the bridge, a background caller): record anyway, the document is in the library.
-        _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(ref)])
         let recording: JSONValue
         do {
             recording = try await ctx.execute(CommandIDs.audioRecord, ["doc": .string(ref), "action": "start"])
@@ -625,6 +623,11 @@ struct AudioQuickRecord: NibCommand {
             _ = try? await ctx.execute(CommandIDs.libraryTrash, ["refs": [.string(ref)]])
             throw error
         }
+        // Permission and input I/O startup can suspend for seconds. Present the editor only once
+        // recording is live, so its first chrome evaluation includes the HUD. On failure we stay
+        // in the invoking screen instead of leaving an empty, now-trashed document open.
+        // No window (the bridge, a background caller): record anyway, the document is in the library.
+        _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(ref)])
         return Output(ref: ref, clip: recording["ref"]?.stringValue)
     }
 

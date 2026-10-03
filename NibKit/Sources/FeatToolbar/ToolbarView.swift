@@ -44,6 +44,7 @@ struct PaletteItem: Identifiable, Equatable {
     /// The palette slot id: the tool id for tools (so the selection is `session.tool`), else the item id.
     let id: String
     let descriptorID: String
+    var accessibilityID: String = ""
     /// `resolvedTitle(for:)` of the window.
     let title: String
     /// `resolvedIcon(for:)` of the window.
@@ -53,7 +54,7 @@ struct PaletteItem: Identifiable, Equatable {
     let hasSettings: Bool
     /// The current ink (pen, pencil) or highlight colour (highlighter) on the glyph's colour layer.
     let tint: RGBA?
-    /// VoiceOver value, e.g. "Carbon", "On" or "Unavailable".
+    /// VoiceOver value, e.g. "Carbon, 0.42 millimetres", "On" or "Unavailable".
     let value: String?
     /// The key the shell runs this item with (`ToolbarShortcuts`), shown as a hint on hover and while ⌘ is held.
     let keyHint: KeyShortcut?
@@ -90,7 +91,7 @@ enum ToolKeyHint {
     }
 }
 
-/// One of the palette's three quick colours: the first slots of the current writing tool's presets.
+/// A colour slot of the current writing tool's presets, retaining its original index.
 struct QuickSwatch: Identifiable, Equatable {
     let index: Int
     let color: RGBA
@@ -134,11 +135,21 @@ final class ToolbarModel: ObservableObject {
     /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): the options bar's chevron opens it.
     /// One popover at a time: opening it closes the options bar's own popover.
     @Published var settingsOpen = false {
-        didSet { if settingsOpen && !oldValue { closeOptionsPopovers() } }
+        didSet {
+            if settingsOpen && !oldValue {
+                moreOpen = false
+                closeOptionsPopovers()
+            }
+        }
     }
     /// The palette's More grid (`NibToolPalette(morePresented:)`); it too closes the options bar's popover.
     @Published var moreOpen = false {
-        didSet { if moreOpen && !oldValue { closeOptionsPopovers() } }
+        didSet {
+            if moreOpen && !oldValue {
+                settingsOpen = false
+                closeOptionsPopovers()
+            }
+        }
     }
 
     private var descriptors: [String: ToolbarItemDescriptor] = [:]
@@ -221,10 +232,11 @@ final class ToolbarModel: ObservableObject {
             let key = keys.get(ToolbarShortcuts.prefix + d.id).flatMap { $0.owner == FeatToolbarFeature.id ? $0 : nil }
             let enabled = d.isEnabled?(session) ?? true
             let colour = presets.map { Self.colourName($0.color, index: $0.selectedSwatch) }
-            return PaletteItem(id: slot, descriptorID: d.id, title: d.resolvedTitle(for: session),
+            return PaletteItem(id: slot, descriptorID: d.id, accessibilityID: d.toolID.map { "tool." + $0 } ?? "cmd." + (d.command ?? d.id), title: d.resolvedTitle(for: session),
                                icon: d.resolvedIcon(for: session), isPlugin: plugins.contains(d.id),
                                isTool: d.toolID != nil, hasSettings: d.settings != nil, tint: presets?.color,
-                               value: Self.accessibilityValue(colour: colour, isOn: d.isOn?(session) ?? false,
+                               value: Self.accessibilityValue(colour: colour, width: presets?.width,
+                                                              isOn: d.isOn?(session) ?? false,
                                                               isEnabled: enabled),
                                keyHint: key?.shortcut, isEnabled: enabled, showsInCompactWidth: d.showsInCompactWidth)
         }
@@ -255,8 +267,13 @@ final class ToolbarModel: ObservableObject {
         var index = -1
         if app.commands.entry(Self.presetSelect) != nil {
             let presets = app.settings.get(NibSettings.presets(inkTool))
-            next = presets.swatches.prefix(3).enumerated().map { QuickSwatch(index: $0.offset, color: $0.element.color) }
-            index = presets.selectedSwatch < next.count ? presets.selectedSwatch : -1
+            next = presets.swatches.enumerated().map { slot, swatch in
+                // Match the options strip: transparency belongs to the highlight stroke, not its colour control.
+                let colour = inkTool == "highlighter"
+                    ? RGBA(swatch.color.r, swatch.color.g, swatch.color.b) : swatch.color
+                return QuickSwatch(index: slot, color: colour)
+            }
+            index = next.indices.contains(presets.selectedSwatch) ? presets.selectedSwatch : -1
         }
         if next != swatches { swatches = next }
         if index != swatchIndex { swatchIndex = index }
@@ -269,11 +286,16 @@ final class ToolbarModel: ObservableObject {
         return String(localized: "Colour \(index + 1)")
     }
 
-    /// What VoiceOver reads after an item's name: its colour, "On" for an accessory that is on (Zoom Window open,
-    /// timer running) and "Unavailable" while it is disabled.
-    static func accessibilityValue(colour: String?, isOn: Bool, isEnabled: Bool) -> String? {
+    /// What VoiceOver reads after an item's name: colour and thickness, then accessory and availability states.
+    /// Preset widths are page points; spoken thickness uses millimetres, like the tool's options strip.
+    static func accessibilityValue(colour: String?, width: Double? = nil, isOn: Bool, isEnabled: Bool,
+                                   locale: Locale = .current) -> String? {
         var parts: [String] = []
         if let colour { parts.append(colour) }
+        if let width {
+            parts.append(String(format: String(localized: "%.2f millimetres", locale: locale),
+                                locale: locale, width * 25.4 / 72))
+        }
         if isOn { parts.append(String(localized: "On")) }
         if !isEnabled { parts.append(String(localized: "Unavailable")) }
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
@@ -338,8 +360,13 @@ final class ToolbarModel: ObservableObject {
 
     /// `$tool` publishes before the session stores the value: everything here uses `t`.
     private func toolDidChange(_ t: String) {
+        // Shortcuts and a non-sticky tool's hand-back bypass select(_:). Release the old
+        // options popover before publishing the new tool, rather than waiting for the
+        // palette's next rendered frame to remove its modal input surface.
+        closeOptionsPopovers()
         tool = t
         settingsOpen = false
+        moreOpen = false
         expandOptions()
         if Self.inkTools.contains(t), t != inkTool {
             inkTool = t
@@ -443,6 +470,13 @@ final class ToolbarModel: ObservableObject {
     /// A disabled item runs nothing.
     func select(_ id: String) {
         guard let d = descriptors[id], d.isEnabled?(session) ?? true else { return }
+        // Release modal input in the same action that chooses the tool. Command execution is
+        // asynchronous; waiting for $tool leaves a retained menu over the next canvas/palette tap
+        // (and command accessories do not publish a tool change at all).
+        settingsOpen = false
+        moreOpen = false
+        closeOptionsPopovers()
+        expandOptions()
         if let toolID = d.toolID {
             app.perform(CommandIDs.toolSelect, ["tool": .string(toolID)], session: session)
         } else if let command = d.command {
@@ -452,7 +486,8 @@ final class ToolbarModel: ObservableObject {
 
     /// The palette's quick inks: three on iPad; on iPhone one, the current ink (DESIGN.md §14.2).
     func quickInks(compact: Bool) -> [QuickSwatch] {
-        guard compact, let first = swatches.first else { return swatches }
+        guard compact else { return Array(swatches.prefix(3)) }
+        guard let first = swatches.first else { return [] }
         return [swatches.first { $0.index == swatchIndex } ?? first]
     }
 
@@ -504,6 +539,13 @@ final class ToolbarModel: ObservableObject {
     /// The window's size and size class, for `toolbar.dock` (the default dock and the compact refusal).
     func windowDidChange(size: CGSize, compact: Bool) {
         runtime?.windowDidChange(session, size: size, compact: compact)
+        publishQADock(size: size, compact: compact)
+    }
+
+    func publishQADock(size: CGSize, compact: Bool) {
+        guard NibUITestMode.isEnabled else { return }
+        let value = dock(for: size, compact: compact)
+        session.toolOptions["nib.qa.paletteDock"] = ["edge": .string(value.edge.commandValue), "along": .number(Double(value.along))]
     }
 
     /// The window's UndoManager, which takes the "Move Palette" steps; nil when the palette leaves its window.
@@ -554,6 +596,7 @@ struct ToolbarRootView: View {
                 }
             }
             .frame(width: size.width, height: size.height, alignment: .topLeading)
+            .onChange(of: dock, initial: true) { _, _ in model.publishQADock(size: size, compact: compact) }
             .onChange(of: WindowMetrics(size: size, compact: compact), initial: true) { _, window in
                 model.windowDidChange(size: window.size, compact: window.compact)
             }
@@ -584,7 +627,7 @@ struct ToolbarRootView: View {
                 symbol: item.isPlugin ? NibSymbol.plugin(item.icon) : (NibSymbol(systemName: item.icon) ?? .puzzle),
                 isPlugin: item.isPlugin, hasSettings: item.hasSettings, value: item.value,
                 shortcut: item.keyHint.flatMap { ToolKeyHint.keyboardShortcut($0) }, registersShortcut: false,
-                tint: item.tint.map { Self.color($0) })
+                tint: item.tint.map { Self.color($0) }, accessibilityID: item.accessibilityID)
     }
 
     private func swatch(_ s: QuickSwatch) -> NibSwatch {
@@ -612,6 +655,7 @@ struct RevealToolsButton: View {
     var body: some View {
         // One bar button and the bar group's padding, 44 pt thick.
         NibToolbarItem(.pen, label: String(localized: "Show Tools"), action: action)
+            .accessibilityIdentifier("cmd.toolbar.setVisible")
             .nibChromeTypeCap()
             .dropletDockable(ToolbarModel.paletteID + ".reveal", length: NibMetrics.hitTarget + 2 * NibSpacing.xs,
                              thickness: NibMetrics.barHeight, current: dock, style: .bar, onDock: onDock)

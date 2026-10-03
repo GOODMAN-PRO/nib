@@ -57,6 +57,79 @@ private final class ToastHost: FloatingHosting {
 
 @MainActor
 final class FeatLibraryOrganizeTests: XCTestCase {
+    private final class MenuAnimator: NSObject, UIContextMenuInteractionAnimating {
+        var previewViewController: UIViewController? { nil }
+        var completions: [() -> Void] = []
+        func addAnimations(_ animations: @escaping () -> Void) { animations() }
+        func addCompletion(_ completion: @escaping () -> Void) { completions.append(completion) }
+        func finish() {
+            let pending = completions
+            completions.removeAll()
+            pending.forEach { $0() }
+        }
+    }
+
+    func testTrashMenuWaitsForDismissalBeforeRemovingRowsOrPresentingSheets() throws {
+        let button = TrashMenuButton(type: .custom)
+        button.showsMenuAsPrimaryAction = true
+        var outcomes: [String] = []
+        button.configure(recover: { outcomes.append("recover") }, move: { outcomes.append("move") },
+                         delete: { outcomes.append("delete") })
+        let interaction = try XCTUnwrap(button.contextMenuInteraction)
+        let configuration = UIContextMenuConfiguration(identifier: nil, previewProvider: nil, actionProvider: nil)
+        let actions = try XCTUnwrap(button.menu).children.compactMap { $0 as? UIAction }
+        XCTAssertEqual(actions.map(\.title), ["Recover", "Move", "Delete Permanently"])
+        XCTAssertTrue(actions[2].attributes.contains(.destructive))
+        for (index, action) in actions.enumerated() {
+            button.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: nil)
+            button.sendAction(action)
+            XCTAssertEqual(outcomes.count, index, "The source row must survive menu selection")
+            let animator = MenuAnimator()
+            button.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+            XCTAssertTrue(button.isPresentingMenu)
+            XCTAssertEqual(outcomes.count, index, "Wait for UIKit's dismissal, not just its start")
+            animator.finish()
+            XCTAssertFalse(button.isPresentingMenu)
+            XCTAssertEqual(outcomes.count, index + 1)
+            animator.finish()
+            XCTAssertEqual(outcomes.count, index + 1, "An action must run only once")
+        }
+        XCTAssertEqual(outcomes, ["recover", "move", "delete"])
+        button.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: nil)
+        button.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil)
+        XCTAssertEqual(outcomes.count, 3, "Cancelling must not replay the preceding action")
+    }
+
+    func testRecoverFolderThenDocumentRunsAfterEachMenuDismissesInTheInvokingWindow() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let recorder = stub(h, [CommandIDs.trashRecover])
+        let window = OrganizeWindow(app: h.app, session: h.session)
+        let entries = [
+            TrashEntry(ref: "folder:FIXTUREFLD01", title: "Folder", kind: .folder,
+                       trashedAt: 1, style: nil, documentTitle: nil),
+            TrashEntry(ref: "doc:FIXTUREDOC01", title: "Document", kind: .document(.notebook),
+                       trashedAt: 1, style: nil, documentTitle: nil),
+        ]
+        for (index, entry) in entries.enumerated() {
+            let button = TrashMenuButton(type: .custom)
+            button.configure(recover: { Task { await TrashActions.recover(window, [entry]) } },
+                             move: {}, delete: {})
+            let interaction = try XCTUnwrap(button.contextMenuInteraction)
+            let configuration = UIContextMenuConfiguration(identifier: nil, previewProvider: nil, actionProvider: nil)
+            button.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: nil)
+            button.sendAction(try XCTUnwrap(button.menu?.children.first as? UIAction))
+            let animator = MenuAnimator()
+            button.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+            await Task.yield()
+            XCTAssertEqual(recorder.calls.count, index)
+            animator.finish()
+            await eventually { recorder.calls.count == index + 1 }
+            XCTAssertEqual(recorder.calls.last?.params, ["refs": [.string(entry.ref)]],
+                           "Omit destination so recovery uses the original location")
+            XCTAssertEqual(recorder.calls.last?.session, h.session.id)
+        }
+    }
+
     private func stub(_ h: Harness, _ ids: [String], result: JSONValue = [:]) -> Recorder {
         let recorder = Recorder()
         for id in ids {

@@ -13,7 +13,9 @@ public enum NibAIProvidersFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         // The store loads its file lazily, on first use, so registration stays fast.
-        app.services.set(ProviderStore(), for: ServiceKeys.aiProviders)
+        let store = ProviderStore()
+        store.bridgeIsEnabled = { [weak app] in app?.settings.get(SettingKey(BridgeNames.enabledSetting, default: false)) ?? false }
+        app.services.set(store, for: ServiceKeys.aiProviders)
     }
 }
 
@@ -255,7 +257,12 @@ enum ProviderCredential: Equatable {
         switch self {
         case .key(let k): return k
         case .none: return nil
-        case .missing: throw ProviderErrors.missingKey(config.name)
+        case .missing:
+            if config.extraHeaders["X-Nib-Subscription"] == "1" {
+                throw NibError(.permissionDenied, "The Nib Agent pairing token is missing from this device.",
+                               hint: "paste the pairing string from your Mac again in Settings › AI")
+            }
+            throw ProviderErrors.missingKey(config.name)
         }
     }
 }

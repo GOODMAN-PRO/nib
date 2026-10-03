@@ -289,6 +289,8 @@ Four files live beside these and are not reproduced here: `Gallery/DesignGallery
 
 Live glass regression tests in `GlassForegroundSnapshotTests.swift` use `NibGlassForegroundGallery` and `NibSnapshot.hostedImage`: glyph pixels are compared against an unglassed reference, small-label contrast is measured over ink and dark-mode white paper, rims are checked for foreground ghosts, and the library New label must have accent pixels behind it. The neutral dark-appearance underlay exception is specified in DESIGN.md §2.3 and §3.3.
 
+Native glass uses the system's `Capsule` and continuous `RoundedRectangle` primitives, avoiding an inferred optical mesh from a custom path on large panels. Both `.droplet` and `nibGlass` export their actual glass bounds through `NibGlassBackdropKey`; the container resolves those anchors behind `GlassEffectContainer`. It never draws a second native underlay from the fallback physics path. The anchor includes the presentation offset and body envelope before reciprocal padding restores the rest layout. Paper coverage is measured in `NibLiquid.space` using the live page rectangles, and underlay colours resolve from the same captured app appearance as the material and foreground. Frozen bodies keep the same anchor. Portrait regression probes cover offset/resized silhouettes, dark Clear contrast, and uniform Deep panel cores, including live native-compositor captures when hosted.
+
 ### 3.1 `NibKit/Sources/NibDesign/Modifiers/NibInteraction.swift`
 
 Press, focus, hover and keyboard behaviour shared by every Nib control (DESIGN.md §12, §13). There is no `NibDesign.swift`: a public `enum NibDesign` shadows the module name, so client code could never write `NibDesign.X` to disambiguate.
@@ -442,7 +444,8 @@ extension UIColor {
 public enum NibUIColor {
     // UI neutrals
     public static let label = UIColor.label
-    public static let labelSecondary = UIColor.secondaryLabel
+    public static let labelSecondary = UIColor.nib(0x3C3C43, 0.94, dark: 0xEBEBF5, 0.80,
+                                                  contrastLight: 1, contrastDark: 1)
     public static let labelTertiary = UIColor.tertiaryLabel
     public static let labelQuaternary = UIColor.quaternaryLabel
     public static let separator = UIColor.separator

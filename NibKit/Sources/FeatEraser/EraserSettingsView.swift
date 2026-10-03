@@ -59,6 +59,10 @@ final class EraserOptions: ObservableObject {
     /// Slider drags are written once the finger rests (~120 ms), not on every frame.
     private var sizeWrite: Task<Void, Never>?
     private var subscription: AnyCancellable?
+    /// Store notifications can arrive between UI edits and their queued commands. Keep each unacknowledged
+    /// choice until its command finishes; reloading another setting must not roll a filter or mode back.
+    private var pending: [String: (token: UUID, value: JSONValue)] = [:]
+    private(set) var pendingSettingsWrite: Task<Void, Never>?
 
     @Published var mode = EraserMode.standard {
         didSet { if !isReloading && mode != oldValue { write(NibSettings.eraserMode.name, .string(mode.rawValue)) } }
@@ -92,10 +96,15 @@ final class EraserOptions: ObservableObject {
     func reload() {
         let s = app.settings
         isReloading = true
-        mode = EraserSettings.mode(s)
-        if sizeWrite == nil { size = EraserSettings.size(s) }
-        filter = EraserSettings.filter(s)
-        autoDeselect = s.get(EraserSettings.autoDeselect)
+        mode = pending[NibSettings.eraserMode.name]?.value.stringValue.flatMap(EraserMode.init(rawValue:))
+            ?? EraserSettings.mode(s)
+        if sizeWrite == nil {
+            size = pending[NibSettings.eraserSize.name]?.value.doubleValue ?? EraserSettings.size(s)
+        }
+        filter = Set(InkTool.allCases.filter {
+            pending[NibSettings.eraserFilter($0).name]?.value.boolValue ?? s.get(NibSettings.eraserFilter($0))
+        })
+        autoDeselect = pending[EraserSettings.autoDeselect.name]?.value.boolValue ?? s.get(EraserSettings.autoDeselect)
         isReloading = false
     }
 
@@ -115,18 +124,45 @@ final class EraserOptions: ObservableObject {
         filter = [tool]
     }
 
+    /// A preset tap is a finished choice, not an in-progress slider drag.
+    func selectSize(_ value: Double) {
+        size = EraserSettings.clamped(value)
+        flushSizeWrite()
+    }
+
+    /// Finish a size edit immediately (a preset tap or removal of the settings view).
+    func flushSizeWrite() {
+        guard sizeWrite != nil else { return }
+        sizeWrite?.cancel()
+        sizeWrite = nil
+        write(NibSettings.eraserSize.name, .number(EraserSettings.clamped(size)))
+    }
+
     private func scheduleSizeWrite() {
         sizeWrite?.cancel()
         sizeWrite = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard !Task.isCancelled else { return }
-            self.sizeWrite = nil
-            self.write(NibSettings.eraserSize.name, .number(EraserSettings.clamped(self.size)))
+            self.flushSizeWrite()
         }
     }
 
     private func write(_ name: String, _ value: JSONValue) {
-        app.perform(CommandIDs.settingsSet, ["name": .string(name), "value": value])
+        let token = UUID()
+        pending[name] = (token, value)
+        let previous = pendingSettingsWrite
+        pendingSettingsWrite = Task { @MainActor [app, weak self] in
+            await previous?.value
+            do {
+                _ = try await app.bus.execute(CommandIDs.settingsSet, ["name": .string(name), "value": value])
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": CommandIDs.settingsSet, "error": NibError.wrap(error)])
+            }
+            guard let self, self.pending[name]?.token == token else { return }
+            self.pending[name] = nil
+            self.reload()
+        }
     }
 }
 
@@ -141,10 +177,11 @@ struct EraserSettingsView: View {
     @StateObject private var model: EraserOptions
     @State private var confirmingClear = false
 
-    init(app: NibApp, session: EditorSession) {
+    init(app: NibApp, session: EditorSession, confirmingClear: Bool = false) {
         self.app = app
         self._session = ObservedObject(wrappedValue: session)
         self._model = StateObject(wrappedValue: EraserOptions(app: app))
+        self._confirmingClear = State(initialValue: confirmingClear)
     }
 
     var body: some View {
@@ -174,14 +211,17 @@ struct EraserSettingsView: View {
                 confirmingClear = true
             }
             .disabled(session.document == nil || session.page == nil || session.readOnly)
-            .confirmationDialog(String(localized: "Clear this page?"), isPresented: $confirmingClear,
-                                titleVisibility: .visible) {
+            // An iPad confirmationDialog hides Cancel and relies on outside taps while another
+            // popover (the retained eraser settings bud) already owns outside dismissal. Use a
+            // system alert so cancellation is an explicit, accessible action on every device.
+            .alert(String(localized: "Clear this page?"), isPresented: $confirmingClear) {
                 Button(String(localized: "Clear Page"), role: .destructive) { clearPage() }
-                Button(String(localized: "Cancel"), role: .cancel) {}
+                Button(String(localized: "Cancel"), role: .cancel) { confirmingClear = false }
             } message: {
                 Text(String(localized: "Everything on this page is removed. You can undo this."))
             }
         }
+        .onDisappear { model.flushSizeWrite() }
     }
 
     private func clearPage() {
@@ -199,7 +239,7 @@ struct EraserSizePresets: View {
         ForEach(Array(EraserSettings.presets.enumerated()), id: \.offset) { index, preset in
             NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected: abs(model.size - preset) < 0.5,
                                  label: EraserSizeFormat.presetName(index, preset)) {
-                model.size = preset
+                model.selectSize(preset)
             }
         }
     }

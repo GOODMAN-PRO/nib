@@ -497,6 +497,7 @@ struct SharedPanel: View {
             } label: {
                 Label(item.resolvedTitle(for: ctx), systemImage: item.icon ?? NibSymbol.notebook.name)
             }
+            .accessibilityIdentifier("cmd." + item.command)
         }
         if !(e.isLive && e.isHost) {
             Divider()

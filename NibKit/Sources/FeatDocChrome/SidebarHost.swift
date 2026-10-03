@@ -4,7 +4,8 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
 /// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
-/// Panels providing their own header keep it; the assistant is a standalone panel without navigation tabs.
+/// Panels providing their own header own its actions too; never prepend a second, untitled More row.
+/// The assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
     let side: SidebarSide
@@ -17,20 +18,14 @@ struct SidebarPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if chrome.drawsHeader(selected) {
-                header
-            } else if selected.id != PanelIDs.assistant {
-                HStack {
-                    Spacer(minLength: 0)
-                    PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
-                                       mode: showsModeToggle ? mode : nil,
-                                       additionalPanels: SidebarNavigation.additional(tabs))
-                }
-            }
+            // §14.4: tabs lead every navigator, including panels that embed their own header.
             if selected.id != PanelIDs.assistant { tabStrip }
             Rectangle()
                 .fill(NibColor.separatorSoft)
                 .frame(height: NibStroke.hairline)
+            if chrome.drawsHeader(selected) {
+                header
+            }
             selected.makeView(chrome.panelContext(selected.id, presentation: presentation))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(selected.id)
@@ -95,6 +90,7 @@ struct PanelPlacementMenu: View {
                 Section(String(localized: "Panels")) {
                     ForEach(additionalPanels, id: \.id) { tab in
                         Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
+                        .accessibilityIdentifier("cmd." + "panel.open")
                     }
                 }
             }
@@ -102,6 +98,7 @@ struct PanelPlacementMenu: View {
                 Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
                     chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
                 }
+                .accessibilityIdentifier("cmd." + "sidebar.toggle")
             }
             option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
             option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)

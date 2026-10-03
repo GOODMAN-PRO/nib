@@ -334,6 +334,7 @@ struct CalendarTabBody: View {
             } label: {
                 Label { Text(String(localized: "New Event Planner")) } icon: { Image(nib: .templates) }
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
             Button {
                 showsOtherEvents = true
             } label: {

@@ -99,6 +99,35 @@ final class UnsavedWrites {
     }
 }
 
+/// Read-side snapshots of queued, in-flight and failed writes. Never hold this lock during file I/O: a coordinated
+/// write may wait for a file presenter while the main actor needs to read the document. A successful older write
+/// must not discard snapshots submitted after it; the latest successful write releases the accumulated snapshot.
+final class ReadableWrites {
+    private let lock = NSLock()
+    private var jobs: [DocumentID: (token: UUID, job: PendingWrite)] = [:]
+
+    func submit(_ job: PendingWrite, for doc: DocumentID) -> UUID {
+        lock.lock()
+        defer { lock.unlock() }
+        let token = UUID()
+        let merged = jobs[doc]?.job.merged(with: job, now: PackageCodec.ms(Date())) ?? job
+        jobs[doc] = (token, merged)
+        return token
+    }
+
+    func snapshot(_ doc: DocumentID) -> PendingWrite? {
+        lock.lock()
+        defer { lock.unlock() }
+        return jobs[doc]?.job
+    }
+
+    func completed(_ doc: DocumentID, token: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        if jobs[doc]?.token == token { jobs[doc] = nil }
+    }
+}
+
 /// `DocumentPersistence` over `.nibnote` packages in the library folder (ARCHITECTURE §4.2–4.3).
 ///
 /// - Reads merge EVERY device file of the head / a page (conflict copies included) last-writer-wins; merged
@@ -136,6 +165,7 @@ final class PackagePersistence: DocumentPersistence {
     private let io = DispatchQueue(label: "app.nib.store.io", qos: .utility)
     /// Only touched on `io`.
     private let unsaved = UnsavedWrites()
+    private let readable = ReadableWrites()
     private let log = Logger(subsystem: "app.nib", category: "store")
     private var known: [DocumentID: Known] = [:]
     /// Changes not handed to `io` yet.
@@ -162,16 +192,16 @@ final class PackagePersistence: DocumentPersistence {
     func loadHead(_ doc: DocumentID) throws -> DocumentContent {
         let pkg = try files.package(doc)
         let now = PackageCodec.ms(Date())
-        // Drain queued log appends and writes before reading the files, so a write in flight is in them (it truncates
-        // the log it covered). A failed write's head is still in the log, or at least in the unsaved writes (when
-        // logging failed too).
-        let wal = self.wal, unsaved = self.unsaved
-        let (logged, failedHead) = io.sync { (wal.read(doc), unsaved.job(doc)?.head) }
+        // Snapshot BEFORE reading the log/files: a completed write may truncate the log and retire its snapshot
+        // while we read. It has then already replaced the files atomically. Never drain the coordinated-write queue
+        // here: reads run on the main actor, which file presenters may need in order to release a writer.
+        let queued = readable.snapshot(doc)
+        let logged = wal.read(doc)
         let sources = try files.headSources(pkg)
         let read = files.read(sources, in: "", decode: PackageCodec.decodeHead) { PackageCodec.hasFutureRev($0, now: now) }
         report(doc, read)
         var candidates = read.values + logged.compactMap { $0.head }
-        if let kept = failedHead { candidates.append(kept) }
+        if let kept = queued?.head { candidates.append(kept) }
         if let unwritten = pending[doc]?.head { candidates.append(unwritten) }
         guard var head = PackageCodec.mergeHeads(candidates, now: now) else {
             if read.failures.isEmpty { throw NibError.notFound("document \(doc.raw)") }
@@ -234,19 +264,19 @@ final class PackagePersistence: DocumentPersistence {
     }
 
     /// A page as this device knows it: every device file (and conflict copy) merged, then what is not written yet.
-    /// Queued log appends and writes are drained first, so the files hold a write that was in flight. The log and the
-    /// unsaved writes hold what a failed write left behind, and pending snapshots hold what is not queued yet.
+    /// Queued/in-flight/failed snapshots are captured before reading the log and files, without waiting for writes.
+    /// Pending snapshots hold what is not queued yet.
     /// Unreadable and clock-skewed files are reported.
     private func mergedPage(_ doc: DocumentID, _ pkg: URL, _ page: PageID,
                             now: UInt64) -> (items: [Item], read: PackageFiles.ReadResult<[Item]>) {
-        let wal = self.wal, unsaved = self.unsaved
-        let (logged, failedItems) = io.sync { (wal.read(doc), unsaved.job(doc)?.pages[page]) }
+        let queued = readable.snapshot(doc)
+        let logged = wal.read(doc)
         let read = files.read(files.pageSources(pkg, page: page), in: PackageCodec.pageDirectory(page),
                               decode: PackageCodec.decodeItems) { PackageCodec.hasFutureRev($0, now: now) }
         report(doc, read)
         var items = PackageCodec.mergeItems(read.values)
         for entry in logged { if let changed = entry.pages[page.raw] { items = LWW.merge(items, changed) } }
-        if let kept = failedItems { items = LWW.merge(items, kept) }
+        if let kept = queued?.pages[page] { items = LWW.merge(items, kept) }
         if let unwritten = pending[doc]?.pages[page] { items = LWW.merge(items, unwritten) }
         return (items, read)
     }
@@ -333,14 +363,19 @@ final class PackagePersistence: DocumentPersistence {
             if synchronously { io.sync {} }
             return
         }
-        let files = self.files, wal = self.wal, unsaved = self.unsaved
+        let files = self.files, wal = self.wal, unsaved = self.unsaved, readable = self.readable
+        let token = readable.submit(job, for: doc)
         let run = { () -> Error? in
             // A failed write's retry may not be queued yet, so its changes may exist only here and in the log.
             // They go into this write, so truncating the log below never drops a change that is not on disk.
-            guard let all = unsaved.take(doc, adding: job, now: PackageCodec.ms(Date())) else { return nil }
+            guard let all = unsaved.take(doc, adding: job, now: PackageCodec.ms(Date())) else {
+                readable.completed(doc, token: token)
+                return nil
+            }
             do {
                 try files.write(doc, head: all.head, pages: all.pages, deleting: Array(all.copies), now: Date())
                 wal.truncate(doc)
+                readable.completed(doc, token: token)
                 return nil
             } catch {
                 unsaved.keep(all, for: doc)
@@ -391,11 +426,11 @@ final class PackagePersistence: DocumentPersistence {
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
         guard NibID.isValid(page.raw), let pkg = try? files.package(doc),
               FileManager.default.fileExists(atPath: pkg.path) else { return nil }
-        // As in `mergedPage`: drain queued log appends and writes, so the files hold a write that was in flight.
-        let wal = self.wal, unsaved = self.unsaved
-        let (logged, failedItems) = io.sync { (wal.read(doc), unsaved.job(doc)?.pages[page]) }
+        // Same read ordering as `mergedPage`, without waiting on file coordination.
+        let queued = readable.snapshot(doc)
+        let logged = wal.read(doc)
         var unwritten = logged.compactMap { $0.pages[page.raw] }
-        if let kept = failedItems { unwritten.append(kept) }
+        if let kept = queued?.pages[page] { unwritten.append(kept) }
         if let items = pending[doc]?.pages[page] { unwritten.append(items) }
 
         let sources = files.pageSources(pkg, page: page)

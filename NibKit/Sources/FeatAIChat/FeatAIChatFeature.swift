@@ -138,8 +138,8 @@ final class ChatRuntime: ConfirmationPresenter {
             pending.previewText = String(localized: "This action cannot be previewed without running it.")
         }
         guard model.isStreaming, model.turnToken == token else { return .deny }
-        pending.labels = Dictionary(uniqueKeysWithValues: ChatCitations.refs(in: pending.parameterSummary).map { ($0, model.citationLabel($0)) })
-        for ref in pending.summary?.all ?? [] { pending.labels[ref] = model.citationLabel(ref) }
+        pending.labels = Dictionary(uniqueKeysWithValues: pending.targetRefs.map { ($0, model.confirmationTargetLabel($0)) })
+        for ref in pending.summary?.all ?? [] { pending.labels[ref] = model.confirmationTargetLabel(ref) }
         return await model.requestConfirmation(pending)
     }
 }
@@ -200,14 +200,14 @@ enum ChatCommands {
                 if ctx.dryRun { return [:] }
                 let action = try string(p, "action")
                 if action == "review" {
-                    guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "wait for this turn") }
+                    guard model.canConfigureContext else { throw NibError(.conflict, "wait for this turn") }
                     let pending = ChatConfirmation(request: ConfirmationRequest(principal: .user,
                         command: ctx.bus.registry.descriptor(ChatCommand.accept)!, params: ["count": .number(Double(model.proposals.count))]))
                     var summary = ChangeSummary()
                     for row in model.proposals { summary.merge(row.changes) }
                     pending.summary = summary
                     pending.previewText = String(localized: "Review each proposed change. Accept applies only included rows; deletions need their own approval.")
-                    for ref in summary.all { pending.labels[ref] = model.citationLabel(ref) }
+                    for ref in summary.all { pending.labels[ref] = model.confirmationTargetLabel(ref) }
                     switch await model.requestConfirmation(pending) {
                     case .allow, .allowRestOfGroup: model.proposalsReviewed = true
                     case .deny: break
@@ -234,7 +234,7 @@ enum ChatCommands {
                 let model = try model(ctx)
                 if ctx.dryRun { return [:] }
                 if let scope = p["scope"]?.stringValue {
-                    guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "stop this turn before changing its context") }
+                    guard model.canConfigureContext else { throw NibError(.conflict, "stop this turn before changing its context") }
                     if ctx.principal.isUser { model.registerContextUndo() }
                     try model.setScope(try kind(scope), refs: try refs(p))
                 }
@@ -317,7 +317,7 @@ enum ChatCommands {
             schema: .obj(["mode": .str(choices: AIMode.allCases.map(\.rawValue)), "scope": scopeSchema, "refs": .arr(.ref)]),
             examples: [["mode": "ask", "scope": "document"]]) { p, ctx in
                 let model = try model(ctx)
-                guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "stop this turn before changing its context") }
+                guard model.canConfigureContext else { throw NibError(.conflict, "stop this turn before changing its context") }
                 if ctx.dryRun { return [:] }
                 if ctx.principal.isUser { model.registerContextUndo() }
                 if let raw = p["mode"]?.stringValue {
@@ -367,7 +367,7 @@ enum ChatCommands {
             schema: .obj(["source": .str(choices: ["screenshot", "image", "remove"]), "asset": .str(), "base64": .str()], required: ["source"]),
             examples: [["source": "image", "asset": "fixture-image.png"]]) { p, ctx in
                 let model = try model(ctx)
-                guard !model.isStreaming, !model.isApplyingProposals else { throw NibError(.conflict, "wait for this turn before adding context") }
+                guard model.canConfigureContext else { throw NibError(.conflict, "wait for this turn before adding context") }
                 if ctx.dryRun { return [:] }
                 let source = try string(p, "source")
                 if source == "remove" {

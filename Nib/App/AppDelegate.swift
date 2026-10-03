@@ -10,17 +10,36 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        SafeMode.beginLaunch()
-        let app = NibApp()
+        if !NibUITestMode.isEnabled { SafeMode.beginLaunch() }
+        do {
+            let documents = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                                        appropriateFor: nil, create: true)
+            try LocalDocumentStorage.prepare(documents: documents)
+        } catch {
+            NSLog("Could not prepare local document storage: %@", String(describing: error))
+        }
+        do { try NibUITestMode.prepareStorage() }
+        catch { UITestFixture.failure = "Could not prepare fixture storage: \(error)" }
+        let app = NibApp(defaults: UITestFixture.defaults())
         app.gateway.presenter = AppDelegate.confirmer
-        let disabled = SafeMode.disabledFeatures
+        let disabled = NibUITestMode.isEnabled ? Set<String>() : SafeMode.disabledFeatures
         let features = FeatureList.all.filter { !disabled.contains($0.id) }
         app.register(features)
+        UITestFixture.configure(app)
         DesignGallery.registerSettingsPage(in: app)   // Settings › Advanced › Developer (NibDesign is not a feature)
         registerBackgroundTasks(app)   // must run before this method returns
         Task { @MainActor in
+            guard UITestFixture.failure == nil else { return }
             await app.start(features)
-            SafeMode.endLaunch()
+            if NibUITestMode.isEnabled {
+                do {
+                    try await UITestFixture.seed(app)
+                    UITestFixture.isReady = true
+                    app.ui.activeNavigator?.showLibrary(folder: nil)
+                } catch {
+                    UITestFixture.failure = String(describing: error)
+                }
+            } else { SafeMode.endLaunch() }
         }
         return true
     }
@@ -152,7 +171,7 @@ final class ShellConfirmationPresenter: ConfirmationPresenter {
             alert.addAction(UIAlertAction(title: String(localized: "Deny"), style: .cancel) { _ in
                 continuation.resume(returning: .deny)
             })
-            alert.addAction(UIAlertAction(title: String(localized: "Allow Rest of This Turn"), style: .default) { _ in
+            alert.addAction(UIAlertAction(title: String(localized: "Allow rest of this turn"), style: .default) { _ in
                 continuation.resume(returning: .allowRestOfGroup)
             })
             alert.addAction(UIAlertAction(title: String(localized: "Allow"), style: .default) { _ in

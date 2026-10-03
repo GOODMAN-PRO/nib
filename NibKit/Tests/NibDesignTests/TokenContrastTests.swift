@@ -64,6 +64,19 @@ final class TokenContrastTests: XCTestCase {
         }
     }
 
+    func testSmallSecondaryLabelsPassOnEverySupportedSurface() {
+        for dark in [false, true] {
+            for backdrop in [blackInk, whitePaper] {
+                for surface in [NibUIColor.background, NibUIColor.backgroundSecondary, NibUIColor.backgroundTertiary,
+                                NibUIColor.groupedBackground, NibUIColor.chromeOpaque, NibUIColor.deepBody] {
+                    XCTAssertGreaterThanOrEqual(
+                        contrast(NibUIColor.labelSecondary, on: surface, over: backdrop, dark: dark), 4.5,
+                        "Small secondary text on \(surface), dark \(dark)")
+                }
+            }
+        }
+    }
+
     @MainActor
     func testEmptyStateExplanationIsReadableInstructionalText() {
         let message = UIColor(NibEmptyState.messageForeground)

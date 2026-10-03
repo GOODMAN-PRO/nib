@@ -111,9 +111,9 @@ enum LibrarySort: String, Codable, CaseIterable {
     case modified, modifiedAscending, created, createdAscending, name, nameDescending, type, manual
     var title: String {
         switch self {
-        case .modified: return String(localized: "Date modified")
+        case .modified: return String(localized: "Modified, newest first")
         case .modifiedAscending: return String(localized: "Modified, oldest first")
-        case .created: return String(localized: "Date created")
+        case .created: return String(localized: "Created, newest first")
         case .createdAscending: return String(localized: "Created, oldest first")
         case .name: return String(localized: "Name, A to Z")
         case .nameDescending: return String(localized: "Name, Z to A")
@@ -130,7 +130,9 @@ enum LibrarySorting {
         let needle = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let rows = input.filter {
             (filter == .all || (filter == .folders ? $0.isFolder : !$0.isFolder)) &&
-            (needle.isEmpty || $0.name.localizedStandardContains(needle))
+            // Literal matches already satisfy the search; reserve locale-aware
+            // comparison for case/diacritic variants in large libraries.
+            (needle.isEmpty || $0.name.contains(needle) || $0.name.localizedStandardContains(needle))
         }
         return rows.sorted { a, b in
             // Folders and notebooks occupy separate sections, including in Manual.

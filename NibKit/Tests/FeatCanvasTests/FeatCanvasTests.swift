@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import SwiftUI
+import PencilKit
 import NibContracts
 import NibTesting
 import NibDesign
@@ -269,6 +270,78 @@ final class FeatCanvasTests: XCTestCase {
         }
     }
 
+    func testLandscapeOpeningTextClearsBottomOptionsAndLassoChevron() async throws {
+        let size = CGSize(width: 874, height: 402)
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            for settingsOnly in [false, true] {
+                let h = Harness(features: [FeatCanvasFeature.self])
+                h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+                h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+                var openingTool = ToolbarItemDescriptor(
+                    id: "test.openingTool", title: "Opening Tool", icon: "", group: .lasso, order: 0,
+                    owner: "test", toolID: h.session.tool,
+                    settings: { _ in AnyView(EmptyView()) })
+                if !settingsOnly { openingTool.activeToolMenu = { _ in AnyView(EmptyView()) } }
+                h.app.ui.toolbar.register(openingTool)
+                // The heading and two-line opening paragraph have enough blank header to recover useful height.
+                let title = Item(kind: .text, text: TextBoxItem(
+                    frame: Frame(x: 72, y: 72, w: 400, h: 32), text: RichText(plain: "Motion & forces")))
+                let body = Item(kind: .text, text: TextBoxItem(
+                    frame: Frame(x: 72, y: 128, w: 440, h: 40),
+                    text: RichText(plain: "Understanding how objects move\nVelocity, acceleration and Newton's laws")))
+                _ = try await h.insert([title, body], page: Fixtures.page2)
+                let vc = try makeCanvas(h, page: Fixtures.page2, size: size)
+                defer { vc.closeCanvas() }
+                vc.traitOverrides.horizontalSizeClass = .compact
+                vc.overrideUserInterfaceStyle = appearance
+                vc.view.setNeedsLayout()
+                vc.view.layoutIfNeeded()
+                let region = DropletDockModel.region(size: size, safeArea: EdgeInsets(), compact: true)
+                XCTAssertGreaterThanOrEqual(vc.scrollView.chromeInsets.bottom,
+                    size.height - region.maxY + NibMetrics.paletteThickness + NibMetrics.barHeight + NibSpacing.l,
+                    "both a full options bar and a settings-only chevron reserve the entire arm before measurement")
+                // Apply EditorHost's measured landscape geometry directly so this regression is independent of
+                // the test runner's physical device/orientation. Hosted automatic refits are tested below.
+                let bottomExtra = NibMetrics.barHeight - 1
+                for tabs in [CGFloat.zero, NibMetrics.tabCapsuleHeight, 0] {
+                    vc.scrollView.chromeInsets = CanvasChromeInsets.resolve(
+                        safeArea: UIEdgeInsets(top: tabs, left: 62, bottom: 21 + bottomExtra, right: 62),
+                        additional: UIEdgeInsets(top: tabs, left: 0, bottom: bottomExtra, right: 0),
+                        compact: true, topDocked: false, fallbackTop: nil)
+                    vc.reloadAll()
+                    vc.setZoom(vc.fitZoom, anchor: nil, centreFit: true)
+                    let clearance = unobscured(vc)
+                    let transform = try XCTUnwrap(vc.host.pageTransform(Fixtures.page2))
+                    let headingRect = h.app.content.paintBounds(for: title).cg.applying(transform)
+                    let bodyRect = h.app.content.paintBounds(for: body).cg.applying(transform)
+                    XCTAssertGreaterThanOrEqual(headingRect.minY, clearance.minY)
+                    XCTAssertLessThanOrEqual(bodyRect.maxY, clearance.maxY,
+                                             "the full paragraph clears the options lens, including with tabs")
+                    XCTAssertEqual(vc.scrollView.chromeInsets.bottom,
+                                   21 + bottomExtra + NibMetrics.canvasBottomInsetCompact)
+                    XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
+                    XCTAssertEqual(h.session.page, Fixtures.page2)
+                    let position = windowPoint(vc, Point(72, 128), Fixtures.page2)
+                    vc.reloadAll()
+                    XCTAssertEqual(windowPoint(vc, Point(72, 128), Fixtures.page2).y, position.y, accuracy: 0.5)
+                }
+                vc.scrollBy(dx: 0, dy: 24, windowFractions: false, animated: false)
+                let manualPosition = windowPoint(vc, Point(72, 128), Fixtures.page2)
+                vc.scrollView.chromeInsets.bottom += NibSpacing.m
+                vc.reloadAll()
+                XCTAssertEqual(windowPoint(vc, Point(72, 128), Fixtures.page2).y, manualPosition.y, accuracy: 0.5,
+                               "a later options measurement does not move a manually chosen reading position")
+                // Explicit fit uses the opening content again; a blank page still starts at its top edge.
+                vc.setZoom(vc.fitZoom, anchor: nil, centreFit: true)
+                let titleBounds = h.app.content.paintBounds(for: title)
+                XCTAssertEqual(windowPoint(vc, Point(titleBounds.x, titleBounds.y), Fixtures.page2).y,
+                               vc.scrollView.chromeInsets.top + NibSpacing.m, accuracy: 0.5)
+                vc.goToPage(Fixtures.pdfPage, animated: false)
+                XCTAssertEqual(windowPoint(vc, .zero, Fixtures.pdfPage).y, vc.scrollView.chromeInsets.top, accuracy: 0.5)
+            }
+        }
+    }
+
     func testMeasuredChromeAndTabsRefitUntouchedPagesAndPreserveManualAnchors() throws {
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834),
                      CGSize(width: 844, height: 390)] {
@@ -517,6 +590,298 @@ final class FeatCanvasTests: XCTestCase {
     }
 
     // MARK: view.scrollBy
+
+    func testFitPageAndWidthMenuActionsHaveDistinctGeometry() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h, size: CGSize(width: 1366, height: 1024))
+        defer { vc.closeCanvas() }
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let context = MenuContext(app: h.app, session: h.session)
+        let page = try XCTUnwrap(h.app.ui.menus.get("canvas.fit.page"))
+        let width = try XCTUnwrap(h.app.ui.menus.get("canvas.fit.width"))
+        XCTAssertEqual(page.title, "Fit Page")
+        XCTAssertEqual(width.title, "Fit Width")
+        XCTAssertTrue(page.isVisible(context))
+        _ = try await h.run(page.command, page.params(context))
+        let pageZoom = vc.zoom
+        let frame = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
+        XCTAssertTrue(unobscured(vc).insetBy(dx: -0.5, dy: -0.5).contains(frame))
+        _ = try await h.run(width.command, width.params(context))
+        XCTAssertGreaterThan(vc.zoom, pageZoom)
+        XCTAssertEqual(try XCTUnwrap(vc.host.pageFrame(Fixtures.page1)).width, 760, accuracy: 0.5)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before)
+        await assertThrows(.invalidParams) { _ = try await h.run("view.zoom", ["fitMode": "invalid"]) }
+    }
+
+    func testPaperHitTestingReachesWetInkAfterOpeningAndReopening() throws {
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+        h.app.settings.set(NibSettings.stylusMode, .anyInput)
+        let tool = NavigationInkTool()
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+        h.session.tool = tool.id
+        let install = try XCTUnwrap(CanvasInputHooks.install)
+        let vc = try makeCanvas(h, input: install, size: CGSize(width: 1376, height: 1032))
+        let window = UIWindow(frame: vc.view.frame)
+        window.rootViewController = vc
+        window.isHidden = false
+        vc.view.layoutIfNeeded()
+        defer { vc.closeCanvas(); window.isHidden = true }
+        for reopening in [false, true] {
+            if reopening {
+                vc.closeCanvas()
+                vc.viewWillAppear(false)
+                vc.view.layoutIfNeeded()
+            }
+            let point = CGPoint(x: vc.view.bounds.width * 0.4, y: vc.view.bounds.height * 0.65)
+            XCTAssertNotNil(vc.host.pagePoint(vc.view.convert(point, to: vc.scrollView)))
+            let hit = try XCTUnwrap(window.hitTest(vc.view.convert(point, to: window), with: nil))
+            var ancestor: UIView? = hit
+            while ancestor != nil, !(ancestor is PKCanvasView) { ancestor = ancestor?.superview }
+            let ink = try XCTUnwrap(ancestor as? PKCanvasView,
+                                   "Paper must reach PencilKit, got \(hit); reopening=\(reopening)")
+            XCTAssertTrue(ink.isDescendant(of: vc.host.wetInkContainer))
+            XCTAssertEqual(ink.drawingPolicy, .anyInput)
+            XCTAssertTrue(ink.drawingGestureRecognizer.isEnabled)
+        }
+    }
+
+    func testInkCommitsWhenNativeBeginArrivesAfterObservedLift() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+        h.app.settings.set(NibSettings.stylusMode, .anyInput)
+        registerInkStandIn(h)
+        let tool = NavigationInkTool()
+        tool.commits = true
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+        h.session.tool = tool.id
+        let vc = try makeCanvas(h, input: XCTUnwrap(CanvasInputHooks.install))
+        defer { vc.closeCanvas() }
+        let input = try XCTUnwrap(vc.host.inputController as? WetInkController)
+        let before = try h.snapshot()
+        let count = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count
+        let start = CanvasSample(page: Fixtures.page1, location: Point(160, 420), timestamp: 1,
+                                 isPencil: false, touchID: 1)
+        let end = CanvasSample(page: Fixtures.page1, location: Point(360, 440), timestamp: 1.35,
+                               isPencil: false, touchID: 1)
+        let contact = NSObject()
+        let canvas = try XCTUnwrap(input.acceptContact(ObjectIdentifier(contact), sample: start))
+        let ink = PKBridge.pkStroke(stroke())
+        input.begin(start, screenPoint: start.location, route: .tool(tool),
+                    contact: ObjectIdentifier(contact), startedAt: ink.path.creationDate)
+        input.move([end], screenPoint: end.location, id: 1)
+        input.end(end)
+        // UIKit's observer and PencilKit's delegate are independent delivery paths. A short
+        // first stroke must survive native recognition arriving after the observing stream lifted.
+        input.canvasViewDidBeginUsingTool(canvas)
+        canvas.drawing = PKDrawing(strokes: [ink])
+        input.canvasViewDrawingDidChange(canvas)
+        input.canvasViewDidEndUsingTool(canvas)
+        await waitUntil("late native stroke committed") {
+            (try? h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count) == count + 1
+        }
+        XCTAssertEqual(tool.finished, 1)
+        let after = try h.snapshot()
+        _ = try await h.run("edit.undo", ["doc": .string(Fixtures.docID.raw)])
+        XCTAssertEqual(try h.snapshot(), before)
+        _ = try await h.run("edit.redo", ["doc": .string(Fixtures.docID.raw)])
+        XCTAssertEqual(try h.snapshot(), after)
+    }
+
+    func testDoubleTapThroughInputHandlerTogglesInAnyInputWithoutCommittingDots() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+        h.app.settings.set(NibSettings.stylusMode, .anyInput)
+        let tool = NavigationInkTool()
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+        h.session.tool = tool.id
+        let install = try XCTUnwrap(CanvasInputHooks.install)
+        let vc = try makeCanvas(h, input: install)
+        defer { vc.closeCanvas() }
+        let input = try XCTUnwrap(vc.host.inputController as? WetInkController)
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let fit = vc.zoom
+        let point = Point(400, 450)
+        let anchor = windowPoint(vc, point, Fixtures.page1)
+        for round in 0..<2 {
+            for tap in 0..<2 {
+                let sample = CanvasSample(page: Fixtures.page1, location: point,
+                                          timestamp: Double(round * 2) + Double(tap) * 0.1,
+                                          isPencil: false, touchID: round * 2 + tap + 1)
+                let contact = NSObject()
+                let canvas = try XCTUnwrap(input.acceptContact(ObjectIdentifier(contact), sample: sample))
+                let dot = PKBridge.pkStroke(Stroke(style: .defaultPen,
+                    points: [StrokePoint(x: Float(point.x), y: Float(point.y))],
+                    t0: Date().timeIntervalSince1970 + Double(sample.touchID)))
+                input.begin(sample, screenPoint: Point(vc.host.viewPoint(point, page: Fixtures.page1)), route: .tool(tool),
+                            contact: ObjectIdentifier(contact), startedAt: dot.path.creationDate)
+                input.canvasViewDidBeginUsingTool(canvas)
+                canvas.drawing = PKDrawing(strokes: canvas.drawing.strokes + [dot])
+                input.canvasViewDrawingDidChange(canvas)
+                input.end(sample)
+                input.canvasViewDidEndUsingTool(canvas)
+            }
+            let target = round == 0 ? fit * 2 : fit
+            await waitUntil("double tap zoom") { abs(vc.zoom - target) < 0.001 }
+            XCTAssertEqual(windowPoint(vc, point, Fixtures.page1).x, anchor.x, accuracy: 0.5)
+            XCTAssertEqual(windowPoint(vc, point, Fixtures.page1).y, anchor.y, accuracy: 0.5)
+        }
+        XCTAssertEqual(tool.finished, 0)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before)
+        XCTAssertFalse(h.session.inking.isInking)
+    }
+
+    func testDoubleTapZoomYieldsToItemHandlersAndClaimedAttachments() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let attachment = NavigationClaimAttachment()
+        h.app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "test.claim", owner: "test", order: 0) { _ in attachment })
+        await waitUntil("attachment") { vc.host.attachments.contains { $0 === attachment } }
+        let params: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [400, 450], "gesture": "doubleTap"]
+        let initial = vc.zoom
+        let result = try await h.run(CanvasDoubleTapZoom.descriptor.id, params)
+        XCTAssertEqual(result["handled"]?.boolValue, false)
+        XCTAssertEqual(vc.zoom, initial)
+        attachment.claims = false
+        h.app.commands.register(CommandDescriptor(id: "test.itemDoubleTap", title: "Item", summary: "Item test",
+                                                   params: .anything(), effect: .session)) { _, _ in ["handled": true] }
+        h.app.content.tapHandlers.register(TapHandlerDescriptor(id: "test.itemDoubleTap", owner: "test",
+            gesture: .doubleTap, command: "test.itemDoubleTap", order: 100))
+        let router = GestureRouter(host: vc.host, attachments: { vc.host.attachments }, activeTool: { nil },
+                                   isReadOnly: { false }, topmostItem: { _ in nil })
+        let handled = await router.gesture(.doubleTap, sample: CanvasSample(page: Fixtures.page1, location: Point(400, 450),
+                                                                          isPencil: false), route: .navigation)
+        XCTAssertTrue(handled)
+        XCTAssertEqual(vc.zoom, initial, "An earlier handled item gesture must not also zoom")
+    }
+
+    func testNativeNavigationRecognizersCoexistAndPublishPinchZoom() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let pan = vc.scrollView.panGestureRecognizer
+        let pinch = try XCTUnwrap(vc.scrollView.pinchGestureRecognizer)
+        XCTAssertTrue(pan.delegate === vc.scrollView)
+        XCTAssertTrue(pinch.delegate === vc.scrollView)
+        XCTAssertTrue(pan.isEnabled)
+        XCTAssertTrue(pinch.isEnabled)
+        XCTAssertTrue(vc.scrollView.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pinch))
+        XCTAssertTrue(vc.scrollView.gestureRecognizer(pinch, shouldRecognizeSimultaneouslyWith: pan))
+        let ink = PKCanvasView()
+        vc.host.wetInkContainer.addSubview(ink)
+        // The decision must already allow the first drawing contact, before UIKit reports two
+        // navigation touches. Otherwise PencilKit fails the parent's still-possible recognizers.
+        XCTAssertTrue(pan.delegate?.gestureRecognizer?(pan,
+            shouldRecognizeSimultaneouslyWith: ink.drawingGestureRecognizer) == true)
+        XCTAssertTrue(pinch.delegate?.gestureRecognizer?(pinch,
+            shouldRecognizeSimultaneouslyWith: ink.drawingGestureRecognizer) == true)
+        let attachmentGesture = UIPanGestureRecognizer()
+        vc.scrollView.addGestureRecognizer(attachmentGesture)
+        XCTAssertFalse(vc.scrollView.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: attachmentGesture))
+        XCTAssertFalse(vc.scrollView.gestureRecognizer(pinch, shouldRecognizeSimultaneouslyWith: attachmentGesture))
+        let initial = vc.zoom
+        vc.scrollViewWillBeginZooming(vc.scrollView, with: vc.scrollView.contentView)
+        vc.scrollView.setZoomScale(CGFloat(initial * 1.5), animated: false)
+        vc.additionalSafeAreaInsets.top = 80
+        vc.viewDidLayoutSubviews()
+        XCTAssertEqual(vc.zoom, initial * 1.5, accuracy: 0.001,
+                       "A chrome layout during pinch must not restore the previous fit zoom")
+        vc.scrollViewDidEndZooming(vc.scrollView, with: vc.scrollView.contentView, atScale: vc.scrollView.zoomScale)
+        XCTAssertEqual(h.session.zoom, initial * 1.5, accuracy: 0.001)
+    }
+
+    func testWindowAttachedWetInkLeavesPinchToDocumentAcrossLayoutAndReopening() throws {
+        func canvases(_ view: UIView) -> [PKCanvasView] {
+            (view as? PKCanvasView).map { [$0] } ?? view.subviews.flatMap { canvases($0) }
+        }
+        for mode in [StylusMode.anyInput, .pencilOnly] {
+            let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+            h.app.settings.set(NibSettings.stylusMode, mode)
+            let tool = NavigationInkTool()
+            h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+            h.session.tool = tool.id
+            let vc = try makeCanvas(h, input: XCTUnwrap(CanvasInputHooks.install))
+            let window = UIWindow(frame: vc.view.frame)
+            window.rootViewController = vc
+            window.isHidden = false
+            vc.view.layoutIfNeeded()
+            defer { vc.closeCanvas(); window.isHidden = true }
+
+            for reopening in [false, true] {
+                if reopening {
+                    vc.closeCanvas()
+                    vc.viewWillAppear(false)
+                    vc.view.layoutIfNeeded()
+                }
+                for style in [InkStyle.defaultPen, .defaultHighlighter] {
+                    tool.style = style
+                    vc.host.syncActiveTool(force: true)
+                    vc.setZoom(1.5, anchor: nil, centreFit: false)
+                    vc.view.layoutIfNeeded()
+                    let pinch = try XCTUnwrap(vc.scrollView.pinchGestureRecognizer)
+                    XCTAssertTrue(pinch.isEnabled)
+                    XCTAssertTrue(vc.scrollView.panGestureRecognizer.isEnabled)
+                    let surfaces = canvases(vc.host.wetInkContainer)
+                    XCTAssertEqual(surfaces.count, 2)
+                    for ink in surfaces {
+                        XCTAssertNotNil(ink.window)
+                        ink.setNeedsLayout()
+                        ink.layoutIfNeeded()
+                        // Construction-only checks miss PencilKit restoring its own pinch on window entry/layout.
+                        XCTAssertFalse(try XCTUnwrap(ink.pinchGestureRecognizer).isEnabled,
+                                       "Window-attached wet ink must leave pinch zoom to the document")
+                        XCTAssertFalse(ink.panGestureRecognizer.isEnabled)
+                        XCTAssertTrue(ink.drawingGestureRecognizer.isEnabled)
+                        XCTAssertEqual(Double(ink.zoomScale), vc.zoom, accuracy: 0.001,
+                                       "Disabling navigation must preserve programmatic wet-ink scaling")
+                        XCTAssertTrue(pinch.delegate?.gestureRecognizer?(pinch,
+                            shouldRecognizeSimultaneouslyWith: ink.drawingGestureRecognizer) == true)
+                        for other in [ink.drawingGestureRecognizer, ink.panGestureRecognizer,
+                                      ink.pinchGestureRecognizer].compactMap({ $0 }) {
+                            XCTAssertFalse(pinch.delegate?.gestureRecognizer?(pinch, shouldRequireFailureOf: other) ?? false)
+                            XCTAssertFalse(other.delegate?.gestureRecognizer?(other, shouldBeRequiredToFailBy: pinch) ?? false)
+                        }
+                        if ink.isUserInteractionEnabled {
+                            let point = CGPoint(x: ink.bounds.midX, y: ink.bounds.midY)
+                            let hit = try XCTUnwrap(ink.hitTest(point, with: nil))
+                            let contact = CanvasNavigationTouch(hitView: hit, point: ink.convert(point, to: hit))
+                            XCTAssertTrue(pinch.delegate?.gestureRecognizer?(pinch, shouldReceive: contact) ?? true,
+                                          "The document pinch must receive fingers on wet ink")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testOptionArrowResponderCommandsPanThisBoardAndYieldWhileEditing() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        defer { vc.closeCanvas() }
+        let initial = vc.scrollView.contentOffset
+        let before = try h.app.workspace.items(Fixtures.whiteboardID, page: Fixtures.boardID)
+        let keys = try XCTUnwrap(vc.keyCommands)
+        XCTAssertEqual(Set(keys.compactMap(\.input)), Set([UIKeyCommand.inputUpArrow, UIKeyCommand.inputDownArrow,
+                                                           UIKeyCommand.inputLeftArrow, UIKeyCommand.inputRightArrow]))
+        for key in keys {
+            XCTAssertEqual(key.modifierFlags, .alternate)
+            XCTAssertTrue(key.wantsPriorityOverSystemBehavior)
+            let action = try XCTUnwrap(key.action)
+            XCTAssertTrue(vc.canPerformAction(action, withSender: nil), "UIKit must discover the pan action before providing a key")
+            XCTAssertTrue(vc.canPerformAction(action, withSender: NSObject()))
+            XCTAssertTrue(vc.canPerformAction(action, withSender: key))
+            let start = vc.scrollView.contentOffset
+            vc.panFromKeyboard(key)
+            await waitUntil("keyboard pan") { vc.scrollView.contentOffset != start }
+        }
+        XCTAssertEqual(vc.scrollView.contentOffset.x, initial.x, accuracy: 0.5)
+        XCTAssertEqual(vc.scrollView.contentOffset.y, initial.y, accuracy: 0.5)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.whiteboardID, page: Fixtures.boardID), before)
+        h.session.isEditingText = true
+        XCTAssertTrue(vc.keyCommands?.isEmpty == true)
+        XCTAssertFalse(vc.canPerformAction(try XCTUnwrap(keys[0].action), withSender: nil))
+        XCTAssertFalse(vc.canPerformAction(try XCTUnwrap(keys[0].action), withSender: keys[0]))
+        vc.panFromKeyboard(keys[0])
+        XCTAssertEqual(vc.scrollView.contentOffset, initial)
+    }
 
     func testScrollByMovesByPagePointsOrWindowFractions() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
@@ -1712,6 +2077,22 @@ final class FeatCanvasTests: XCTestCase {
     }
 }
 
+private final class CanvasNavigationTouch: UITouch {
+    let hitView: UIView
+    let point: CGPoint
+    init(hitView: UIView, point: CGPoint) {
+        self.hitView = hitView
+        self.point = point
+        super.init()
+    }
+    override var view: UIView? { hitView }
+    override var window: UIWindow? { hitView.window }
+    override var type: UITouch.TouchType { .direct }
+    override var phase: UITouch.Phase { .began }
+    override var majorRadius: CGFloat { 8 }
+    override func location(in view: UIView?) -> CGPoint { hitView.convert(point, to: view) }
+}
+
 // MARK: - Test doubles
 
 @MainActor
@@ -1746,6 +2127,27 @@ private final class ProbeTool: CanvasTool {
 
     func activate(_ host: CanvasHost) { activations += 1 }
     func deactivate(_ host: CanvasHost) { deactivations += 1 }
+}
+
+@MainActor
+private final class NavigationInkTool: CanvasTool {
+    let id = "test.navigationInk"
+    var inputMode: CanvasInputMode { .pencilKit }
+    var finished = 0
+    var commits = false
+    var style = InkStyle.defaultPen
+    func inkStyle(_ host: CanvasHost) -> InkStyle? { style }
+    func strokeFinished(_ stroke: Stroke, page: PageID, host: CanvasHost) {
+        finished += 1
+        if commits { host.commitStroke(stroke, page: page) }
+    }
+}
+
+@MainActor
+private final class NavigationClaimAttachment: CanvasAttachment {
+    var claims = true
+    func attach(to host: CanvasHost) {}
+    func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool { claims }
 }
 
 @MainActor

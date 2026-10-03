@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 @testable import FeatHighlighter
@@ -109,13 +110,13 @@ final class FeatHighlighterTests: XCTestCase {
     // MARK: Presets
 
     func testThicknessSelectsAMatchingSlotOrResizesTheSelectedOne() {
-        let p = ToolPresets.defaults(for: "highlighter")                       // widths 8, 12, 18; slot 1 selected
-        XCTAssertNil(PresetEdit.width(12, in: p))
+        let p = ToolPresets.defaults(for: "highlighter")                       // DESIGN §14.3: 8, 14, 20; slot 1 selected
+        XCTAssertNil(PresetEdit.width(14, in: p))
         XCTAssertEqual(PresetEdit.width(8, in: p), .selectWidth(0))
-        XCTAssertEqual(PresetEdit.width(14.04, in: p), .setWidth(index: 1, width: 14))
+        XCTAssertEqual(PresetEdit.width(16.04, in: p), .setWidth(index: 1, width: 16))
         var q = p
-        PresetEdit.setWidth(index: 1, width: 14).apply(to: &q)
-        XCTAssertEqual(q.widths, [8, 14, 18])
+        PresetEdit.setWidth(index: 1, width: 16).apply(to: &q)
+        XCTAssertEqual(q.widths, [8, 16, 20])
         let mint = PresetEdit.setColour(index: 0, color: NibHighlighter.mint.rgba)
         XCTAssertEqual(mint.command, "preset.setSwatch")
         XCTAssertEqual(mint.params["color"]?.stringValue, "#86E3AE80")
@@ -124,6 +125,66 @@ final class FeatHighlighterTests: XCTestCase {
         // Every highlighter colour, preset or custom, carries the contracts' highlighter translucency.
         XCTAssertTrue(NibHighlighter.allCases.allSatisfy { $0.rgba.a == RGBA.highlighterAlpha })
         XCTAssertEqual(RGBA(0x12, 0x34, 0x56).asHighlighter, RGBA(0x12, 0x34, 0x56, RGBA.highlighterAlpha))
+    }
+
+    func testDesignWidthsReachFinishedStrokesWithoutChangingTools() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        let host = FakeCanvasHost(h)
+        let tool = try XCTUnwrap(h.app.ui.canvasTools.get("highlighter")?.make())
+        try await h.run(CommandIDs.toolSelect, ["tool": "highlighter"])
+        let defaults = h.app.settings.get(HighlighterSettings.presets)
+        XCTAssertEqual(defaults.widths, [8, 14, 20], "The options bar and capture must share DESIGN §14.3 defaults")
+
+        for (index, expected) in [8.0, 14.0, 20.0].enumerated() {
+            var presets = defaults
+            PresetEdit.selectWidth(index).apply(to: &presets)
+            try await h.run(CommandIDs.settingsSet, ["name": .string(HighlighterSettings.presets.name),
+                                                    "value": try JSONValue.from(presets)])
+            let style = try XCTUnwrap(tool.inkStyle(host))
+            XCTAssertEqual(style.width, expected)
+            XCTAssertEqual(style.tool, .highlighter)
+            let stroke = Stroke(style: style, points: wobbly, t0: 0)
+            tool.strokeFinished(stroke, page: Fixtures.page1, host: host)
+            XCTAssertEqual(host.committed.count, index + 1)
+            XCTAssertEqual(host.committed.last?.stroke, stroke)
+            XCTAssertEqual(host.committed.last?.page, Fixtures.page1)
+            XCTAssertEqual(h.session.tool, "highlighter")
+        }
+        XCTAssertEqual(host.wetStrokeCancels, 0, "Ordinary marker strokes must reach the host's commit path")
+    }
+
+    func testCustomPickerColourPersistsThroughToolSwitchAndFinishedStroke() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        let host = FakeCanvasHost(h)
+        let tool = HighlighterTool()
+        var presets = h.app.settings.get(HighlighterSettings.presets)
+        let expected = RGBA(0x12, 0xA4, 0xC8, RGBA.highlighterAlpha)
+        var picks = 0
+        var finished = false
+        let picker = SystemColourPicker(initial: presets.color.uiColor, onPick: { colour in
+            picks += 1
+            PresetEdit.setColour(index: presets.selectedSwatch, color: RGBA(colour).asHighlighter).apply(to: &presets)
+        }, onDone: { finished = true })
+        let coordinator = picker.makeCoordinator()
+        let controller = UIColorPickerViewController()
+        controller.selectedColor = RGBA(expected.r, expected.g, expected.b).uiColor
+        coordinator.colorPickerViewController(controller, didSelect: controller.selectedColor, continuously: false)
+        coordinator.colorPickerViewControllerDidFinish(controller)
+        XCTAssertEqual(picks, 1, "Closing the system picker must not duplicate its final selection")
+        XCTAssertTrue(finished)
+        XCTAssertEqual(presets.color, expected)
+        try await h.run(CommandIDs.settingsSet, ["name": .string(HighlighterSettings.presets.name),
+                                                "value": try JSONValue.from(presets)])
+        try await h.run(CommandIDs.toolSelect, ["tool": "pen"])
+        try await h.run(CommandIDs.toolSelect, ["tool": "highlighter"])
+        let style = try XCTUnwrap(tool.inkStyle(host))
+        XCTAssertEqual(style.color, expected)
+        XCTAssertEqual(style.tool, .highlighter)
+        tool.strokeFinished(Stroke(style: style, points: wobbly, t0: 0), page: Fixtures.page1, host: host)
+        XCTAssertEqual(host.committed.count, 1)
+        XCTAssertEqual(host.committed.first?.stroke.style.color, expected)
+        XCTAssertEqual(h.session.tool, "highlighter")
+        XCTAssertEqual(host.wetStrokeCancels, 0)
     }
 
     // MARK: Draw and Hold

@@ -86,10 +86,20 @@ struct ProviderListView: View {
     var body: some View {
         Form {
             Section {
+                NavigationLink { SubscriptionSetupView(app: app, preset: .claudeSubscription) } label: {
+                    NibRow(ProviderPreset.claudeSubscription.title, subtitle: String(localized: "Connect Claude Code on your Mac"), icon: .assistant)
+                }
+                NavigationLink { SubscriptionSetupView(app: app, preset: .chatGPTSubscription) } label: {
+                    NibRow(ProviderPreset.chatGPTSubscription.title, subtitle: String(localized: "Connect Codex on your Mac"), icon: .assistant)
+                }
+            } header: { AISettingsHeader(String(localized: "Your subscriptions")) }
+            Section {
                 ForEach(model.providers) { row in
                     VStack(alignment: .leading, spacing: NibSpacing.s) {
                         NavigationLink {
-                            ProviderEditorView(app: app, row: row)
+                            if row.config.extraHeaders["X-Nib-Subscription"] == "1" {
+                                SubscriptionSetupView(app: app, preset: row.config.model == "chatgpt" ? .chatGPTSubscription : .claudeSubscription, existing: row.config)
+                            } else { ProviderEditorView(app: app, row: row) }
                         } label: {
                             NibRow(row.config.name, subtitle: row.config.model.isEmpty ? String(localized: "Choose a model") : row.config.model,
                                    icon: .assistant) {

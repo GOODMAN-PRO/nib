@@ -437,6 +437,132 @@ final class FeatStudyEditorTests: XCTestCase {
 
     // MARK: Editor model
 
+    func testListAndPreviewKeepDistinctAccessibleFieldNamesWhenSidesChange() {
+        let listFields = CardSide.allCases.map { CardField(card: Fixtures.card1, side: $0) }
+        let listLabels = Set(listFields.map(\.accessibilityLabel))
+        XCTAssertEqual(listLabels, Set([String(localized: "Term"), String(localized: "Definition")]))
+        for field in listFields {
+            let preview = CardField(card: field.card, side: field.side, inPane: true)
+            XCTAssertFalse(listLabels.contains(preview.accessibilityLabel),
+                           "Showing a face in the preview must not add another match for a list field's spoken name")
+            XCTAssertEqual(field.key, preview.key, "Both inputs still edit the same card face")
+        }
+    }
+
+    func testDefinitionKeepsFocusAndTypedTextAsPreviewFollowsTheList() async throws {
+        let h = harness()
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        let term = CardField(card: Fixtures.card1, side: .front)
+        let definition = CardField(card: Fixtures.card1, side: .back)
+        model.focus = term
+        model.setText("Typed front", for: term)
+        await model.flush()
+        model.focus = nil // Dismiss the keyboard between fields, as in the creation flow.
+        model.focus = definition
+        XCTAssertEqual(model.side, .back, "The preview follows the newly focused list field")
+        XCTAssertEqual(model.focus, definition, "Showing Definition in the preview must keep focus in the list")
+        XCTAssertTrue(h.session.isEditingText)
+        model.setText("Typed back", for: definition)
+        await model.flush()
+        model.reload()
+        XCTAssertEqual(model.focus, definition, "Command-driven refresh must preserve the editing field")
+        let card = try XCTUnwrap(model.currentCard)
+        XCTAssertEqual(card.front.text?.plainText, "Typed front")
+        XCTAssertEqual(card.back.text?.plainText, "Typed back")
+        XCTAssertEqual(model.text(definition.key, in: card), "Typed back")
+    }
+
+    func testOpeningNewSetProvidesEditableFacesAndPreservesTitleOnReopen() async throws {
+        let h = harness()
+        let doc = DocumentID("NEWSTUDYSET01")
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .studySet)),
+                                         title: "Typed study draft", in: nil)
+        let descriptor = try XCTUnwrap(h.app.ui.editors.get(DocumentKind.studySet.rawValue))
+        let editor = try XCTUnwrap(descriptor.make(doc, h.session, h.app) as? StudySetViewController)
+        let added = expectation(description: "Opening a pristine study set creates its first card")
+        let observation = h.app.bus.observeCommits { change in
+            if change.command == CommandIDs.cardAdd, change.documents.contains(doc) { added.fulfill() }
+        }
+        defer { observation.cancel() }
+        editor.loadViewIfNeeded()
+        editor.beginAppearanceTransition(true, animated: false)
+        editor.endAppearanceTransition()
+        await fulfillment(of: [added], timeout: 5)
+        let model = editor.model
+        await model.prepareForEditing()
+        let card = try XCTUnwrap(model.currentCard)
+        XCTAssertEqual(model.cards.count, 1)
+        XCTAssertEqual(card.front.kind, .text)
+        XCTAssertEqual(card.back.kind, .text)
+        XCTAssertEqual(model.focus, CardField(card: card.id, side: .front))
+        XCTAssertEqual(h.undoDepth(doc), 1, "the starter uses the normal undoable card command")
+
+        model.setText("Question from UI", for: CardField(card: card.id, side: .front))
+        model.setText("Answer from UI", for: CardField(card: card.id, side: .back))
+        await model.flush()
+        let reopened = StudySetModel(app: h.app, doc: doc, session: h.session)
+        await reopened.prepareForEditing()
+        XCTAssertEqual(reopened.cards.count, 1)
+        XCTAssertEqual(reopened.currentCard?.id, card.id)
+        XCTAssertEqual(reopened.currentCard?.front.text?.plainText, "Question from UI")
+        XCTAssertEqual(reopened.currentCard?.back.text?.plainText, "Answer from UI")
+        XCTAssertEqual(h.library.allNodes().first { $0.id == doc }?.title, "Typed study draft")
+    }
+
+    func testPreparingNewSetDoesNotRecreateAnUndoneOrDeletedStarter() async throws {
+        let h = harness()
+        let doc = DocumentID("NEWSTUDYSET02")
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .studySet)),
+                                         title: "Empty set", in: nil)
+        let model = StudySetModel(app: h.app, doc: doc, session: h.session)
+        await model.prepareForEditing()
+        let id = try XCTUnwrap(model.current)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        await model.prepareForEditing()
+        let reopened = StudySetModel(app: h.app, doc: doc, session: h.session)
+        await reopened.prepareForEditing()
+        XCTAssertTrue(try liveCards(h, doc).isEmpty)
+        XCTAssertEqual(h.undoDepth(doc), 0)
+        XCTAssertTrue(h.app.bus.redo(doc))
+        await reopened.delete([id])
+        let afterDelete = try h.snapshot(doc)
+        await StudySetModel(app: h.app, doc: doc, session: h.session).prepareForEditing()
+        XCTAssertEqual(try h.snapshot(doc), afterDelete)
+        XCTAssertTrue(try liveCards(h, doc).isEmpty)
+    }
+
+    func testPreparingFirstCardRespectsReadOnlyAndMissingSets() async throws {
+        let h = harness()
+        let doc = DocumentID("NEWSTUDYSET03")
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .studySet)),
+                                         title: "Read only", in: nil)
+        let model = StudySetModel(app: h.app, doc: doc, session: h.session)
+        h.session.readOnly = true
+        await model.prepareForEditing()
+        XCTAssertTrue(try liveCards(h, doc).isEmpty)
+        h.session.readOnly = false
+        h.app.services.set(NSMutableSet(array: [doc.raw]), for: ServiceKeys.storeReadOnly)
+        await model.prepareForEditing()
+        XCTAssertTrue(try liveCards(h, doc).isEmpty)
+        XCTAssertEqual(h.undoDepth(doc), 0)
+        XCTAssertNil(model.focus)
+        let missing = StudySetModel(app: h.app, doc: DocumentID("MISSINGSET01"), session: h.session)
+        await missing.prepareForEditing()
+        XCTAssertTrue(missing.isMissing)
+        XCTAssertTrue(missing.cards.isEmpty)
+    }
+
+    func testPreparingExistingSetDoesNotChangeItsCardsOrFocus() async throws {
+        let h = harness()
+        let before = try h.snapshot(Fixtures.studySetID)
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        model.focus = CardField(card: Fixtures.card1, side: .back)
+        await model.prepareForEditing()
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+        XCTAssertEqual(model.focus, CardField(card: Fixtures.card1, side: .back))
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 0)
+    }
+
     func testTypingCommitsEachPauseAsOneUndoStep() async throws {
         let h = harness()
         let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)

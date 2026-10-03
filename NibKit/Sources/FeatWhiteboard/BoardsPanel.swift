@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import Combine
 import NibContracts
 import NibDesign
@@ -60,6 +61,7 @@ final class BoardsModel: ObservableObject {
     private var versions: [PageID: Int] = [:]
     private let bag = WhiteboardSubscriptions()
     private var documentChanges: AnyCancellable?
+    private var editingBeforeRename: Bool?
 
     init(app: NibApp, session: EditorSession) {
         self.app = app
@@ -119,22 +121,27 @@ final class BoardsModel: ObservableObject {
 
     func add() {
         Task { @MainActor in
-            guard let value = await execute(CommandIDs.boardAdd, ["doc": docRef]), let ref = value["ref"] else { return }
-            perform(CommandIDs.viewGoToPage, ["page": ref])
+            guard await execute(CommandIDs.boardAdd, ["doc": docRef]) != nil else { return }
             AccessibilityNotification.Announcement(String(localized: "Board added")).post()
         }
     }
 
     func beginRename(_ board: BoardRow) {
+        if editingBeforeRename == nil { editingBeforeRename = session.isEditingText }
+        session.isEditingText = true
         renameText = board.title
         renaming = board.id
     }
 
-    func cancelRename() { renaming = nil }
+    func cancelRename() {
+        renaming = nil
+        if let editingBeforeRename { session.isEditingText = editingBeforeRename }
+        editingBeforeRename = nil
+    }
 
     func commitRename() {
         guard let id = renaming else { return }
-        renaming = nil
+        cancelRename()
         let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty, title != boards.first(where: { $0.id == id })?.title else { return }
         perform(CommandIDs.boardRename, ["page": .string(ref(id)), "title": .string(title)])
@@ -310,7 +317,6 @@ struct BoardsPanel: View {
 struct BoardsList: View {
     @StateObject private var model: BoardsModel
     @ObservedObject private var session: EditorSession
-    @FocusState private var renameFocused: Bool
 
     init(app: NibApp, session: EditorSession) {
         _model = StateObject(wrappedValue: BoardsModel(app: app, session: session))
@@ -323,7 +329,7 @@ struct BoardsList: View {
             if model.boards.isEmpty {
                 NibEmptyState(symbol: .whiteboard, title: String(localized: "No boards yet"),
                               message: String(localized: "Add a board to start drawing."),
-                              primary: NibAction(String(localized: "Add Board")) { model.add() })
+                              primary: NibAction(String(localized: "Add Board"), command: CommandIDs.boardAdd) { model.add() })
                     .frame(maxHeight: .infinity)
             } else {
                 list
@@ -331,25 +337,32 @@ struct BoardsList: View {
             if model.isSelecting { selectionBar }
         }
         .nibSheet(isPresented: $model.showsMove) { MoveBoardsSheet(model: model) }
+        .onDisappear { model.cancelRename() }
     }
 
     private var toolbar: some View {
         HStack(spacing: 0) {
-            Button(model.isSelecting ? String(localized: "Done") : String(localized: "Select")) {
+            Button {
                 model.isSelecting.toggle()
-            }
-            .font(NibFont.button)
-            .foregroundStyle(NibColor.accent)
-            .buttonStyle(NibPressStyle())
-            .padding(.horizontal, NibSpacing.s)
-            .frame(minHeight: NibMetrics.hitTarget)
-            if model.isSelecting {
-                Button(String(localized: "Select All")) { model.selectAll() }
+            } label: {
+                Text(model.isSelecting ? String(localized: "Done") : String(localized: "Select"))
                     .font(NibFont.button)
-                    .foregroundStyle(NibColor.accent)
-                    .buttonStyle(NibPressStyle())
                     .padding(.horizontal, NibSpacing.s)
                     .frame(minHeight: NibMetrics.hitTarget)
+                    .contentShape(Rectangle())
+            }
+            .foregroundStyle(NibColor.accent)
+            .buttonStyle(NibPressStyle())
+            if model.isSelecting {
+                Button { model.selectAll() } label: {
+                    Text(String(localized: "Select All"))
+                        .font(NibFont.button)
+                        .padding(.horizontal, NibSpacing.s)
+                        .frame(minHeight: NibMetrics.hitTarget)
+                        .contentShape(Rectangle())
+                }
+                .foregroundStyle(NibColor.accent)
+                .buttonStyle(NibPressStyle())
             }
             Spacer(minLength: NibSpacing.s)
             NibIconButton(.templates, label: String(localized: "Templates"),
@@ -384,21 +397,8 @@ struct BoardsList: View {
                 BoardThumbnail(app: model.app, doc: model.doc, board: board)
             }
             if model.renaming == board.id {
-                TextField(String(localized: "Board name"), text: $model.renameText)
-                    .accessibilityLabel(String(localized: "Board name"))
-                    .font(NibFont.body)
-                    .multilineTextAlignment(.center)
-                    .submitLabel(.done)
-                    .focused($renameFocused)
-                    .onSubmit { model.commitRename() }
-                    .onKeyPress(.escape) {
-                        model.cancelRename()
-                        return .handled
-                    }
-                    .onAppear { renameFocused = true }
-                    .onChange(of: renameFocused) { _, focused in
-                        if !focused && model.renaming == board.id { model.commitRename() }
-                    }
+                BoardRenameEditor(text: $model.renameText, commit: { model.commitRename() },
+                                  cancel: { model.cancelRename() })
                     .padding(.horizontal, NibSpacing.s)
                     .frame(minHeight: NibMetrics.hitTarget)
                     .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
@@ -412,7 +412,10 @@ struct BoardsList: View {
         }
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
-        .onTapGesture { model.isSelecting ? model.toggle(board.id) : model.open(board.id) }
+        .onTapGesture {
+            guard model.renaming != board.id else { return }
+            model.isSelecting ? model.toggle(board.id) : model.open(board.id)
+        }
         .hoverEffect(.highlight)
         .contextMenu { contextMenu(board) }
         .modifier(BoardRowAccessibility(
@@ -443,6 +446,7 @@ struct BoardsList: View {
                     if let symbol = item.icon.flatMap({ NibSymbol(systemName: $0) }) { Image(nib: symbol) }
                 }
             }
+            .accessibilityIdentifier("cmd." + item.command)
         }
     }
 
@@ -472,6 +476,89 @@ struct BoardsList: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Selected boards"))
     }
+}
+
+/// Keep native text selection in the rename field, ahead of the canvas's Select All shortcut.
+struct BoardRenameEditor: UIViewRepresentable {
+    @Binding var text: String
+    var commit: () -> Void
+    var cancel: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> BoardRenameTextField {
+        let field = BoardRenameTextField()
+        field.text = text
+        field.placeholder = String(localized: "Board name")
+        field.accessibilityLabel = String(localized: "Board name")
+        field.font = NibUIFont.body
+        field.textColor = NibUIColor.label
+        field.tintColor = NibUIColor.accent
+        field.textAlignment = .center
+        field.adjustsFontForContentSizeCategory = true
+        field.returnKeyType = .done
+        field.delegate = context.coordinator
+        field.cancel = { context.coordinator.editor.cancel() }
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .editingChanged)
+        return field
+    }
+
+    func updateUIView(_ field: BoardRenameTextField, context: Context) {
+        context.coordinator.editor = self
+        if field.text != text { field.text = text }
+    }
+
+    static func dismantleUIView(_ field: BoardRenameTextField, coordinator: Coordinator) {
+        field.delegate = nil
+        field.resignFirstResponder()
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var editor: BoardRenameEditor
+        init(_ editor: BoardRenameEditor) { self.editor = editor }
+
+        @objc func changed(_ field: UITextField) { editor.text = field.text ?? "" }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            changed(textField)
+            editor.commit()
+            textField.resignFirstResponder()
+            return true
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            changed(textField)
+            editor.commit()
+        }
+    }
+}
+
+final class BoardRenameTextField: UITextField {
+    var cancel: (() -> Void)?
+    private var hasFocused = false
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil, !hasFocused {
+            hasFocused = becomeFirstResponder()
+            if hasFocused { selectRenameText(nil) }
+        }
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        let all = UIKeyCommand(title: String(localized: "Select All"), action: #selector(selectRenameText(_:)),
+                               input: "a", modifierFlags: .command)
+        let escape = UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(cancelRename))
+        all.wantsPriorityOverSystemBehavior = true
+        escape.wantsPriorityOverSystemBehavior = true
+        return [all, escape] + (super.keyCommands ?? [])
+    }
+
+    @objc func selectRenameText(_ sender: Any?) {
+        // Select synchronously: the next hardware-keyboard insertion must replace the entire draft.
+        selectedTextRange = textRange(from: beginningOfDocument, to: endOfDocument)
+    }
+    @objc private func cancelRename() { cancel?() }
 }
 
 /// A board row for VoiceOver: one button with its name, position and actions (Rename, Move Up, Move Down). While it is

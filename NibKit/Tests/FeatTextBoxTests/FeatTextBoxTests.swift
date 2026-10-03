@@ -773,6 +773,167 @@ final class FeatTextBoxTests: XCTestCase {
         withExtendedLifetime(floating) {}
     }
 
+    func testParagraphButtonsOpenAboveKeyboardAndChoicesFormatTheSelection() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let (host, editor) = self.editor(h)
+        defer { editor.detach(from: host) }
+        try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "first\nsecond\nuntouched"])
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        tv.selectedRange = NSRange(location: 0, length: 12)
+        editor.textViewDidChangeSelection(tv)
+        let bar = try XCTUnwrap(tv.inputAccessoryView as? TextKeyboardBar)
+        let state = try XCTUnwrap(editor.editingState)
+        func buttons(_ view: UIView) -> [UIButton] {
+            (view as? UIButton).map { [$0] } ?? view.subviews.flatMap(buttons)
+        }
+        for (title, panel, choice) in [
+            ("Alignment", TextFormatPanel.alignment, TextParagraphChoice.alignment(.center)),
+            ("Line Spacing", .lineSpacing, .spacing(.wide)),
+            ("List", .list, .list(.numberParen))
+        ] {
+            let button = try XCTUnwrap(buttons(bar).first { $0.accessibilityLabel == title })
+            XCTAssertFalse(button.showsMenuAsPrimaryAction, "An accessory menu must not open beneath the keyboard")
+            button.sendActions(for: .primaryActionTriggered)
+            XCTAssertTrue(state.popover.isPresented)
+            XCTAssertEqual(state.popover.panel, panel)
+            XCTAssertTrue(panel.choices.contains(choice))
+            choice.apply(to: state.model)
+            XCTAssertTrue(choice.isSelected(in: state.model.state))
+            state.popover.isPresented = false
+        }
+        state.model.indent(1)
+        editor.endEditing()
+        await editor.flush()
+        let paragraphs = try box(h).text.paragraphs
+        for paragraph in paragraphs.prefix(2) {
+            XCTAssertEqual(paragraph.align, .center)
+            XCTAssertEqual(paragraph.list, .numberParen)
+            XCTAssertEqual(paragraph.indent, 1)
+            XCTAssertGreaterThan(paragraph.lineSpacing ?? 0, 0)
+        }
+        XCTAssertEqual(paragraphs[2].align, .natural)
+        XCTAssertEqual(paragraphs[2].list, .plain)
+        XCTAssertEqual(paragraphs[2].indent, 0)
+    }
+
+    func testStyleNameAlertHasAPersistentAccessibleName() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let model = TextFormatModel(app: h.app, session: h.session, kind: .defaults)
+        let controller = UIHostingController(rootView: TextFormatInspector(model: model, naming: true))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 1000))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer {
+            controller.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func presentedAlert(_ controller: UIViewController) -> UIAlertController? {
+            if let alert = controller as? UIAlertController { return alert }
+            if let presented = controller.presentedViewController, let alert = presentedAlert(presented) { return alert }
+            return controller.children.lazy.compactMap { presentedAlert($0) }.first
+        }
+        controller.view.layoutIfNeeded()
+        for _ in 0..<100 where presentedAlert(controller) == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let alert = try XCTUnwrap(presentedAlert(controller))
+        let field = try XCTUnwrap(alert.textFields?.first)
+        let save = try XCTUnwrap(alert.actions.first { $0.title == "Save" })
+        XCTAssertFalse(save.isEnabled)
+        XCTAssertEqual(field.accessibilityLabel, "Name")
+        XCTAssertEqual(field.accessibilityIdentifier, "text.style.name")
+        XCTAssertTrue(field.isEnabled)
+        field.text = "Lab Caption"
+        field.sendActions(for: .editingChanged)
+        XCTAssertEqual(field.accessibilityLabel, "Name", "The name remains available after the placeholder disappears")
+        XCTAssertTrue(save.isEnabled)
+        field.text = "invalid/style"
+        field.sendActions(for: .editingChanged)
+        XCTAssertFalse(save.isEnabled, "The native prompt keeps the style-name validation")
+    }
+
+    func testNamedStyleFromEditingBecomesTheNextBoxesDefault() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        defer { editor.detach(from: host) }
+        editor.beginNewBox(page: Fixtures.page2, at: Point(100, 100))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        typeText("First", into: tv, editor)
+        tv.selectedRange = NSRange(location: 0, length: 5)
+        editor.textViewDidChangeSelection(tv)
+        let model = try XCTUnwrap(editor.editingState?.model)
+        model.stepSize(1)
+        let size = model.state.size
+        model.saveStyle(named: "Lab Caption")
+        await model.flush()
+        XCTAssertTrue(model.styleNames.contains("Lab Caption"))
+        model.applyNamed("Lab Caption")
+        model.saveAsDefault()
+        await model.flush()
+        editor.endEditing()
+        await editor.flush()
+        let saved = try XCTUnwrap(TextStyles.named("Lab Caption", h.app.settings))
+        XCTAssertEqual(saved.box.defaults.size, size)
+        XCTAssertEqual(TextStyles.defaultStyle(h.app.settings), saved)
+
+        editor.beginNewBox(page: Fixtures.page2, at: Point(200, 200))
+        let next = try XCTUnwrap(editor.editingTextView)
+        typeText("Second", into: next, editor)
+        editor.commitNow()
+        await editor.flush()
+        let (page, id) = try editingID(editor)
+        editor.endEditing()
+        await editor.flush()
+        let created = try box(h, id, page: page)
+        XCTAssertEqual(created.text.plainText, "Second")
+        XCTAssertEqual(created.style, saved.box)
+        XCTAssertEqual(TextLayout.resolved(RichTextEdit.merged(created.style.defaults,
+                       created.text.paragraphs[0].runs[0].attrs)).size, size)
+    }
+
+    func testFormatPopoverHasOneVerticalScrollOwnerForBoxControls() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let model = TextFormatModel(app: h.app, session: h.session, kind: .defaults)
+        let state = TextPopoverState()
+        state.isPresented = true
+        let controller = UIHostingController(rootView: TextFormatPopover(state: state, model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 1000))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for _ in 0..<5 {
+            controller.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        func scrolls(_ view: UIView) -> [UIScrollView] {
+            let own = (view as? UIScrollView).map { [$0] } ?? []
+            return own + view.subviews.flatMap(scrolls)
+        }
+        let vertical = scrolls(controller.view).filter { $0.bounds.height > 100 && $0.bounds.width > 200 }
+        XCTAssertEqual(vertical.count, 1, "The panel must scroll the whole inspector, including its box controls")
+        let scroll = try XCTUnwrap(vertical.first)
+        XCTAssertGreaterThan(scroll.contentSize.height, scroll.bounds.height)
+        model.saveStyle(named: "Lab Caption")
+        await model.flush()
+        for _ in 0..<5 {
+            controller.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let styles = try XCTUnwrap(scrolls(controller.view).first {
+            $0.bounds.height < 100 && $0.contentSize.width > $0.bounds.width
+        })
+        XCTAssertGreaterThan(styles.contentOffset.x, 0, "Saving reveals the new style beyond the built-in presets")
+        XCTAssertEqual(styles.contentOffset.x + styles.bounds.width, styles.contentSize.width, accuracy: 1)
+        let bottom = scroll.contentSize.height - scroll.bounds.height
+        scroll.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+        XCTAssertEqual(scroll.contentOffset.y, bottom, accuracy: 1)
+    }
+
     func testInspectorIdentityFollowsTheSelection() {
         let a = TextItemsInspector.identity(doc: Fixtures.docID, page: Fixtures.page1, ids: [Fixtures.textID])
         let b = TextItemsInspector.identity(doc: Fixtures.docID, page: Fixtures.page1, ids: [Fixtures.stickyID])

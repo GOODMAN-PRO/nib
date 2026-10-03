@@ -1,17 +1,19 @@
 import UIKit
 import SwiftUI
 import NibContracts
+import NibDesign
 
 /// Root of every window. Owns the tab model and implements `SceneNavigator`; everything visible is provided by
 /// features through `app.ui.screens` (library, document chrome, settings, onboarding) with minimal fallbacks.
 @MainActor
-final class ShellViewController: UIViewController, SceneNavigator {
+final class ShellViewController: UIViewController, SceneNavigator, UIGestureRecognizerDelegate {
     let app: NibApp
     let session: EditorSession
     private(set) var openDocuments: [DocumentID] = []
     private(set) var activeDocument: DocumentID?
     private var content: UIViewController?
     private var tabBar: UIView?
+    private var qaProbe: QAStateProbe?
     private var failureObserver: NSObjectProtocol?
     /// What the window shows right now, for key commands (`KeyCommandContext`): a document of `shownKind`, or the
     /// library / onboarding. `activeDocument` stays the selected tab while the library shows.
@@ -33,7 +35,22 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        synchroniseLiquidMode()
+        NotificationCenter.default.addObserver(self, selector: #selector(synchroniseLiquidMode),
+            name: SettingsStore.didChange, object: app.settings)
+        let focusTap = UITapGestureRecognizer(target: self, action: #selector(reclaimLibraryKeyFocusAfterTap))
+        focusTap.cancelsTouchesInView = false
+        focusTap.delaysTouchesBegan = false
+        focusTap.delaysTouchesEnded = false
+        focusTap.delegate = self
+        view.addGestureRecognizer(focusTap)
         view.backgroundColor = .systemBackground
+        if NibUITestMode.isEnabled {
+            let probe = QAStateProbe(shell: self)
+            qaProbe = probe
+            view.addSubview(probe)
+            view.addSubview(probe.clipboardProbe)
+        }
         registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
             (shell: ShellViewController, _: UITraitCollection) in
             shell.synchroniseContentAppearance()
@@ -42,7 +59,9 @@ final class ShellViewController: UIViewController, SceneNavigator {
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
             Task { @MainActor in self?.toastIfActive(message) }
         }
-        if let onboarding = app.ui.screens.onboarding?(app, self) {
+        if NibUITestMode.isEnabled && !UITestFixture.isReady {
+            display(FallbackEditorViewController(message: "Preparing test fixture…"))
+        } else if let onboarding = app.ui.screens.onboarding?(app, self) {
             display(onboarding)
         } else {
             showLibrary(folder: nil)
@@ -199,6 +218,11 @@ final class ShellViewController: UIViewController, SceneNavigator {
             return
         }
         activeDocument = nil
+        // Closing a tab behind the library must not replace the library (or detach its active modal).
+        guard session.document != nil else {
+            refreshTabBar()
+            return
+        }
         if let next = openDocuments.last {
             openDocument(next, page: nil, mode: .replace)
         } else {
@@ -223,6 +247,50 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // UIKit calls this only for presses not consumed by a UIKeyCommand.
+        // Embedded SwiftUI hosts can leave a registered command unhandled even
+        // with this shell as first responder, in documents as well as the library.
+        // Replay the same validated route (including scope and text-input priority);
+        // never intercept typing or dispatch a recognised shortcut a second time.
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key else { continue }
+            let input: String
+            switch key.keyCode {
+            case .keyboardReturnOrEnter, .keypadEnter: input = "return"
+            case .keyboardEscape: input = "escape"
+            case .keyboardTab: input = "tab"
+            case .keyboardDeleteOrBackspace: input = "delete"
+            case .keyboardUpArrow: input = "up"
+            case .keyboardDownArrow: input = "down"
+            case .keyboardLeftArrow: input = "left"
+            case .keyboardRightArrow: input = "right"
+            case .keyboardSpacebar: input = "space"
+            default: input = key.charactersIgnoringModifiers.lowercased()
+            }
+            // A forwarded press can carry the chord on its event rather than its
+            // individual UIKey. Keep both, or Command-D becomes the plain D tool
+            // shortcut and Command-Option-0 selects a colour instead of zooming.
+            let flags = key.modifierFlags.union(event?.modifierFlags ?? [])
+            var modifiers: KeyModifiers = []
+            if flags.contains(.command) { modifiers.insert(.command) }
+            if flags.contains(.shift) { modifiers.insert(.shift) }
+            if flags.contains(.alternate) { modifiers.insert(.option) }
+            if flags.contains(.control) { modifiers.insert(.control) }
+            #if DEBUG
+            NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0)")
+            #endif
+            guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
+                descriptors: app.content.keyCommands.all, in: keyCommandContext),
+                  let command = keyCommands?.first(where: { $0.propertyList as? String == descriptor.id }),
+                  let action = command.action, canPerformAction(action, withSender: command) else { continue }
+            runKeyCommand(command)
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
     /// What decides which key commands are live in this window: the document kind it shows, whether text has the
     /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
     /// so typing in a search field or a rename alert never switches tools), and whether it has tabs (the tab keys stay
@@ -245,13 +313,16 @@ final class ShellViewController: UIViewController, SceneNavigator {
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
                                        propertyList: d.id)
             command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
-            return command
+            return command.nibCommand(d.command)
         }
         keyCommandCache = (generation, context, commands)
         return commands
     }
 
     @objc private func runKeyCommand(_ sender: UIKeyCommand) {
+        #if DEBUG
+        NSLog("%@", "[Library key diagnostic] command \(String(describing: sender.propertyList)) typing \(keyCommandContext.isEditingText)")
+        #endif
         guard let d = liveKeyCommand(sender) else { return }
         activateWindow()
         let params = d.resolvedParams(for: session)
@@ -269,7 +340,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
     /// while the document's history or the window's UndoManager has a step. A disabled key falls through to the system.
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         guard action == #selector(runKeyCommand(_:)) else { return super.canPerformAction(action, withSender: sender) }
-        guard let command = sender as? UIKeyCommand, let d = liveKeyCommand(command) else { return false }
+        // UIKit also probes a selector with a nil/non-command sender when building
+        // the hardware-key routing table. Rejecting that probe disables every shortcut.
+        guard let command = sender as? UIKeyCommand else {
+            return !KeyCommandRouting.active(app.content.keyCommands.all, in: keyCommandContext).isEmpty
+        }
+        guard let d = liveKeyCommand(command) else { return false }
         return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
     }
 
@@ -312,11 +388,30 @@ final class ShellViewController: UIViewController, SceneNavigator {
         }
     }
 
-    /// Takes keyboard focus back when nothing in this window has it (the responder that had it left with the screen it
-    /// belonged to), so the key commands keep working. Never takes it from a responder in this window.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
+
+    @objc private func reclaimLibraryKeyFocusAfterTap() {
+        guard !showsDocument else { return }
+        // SwiftUI finishes updating button/scroll focus after delivering the tap.
+        DispatchQueue.main.async { [weak self] in self?.reclaimKeyFocusIfNeeded() }
+    }
+
+    /// Library controls can take non-text focus without providing the shell's registered keys.
+    /// Keep the shell focused there; a text input, sheet, or document editor keeps its own responder.
     private func reclaimKeyFocusIfNeeded() {
-        guard let window = viewIfLoaded?.window, window.isKeyWindow, !isFirstResponder,
-              !ShellFocus.hasFocus(in: window) else { return }
+        guard let window = viewIfLoaded?.window else { return }
+        // SwiftUI may present from a child host. During the transition no field
+        // has focus yet; claiming it here would take the new dialog's keyboard.
+        func hasModal(_ controller: UIViewController) -> Bool {
+            controller.presentedViewController != nil || controller.children.contains(where: hasModal)
+        }
+        guard ShellFocusPolicy.shouldReclaim(isKeyWindow: window.isKeyWindow, shellHasFocus: isFirstResponder,
+            hasModal: hasModal(self), isEditingText: ShellFocus.isEditingText(in: window),
+            showsDocument: showsDocument, hasFocusedResponder: ShellFocus.hasFocus(in: window)) else { return }
+        #if DEBUG
+        NSLog("%@", "[Library key diagnostic] reclaim from \(String(describing: ShellFocus.firstResponder()))")
+        #endif
         becomeFirstResponder()
     }
 
@@ -366,6 +461,10 @@ final class ShellViewController: UIViewController, SceneNavigator {
         addChild(vc)
         setOverrideTraitCollection(chromeTraits, forChild: vc)
         view.addSubview(vc.view)
+        if let qaProbe {
+            view.bringSubviewToFront(qaProbe)
+            view.bringSubviewToFront(qaProbe.clipboardProbe)
+        }
         vc.didMove(toParent: self)
         content = vc
         keyCommandCache = nil
@@ -373,6 +472,10 @@ final class ShellViewController: UIViewController, SceneNavigator {
         contentPresentationDidChange()
         // The new screen may take focus as it appears; only when nothing did does the shell take it.
         Task { @MainActor [weak self] in self?.reclaimKeyFocusIfNeeded() }
+    }
+
+    @objc private func synchroniseLiquidMode() {
+        traitOverrides[NibLiquidModeTrait.self] = NibLiquidMode(rawValue: app.settings.get(NibSettings.liquidMode)) ?? .full
     }
 
     private var chromeTraits: UITraitCollection {
@@ -463,7 +566,9 @@ enum ShellFocus {
         guard let window, let responder = firstResponder(), self.window(of: responder) === window else { return false }
         if let textView = responder as? UITextView { return textView.isEditable }
         if let field = responder as? UITextField { return field.isEnabled }
-        return responder is UIKeyInput
+        // Hosting/keyboard responders can implement UIKeyInput just to receive keys.
+        // Only an actual text input should suppress library focus reclamation.
+        return responder is UITextInput
     }
 
     private static func window(of responder: UIResponder) -> UIWindow? {
@@ -559,6 +664,7 @@ final class FallbackSettingsViewController: UITableViewController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak self] _ in
             self?.dismiss(animated: true)
         })
+        navigationItem.rightBarButtonItem?.accessibilityIdentifier = "sheet.dismiss"
     }
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { pages.count }

@@ -2767,7 +2767,8 @@
         "NibKit/Sources/NibAIProviders/AnthropicProvider.swift",
         "NibKit/Sources/NibAIProviders/OpenAICompatibleProvider.swift",
         "NibKit/Sources/NibAIProviders/NibHTTPProvider.swift",
-        "NibKit/Sources/NibAIProviders/ProviderStore.swift"
+        "NibKit/Sources/NibAIProviders/ProviderStore.swift",
+        "NibKit/Sources/NibAIProviders/SubscriptionBridge.swift"
       ],
       "tests": [
         "NibKit/Tests/NibAIProvidersTests/NibAIProvidersTests.swift",
@@ -2775,7 +2776,8 @@
         "NibKit/Tests/NibAIProvidersTests/Fixtures/anthropic_tool.txt",
         "NibKit/Tests/NibAIProvidersTests/Fixtures/openai_tool.txt",
         "NibKit/Tests/NibAIProvidersTests/Fixtures/ollama_tool.txt",
-        "NibKit/Tests/NibAIProvidersTests/Fixtures/nibhttp_tool.ndjson"
+        "NibKit/Tests/NibAIProvidersTests/Fixtures/nibhttp_tool.ndjson",
+        "NibKit/Tests/NibAIProvidersTests/SubscriptionBridgeTests.swift"
       ],
       "inventory": [
         "N-012"
@@ -2839,7 +2841,8 @@
       ],
       "tests": [
         "NibKit/Tests/FeatAIChatTests/FeatAIChatTests.swift",
-        "NibKit/Tests/FeatAIChatTests/ChatViewModelTests.swift"
+        "NibKit/Tests/FeatAIChatTests/ChatViewModelTests.swift",
+        "NibKit/Tests/FeatAIChatTests/SubscriptionEmptyStateTests.swift"
       ],
       "inventory": [
         "S-001",
@@ -2867,10 +2870,18 @@
       "files": [
         "NibKit/Sources/FeatAISettings/FeatAISettingsFeature.swift",
         "NibKit/Sources/FeatAISettings/ProviderListView.swift",
-        "NibKit/Sources/FeatAISettings/ProviderEditorView.swift"
+        "NibKit/Sources/FeatAISettings/ProviderEditorView.swift",
+        "NibKit/Sources/FeatAISettings/SubscriptionSetupView.swift",
+        "tools/agent/agent.mjs",
+        "tools/agent/install-macos.sh",
+        "tools/agent/README.md",
+        "tools/agent/smoke.mjs"
       ],
       "tests": [
-        "NibKit/Tests/FeatAISettingsTests/FeatAISettingsTests.swift"
+        "NibKit/Tests/FeatAISettingsTests/FeatAISettingsTests.swift",
+        "NibKit/Tests/FeatAISettingsTests/SubscriptionSetupTests.swift",
+        "tools/agent/index.js",
+        "tools/agent/agent.test.cjs"
       ],
       "inventory": [
         "S-018",

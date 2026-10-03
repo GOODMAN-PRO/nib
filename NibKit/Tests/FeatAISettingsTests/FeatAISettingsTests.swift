@@ -5,8 +5,33 @@ import NibDesign
 import NibTesting
 @testable import FeatAISettings
 
+private final class StartupSecretStore: SecretStore {
+    private(set) var accesses = 0
+    func get(service: String, account: String) -> Data? { accesses += 1; return nil }
+    func set(_ data: Data?, service: String, account: String) -> Bool { accesses += 1; return false }
+}
+
 @MainActor
 final class FeatAISettingsTests: XCTestCase {
+    func testStartCompletesWithoutAccessingKeychain() async {
+        let h = Harness()
+        let previous = Keychain.store
+        let secrets = StartupSecretStore()
+        Keychain.store = secrets
+        defer { Keychain.store = previous }
+        h.app.register([FeatAISettingsFeature.self])
+        let completed = expectation(description: "AI settings startup completes without external services")
+        Task { @MainActor in
+            await h.app.start([FeatAISettingsFeature.self])
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 4)
+        // Also catch work scheduled by start rather than directly awaited by it.
+        await Task.yield()
+        XCTAssertTrue(h.app.isStarted)
+        XCTAssertEqual(secrets.accesses, 0)
+    }
+
     private func setupStore() -> (Harness, SettingsProviderStore) {
         let h = Harness(features: [FeatAISettingsFeature.self])
         Keychain.store = InMemorySecretStore()
@@ -41,6 +66,44 @@ final class FeatAISettingsTests: XCTestCase {
         XCTAssertEqual(store.configs.map(\.id), [second.id])
         XCTAssertEqual(try h.snapshotAll(), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0) // Session settings deliberately aren't document undo steps.
+    }
+
+    func testAISectionOffersDirectProviderSetupAlongsideSubscriptionPagesAndSavesLocalModels() async throws {
+        let (h, store) = setupStore()
+        let pages = h.app.ui.settingsPages.all.filter { $0.owner == FeatAISettingsFeature.id }
+        let root = try XCTUnwrap(pages.first { $0.id == "settings.ai" })
+        XCTAssertEqual(root.title, "AI")
+        XCTAssertEqual(root.section, .ai)
+        XCTAssertEqual(Set(pages.filter { $0.id.hasPrefix(root.id + ".") }.map(\.id)),
+                       ["settings.ai.claude", "settings.ai.chatgpt", "settings.ai.addProvider"])
+        XCTAssertTrue(pages.allSatisfy { $0.section == root.section })
+        let add = try XCTUnwrap(pages.first { $0.title == "Add provider" })
+        XCTAssertEqual(add.section, .ai, "The multi-page AI section must expose provider creation directly")
+        for variant in NibSnapshot.Variant.allCases {
+            let image = NibSnapshot.image(add.makeView(h.app), size: NibMetrics.settingsSheetSize, variant: variant)
+            XCTAssertNotNil(image, "The registered Add provider destination must render: \(variant)")
+        }
+
+        // Follow the provider editor's production path, including its preset change and
+        // credential-free local endpoint used for both diagrams and audio transcription.
+        var draft = ProviderDraft(preset: .openAI)
+        draft.apply(.custom)
+        draft.name = "Local provider"
+        draft.baseURL = "http://127.0.0.1:7332/v1"
+        draft.model = "chat-model"
+        draft.transcriptionModel = "speech-model"
+        let config = try draft.config()
+        let runtime = try XCTUnwrap(h.app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self))
+        try await runtime.saveFromSettings(config, key: nil, app: h.app)
+        let model = ProviderListModel(app: h.app)
+        await model.refresh()
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.activeID, config.id)
+        XCTAssertEqual(store.provider(nil)?.config.model, "chat-model")
+        XCTAssertEqual(store.provider(nil)?.config.transcriptionModel, "speech-model")
+        XCTAssertFalse(try XCTUnwrap(model.providers.first).credentialsMissing)
+        XCTAssertNil(Keychain.getString(service: AIProviderConfig.keychainService, account: config.keychainAccount))
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
     func testSecretNeverReachesCommandHooksOrListResults() async throws {
         let (h, _) = setupStore()
@@ -301,7 +364,7 @@ final class FeatAISettingsTests: XCTestCase {
         catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
     }
     func testPresetsAndRegistrationConformance() async throws {
-        XCTAssertEqual(ProviderPreset.allCases.count, 7)
+        XCTAssertEqual(ProviderPreset.allCases, [.claudeSubscription, .chatGPTSubscription, .anthropic, .openAI, .openRouter, .ollama, .lmStudio, .custom, .nibHTTP])
         XCTAssertEqual(ProviderPreset.ollama.baseURL, "http://localhost:11434/v1")
         XCTAssertEqual(ProviderPreset.lmStudio.baseURL, "http://localhost:1234/v1")
         XCTAssertEqual(ProviderPreset.nibHTTP.kind, .nibHTTP)

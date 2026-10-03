@@ -25,13 +25,14 @@ enum CanvasMode: Equatable {
 /// clearance once: the safe area already includes the host's additional insets (including document tabs).
 enum CanvasChromeInsets {
     static func resolve(safeArea: UIEdgeInsets, additional: UIEdgeInsets, compact: Bool,
-                        topDocked: Bool, fallbackTop: CGFloat?) -> UIEdgeInsets {
+                        topDocked: Bool, fallbackTop: CGFloat?, fallbackBottom: CGFloat? = nil) -> UIEdgeInsets {
         var top = safeArea.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
         if additional.top == 0, let fallbackTop { top = max(top, fallbackTop) }
         // EditorHost subtracts this baseline when forwarding occupied bounds. Keep it when there is a
         // measured bottom obstruction, but release the phone's empty bottom rail when its palette is on top.
         let bottomBaseline = compact ? NibMetrics.canvasBottomInsetCompact : NibSpacing.l
-        let bottom = safeArea.bottom + (topDocked && additional.bottom == 0 ? NibSpacing.l : bottomBaseline)
+        var bottom = safeArea.bottom + (topDocked && additional.bottom == 0 ? NibSpacing.l : bottomBaseline)
+        if additional.bottom == 0, let fallbackBottom { bottom = max(bottom, fallbackBottom) }
         return UIEdgeInsets(top: top, left: safeArea.left, bottom: bottom, right: safeArea.right)
     }
 }
@@ -308,7 +309,7 @@ protocol DocumentScrollViewHost: AnyObject {
 /// document zoom (view points per page point). Only the pages on screen (plus one either side) have views, taken
 /// from a small pool. Paper shadows live outside the zoomed view so their size never scales. Tiles are baked for
 /// the zoom level when a zoom ends; during a pinch the current tiles scale.
-final class DocumentScrollView: UIScrollView {
+final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     /// Zoomed; holds the page views in layout space.
     let contentView = UIView()
     /// Above the pages, below attachments: the input half's wet ink canvases (F101). Scroll-content coordinates.
@@ -349,6 +350,19 @@ final class DocumentScrollView: UIScrollView {
     private func restrictGesturesToFingers() {
         panGestureRecognizer.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
         pinchGestureRecognizer?.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
+    }
+
+    /// UIKit uses the scroll view as its navigation recognizers' delegate. Keep that delegate and
+    /// let navigation coexist with the descendant wet-ink recognizer from the FIRST contact: the first
+    /// finger may already have begun drawing before the second arrives. Waiting for two here lets
+    /// PencilKit fail the still-possible pan/pinch before that second contact. F101's failure gate still
+    /// rejects palms/claimed contacts and its touch stream cancels the provisional stroke.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        let navigation = [panGestureRecognizer, pinchGestureRecognizer].compactMap { $0 }
+        guard navigation.contains(where: { $0 === gestureRecognizer }) else { return false }
+        if navigation.contains(where: { $0 === other }) { return true }
+        return other.view?.isDescendant(of: wetInkContainer) == true
     }
 
     override init(frame: CGRect) {

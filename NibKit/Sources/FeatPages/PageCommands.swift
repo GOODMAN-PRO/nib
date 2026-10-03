@@ -139,7 +139,24 @@ struct PageAdd: NibCommand {
         let keys = OrderKeys.keys(position, anchor: anchor, count: specs.count, in: current)
         var records: [PageRecord] = []
         for (i, spec) in specs.enumerated() {
-            records.append(PageRecord(id: ids[i] ?? NibID.make(), order: keys[i], size: spec.size, background: spec.background))
+            var background = spec.background
+            // F021 persists the creation choice on this notebook. Explicit template/import choices still win.
+            if source == "current", current.meta.kind == .notebook,
+               let distribution = current.meta.ext?["create.paperDistribution"],
+               distribution["pattern"]?.stringValue == "everyOther",
+               let paper = try? distribution["background"]?.decode(Background.self) {
+                let paperIndex = current.livePages.filter { page in
+                    page.order < keys[i] && !(page.background.template.map { PageTemplates.isCover($0, ctx.content) } ?? false)
+                }.count + i
+                if paperIndex % 2 == 1 {
+                    var plain = TemplateRef(TemplateIDs.blank)
+                    plain.params[TemplateParamNames.paper] = paper.template?.params[TemplateParamNames.paper]
+                    background = Background(kind: .template, template: plain)
+                } else {
+                    background = paper
+                }
+            }
+            records.append(PageRecord(id: ids[i] ?? NibID.make(), order: keys[i], size: spec.size, background: background))
         }
         // One batch write: a long PDF added page by page does not re-sort the page list once per page.
         try ctx.mutate { tx in try tx.put(records, doc: doc) }

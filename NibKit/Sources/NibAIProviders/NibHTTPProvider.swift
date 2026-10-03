@@ -11,8 +11,10 @@ final class NibHTTPProvider: AIProvider {
     let config: AIProviderConfig
     private let credential: ProviderCredential
     private let http: ProviderHTTP
+    private let bridgeAllowed: Bool
 
-    init(config: AIProviderConfig, credential: ProviderCredential, http: ProviderHTTP) {
+    init(config: AIProviderConfig, credential: ProviderCredential, http: ProviderHTTP, bridgeAllowed: Bool = true) {
+        self.bridgeAllowed = bridgeAllowed
         self.config = config
         self.credential = credential
         self.http = http
@@ -22,15 +24,42 @@ final class NibHTTPProvider: AIProvider {
         let config = self.config
         let credential = self.credential
         let http = self.http
+        let bridgeAllowed = self.bridgeAllowed
         let ctx = ProviderCallContext(call: .chat, config: config, timeout: http.idleTimeout(for: config.baseURL))
         return ProviderStreaming.stream(ctx) { emit in
             let key = try credential.key(for: config)
-            let body = try JSONWire.encode(try NibAgentWire.body(request, config: config))
+            var payload = try NibAgentWire.body(request, config: config)
+            let subscription = config.extraHeaders["X-Nib-Subscription"] == "1"
+            if subscription && !bridgeAllowed && !request.tools.isEmpty {
+                throw NibError(.permissionDenied, "Nib’s tool bridge is off.", hint: "enable the bridge in Settings › Bridge to use subscription tools")
+            }
+            let bridge = subscription && config.supportsTools && !request.tools.isEmpty ? try SubscriptionBridge(tools: request.tools) : nil
+            defer { bridge?.stop() }
+            if let bridge {
+                let pairing = try await bridge.start(host: config.extraHeaders["X-Nib-Bridge-Host"])
+                payload = payload.merging(["bridge": pairing])
+            }
+            let body = try JSONWire.encode(payload)
             var headers: [String: String] = [:]
             if let key = key, !key.isEmpty { headers["Authorization"] = "Bearer " + key }
             let req = ProviderRequests.make(config.baseURL, method: "POST", body: body, accept: "application/x-ndjson",
                                             headers: headers, config: config, timeout: ctx.timeout)
-            let (response, bytes) = try await http.stream(req)
+            let response: HTTPURLResponse
+            let bytes: URLSession.AsyncBytes
+            do {
+                (response, bytes) = try await http.stream(req)
+            } catch {
+                if error is CancellationError || (error as? URLError)?.code == .cancelled { throw error }
+                if subscription, let status = error as? HTTPStatusError, status.status == 401 || status.status == 403 {
+                    throw NibError(.permissionDenied, "Nib Agent did not accept this pairing token.",
+                                   hint: "paste the current pairing string from your Mac in Settings › AI")
+                }
+                if subscription {
+                    throw NibError(.unavailable, "Could not reach Nib Agent on your Mac.",
+                                   hint: "start Nib Agent, keep both devices on the same network, and check the pairing token in Settings › AI")
+                }
+                throw error
+            }
             var decoder = NibAgentStreamDecoder(context: ctx)
             // Proxies sometimes re-frame the lines as Server-Sent Events; both carry the same event objects.
             let isSSE = response.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("text/event-stream") ?? false

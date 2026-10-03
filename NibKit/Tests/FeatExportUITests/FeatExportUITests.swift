@@ -32,7 +32,7 @@ final class FeatExportUITests: XCTestCase {
             let data = Fixtures.pdfData()
             let asset = try ctx.services.assets!.putTemporary(data, ext: "pdf")
             return ["files": .array((0..<probe.fileCount).map { index in
-                ["asset": .string("tmp:" + asset.name), "name": .string("Notes\(index).pdf"), "bytes": .number(Double(data.count))]
+                ["asset": .string("tmp:" + asset.name), "name": .string(probe.fileName ?? "Notes\(index).pdf"), "bytes": .number(Double(data.count))]
             })]
         }
         return (h, presenter, probe)
@@ -84,6 +84,91 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertEqual(presenter.draft?.format, "zip")
         XCTAssertEqual(presenter.selection?.refs, ["folder:FIXTUREFLD01"])
         XCTAssertEqual(presenter.selection?.pageScopes, [.all])
+    }
+
+    func testSelectedBoardDialogPreservesScopeAndDoesNotEditBoards() async throws {
+        let (h, presenter, probe) = harness()
+        let doc = Fixtures.whiteboardID
+        let second = PageRecord(id: "EXPORTBRD02", order: "k", size: nil,
+                                background: .ofTemplate("builtin.whiteboardDots"), title: "Board 2")
+        h.persistence.heads[doc]?.pages.append(second)
+        h.session.document = doc
+        h.session.page = second.id
+        let before = try h.app.workspace.peekContent(doc)
+        let depths = h.undoDepths()
+        let firstRef = NodeRef.page(doc, Fixtures.boardID).description
+        let secondRef = NodeRef.page(doc, second.id).description
+
+        _ = try await h.run("export.present", ["docs": [.string(NodeRef.document(doc).description)],
+                                               "pages": [.string(firstRef)]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        XCTAssertTrue(selection.isBoard)
+        XCTAssertEqual(selection.documents[0].pages.map(\.title), ["Board 1", "Board 2"])
+        XCTAssertEqual(selection.currentPage, secondRef)
+        XCTAssertEqual(draft.scope, .selected)
+        XCTAssertEqual(draft.selectedPages, [firstRef])
+        let params = try draft.submitParams(destination: "files", selection: selection)
+        XCTAssertEqual(params["pages"], .array([.string(firstRef)]))
+
+        // Closing discards the local draft, without submitting an export or changing the boards.
+        var cancelledDraft = draft
+        cancelledDraft.selectedPages = [secondRef]
+        XCTAssertEqual(draft.selectedPages, [firstRef])
+        XCTAssertTrue(probe.calls.isEmpty)
+        XCTAssertEqual(try h.app.workspace.peekContent(doc), before)
+        XCTAssertEqual(h.session.page, second.id)
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
+    func testFormatChoicesStayInOneRowAtPopoverWidth() {
+        let formats = ["pdf", "images", "nibnote", "zip"]
+        let titles = ["pdf": "PDF", "images": "Images", "nibnote": "Nib file", "zip": "Zipped Folder"]
+        for width in [NibMetrics.popoverWidth - 2 * NibSpacing.l, CGFloat(600)] {
+            let picker = ExportFormatPicker(selection: .constant("pdf"), options: formats) { titles[$0]! }
+                .environment(\.dynamicTypeSize, .large)
+            let host = UIHostingController(rootView: picker)
+            let size = host.sizeThatFits(in: CGSize(width: width, height: 2000))
+            XCTAssertLessThanOrEqual(size.width, width + 1)
+            XCTAssertLessThanOrEqual(size.height, NibMetrics.hitTarget + 1,
+                                     "Format choices must not push selected boards below the popover viewport")
+        }
+    }
+
+    func testBoardOptionsPresentBeforeFloatingAnchorAttaches() async throws {
+        let (h, presenter, probe) = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let page = NodeRef.page(Fixtures.whiteboardID, Fixtures.boardID).description
+        _ = try await h.run(CommandIDs.exportPresent, [
+            "docs": [.string(NodeRef.document(Fixtures.whiteboardID).description)], "pages": [.string(page)]
+        ])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        let before = try h.app.workspace.peekContent(Fixtures.whiteboardID)
+        let depths = h.undoDepths()
+        let parent = UIViewController()
+        parent.view.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        let host = AttachingExportHost()
+        let popover = SystemExportPresenter().showPopover(selection: selection, draft: draft,
+            printing: false, instant: false, app: h.app, session: h.session, host: host, parent: parent)
+
+        XCTAssertTrue(host.isPresenting("exportui.dialog"), "Anchor attachment must not prevent opening options")
+        XCTAssertNil(popover.sourceRect)
+        XCTAssertEqual(popover.source, "chrome.anchor.share")
+        XCTAssertEqual(popover.draft.selectedPages, [page])
+        XCTAssertEqual(popover.draft.scope, .selected)
+        let bounds = CGRect(x: 256, y: 32, width: 768, height: 736)
+        XCTAssertTrue(bounds.contains(ExportPopover.fallbackAnchor(in: bounds)))
+
+        host.convertedRect = CGRect(x: 920, y: 40, width: 44, height: 44)
+        XCTAssertEqual(popover.updateSourceRect(), host.convertedRect)
+        XCTAssertEqual(host.anchorID, ExportPresentation.anchorID)
+        host.dismiss("exportui.dialog")
+        XCTAssertFalse(host.isPresenting("exportui.dialog"))
+        XCTAssertTrue(probe.calls.isEmpty)
+        XCTAssertEqual(try h.app.workspace.peekContent(Fixtures.whiteboardID), before)
+        XCTAssertEqual(h.undoDepths(), depths)
     }
 
     func testDialogSubmissionsPreserveScopesAndOptions() async throws {
@@ -318,6 +403,49 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertEqual(ExportFiles.uniqueName("notes.pdf", used: &used), "notes (2).pdf")
     }
 
+    func testFilesExportKeepsReadablePDFsUntilSaveOrCancelThenCleansUp() async throws {
+        for saved in [true, false] {
+            let (h, presenter, probe) = harness()
+            probe.fileCount = 2
+            probe.fileName = "Physics — Motion.pdf"
+            let system = SystemExportPresenter()
+            defer { system.finishFiles(false) }
+            let presented = expectation(description: "Files presentation requested")
+            var deliveredURLs: [URL] = []
+            var completed = false
+            presenter.onDelivery = { urls in
+                deliveredURLs = urls
+                return try await system.waitForFiles { presented.fulfill() }
+            }
+            let export = Task {
+                let result = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"], "destination": "files"])
+                completed = true
+                return result
+            }
+            await fulfillment(of: [presented], timeout: 5)
+            // The presentation call has returned, but a destination has not been picked.
+            // Let queued work run: export completion here would delete Files' source PDFs.
+            await Task.yield()
+            XCTAssertFalse(completed)
+            XCTAssertEqual(deliveredURLs.map(\.lastPathComponent), ["Physics — Motion.pdf", "Physics — Motion (2).pdf"])
+            for url in deliveredURLs {
+                XCTAssertNotNil(PDFDocument(data: try Data(contentsOf: url)))
+            }
+            do {
+                _ = try await system.waitForFiles { XCTFail("A second picker replaced the pending delivery") }
+                XCTFail("Concurrent file delivery was accepted")
+            } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+            system.finishFiles(saved)
+            system.finishFiles(!saved) // A duplicate callback must not resume twice or change the outcome.
+            let result = try await export.value
+            XCTAssertEqual(result["completed"], .bool(saved))
+            let cleaned = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                deliveredURLs.allSatisfy { !FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().path) }
+            }, object: nil)
+            await fulfillment(of: [cleaned], timeout: 5)
+        }
+    }
+
     func testMixedPDFSizesRemainSeparatePrintPages() throws {
         let portrait = CGRect(x: 0, y: 0, width: 595, height: 842)
         let landscape = CGRect(x: 0, y: 0, width: 842, height: 595)
@@ -399,9 +527,28 @@ final class FeatExportUITests: XCTestCase {
 }
 
 @MainActor
+private final class AttachingExportHost: FloatingHosting {
+    var convertedRect: CGRect?
+    var anchorID: String?
+    private var contents: [String: AnyView] = [:]
+    func present(_ id: String, content: AnyView) { contents[id] = content }
+    func dismiss(_ id: String) { contents[id] = nil }
+    func isPresenting(_ id: String) -> Bool { contents[id] != nil }
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { convertedRect }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
+        guard convertedRect != nil else { return false }
+        anchorID = id
+        return true
+    }
+    func removeAnchor(_ id: String) { if anchorID == id { anchorID = nil } }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+}
+
+@MainActor
 private final class ExportProbe {
     var calls: [JSONValue] = []
     var fileCount = 1
+    var fileName: String?
     var onExport: (() -> Void)?
 }
 
@@ -413,6 +560,7 @@ private final class RecordingExportPresenter: ExportPresenting {
     var filesExistedDuringDelivery = false
     var printCount = 0
     var lockedScreens = 0
+    var onDelivery: (([URL]) async throws -> Bool)?
     func showLocked(doc: DocumentID, retry: String, params: JSONValue, ctx: CommandContext) async throws { lockedScreens += 1 }
     func show(selection: ExportSelection, draft: ExportDraft, printing: Bool, instant: Bool, ctx: CommandContext) async throws {
         self.selection = selection
@@ -421,6 +569,7 @@ private final class RecordingExportPresenter: ExportPresenting {
     func deliver(_ urls: [URL], destination: String, ctx: CommandContext) async throws -> Bool {
         destinations.append(destination)
         filesExistedDuringDelivery = urls.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+        if let onDelivery { return try await onDelivery(urls) }
         return true
     }
     func printPDF(_ url: URL, title: String, ctx: CommandContext) async throws -> Bool {

@@ -38,6 +38,10 @@ public enum FeatZoomWindowFeature: NibFeature {
         // container (contracts-v2 chrome overlay). Its canvas's zoom box attachment owns it, so it shows while that
         // canvas shows the box's page.
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "zoomwindow.keyboard", owner: id, placement: .center, surface: .none,
+            recedesWhileWriting: false, isInteractive: false, docKinds: [.notebook],
+            makeView: { ctx in AnyView(ZoomKeyboardShortcuts(app: ctx.app, session: ctx.session)) }))
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
             id: paneOverlayID, owner: id, placement: .bottom, surface: .panel, order: 300, docKinds: [.notebook],
             isVisible: { ctx in store.activePane(for: ctx.session) != nil },
             makeView: { ctx in

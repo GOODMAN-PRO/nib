@@ -137,6 +137,8 @@ struct ViewZoom: NibCommand {
     struct Params: Codable {
         var scale: Double?
         var fit: Bool?
+        /// Explicit paper fit, independent of scroll direction. `fit: true` retains its existing default.
+        var fitMode: String?
         var actual: Bool?
         /// Additive: "in" or "out" by one zoom step.
         var step: String?
@@ -158,11 +160,12 @@ struct ViewZoom: NibCommand {
         summary: "Zoom the window's page: scale (1 = 100 %, notebooks 0.5–8, boards 0.05–4), fit: true, actual: true, or step in/out.",
         params: .obj(["scale": .num("zoom factor, 1 = 100 %", min: 0.01, max: 16),
                       "fit": .bool("fit the page width (a board: all of its content)"),
+                      "fitMode": .str("fit the whole page or its width", choices: ["page", "width"]),
                       "actual": .bool("100 %"),
                       "step": .str("one zoom step", choices: ["in", "out"]),
                       "at": .point,
                       "page": .ref]),
-        examples: [["scale": 2], ["fit": true], ["actual": true], ["step": "in"]],
+        examples: [["scale": 2], ["fit": true], ["actual": true], ["step": "in"], ["fitMode": "page"], ["fitMode": "width"]],
         effect: .session)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
@@ -177,6 +180,14 @@ struct ViewZoom: NibCommand {
         }
         let canvas = try CanvasLocator.required(ctx, doc: doc)
         let limits = canvas.zoomLimits
+        if let mode = p.fitMode {
+            guard mode == "page" || mode == "width" else {
+                throw NibError(.invalidParams, "fitMode must be page or width", path: "$.fitMode")
+            }
+            canvas.fitPaper(widthOnly: mode == "width")
+            let z = canvas.zoom
+            return Output(scale: z, percent: ZoomRules.percent(z), min: limits.lowerBound, max: limits.upperBound)
+        }
         let target: Double
         if p.actual == true {
             target = 1
@@ -206,6 +217,38 @@ struct ViewZoom: NibCommand {
         canvas.setZoom(target, anchor: anchor, centreFit: p.fit == true)
         let z = canvas.host.zoomScale
         return Output(scale: z, percent: ZoomRules.percent(z), min: limits.lowerBound, max: limits.upperBound)
+    }
+}
+
+/// Last-resort double-tap navigation in the normal tap-handler chain. F101 cancels the pending
+/// finger dots when this returns handled, including while finger drawing is enabled.
+struct CanvasDoubleTapZoom: NibCommand {
+    struct Params: Codable {
+        var page: String
+        var point: [Double]
+        var gesture: String?
+    }
+    struct Output: Codable { var handled: Bool }
+    static let descriptor = CommandDescriptor(
+        id: "canvas.doubleTapZoom", title: "Double-Tap Zoom",
+        summary: "Toggle fit and twice fit at an unclaimed finger double-tap.",
+        params: .obj(["page": .ref, "point": .point, "gesture": .str(), "ref": .ref], required: ["page", "point"]),
+        examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [500, 600], "gesture": "doubleTap"]],
+        effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        guard p.gesture == CanvasGesture.doubleTap.rawValue,
+              case let .page(doc, page)? = NodeRef(p.page), p.point.count == 2,
+              p.point.allSatisfy(\.isFinite), let canvas = CanvasLocator.canvas(showing: doc, ctx),
+              !canvas.isClosed, canvas.didInitialLayout,
+              canvas.host.isReadOnly || canvas.host.activeTool == nil || canvas.host.activeTool?.inputMode == .pencilKit
+        else { return Output(handled: false) }
+        let point = canvas.host.viewPoint(Point(p.point[0], p.point[1]), page: page)
+        guard canvas.host.pageTransform(page) != nil,
+              !canvas.host.attachments.contains(where: { $0.hitTest(point, isPencil: false, host: canvas.host) })
+        else { return Output(handled: false) }
+        canvas.toggleZoom(at: point)
+        return Output(handled: true)
     }
 }
 

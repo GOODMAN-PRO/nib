@@ -62,6 +62,7 @@ struct DevConsoleView: View {
         NibButton(String(localized: "Export nib.d.ts"), symbol: .share) { model.perform(ManagerCommands.sdkExport, ["share": true], reload: false) }
         if !pluginID.isEmpty {
             NibIconButton(.retry, label: String(localized: "Reload Plugin"), size: .panel) { model.perform(CommandIDs.pluginReload, ["id": .string(pluginID)]) }
+            .accessibilityIdentifier("cmd." + CommandIDs.pluginReload)
         }
     }
     private func evaluate() {

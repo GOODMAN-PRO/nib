@@ -8,6 +8,209 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testRetainedPopoverStopsNativeScrollingAndHitTestingAcrossRelayouts() async throws {
+        func panel(_ presented: Bool, width: CGFloat) -> some View {
+            NibPopoverPanel(title: "Apple Pencil", width: width, maxHeight: 220) {
+                ForEach(0..<24) { index in
+                    Button("Preference \(index)") {}
+                        .frame(minHeight: NibMetrics.hitTarget)
+                }
+            }
+            .budsFrom("settings", isPresented: .constant(presented))
+        }
+        let host = UIHostingController(rootView: panel(true, width: 312))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 760, height: 706))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scroll(in view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { scroll(in: $0) }.first
+        }
+        func settle() async throws {
+            for _ in 0..<5 {
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        try await settle()
+        let original = try XCTUnwrap(scroll(in: host.view))
+        XCTAssertGreaterThan(original.contentSize.height, original.bounds.height)
+        original.setContentOffset(CGPoint(x: 0, y: 180), animated: false)
+
+        // Closing, relayout while closed, then reopening must retain the content and
+        // scroll position, but never leave an invisible native input surface on top.
+        for (presented, width) in [(false, CGFloat(312)), (false, 280), (true, 280)] {
+            host.rootView = panel(presented, width: width)
+            try await settle()
+            let current = try XCTUnwrap(scroll(in: host.view))
+            XCTAssertTrue(current === original, "Keep the user's position in a long preferences panel")
+            XCTAssertEqual(current.isScrollEnabled, presented)
+            XCTAssertEqual(current.isUserInteractionEnabled, presented)
+            XCTAssertEqual(current.accessibilityElementsHidden, !presented)
+            if !presented {
+                XCTAssertNil(current.hitTest(CGPoint(x: current.bounds.midX, y: current.bounds.midY), with: nil),
+                             "A closed popover must not consume the next navigation or preset tap")
+                // Reproduce UIKit refreshing the retained host after the probe disabled it.
+                // SwiftUI's source-level gate must still protect the controls underneath.
+                current.isUserInteractionEnabled = true
+                let point = current.convert(CGPoint(x: current.bounds.midX, y: current.bounds.midY), to: host.view)
+                let hit = host.view.hitTest(point, with: nil)
+                XCTAssertFalse(hit?.isDescendant(of: current) == true,
+                               "A native host refresh must not resurrect a closed menu's hit target")
+                current.isUserInteractionEnabled = false
+            } else {
+                let point = current.convert(CGPoint(x: current.bounds.midX, y: current.bounds.midY), to: host.view)
+                XCTAssertTrue(host.view.hitTest(point, with: nil)?.isDescendant(of: current) == true,
+                              "Reopening must restore actual interaction with preferences")
+            }
+            XCTAssertEqual(current.contentOffset.y, 180, accuracy: 1)
+        }
+    }
+
+    func testPlannerFormAdaptsToAConstrainedViewportWithoutLosingDateAndWeekControls() async throws {
+        // A keyboard, landscape phone or resized iPad window supplies a finite height,
+        // unlike the ideal-size query below. The default must not force a 640 pt form
+        // outside that viewport, and the list must still scroll to its lower controls.
+        for size in [CGSize(width: 720, height: 320), CGSize(width: 390, height: 460)] {
+            let host = UIHostingController(rootView: SheetViewportFixture().modifier(NibSheetChrome())
+                .ignoresSafeArea())
+            let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            func list(in view: UIView) -> UIScrollView? {
+                if let scroll = view as? UIScrollView { return scroll }
+                return view.subviews.lazy.compactMap { list(in: $0) }.first
+            }
+            for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let scroll = try XCTUnwrap(list(in: host.view))
+            // SwiftUI List may extend its native scroll view under the header and
+            // reserve that space with adjustedContentInset instead of its frame.
+            let frame = scroll.convert(scroll.bounds.inset(by: scroll.adjustedContentInset), to: host.view)
+            XCTAssertGreaterThan(frame.height, 200, "Planner controls need more than a single-row viewport")
+            XCTAssertGreaterThanOrEqual(frame.minY, 60, "Scrolling content must clear the sheet header")
+            XCTAssertLessThanOrEqual(frame.maxY, size.height + 1)
+            XCTAssertGreaterThan(scroll.contentSize.height, 0)
+            let bottom = max(-scroll.adjustedContentInset.top,
+                             scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+            scroll.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(scroll.contentOffset.y, bottom, accuracy: 1,
+                           "The date and count rows must remain reachable in the constrained form")
+        }
+    }
+
+    func testClosedPopoverDoesNotCoverAnEditableTextView() async throws {
+        // A retained native popover used to consume a tap even after its SwiftUI
+        // content had disappeared. Exercise the underlying input hit target too.
+        let host = UIHostingController(rootView:
+            NibPopoverPanel(title: "Menu") { Button("Action") {} }
+                .budsFrom("source", isPresented: .constant(false)))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func list(in view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { list(in: $0) }.first
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let scroll = try XCTUnwrap(list(in: host.view))
+        XCTAssertNil(scroll.hitTest(CGPoint(x: scroll.bounds.midX, y: scroll.bounds.midY), with: nil),
+                     "A closed menu must not claim the text editor's touch")
+        let parent = try XCTUnwrap(scroll.superview)
+        let input = UITextView(frame: scroll.frame)
+        parent.insertSubview(input, belowSubview: scroll)
+        let point = CGPoint(x: input.frame.midX, y: input.frame.midY)
+        let hit = try XCTUnwrap(parent.hitTest(point, with: nil))
+        XCTAssertTrue(hit === input || hit.isDescendant(of: input),
+                      "The input behind the retained popover must receive the tap")
+        XCTAssertTrue(input.becomeFirstResponder())
+        input.insertText("First block title")
+        XCTAssertTrue(input.isFirstResponder)
+        XCTAssertEqual(input.text, "First block title")
+    }
+
+    func testFormSheetLeavesAUsableViewportForANativeList() async throws {
+        // Package tests have no UIWindowScene to present a modal. Exercise the same ideal
+        // size query used by presentationSizing, with a real hosted native list instead.
+        let content = SheetViewportFixture().modifier(NibSheetChrome())
+            .fixedSize(horizontal: false, vertical: true)
+        let host = UIHostingController(rootView: content)
+        // This is a form-content measurement, not a full-screen hosting controller.
+        // A hostless UIWindow's status/home safe areas are not part of the 640 pt form.
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 1366))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        let size = host.sizeThatFits(in: CGSize(width: 720, height: 1366))
+        host.view.frame = CGRect(origin: .zero, size: size)
+        host.view.layoutIfNeeded()
+        func list(in view: UIView) -> UIScrollView? {
+            if let list = view as? UIScrollView { return list }
+            return view.subviews.lazy.compactMap { list(in: $0) }.first
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let visible = try XCTUnwrap(list(in: host.view), "The form must contain the native list")
+        XCTAssertGreaterThan(visible.bounds.height, 300,
+                             "Intrinsic-height fitting must not collapse a planner form to one row")
+        XCTAssertEqual(size.height, NibMetrics.newDocumentSheetSize.height, accuracy: 1)
+        // Existing explicitly sized and small intrinsic sheets remain backward compatible.
+        for height in [CGFloat(160), 640] {
+            let fixed = Color.clear.frame(width: 720, height: height).modifier(NibSheetChrome())
+                .fixedSize(horizontal: false, vertical: true)
+            XCTAssertEqual(NibSnapshot.fittingSize(fixed, width: 720).height, height, accuracy: 1)
+        }
+    }
+
+    func testClosedPopoverDisablesItsNativeScrollHitTargetAndReopens() async throws {
+        func panel(_ presented: Bool) -> some View {
+            NibPopoverPanel(title: "Menu") { Button("Action") {} }
+                .budsFrom("source", isPresented: .constant(presented))
+        }
+        let host = UIHostingController(rootView: panel(false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrollView(_ view: UIView) -> UIScrollView? {
+            if let scroll = view as? UIScrollView { return scroll }
+            return view.subviews.lazy.compactMap { scrollView($0) }.first
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let scroll = try XCTUnwrap(scrollView(host.view))
+        XCTAssertFalse(scroll.isUserInteractionEnabled, "A hidden menu must not consume taps on Library or sidebar buttons")
+        XCTAssertTrue(scroll.accessibilityElementsHidden)
+        host.rootView = panel(true)
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(scroll.isUserInteractionEnabled, "The same retained popover must become interactive when reopened")
+        XCTAssertFalse(scroll.accessibilityElementsHidden)
+    }
+
+    func testToastDoesNotCaptureOutsideTapsOrPopoverDismissal() {
+        let field = DropletField()
+        field.reduceMotion = true
+        field.setWorldAnchor("source", CGRect(x: 300, y: 700, width: 1, height: 1))
+        field.setRest("toast", CGRect(x: 100, y: 620, width: 400, height: 48), style: .toast)
+        var toastDismissed = false
+        field.setBud("toast", source: "source", presented: true, instant: true) { toastDismissed = true }
+        XCTAssertTrue(field.node("toast").presentation.isDrawn)
+        XCTAssertFalse(field.hasOpenBud, "A toast must leave navigation and library cells interactive")
+
+        field.setRest("menu", CGRect(x: 100, y: 200, width: 300, height: 200), style: .popover)
+        var menuDismissed = false
+        field.setBud("menu", source: "source", presented: true, instant: true) { menuDismissed = true }
+        XCTAssertTrue(field.hasOpenBud)
+        field.dismissBuds()
+        XCTAssertTrue(menuDismissed)
+        XCTAssertFalse(toastDismissed, "Outside dismissal belongs to the menu, not the Undo notification")
+        field.unregister("menu")
+        field.unregister("toast")
+    }
+
     func testReducedMotionBudsStayAtTheirFinalMeasuredPosition() {
         for mode in [NibLiquidMode.full, .off] {
             let field = DropletField()
@@ -222,6 +425,21 @@ final class SharedChromeRegressionTests: XCTestCase {
             let measured = NibSnapshot.fittingSize(on, width: 44, variant: variant)
             XCTAssertGreaterThanOrEqual(measured.width, 44)
             XCTAssertGreaterThanOrEqual(measured.height, 44)
+        }
+    }
+}
+
+private struct SheetViewportFixture: View {
+    var body: some View {
+        VStack(spacing: 0) {
+            NibSheetHeader("New Event Planner", onCancel: {})
+            List {
+                Text("Layout")
+                Text("Week starts on")
+                DatePicker("Starts", selection: .constant(Date()), displayedComponents: .date)
+                Text("7 days")
+            }
+            .listStyle(.insetGrouped)
         }
     }
 }

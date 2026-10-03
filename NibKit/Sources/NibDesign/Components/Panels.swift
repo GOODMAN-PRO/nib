@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Popover content chrome on Deep water: title (headline) and optional subtitle, 16 pt insets, scrolls past 520 pt.
 /// Put it in a droplet: `.droplet(id, style: .popover).budsFrom(source, isPresented:)`, or use `NibBudPopover`.
@@ -12,6 +13,7 @@ public struct NibPopoverPanel<Content: View>: View {
     let maxHeight: CGFloat
     @State private var contentHeight: CGFloat = NibMetrics.popoverMaxHeight
     @Environment(DropletField.self) private var field: DropletField?
+    @Environment(\.nibBud) private var bud
 
     public init(title: String, subtitle: String? = nil, width: CGFloat = NibMetrics.popoverWidth,
                 maxHeight: CGFloat = NibMetrics.popoverMaxHeight, @ViewBuilder content: () -> Content) {
@@ -23,6 +25,7 @@ public struct NibPopoverPanel<Content: View>: View {
     }
 
     public var body: some View {
+        let isPresented = bud?.isPresented.wrappedValue ?? true
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.m) {
                 HStack(alignment: .firstTextBaseline) {
@@ -39,13 +42,28 @@ public struct NibPopoverPanel<Content: View>: View {
                 content
             }
             .padding(NibSpacing.l)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
+            // Empty insets and gaps are part of the scrolling surface. Without a
+            // hit shape, a drag there can reach chrome or the outside-tap catcher.
+            .contentShape(Rectangle())
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                // A native viewport can round the same content to adjacent fractional
+                // heights. Feeding that noise into its own frame restarts layout forever.
+                if abs(height - contentHeight) > 0.5 { contentHeight = height }
+            }
+            .background(PopoverScrollInteraction(isPresented: isPresented))
         }
+        // Gate the native scroll host at its source, not only the animated droplet around it.
+        // UIKit can rebuild/re-enable that host during a glass or layout update. A closed
+        // menu must immediately stop intercepting Library, width slots and other menus,
+        // even while its retained content is still animating out.
+        .scrollDisabled(!isPresented)
+        .allowsHitTesting(isPresented)
         .scrollBounceBehavior(.basedOnSize)
         .frame(width: min(width, viewport.width))
         .frame(height: min(contentHeight, maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
+        .accessibilityHidden(!isPresented)
     }
 
     private var viewport: CGSize {
@@ -54,6 +72,36 @@ public struct NibPopoverPanel<Content: View>: View {
         }
         return CGSize(width: max(0, bounds.width - 2 * NibMetrics.chromeInset),
                       height: max(0, bounds.height - 2 * NibMetrics.chromeInset))
+    }
+}
+
+/// SwiftUI can keep a hidden popover's native scroll view above neighbouring controls.
+/// Disable that UIKit hit target as well as the droplet's SwiftUI gestures, retaining its closing animation.
+private struct PopoverScrollInteraction: UIViewRepresentable {
+    let isPresented: Bool
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+    func updateUIView(_ view: Probe, context: Context) {
+        view.isPresented = isPresented
+        view.updateScrollView()
+    }
+    final class Probe: UIView {
+        var isPresented = true
+        override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
+        func updateScrollView() {
+            var ancestor = superview
+            while let view = ancestor {
+                if let scroll = view as? UIScrollView {
+                    scroll.isUserInteractionEnabled = isPresented
+                    scroll.accessibilityElementsHidden = !isPresented
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
     }
 }
 
@@ -179,6 +227,8 @@ public struct NibBudPopover<Content: View>: View {
                 .budsFrom(source, isPresented: $isPresented)
                 .position(x: centre.x - frame.minX, y: centre.y - frame.minY)
         }
+        .allowsHitTesting(isPresented)
+        .accessibilityHidden(!isPresented)
     }
 }
 
@@ -217,6 +267,7 @@ public struct NibInspectorSection<Content: View>: View {
                             .hitPadding(13)
                     }
                     .buttonStyle(.plain)
+                    .nibCommand(action.command)
                 }
             }
             content
@@ -332,22 +383,25 @@ public struct NibSheetHeader: View {
     let isPrimaryEnabled: Bool
     let onCancel: () -> Void
     let onPrimary: () -> Void
+    let primaryCommand: String?
 
     /// `cancelTitle` nil = "Cancel" (a default argument cannot read the internal `Bundle.module`).
     public init(_ title: String, cancelTitle: String? = nil,
                 primaryTitle: String? = nil, isPrimaryEnabled: Bool = true, onCancel: @escaping () -> Void,
-                onPrimary: @escaping () -> Void = {}) {
+                onPrimary: @escaping () -> Void = {}, primaryCommand: String? = nil) {
         self.title = title
         self.cancelTitle = cancelTitle ?? String(localized: "Cancel", bundle: .module)
         self.primaryTitle = primaryTitle
         self.isPrimaryEnabled = isPrimaryEnabled
         self.onCancel = onCancel
         self.onPrimary = onPrimary
+        self.primaryCommand = primaryCommand
     }
 
     public var body: some View {
         HStack(spacing: NibSpacing.m) {
             Button(cancelTitle, action: onCancel)
+                .accessibilityIdentifier("sheet.dismiss")
                 .font(NibFont.body)
                 .foregroundStyle(NibColor.accent)
                 .buttonStyle(.plain)
@@ -362,6 +416,7 @@ public struct NibSheetHeader: View {
                 .accessibilityAddTraits(.isHeader)
             if let primaryTitle {
                 NibButton(primaryTitle, kind: .primary, size: .compact, shortcut: .defaultAction, action: onPrimary)
+                    .nibCommand(primaryCommand)
                     .disabled(!isPrimaryEnabled)
             }
         }
@@ -391,8 +446,10 @@ public extension View {
 struct NibSheetChrome: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
-            chrome(content)
-                .presentationSizing(.form.fitted(horizontal: true, vertical: true))
+            NibSheetContentLayout {
+                chrome(content)
+            }
+            .presentationSizing(.form.fitted(horizontal: true, vertical: true))
         } else {
             chrome(content)
         }
@@ -406,6 +463,28 @@ struct NibSheetChrome: ViewModifier {
                 .presentationCornerRadius(NibRadius.sheet)
                 .presentationBackground(NibColor.backgroundSecondary)
         }
+    }
+}
+
+/// Native lists have no useful intrinsic height. Give flexible content a form-sized
+/// proposal during ideal sizing, without imposing that height on an intrinsic sheet
+/// (or on the finite viewport supplied by a keyboard or a smaller window).
+private struct NibSheetContentLayout: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        if let height = proposal.height, height.isFinite {
+            return content.sizeThatFits(proposal)
+        }
+        let intrinsic = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        let form = content.sizeThatFits(ProposedViewSize(width: proposal.width,
+                                                       height: NibMetrics.newDocumentSheetSize.height))
+        // A fixed-height view returns the same size for both proposals. A List/ScrollView
+        // expands to fill the form proposal instead of collapsing to its ~10 pt ideal.
+        return form.height > intrinsic.height ? form : intrinsic
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading, proposal: ProposedViewSize(bounds.size))
     }
 }
 
@@ -430,39 +509,77 @@ public struct NibPanelHeader<Trailing: View>: View {
         self.menu = menu()
     }
 
+    @Environment(\.dynamicTypeSize) private var typeSize
+
     public var body: some View {
-        HStack(spacing: 10) {
-            Image(nib: symbol)
-                .font(NibFont.glyph(.round))
-                .foregroundStyle(NibColor.label)
-                .frame(width: 30, height: 30)
-                .background(NibColor.fill3, in: Circle())
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: NibSpacing.s) {
-                    Text(title)
-                        .font(NibFont.headline)
-                        .foregroundStyle(NibColor.label)
-                        .lineLimit(2)
-                        .accessibilityAddTraits(.isHeader)
-                    if let badge { NibBadge(badge) }
-                }
-                if let subtitle {
-                    Text(subtitle)
-                        .font(NibFont.caption1)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .lineLimit(2)
+        Group {
+            if typeSize.isAccessibilitySize {
+                stacked
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) {
+                        glyph
+                        heading.fixedSize(horizontal: true, vertical: true)
+                        Spacer(minLength: NibSpacing.s)
+                        controls
+                    }
+                    stacked
                 }
             }
-            Spacer(minLength: NibSpacing.s)
-            menu
-            NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
-                          action: onClose)
         }
         .padding(.leading, NibSpacing.l)
         .padding(.trailing, NibSpacing.xs)
         .padding(.vertical, NibSpacing.s)
         .frame(minHeight: 60)
+    }
+
+    private var stacked: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.s) {
+            HStack {
+                glyph
+                Spacer(minLength: NibSpacing.s)
+                controls
+            }
+            heading
+                .padding(.trailing, NibSpacing.m)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var glyph: some View {
+        Image(nib: symbol)
+            .font(NibFont.glyph(.round))
+            .foregroundStyle(NibColor.label)
+            .frame(width: 30, height: 30)
+            .background(NibColor.fill3, in: Circle())
+            .accessibilityHidden(true)
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: NibSpacing.s) {
+                Text(title)
+                    .font(NibFont.headline)
+                    .foregroundStyle(NibColor.label)
+                    .accessibilityAddTraits(.isHeader)
+                if let badge { NibBadge(badge) }
+            }
+            if let subtitle {
+                Text(subtitle)
+                    .font(NibFont.caption1)
+                    .foregroundStyle(NibColor.labelSecondary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 0) {
+            menu
+            NibIconButton(.xmark, label: String(localized: "Close \(title)", bundle: .module), size: .round,
+                          action: onClose)
+                .accessibilityIdentifier("cmd.panel.close")
+        }
     }
 }
 
@@ -474,7 +591,7 @@ public extension NibPanelHeader where Trailing == EmptyView {
 }
 
 /// Chrome Nib draws around a plugin panel: `NibPanelHeader` with the "Plugin" badge and More (Reload, Permissions,
-/// Report a Problem). The plugin draws only inside `content`, and never draws its own glass.
+/// Report a problem). The plugin draws only inside `content`, and never draws its own glass.
 public struct NibPluginPanelChrome<Content: View>: View {
     let name: String
     let symbol: NibSymbol
@@ -502,7 +619,7 @@ public struct NibPluginPanelChrome<Content: View>: View {
                 Menu {
                     Button(String(localized: "Reload", bundle: .module), action: onReload)
                     Button(String(localized: "Permissions", bundle: .module), action: onPermissions)
-                    Button(String(localized: "Report a Problem", bundle: .module), action: onReport)
+                    Button(String(localized: "Report a problem", bundle: .module), action: onReport)
                 } label: {
                     Image(nib: .more)
                         .font(NibFont.glyph(.panel))

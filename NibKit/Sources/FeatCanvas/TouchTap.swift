@@ -1,5 +1,6 @@
 import UIKit
 import UIKit.UIGestureRecognizerSubclass
+import os
 import NibContracts
 
 /// A stillness clock. Predictions never advance it or become durable stroke points.
@@ -80,6 +81,11 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
     private func finish(_ touches: Set<UITouch>, event: UIEvent, cancelled: Bool) {
         enteringBegan = false
         for touch in touches {
+            #if DEBUG
+            if cancelled {
+                Logger(subsystem: "app.nib", category: "canvasinput").debug("Touch stream cancelled: phase=\(touch.phase.rawValue) coalesced=\(event.coalescedTouches(for: touch)?.count ?? 0) recognizerState=\(self.state.rawValue)")
+            }
+            #endif
             if let id = ids.removeValue(forKey: ObjectIdentifier(touch)) { ended?(touch, event, id, cancelled) }
         }
         state = ids.isEmpty ? .ended : .changed
@@ -104,10 +110,31 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
 
     static func samples(touch: UITouch, event: UIEvent, touchID: Int, reduceLatency: Bool,
                         host: CanvasHost) -> [CanvasSample] {
-        let actual = event.coalescedTouches(for: touch) ?? [touch]
+        let history = event.coalescedTouches(for: touch)
+        let actual = history ?? []
+        #if DEBUG
+        if actual.isEmpty {
+            Logger(subsystem: "app.nib", category: "canvasinput").debug("Touch sample without coalesced history: provided=\(history != nil) eventDelta=\(event.timestamp - touch.timestamp); using current touch")
+        }
+        #endif
         let predicted = reduceLatency ? (event.predictedTouches(for: touch) ?? []) : []
-        return actual.compactMap { sample($0, event: event, touchID: touchID, predicted: false, host: host) }
-            + predicted.compactMap { sample($0, event: event, touchID: touchID, predicted: true, host: host) }
+        return samples(current: sample(touch, event: event, touchID: touchID, host: host),
+                       coalesced: actual.compactMap { sample($0, event: event, touchID: touchID, host: host) },
+                       predicted: predicted.compactMap { sample($0, event: event, touchID: touchID, predicted: true, host: host) })
+    }
+
+    /// Coalescing is optional, including an empty array for synthesized/direct input. The actual
+    /// callback touch must survive even when UIKit supplies no history (or history without its tip).
+    /// Keep each touch's timestamp: UIEvent.timestamp describes the batch, not each Pencil sample.
+    static func samples(current: CanvasSample?, coalesced: [CanvasSample], predicted: [CanvasSample]) -> [CanvasSample] {
+        var actual = coalesced.filter { !$0.isPredicted }.sorted { $0.timestamp < $1.timestamp }
+        if let current = current, !actual.contains(where: {
+            $0.timestamp == current.timestamp && $0.location == current.location
+        }) {
+            actual.append(current)
+            actual.sort { $0.timestamp < $1.timestamp }
+        }
+        return actual + predicted
     }
 
     static func sample(_ touch: UITouch, event: UIEvent, touchID: Int, predicted: Bool = false,

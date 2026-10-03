@@ -197,6 +197,7 @@ struct CommentMenuContent: View {
                 Text(entry.title)
             }
         }
+        .accessibilityIdentifier("cmd." + entry.command)
     }
 }
 
@@ -593,6 +594,7 @@ struct CommentThreadView: View {
         let hasText = !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return HStack(alignment: .bottom, spacing: NibSpacing.s) {
             NibField(text: $reply, prompt: prompt, lines: 1...5)
+                .accessibilityLabel(prompt)
                 .focused($composerFocused)
                 .onKeyPress(.return, phases: .down) { press in
                     guard press.modifiers.contains(.command) else { return .ignored }

@@ -373,7 +373,7 @@ struct TranscriptPanel: View {
                 NibToggle(String(localized: "Follow playback"), isOn: $follow)
                 if confirmRegenerate {
                     NibBanner(String(localized: "Regenerating replaces all transcript corrections and cannot be undone."),
-                        action: NibAction(String(localized: "Replace Transcript")) {
+                        action: NibAction(String(localized: "Replace Transcript"), command: CommandIDs.transcriptRegenerate) {
                             confirmRegenerate = false
                             model.run(CommandIDs.transcriptRegenerate, ["clip": .string(model.selectedClip)])
                         })
@@ -387,7 +387,8 @@ struct TranscriptPanel: View {
             if context.app.services.ai?.isConfigured == true && context.app.commands.descriptor(CommandIDs.meetingSummarize) != nil {
                 NibButton(tab == .summary ? String(localized: "Regenerate Summary") : String(localized: "Summarise"), symbol: .assistant, expands: true) {
                     model.run(CommandIDs.meetingSummarize, ["clip": .string(model.selectedClip)])
-                }.disabled(model.busy)
+                }
+                .accessibilityIdentifier("cmd." + CommandIDs.meetingSummarize).disabled(model.busy)
             }
             if model.busy { ProgressView().accessibilityLabel(String(localized: "Transcribing")) }
         }.padding(NibSpacing.l)
@@ -445,7 +446,8 @@ struct TranscriptRecordingSettings: View {
                         NibRow(item.name, subtitle: availability(item), icon: .language) {
                             if language == item.id { Image(nib: .checkmark).foregroundStyle(NibColor.accent) }
                         }
-                    }.buttonStyle(.plain).hoverEffect(.highlight).accessibilityLabel(item.name)
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.settingsSet).buttonStyle(.plain).hoverEffect(.highlight).accessibilityLabel(item.name)
                     .accessibilityValue(availability(item))
                     .accessibilityAddTraits(language == item.id ? [.isSelected] : [])
                 }

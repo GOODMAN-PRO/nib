@@ -18,6 +18,19 @@ public enum FeatLibraryUIFeature: NibFeature {
             _ = try await context.execute(CommandIDs.librarySetView, ["folder": params["folder"]?.stringValue.map(JSONValue.string) ?? "lib", "sidebar": false])
             return result
         }
+        // Window-level external drops enter import.files without a destination. The
+        // browser owns the current folder; preserve explicit picker/canvas destinations.
+        if let importer = app.commands.entry(CommandIDs.importFiles) {
+            app.commands.register(importer.descriptor) { params, context in
+                var routed = params
+                if params["folder"] == nil, params["doc"] == nil,
+                   let app = context.app, let session = context.activeSession, session.document == nil,
+                   let model = LibraryModels.get(app).models[session.id] {
+                    routed = params.merging(["folder": model.folderRef])
+                }
+                return try await importer.handler(routed, context)
+            }
+        }
     }
     public static func register(_ app: NibApp) {
         app.commands.register(LibrarySetView.self)
@@ -35,9 +48,9 @@ public enum FeatLibraryUIFeature: NibFeature {
         app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".endSelection", title: String(localized: "Deselect All"),
             shortcut: KeyShortcut("escape"), command: CommandIDs.librarySetView,
             params: ["selection": "clear", "menu": "none"], scope: .library, owner: id))
-        app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".rename", title: String(localized: "Rename"),
+        app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".openSelection", title: String(localized: "Open"),
             shortcut: KeyShortcut("return"), command: CommandIDs.librarySetView,
-            params: ["renameSelected": true], scope: .library, owner: id))
+            params: ["openSelected": true], scope: .library, owner: id))
         app.ui.panels.register(PanelDescriptor(id: "libraryui.move", title: String(localized: "Move Items"), icon: NibSymbol.folder.name,
             placement: .sheet, order: 0, owner: id) { context in
                 AnyMovePicker.make(context)
@@ -47,6 +60,7 @@ public enum FeatLibraryUIFeature: NibFeature {
 
 struct LibrarySetView: NibCommand {
     struct Params: Codable {
+        var collection: LibraryCollection?
         var folder: String?
         var layout: LibraryLayout?
         var sort: LibrarySort?
@@ -58,19 +72,24 @@ struct LibrarySetView: NibCommand {
         var selection: String?
         var refs: [String]?
         var menu: String?
+        var menuIfCurrent: String?
         var rename: String?
         var renameSelected: Bool?
+        var openSelected: Bool?
         var search: String?
         var sidebar: Bool?
     }
     typealias Output = JSONValue
     static let descriptor = CommandDescriptor(id: "library.setView", title: "Set Library View",
         summary: "Set this window's folder, layout, sort, filter or selection; present or close a registered library panel with params.",
-        params: .obj(["folder": .str("folder:<id>, or lib for root"), "layout": .str(choices: LibraryLayout.allCases.map(\.rawValue)),
+        params: .obj(["collection": .str(choices: LibraryCollection.allCases.map(\.rawValue)),
+            "folder": .str("folder:<id>, or lib for root"), "layout": .str(choices: LibraryLayout.allCases.map(\.rawValue)),
             "sort": .str(choices: LibrarySort.allCases.map(\.rawValue)), "filter": .str(choices: LibraryFilter.allCases.map(\.rawValue)),
             "panel": .str("registered panel id, or documents"), "params": .anything("panel parameters"), "close": .bool(),
             "selection": .str(choices: ["all", "clear", "begin", "toggle", "replace"]), "refs": .arr(.ref),
-            "menu": .str(choices: ["new", "app", "sort", "none"]), "rename": .ref, "renameSelected": .bool(),
+            "menu": .str(choices: ["new", "app", "sort", "none"]),
+            "menuIfCurrent": .str("Apply this menu change only while this source menu is current", choices: ["new", "app", "sort"]),
+            "rename": .ref, "renameSelected": .bool(), "openSelected": .bool(),
             "search": .str(), "sidebar": .bool()]),
         examples: [["layout": "list", "sort": "created"], ["folder": "lib", "filter": "folders"]],
         effect: .session, target: .app)
@@ -88,11 +107,13 @@ struct LibrarySetView: NibCommand {
             throw NibError.invalid("Unknown selection operation", path: "$.selection")
         }
         let existing = LibraryModels.get(app).models[session.id]
-        let targetFolder = p.folder != nil ? folder ?? nil : existing?.folder
+        let targetFolder = p.folder != nil ? folder ?? nil : p.collection != nil || p.panel == "documents" ? nil : existing?.folder
         let saved = app.settings.json(LibraryOrder.viewKey(targetFolder))
-        let targetLayout = p.layout ?? (p.folder == nil ? existing?.layout : nil) ?? LibraryLayout(rawValue: saved?["layout"]?.stringValue ?? "") ?? .grid
-        let targetSort = p.sort ?? (p.folder == nil ? existing?.sort : nil) ?? LibrarySort(rawValue: saved?["sort"]?.stringValue ?? "") ?? .modified
-        let targetFilter = p.filter ?? (p.folder == nil ? existing?.filter : nil) ?? LibraryFilter(rawValue: saved?["filter"]?.stringValue ?? "") ?? .all
+        let navigates = p.folder != nil || p.collection != nil || p.panel == "documents"
+        let targetCollection = p.folder != nil || p.panel == "documents" ? LibraryCollection.documents : p.collection ?? existing?.collection ?? .documents
+        let targetLayout = p.layout ?? (!navigates ? existing?.layout : nil) ?? LibraryLayout(rawValue: saved?["layout"]?.stringValue ?? "") ?? .grid
+        let targetSort = p.sort ?? (!navigates ? existing?.sort : nil) ?? (targetCollection != .documents ? .modified : LibrarySort(rawValue: saved?["sort"]?.stringValue ?? "") ?? .modified)
+        let targetFilter = p.filter ?? (!navigates ? existing?.filter : nil) ?? (targetCollection != .documents ? .documents : LibraryFilter(rawValue: saved?["filter"]?.stringValue ?? "") ?? .all)
         let result: JSONValue
         if let panel = p.panel, panel != "documents" {
             if p.close == true {
@@ -102,25 +123,43 @@ struct LibrarySetView: NibCommand {
                 result = ["panel": .string(panel), "placement": .string(descriptor?.placement == .floating ? "sheet" : descriptor!.placement.rawValue)]
             }
         } else {
-            result = ["folder": .string(targetFolder.map { NodeRef.folder($0).description } ?? "lib"),
+            result = ["collection": .string(targetCollection.rawValue), "folder": .string(targetFolder.map { NodeRef.folder($0).description } ?? "lib"),
                       "layout": .string(targetLayout.rawValue), "sort": .string(targetSort.rawValue), "filter": .string(targetFilter.rawValue)]
         }
         guard !ctx.dryRun else { return result }
         let model = existing ?? LibraryModels.get(app).model(session)
+        if navigates {
+            model.menu = nil
+            model.renaming = nil
+            model.search = ""
+        }
+        if let collection = p.collection {
+            model.collection = collection; model.folder = nil; model.closeTab()
+            model.selection.clear(); model.search = ""
+            model.layout = targetLayout; model.sort = targetSort; model.filter = targetFilter
+        }
         if p.folder != nil {
+            model.collection = .documents
             model.folder = targetFolder; model.restoreView(); model.closeTab(); model.selection.clear()
         }
         if let panel = p.panel {
-            if panel == "documents" { model.closeTab() }
+            if panel == "documents" {
+                model.closeTab(); model.collection = .documents
+                model.folder = nil; model.selection.clear()
+            }
             else {
                 if p.close == true { model.closePanel(panel) }
-                else if let descriptor { model.openPanel(descriptor, params: p.params ?? [:]) }
-                if p.folder != nil { await model.markDirty() }
+                else if let descriptor {
+                    var params = p.params ?? [:]
+                    if panel == "organize.folder.new", params["folder"] == nil { params = params.merging(["folder": model.folderRef]) }
+                    model.openPanel(descriptor, params: params)
+                }
+                if navigates { await model.markDirty() }
                 return result
             }
         }
         model.layout = targetLayout; model.sort = targetSort; model.filter = targetFilter
-        if p.layout != nil || p.sort != nil || p.filter != nil {
+        if model.collection == .documents && (p.layout != nil || p.sort != nil || p.filter != nil) {
             app.settings.setJSON(LibraryOrder.viewKey(model.folder), ["layout": .string(model.layout.rawValue), "sort": .string(model.sort.rawValue), "filter": .string(model.filter.rawValue)])
         }
         if let selection = p.selection {
@@ -133,13 +172,28 @@ struct LibrarySetView: NibCommand {
             default: break
             }
         }
-        if let menu = p.menu { model.menu = menu == "none" ? nil : menu }
-        if let rename = p.rename { model.renaming = rename.isEmpty ? nil : rename }
+        if let menu = p.menu, p.menuIfCurrent == nil || model.menu == p.menuIfCurrent {
+            #if DEBUG
+            NSLog("%@", "[Library menu diagnostic] \(menu) \(model.menuAnchors)")
+            #endif
+            model.menu = menu == "none" ? nil : menu
+        }
+        if let rename = p.rename {
+            model.menu = nil
+            model.renaming = rename.isEmpty ? nil : rename
+        }
         if p.renameSelected == true, model.selection.refs.count == 1 { model.renaming = model.selection.refs.first }
+        if p.openSelected == true, model.selection.refs.count == 1, let ref = model.selection.refs.first {
+            if case .folder? = NodeRef(ref) {
+                return try await ctx.execute(CommandIDs.librarySetView, ["folder": .string(ref), "sidebar": false])
+            }
+            model.selection.clear()
+            return try await ctx.execute(CommandIDs.docOpen, ["doc": .string(ref)])
+        }
         if let search = p.search { model.search = search }
         if let sidebar = p.sidebar { model.sidebarVisible = sidebar }
         if p.sort != nil || p.filter != nil || p.search != nil { model.applySort() }
-        if p.folder != nil { await model.markDirty() }
+        if navigates { await model.markDirty() }
         return result
     }
 }

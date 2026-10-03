@@ -192,6 +192,7 @@ struct NotificationsPage: View {
                     }
                     .contentShape(Rectangle())
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
                 .accessibilityHint(Text(String(localized: "Opens the Settings app")))
             } footer: {
                 SettingsFooter(String(localized: "Nib uses notifications for study reminders and timers. Allow or silence them in the Settings app."))

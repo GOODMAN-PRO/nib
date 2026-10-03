@@ -77,6 +77,90 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertFalse(SearchFilter.pdf.includes(hit()))
     }
 
+    func testTitleMatchesShowOneHighlightedHeadingAndDocumentMetadata() {
+        var result = hit(kind: "title", docKind: "studySet")
+        result.title = "Café notes: CAFÉ revision"
+        result.snippet = result.title
+        let heading = result.heading(query: "cafe")
+        XCTAssertEqual(String(heading.characters), result.title)
+        let highlights = heading.runs.filter { $0.backgroundColor == NibColor.accentWash }
+        XCTAssertEqual(highlights.map { String(heading[$0.range].characters) }, ["Café", "CAFÉ"])
+        XCTAssertNil(result.detailSnippet, "A title match must not repeat its heading as a snippet")
+        XCTAssertEqual(result.documentKindLabel, "Study set")
+
+        result.kind = "typed"
+        result.snippet = "Notes from the café"
+        XCTAssertEqual(result.detailSnippet, "Notes from the café")
+        XCTAssertTrue(result.heading(query: "cafe").runs.allSatisfy { $0.backgroundColor == nil },
+            "Content matches highlight the snippet, not the document heading")
+    }
+
+    func testTitleIdentityUsesDocumentKindAndSafeUnknownFallback() {
+        let cases: [(String, NibSymbol, String, String)] = [
+            ("notebook", .notebook, "Untitled notebook", "Notebook"),
+            ("whiteboard", .whiteboard, "Untitled whiteboard", "Whiteboard"),
+            ("textDocument", .textDocument, "Untitled text document", "Text document"),
+            ("studySet", .studySets, "Untitled study set", "Study set"),
+            ("unknown", .library, "Untitled document", "Document")
+        ]
+        for (kind, symbol, fallback, metadata) in cases {
+            var result = hit(kind: "title", docKind: kind)
+            XCTAssertEqual(result.symbol, symbol)
+            XCTAssertEqual(result.documentKindLabel, metadata)
+            XCTAssertEqual(result.displayTitle, "Fixture")
+            for title in ["", " \n "] {
+                result.title = title
+                XCTAssertEqual(result.displayTitle, fallback)
+                XCTAssertNil(result.detailSnippet)
+            }
+        }
+        XCTAssertEqual(hit(kind: "pdf").symbol, .pdf)
+        XCTAssertEqual(hit(kind: "ink").symbol, .pen)
+        XCTAssertEqual(hit(kind: "typed", docKind: "textDocument").symbol, .text)
+    }
+
+    func testSearchFieldPromptFollowsScope() {
+        let state = SearchState()
+        for scope in ["lib", "folder:FOLDER01"] {
+            state.scope = scope
+            XCTAssertEqual(state.searchPrompt, "Search your notes")
+        }
+        for scope in ["document", NodeRef.document(Fixtures.docID).description,
+                      NodeRef.page(Fixtures.docID, Fixtures.page1).description] {
+            state.scope = scope
+            XCTAssertEqual(state.searchPrompt, "Find in this document")
+        }
+    }
+
+    func testMatchControlsDisableForEmptyPendingFailedAndFilteredResults() {
+        let state = SearchState()
+        state.scope = NodeRef.document(Fixtures.docID).description
+        XCTAssertFalse(state.canStepMatches)
+        state.query = "Hello"
+        XCTAssertFalse(state.canStepMatches)
+        state.matches = [hit()]
+        state.reconcileSelection()
+        XCTAssertTrue(state.canStepMatches, "A single result can still be revealed by the existing command")
+        state.loading = true
+        XCTAssertFalse(state.canStepMatches)
+        state.loading = false
+        state.error = "Search unavailable"
+        XCTAssertFalse(state.canStepMatches)
+        state.error = nil
+        state.filter = .pdf
+        XCTAssertFalse(state.canStepMatches)
+        state.filter = .all
+        XCTAssertTrue(state.canStepMatches)
+        state.query = " \n "
+        XCTAssertFalse(state.canStepMatches)
+        state.query = "Hello"
+        state.matches.append(hit(Fixtures.page2))
+        for result in state.matches {
+            state.selectedID = result.id
+            XCTAssertTrue(state.canStepMatches, "Navigation wraps at both ends")
+        }
+    }
+
     func testCountLabelResolvesInflectionForZeroOneAndMultipleMatches() {
         let state = SearchState()
         for (count, expected) in [(0, "0 matches"), (1, "1 match"), (3, "3 matches")] {
@@ -592,8 +676,10 @@ final class FeatSearchUITests: XCTestCase {
         for query in ["h", "he", "hel", "hello"] { binding.wrappedValue = query }
         XCTAssertEqual(state.query, "hello")
         XCTAssertTrue(queries.isEmpty)
+        XCTAssertEqual(state.emptyPresentation, .searching)
         try await Task.sleep(nanoseconds: 250_000_000)
         XCTAssertEqual(queries, ["hello"])
+        XCTAssertEqual(state.emptyPresentation, .noResults("hello"))
         binding.wrappedValue = "closed"
         try await h.run(CommandIDs.searchOpen, ["scope": "document", "close": true])
         try await Task.sleep(nanoseconds: 250_000_000)
@@ -677,6 +763,21 @@ final class FeatSearchUITests: XCTestCase {
         h.session.openPanels.remove(SearchOpen.documentPanel)
         XCTAssertFalse(state.isPresented)
         XCTAssertEqual(state.query, "Hello")
+    }
+
+    func testExternalLibraryPanelDismissalStopsPendingSearchAndKeepsQuery() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Physics"])
+        try await h.run(CommandIDs.panelOpen, ["id": .string(SearchOpen.libraryPanel)])
+        let state = SearchRuntime.from(h.app).state(h.session)
+        let generation = state.generation
+        state.loading = true
+        h.session.openPanels.remove(SearchOpen.libraryPanel)
+        XCTAssertFalse(state.isPresented)
+        XCTAssertFalse(state.loading)
+        XCTAssertGreaterThan(state.generation, generation)
+        XCTAssertEqual(state.query, "Physics")
     }
 
     func testDocumentSearchUsesDedicatedSurfaceWithoutNavigatorTabs() async throws {
@@ -827,6 +928,138 @@ final class FeatSearchUITests: XCTestCase {
             XCTAssertGreaterThanOrEqual(resultsFrame.minX, NibMetrics.chromeInset - 1)
             XCTAssertLessThanOrEqual(resultsFrame.maxX, size.width - NibMetrics.chromeInset + 1)
         }
+    }
+
+    func testLibraryWithoutFloatingHostKeepsBackdropInsteadOfOpeningCover() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [])
+        XCTAssertNil(h.session.floatingHost)
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "query": "Physics"])
+        let fallback = try XCTUnwrap(h.app.ui.chromeOverlays.get("searchui.libraryFallback"))
+        XCTAssertEqual(fallback.surface, .none, "The field and results supply their own Clear and Deep surfaces")
+        for compact in [false, true] {
+            let context = ChromeContext(app: h.app, session: h.session, isCompact: compact)
+            XCTAssertEqual(fallback.isVisible(context), !SearchOpen.usesDocumentSheet)
+        }
+        XCTAssertEqual(h.session.openPanels.contains(SearchOpen.libraryPanel), SearchOpen.usesDocumentSheet)
+        let floating = SearchTestFloatingHost()
+        h.session.floatingHost = floating
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib"])
+        XCTAssertFalse(fallback.isVisible(ChromeContext(app: h.app, session: h.session)),
+            "A late-attaching host must not duplicate the field or results")
+        try await h.run(CommandIDs.searchOpen, ["scope": "lib", "close": true])
+        XCTAssertFalse(fallback.isVisible(ChromeContext(app: h.app, session: h.session)))
+        XCTAssertEqual(SearchRuntime.from(h.app).state(h.session).query, "Physics")
+    }
+
+    func testEmptyQueriesExplainLoadingIndexingAndNoMatchesInEveryScope() {
+        let state = SearchState()
+        for scope in ["lib", "folder:PHYSICS", NodeRef.document(Fixtures.docID).description] {
+            state.scope = scope
+            state.query = " Physics "
+            state.loading = true
+            XCTAssertEqual(state.emptyPresentation, .searching)
+            state.loading = false
+            XCTAssertEqual(state.emptyPresentation, .noResults("Physics"))
+            XCTAssertEqual(state.emptyPresentation?.title, "No results for “Physics”")
+            XCTAssertFalse(state.emptyPresentation?.message.isEmpty ?? true)
+            state.progress = IndexProgressPayload(running: true, done: 0, total: 12, pending: 12)
+            XCTAssertEqual(state.emptyPresentation, .indexing)
+            XCTAssertEqual(state.indexingMessage, "Handwriting in 12 pages is still being indexed.")
+            state.progress = IndexProgressPayload(running: true, done: 11, total: 12, pending: 1)
+            XCTAssertEqual(state.indexingMessage, "Handwriting in 1 page is still being indexed.")
+            state.matches = [hit()]
+            XCTAssertNil(state.emptyPresentation, "Indexing must not hide available results")
+            XCTAssertNotNil(state.indexingMessage)
+            state.filter = .handwriting
+            XCTAssertEqual(state.emptyPresentation, .indexing)
+            state.progress = IndexProgressPayload(running: true, done: 12, total: 12, pending: 0)
+            XCTAssertNotNil(state.indexingMessage, "Running with no pending count must still explain indexing")
+            state.progress = IndexProgressPayload(running: false, done: 12, total: 12, pending: 0)
+            XCTAssertEqual(state.emptyPresentation, .noResults("Physics"), "An empty filter needs the same tip")
+            XCTAssertNil(state.indexingMessage)
+            state.query = "  "
+            XCTAssertNil(state.emptyPresentation)
+            state.matches = []
+            state.filter = .all
+            state.progress = nil
+        }
+    }
+
+    func testNativePhoneFieldHasIndependentClearAndCancelInBothAppearances() async throws {
+        var query = "Physics"
+        var closed = false
+        var submitted = false
+        let field = SystemSearchField(text: Binding(get: { query }, set: { query = $0 }),
+            prompt: "Search your notes", focusGeneration: 0,
+            onSubmit: { submitted = true }, onClose: { closed = true })
+        let host = UIHostingController(rootView: field.frame(height: NibMetrics.barHeight))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            window.overrideUserInterfaceStyle = style
+            for size in [CGSize(width: 390, height: 844), CGSize(width: 844, height: 390)] {
+                window.frame = CGRect(origin: .zero, size: size)
+                host.view.frame = window.bounds
+                host.view.layoutIfNeeded()
+                try await Task.sleep(nanoseconds: 50_000_000)
+                let bar = try XCTUnwrap(searchDescendants(UISearchBar.self, in: host.view).first)
+                XCTAssertEqual(bar.searchBarStyle, .minimal)
+                XCTAssertTrue(bar.showsCancelButton)
+                XCTAssertEqual(bar.searchTextField.accessibilityLabel, "Search your notes")
+                let rect = bar.searchTextField.convert(bar.searchTextField.bounds, to: window)
+                XCTAssertGreaterThan(rect.width, 0)
+                XCTAssertGreaterThanOrEqual(rect.minX, 0)
+                XCTAssertLessThanOrEqual(rect.maxX, size.width)
+                bar.delegate?.searchBar?(bar, textDidChange: "")
+                XCTAssertEqual(query, "")
+                XCTAssertFalse(closed, "Clearing the query must keep search open")
+                bar.delegate?.searchBarSearchButtonClicked?(bar)
+                XCTAssertTrue(submitted)
+            }
+        }
+        let bar = try XCTUnwrap(searchDescendants(UISearchBar.self, in: host.view).first)
+        bar.delegate?.searchBarCancelButtonClicked?(bar)
+        XCTAssertTrue(closed, "Cancel dismisses even with an empty query")
+    }
+
+    func testFilterHeaderStaysInsetWhenResultsScrollInShortKeyboardRegion() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.query = "Hello"
+        state.matches = (0..<20).map { hit(text: "Hello result \($0)") }
+        let results = SearchResults(app: h.app, session: h.session, state: state)
+        let host = UIHostingController(rootView: results)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 344, height: 240))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            window.overrideUserInterfaceStyle = style
+            host.view.frame = window.bounds
+            host.view.layoutIfNeeded()
+            try await Task.sleep(nanoseconds: 50_000_000)
+            let scrolls = searchDescendants(UIScrollView.self, in: host.view)
+            let header = try XCTUnwrap(scrolls.first { $0.contentSize.width > $0.bounds.width + 1 })
+            let list = try XCTUnwrap(scrolls.first { $0.bounds.height > NibMetrics.hitTarget * 2 })
+            XCTAssertFalse(header === list)
+            let headerFrame = header.convert(header.bounds, to: window)
+            let listFrame = list.convert(list.bounds, to: window)
+            XCTAssertGreaterThanOrEqual(headerFrame.minY, NibSpacing.s)
+            XCTAssertGreaterThanOrEqual(headerFrame.height, NibMetrics.hitTarget + 2 * NibSpacing.s)
+            XCTAssertGreaterThanOrEqual(listFrame.minY, headerFrame.maxY)
+            XCTAssertLessThanOrEqual(listFrame.maxY, window.bounds.maxY)
+            list.setContentOffset(CGPoint(x: 0, y: 120), animated: false)
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(header.convert(header.bounds, to: window), headerFrame,
+                "Result scrolling must never move filters into the panel's clipped rim")
+        }
+    }
+
+    private func searchDescendants<T: UIView>(_ type: T.Type, in view: UIView) -> [T] {
+        ((view as? T).map { [$0] } ?? []) + view.subviews.flatMap { searchDescendants(type, in: $0) }
     }
 
     func testInvalidMatchAndScopeAreRejected() async throws {

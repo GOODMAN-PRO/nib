@@ -584,7 +584,8 @@ struct LinkTapAt: NibCommand {
         let navigator = try LinkNavigator.require(ctx.services)
         let from = LinkStop(doc: doc, page: page)
         if followsText, let link = try LinkHitTester.link(at: point, doc: doc, page: page, workspace: ctx.workspace,
-                                                        content: ctx.content, hiddenLayers: session?.hiddenLayers ?? []) {
+                                                        content: ctx.content, hiddenLayers: session?.hiddenLayers ?? [],
+                                                        zoom: session?.zoom ?? 1) {
             let result = try await navigator.follow(link, from: from, ctx: ctx)
             return Output(handled: true, target: result.target)
         }

@@ -266,6 +266,53 @@ enum NavBarModel {
     }
 }
 
+/// Display only: use the shell's active shortcut winners without registering another key command.
+@MainActor
+enum NavShortcutHint {
+    static func resolve(_ item: NavItem, descriptors: [KeyCommandDescriptor], context: KeyCommandContext,
+                        session: EditorSession?) -> KeyShortcut? {
+        guard case let .command(command, params) = item.action else { return nil }
+        let active = KeyCommandRouting.active(descriptors, in: context)
+        if let exact = active.first(where: { key in
+            guard key.command == command else { return false }
+            let keyParams = key.resolvedParams(for: session)
+            // Keyboard-only presentation flags (such as instant) do not change the action's target.
+            return (params.objectValue ?? [:]).allSatisfy { name, value in
+                keyParams[name].map { $0 == value } ?? (name != "id")
+            }
+        }) { return exact.shortcut }
+        // The built-in droplet opens the well-known panel; its feature's shortcut opens that same assistant.
+        if command == "panel.open", params["id"]?.stringValue == PanelIDs.assistant {
+            return active.first { $0.command == "ai.chat.open" }?.shortcut
+        }
+        return nil
+    }
+
+    static func keyboardShortcut(_ shortcut: KeyShortcut) -> KeyboardShortcut? {
+        let key: KeyEquivalent
+        switch shortcut.key.lowercased() {
+        case "up": key = .upArrow
+        case "down": key = .downArrow
+        case "left": key = .leftArrow
+        case "right": key = .rightArrow
+        case "escape": key = .escape
+        case "delete": key = .delete
+        case "tab": key = .tab
+        case "return": key = .return
+        case "space": key = .space
+        default:
+            guard shortcut.key.count == 1, let character = shortcut.key.lowercased().first else { return nil }
+            key = KeyEquivalent(character)
+        }
+        var modifiers: EventModifiers = []
+        if shortcut.modifiers.contains(.command) { modifiers.insert(.command) }
+        if shortcut.modifiers.contains(.shift) { modifiers.insert(.shift) }
+        if shortcut.modifiers.contains(.option) { modifiers.insert(.option) }
+        if shortcut.modifiers.contains(.control) { modifiers.insert(.control) }
+        return KeyboardShortcut(key, modifiers: modifiers)
+    }
+}
+
 // MARK: - Nav bar view
 
 /// Clear leading and trailing bars. The title and optional status controls share the leading bar on every width.
@@ -316,6 +363,7 @@ struct NavBarView: View {
         if let provider = chrome.app.ui.toolbar.get(item.id)?.compactStatus,
            let content = provider(context) {
             content
+                .nibCommand(chrome.app.ui.toolbar.get(item.id)?.command)
                 .fixedSize(horizontal: true, vertical: false)
                 .font(NibFont.caption1)
                 .foregroundStyle(NibColor.label)
@@ -333,6 +381,7 @@ struct NavBarView: View {
                 titleLabel
             }
             .buttonStyle(NibPressStyle(shape: Capsule()))
+            .accessibilityIdentifier("menu.title")
             .nibBudAnchor(ChromeMenu.title.anchor)
             .accessibilityHint(String(localized: "Opens the document menu"))
         } else {
@@ -341,7 +390,7 @@ struct NavBarView: View {
     }
 
     /// Read only: `lock` on the subtitle's line (DESIGN.md §14.2); the subtitle says it, so VoiceOver skips the glyph.
-    private var titleLabel: some View {
+    var titleLabel: some View {
         HStack(alignment: .lastTextBaseline, spacing: NibSpacing.xs) {
             if readOnly {
                 Image(nib: .lock)
@@ -352,6 +401,8 @@ struct NavBarView: View {
             }
             NibBarTitle(title: title, subtitle: subtitle)
         }
+        .frame(minHeight: NibMetrics.hitTarget)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -359,19 +410,32 @@ struct NavBarView: View {
         switch item.action {
         case .library:
             NibToolbarItem(item.symbol, label: item.title) { chrome.goToLibrary() }
+                .accessibilityIdentifier("cmd.window.showLibrary")
         case .menu(let menu):
             NibToolbarItem(item.symbol, label: item.title, isOn: openMenu == menu) { toggle(menu) }
                 .nibBudAnchor(menu.anchor)
+                .accessibilityIdentifier("menu." + menu.rawValue)
         case .command(let command, let params):
             if item.id == NavBarModel.sidebar {
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
+                    .nibShortcutHint(shortcutHint(for: item))
+                    .accessibilityIdentifier("cmd." + command)
                     .contextMenu { sidebarModes(command, visible: item.isOn) }
             } else {
                 // NibDesign buttons dim themselves when disabled.
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
+                    .nibShortcutHint(shortcutHint(for: item))
+                    .accessibilityIdentifier("cmd." + command)
                     .disabled(!item.isEnabled)
             }
         }
+    }
+
+    private func shortcutHint(for item: NavItem) -> KeyboardShortcut? {
+        let context = KeyCommandContext(docKind: kind, isEditingText: chrome.session.isEditingText)
+        return NavShortcutHint.resolve(item, descriptors: chrome.app.content.keyCommands.all,
+                                       context: context, session: chrome.session)
+            .flatMap(NavShortcutHint.keyboardShortcut)
     }
 
     /// Long-press on Sidebar: Sidebar vs Window (D-117).
@@ -383,6 +447,7 @@ struct NavBarView: View {
             } label: {
                 Label { Text(String(localized: "Show as Sidebar")) } icon: { Image(nib: .sidebar) }
             }
+            .accessibilityIdentifier("cmd." + command)
         }
         if !visible || sidebarMode == .sidebar {
             Button {
@@ -390,6 +455,7 @@ struct NavBarView: View {
             } label: {
                 Label { Text(String(localized: "Show as Window")) } icon: { Image(nib: .pages) }
             }
+            .accessibilityIdentifier("cmd." + command)
         }
         if visible {
             Button {
@@ -397,6 +463,7 @@ struct NavBarView: View {
             } label: {
                 Label { Text(String(localized: "Hide Sidebar")) } icon: { Image(nib: .xmark) }
             }
+            .accessibilityIdentifier("cmd." + command)
         }
     }
 
@@ -441,6 +508,7 @@ struct ChromeMenuRow: Identifiable {
     var isEnabled = true
     /// A display-only shortcut label ("⌃⌘S", `MenuItemDescriptor.shortcut`).
     var shortcut: String? = nil
+    var command: String? = nil
     let action: () -> Void
 }
 
@@ -555,6 +623,7 @@ struct ChromeMenuList: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
+                .accessibilityIdentifier(row.command.map { "cmd." + $0 } ?? row.id)
                 .disabled(!row.isEnabled)
                 .opacity(row.isEnabled ? 1 : NibOpacity.disabled)
                 .accessibilityAddTraits(row.isOn ? .isSelected : [])

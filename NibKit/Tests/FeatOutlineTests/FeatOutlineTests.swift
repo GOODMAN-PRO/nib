@@ -534,6 +534,34 @@ final class FeatOutlineTests: XCTestCase {
 
     // MARK: Panel layout
 
+    func testOutlineCellEmphasizesOnlyTheCurrentPageAndClearsEmphasisOnReuse() throws {
+        func titleLabel(in view: UIView, title: String) -> UILabel? {
+            if let label = view as? UILabel, label.text == title { return label }
+            return view.subviews.lazy.compactMap { titleLabel(in: $0, title: title) }.first
+        }
+
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            let cell = OutlineCell(style: .default, reuseIdentifier: OutlineCell.reuseID)
+            cell.overrideUserInterfaceStyle = appearance
+            for kind in [OutlineSectionKind.custom, .pdf] {
+                var row = OutlineRow(id: "weight-regression", kind: kind, entry: nil,
+                                     title: "Outline title", depth: 1, page: Fixtures.pdfPage,
+                                     pageNumber: 3, hasChildren: false, isExpanded: false, isCurrent: false)
+                // Reconfigure the same cell to catch selection emphasis leaking into a reused row.
+                for isCurrent in [false, true, false] {
+                    row.isCurrent = isCurrent
+                    cell.configure(row, showsThumbnail: false, image: nil, aspect: 1)
+                    let label = try XCTUnwrap(titleLabel(in: cell.contentView, title: row.title))
+                    XCTAssertEqual(label.font, isCurrent ? NibUIFont.bodyEmphasis : NibUIFont.body,
+                                   "Only the current page is emphasized, for both custom and PDF entries")
+                    XCTAssertTrue(label.adjustsFontForContentSizeCategory)
+                    XCTAssertEqual(cell.backgroundView != nil, isCurrent,
+                                   "Title emphasis follows the row's selection highlight")
+                }
+            }
+        }
+    }
+
     func testNavigatorHeadingKeepsItsTitleReadableAndReflowsAccessories() {
         let h = harness()
         let model = OutlinePanelModel(app: h.app, session: h.session)
@@ -596,6 +624,77 @@ final class FeatOutlineTests: XCTestCase {
 
     // MARK: Panel model
 
+    func testHiddenOutlineActionRestoresBothSourcesWithoutChangingTheDocument() async throws {
+        let h = harness()
+        let pdf = FakePDFService()
+        pdf.outlines[Fixtures.pdfAsset.name] = [PDFOutlineNode(title: "Chapter 1", pageIndex: 0)]
+        h.app.services.pdf = pdf
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        try await waitUntil { model.sections.map { $0.kind } == [.pdf, .custom] }
+        let originalSections = model.sections
+        let originalOutline = try h.app.workspace.content(doc).outline
+        try await h.run("settings.set", ["name": .string(OutlineSettings.showThumbnails.name), "value": true])
+        for key in [OutlineSettings.showPDFOutline, OutlineSettings.showCustomOutline] {
+            try await h.run("settings.set", ["name": .string(key.name), "value": false])
+        }
+        try await waitUntil { !model.showsPDF && !model.showsCustom && model.showsThumbnails }
+
+        XCTAssertTrue(model.sections.isEmpty)
+        XCTAssertEqual(model.emptyTitle, "Outline entries hidden")
+        XCTAssertEqual(model.emptyMessage, "PDF Outline and Custom Outline are both turned off in the options.")
+        let action = try XCTUnwrap(model.emptyAction)
+        XCTAssertEqual(action.title, "Show outline")
+        action.handler()
+
+        try await waitUntil { model.sections == originalSections }
+        XCTAssertTrue(h.app.settings.get(OutlineSettings.showPDFOutline))
+        XCTAssertTrue(h.app.settings.get(OutlineSettings.showCustomOutline))
+        XCTAssertTrue(model.showsThumbnails)
+        XCTAssertNil(model.prompt)
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertEqual(try h.app.workspace.content(doc).outline, originalOutline)
+    }
+
+    func testHiddenOutlineCanBeShownWithoutACurrentPage() async throws {
+        let h = harness()
+        h.session.page = nil
+        for key in [OutlineSettings.showPDFOutline, OutlineSettings.showCustomOutline] {
+            try await h.run("settings.set", ["name": .string(key.name), "value": false])
+        }
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        XCTAssertFalse(model.canAdd)
+        XCTAssertEqual(model.emptyTitle, "Outline entries hidden")
+        let action = try XCTUnwrap(model.emptyAction)
+        XCTAssertEqual(action.title, "Show outline")
+        action.handler()
+        try await waitUntil { model.showsPDF && model.showsCustom && !model.sections.isEmpty }
+        XCTAssertNil(model.prompt)
+        XCTAssertNil(h.session.page)
+    }
+
+    func testEmptyOutlineKeepsAddEntryWhenASourceIsVisible() async throws {
+        let h = harness()
+        try await h.run("outline.delete", ["entry": entryRef(Fixtures.outlineID)])
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        for (pdf, custom) in [(true, true), (true, false), (false, true)] {
+            try await h.run("settings.set", ["name": .string(OutlineSettings.showPDFOutline.name), "value": .bool(pdf)])
+            try await h.run("settings.set", ["name": .string(OutlineSettings.showCustomOutline.name), "value": .bool(custom)])
+            try await waitUntil { model.showsPDF == pdf && model.showsCustom == custom }
+            XCTAssertTrue(model.sections.isEmpty)
+            XCTAssertEqual(model.emptyTitle, "No outline yet")
+            XCTAssertEqual(model.emptyMessage, "Entries take you straight back to a page.")
+            let action = try XCTUnwrap(model.emptyAction)
+            XCTAssertEqual(action.title, "Add entry")
+            action.handler()
+            XCTAssertEqual(model.prompt, .add(Fixtures.page1))
+            model.cancelPrompt()
+        }
+        h.session.page = nil
+        try await waitUntil { !model.canAdd }
+        XCTAssertNil(model.emptyAction)
+        XCTAssertNil(model.emptyMessage)
+    }
+
     func testPanelModelLoadsThePDFOutlineAndFollowsCommits() async throws {
         let h = harness()
         let pdf = FakePDFService()
@@ -617,6 +716,98 @@ final class FeatOutlineTests: XCTestCase {
 
         try await h.run("settings.set", ["name": .string(OutlineSettings.showPDFOutline.name), "value": false])
         try await waitUntil { model.sections.map { $0.kind } == [.custom] }
+    }
+
+    func testBookmarkControlHitTargetCoversPreviewTitleAndWhitespace() throws {
+        let control = BookmarkRowControl()
+        var activations = 0
+        var row = BookmarkRow(page: Fixtures.page1, number: 1, title: nil, isCurrent: false, aspect: 595 / 842)
+        control.configure(row: row, image: nil) { activations += 1 }
+        for width in [NibMetrics.navigatorWidth, NibMetrics.panelWidthAccessibility] {
+            let size = control.systemLayoutSizeFitting(CGSize(width: width, height: 0),
+                withHorizontalFittingPriority: .required, verticalFittingPriority: .fittingSizeLevel)
+            XCTAssertEqual(size.width, width, accuracy: 1)
+            XCTAssertGreaterThanOrEqual(size.height, NibMetrics.hitTarget)
+            control.frame = CGRect(origin: .zero, size: size)
+            control.layoutIfNeeded()
+            // The failing tap was at the row's centre, beyond the short "Page 1" text.
+            for x in [NibSpacing.m, width / 2, width - NibSpacing.m] {
+                let hit = try XCTUnwrap(control.hitTest(CGPoint(x: x, y: size.height / 2), with: nil))
+                XCTAssertTrue(hit === control, "The decorative hosted label must not consume selection")
+            }
+        }
+        control.sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(control.accessibilityLabel, "Page 1")
+        XCTAssertTrue(control.accessibilityTraits.contains(.button))
+        XCTAssertFalse(control.accessibilityTraits.contains(.selected))
+
+        // Reconfiguration (navigation or a new thumbnail) retains one action and updates its destination.
+        row.isCurrent = true
+        row.title = "Introduction"
+        var replacementActivations = 0
+        control.configure(row: row, image: nil) { replacementActivations += 1 }
+        XCTAssertEqual(control.accessibilityLabel, "Page 1, Introduction")
+        XCTAssertEqual(control.accessibilityValue, "Current page")
+        XCTAssertTrue(control.accessibilityTraits.contains(.selected))
+        XCTAssertTrue(control.accessibilityActivate())
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(replacementActivations, 1)
+        control.isEnabled = false
+        XCTAssertFalse(control.accessibilityActivate())
+        XCTAssertEqual(replacementActivations, 1)
+    }
+
+    func testBookmarkActivationNavigatesInvokingSessionThenCanUnbookmark() async throws {
+        let h = harness()
+        try await h.run("page.setBookmarked", ["pages": [pageRef(Fixtures.page1)], "on": true])
+        h.session.page = Fixtures.page2
+        let model = BookmarksPanelModel(app: h.app, session: h.session)
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertFalse(row.isCurrent)
+        let other = EditorSession()
+        other.document = doc
+        other.page = Fixtures.pdfPage
+        h.app.services.sessions.add(other)
+        var calls = 0
+        // F006 owns navigation; verify the actual command boundary without importing another feature.
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Go to Page",
+            summary: "Test navigation receiver.", effect: .session)) { params, context in
+            calls += 1
+            XCTAssertTrue(context.session === h.session)
+            XCTAssertEqual(params["page"], self.pageRef(Fixtures.page1))
+            context.session?.page = Fixtures.page1
+            return .null
+        }
+        let context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        let host = UIHostingController(rootView: BookmarksPanel(context: context)
+            .environment(\.horizontalSizeClass, .regular))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: NibMetrics.navigatorWidth, height: 640))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        func controls(in view: UIView) -> [BookmarkRowControl] {
+            (view as? BookmarkRowControl).map { [$0] } ?? view.subviews.flatMap { controls(in: $0) }
+        }
+        try await waitUntil {
+            host.view.layoutIfNeeded()
+            return controls(in: host.view).first?.bounds.width ?? 0 > 0
+        }
+        let control = try XCTUnwrap(controls(in: host.view).first)
+        XCTAssertEqual(control.accessibilityLabel, "Page 1")
+        XCTAssertGreaterThan(control.bounds.width, NibMetrics.navigatorWidth / 2)
+        let point = control.convert(CGPoint(x: control.bounds.midX, y: control.bounds.midY), to: window)
+        XCTAssertTrue(window.hitTest(point, with: nil) === control,
+                      "The actual List row must deliver its centre tap to the navigation control")
+        control.sendActions(for: .primaryActionTriggered)
+        try await waitUntil { model.rows.first?.isCurrent == true }
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertEqual(other.page, Fixtures.pdfPage)
+        model.remove(try XCTUnwrap(model.rows.first))
+        try await waitUntil { model.rows.isEmpty }
+        XCTAssertFalse(try XCTUnwrap(h.app.workspace.content(doc).page(Fixtures.page1)).bookmarked)
     }
 
     func testBookmarksPanelFollowsBookmarksTrashAndTheCurrentPage() async throws {

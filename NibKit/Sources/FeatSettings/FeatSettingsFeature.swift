@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
@@ -26,6 +27,60 @@ public enum FeatSettingsFeature: NibFeature {
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: CommandIDs.settingsOpen, title: String(localized: "Settings"), shortcut: AppMenu.settingsShortcut,
             command: CommandIDs.settingsOpen, scope: .global, order: 100, owner: id))
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: SettingsChromeShortcut.overlayID, owner: id, placement: .center, surface: .none,
+            recedesWhileWriting: false) { AnyView(SettingsChromeShortcutView(context: $0)) })
+    }
+}
+
+/// SwiftUI chrome can own keyboard dispatch before it reaches the shell's UIKeyCommands.
+/// Offer the same registered Settings command in that host, with the invoking window's session.
+@MainActor
+enum SettingsChromeShortcut {
+    static let overlayID = "settings.keyboardShortcut"
+
+    static func descriptor(in context: ChromeContext) -> KeyCommandDescriptor? {
+        let keys = KeyCommandContext(docKind: context.kind, isEditingText: context.session.isEditingText,
+                                     hasTabs: !(context.navigator?.openDocuments.isEmpty ?? true))
+        return KeyCommandRouting.active(context.app.content.keyCommands.all, in: keys).first {
+            $0.shortcut == AppMenu.settingsShortcut && $0.command == CommandIDs.settingsOpen
+        }
+    }
+
+    static func perform(in context: ChromeContext) {
+        guard let navigator = context.navigator, navigator.session === context.session,
+              let descriptor = descriptor(in: context) else { return }
+        var controller = navigator.rootViewController
+        while let current = controller {
+            if current.presentedViewController != nil { return }
+            controller = current.parent
+        }
+        if let window = navigator.rootViewController?.viewIfLoaded?.window, !window.isKeyWindow { return }
+        context.app.ui.activeNavigator = navigator
+        context.app.services.sessions.activate(context.session)
+        context.app.perform(descriptor.command, descriptor.resolvedParams(for: context.session),
+                            session: context.session)
+    }
+}
+
+private struct SettingsChromeShortcutView: View {
+    let context: ChromeContext
+    @State private var revision = 0
+
+    var body: some View {
+        let _ = revision
+        Group {
+            if let descriptor = SettingsChromeShortcut.descriptor(in: context) {
+                Button(descriptor.title) { SettingsChromeShortcut.perform(in: context) }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+        }
+        .frame(width: 0, height: 0)
+        .clipped()
+        .accessibilityHidden(true)
+        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange,
+                                                        object: context.app.content.keyCommands)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate)) { _ in revision += 1 }
     }
 }
 

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import NibContracts
 
 /// A spring in SwiftUI's parameterisation: stiffness k = (2π / response)², damping c = 4π·ζ / response, mass 1.
 public struct NibSpring: Equatable, Sendable {
@@ -21,6 +22,7 @@ public struct NibSpring: Equatable, Sendable {
     /// The animation for this spring. Under Reduce Motion or Liquid Off it is `NibMotion.reduced` (critically damped,
     /// no overshoot), here in the one shared place, so no component or feature can forget it (DESIGN.md §12).
     public var animation: Animation {
+        if NibUITestMode.isEnabled { return .linear(duration: 0) }
         let s = (NibMotion.forcesReduced || UIAccessibility.isReduceMotionEnabled) ? NibMotion.reduced : self
         return .spring(response: s.response, dampingFraction: s.dampingRatio, blendDuration: 0)
     }
@@ -101,6 +103,11 @@ public enum NibMotion {
     /// UIKit: a spring animator that carries a per-axis initial velocity (normalised by distance, as UIKit expects).
     public static func animateUIKit(_ spring: NibSpring, initialVelocity: CGVector = .zero,
                                     animations: @escaping () -> Void, completion: ((Bool) -> Void)? = nil) {
+        if NibUITestMode.isEnabled {
+            UIView.performWithoutAnimation(animations)
+            completion?(true)
+            return
+        }
         let s = (forcesReduced || UIAccessibility.isReduceMotionEnabled) ? NibMotion.reduced : spring
         let animator = UIViewPropertyAnimator(duration: 0, timingParameters: s.timingParameters(initialVelocity: initialVelocity))
         animator.addAnimations(animations)

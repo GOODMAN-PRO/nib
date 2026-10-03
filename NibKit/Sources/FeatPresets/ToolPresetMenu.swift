@@ -21,11 +21,6 @@ enum WidthScale {
         let w = range.lowerBound * pow(range.upperBound / range.lowerBound, t)
         return min(max((w * 100).rounded() / 100, range.lowerBound), range.upperBound)
     }
-
-    /// The line weight a thickness slot draws with: 1.5…10 pt along the tool's own scale.
-    static func slotLineWidth(_ width: Double, tool: String) -> CGFloat {
-        CGFloat(1.5 + 8.5 * position(width, range: PresetRules.widthRange(tool)))
-    }
 }
 
 enum PresetText {
@@ -305,8 +300,12 @@ final class PresetMenuModel {
     func openPicker() {
         guard let app, let session else { return }
         let tool = self.tool, slot = colourSlot
+        let initial = editedSwatch.color
+        // Release the menu's modal input catcher before handing input to UIKit. Keep the
+        // edited target and initial colour even as the menu's presentation changes.
+        close()
         SystemColourPicker.present(title: String(localized: "\(PresetText.toolName(tool)) Colour"),
-                                   initial: editedSwatch.color, supportsAlpha: tool != "highlighter",
+                                   initial: initial, supportsAlpha: tool != "highlighter",
                                    commitsOnFinishOnly: slot == nil, app: app, session: session) { colour in
             let hex = tool == "highlighter" ? PresetColour.rgbHex(colour) : colour.hex
             let call = slot.map { i in
@@ -314,7 +313,6 @@ final class PresetMenuModel {
             } ?? PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])
             PresetActions.run(app, session: session, [call])
         }
-        close()
     }
 
     var canPickFromPage: Bool {
@@ -399,6 +397,7 @@ struct ToolPresetMenu: View {
         .confirmationDialog(String(localized: "Restore the default colours and thicknesses?"),
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button(String(localized: "Restore Defaults"), role: .destructive) { model.reset() }
+                .accessibilityIdentifier("cmd.preset.reset")
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "Your own \(PresetText.toolName(tool)) colours and thicknesses are replaced."))
@@ -413,12 +412,13 @@ struct ToolPresetMenu: View {
         HStack(spacing: 0) {
             ForEach(0..<PresetRules.widthSlots, id: \.self) { i in
                 let selected = i == presets.selectedWidth
-                LineSampleButton(lineWidth: WidthScale.slotLineWidth(presets.widths[i], tool: tool), pattern: presets.patterns[i],
-                                 isSelected: selected, label: String(localized: "Thickness \(i + 1)"),
-                                 value: PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]),
-                                 hint: selected ? String(localized: "Double-tap to adjust.") : nil) {
+                NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(i), isSelected: selected,
+                                     label: String(localized: "Thickness \(i + 1)")) {
                     model.tapWidth(i)
                 }
+                .accessibilityIdentifier("cmd.preset.select")
+                .accessibilityValue(PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]))
+                .accessibilityHint(selected ? String(localized: "Double-tap to adjust.") : "")
                 .presetPopoverSource(tool, model.shown == .width(i))
             }
             NibBarSeparator()
@@ -456,20 +456,32 @@ struct ToolPresetMenu: View {
     }
 
     private func swatchStrip(arranging: Bool) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(Array(presets.swatches.enumerated()), id: \.offset) { i, swatch in
-                        swatchSlot(i, swatch, arranging: arranging).id(i)
+        Group {
+            if CGFloat(presets.swatches.count) * NibMetrics.paletteSwatchPitch <= stripWidth(presets.swatches.count) {
+                // The usual three colours fit. A nested scroll view here delays delivery
+                // of the touch to UIButton's long-press recogniser for no scrolling benefit.
+                swatchCells(arranging: arranging)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        swatchCells(arranging: arranging)
                     }
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                    .onAppear { proxy.scrollTo(presets.selectedSwatch, anchor: .center) }
+                    // Keys 1-9/0, the AI or another window can select a slot scrolled out of view.
+                    .onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }
                 }
             }
-            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-            .onAppear { proxy.scrollTo(presets.selectedSwatch, anchor: .center) }
-            // Keys 1-9/0, the AI or another window can select a slot scrolled out of view.
-            .onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }
         }
         .frame(width: stripWidth(presets.swatches.count), height: NibMetrics.hitTarget)
+    }
+
+    private func swatchCells(arranging: Bool) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(presets.swatches.enumerated()), id: \.offset) { i, swatch in
+                swatchSlot(i, swatch, arranging: arranging).id(i)
+            }
+        }
     }
 
     @ViewBuilder
@@ -482,6 +494,7 @@ struct ToolPresetMenu: View {
                        isSelected: false, registry: registry) {
                 if removable { model.remove(i) }
             }
+            .accessibilityIdentifier("cmd.preset.removeSwatch")
             .overlay(alignment: .topTrailing) {
                 if removable { RemoveBadge() }
             }
@@ -499,20 +512,14 @@ struct ToolPresetMenu: View {
                 if i < presets.swatches.count - 1 { model.move(i, i + 1) }
             }
         } else {
-            SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry) {
+            SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry,
+                       menu: PresetSwatchMenu.make(model: model, index: i) { confirmReset = true }) {
                 model.tapSwatch(i)
             }
+            .accessibilityIdentifier("cmd.preset.select")
             // In compact width the selected swatch remains the source while the popover adds a colour or
             // edits another saved slot: those controls no longer live in the bar.
             .presetPopoverSource(tool, isColourSource(i))
-            .contextMenu {
-                Button(String(localized: "Change Colour")) { model.open(.colour(.slot(i))) }
-                Button(String(localized: "Rearrange Colours")) { model.beginArranging() }
-                if removable {
-                    Button(String(localized: "Remove Colour"), role: .destructive) { model.remove(i) }
-                }
-                Button(String(localized: "Restore Default Presets"), role: .destructive) { confirmReset = true }
-            }
             .accessibilityAction(named: Text(String(localized: "Change Colour"))) { model.open(.colour(.slot(i))) }
             .accessibilityAction(named: Text(String(localized: "Rearrange Colours"))) { model.beginArranging() }
         }
@@ -569,6 +576,7 @@ struct WidthEditor: View {
                                 value: "\(PresetText.millimetres(width)) · \(PresetText.points(width))") {
                 NibSlider(value: Binding(get: { model.widthPosition }, set: { model.setWidthPosition($0) }),
                           label: String(localized: "Thickness"))
+                    .accessibilityIdentifier("cmd.preset.setWidth")
                     .accessibilityValue(PresetText.widthValue(width, pattern: pattern))
             }
             if PresetRules.patternTools.contains(model.tool) {
@@ -579,6 +587,7 @@ struct WidthEditor: View {
                                              label: PresetText.patternName(p), value: nil, hint: nil) {
                                 model.setPattern(p)
                             }
+                            .accessibilityIdentifier("cmd.preset.setWidth")
                         }
                     }
                 }
@@ -589,7 +598,7 @@ struct WidthEditor: View {
 
 // MARK: - Slots
 
-/// A short line drawn with a thickness and a pattern: the thickness slots and the pattern choices.
+/// A short line for the width editor's pattern choices. Thickness slots use `NibWidthPresetButton`.
 struct LineSampleButton: View {
     let lineWidth: CGFloat
     let pattern: StrokePattern
@@ -635,6 +644,7 @@ struct SwatchSlot: View {
     let name: String
     let isSelected: Bool
     let registry: Registry<TapePatternDescriptor>?
+    var menu: UIMenu? = nil
     let action: () -> Void
     @State private var pattern: NibSwatchPattern?
 
@@ -643,8 +653,15 @@ struct SwatchSlot: View {
 
     var body: some View {
         let colour = PresetColour.display(swatch.color, tool: tool)
-        NibPenSwatch(PresetColour.swatch(colour, id: swatch.color.hex, name: name), pattern: pattern, isSelected: isSelected,
-                     size: .palette, action: action)
+        let display = PresetColour.swatch(colour, id: swatch.color.hex, name: name, pattern: pattern)
+        Group {
+            if let menu {
+                PresetSwatchControl(swatch: display, isSelected: isSelected, menu: menu, action: action)
+                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            } else {
+                NibPenSwatch(display, isSelected: isSelected, size: .palette, action: action)
+            }
+        }
             .task(id: patternID) {
                 guard let id = patternID, let registry else {
                     pattern = nil
@@ -652,6 +669,85 @@ struct SwatchSlot: View {
                 }
                 pattern = await TapePatternCache.pattern(id, registry: registry)
             }
+    }
+}
+
+/// Keep the primary action and the long-press menu on the same native control. A SwiftUI
+/// contextMenu around the styled swatch inside the scrolling options bar can lose to its
+/// button gesture, opening the selected colour's editor when the user holds for a menu.
+struct PresetSwatchControl: UIViewRepresentable {
+    let swatch: NibSwatch
+    let isSelected: Bool
+    let menu: UIMenu
+    let action: () -> Void
+
+    func makeUIView(context: Context) -> PresetSwatchNativeButton { PresetSwatchNativeButton() }
+
+    func updateUIView(_ button: PresetSwatchNativeButton, context: Context) {
+        button.configure(swatch: swatch, isSelected: isSelected, menu: menu, action: action)
+    }
+}
+
+final class PresetSwatchNativeButton: UIButton {
+    private var tap: (() -> Void)?
+    private var menuOwnsInteraction = false
+
+    init() {
+        super.init(frame: .zero)
+        showsMenuAsPrimaryAction = false
+        isPointerInteractionEnabled = true
+        // UIButton can forward touchUpInside to its primary action even after a menu
+        // long press. Keep that release from toggling the editor behind the menu.
+        addAction(UIAction { [weak self] _ in self?.menuOwnsInteraction = true }, for: .menuActionTriggered)
+        addAction(UIAction { [weak self] _ in
+            guard let self, !self.menuOwnsInteraction else { return }
+            self.tap?()
+        }, for: .primaryActionTriggered)
+        accessibilityIdentifier = "cmd.preset.select"
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        menuOwnsInteraction = false
+        return super.beginTracking(touch, with: event)
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willEndFor configuration: UIContextMenuConfiguration,
+                                         animator: UIContextMenuInteractionAnimating?) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        let finished: () -> Void = { [weak self] in self?.menuOwnsInteraction = false }
+        if let animator {
+            animator.addCompletion(finished)
+        } else {
+            // With no animation, the release can still be delivered in this event turn.
+            DispatchQueue.main.async(execute: finished)
+        }
+    }
+
+    func configure(swatch: NibSwatch, isSelected: Bool, menu: UIMenu, action: @escaping () -> Void) {
+        tap = action
+        self.menu = menu
+        self.isSelected = isSelected
+        setImage(.nibSwatch(swatch, size: .palette, isSelected: isSelected), for: .normal)
+        accessibilityLabel = swatch.pattern?.name.map { "\(swatch.name), \($0)" } ?? swatch.name
+        accessibilityTraits = isSelected ? [.button, .selected] : [.button]
+    }
+}
+
+@MainActor
+enum PresetSwatchMenu {
+    static func make(model: PresetMenuModel, index: Int, restore: @escaping () -> Void) -> UIMenu {
+        var actions = [
+            UIAction(title: String(localized: "Change Colour")) { _ in model.open(.colour(.slot(index))) },
+            UIAction(title: String(localized: "Rearrange Colours")) { _ in model.beginArranging() }
+        ]
+        if model.presets.swatches.count > 1 {
+            actions.append(UIAction(title: String(localized: "Remove Colour"), attributes: .destructive) { _ in model.remove(index) })
+        }
+        actions.append(UIAction(title: String(localized: "Restore Default Presets"), attributes: .destructive) { _ in restore() })
+        return UIMenu(children: actions)
     }
 }
 

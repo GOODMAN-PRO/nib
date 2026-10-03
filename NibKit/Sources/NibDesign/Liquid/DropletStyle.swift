@@ -65,6 +65,8 @@ public struct DropletStyle: Equatable, Sendable {
     /// droplet inside or outside a container). The glass is hosted by the foreground controls; the poke (§10.2) and
     /// the held rim (`liftedRim`) also follow Nib's physics.
     public var isInteractive = true
+    /// Popovers block outside interaction; transient notifications leave the underlying interface usable.
+    public var modalWhenBudded = true
     /// Rim strength at rest (DESIGN.md §10.9): 1. `lifted` raises it to `liftedRim`.
     public var rim: CGFloat = 1
     /// Rim strength while the droplet is held, reached at full lift and following the lift spring there and back: the
@@ -101,7 +103,7 @@ public struct DropletStyle: Equatable, Sendable {
                                                rigidity: 0.70, lift: 1.045, poke: 1.4, drag: .free, envelope: 3,
                                                restsDry: true)
     public static let toast = DropletStyle(material: .deep, cornerRadius: nil, stretchCap: 0.08, rigidity: 0.2,
-                                           lift: 1.0, poke: 1.0, isInteractive: false)
+                                           lift: 1.0, poke: 1.0, isInteractive: false, modalWhenBudded: false)
     public static let primary = DropletStyle(material: .tinted, cornerRadius: nil, stretchCap: 0.10, rigidity: 0.5,
                                              neck: NeckParams(join: 11, t0: 26, off: 44))
     /// Precision affordances never deform (DESIGN.md §10.15): lasso and resize handles, the rotation bead.

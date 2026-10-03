@@ -629,6 +629,16 @@ public extension KeyCommandDescriptor {
 /// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
 /// hands UIKit one command per shortcut, so two features mapping the same keys never race).
 public enum KeyCommandRouting {
+    /// Fallback for a hardware press UIKit delivered without invoking its
+    /// UIKeyCommand (for example through an embedded SwiftUI hosting tree).
+    /// Use the same winner and text-input priority rules as the command table.
+    public static func unhandledPress(_ shortcut: KeyShortcut, descriptors: [KeyCommandDescriptor],
+                                      in context: KeyCommandContext) -> KeyCommandDescriptor? {
+        active(descriptors, in: context).first {
+            $0.shortcut == shortcut && overridesSystemKeys($0, in: context)
+        }
+    }
+
     /// True when `a` wins over `b` for the same shortcut, most specific first: the command limited to fewer document
     /// kinds (`docKinds`; nil, empty and every kind all count as every kind, so they tie); then the narrower scope
     /// (`.canvas`, then `.document` or `.library`, then `.global`); then the lower `order`; then the id.
@@ -656,9 +666,11 @@ public enum KeyCommandRouting {
     /// True when the key command should take priority over what the system does with the same keys (the shell sets
     /// `UIKeyCommand.wantsPriorityOverSystemBehavior`): always, except for a key without ⌘, ⌥ or ⌃ (a letter, an
     /// arrow, Space, Return, Tab, Delete or Escape, with or without ⇧) while text has the keyboard, where typing,
-    /// cursor movement and the text view's own Escape win.
+    /// cursor movement and the text view's own Escape win. Command-A also belongs to an active text input;
+    /// selecting library items must not steal Select All from a rename or colour field.
     public static func overridesSystemKeys(_ d: KeyCommandDescriptor, in context: KeyCommandContext) -> Bool {
-        !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+        if context.isEditingText, d.shortcut == KeyShortcut("a", [.command]) { return false }
+        return !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
     }
 
     /// How many document kinds a command is live in: its `docKinds`, or every kind when they are nil or empty.

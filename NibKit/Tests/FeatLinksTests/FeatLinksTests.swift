@@ -292,6 +292,56 @@ final class FeatLinksTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
     }
 
+    func testWebsiteFieldHasAPersistentAccessibleName() async throws {
+        let h = harness()
+        let target = try LinkEditorPresenter.makeTarget(ref: textRef, range: nil, editing: nil,
+                                                        workspace: h.app.workspace, content: h.app.content)
+        let model = LinkEditorModel(app: h.app, session: h.session, target: target)
+        let host = UIHostingController(rootView: LinkWebsiteForm(model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 540, height: 640))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func fields(_ view: UIView) -> [UITextField] {
+            (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { fields($0) }
+        }
+        host.view.layoutIfNeeded()
+        for _ in 0..<100 where fields(host.view).isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            host.view.layoutIfNeeded()
+        }
+        let field = try XCTUnwrap(fields(host.view).first)
+        XCTAssertEqual(field.accessibilityLabel, "Website address")
+        XCTAssertTrue(field.isEnabled)
+        XCTAssertEqual(field.keyboardType, .URL)
+        field.text = "https://example.com/lab"
+        // Package tests are hostless: UIControl.sendActions requires UIApplicationMain. Exercise the
+        // actual registered editing action directly, including the control-to-coordinator wiring.
+        let editingActions = field.allTargets.compactMap { $0.base as? NSObject }.flatMap { target in
+            (field.actions(forTarget: target, forControlEvent: .editingChanged) ?? []).map {
+                (target, NSSelectorFromString($0))
+            }
+        }
+        XCTAssertFalse(editingActions.isEmpty, "The field must wire its editing event to the draft")
+        for (target, action) in editingActions { _ = target.perform(action, with: field) }
+        XCTAssertEqual(model.url, "https://example.com/lab")
+        XCTAssertEqual(field.accessibilityLabel, "Website address", "The name must survive replacement of the placeholder")
+        let saved = expectation(description: "Return saves the address")
+        model.dismiss = { saved.fulfill() }
+        _ = field.delegate?.textFieldShouldReturn?(field)
+        await fulfillment(of: [saved], timeout: 10)
+        XCTAssertEqual(LinkText.links(in: try fixtureText(h)).first?.link.url, "https://example.com/lab")
+        let editTarget = try LinkEditorPresenter.makeTarget(ref: textRef, range: nil, editing: nil,
+                                                            workspace: h.app.workspace, content: h.app.content)
+        let editModel = LinkEditorModel(app: h.app, session: h.session, target: editTarget)
+        let removed = expectation(description: "Remove Link finishes")
+        editModel.dismiss = { removed.fulfill() }
+        editModel.remove()
+        await fulfillment(of: [removed], timeout: 10)
+        XCTAssertTrue(LinkText.links(in: try fixtureText(h)).isEmpty)
+        XCTAssertEqual(try fixtureText(h).plainText, target.excerpt)
+    }
+
     func testEditorTargetsTheLinkAroundACaretOrTheWholeText() async throws {
         let h = harness()
         try await h.run("link.set", ["ref": .string(textRef), "range": [6, 3], "link": ["url": "https://nib.example"]])
@@ -548,6 +598,28 @@ final class FeatLinksTests: XCTestCase {
             _ = try await h.run("link.follow", ["url": "obsidian://open?vault=notes"], as: .ai("chat"))
         }
         XCTAssertEqual(opened.count, 1)
+    }
+
+    func testReadOnlyTapNearLinkedTextNavigatesAndReturns() async throws {
+        let h = harness()
+        // The UI failure left a saved, single-line link with the finger just below its glyphs.
+        // Use its page geometry and zoom, exercising the broad-phase bounds as well as TextKit.
+        h.session.zoom = 1.2767101196075796
+        let text = RichText(plain: "Visit lab")
+        _ = try await h.insert([Item(id: "LINKNEARTXT1", kind: .text, z: "z",
+                                    text: TextBoxItem(frame: Frame(x: 216.1, y: 414.5, w: 355.2, h: 28), text: text))])
+        try await h.run("link.set", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/LINKNEARTXT1", "range": [0, 9],
+                                      "link": ["page": "page:FIXTUREDOC01/FIXTUREPG002"]])
+        h.session.readOnly = true
+        let tap = try await h.run("link.tapAt", ["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [254.5, 450.1],
+                                                 "gesture": "tap"])
+        XCTAssertEqual(tap["handled"]?.boolValue, true)
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+        let back = try await h.run("link.back")
+        XCTAssertEqual(back["returned"]?.boolValue, true)
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        let saved = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "LINKNEARTXT1")
+        XCTAssertEqual(saved.text?.text.plainText, "Visit lab")
     }
 
     func testReadOnlyTapFollowsATextLinkAndEditModeTakesALongPress() async throws {

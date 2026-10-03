@@ -121,6 +121,7 @@ struct PluginListView: View {
                     Button(String(localized: "Install from Files")) { app.perform(ManagerCommands.installFile) }
                     Button(String(localized: "Install from URL")) { showURL = true }
                     Button(String(localized: "Browse Gallery")) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
                 } label: {
                     Label { Text(String(localized: "Install from…")) } icon: { Image(nib: .importFile) }
                         .font(NibFont.button).frame(minHeight: NibMetrics.hitTarget)
@@ -128,6 +129,7 @@ struct PluginListView: View {
                 NibIconButton(.command, label: String(localized: "Open Developer Console"), size: .panel) {
                     app.perform(CommandIDs.panelOpen, ["id": .string(ManagerCommands.consolePanel)])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
             }
             if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Try Again")) { Task { await refresh() } }) }
             GeometryReader { proxy in
@@ -176,7 +178,7 @@ struct PluginListView: View {
             if model.plugins.isEmpty && !model.loading && model.error == nil {
                 NibEmptyState(symbol: .puzzle, title: String(localized: "No plugins yet"),
                     message: String(localized: "Plugins add tools, panels and templates."),
-                    primary: NibAction(String(localized: "Browse Gallery")) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) })
+                    primary: NibAction(String(localized: "Browse Gallery"), command: CommandIDs.panelOpen) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) })
             }
             ForEach(model.plugins) { plugin in
                 HStack(spacing: NibSpacing.s) {
@@ -235,11 +237,14 @@ struct PluginDetailView: View {
                     Text(String(localized: "This plugin stopped.")).font(NibFont.headline)
                     Text(error).font(NibFont.callout).foregroundStyle(NibColor.labelSecondary)
                     NibButton(String(localized: "Reload Plugin"), symbol: .retry) { model.perform(CommandIDs.pluginReload, ["id": .string(current.id)]) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.pluginReload)
                 }
                 if current.needsReview {
                     NibButton(String(localized: "Review Permissions"), kind: .primary) { model.perform(CommandIDs.pluginReview, ["id": .string(current.id)]) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.pluginReview)
                 } else if let update = model.update(for: current) {
                     NibButton(String(localized: "Review Update to \(update.version)"), kind: .primary) { model.perform(CommandIDs.pluginInstall, update.installParams) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.pluginInstall)
                 }
             }
             Section(String(localized: "Permissions")) {
@@ -280,9 +285,11 @@ struct PluginDetailView: View {
                 NibButton(String(localized: "Open Developer Console"), symbol: .command) {
                     model.app.perform(CommandIDs.panelOpen, ["id": .string(ManagerCommands.consolePanel), "plugin": .string(current.id)])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
                 NibButton(current.enabled ? String(localized: "Disable Plugin") : String(localized: "Enable Plugin")) {
                     model.perform(CommandIDs.pluginEnable, ["id": .string(current.id), "enabled": .bool(!current.enabled)])
-                }.disabled(current.needsReview)
+                }
+                .accessibilityIdentifier("cmd." + CommandIDs.pluginEnable).disabled(current.needsReview)
                 NibButton(String(localized: "Remove Plugin"), symbol: .trash, kind: .destructivePlain) { remove = true }
             }
         }
@@ -293,6 +300,7 @@ struct PluginDetailView: View {
             Button(String(localized: "Remove Plugin"), role: .destructive) {
                 model.perform(CommandIDs.pluginUninstall, ["id": .string(current.id), "removeData": false]) { if isPushed { dismiss() } }
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.pluginUninstall)
         } message: { Text(String(localized: "The plugin will stop. Its saved data is kept for a reinstall.")) }
         .task(id: current.id + "|" + current.sha256) { await loadDetails() }
         .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange)) { note in

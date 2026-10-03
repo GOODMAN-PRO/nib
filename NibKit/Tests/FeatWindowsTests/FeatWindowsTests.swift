@@ -329,6 +329,70 @@ final class FeatWindowsTests: XCTestCase {
 
     // MARK: Windows
 
+    func testRequestedBoardOpensInBothWindowsWhenRestorationIsDisabled() async throws {
+        let (h, scenes, hooks) = try windows()
+        let origin = window(h, scenes)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC04", "page": "page:FIXTUREDOC04/FIXTUREBRD01"],
+                      in: origin)
+        var requested: NSUserActivity?
+        scenes.supportsMultipleWindows = { true }
+        scenes.requestWindow = { activity, _ in requested = activity }
+        let stale = WindowState(tabs: [notebook], active: notebook, page: Fixtures.page2)
+        h.app.settings.set(WindowSettings.lastSession, stale)
+
+        // Exercise the same command/activity handoff as the board's Open in New Window menu.
+        for command in ["window.open", "doc.open"] {
+            requested = nil
+            var params: JSONValue = ["doc": "doc:FIXTUREDOC04", "page": "page:FIXTUREDOC04/FIXTUREBRD01"]
+            if command == "doc.open" {
+                params = ["doc": "doc:FIXTUREDOC04", "page": "page:FIXTUREDOC04/FIXTUREBRD01", "mode": "newWindow"]
+            }
+            try await run(h, command, params, in: origin)
+            let activity = try XCTUnwrap(requested)
+            XCTAssertEqual(activity.activityType, WindowState.activityType)
+            let target = FakeNavigator(app: h.app)
+            hooks.connect(target, requested: WindowState(userInfo: activity.userInfo ?? [:]), restored: stale,
+                          external: false, allowsRestoration: false)
+
+            XCTAssertTrue(scenes.navigator(sessionID: target.session.id) === target)
+            for navigator in [origin, target] {
+                XCTAssertEqual(navigator.openDocuments, [board])
+                XCTAssertEqual(navigator.session.document, board)
+                XCTAssertEqual(navigator.session.page, Fixtures.boardID)
+                XCTAssertEqual(navigator.editorsBuilt, 1)
+            }
+        }
+    }
+
+    func testDisablingRestorationSkipsSavedScenesAndColdLaunchButRegistersWindows() throws {
+        let saved = WindowState(tabs: [board], active: board, page: Fixtures.boardID)
+        for restored in [nil, saved] as [WindowState?] {
+            let (h, scenes, hooks) = try windows()
+            h.app.settings.set(WindowSettings.lastSession, saved)
+            let navigator = FakeNavigator(app: h.app)
+            hooks.connect(navigator, requested: nil, restored: restored, external: false, allowsRestoration: false)
+            XCTAssertTrue(scenes.navigator(sessionID: navigator.session.id) === navigator)
+            XCTAssertTrue(navigator.openDocuments.isEmpty)
+            XCTAssertNil(navigator.session.document)
+            XCTAssertEqual(navigator.editorsBuilt, 0)
+        }
+    }
+
+    func testExplicitLibraryRequestDoesNotRestoreASavedDocument() throws {
+        for allowsRestoration in [false, true] {
+            let (h, scenes, hooks) = try windows()
+            let saved = WindowState(tabs: [board], active: board, page: Fixtures.boardID)
+            h.app.settings.set(WindowSettings.lastSession, saved)
+            let navigator = FakeNavigator(app: h.app)
+            let activity = WindowState.library.activity()
+            hooks.connect(navigator, requested: WindowState(userInfo: activity.userInfo ?? [:]), restored: saved,
+                          external: false, allowsRestoration: allowsRestoration)
+            XCTAssertTrue(navigator.openDocuments.isEmpty)
+            XCTAssertNil(navigator.session.document)
+            XCTAssertEqual(navigator.editorsBuilt, 0)
+        }
+    }
+
     func testNewWindowRequestsCarryTheDocumentAndPage() async throws {
         let (h, scenes, _) = try windows()
         let navigator = window(h, scenes)
@@ -450,6 +514,76 @@ final class FeatWindowsTests: XCTestCase {
         try await run(h, "tab.close", in: navigator)
         XCTAssertTrue(navigator.openDocuments.isEmpty)
         XCTAssertNil(navigator.session.document)
+    }
+
+    func testBackgroundSnapshotKeepsLiveTabPagesAndCommittedEdits() async throws {
+        let (h, scenes, hooks) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        h.app.commands.register(RetitlePage.self)
+        let navigator = window(h, scenes)
+        h.app.ui.activeNavigator = navigator
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.settingsSet,
+                      ["name": .string(WindowSettings.showTabs.name), "value": true], in: navigator)
+        navigator.session.page = Fixtures.page2
+        try await run(h, RetitlePage.descriptor.id, ["title": "Saved before background"], in: navigator)
+        try await run(h, CommandIDs.windowShowLibrary, in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let boardPage = navigator.session.page
+        let activity = try XCTUnwrap(hooks.restorationActivity(navigator))
+        let state = WindowState(userInfo: activity.userInfo ?? [:])
+        XCTAssertEqual(state.tabs, [notebook, board])
+        XCTAssertEqual(state.active, board)
+        XCTAssertEqual(state.page, boardPage)
+
+        // Background/foreground keeps the live session; saving its activity must not discard page memory.
+        let firstKey = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.tab1"))
+        try await run(h, firstKey.command, firstKey.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertEqual(navigator.session.document, notebook)
+        XCTAssertEqual(navigator.session.page, Fixtures.page2)
+        XCTAssertEqual(try h.app.workspace.content(notebook).livePages.first?.title, "Saved before background")
+        let lastKey = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.tab9"))
+        try await run(h, lastKey.command, lastKey.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertEqual(navigator.session.document, board)
+        XCTAssertEqual(navigator.session.page, boardPage)
+        XCTAssertNotNil(hooks.makeTabBar(navigator))
+    }
+
+    func testTabMenuCloseAndKeyboardCloseAllKeepLibraryDocuments() async throws {
+        let (h, scenes, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let navigator = window(h, scenes)
+        h.app.ui.activeNavigator = navigator
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.settingsSet,
+                      ["name": .string(WindowSettings.showTabs.name), "value": true], in: navigator)
+        try await run(h, CommandIDs.windowShowLibrary, in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
+        let tab = try XCTUnwrap(model.tabs.first { $0.id == board })
+        let close = try XCTUnwrap(model.menuItems(tab).first { $0.id == "windows.tab.close" })
+        try await run(h, close.command, close.params(model.menuContext(tab)), in: navigator)
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertEqual(navigator.session.document, notebook)
+
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let closeKey = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.closeTab"))
+        try await run(h, closeKey.command, closeKey.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertEqual(navigator.session.document, notebook)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let closeAll = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.closeAllTabs"))
+        try await run(h, closeAll.command, closeAll.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertTrue(navigator.openDocuments.isEmpty)
+        XCTAssertNil(navigator.session.document)
+        for doc in [notebook, board] {
+            let node = try XCTUnwrap(h.library.node(doc))
+            XCTAssertNil(node.trashedAt)
+            try await run(h, CommandIDs.docOpen,
+                          ["doc": .string(NodeRef.document(doc).description)], in: navigator)
+            XCTAssertEqual(navigator.session.document, doc)
+            XCTAssertFalse(try h.app.workspace.content(doc).livePages.isEmpty)
+        }
     }
 
     func testClosingTheCurrentTabFromTheLibraryKeepsTheLibrary() async throws {
@@ -592,6 +726,38 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(Set(all.map { $0.shortcut }).count, all.count)   // no key combination twice
     }
 
+    func testTabShortcutHintsMatchRegisteredDestinationsIncludingOverflow() throws {
+        let keys = WindowShortcuts.descriptors(owner: FeatWindowsFeature.id)
+            .filter { $0.command == CommandIDs.tabSelect }
+        for count in [1, 5, 8, 9, 10, 12] {
+            for index in 0..<count {
+                let hint = TabCapsule.shortcutHint(index: index, count: count)
+                let matchingKeys = keys.filter {
+                    $0.params == ["index": .number(Double(index))]
+                        || (index == count - 1 && $0.params == ["index": -1])
+                }
+                if matchingKeys.isEmpty {
+                    XCTAssertNil(hint, "Tabs beyond eight only have a shortcut when last")
+                } else {
+                    let hint = try XCTUnwrap(hint)
+                    XCTAssertEqual(hint.modifiers, .command)
+                    XCTAssertTrue(matchingKeys.contains { $0.shortcut.key == String(hint.key.character) })
+                    if index < 8 {
+                        XCTAssertEqual(String(hint.key.character), String(index + 1))
+                    } else {
+                        XCTAssertEqual(hint.key.character, "9")
+                    }
+                }
+            }
+        }
+        let plan = TabStripLayout.documentPlan(count: 12, active: 11, width: 2000, compact: false)
+        let hints = plan.shown.compactMap { TabCapsule.shortcutHint(index: $0, count: 12)?.key.character }
+        XCTAssertEqual(hints, ["1", "2", "3", "4", "9"], "Hints follow document order, not visible slots")
+        XCTAssertNil(TabCapsule.shortcutHint(index: 0, count: 0))
+        XCTAssertNil(TabCapsule.shortcutHint(index: -1, count: 5))
+        XCTAssertNil(TabCapsule.shortcutHint(index: 5, count: 5))
+    }
+
     func testTabKeysStayLiveInTheLibraryWhileTheWindowHasTabs() async throws {
         let (h, _, _) = try windows()
         await FeatWindowsFeature.start(h.app)
@@ -633,6 +799,71 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(navigator.openDocuments, [notebook, board])
     }
 
+    func testNativeTabsSwitchRunsSettingsCommandAndReflectsExternalChanges() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
+        let page = try XCTUnwrap(h.app.ui.settingsPages.get("windows.settings.tabs"))
+        let hosting = UIHostingController(rootView: page.makeView(h.app))
+        let settingsWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        settingsWindow.rootViewController = hosting
+        settingsWindow.isHidden = false
+        defer {
+            settingsWindow.isHidden = true
+            settingsWindow.rootViewController = nil
+        }
+        func nativeSwitch(in view: UIView) -> UISwitch? {
+            if let control = view as? UISwitch { return control }
+            return view.subviews.lazy.compactMap { nativeSwitch(in: $0) }.first
+        }
+        hosting.view.layoutIfNeeded()
+        try await waitUntil { nativeSwitch(in: hosting.view) != nil }
+        let control = try XCTUnwrap(nativeSwitch(in: hosting.view))
+        XCTAssertFalse(control.isOn)
+        XCTAssertFalse(model.isVisible)
+
+        func enableNativeSwitch() {
+            control.setOn(true, animated: false)
+            // ARCHITECTURE §15.10: package tests are hostless. sendActions(for:) needs
+            // UIApplicationMain, so deliver the control's real registered action directly.
+            var deliveredChange = false
+            control.enumerateEventHandlers { action, targetAction, events, _ in
+                guard events.contains(.valueChanged) else { return }
+                if let action {
+                    control.sendAction(action)
+                    deliveredChange = true
+                } else if let (target, selector) = targetAction, let receiver = target as? NSObject {
+                    _ = receiver.perform(selector, with: control)
+                    deliveredChange = true
+                }
+            }
+            XCTAssertTrue(deliveredChange, "Native switch must have a registered value-change action")
+        }
+
+        // DESIGN §10.13 uses the native switch. Activate the control, not its enclosing labelled row.
+        enableNativeSwitch()
+        try await waitUntil { h.app.settings.get(WindowSettings.showTabs) && model.isVisible }
+        XCTAssertTrue(h.app.settings.get(WindowSettings.showTabs))
+        XCTAssertTrue(model.isVisible)
+        XCTAssertTrue(control.isOn)
+
+        // A synced/command-driven change must flow back into the already-presented native control.
+        try await run(h, CommandIDs.settingsSet,
+                      ["name": .string(WindowSettings.showTabs.name), "value": false], in: navigator)
+        try await waitUntil { !control.isOn && !model.isVisible }
+        XCTAssertFalse(control.isOn)
+        XCTAssertFalse(model.isVisible)
+        enableNativeSwitch()
+        try await waitUntil { h.app.settings.get(WindowSettings.showTabs) && model.isVisible }
+        XCTAssertTrue(h.app.settings.get(WindowSettings.showTabs))
+        XCTAssertTrue(model.isVisible)
+        XCTAssertTrue(h.app.settings.get(NibSettings.openAsTabs))
+        XCTAssertEqual(navigator.openDocuments, [notebook, board])
+        XCTAssertEqual(navigator.editorsBuilt, 2)
+    }
+
     func testChangingTabsVisibilityUpdatesEveryDocumentWindowWithoutReopeningAnEditor() async throws {
         let (h, scenes, hooks) = try windows()
         var documents: [UIViewController] = []
@@ -672,6 +903,101 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(documents.map { $0.additionalSafeAreaInsets.top }, [12, 8])
         XCTAssertEqual(navigators.map { $0.editorsBuilt }, [2, 2])
         withExtendedLifetime(roots) {}
+    }
+
+    func testTabsMenuDoesNotRequireAFloatingPresentationAndFollowsVisibilityPolicy() async throws {
+        let (h, scenes, hooks) = try windows()
+        let navigator = window(h, scenes)
+        let descriptor = try XCTUnwrap(h.app.ui.toolbar.get("windows.tabs.menu"))
+        let provider = try XCTUnwrap(descriptor.compactStatus)
+        XCTAssertTrue(descriptor.showsInCompactWidth)
+        XCTAssertFalse(descriptor.hideable)
+        h.app.settings.set(WindowSettings.showTabs, true)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        for compact in [true, false] {
+            let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                        kind: .notebook, isCompact: compact)
+            XCTAssertNil(provider(context), "A single document needs no switcher")
+        }
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        XCTAssertNil(navigator.rootViewController)
+        XCTAssertNil(navigator.floatingHost)
+        for compact in [true, false] {
+            let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                        kind: .whiteboard, isCompact: compact)
+            XCTAssertNotNil(provider(context), "Tabs must be reachable before makeTabBar attaches a presentation")
+            XCTAssertNotNil(hooks.makeTabBar(navigator)) // legacy host, still no document presentation
+            XCTAssertNotNil(provider(context))
+            h.app.settings.set(WindowSettings.showTabs, false)
+            XCTAssertNil(provider(context))
+            h.app.settings.set(WindowSettings.showTabs, true)
+            XCTAssertNotNil(provider(context))
+        }
+        navigator.closeDocument(notebook)
+        let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                    kind: .whiteboard, isCompact: true)
+        XCTAssertNil(provider(context), "Closing the other document removes the switcher")
+        navigator.addTab(notebook)
+        XCTAssertNotNil(provider(context))
+        navigator.showLibrary(folder: nil)
+        XCTAssertNil(provider(context), "The document switcher does not belong on the library bar")
+    }
+
+    func testPhoneTabsOverflowHasAVisibleHitTargetInBothOrientationsAndAppearances() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        h.app.settings.set(WindowSettings.showTabs, true)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let descriptor = try XCTUnwrap(h.app.ui.toolbar.get("windows.tabs.menu"))
+        let provider = try XCTUnwrap(descriptor.compactStatus)
+        let context = ChromeContext(app: h.app, session: navigator.session, navigator: navigator,
+                                    kind: .whiteboard, isCompact: true)
+
+        // Phone landscape also uses compact chrome. Exercise the actual registered menu without a capsule host.
+        for size in [CGSize(width: 393, height: 852), CGSize(width: 852, height: 393)] {
+            for appearance in [ColorScheme.light, .dark] {
+                let menu = try XCTUnwrap(provider(context))
+                var menuFrame = CGRect.zero
+                let root = NibDropletContainer {
+                    HStack(spacing: NibSpacing.l) {
+                        NibBarGroup(id: "test.leading") {
+                            NibToolbarItem(.back, label: "Library") {}
+                            NibBarTitle(title: "A long document title that must truncate")
+                            menu
+                                .fixedSize(horizontal: true, vertical: false)
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                                    menuFrame = $0
+                                }
+                        }
+                        NibBarGroup(id: "test.trailing") {
+                            NibToolbarItem(.undo, label: "Undo") {}
+                            NibToolbarItem(.assistant, label: "Assistant") {}
+                            NibToolbarItem(.more, label: "More") {}
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .padding(.horizontal, NibMetrics.chromeInset)
+                }
+                .environment(\.colorScheme, appearance)
+                let hosting = UIHostingController(rootView: root)
+                hosting.safeAreaRegions = []
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = hosting
+                window.isHidden = false
+                defer {
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                hosting.view.layoutIfNeeded()
+                try await waitUntil { menuFrame.width >= NibMetrics.hitTarget }
+                XCTAssertGreaterThanOrEqual(menuFrame.height, NibMetrics.hitTarget)
+                XCTAssertGreaterThanOrEqual(menuFrame.minX, NibMetrics.chromeInset)
+                XCTAssertLessThanOrEqual(menuFrame.maxX, size.width - NibMetrics.chromeInset)
+                XCTAssertGreaterThanOrEqual(menuFrame.minY, 0)
+                XCTAssertLessThanOrEqual(menuFrame.maxY, size.height)
+            }
+        }
     }
 
     func testDocumentTabsUseTheExistingFloatingHostWithoutMovingTheBars() async throws {

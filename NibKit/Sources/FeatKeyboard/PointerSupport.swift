@@ -79,6 +79,7 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
     }
 
     private weak var host: CanvasHost?
+    let keyboard = CanvasKeyboardResponder()
     private var secondaryClick: UITapGestureRecognizer?
     private var scrollZoom: UIPanGestureRecognizer?
     private var gesture: ZoomGesture?
@@ -92,6 +93,7 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
 
     func attach(to host: CanvasHost) {
         self.host = host
+        keyboard.attach(to: host)
         HoverEffects.excludeSubtree(host.canvasView)
         let click = UITapGestureRecognizer(target: self, action: #selector(secondaryClicked(_:)))
         click.buttonMaskRequired = .secondary
@@ -111,7 +113,10 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
         scrollZoom = scroll
     }
 
+    func canvasDidChange(_ host: CanvasHost) { keyboard.scheduleFocus() }
+
     func detach(from host: CanvasHost) {
+        keyboard.detach()
         if let click = secondaryClick { host.canvasView.removeGestureRecognizer(click) }
         if let scroll = scrollZoom { host.canvasView.removeGestureRecognizer(scroll) }
         HoverEffects.includeSubtree(host.canvasView)
@@ -235,6 +240,300 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
     func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
         guard recognizer === scrollZoom, let scrollView = host?.canvasView as? UIScrollView else { return false }
         return other === scrollView.panGestureRecognizer
+    }
+}
+
+// MARK: - Canvas keyboard focus
+
+/// The shell is above a SwiftUI hosting boundary and is not always the responder UIKit restores after a panel
+/// closes or the canvas is relaid out. Keep the page shortcuts on a responder inside the canvas, and repair focus
+/// after those transitions. This is a view, not a text input: it never opens a keyboard or intercepts a touch.
+/// Descriptors still come from the registry (including another owner's winning Delete or Go to Page command).
+@MainActor
+final class CanvasKeyboardResponder: UIView {
+    private weak var host: CanvasHost?
+    private var observers: NotificationBag?
+    private var focusScheduled = false
+    private var shortcuts: Set<KeyShortcut> = []
+
+    init() {
+        super.init(frame: .zero)
+        // UIView drops key events when interaction is disabled, even while it is
+        // first responder. Exclude this view from touch hit testing instead.
+        isUserInteractionEnabled = true
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var canBecomeFirstResponder: Bool { true }
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+
+    func attach(to host: CanvasHost) {
+        self.host = host
+        shortcuts = Set(GlobalShortcuts.catalog(app: host.app, owner: FeatKeyboardFeature.id)
+            // The Assistant is available in every document kind, but its shortcut must also reach
+            // the canvas responder below SwiftUI's hosting boundary after a panel closes.
+            .filter { $0.docKinds == ShortcutContext.canvasKinds || $0.command == "ai.chat.open" }
+            .map { ShortcutRules.normalized($0.shortcut) })
+        host.canvasView.addSubview(self)
+        let bag = NotificationBag()
+        observers = bag
+        for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
+                     UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
+                     UIResponder.keyboardDidHideNotification, .nibChromeNeedsUpdate, .nibRegistryDidChange] {
+            bag.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                KeyboardRuntime.onMain { self?.scheduleFocus() }
+            })
+        }
+        bag.add(host.app.events.subscribe { [weak self] event in
+            guard [NibEventType.toolChanged, NibEventType.sessionDocument, NibEventType.sessionActivated]
+                .contains(event.type) else { return }
+            KeyboardRuntime.onMain { self?.scheduleFocus() }
+        })
+        scheduleFocus()
+    }
+
+    func detach() {
+        observers = nil
+        host = nil
+        if isFirstResponder { resignFirstResponder() }
+        removeFromSuperview()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        scheduleFocus()
+    }
+
+    /// Coalesce layout/selection/chrome updates and wait until UIKit has finished moving the old responder.
+    func scheduleFocus() {
+        guard host != nil, !focusScheduled else { return }
+        focusScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.focusScheduled = false
+            self.restoreFocus()
+        }
+    }
+
+    func restoreFocus() {
+        guard let host, let window, window.isKeyWindow, !isFirstResponder,
+              host.session.document == host.documentID, !host.session.isEditingText,
+              !CanvasKeyboardFocus.hasModal(window.rootViewController),
+              CanvasKeyboardFocus.mayReplace(CanvasKeyboardFocus.firstResponder(in: window),
+                                             canvas: host.canvasView) else { return }
+        var ancestor: UIView? = host.canvasView
+        while let view = ancestor {
+            guard !view.isHidden, view.alpha > 0 else { return }
+            ancestor = view.superview
+        }
+        becomeFirstResponder()
+    }
+
+    private var context: KeyCommandContext {
+        guard let host else { return KeyCommandContext(docKind: nil) }
+        let typing = host.session.isEditingText || window.map {
+            CanvasKeyboardFocus.isTextInput(CanvasKeyboardFocus.firstResponder(in: $0))
+        } == true
+        return KeyCommandContext(docKind: ShortcutContext(session: host.session, app: host.app).kind,
+                                 isEditingText: typing, hasTabs: true)
+    }
+
+    private var descriptors: [KeyCommandDescriptor] {
+        guard let host, host.session.document == host.documentID else { return [] }
+        return KeyCommandRouting.active(host.app.content.keyCommands.all, in: context).filter {
+            if shortcuts.contains(ShortcutRules.normalized($0.shortcut)) { return true }
+            // Feature-owned page shortcuts (e.g. the Pencil palette) also need a target below the
+            // SwiftUI hosting boundary. Read the live registry so late registrations/replacements
+            // work; the keyboard feature's catalog is not the complete set of canvas commands.
+            guard $0.scope == .document || $0.scope == .canvas,
+                  let kinds = $0.docKinds, !kinds.isEmpty else { return false }
+            return kinds.isSubset(of: ShortcutContext.canvasKinds)
+        }
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        let context = context
+        return descriptors.map { d in
+            let command = UIKeyCommand(title: d.title, action: #selector(runCanvasKey(_:)),
+                                       input: Self.input(d.shortcut.key),
+                                       modifierFlags: Self.modifiers(d.shortcut.modifiers), propertyList: d.id)
+            command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
+            return command.nibCommand(d.command)
+        }
+    }
+
+    func descriptor(for command: UIKeyCommand) -> KeyCommandDescriptor? {
+        guard let id = command.propertyList as? String else { return nil }
+        return descriptors.first { $0.id == id }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(selectAll(_:)) { return selectAllDescriptor(sender) != nil }
+        guard action == #selector(runCanvasKey(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        // UIKit probes the action without a UIKeyCommand while discovering keyboard targets.
+        // Rejecting that probe hides every canvas shortcut, even when its descriptor is live.
+        // Once UIKit supplies a command, still validate its ID against the current registry/focus.
+        guard let command = sender as? UIKeyCommand else { return !descriptors.isEmpty }
+        return descriptor(for: command) != nil
+    }
+
+    /// UIKit's Edit menu and standard Command-A dispatch use selectAll(_:), not our private
+    /// key selector. Both entry points must resolve the same live, window-scoped descriptor.
+    /// In particular, never take Select All from a native text input or a presented sheet.
+    private func selectAllDescriptor(_ sender: Any?) -> KeyCommandDescriptor? {
+        guard !context.isEditingText, !CanvasKeyboardFocus.hasModal(window?.rootViewController),
+              let descriptor = descriptors.first(where: { $0.shortcut == KeyShortcut("a", .command) }) else {
+            return nil
+        }
+        if let command = sender as? UIKeyCommand {
+            if let id = command.propertyList as? String {
+                guard id == descriptor.id else { return nil }
+            } else {
+                // A system-created Edit command has no registry ID attached.
+                guard command.input?.lowercased() == "a", command.modifierFlags == .command else { return nil }
+            }
+        }
+        return descriptor
+    }
+
+    override func selectAll(_ sender: Any?) {
+        guard let descriptor = selectAllDescriptor(sender) else { return }
+        run(descriptor)
+    }
+
+    @objc private func runCanvasKey(_ command: UIKeyCommand) {
+        guard let descriptor = descriptor(for: command) else { return }
+        run(descriptor)
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key,
+                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    /// UIKit delivers only presses that did not invoke a UIKeyCommand here. Handle them
+    /// before forwarding through a SwiftUI host, which may consume them before the shell.
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard window?.isKeyWindow == true, !CanvasKeyboardFocus.hasModal(window?.rootViewController),
+              let descriptor = KeyCommandRouting.unhandledPress(shortcut, descriptors: descriptors,
+                                                                 in: context) else { return false }
+        run(descriptor)
+        return true
+    }
+
+    private func run(_ descriptor: KeyCommandDescriptor) {
+        guard let host else { return }
+        if window?.isKeyWindow == true,
+           let navigator = window?.rootViewController as? SceneNavigator, navigator.session === host.session {
+            host.app.ui.activeNavigator = navigator
+            host.app.services.sessions.activate(host.session)
+        }
+        host.app.perform(descriptor.command, descriptor.resolvedParams(for: host.session), session: host.session)
+    }
+
+    static func input(_ key: String) -> String {
+        switch key {
+        case "up": return UIKeyCommand.inputUpArrow
+        case "down": return UIKeyCommand.inputDownArrow
+        case "left": return UIKeyCommand.inputLeftArrow
+        case "right": return UIKeyCommand.inputRightArrow
+        case "delete": return UIKeyCommand.inputDelete
+        case "escape": return UIKeyCommand.inputEscape
+        case "tab": return "\t"
+        case "return": return "\r"
+        case "space": return " "
+        default: return key
+        }
+    }
+
+    static func modifiers(_ flags: KeyModifiers) -> UIKeyModifierFlags {
+        var result: UIKeyModifierFlags = []
+        if flags.contains(.command) { result.insert(.command) }
+        if flags.contains(.option) { result.insert(.alternate) }
+        if flags.contains(.shift) { result.insert(.shift) }
+        if flags.contains(.control) { result.insert(.control) }
+        return result
+    }
+}
+
+/// A forwarded key can carry its chord on the event rather than the individual key.
+/// Preserve both, and use HID codes for navigation keys whose characters are private Unicode.
+@MainActor
+enum CanvasKeyPress {
+    static func shortcut(_ key: UIKey, event: UIPressesEvent?) -> KeyShortcut {
+        shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
+                 keyFlags: key.modifierFlags, eventFlags: event?.modifierFlags ?? [])
+    }
+
+    static func shortcut(code: UIKeyboardHIDUsage, characters: String,
+                         keyFlags: UIKeyModifierFlags, eventFlags: UIKeyModifierFlags) -> KeyShortcut {
+        let input: String
+        switch code {
+        case .keyboardReturnOrEnter, .keypadEnter: input = "return"
+        case .keyboardEscape: input = "escape"
+        case .keyboardTab: input = "tab"
+        case .keyboardDeleteOrBackspace: input = "delete"
+        case .keyboardUpArrow: input = "up"
+        case .keyboardDownArrow: input = "down"
+        case .keyboardLeftArrow: input = "left"
+        case .keyboardRightArrow: input = "right"
+        case .keyboardSpacebar: input = "space"
+        default: input = characters.lowercased()
+        }
+        let flags = keyFlags.union(eventFlags)
+        var modifiers: KeyModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.alternate) { modifiers.insert(.option) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        if flags.contains(.control) { modifiers.insert(.control) }
+        return KeyShortcut(input, modifiers)
+    }
+}
+
+@MainActor
+enum CanvasKeyboardFocus {
+    /// Search this window only, including view controllers in its responder chain. No process-wide active session.
+    static func firstResponder(in view: UIView) -> UIResponder? {
+        if view.isFirstResponder { return view }
+        if let controller = view.next as? UIViewController, controller.isFirstResponder { return controller }
+        for child in view.subviews {
+            if let responder = firstResponder(in: child) { return responder }
+        }
+        return nil
+    }
+
+    static func isTextInput(_ responder: UIResponder?) -> Bool {
+        if let text = responder as? UITextView { return text.isEditable }
+        if let field = responder as? UITextField { return field.isEnabled }
+        return responder is UIKeyInput
+    }
+
+    static func mayReplace(_ responder: UIResponder?, canvas: UIView) -> Bool {
+        guard let responder else { return true }
+        guard !isTextInput(responder) else { return false }
+        if let view = responder as? UIView {
+            return !(view is UIControl) && (view.isDescendant(of: canvas) || canvas.isDescendant(of: view))
+        }
+        // Apply the same subtree rule to hosting controllers as to their views.
+        // Controllers in unrelated panels keep their own keyboard handling.
+        guard let view = (responder as? UIViewController)?.viewIfLoaded else { return false }
+        return view.isDescendant(of: canvas) || canvas.isDescendant(of: view)
+    }
+
+    static func hasModal(_ controller: UIViewController?) -> Bool {
+        guard let controller else { return false }
+        if controller.presentedViewController != nil { return true }
+        return controller.children.contains { hasModal($0) }
     }
 }
 

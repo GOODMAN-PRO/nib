@@ -19,12 +19,82 @@ import NibAIAgent
 @testable import FeatPluginInstall
 @testable import FeatTemplateUI
 import FeatSyncUI
+import FeatQuery
+import FeatLasso
+import FeatObjectMenu
+@testable import FeatLibraryUI
+@testable import FeatSearchUI
 
 /// Each scenario composes the actual feature registrations; no feature command is replaced with a test handler.
 /// Only services requiring hardware or a remote provider are faked. @testable accesses the camera/consent seams
 /// and the History view model without widening production API just for an integration target.
 @MainActor
 enum Scenarios {
+    /// The capture starts with stale search state deliberately present. Merely changing the layout is not a
+    /// dismissal: exercise the same search.close + setView recipe used by the device bridge.
+    static func libraryCaptureStates() async throws {
+        let h = Harness(features: [FeatLibraryUIFeature.self, FeatSearchUIFeature.self, FeatQueryFeature.self])
+        defer { try? FileManager.default.removeItem(at: h.persistence.root) }
+        h.session.document = nil
+        h.session.page = nil
+        let model = LibraryModels.get(h.app).model(h.session)
+        let search = SearchRuntime.from(h.app).state(h.session)
+        for (folder, layout) in [("lib", "list"), ("folder:FIXTUREFLD01", "grid")] {
+            search.isPresented = true
+            model.search = "stale search"
+            model.menu = "sort"
+            try await h.run("search.open", ["scope": "lib", "close": true, "instant": true])
+            let output = try await h.run("library.setView", [
+                "folder": .string(folder), "layout": .string(layout), "filter": "all", "sort": "name",
+                "panel": "documents", "search": "", "menu": "none", "selection": "clear", "sidebar": false
+            ])
+            XCTAssertFalse(search.isPresented, "A list/folder screenshot must not show the previous search")
+            XCTAssertEqual(model.search, "")
+            XCTAssertNil(model.menu)
+            XCTAssertNil(model.tab)
+            XCTAssertFalse(model.sidebarVisible)
+            XCTAssertEqual(model.layout.rawValue, layout)
+            XCTAssertEqual(model.folder, folder == "lib" ? nil : Fixtures.folderID)
+            XCTAssertEqual(output["folder"], .string(folder))
+            XCTAssertEqual(output["layout"], .string(layout))
+            let context = try await h.run("query.context")
+            XCTAssertNil(context["document"])
+            XCTAssertEqual(context["selection"]?["refs"], .array([]))
+        }
+    }
+
+    /// Uses the real reveal, selection and query commands. Visible placement/menu presentation still requires
+    /// the full-window device capture gate; a headless page render cannot certify floating chrome.
+    static func lassoCaptureState() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self, FeatLassoFeature.self,
+                                   FeatObjectMenuFeature.self, FeatQueryFeature.self])
+        defer { try? FileManager.default.removeItem(at: h.persistence.root) }
+        let shape: JSONValue = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"
+        h.session.page = Fixtures.page2 // Reproduce a selection whose page was previously off screen.
+        let empty = try await h.run("query.context")
+        XCTAssertEqual(empty["selection"]?["refs"], .array([]))
+        let reveal = try await h.run("view.reveal", ["ref": shape, "flash": false, "animated": false])
+        XCTAssertEqual(reveal["page"], "page:FIXTUREDOC01/FIXTUREPG001")
+        try await h.run("tool.select", ["tool": "lasso"])
+        let selected = try await h.run("selection.set", ["refs": .array([shape])])
+        XCTAssertEqual(selected["count"], 1)
+        let context = try await h.run("query.context")
+        XCTAssertEqual(context["page"]?["ref"], "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertEqual(context["tool"], "lasso")
+        XCTAssertEqual(context["selection"]?["refs"], .array([shape]))
+        XCTAssertEqual(context["selection"]?["kinds"], ["shape"])
+        XCTAssertEqual(context["selection"]?["bbox"]?.arrayValue?.count, 4)
+        let menu = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID,
+                               page: Fixtures.page1, selection: h.session.selection)
+        let ids = Set(h.app.ui.menuItems(.objectMenu, menu).map(\.id))
+        XCTAssertTrue(ids.contains("objectmenu.copy"))
+        XCTAssertTrue(ids.contains("objectmenu.duplicate"))
+        XCTAssertTrue(ids.contains("objectmenu.colour"))
+        try await h.run("selection.clear")
+        let cleared = try await h.run("query.context")
+        XCTAssertEqual(cleared["selection"]?["refs"], .array([]), "A lost selection must fail the capture gate")
+    }
+
     static let doc: JSONValue = .string(NodeRef.document(Fixtures.docID).description)
     static let page: JSONValue = .string(NodeRef.page(Fixtures.docID, Fixtures.page2).description)
 

@@ -294,6 +294,7 @@ struct ToolbarCustomizationView: View {
             TextField(String(localized: "Layout name"), text: $newName)
             Button(String(localized: "Cancel"), role: .cancel) {}
             Button(String(localized: "Save")) { model.save(newName) }
+                .accessibilityIdentifier("cmd.toolbar.saveLayout")
                 .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: {
             Text(String(localized: "Saves the palette as it is now. A layout with the same name is replaced."))
@@ -301,8 +302,11 @@ struct ToolbarCustomizationView: View {
         .confirmationDialog(String(localized: "Reset the toolbar?"), isPresented: $confirmingReset,
                             titleVisibility: .visible) {
             Button(String(localized: "Reset Writing Tools"), role: .destructive) { model.reset(.tools) }
+                .accessibilityIdentifier("cmd.toolbar.reset")
             Button(String(localized: "Reset Accessories"), role: .destructive) { model.reset(.accessories) }
+                .accessibilityIdentifier("cmd.toolbar.reset")
             Button(String(localized: "Reset Whole Toolbar"), role: .destructive) { model.reset(.toolbar) }
+                .accessibilityIdentifier("cmd.toolbar.reset")
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "Saved layouts are kept."))
@@ -354,6 +358,7 @@ struct ToolbarCustomizationView: View {
                 ForEach(model.savedNames, id: \.self) { name in
                     NibRow(name, icon: .listView) {
                         NibButton(String(localized: "Apply"), kind: .plain, size: .compact) { model.apply(name) }
+                            .accessibilityIdentifier("cmd.toolbar.applyLayout")
                             .buttonStyle(.borderless)
                             .accessibilityLabel(String(localized: "Apply \(name)"))
                     }
@@ -393,6 +398,10 @@ struct ToolbarCustomizationView: View {
         HStack(spacing: NibSpacing.xs) {
             if let control {
                 controlButton(row, control)
+            } else {
+                Color.clear
+                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+                    .accessibilityHidden(true)
             }
             NibRow(row.title, icon: row.symbol) {
                 if row.isPlugin { NibBadge(.plugin) }
@@ -402,9 +411,11 @@ struct ToolbarCustomizationView: View {
             if let section {
                 if model.canNudge(row.id, by: -1, in: section) {
                     Button(String(localized: "Move Up")) { model.nudge(row.id, by: -1, in: section) }
+                        .accessibilityIdentifier("cmd.toolbar.setLayout")
                 }
                 if model.canNudge(row.id, by: 1, in: section) {
                     Button(String(localized: "Move Down")) { model.nudge(row.id, by: 1, in: section) }
+                        .accessibilityIdentifier("cmd.toolbar.setLayout")
                 }
             }
         }
@@ -423,6 +434,7 @@ struct ToolbarCustomizationView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: Circle()))
+        .accessibilityIdentifier("cmd.toolbar.setLayout")
         .accessibilityLabel(control == .hide ? String(localized: "Hide \(row.title)")
                                              : String(localized: "Show \(row.title)"))
     }

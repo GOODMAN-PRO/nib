@@ -19,6 +19,11 @@ private final class FakeEditor: DocumentEditing {
 }
 
 @MainActor
+private final class PaletteTestController: UIViewController {
+    override var canBecomeFirstResponder: Bool { true }
+}
+
+@MainActor
 final class FeatPencilHardwareTests: XCTestCase {
     private func context(tool: String = "pen", previous: String? = nil, readOnly: Bool = false,
                          point: Point? = nil) -> PencilActionContext {
@@ -613,6 +618,45 @@ final class FeatPencilHardwareTests: XCTestCase {
         XCTAssertTrue(ids.contains("test.pencil"))
         XCTAssertTrue(ids.contains("pencilhw.undo"))
         XCTAssertEqual(listed["squeeze"], "test.pencil")
+    }
+
+    func testKeyboardPaletteCommandOpensInItsWindowAndRestoresControllerFocus() async throws {
+        let h = Harness(features: [FeatPencilHardwareFeature.self])
+        let handler = try pencilHandler(h)
+        let host = FakeCanvasHost(h)
+        let editor = FakeEditor(host)
+        h.session.editor = editor
+        let root = PaletteTestController()
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer {
+            handler.palette.dismiss()
+            window.isHidden = true
+            withExtendedLifetime(editor) {}
+        }
+        XCTAssertTrue(root.becomeFirstResponder())
+        let shortcut = try XCTUnwrap(h.app.content.keyCommands.get("pencilhw.palette"))
+
+        // Repeat the keyboard path after closing: the shell is a controller, not a UIView.
+        for _ in 0..<2 {
+            let result = try await h.run(shortcut.command, shortcut.resolvedParams(for: h.session))
+            XCTAssertEqual(result["shown"], true)
+            XCTAssertEqual(result["kind"], "tools")
+            let palette = try XCTUnwrap(root.children.compactMap { $0 as? PaletteHostingController }.first)
+            XCTAssertTrue(palette.view.superview === root.view, "The view hierarchy must match controller containment")
+            XCTAssertTrue(palette.view.window === window)
+            XCTAssertTrue(palette.isFirstResponder)
+            XCTAssertFalse(root.isFirstResponder)
+            let escape = try XCTUnwrap(palette.keyCommands?.first { $0.input == UIKeyCommand.inputEscape })
+            let action = try XCTUnwrap(escape.action)
+            _ = palette.perform(action, with: escape)
+            XCTAssertFalse(handler.palette.isPresented)
+            XCTAssertNil(palette.view.window)
+            XCTAssertTrue(root.isFirstResponder, "Closing the palette must restore the scene's keyboard route")
+        }
+        XCTAssertNil(handler.lastFeedback, "Keyboard presentation does not generate Pencil haptics")
     }
 
     func testPaletteCommandMirrorsTheToolbarAndNeedsACanvas() async throws {

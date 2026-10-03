@@ -150,6 +150,7 @@ struct GalleryEntryRow: View {
         .alert(String(localized: "Replace \(entry.name) from another source?"), isPresented: $replacing) {
             Button(String(localized: "Cancel"), role: .cancel) {}
             Button(String(localized: "Review Replacement"), role: .destructive) { model.perform(CommandIDs.pluginInstall, entry.installParams) }
+            .accessibilityIdentifier("cmd." + CommandIDs.pluginInstall)
         } message: {
             Text(String(localized: "This package comes from \(galleryName), a different source than the installed plugin. It will replace the installed package and may be controlled by another publisher."))
         }
@@ -161,6 +162,7 @@ struct GalleryEntryRow: View {
         } else {
             NibButton(installed == nil ? String(localized: "Install Plugin") : (isUpdate ? String(localized: "Review Update") : String(localized: "Installed")),
                       symbol: .importFile, kind: .secondary) { model.perform(CommandIDs.pluginInstall, entry.installParams) }
+            .accessibilityIdentifier("cmd." + CommandIDs.pluginInstall)
                 .disabled(model.busy || (installed != nil && !isUpdate))
         }
         NibButton(expanded ? String(localized: "Hide Details") : String(localized: "Show Details"), kind: .plain) { expanded.toggle() }

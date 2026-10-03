@@ -1,10 +1,17 @@
 import SwiftUI
 import Observation
+import UIKit
 
 /// Settings › Appearance › Liquid. Calm halves every stretch cap and drops necks; Off uses the Reduce Motion and
 /// Reduce Transparency fallbacks whatever the system settings say.
 public enum NibLiquidMode: String, CaseIterable, Sendable {
     case full, calm, off
+}
+
+/// Inherited by UIKit canvas overlays from the app shell, including newly attached handles.
+public struct NibLiquidModeTrait: UITraitDefinition {
+    public static let defaultValue: NibLiquidMode = .full
+    public static let affectsColorAppearance = true
 }
 
 public enum NibLiquid {

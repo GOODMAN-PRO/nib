@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import ImageIO
+import ObjectiveC
 import NibContracts
 import NibDesign
 
@@ -122,6 +123,7 @@ struct ColourEditor: View {
                                        registry: model.app?.content.tapePatterns) {
                                 model.tapSwatch(index)
                             }
+                            .accessibilityIdentifier("cmd.preset.select")
                         }
                         if model.presets.swatches.count < ToolPresets.maxSwatches {
                             NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
@@ -136,6 +138,7 @@ struct ColourEditor: View {
             }
             NibInspectorSection(slot == nil ? String(localized: "New Colour") : String(localized: "Colour")) {
                 NibSwatchGrid(swatches: inks.map(\.swatch), selection: inkSelection(slot: slot))
+                    .accessibilityIdentifier(slot == nil ? "cmd.preset.addSwatch" : "cmd.preset.setSwatch")
             }
             HStack(spacing: NibSpacing.s) {
                 NibButton(String(localized: "Custom"), symbol: .customColour, size: .compact) { model.openPicker() }
@@ -147,6 +150,7 @@ struct ColourEditor: View {
                 Spacer(minLength: 0)
                 if slot != nil, model.presets.swatches.count > 1 {
                     NibIconButton(.trash, label: String(localized: "Remove Colour")) { model.removeEdited() }
+                        .accessibilityIdentifier("cmd.preset.removeSwatch")
                 }
             }
         }
@@ -199,6 +203,7 @@ struct TapePatternGrid: View {
             PresetColour.swatch(colour, id: d.id, name: tiles[d.id] == nil ? d.title : name, pattern: tiles[d.id])
         }
         NibSwatchGrid(swatches: swatches, selection: selection, noneLabel: String(localized: "No Pattern"))
+            .accessibilityIdentifier(model.colourSlot == nil ? "cmd.preset.addSwatch" : "cmd.preset.setSwatch")
             .task(id: descriptors.map(\.id)) {
                 for d in descriptors where tiles[d.id] == nil {
                     if let tile = await TapePatternCache.pattern(d.id, registry: registry) { tiles[d.id] = tile }
@@ -252,12 +257,13 @@ enum TapePatternCache {
 /// Presents `UIColorPickerViewController` (grid, spectrum, sliders with hex, and the system eyedropper) and reports
 /// the chosen colour. A slot changes with every settled choice; a new slot is added once, when the picker closes.
 @MainActor
-final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
-    private static var active: SystemColourPicker?
+final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
+    private static var coordinatorKey: UInt8 = 0
     private let commitsOnFinishOnly: Bool
     private let onPick: @MainActor (RGBA) -> Void
     private var latest: RGBA?
     private var committed: RGBA?
+    private var finished = false
 
     init(initial: RGBA, commitsOnFinishOnly: Bool, onPick: @escaping @MainActor (RGBA) -> Void) {
         self.committed = initial
@@ -268,29 +274,46 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
 
     static func present(title: String, initial: RGBA, supportsAlpha: Bool, commitsOnFinishOnly: Bool, app: NibApp,
                         session: EditorSession, onPick: @escaping @MainActor (RGBA) -> Void) {
+        // Keep UIKit's concrete picker and its native presentation/remote-view setup.
+        // Subclassing just to retain a delegate changes the controller UIKit presents.
         let picker = UIColorPickerViewController()
         picker.title = title
         picker.supportsAlpha = supportsAlpha
         picker.selectedColor = PresetColour.uiColor(initial)
         let coordinator = SystemColourPicker(initial: initial, commitsOnFinishOnly: commitsOnFinishOnly, onPick: onPick)
         picker.delegate = coordinator
-        active = coordinator
+        // UIKit's delegate is weak. Its own controller, not a process-global slot, keeps
+        // it alive so opening a picker in another window cannot detach this one.
+        objc_setAssociatedObject(picker, &coordinatorKey, coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         picker.modalPresentationStyle = .formSheet
+        picker.presentationController?.delegate = coordinator
         if let sheet = picker.sheetPresentationController {
             sheet.detents = [.medium(), .large()]
+            sheet.selectedDetentIdentifier = .large
             sheet.prefersGrabberVisible = true
         }
         PresetPresenter.present(picker, app: app, session: session)
     }
 
     func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor, continuously: Bool) {
+        guard !finished else { return }
         latest = PresetColour.rgba(color)
         if !continuously && !commitsOnFinishOnly { commitLatest() }
     }
 
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+        // UIKit dismisses its Close button presentation before this callback.
+        finish()
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finish()
+    }
+
+    private func finish() {
+        guard !finished else { return }
+        finished = true
         commitLatest()
-        if Self.active === self { Self.active = nil }
     }
 
     private func commitLatest() {

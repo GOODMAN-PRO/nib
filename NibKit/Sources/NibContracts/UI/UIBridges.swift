@@ -65,25 +65,35 @@ public enum PKBridge {
     }
 
     public static func pkStroke(_ stroke: Stroke) -> PKStroke {
+        pkStroke(stroke, normalizeForRendering: false)
+    }
+
+    private static func pkStroke(_ stroke: Stroke, normalizeForRendering: Bool) -> PKStroke {
         var s = stroke
+        let synthetic = !s.points.isEmpty && s.points.allSatisfy { $0.width <= 0 }
         InkModel.prepare(&s)                       // densifies synthetic (zero-width) strokes; no-op for captured ink
         var pts = s.points
         InkModel.fillSizes(&pts, style: s.style)
+        // PencilKit can discard thin synthetic nibs before applying the requested
+        // raster scale. Build those paths in a larger coordinate space, then map
+        // them back to page space without changing their geometry or final width.
+        let normalization: CGFloat = normalizeForRendering && synthetic ? max(1, 8 / CGFloat(max(s.style.width, 0.1))) : 1
         let controls = pts.map { p in
-            PKStrokePoint(location: CGPoint(x: CGFloat(p.x), y: CGFloat(p.y)),
+            PKStrokePoint(location: CGPoint(x: CGFloat(p.x) * normalization, y: CGFloat(p.y) * normalization),
                           timeOffset: TimeInterval(p.t),
-                          size: CGSize(width: CGFloat(p.width), height: CGFloat(p.height)),
+                          size: CGSize(width: CGFloat(p.width) * normalization, height: CGFloat(p.height) * normalization),
                           opacity: CGFloat(p.opacity),
                           force: CGFloat(p.force),
                           azimuth: CGFloat(p.azimuth),
                           altitude: CGFloat(p.altitude))
         }
         let path = PKStrokePath(controlPoints: controls, creationDate: Date(timeIntervalSince1970: stroke.t0))
-        return PKStroke(ink: ink(stroke.style), path: path)
+        return PKStroke(ink: ink(stroke.style), path: path,
+                        transform: CGAffineTransform(scaleX: 1 / normalization, y: 1 / normalization))
     }
 
     public static func drawing(_ strokes: [Stroke]) -> PKDrawing {
-        PKDrawing(strokes: strokes.map { pkStroke($0) })
+        PKDrawing(strokes: strokes.map { pkStroke($0, normalizeForRendering: true) })
     }
 
     /// Converts a captured PencilKit stroke (canvas coordinates == page coordinates) into the model.

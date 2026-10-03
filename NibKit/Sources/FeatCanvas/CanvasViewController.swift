@@ -128,6 +128,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         scrollView.delegate = self
         scrollView.host = self
+        scrollView.accessibilityIdentifier = "nib.canvas"
         view.addSubview(scrollView)
         fixedOverlay.frame = view.bounds
         fixedOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -260,7 +261,10 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         inkingObservation = session.inking.observe { [weak self] signal in self?.inkingChanged(signal) }
         // @Published emits before the value changes: read the session on the next turn.
         let main = DispatchQueue.main
-        session.$tool.dropFirst().receive(on: main).sink { [weak self] _ in self?.host.syncActiveTool() }
+        session.$tool.dropFirst().receive(on: main).sink { [weak self] _ in
+            self?.host.syncActiveTool()
+            self?.view.setNeedsLayout()
+        }
             .store(in: &subscriptions)
         session.$selection.dropFirst().receive(on: main).sink { [weak self] _ in self?.canvasDidChange() }
             .store(in: &subscriptions)
@@ -329,18 +333,20 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // MARK: Layout
 
-    /// Room for the chrome (bars at the top; on iPhone the palette at the bottom, DESIGN.md §14.2) so a page at fit
-    /// starts below the bars and its last line scrolls above the palette.
+    /// Room for the complete chrome footprint (bars, palette and options, DESIGN.md §14.2), so opening content
+    /// and the last line can clear every docked control.
     private func updateChromeInsets() {
         let safe = view.safeAreaInsets
         var fallbackTop: CGFloat?
+        var fallbackBottom: CGFloat?
         var topDocked = false
         if app.ui.screens.toolbarView != nil, !session.readOnly {
             let savedName = app.settings.json(CommandIDs.toolbarDock)?["edge"]?.stringValue
             let savedEdge = savedName.flatMap { NibDock(commandValue: $0) }
             let defaultEdge: NibDock = isCompact ? .bottom : (view.bounds.width > view.bounds.height ? .leading : .top)
-            if (savedEdge ?? defaultEdge) == .top {
-                topDocked = true
+            let edge = savedEdge ?? defaultEdge
+            topDocked = edge == .top
+            if edge == .top || edge == .bottom {
                 // EditorHost passes the chrome's occupied bounds through additionalSafeAreaInsets,
                 // less the canvas baseline. Never feed that clearance back into the dock geometry.
                 let region = DropletDockModel.region(
@@ -354,12 +360,22 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
                     UIFontMetrics(forTextStyle: .body)
                         .scaledValue(for: NibMetrics.paletteThickness, compatibleWith: traitCollection)))
                 // Standalone editors have no measured chrome; use the shared dock metrics as a fallback.
-                fallbackTop = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+                if topDocked {
+                    fallbackTop = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+                } else {
+                    let active = app.ui.toolbarItems(for: kind).first { ($0.toolID ?? $0.id) == session.tool }
+                    let hasOptions = app.ui.toolMenus.get(session.tool) != nil
+                        || active?.activeToolMenu != nil || active?.settings != nil
+                    // Settings-only tools (including lasso) still have an options chevron above the palette.
+                    // Reserve the complete arm, plus paper clearance; measured host bounds take precedence.
+                    fallbackBottom = view.bounds.height - region.maxY + thickness
+                        + (hasOptions ? NibMetrics.barHeight : 0) + NibSpacing.l
+                }
             }
         }
         scrollView.chromeInsets = CanvasChromeInsets.resolve(safeArea: safe, additional: additionalSafeAreaInsets,
                                                             compact: isCompact, topDocked: topDocked,
-                                                            fallbackTop: fallbackTop)
+                                                            fallbackTop: fallbackTop, fallbackBottom: fallbackBottom)
     }
 
     /// Lays the pages out for the current mode and window, then zooms and scrolls: to the current page at fit the first
@@ -663,10 +679,31 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             setOffset(CGPoint(x: x, y: y), animated: animated)
         case .stack:
             let x = rect.width <= bounds.width ? scrollView.contentOffset.x : max(scrollView.contentOffset.x, rect.minX)
-            setOffset(CGPoint(x: x, y: rect.minY - insets.top), animated: animated)
+            setOffset(CGPoint(x: x, y: rect.minY - insets.top + openingMarginOffset(page)), animated: animated)
         case .world:
             break
         }
+    }
+
+    /// A short landscape window with bottom-docked tools should open on the writing, rather than spending its
+    /// usable height on the page's blank header. Top-docked tools keep the page-first fit below their full rail.
+    /// Keep fit width and a token-sized margin above the first painted item. Only explicit page navigation / fit
+    /// and untouched fitted relayouts use this; a manual reading anchor is never moved.
+    private func openingMarginOffset(_ page: PageID) -> CGFloat {
+        let size = scrollView.bounds.size
+        guard isCompact, size.width > size.height, size.height < NibMetrics.compactBreakpoint,
+              app.ui.screens.toolbarView != nil, !session.readOnly,
+              let pageSize = shown[page]?.size else { return 0 }
+        let savedDock = app.settings.json(CommandIDs.toolbarDock)?["edge"]?.stringValue
+        let dock = savedDock.flatMap { NibDock(commandValue: $0) } ?? .bottom
+        guard dock == .bottom else { return 0 }
+        let firstInk = ((try? app.workspace.items(documentID, page: page)) ?? [])
+            .filter { !$0.deleted && host.visibleLayers.contains($0.layer) }
+            .compactMap { Self.contentBounds($0, app.content) }
+            .filter { $0.maxY > 0 && $0.y < pageSize.height }
+            .map(\.y).min()
+        guard let firstInk else { return 0 }
+        return max(0, CGFloat(firstInk) * scrollView.zoomScale - NibSpacing.m)
     }
 
     func reveal(page: PageID, rect: Rect?, animated: Bool) {
@@ -1008,6 +1045,66 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         return fitZoom
     }
 
+    /// Explicit fit controls use the current paper, independently of the scrolling direction.
+    func fitPaper(widthOnly: Bool) {
+        guard let page = currentPage, let size = livePages.first(where: { $0.id == page })?.size else {
+            setZoom(currentFitZoom(), anchor: nil, centreFit: true)
+            return
+        }
+        let target = ZoomRules.fit(page: size, viewport: scrollView.bounds.size, insets: scrollView.chromeInsets,
+                                   direction: widthOnly ? .vertical : .horizontal, compact: isCompact)
+        setZoom(target, anchor: nil, centreFit: true)
+        if !widthOnly, let frame = host.pageFrame(page) {
+            // Fit Page includes the blank header; the normal opening position may skip it.
+            let centre = visibleCentre
+            setOffset(CGPoint(x: frame.midX - centre.x, y: frame.midY - centre.y))
+            requestedPage = page
+            finishViewChange(bake: true)
+            flushSessionState()
+        }
+    }
+
+    /// Canvas navigation remains in the responder chain even when an input/keyboard attachment holds focus.
+    override var keyCommands: [UIKeyCommand]? {
+        let live = Set(livePanCommands.map(\.id))
+        return CanvasKeys.pans.compactMap { pan -> UIKeyCommand? in
+            guard live.contains(pan.id), let descriptor = app.content.keyCommands.get(pan.id),
+                  let input = ["up": UIKeyCommand.inputUpArrow, "down": UIKeyCommand.inputDownArrow,
+                               "left": UIKeyCommand.inputLeftArrow, "right": UIKeyCommand.inputRightArrow][pan.key]
+            else { return nil }
+            let command = UIKeyCommand(title: descriptor.title, action: #selector(panFromKeyboard(_:)),
+                                       input: input, modifierFlags: .alternate, propertyList: pan.id)
+            command.wantsPriorityOverSystemBehavior = true
+            return command
+        }
+    }
+
+    @objc func panFromKeyboard(_ command: UIKeyCommand) {
+        guard let id = command.propertyList as? String,
+              let descriptor = livePanCommands.first(where: { $0.id == id }) else { return }
+        app.perform(descriptor.command, descriptor.resolvedParams(for: session), session: session)
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(panFromKeyboard(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        // UIKit discovers the action with no concrete command before routing a key.
+        guard let command = sender as? UIKeyCommand else { return !livePanCommands.isEmpty }
+        guard let id = command.propertyList as? String else { return false }
+        return livePanCommands.contains { $0.id == id }
+    }
+
+    private var livePanCommands: [KeyCommandDescriptor] {
+        guard !isClosed, session.editor === self, session.document == documentID else { return [] }
+        func textHasFocus(_ view: UIView) -> Bool {
+            if view.isFirstResponder, view is UIKeyInput { return true }
+            return view.subviews.contains(where: textHasFocus)
+        }
+        let typing = session.isEditingText || viewIfLoaded?.window.map(textHasFocus) == true
+        let context = KeyCommandContext(docKind: kind, isEditingText: typing)
+        let ids = Set(CanvasKeys.pans.map(\.id))
+        return KeyCommandRouting.active(app.content.keyCommands.all, in: context).filter { ids.contains($0.id) }
+    }
+
     /// Grows the board world when the window nears its edge (once a drag or zoom has settled), keeping everything
     /// where it is on screen.
     private func growBoardIfNeeded() {
@@ -1116,6 +1213,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
         requestedPage = nil
+        // Chrome/layout changes during the pinch must preserve its anchor instead of restoring fit.
+        isAtFit = false
+        hasManualPan = true
         self.scrollView.isZoomingNow = true
         hudLingerTask?.cancel()
         hud.setPinching(true)
@@ -1127,6 +1227,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         host.layoutOverlay()
         hud.setZoom(ZoomRules.percent(self.scrollView.zoom))
         self.scrollView.updateVisiblePages()
+        scheduleSessionFlush()
         canvasDidChange()
         layoutFixedViews()
     }
@@ -1430,7 +1531,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         let empty = kind == .notebook && livePages.filter({ $0.size != nil }).isEmpty && !mode.isWorld
         if empty, emptyHost == nil {
             var add: NibAction?
-            if canAddPage { add = NibAction(String(localized: "Add Page"), handler: { [weak self] in self?.addPage() }) }
+            if canAddPage { add = NibAction(String(localized: "Add Page"), command: CommandIDs.pageAdd, handler: { [weak self] in self?.addPage() }) }
             let state = NibEmptyState(symbol: .addPage, title: String(localized: "No pages"),
                                       message: String(localized: "This notebook has no pages yet."), primary: add)
             let hosting = UIHostingController(rootView: state)
@@ -1576,6 +1677,7 @@ struct CanvasPageHUD: View {
         HStack(spacing: NibSpacing.xxs) {
             if model.canShowNavigator {
                 NibIconButton(.pages, label: model.navigatorLabel, size: .bar) { model.showNavigator() }
+                    .accessibilityIdentifier("cmd." + CommandIDs.sidebarToggle)
             }
             if model.isLoading {
                 ProgressView()

@@ -84,7 +84,7 @@ targets:
         NSLocalNetworkUsageDescription: Nib uses the local network for live collaboration and the AI bridge.
         NSCalendarsFullAccessUsageDescription: Nib shows your calendar events and creates notes for meetings.
         NSCalendarsUsageDescription: Nib shows your calendar events and creates notes for meetings.
-        NSBonjourServices: [_nib._tcp, _nib-collab._tcp, _nib-collab._udp]
+        NSBonjourServices: [_nib-agent._tcp, _nib._tcp, _nib-collab._tcp, _nib-collab._udp]
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSUserActivityTypes: [app.nib.openDocument]
@@ -151,6 +151,23 @@ targets:
           - UTTypeIdentifier: app.nib.pages
             UTTypeDescription: Nib Pages
             UTTypeConformsTo: [public.json]
+  NibUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: NibUITests
+      # Compile pure UI-test helpers in both the runner and NibContractsTests.
+      - path: NibKit/Sources/NibContracts/UI/NibUITestScrollGeometry.swift
+      - path: NibKit/Sources/NibContracts/UI/NibUITestSnapshot.swift
+    dependencies:
+      - target: Nib
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nib.NibUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: Nib
+        SWIFT_OBJC_BRIDGING_HEADER: NibUITests/Support/NibTouchPaths.h
   NibWidgets:
     type: app-extension
     platform: iOS
@@ -215,3 +232,16 @@ schemes:
       config: Debug
     archive:
       config: Release
+  NibUITests:
+    build:
+      targets:
+        Nib: all
+        NibUITests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - name: NibUITests
+          parallelizable: false
+    run:
+      config: Debug

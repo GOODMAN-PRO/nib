@@ -71,6 +71,7 @@ struct ActiveToolOptions: View {
                 if menu != nil { NibBarSeparator() }
                 NibIconButton(.chevronDown, label: String(localized: "\(settingsTitle) Settings"), size: .bar,
                               action: openSettings)
+                    .accessibilityIdentifier("menu.toolSettings")
             }
         }
     }

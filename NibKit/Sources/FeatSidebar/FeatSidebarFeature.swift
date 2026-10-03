@@ -55,6 +55,23 @@ enum SidebarIDs {
 /// pages are put in document order (sorting only those) when an entry runs.
 @MainActor
 struct SidebarMenuTarget {
+    /// A location hint, never a cached record: each menu action checks the current head at
+    /// this index, so edits/deletions/reorders cannot leave visibility using stale page data.
+    private static var pageHint: (doc: DocumentID, page: PageID, index: Int)?
+
+    static func isLive(_ page: PageID, in content: DocumentContent, doc: DocumentID) -> Bool {
+        if let hint = pageHint, hint.doc == doc, hint.page == page,
+           content.pages.indices.contains(hint.index), content.pages[hint.index].id == page {
+            return !content.pages[hint.index].deleted
+        }
+        guard let index = content.pages.firstIndex(where: { $0.id == page }) else {
+            pageHint = nil
+            return false
+        }
+        pageHint = (doc, page, index)
+        return !content.pages[index].deleted
+    }
+
     let app: NibApp
     let session: EditorSession?
     let doc: DocumentID
@@ -118,7 +135,7 @@ struct SidebarMenuTarget {
         guard let doc = ctx.doc ?? ctx.session?.document, let first = ids.first,
               let content = try? ctx.app.workspace.content(doc), content.meta.kind == .notebook else { return nil }
         // Usually the first page is live (one scan up to it); otherwise one pass over the document.
-        let firstLive = content.page(first).map { !$0.deleted } ?? false
+        let firstLive = isLive(first, in: content, doc: doc)
         if !firstLive {
             let wanted = Set(ids)
             guard content.pages.contains(where: { !$0.deleted && wanted.contains($0.id) }) else { return nil }

@@ -30,7 +30,7 @@ public enum NibSyncFeature: NibFeature {
     public static func start(_ app: NibApp) async {
         guard let watcher = app.services.get(FolderWatcher.serviceKey, as: FolderWatcher.self) else { return }
         watcher.start()
-        LibraryRecovery.begin(app)
+        if !NibUITestMode.isEnabled { LibraryRecovery.begin(app) }
     }
 
     /// Before a document opens: its evicted iCloud items are downloaded first (the store would block reading them).

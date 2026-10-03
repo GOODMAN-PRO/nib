@@ -749,3 +749,10 @@ public extension Notification.Name {
     /// contracts-v2: posted by `UIRegistries.setNeedsChromeUpdate`; userInfo ["session": id] or nil for every window.
     static let nibChromeNeedsUpdate = Notification.Name("NibChromeNeedsUpdate")
 }
+
+public extension UIMenuElement {
+    @discardableResult func nibCommand(_ command: String) -> Self {
+        accessibilityIdentifier = "cmd." + command
+        return self
+    }
+}

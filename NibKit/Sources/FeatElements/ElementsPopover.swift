@@ -158,6 +158,10 @@ final class ElementsModel: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in Task { await self?.reload() } }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: GiphyKey.didChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.gifKeyChanged() }
+            .store(in: &cancellables)
     }
 
     private static func selectable(_ s: Selection, doc: DocumentID?) -> Bool {
@@ -436,6 +440,15 @@ final class ElementsModel: ObservableObject {
         }
     }
 
+    private func gifKeyChanged() {
+        // A reply authorised with the previous key must not replace the new key state. Keep the user's query.
+        gifSearchToken = UUID()
+        gifs = []
+        gifTotal = 0
+        gifNextOffset = 0
+        gifState = GiphyKey.load() == nil ? .needsKey : .idle
+    }
+
     func setGIFKind(_ kind: GiphyKind) {
         guard kind != gifKind else { return }
         gifKind = kind
@@ -498,6 +511,8 @@ final class ElementsModel: ObservableObject {
     /// Settings › Elements and GIFs through `settings.open {page}` (F027), which opens Settings at that page; the
     /// window's navigator when Settings is not installed.
     func openSettings() {
+        // Leaving this non-sticky tool closes its retained popover before the Settings sheet opens.
+        if session.tool == ElementsTool.toolID { session.finishToolUse(sticky: false) }
         if app.commands.entry(CommandIDs.settingsOpen) != nil {
             app.perform(CommandIDs.settingsOpen, ["page": .string(ElementsSettingsPage.id)], session: session)
         } else {
@@ -589,6 +604,10 @@ struct ElementsPopover: View {
         _model = StateObject(wrappedValue: ElementsModel(app: app, session: session))
     }
 
+    init(model: ElementsModel) {
+        _model = StateObject(wrappedValue: model)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
             NibSegmentedControl(selection: $model.tab, options: ElementsModel.Tab.allCases) { $0.title }
@@ -601,16 +620,7 @@ struct ElementsPopover: View {
         }
         .task { await model.start() }
         .onDisappear { model.stop() }
-        .alert(model.prompt?.title ?? "", isPresented: $model.showsPrompt, presenting: model.prompt) { prompt in
-            TextField(prompt.placeholder, text: $model.promptText)
-                .textInputAutocapitalization(prompt == .gifLink ? TextInputAutocapitalization.never
-                                                                : TextInputAutocapitalization.sentences)
-                .autocorrectionDisabled(prompt == .gifLink)
-            Button(prompt.action) { Task { await model.submit(prompt) } }
-            Button(String(localized: "Cancel"), role: .cancel) {}
-        } message: { prompt in
-            Text(prompt.message)
-        }
+        .background(ElementsPromptPresenter(model: model).allowsHitTesting(false))
         .confirmationDialog(model.deletion?.title ?? "", isPresented: $model.showsDeletion, titleVisibility: .visible,
                             presenting: model.deletion) { deletion in
             Button(deletion.action, role: .destructive) { Task { await model.confirm(deletion) } }
@@ -626,6 +636,173 @@ struct ElementsPopover: View {
             ElementsSheet(model: model)
         }
         .accessibilityElement(children: .contain)
+    }
+}
+
+/// Use the system alert directly: SwiftUI's alert builder drops the text field's accessibility metadata.
+/// Presentation belongs to this popover's controller hierarchy, so it stays in the invoking scene.
+private struct ElementsPromptPresenter: UIViewControllerRepresentable {
+    @ObservedObject var model: ElementsModel
+
+    func makeUIViewController(context: Context) -> Controller { Controller(model: model) }
+    func updateUIViewController(_ controller: Controller, context: Context) { controller.updatePrompt() }
+    static func dismantleUIViewController(_ controller: Controller, coordinator: ()) {
+        controller.alert?.dismiss(animated: false)
+    }
+
+    final class Controller: UIViewController {
+        let model: ElementsModel
+        weak var alert: UIAlertController?
+
+        init(model: ElementsModel) {
+            self.model = model
+            super.init(nibName: nil, bundle: nil)
+        }
+        required init?(coder: NSCoder) { return nil }
+        override func loadView() {
+            view = UIView()
+            view.isUserInteractionEnabled = false
+        }
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            updatePrompt()
+        }
+
+        func updatePrompt() {
+            guard model.showsPrompt else {
+                alert?.dismiss(animated: true)
+                alert = nil
+                return
+            }
+            guard viewIfLoaded?.window != nil, alert == nil, let prompt = model.prompt else { return }
+            let dialog = UIAlertController(title: prompt.title, message: prompt.message.isEmpty ? nil : prompt.message,
+                                           preferredStyle: .alert)
+            dialog.addTextField { [model] field in
+                field.text = model.promptText
+                field.placeholder = prompt.placeholder
+                field.accessibilityIdentifier = prompt.placeholder
+                field.accessibilityLabel = prompt == .gifLink ? String(localized: "GIF web address") : prompt.placeholder
+                field.keyboardType = prompt == .gifLink ? .URL : .default
+                field.autocapitalizationType = prompt == .gifLink ? .none : .sentences
+                field.autocorrectionType = prompt == .gifLink ? .no : .default
+            }
+            dialog.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { [weak self] _ in
+                self?.alert = nil
+                self?.model.showsPrompt = false
+            })
+            dialog.addAction(UIAlertAction(title: prompt.action, style: .default) { [weak self, weak dialog] _ in
+                guard let self else { return }
+                model.promptText = dialog?.textFields?.first?.text ?? ""
+                alert = nil
+                model.showsPrompt = false
+                Task { await self.model.submit(prompt) }
+            })
+            alert = dialog
+            var presenter: UIViewController = self
+            while let parent = presenter.parent { presenter = parent }
+            while let presented = presenter.presentedViewController { presenter = presented }
+            presenter.present(dialog, animated: true)
+        }
+    }
+}
+
+/// Native input keeps its accessible name when a value replaces the placeholder. The enclosing views use the
+/// same NibDesign field tokens; UIKit owns editing, secure entry, keyboard behaviour and accessibility together.
+private struct ElementsEntryField: UIViewRepresentable {
+    @Binding var text: String
+    let prompt: String
+    var secure = false
+    var password = false
+    var returnKey: UIReturnKeyType = .done
+    var onSubmit: () -> Void = {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.delegate = context.coordinator
+        field.addAction(UIAction { [coordinator = context.coordinator, weak field] _ in
+            guard let field else { return }
+            coordinator.changed(field)
+        }, for: .editingChanged)
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.adjustsFontForContentSizeCategory = true
+        return field
+    }
+    func updateUIView(_ field: UITextField, context: Context) {
+        context.coordinator.owner = self
+        field.font = NibUIFont.body
+        field.textColor = NibUIColor.label
+        field.tintColor = NibUIColor.accent
+        field.placeholder = prompt
+        field.accessibilityLabel = prompt
+        field.accessibilityIdentifier = prompt
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.textContentType = password ? .password : nil
+        field.returnKeyType = returnKey
+        if field.isSecureTextEntry != secure {
+            let selection = field.selectedTextRange
+            field.isSecureTextEntry = secure
+            field.selectedTextRange = selection
+        }
+        if field.text != text { field.text = text }
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextField, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite else { return nil }
+        return CGSize(width: max(0, width), height: max(NibMetrics.hitTarget, uiView.intrinsicContentSize.height))
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var owner: ElementsEntryField
+        init(_ owner: ElementsEntryField) { self.owner = owner }
+        func changed(_ field: UITextField) { owner.text = field.text ?? "" }
+        func textFieldShouldReturn(_ field: UITextField) -> Bool {
+            owner.text = field.text ?? ""
+            field.resignFirstResponder()
+            owner.onSubmit()
+            return true
+        }
+    }
+}
+
+private struct ElementsSearchField: View {
+    @Binding var text: String
+    let prompt: String
+    var onSubmit: () -> Void = {}
+
+    var body: some View {
+        HStack(spacing: NibSpacing.s) {
+            Image(nib: .search).font(NibFont.body).foregroundStyle(NibColor.labelSecondary).accessibilityHidden(true)
+            ElementsEntryField(text: $text, prompt: prompt, returnKey: .search, onSubmit: onSubmit)
+            if !text.isEmpty {
+                NibIconButton(.clearText, label: String(localized: "Clear search"), size: .panel) { text = "" }
+            }
+        }
+        .padding(.leading, NibSpacing.m)
+        .padding(.trailing, text.isEmpty ? NibSpacing.m : 0)
+        .frame(minHeight: NibMetrics.hitTarget)
+        .background(NibColor.fill4, in: Capsule())
+    }
+}
+
+private struct ElementsSecureField: View {
+    @Binding var text: String
+    let prompt: String
+    let onSubmit: () -> Void
+    @State private var revealed = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ElementsEntryField(text: $text, prompt: prompt, secure: !revealed, password: true, onSubmit: onSubmit)
+                .padding(.leading, NibSpacing.m)
+            NibIconButton(revealed ? .eyeSlash : .eye,
+                          label: revealed ? String(localized: "Hide text") : String(localized: "Show text"),
+                          size: .panel) { revealed.toggle() }
+        }
+        .privacySensitive()
+        .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
     }
 }
 
@@ -660,7 +837,7 @@ struct ElementsStickersPane: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
-            NibSearchField(text: $model.query, prompt: String(localized: "Search elements"))
+            ElementsSearchField(text: $model.query, prompt: String(localized: "Search elements"))
             if searching {
                 results
             } else {
@@ -708,11 +885,18 @@ struct ElementsStickersPane: View {
     }
 
     private func grid(_ elements: [ElementInfo]) -> some View {
-        LazyVGrid(columns: columns, spacing: NibSpacing.s) {
-            ForEach(elements, id: \.key) { element in
-                ElementCell(model: model, element: element)
+        // Keep the collection controls below the grid in reach, even with a large collection and a selection.
+        // The outer tool panel is bounded; only the thumbnails should grow into a scrolling catalogue.
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: NibSpacing.s) {
+                ForEach(elements, id: \.key) { element in
+                    ElementCell(model: model, element: element)
+                }
             }
         }
+        .frame(height: 2 * 64 + NibSpacing.s)
+        .scrollBounceBehavior(.basedOnSize)
+        .accessibilityLabel(String(localized: "Elements in collection"))
     }
 }
 
@@ -867,7 +1051,7 @@ struct ElementsGIFPane: View {
                               message: String(localized: "GIF search uses your own GIPHY API key. Add one in Settings; GIFs from Files or a link work without it."),
                               primary: NibAction(String(localized: "Open Settings")) { model.openSettings() })
             } else {
-                NibSearchField(text: $model.gifQuery, prompt: String(localized: "Search GIPHY")) {
+                ElementsSearchField(text: $model.gifQuery, prompt: String(localized: "Search GIPHY")) {
                     Task { await model.searchGIFs() }
                 }
                 HStack(spacing: NibSpacing.s) {
@@ -1334,7 +1518,7 @@ struct ElementsSettingsView: View {
                         .font(NibFont.body)
                     }
                 } else {
-                    NibSecureField(text: $draftKey, prompt: String(localized: "Paste your GIPHY API key"), onSubmit: saveKey)
+                    ElementsSecureField(text: $draftKey, prompt: String(localized: "Paste your GIPHY API key"), onSubmit: saveKey)
                     Button(String(localized: "Save Key"), action: saveKey)
                         .font(NibFont.body)
                         .frame(minHeight: NibMetrics.hitTarget)

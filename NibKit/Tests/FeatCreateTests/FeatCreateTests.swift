@@ -44,8 +44,130 @@ private final class FakeNavigator: SceneNavigator {
     func presentModal(_ viewController: UIViewController) { presented.append(viewController) }
 }
 
+/// A unit-test presentation whose UIKit completion can be released independently of the dismiss request.
+/// The package's hostless XCTest process has no application scene in which to present a real modal.
+@MainActor
+private final class DeferredDismissalController: UIViewController {
+    let presenter = UIViewController()
+    var isPresented = true
+    var dismissalCompletion: (() -> Void)?
+    override var presentingViewController: UIViewController? { isPresented ? presenter : nil }
+    override func dismiss(animated flag: Bool, completion: (() -> Void)? = nil) {
+        dismissalCompletion = completion
+    }
+}
+
 @MainActor
 final class FeatCreateTests: XCTestCase {
+    func testCustomDimensionErrorsIdentifyFirstFieldAndClearAfterCorrection() async {
+        let h = harness()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.sizeSelection = nil
+        model.customWidth = 0
+        model.customHeight = 6000
+        model.applyCustomSize()
+        XCTAssertNil(model.dimensionMessage, "Do not show validation before Create")
+
+        let created = await model.create()
+        XCTAssertFalse(created)
+        XCTAssertEqual(model.invalidDimension, .width)
+        XCTAssertNotNil(model.dimensionMessage)
+        XCTAssertNil(model.actionMessage, "Size errors belong beside the fields")
+
+        model.customWidth = 100
+        model.applyCustomSize()
+        XCTAssertEqual(model.invalidDimension, .height)
+        XCTAssertNotNil(model.dimensionMessage)
+        model.customHeight = 150
+        model.applyCustomSize()
+        XCTAssertNil(model.invalidDimension)
+        XCTAssertNil(model.dimensionMessage)
+        XCTAssertNil(model.actionMessage)
+
+        model.customHeight = 0
+        model.applyCustomSize()
+        let invalid = await model.create()
+        XCTAssertFalse(invalid)
+        model.sizeSelection = "A4"
+        XCTAssertNil(model.invalidDimension)
+        XCTAssertNil(model.dimensionMessage, "A preset removes the custom-size error")
+        XCTAssertNil(model.actionMessage)
+    }
+
+    func testCreationProgressAndPinnedFailureRecoverForRetry() async {
+        let h = harness()
+        let log = CallLog()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Progress"
+        model.draft.hasCover = false
+        stub(h, "doc.create", log: log) { _ in
+            XCTAssertTrue(model.isWorking, "The form and Cancel must stay disabled during creation")
+            XCTAssertEqual(model.createActionTitle, String(localized: "Creating…"))
+            XCTAssertNil(model.actionMessage)
+            let duplicate = await model.create()
+            XCTAssertFalse(duplicate, "Repeated Create must not start another operation")
+            throw NibError(.internalError, "disk full")
+        }
+        let failed = await model.create()
+        XCTAssertFalse(failed)
+        XCTAssertEqual(log.count("doc.create"), 1)
+        XCTAssertFalse(model.isWorking)
+        XCTAssertEqual(model.createActionTitle, NewDocumentKind.notebook.createTitle)
+        XCTAssertTrue(model.actionMessage?.contains("disk full") ?? false)
+        XCTAssertNil(model.dimensionMessage, "Creation failures belong beside the pinned action")
+
+        stubDocCreate(h, log: log)
+        let retried = await model.create {
+            XCTAssertTrue(model.isWorking, "Keep controls disabled through the existing dismiss/open handoff")
+            XCTAssertNil(model.actionMessage)
+        }
+        XCTAssertTrue(retried)
+        XCTAssertFalse(model.isWorking)
+        XCTAssertNil(model.actionMessage)
+    }
+
+    func testSavedMinimumCustomSizeRetainsFractionalMillimetres() async throws {
+        let h = harness()
+        h.app.settings.set(NibSettings.defaultPageSize, PageSize(72, 144))
+        let model = NewNotebookModel(app: h.app, folder: Fixtures.folderID, kind: .notebook,
+                                     session: h.session, navigator: nil)
+        XCTAssertEqual(model.customWidth, 25.4, accuracy: 0.0001)
+        XCTAssertEqual(model.customHeight, 50.8, accuracy: 0.0001)
+        let created = await model.create()
+        XCTAssertTrue(created, "A saved valid custom page must not be rejected after rounding millimetres")
+    }
+
+    func testInvalidCustomDimensionsDoNotCreateOrRememberClampedPages() async throws {
+        let h = harness()
+        let before = h.library.children(of: Fixtures.folderID).map(\.id)
+        let defaultSize = h.app.settings.get(NibSettings.defaultPageSize)
+        let model = NewNotebookModel(app: h.app, folder: Fixtures.folderID, kind: .notebook,
+                                     session: h.session, navigator: nil)
+        model.sizeSelection = nil
+        for (width, height) in [(0.0, 150.0), (100, 0), (-10, 150), (100, 6000), (.nan, 150), (100, .infinity)] {
+            model.customWidth = width
+            model.customHeight = height
+            model.applyCustomSize()
+            let created = await model.create()
+            XCTAssertFalse(created)
+            XCTAssertNotNil(model.message)
+            XCTAssertFalse(model.isWorking)
+            XCTAssertEqual(h.library.children(of: Fixtures.folderID).map(\.id), before)
+            XCTAssertEqual(h.app.settings.get(NibSettings.defaultPageSize), defaultSize)
+        }
+        model.customWidth = 100
+        model.customHeight = 150
+        model.applyCustomSize()
+        model.draft.hasCover = false
+        let created = await model.create()
+        XCTAssertTrue(created, "Correcting the dimensions must let the same draft create normally")
+        let node = try XCTUnwrap(h.library.children(of: Fixtures.folderID).first { !before.contains($0.id) })
+        let page = try XCTUnwrap(h.app.workspace.content(node.id).livePages.first)
+        let size = try XCTUnwrap(page.size)
+        XCTAssertEqual(size.width, 100 * 72 / 25.4, accuracy: 0.001)
+        XCTAssertEqual(size.height, 150 * 72 / 25.4, accuracy: 0.001)
+    }
+
     private func harness() -> Harness { Harness(features: [FeatCreateFeature.self]) }
 
     /// Registers a stand-in for another feature's command.
@@ -107,7 +229,7 @@ final class FeatCreateTests: XCTestCase {
         h.persistence.pageItems[doc, default: [:]][page.id] = [item]
     }
 
-    private static func ruled(owner: String = "test") -> TemplateDefinition {
+    private static func ruled(owner: String = "builtin") -> TemplateDefinition {
         TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: owner,
                            params: [TemplateParam(name: TemplateParamNames.paper, title: "Paper", kind: "color"),
                                     TemplateParam(name: TemplateParamNames.line, title: "Line", kind: "color")]) { p, size, _ in
@@ -118,7 +240,7 @@ final class FeatCreateTests: XCTestCase {
     }
 
     private static func dots() -> TemplateDefinition {
-        TemplateDefinition(id: TemplateIDs.dots, title: "Dots", category: "Essentials", owner: "test") { _, _, _ in
+        TemplateDefinition(id: TemplateIDs.dots, title: "Dots", category: "Essentials", owner: "builtin") { _, _, _ in
             TemplateRender(paper: .white)
         }
     }
@@ -397,7 +519,7 @@ final class FeatCreateTests: XCTestCase {
         h.app.content.templates.register(Self.solidCover())
         let model = NewNotebookModel(app: h.app, folder: Fixtures.folderID, kind: .notebook, session: h.session,
                                      navigator: nil)
-        XCTAssertEqual(Set(model.groups), ["Writing", "Essentials"])
+        XCTAssertEqual(model.groups, ["Basic", "Lined", "Grid", "Planners", "Music", "From plugins"])
         XCTAssertEqual(model.covers.map(\.id), ["cover.solid"])
         let dots = try XCTUnwrap(model.papers.first { $0.id == TemplateIDs.dots })
         model.selectPaper(dots)
@@ -430,6 +552,234 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertTrue(titledDone)
         let kinematics = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Kinematics" })
         XCTAssertNil(PendingCreations.get(kinematics.id, h.app.settings))
+    }
+
+    func testCreationGroupsSeparateBuiltinsAndPluginsEvenWithMatchingCategories() {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        h.app.content.templates.register(Self.dots())
+        var plugin = Self.ruled(owner: "plugin.example")
+        plugin.id = "plugin.example.paper"
+        h.app.content.templates.register(plugin)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.group = "Lined"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [TemplateIDs.ruled])
+        model.group = "Grid"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [TemplateIDs.dots])
+        model.group = "From plugins"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [plugin.id])
+    }
+
+    func testNativePlannerWithoutBuiltinIDDoesNotAppearAsPluginPaper() {
+        let h = harness()
+        // Register under an installed feature owner, just as Calendar registers planner.events.
+        var planner = Self.ruled(owner: FeatCreateFeature.id)
+        planner.id = "planner.events"
+        planner.category = "Planners"
+        h.app.content.templates.register(planner)
+        var model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.group = "From plugins"
+        XCTAssertTrue(model.papersInGroup.isEmpty)
+        model.group = "Planners"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [planner.id])
+
+        // A plugin cannot acquire native provenance by choosing a builtin-looking ID or category.
+        var plugin = planner
+        plugin.owner = "org.example.paper"
+        plugin.id = "builtin.pluginPlanner"
+        h.app.content.templates.register(plugin)
+        model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.group = "From plugins"
+        XCTAssertEqual(model.papersInGroup.map(\.id), [plugin.id])
+    }
+
+    func testLegalSizeAndIvoryColourRemainIndependentThroughCreation() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Ivory Legal"
+        model.draft.hasCover = false
+        model.sizeSelection = "Legal"
+        model.draft.orientation = .portrait
+        model.draft.paperColour = .ivory
+        XCTAssertEqual(model.draft.pageSize, PageSize(612, 1008))
+        let params = model.draft.request(id: NibID("LEGALIVORY"), folder: nil,
+                                        templates: h.app.content.templates).docCreateParams(.template)
+        XCTAssertEqual(params["size"], [612, 1008])
+        XCTAssertEqual(params["template"]?["params"]?["paper"], "#FBF8F1FF")
+        var dismissed = false
+        let created = await model.create { dismissed = true }
+        XCTAssertTrue(created)
+        XCTAssertTrue(dismissed)
+        XCTAssertNil(model.message)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Ivory Legal" })
+        let page = try XCTUnwrap(h.app.workspace.content(node.id).livePages.first)
+        XCTAssertEqual(page.size, PageSize(612, 1008))
+        XCTAssertEqual(page.background.template?.params[TemplateParamNames.paper], "#FBF8F1FF")
+        let next = NotebookDraft.initial(settings: h.app.settings)
+        XCTAssertEqual(next.size.name, "Legal")
+        XCTAssertEqual(next.paperColour, .ivory)
+        XCTAssertEqual(NotebookDraft.paperSwatch(.legal).name, "Legal paper colour")
+        XCTAssertEqual(NotebookDraft.paperSwatch(.ivory).name, "Ivory")
+        XCTAssertTrue(Set(NotebookDraft.paperColours.map { NotebookDraft.paperSwatch($0).name })
+            .isDisjoint(with: Set(PageSizeChoice.presets.compactMap(\.name))),
+                      "Size and colour controls need unambiguous spoken names")
+    }
+
+    func testCreationSheetKeepsTitleAndHeaderInsideKeyboardReducedViewport() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        for kind in [NewDocumentKind.notebook, .textDocument] {
+            var sheetFrame = CGRect.zero
+            let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: kind, session: h.session,
+                                         navigator: nil, onDone: {})
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { sheetFrame = $0 }
+            let host = UIHostingController(rootView: sheet)
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            // Reproduce the finite safe-area proposal supplied when the native keyboard appears.
+            host.additionalSafeAreaInsets.bottom = 340
+            for _ in 0..<5 {
+                host.view.setNeedsLayout()
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let viewport = host.view.safeAreaLayoutGuide.layoutFrame
+            XCTAssertGreaterThan(sheetFrame.height, 0)
+            XCTAssertGreaterThanOrEqual(sheetFrame.minY, viewport.minY - 1)
+            XCTAssertLessThanOrEqual(sheetFrame.maxY, viewport.maxY + 1,
+                                     "The keyboard must shrink the form instead of pushing its header out of bounds")
+            func fields(in view: UIView) -> [UITextField] {
+                (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { fields(in: $0) }
+            }
+            let title = try XCTUnwrap(fields(in: host.view).first)
+            let titleFrame = title.convert(title.bounds, to: host.view)
+            XCTAssertTrue(viewport.contains(titleFrame), "Title must remain reachable above the keyboard")
+            XCTAssertTrue(title.canBecomeFirstResponder)
+            let hit = host.view.hitTest(CGPoint(x: titleFrame.midX, y: titleFrame.midY), with: nil)
+            XCTAssertTrue(hit === title || hit?.isDescendant(of: title) == true,
+                          "The visible Title field must receive the tap")
+            XCTAssertTrue(title.becomeFirstResponder())
+            try await Task.sleep(for: .milliseconds(20))
+            XCTAssertTrue(title.isFirstResponder, "Title must retain keyboard focus after the layout update")
+            title.resignFirstResponder()
+
+            func scrolls(in view: UIView) -> [UIScrollView] {
+                (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrolls(in: $0) }
+            }
+            let scroll = try XCTUnwrap(scrolls(in: host.view).first)
+            for offset in [max(0, scroll.contentSize.height - scroll.bounds.height), 0] {
+                scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: offset), animated: false)
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+                let createPoint = CGPoint(x: sheetFrame.maxX - 50, y: sheetFrame.minY + 30)
+                let headerHit = try XCTUnwrap(host.view.hitTest(createPoint, with: nil))
+                XCTAssertFalse(headerHit === scroll || headerHit.isDescendant(of: scroll),
+                               "Scrolled paper controls must not intercept the pinned Create button")
+            }
+        }
+    }
+
+    func testCarbonSwatchSelectsCarbonCoverAndReopensFromDefaults() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.solidCover())
+        var carbon = Self.solidCover()
+        carbon.id = "cover.band"
+        carbon.title = "Carbon"
+        h.app.content.templates.register(carbon)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Carbon notebook"
+        model.selectCloth(.carbon)
+        XCTAssertEqual(model.draft.cover.id, "cover.band")
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Carbon notebook" })
+        XCTAssertEqual(try h.app.workspace.content(node.id).livePages.first?.background.template?.id, "cover.band")
+        let reopened = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        XCTAssertEqual(reopened.draft.cover.id, "cover.band")
+        XCTAssertEqual(reopened.draft.cloth, .carbon)
+        reopened.selectCover(reopened.covers.first { $0.id == "cover.solid" })
+        XCTAssertNil(reopened.draft.cloth, "A different tile must restore its own cloth instead of inheriting Carbon")
+    }
+
+    func testCreationWaitsForDismissalBeforeOpeningEveryDocumentKind() async throws {
+        for kind in NewDocumentKind.allCases {
+            let h = harness()
+            let log = CallLog()
+            var dismissed = false
+            stub(h, CommandIDs.docOpen, effect: .session, log: log) { _ in
+                XCTAssertTrue(dismissed, "Opening must not detach a still-presented creation sheet")
+                return [:]
+            }
+            let model = NewNotebookModel(app: h.app, folder: nil, kind: kind, session: h.session, navigator: nil)
+            model.draft.title = "Dismiss before opening"
+            let created = await model.create {
+                XCTAssertEqual(log.count(CommandIDs.docOpen), 0)
+                await Task.yield()
+                dismissed = true
+            }
+            XCTAssertTrue(created)
+            XCTAssertEqual(log.count(CommandIDs.docOpen), 1)
+        }
+    }
+
+    func testCreationDismissalWaitsForUIKitToRemoveTheModal() async throws {
+        let h = harness()
+        let sheet = DeferredDismissalController()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.presentationController = sheet
+        var finished = false
+        let dismissal = Task { @MainActor in
+            await model.dismissPresentation()
+            finished = true
+        }
+        await settle { sheet.dismissalCompletion != nil }
+        let complete = try XCTUnwrap(sheet.dismissalCompletion, "Dismissal must be requested from the presenting controller")
+        XCTAssertFalse(finished, "Navigation must wait while UIKit still presents the creation sheet")
+        sheet.isPresented = false
+        complete()
+        await dismissal.value
+        XCTAssertTrue(finished)
+        XCTAssertNil(sheet.presentingViewController, "Creation can now safely replace the presenting library")
+    }
+
+    func testDistributionPersistsWithTheNotebook() async throws {
+        let h = harness()
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Alternating paper"
+        model.draft.distribution = .everyOther
+        model.draft.hasCover = true
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Alternating paper" })
+        let distribution = try XCTUnwrap(h.persistence.heads[node.id]?.meta.ext?["create.paperDistribution"])
+        XCTAssertEqual(distribution["pattern"], "everyOther")
+        let background = try XCTUnwrap(distribution["background"]).decode(Background.self)
+        XCTAssertEqual(background.template?.id, model.draft.paper.id, "The cover must not become repeating paper")
+        let reopened = try h.app.workspace.content(node.id)
+        XCTAssertEqual(reopened.meta.ext?["create.paperDistribution"]?["pattern"], "everyOther")
+        XCTAssertEqual(NotebookDraft.initial(settings: h.app.settings).distribution, .everyOther,
+                       "The next creation sheet remembers the last distribution without changing existing notebooks")
+    }
+
+    func testDistributionUsesNodeSetAfterDocCreate() async throws {
+        let h = harness()
+        let log = CallLog()
+        stubDocCreate(h, log: log)
+        stub(h, CommandIDs.nodeSet, effect: .edit, log: log)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Alternating"
+        model.draft.distribution = .everyOther
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let distribution = try XCTUnwrap(log.params(CommandIDs.nodeSet).first?["fields"]?["meta"]?["ext"]?["create.paperDistribution"])
+        XCTAssertEqual(distribution["pattern"], "everyOther")
+        XCTAssertEqual(try distribution["background"]?.decode(Background.self).template?.id, TemplateIDs.ruled)
+        XCTAssertEqual(log.calls.map(\.command).filter { [CommandIDs.docCreate, CommandIDs.nodeSet].contains($0) },
+                       [CommandIDs.docCreate, CommandIDs.nodeSet])
     }
 
     func testTemplateChoiceBecomesThePaper() {
@@ -1407,6 +1757,109 @@ final class FeatCreateTests: XCTestCase {
     }
 
     // MARK: - Screens render (Light, Dark, AX3)
+
+    func testPaperChooserKeepsRailAndFourColumnsInIPadSheetRegardlessOfSizeClass() async throws {
+        // Portrait/landscape sheet bodies, the exact rail-fit boundary, and narrow phone/Split View widths.
+        for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),
+                     CGSize(width: 668, height: 520), CGSize(width: 667, height: 520),
+                     CGSize(width: 402, height: 720), CGSize(width: 320, height: 520)] {
+            for variant in NibSnapshot.Variant.allCases {
+                var railFrame = CGRect.zero
+                var chipsFrame = CGRect.zero
+                var tileFrames: [Int: CGRect] = [:]
+                let chooser = NewNotebookPaperChooser(availableWidth: size.width - NibSpacing.xl * 2) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(["Basic", "Lined", "Grid", "Planners", "Music", "From plugins"], id: \.self) { group in
+                            Text(group).font(NibFont.body)
+                                .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                        }
+                    }
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { railFrame = $0 }
+                } chips: {
+                    Text("Basic").font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { chipsFrame = $0 }
+                } papers: {
+                    ForEach(0..<24) { index in
+                        NibPaperTile(name: "Paper \(index)", isSelected: index == 0, action: {}) {
+                            NibPaper.white.color
+                        }
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: {
+                            tileFrames[index] = $0
+                        }
+                    }
+                }
+                let view = NewNotebookFormViewport(contentInset: NibSpacing.xl) {
+                    EmptyView()
+                } paper: {
+                    chooser
+                }
+                .background(NibColor.backgroundSecondary)
+                .ignoresSafeArea()
+                // A compact trait on a form sheet must not replace a rail that fits with chips.
+                .environment(\.horizontalSizeClass, .compact)
+                .environment(\.colorScheme, variant.colorScheme)
+                .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+                let host = UIHostingController(rootView: view)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+
+                let expectsRail = size.width >= 668
+                let columns = expectsRail ? 4 : (size.width == 320 ? 2 : 3)
+                XCTAssertEqual(chooser.showsGroupRail, expectsRail)
+                let first = try XCTUnwrap(tileFrames[0])
+                if expectsRail {
+                    XCTAssertEqual(railFrame.width, 150, accuracy: 0.5)
+                    XCTAssertEqual(railFrame.minX, NibSpacing.xl, accuracy: 0.5)
+                    XCTAssertEqual(first.minX - railFrame.maxX,
+                                   NibSpacing.l + NibStroke.ring + NibStroke.ringOutset, accuracy: 0.5)
+                    XCTAssertEqual(first.minY - railFrame.minY,
+                                   NibStroke.ring + NibStroke.ringOutset, accuracy: 0.5)
+                    XCTAssertEqual(chipsFrame, .zero, "The iPad rail must replace the chip row")
+                } else {
+                    XCTAssertEqual(railFrame, .zero)
+                    XCTAssertGreaterThan(chipsFrame.height, 0)
+                    XCTAssertGreaterThan(first.minY, chipsFrame.maxY)
+                }
+                for index in 0..<columns {
+                    let tile = try XCTUnwrap(tileFrames[index])
+                    XCTAssertEqual(tile.width, 104, accuracy: 0.5)
+                    XCTAssertGreaterThanOrEqual(tile.height, 135)
+                    XCTAssertEqual(tile.minY, first.minY, accuracy: 0.5)
+                    XCTAssertEqual(tile.minX - first.minX, CGFloat(index) * (104 + NibSpacing.m), accuracy: 0.5)
+                    XCTAssertLessThanOrEqual(tile.maxX + NibStroke.ringOutset, size.width - NibSpacing.xl)
+                }
+                let nextRow = try XCTUnwrap(tileFrames[columns])
+                XCTAssertEqual(nextRow.minX, first.minX, accuracy: 0.5)
+                XCTAssertGreaterThan(nextRow.minY, first.maxY)
+
+                func scrollViews(in view: UIView) -> [UIScrollView] {
+                    (view as? UIScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
+                }
+                let regions = scrollViews(in: host.view)
+                XCTAssertEqual(regions.count, 1, "Paper stays in the form scroll with its existing bottom fade")
+                let region = try XCTUnwrap(regions.first)
+                XCTAssertGreaterThan(region.contentSize.height, region.bounds.height)
+                XCTAssertLessThanOrEqual(region.contentSize.width, region.bounds.width + 1)
+                region.setContentOffset(CGPoint(x: region.contentOffset.x, y: 100), animated: false)
+                for _ in 0..<5 {
+                    host.view.setNeedsLayout()
+                    host.view.layoutIfNeeded()
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let scrolledRow = try XCTUnwrap(tileFrames[columns])
+                XCTAssertEqual(nextRow.minY - scrolledRow.minY, 100, accuracy: 1,
+                               "The paper grid must scroll to expose templates below the first row")
+            }
+        }
+    }
 
     func testFormViewportShowsPreviewThenCoverChoicesBeforePaper() async throws {
         for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),

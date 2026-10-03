@@ -946,7 +946,7 @@ enum BlockCommentsEditor {
                 let params: JSONValue = ["id": .string(TextDocCommentsPanel.panelID),
                                          "block": .string(editor.blockRef(id)), "request": .string(NibID.make().raw)]
                 editor.app.perform(CommandIDs.panelOpen, params, session: editor.session)
-            })
+            }.nibCommand(CommandIDs.panelOpen))
         }
         return out
     }

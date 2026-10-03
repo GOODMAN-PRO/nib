@@ -24,7 +24,7 @@ public struct NibDesignGallery: View {
             NibColor.desk.ignoresSafeArea()
             HStack(alignment: .top, spacing: NibSpacing.x3) {
                 VStack(alignment: .leading, spacing: NibSpacing.l) {
-                    NibButton(String(localized: "New Notebook", bundle: .module), symbol: .plus, kind: .primary) {}
+                    NibButton(String(localized: "New notebook", bundle: .module), symbol: .plus, kind: .primary) {}
                     NibButton(String(localized: "Import", bundle: .module), kind: .secondary) {}
                     NibButton(String(localized: "Delete 4 items", bundle: .module), kind: .destructive, size: .compact) {}
                     NibToggle(String(localized: "Pressure sensitivity", bundle: .module), isOn: $toggle)
@@ -59,7 +59,7 @@ public struct NibDesignGallery: View {
                                    subtitle: "Claude Sonnet 4.5 · your API key", symbol: .assistant, onClose: {})
                     NibEmptyState(symbol: .notebook, title: String(localized: "No notebooks yet", bundle: .module),
                                   message: String(localized: "Write something, or bring in a PDF.", bundle: .module),
-                                  primary: NibAction(String(localized: "New Notebook", bundle: .module)) {},
+                                  primary: NibAction(String(localized: "New notebook", bundle: .module)) {},
                                   secondary: NibAction(String(localized: "Import", bundle: .module)) {})
                 }
                 .frame(width: 340)

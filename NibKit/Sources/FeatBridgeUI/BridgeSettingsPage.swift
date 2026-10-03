@@ -134,7 +134,7 @@ enum BridgeAddressKind: Int, Comparable, CaseIterable {
         case .tailscale: return String(localized: "Tailscale")
         case .other: return String(localized: "Outside private networks")
         case .linkLocal: return String(localized: "Link-local")
-        case .loopback: return String(localized: "This iPad only")
+        case .loopback: return String(localized: "This device only")
         }
     }
 }
@@ -161,7 +161,7 @@ enum BridgeNetworkRules {
         return kind(of: BridgeCIDR(bytes: bytes, prefix: bytes.count * 8))
     }
 
-    /// A network that reaches past private ranges (e.g. 0.0.0.0/0): anyone who can reach the iPad could try tokens.
+    /// A network that reaches past private ranges (e.g. 0.0.0.0/0): anyone who can reach this device could try tokens.
     static func isPublic(_ entry: String) -> Bool {
         BridgeCIDR(entry).map { kind(of: $0) == .other } ?? false
     }
@@ -285,6 +285,17 @@ enum BridgeSnippet: String, CaseIterable, Identifiable {
     case claudeCode, json, smokeShell, smokePowerShell
 
     var id: String { rawValue }
+
+    static let pairing: [Self] = [.claudeCode, .json]
+
+    /// Repository commands belong to development builds, outside normal pairing.
+    static var developerDiagnostics: [Self] {
+        #if DEBUG
+        return [.smokeShell, .smokePowerShell]
+        #else
+        return []
+        #endif
+    }
 
     var title: String {
         switch self {
@@ -580,7 +591,7 @@ final class BridgeSettingsModel: ObservableObject {
 
     func applyHostName() async {
         guard let name = BridgeHostRules.normalize(hostNameText) else {
-            hostNameMessage = String(localized: "Enter a host name such as ipad.tail1234.ts.net, or leave it empty.")
+            hostNameMessage = String(localized: "Enter a host name such as device.tail1234.ts.net, or leave it empty.")
             return
         }
         hostNameMessage = nil
@@ -721,9 +732,9 @@ extension ConfirmationPolicy {
     var bridgeDetail: String {
         switch self {
         case .always:
-            return String(localized: "Every change an agent makes waits until you allow it on this iPad.")
+            return String(localized: "Every change an agent makes waits until you allow it on this device.")
         case .destructive:
-            return String(localized: "Deleting and overwriting wait until you allow them on this iPad; other changes go ahead and can be undone.")
+            return String(localized: "Deleting and overwriting wait until you allow them on this device; other changes go ahead and can be undone.")
         case .never:
             return String(localized: "Changes go ahead without asking; you can still undo them.")
         }
@@ -763,6 +774,7 @@ struct BridgeSettingsPage: View {
                     networksSection
                     originsSection
                     screenSection
+                    developerDiagnosticsSection
                 }
                 .listStyle(.insetGrouped)
             } else {
@@ -811,7 +823,7 @@ struct BridgeSettingsPage: View {
                 model.cancelPublicNetwork()
             }
         } message: { entry in
-            Text(String(localized: "\(entry) reaches past private networks: anyone who can reach this iPad from there could try tokens against the bridge."))
+            Text(String(localized: "\(entry) reaches past private networks: anyone who can reach this device from there could try tokens against the bridge."))
         }
     }
 
@@ -894,7 +906,7 @@ struct BridgeSettingsPage: View {
         } header: {
             BridgeHeader(String(localized: "Address"))
         } footer: {
-            BridgeFooter(String(localized: "On Tailscale, enter this iPad's \(BridgeUIIDs.magicDNS) name (for example ipad.tail1234.ts.net, shown in the Tailscale app) so clients keep working when its address changes. Tailscale addresses start with 100. Nib also announces the bridge on the local network as _nib._tcp."))
+            BridgeFooter(String(localized: "On Tailscale, enter this device's \(BridgeUIIDs.magicDNS) name (for example device.tail1234.ts.net, shown in the Tailscale app) so clients keep working when its address changes. Tailscale addresses start with 100. Nib also announces the bridge on the local network as _nib._tcp."))
         }
     }
 
@@ -998,6 +1010,10 @@ struct BridgeSettingsPage: View {
 
     @ViewBuilder
     private var pairingSections: some View {
+        Section {
+            Text(String(localized: "To use your Claude or ChatGPT subscription inside Nib, connect Nib Agent in AI settings. Each turn uses a temporary tool token and keeps your AI confirmation policy. The token below is for external clients."))
+                .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+        } header: { BridgeHeader(String(localized: "Your subscriptions")) }
         if let pairing = model.pairing {
             Section {
                 if model.tokenRevealed {
@@ -1009,20 +1025,35 @@ struct BridgeSettingsPage: View {
                         model.tokenRevealed = true
                     }
                 }
-                snippetRow(.claudeCode, pairing)
-                snippetRow(.json, pairing)
+                ForEach(BridgeSnippet.pairing) { snippet in
+                    snippetRow(snippet, pairing)
+                }
             } header: {
                 BridgeHeader(String(localized: "Pair a Client"))
             } footer: {
                 BridgeFooter(String(localized: "Run the command on the computer that runs Claude Code, or add the JSON to another MCP client's configuration. The QR code holds the address and the token."))
             }
             Section {
-                snippetRow(.smokeShell, pairing)
-                snippetRow(.smokePowerShell, pairing)
+                Text(String(localized: "Keep Nib open on this device and connect from your client. When its name appears under Clients below, the connection is working. If it doesn't appear, check that both devices are on the same Wi-Fi network or connected to Tailscale."))
+                    .font(NibFont.body)
+                    .foregroundStyle(NibColor.labelSecondary)
             } header: {
-                BridgeHeader(String(localized: "Device Smoke Tests"))
+                BridgeHeader(String(localized: "Check the Connection"))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var developerDiagnosticsSection: some View {
+        if let pairing = model.pairing, !BridgeSnippet.developerDiagnostics.isEmpty {
+            Section {
+                ForEach(BridgeSnippet.developerDiagnostics) { snippet in
+                    snippetRow(snippet, pairing)
+                }
+            } header: {
+                BridgeHeader(String(localized: "Developer Diagnostics"))
             } footer: {
-                BridgeFooter(String(localized: "Plays the tools/smoke scripts against this iPad from a clone of the Nib repository."))
+                BridgeFooter(String(localized: "Run the tools/smoke scripts against this device from a clone of the Nib repository."))
             }
         }
     }
@@ -1066,7 +1097,7 @@ struct BridgeSettingsPage: View {
             } header: {
                 BridgeHeader(String(localized: "Clients"))
             } footer: {
-                BridgeFooter(String(localized: "Clients act as Bridge: they can do what the assistant can, never change security settings such as this page, and ask on this iPad as set below."))
+                BridgeFooter(String(localized: "Clients act as Bridge: they can do what the assistant can, never change security settings such as this page, and ask on this device as set below."))
             }
         }
     }
@@ -1085,7 +1116,7 @@ struct BridgeSettingsPage: View {
             BridgeHeader(String(localized: "Ask Before Changes"))
         } footer: {
             BridgeFooter(model.policy.bridgeDetail + " "
-                         + String(localized: "Sending data off the iPad, deleting for good and installing plugins always ask, whatever you choose. A request waits up to 2 minutes for your answer."))
+                         + String(localized: "Sending data off this device, deleting for good and installing plugins always ask, whatever you choose. A request waits up to 2 minutes for your answer."))
         }
     }
 
@@ -1115,7 +1146,7 @@ struct BridgeSettingsPage: View {
         } header: {
             BridgeHeader(String(localized: "Allowed Networks"))
         } footer: {
-            BridgeFooter(String(localized: "Clients must connect from one of these networks. The defaults cover this iPad, private home and office networks, Tailscale and link-local addresses."))
+            BridgeFooter(String(localized: "Clients must connect from one of these networks. The defaults cover this device, private home and office networks, Tailscale and link-local addresses."))
         }
     }
 
@@ -1217,7 +1248,7 @@ struct BridgeQRCode: View, Equatable {
     let payload: String
 
     var body: some View {
-        NibQRCode(payload, label: String(localized: "QR code with this iPad's bridge address and token"))
+        NibQRCode(payload, label: String(localized: "QR code with this device's bridge address and token"))
             .frame(maxWidth: NibMetrics.popoverContentWidth)
             .privacySensitive()
             .frame(maxWidth: .infinity)
@@ -1277,7 +1308,7 @@ private struct BridgeListEntryRow: View {
                     .font(NibFont.code)
                     .foregroundStyle(NibColor.label)
                 if warns {
-                    BridgeFieldMessage(String(localized: "Reaches past private networks: anyone who can reach this iPad could try tokens."))
+                    BridgeFieldMessage(String(localized: "Reaches past private networks: anyone who can reach this device could try tokens."))
                 } else if let detail = detail {
                     Text(detail)
                         .font(NibFont.caption1)

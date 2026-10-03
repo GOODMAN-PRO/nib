@@ -195,6 +195,7 @@ final class DropletField {
     @ObservationIgnored private var dismissers: [String: () -> Void] = [:]
     @ObservationIgnored private var pendingBuds: [String: (source: String, presented: Bool)] = [:]
     @ObservationIgnored private var driver: DisplayLinkDriver?
+    @ObservationIgnored private var isActive = true
     @ObservationIgnored private var restoreWork: DispatchWorkItem?
     @ObservationIgnored private var nextSatellite = 0
     @ObservationIgnored private var stroke: CGRect = .null
@@ -266,7 +267,7 @@ final class DropletField {
             if n.head != b.head.value { n.head = b.head.value }
             if n.tail != b.tail.value { n.tail = b.tail.value }
         }
-        let open = entries.values.contains { $0.bud?.presented == true }
+        let open = entries.values.contains { $0.bud?.presented == true && $0.style.modalWhenBudded }
         if open != hasOpenBud { hasOpenBud = open }
         let next = buildClusters()
         if next != clusters { clusters = next }
@@ -307,6 +308,17 @@ final class DropletField {
     func setRest(_ id: String, _ rect: CGRect, style: DropletStyle) {
         register(id, style: style)
         guard var e = entries[id], NibGeometry.isUsable(rect) else { return }
+        // Native glass/scroll layout can alternate between subpixel frames (for example a
+        // three-row More grid at y = 433⅓ and 433½). Feeding that rounding noise back into
+        // FLIP publishes another geometry update indefinitely and starves control input.
+        // Native viewport heights also alternate by a third of a point. Compare against
+        // the retained frame so real changes accumulate: quarter-point position noise and
+        // half-point size noise must not restart layout; larger changes remain live.
+        if e.hasRest,
+           abs(rect.minX - e.rest.minX) <= 0.25, abs(rect.minY - e.rest.minY) <= 0.25,
+           abs(rect.width - e.rest.width) <= 0.5, abs(rect.height - e.rest.height) <= 0.5 {
+            return
+        }
         if !e.hasRest || (!e.hasPresented && !e.isDragging && e.bud == nil) {
             e.rest = rect
             e.hasRest = true
@@ -556,7 +568,7 @@ final class DropletField {
             }
             let lift = liftProgress(e)
             return Render(id: id, material: e.style.material, path: bodyPath(e, inset: 0), innerPath: bodyPath(e, inset: 0.8),
-                          frostPath: bodyPath(e, inset: 1.5), frostOpacity: frost,
+                          frostPath: bodyPath(e, inset: NibOptics.frostInset), frostOpacity: frost,
                           budLine: e.bud.map { !$0.revealed || $0.closingAt != nil } ?? false,
                           paper: e.style.refracts ? paperShare(visualBox(e)) : 0,
                           lift: Double(lift), rim: Double(e.style.rimStrength(lift: lift)), castsShadow: !e.style.restsDry)
@@ -681,7 +693,7 @@ final class DropletField {
     // MARK: Bud-off
 
     func dismissBuds() {
-        for (id, dismiss) in dismissers where entries[id]?.bud?.presented == true {
+        for (id, dismiss) in dismissers where entries[id]?.bud?.presented == true && entries[id]?.style.modalWhenBudded == true {
             dismiss()
         }
     }
@@ -1055,9 +1067,15 @@ final class DropletField {
 
     // MARK: Frame loop
 
+    func setActive(_ active: Bool) {
+        isActive = active
+        if active { wake() } else { driver?.stop() }
+    }
+
     func wake() {
         // Geometry and visibility must be available even while the display link is parked (or inking).
         publish()
+        guard isActive, !isInking else { return }
         let state = ProcessInfo.processInfo.thermalState
         let hot = state == .serious || state == .critical
         if hot != isThermallyThrottled { isThermallyThrottled = hot }
@@ -1079,7 +1097,8 @@ final class DropletField {
             stepReshape(&e)
             if !moving && !e.isDragging { e.landing = nil }
             let budBusy = e.bud.map { $0.presented ? !$0.revealed : $0.closingAt != nil } ?? false
-            if moving || e.isDragging || e.reshape != .idle || budBusy { busy = true }
+            // Holding a settled droplet is not work. Gesture updates wake the field when the finger moves.
+            if moving || e.reshape != .idle || budBusy { busy = true }
             entries[id] = e
         }
         if stepBonds(step) { busy = true }
@@ -1096,6 +1115,16 @@ final class DisplayLinkDriver: NSObject {
     private var link: CADisplayLink?
     private var last: CFTimeInterval = 0
     private let onTick: (CFTimeInterval) -> Bool
+    var isRunning: Bool { link != nil }
+
+    private final class Target: NSObject {
+        weak var owner: DisplayLinkDriver?
+        init(_ owner: DisplayLinkDriver) { self.owner = owner }
+        @objc func step(_ link: CADisplayLink) {
+            guard let owner else { link.invalidate(); return }
+            owner.advance(at: link.timestamp)
+        }
+    }
 
     init(onTick: @escaping (CFTimeInterval) -> Bool) {
         self.onTick = onTick
@@ -1104,7 +1133,7 @@ final class DisplayLinkDriver: NSObject {
 
     func start() {
         guard link == nil else { return }
-        let l = CADisplayLink(target: self, selector: #selector(step(_:)))
+        let l = CADisplayLink(target: Target(self), selector: #selector(Target.step(_:)))
         l.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
         l.add(to: .main, forMode: .common)
         link = l
@@ -1114,11 +1143,17 @@ final class DisplayLinkDriver: NSObject {
     func stop() {
         link?.invalidate()
         link = nil
+        last = 0
     }
 
-    @objc private func step(_ displayLink: CADisplayLink) {
-        let now = displayLink.timestamp
-        let dt = last == 0 ? 1.0 / 120 : min(max(now - last, 1.0 / 240), 1.0 / 30)
+    deinit { link?.invalidate() }
+
+    func advance(at now: CFTimeInterval) {
+        guard isRunning else { return }
+        // Springs already integrate in stable 1/240 s substeps. Discarding time below
+        // 30 Hz leaves an opening menu over its source instead of its hit targets.
+        // Bound catch-up to the integrator's one-second limit, not one rendered frame.
+        let dt = last == 0 ? 1.0 / 120 : min(max(now - last, 1.0 / 240), 1)
         last = now
         if !onTick(dt) { stop() }
     }

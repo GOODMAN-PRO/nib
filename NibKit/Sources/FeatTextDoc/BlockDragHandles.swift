@@ -322,9 +322,6 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate {
                 ghost.transform = CGAffineTransform(scaleX: DragMetrics.liftScale, y: DragMetrics.liftScale)
             })
         }
-        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        link.add(to: .main, forMode: .common)
-        displayLink = link
         updateDrag(finger: finger)
     }
 
@@ -347,6 +344,11 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate {
             state.line.isHidden = true
         }
         drag = state
+        if displayLink == nil {
+            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
     }
 
     /// The frames of the blocks on screen, in document order (content coordinates).
@@ -377,23 +379,30 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate {
 
     /// Autoscroll while the finger rests near the top or bottom of the column.
     @objc private func tick(_ link: CADisplayLink) {
-        guard let editor = editor, let cv = editor.collectionView, let state = drag else { return }
+        guard let editor = editor, let cv = editor.collectionView, cv.window != nil, let state = drag else {
+            endDrag(commit: false)
+            return
+        }
         let visible = BlockKindMenuPresenter.visibleRect(cv)
         let p = editor.view.convert(state.fingerInEditor, to: cv)
         let dy = DragMetrics.autoscrollStep(fingerY: p.y, visible: visible)
-        guard dy != 0 else { return }
+        guard dy != 0 else { stopAutoScroll(); return }
         let inset = cv.adjustedContentInset
         let minY = -inset.top
         let maxY = max(minY, cv.contentSize.height + inset.bottom - cv.bounds.height)
         let y = min(max(cv.contentOffset.y + dy, minY), maxY)
-        guard y != cv.contentOffset.y else { return }
+        guard y != cv.contentOffset.y else { stopAutoScroll(); return }
         cv.contentOffset.y = y
         updateDrag(finger: state.fingerInEditor)
     }
 
-    private func endDrag(commit: Bool) {
+    private func stopAutoScroll() {
         displayLink?.invalidate()
         displayLink = nil
+    }
+
+    private func endDrag(commit: Bool) {
+        stopAutoScroll()
         guard let state = drag, let editor = editor else {
             drag = nil
             return

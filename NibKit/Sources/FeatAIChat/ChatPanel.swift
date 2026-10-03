@@ -17,11 +17,14 @@ struct ChatPanel: View {
                            onClose: { model.perform(ChatCommand.close) }) {
                 Menu {
                     Button(String(localized: "New conversation")) { model.perform(ChatCommand.new) }
+                        .disabled(!model.canUseHistory)
                     Button(String(localized: "Conversations")) { model.perform(ChatCommand.inspect, ["section": "conversations"]) }
+                        .disabled(!model.canUseHistory)
                     ForEach(sizeClass == .compact ? [PanelPresentation.floating, .sidebar] : [.floating, .sidebar, .window], id: \.self) { mode in
                         Button(modeTitle(mode)) { model.perform(ChatCommand.open, ["mode": .string(mode.rawValue)]) }
                     }
                     Button(String(localized: "AI settings")) { model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)]) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
                 } label: {
                     Image(nib: .more).font(NibFont.glyph(.panel))
                         .foregroundStyle(NibColor.labelSecondary)
@@ -50,6 +53,7 @@ struct ChatPanel: View {
                 if let id = deletingChat { model.perform(CommandIDs.aiChatDelete, ["chat": .string(id)]) }
                 deletingChat = nil
             }
+            .accessibilityIdentifier("cmd." + CommandIDs.aiChatDelete)
             Button(String(localized: "Cancel"), role: .cancel) { deletingChat = nil }
         } message: {
             Text(String(localized: "This conversation will be deleted on every device."))
@@ -74,6 +78,14 @@ struct ChatPanel: View {
         }
         .onDisappear { model.perform(ChatCommand.inspect, ["section": "visibility", "visible": false, "lease": .string(visibilityLease)]) }
         .task {
+            // The provider-store contract has no change publisher. Refresh display metadata while visible;
+            // this never configures a provider or contacts its endpoint.
+            while !Task.isCancelled {
+                model.refreshProviderLabel()
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            }
+        }
+        .task {
             model.windowUndoManager = context.navigator?.rootViewController?.undoManager
             model.perform(ChatCommand.inspect, ["section": "visibility", "visible": true, "lease": .string(visibilityLease)])
             if let scope = context.params["scope"]?.stringValue {
@@ -89,12 +101,16 @@ struct ChatPanel: View {
             }), options: AIMode.allCases) { $0 == .ask ? String(localized: "Ask") : String(localized: "Edit") }
             .accessibilityLabel(String(localized: "Create mode"))
             .accessibilityHint(String(localized: "Ask reads notes. Edit can change notes."))
-            .disabled(model.isStreaming)
+            .disabled(!model.canConfigureContext)
             ScrollView(.horizontal) {
                 HStack(spacing: NibSpacing.s) {
                     Menu {
                         ForEach(AIScopeKind.allCases, id: \.self) { scope in
-                            Button(scopeTitle(scope)) { model.perform(ChatCommand.configure, ["scope": .string(scope.rawValue)]) }
+                            let reason = model.scopeUnavailableReason(scope)
+                            Button([scopeTitle(scope), reason].compactMap { $0 }.joined(separator: " · ")) {
+                                model.perform(ChatCommand.configure, ["scope": .string(scope.rawValue)])
+                            }
+                            .disabled(reason != nil)
                         }
                     } label: {
                         Label { Text(model.contextLabel) } icon: { Image(nib: .citation) }
@@ -102,11 +118,12 @@ struct ChatPanel: View {
                             .frame(minHeight: NibMetrics.hitTarget)
                     }
                     .accessibilityLabel(String(localized: "Context: \(model.contextLabel)"))
-                    .disabled(model.isStreaming)
+                    .disabled(!model.canConfigureContext)
                     ForEach(model.attachments, id: \.self) { ref in
                         NibChip(String(localized: "Page image"), symbol: .image, onRemove: {
                             model.perform(ChatCommand.attach, ["source": "remove", "asset": .string(ref.name)])
                         })
+                        .disabled(!model.canConfigureContext)
                     }
                     Menu {
                         Button(String(localized: "Attach screenshot")) { model.perform(ChatCommand.attach, ["source": "screenshot"]) }
@@ -117,7 +134,7 @@ struct ChatPanel: View {
                             .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                     }
                     .accessibilityLabel(String(localized: "Add image context"))
-                    .disabled(model.isStreaming)
+                    .disabled(!model.canConfigureContext)
                 }
             }
         }
@@ -129,17 +146,17 @@ struct ChatPanel: View {
     private var connectionBody: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.l) {
-                Label { Text(String(localized: "Connect a model")) } icon: { Image(nib: .assistant) }
-                    .font(NibFont.headline).foregroundStyle(NibColor.label)
-                    .accessibilityAddTraits(.isHeader)
-                Text(String(localized: "Connect a model to use the assistant."))
+                Text(String(localized: "Use your Claude or ChatGPT subscription with Nib Agent on your Mac."))
                     .font(NibFont.callout).foregroundStyle(NibColor.label)
                     .fixedSize(horizontal: false, vertical: true)
-                ForEach(["Anthropic", "OpenAI-compatible", "Ollama", "LM Studio", "Custom"], id: \.self) { provider in
+                ForEach(ChatViewModel.connectionActions, id: \.self) { provider in
                     NibButton(provider, symbol: .settings, kind: .plain) {
-                        model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)])
+                        model.perform(CommandIDs.settingsOpen, ["page": .string(ChatViewModel.connectionPage(for: provider))])
                     }
+                    .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
+                    .accessibilityHint(String(localized: "Opens setup for this provider."))
                 }
+                operationFeedback
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(NibSpacing.l)
@@ -164,17 +181,14 @@ struct ChatPanel: View {
             if model.isStreaming, model.entries.last?.text.isEmpty == true {
                 NibTraceRow(String(localized: "Reading your context…"), phase: .running)
             }
-            if model.isGeneratingImage {
-                NibTraceRow(String(localized: "Generating image…"), phase: .running)
-            }
-            if model.isLoadingChat {
-                NibTraceRow(String(localized: "Loading conversation…"), phase: .running)
+            if !model.isStreaming, let progress = model.progressLabel {
+                NibTraceRow(progress, phase: .running)
             }
             if !model.proposals.isEmpty { ChatProposalsView(model: model) }
             if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
             if let error = model.error {
                 NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
-                          action: model.retryPrompt != nil && !model.isStreaming ? NibAction(String(localized: "Retry")) {
+                          action: model.retryPrompt != nil && model.canSend ? NibAction(String(localized: "Retry")) {
                     model.perform(ChatCommand.send, ["retry": true])
                 } : nil)
             }
@@ -194,7 +208,7 @@ struct ChatPanel: View {
                     }
                     .padding(.vertical, NibSpacing.s)
                 }
-                .disabled(model.isStreaming || model.isGeneratingImage)
+                .disabled(!model.canSend)
             }
             HStack(alignment: .bottom, spacing: NibSpacing.s) {
                 NibField(text: $model.composer, prompt: String(localized: "Tell Nib what to change…"), lines: 1...5)
@@ -204,14 +218,14 @@ struct ChatPanel: View {
                 } else if !model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     NibIconButton(.send, label: String(localized: "Send to assistant"), size: .send) { model.perform(ChatCommand.send, ["prompt": .string(model.composer)]) }
                         .keyboardShortcut(.return, modifiers: .command)
-                        .disabled(!model.isConfigured)
+                        .disabled(!model.canSend)
                 }
             }
             HStack(spacing: NibSpacing.s) {
                 NibButton(String(localized: "Generate image"), symbol: .image, kind: .plain, size: .compact) {
                     model.perform(ChatCommand.draft, ["action": "image", "prompt": .string(model.composer)])
                 }
-                .disabled(!model.isConfigured || model.composer.isEmpty || model.isStreaming || model.isGeneratingImage)
+                .disabled(!model.canGenerateImage || model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 Spacer(minLength: 0)
             }
             Text(String(localized: "\(model.tokenCount.formatted()) tokens this chat · sent only to your provider"))
@@ -224,9 +238,10 @@ struct ChatPanel: View {
     private var conversationList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.m) {
+                operationFeedback
                 NibButton(String(localized: "New conversation"), symbol: .plus) { model.perform(ChatCommand.new) }
-                    .disabled(model.isStreaming)
-                if model.conversations.isEmpty {
+                    .disabled(!model.canUseHistory)
+                if model.conversations.isEmpty, model.progressLabel == nil {
                     Text(String(localized: "No conversations yet")).font(NibFont.body).foregroundStyle(NibColor.labelSecondary)
                 }
                 ForEach(model.conversations) { chat in
@@ -237,20 +252,38 @@ struct ChatPanel: View {
                             NibButton(String(localized: "Save name"), kind: .secondary) {
                                 model.perform(CommandIDs.aiChatRename, ["chat": .string(chat.id), "title": .string(model.renameTitle)])
                             }
+                            .accessibilityIdentifier("cmd." + CommandIDs.aiChatRename)
+                            .disabled(model.renameTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                         HStack(spacing: NibSpacing.s) {
                             NibButton(String(localized: "Rename Conversation"), kind: .plain, size: .compact) {
                                 model.perform(ChatCommand.inspect, ["section": "rename", "chat": .string(chat.id)])
                             }
+                            .disabled(model.renamingChat == chat.id)
                             NibButton(String(localized: "Delete Conversation"), kind: .destructivePlain, size: .compact) {
                                 deletingChat = chat.id
                             }
                         }
                     }
+                    .disabled(!model.canUseHistory)
                 }
                 NibButton(String(localized: "Back to thread"), kind: .plain) { model.perform(ChatCommand.inspect, ["section": "conversations"]) }
+                    .disabled(!model.canUseHistory)
             }
             .padding(NibSpacing.l)
+        }
+    }
+
+    private var operationFeedback: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.s) {
+            if let progress = model.progressLabel { NibTraceRow(progress, phase: .running) }
+            if let error = model.error {
+                NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"))
+                if model.showsConversations {
+                    Text(String(localized: "Try the action again. Any unsaved conversation name stays in its field."))
+                        .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
+                }
+            }
         }
     }
 

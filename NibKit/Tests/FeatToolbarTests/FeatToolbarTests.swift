@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatToolbar
 
@@ -126,6 +126,516 @@ final class FeatToolbarTests: XCTestCase {
 
     private func entry(_ id: String, _ group: ToolbarGroup, hideable: Bool = true, plugin: Bool = false) -> ToolbarEntry {
         ToolbarEntry(id: id, title: id, group: group, toolID: id, command: nil, hideable: hideable, isPlugin: plugin)
+    }
+
+    func testEraserSelectionAfterCommitAndCommandHandBackReleasePreviousOptions() async throws {
+        let h = harness()
+        let penPopover = PopoverFlag()
+        let eraserPopover = PopoverFlag()
+        for (tool, flag) in [("pen", penPopover), ("eraser", eraserPopover)] {
+            var menu = ToolMenuDescriptor(tool: tool, owner: TestToolsFeature.id) { _ in AnyView(EmptyView()) }
+            menu.makePopover = { _ in
+                ToolMenuPopover(source: tool + ".size", isPresented: flag.binding, title: "Size") { EmptyView() }
+            }
+            h.app.ui.toolMenus.register(menu)
+        }
+        var eraser = try XCTUnwrap(h.app.ui.toolbar.get("eraser.item"))
+        eraser.settings = { _ in AnyView(Text("Eraser settings")) }
+        h.app.ui.toolbar.register(eraser)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let host = FakeCanvasHost(h)
+
+        for autoDeselect in [true, false] {
+            try await h.run(CommandIDs.toolSelect, ["tool": "pen"])
+            try await h.run(TestTouch.descriptor.id)
+            model.refresh()
+            XCTAssertNotNil(model.toolOptions(for: "pen"))
+            let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+            let item = try XCTUnwrap(model.shown.first { $0.id == "eraser" })
+            XCTAssertEqual(item.accessibilityID, "tool.eraser")
+            XCTAssertTrue(item.isEnabled)
+
+            penPopover.isOpen = true
+            model.select(item.id)
+            XCTAssertFalse(penPopover.isOpen, "The tap releases old options before asynchronous command dispatch")
+            try await waitUntil("Eraser is selected in the invoking window") { h.session.tool == "eraser" }
+            XCTAssertEqual(model.tool, "eraser")
+            XCTAssertEqual(h.session.previousTool, "pen")
+            XCTAssertEqual(other.tool, "pen")
+            XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before)
+            model.openSettings()
+            XCTAssertTrue(model.settingsOpen, "The newly selected tool can immediately open settings")
+            model.settingsOpen = false
+
+            XCTAssertNotNil(model.toolOptions(for: "eraser"))
+            eraserPopover.isOpen = true
+            host.finishToolUse(TestTool(id: "eraser", isSticky: !autoDeselect))
+            XCTAssertEqual(h.session.tool, autoDeselect ? "pen" : "eraser")
+            XCTAssertEqual(model.tool, h.session.tool)
+            XCTAssertEqual(eraserPopover.isOpen, !autoDeselect,
+                           "Hand-back must release the old tool's modal input without a rendered view")
+            // A shortcut also bypasses the palette's selection binding.
+            try await h.run(CommandIDs.toolSelect, ["tool": "pen"])
+            XCTAssertFalse(eraserPopover.isOpen)
+        }
+        withExtendedLifetime(model) {}
+    }
+
+    func testEraserHitTargetSurvivesInkingAndRetainedPopoverLayout() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.settings = { _ in AnyView(Text("Pen settings").frame(height: 700)) }
+        h.app.ui.toolbar.register(pen)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let inking = NibInkingState()
+        var field: DropletField?
+        let host = UIHostingController(rootView:
+            NibDropletContainer(inking: inking) {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+                    .background(ToolbarFieldProbe { field = $0 })
+            }
+            .environment(\.scenePhase, .active))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        try await waitUntil("Eraser has a laid-out palette slot") {
+            host.view.layoutIfNeeded()
+            return field?.anchorRect("toolbar.palette.eraser") != nil
+        }
+        // Keep the settings content mounted, as in the production palette, then draw.
+        model.openSettings()
+        try await waitUntil("Pen settings accepts input") {
+            host.view.layoutIfNeeded()
+            return self.scrollViews(in: host.view).contains { $0.bounds.height > 400 && $0.isUserInteractionEnabled }
+        }
+        model.settingsOpen = false
+        inking.isInking = true
+        try await h.run(TestTouch.descriptor.id)
+        inking.isInking = false
+        model.refresh()
+        try await waitUntil("Retained popovers release input after inking") {
+            host.view.layoutIfNeeded()
+            let panels = self.scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+            return panels.count >= 2 && panels.allSatisfy { !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden }
+        }
+        let slot = try XCTUnwrap(field?.anchorRect("toolbar.palette.eraser"))
+        let point = host.view.convert(CGPoint(x: slot.midX, y: slot.midY), to: window)
+        let hit = try XCTUnwrap(window.hitTest(point, with: nil))
+        for scroll in scrollViews(in: host.view) {
+            XCTAssertFalse(hit === scroll || hit.isDescendant(of: scroll),
+                           "Eraser's visible centre must not route to a retained settings, More or options scroller")
+        }
+        model.select("eraser")
+        try await waitUntil("Eraser selects after the ink commit") { h.session.tool == "eraser" }
+        XCTAssertEqual(h.session.previousTool, "pen")
+    }
+
+    /// Pencil defaults to More. Retained pen settings must release input when More opens, and selecting
+    /// its pencil item must target this window and dismiss the overflow without changing document content.
+    func testPencilInMoreAfterPenSettingsRemainsInteractiveAndSelectsItsWindow() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.settings = { _ in AnyView(Text("Pen settings").frame(height: 700)) }
+        h.app.ui.toolbar.register(pen)
+        h.app.ui.toolbar.register(ToolbarItemDescriptor(
+            id: "pencil.item", title: "Pencil", icon: "pencil", group: .tools, order: 11,
+            owner: TestToolsFeature.id, toolID: "pencil", settings: { _ in AnyView(Text("Pencil settings")) }))
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: "pencil", title: "Pencil", owner: TestToolsFeature.id) {
+            TestTool(id: "pencil", isSticky: true)
+        })
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let pencil = try XCTUnwrap(model.more.first { $0.id == "pencil" })
+        XCTAssertEqual(pencil.accessibilityID, "tool.pencil")
+        XCTAssertTrue(pencil.isEnabled)
+        XCTAssertFalse(model.shown.contains { $0.id == "pencil" }, "Keep the six-tool default palette")
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+
+        let host = UIHostingController(rootView:
+            NibDropletContainer {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+            }
+            .environment(\.scenePhase, .active))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+
+        func panels() -> [UIScrollView] {
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        model.openSettings()
+        try await waitUntil("Pen settings is interactive") {
+            host.view.layoutIfNeeded()
+            return panels().contains { $0.isUserInteractionEnabled && $0.bounds.height > 400 }
+        }
+        // A settings edit/ink commit refreshes the retained panels before the next tool switch.
+        try await h.run(TestTouch.descriptor.id)
+        model.refresh()
+        let before = try h.app.workspace.content(Fixtures.docID)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        model.moreOpen = true
+        XCTAssertFalse(model.settingsOpen, "More must close settings synchronously, before animation/mirroring")
+        try await waitUntil("Only More accepts input") {
+            host.view.layoutIfNeeded()
+            let visible = panels().filter { $0.isUserInteractionEnabled }
+            return visible.count == 1 && visible[0].bounds.height < 400
+        }
+        let more = try XCTUnwrap(panels().first { $0.isUserInteractionEnabled })
+        XCTAssertFalse(more.accessibilityElementsHidden)
+        var inputRoute = "No window hit"
+        try await waitUntil("A window touch reaches the More grid instead of retained settings") {
+            host.view.layoutIfNeeded()
+            let point = more.convert(CGPoint(x: more.bounds.midX, y: more.bounds.midY), to: window)
+            guard let hit = window.hitTest(point, with: nil) else { return false }
+            inputRoute = "Hit \(hit) at \(point), expected a descendant of \(more)"
+            return hit === more || hit.isDescendant(of: more)
+        }
+        let point = more.convert(CGPoint(x: more.bounds.midX, y: more.bounds.midY), to: window)
+        let hit = window.hitTest(point, with: nil)
+        XCTAssertTrue(hit === more || hit?.isDescendant(of: more) == true, inputRoute)
+        for closed in panels() where closed !== more {
+            XCTAssertTrue(closed.accessibilityElementsHidden)
+            XCTAssertNil(closed.hitTest(CGPoint(x: closed.bounds.midX, y: closed.bounds.midY), with: nil))
+        }
+
+        model.select(pencil.id)
+        try await waitUntil("Pencil is selected through the command") { h.session.tool == "pencil" }
+        XCTAssertEqual(model.tool, "pencil")
+        XCTAssertFalse(model.moreOpen)
+        XCTAssertFalse(model.settingsOpen)
+        XCTAssertEqual(other.tool, "pen")
+        XCTAssertNotNil(model.settingsView(for: "pencil"))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), before)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), items)
+
+        model.moreOpen = true
+        model.settingsOpen = true
+        XCTAssertFalse(model.moreOpen, "Opening settings must also close More")
+    }
+
+    func testPencilChosenInPenSettingsCanReopenSettingsAfterDrawing() async throws {
+        let h = harness()
+        for (id, title) in [("pen", "Fountain Pen"), ("pencil", "Pencil")] {
+            h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                id: id == "pen" ? "pen.item" : "pencil.item", title: title, icon: "pencil",
+                group: .tools, order: id == "pen" ? 10 : 11, owner: TestToolsFeature.id, toolID: id,
+                settings: { _ in AnyView(Text(title + " settings").frame(height: 700)) }))
+        }
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: "pencil", title: "Pencil", owner: TestToolsFeature.id) {
+            TestTool(id: "pencil", isSticky: true)
+        })
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let inking = NibInkingState()
+        var field: DropletField?
+        let host = UIHostingController(rootView:
+            NibDropletContainer(inking: inking) {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+                    .background(ToolbarFieldProbe { field = $0 })
+            }
+            .environment(\.scenePhase, .active))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        func panels() -> [UIScrollView] {
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        model.openSettings()
+        try await waitUntil("Pen settings opens") {
+            host.view.layoutIfNeeded()
+            return panels().contains { $0.isUserInteractionEnabled && $0.bounds.height > 400 }
+        }
+        // The Pencil tile dispatches tool.select directly, without the palette's selection binding.
+        try await h.run(CommandIDs.toolSelect, ["tool": "pencil"])
+        XCTAssertEqual(model.paletteSelection(compact: false), "pencil")
+        XCTAssertFalse(model.settingsOpen)
+        inking.isInking = true
+        try await h.run(TestTouch.descriptor.id)
+        inking.isInking = false
+        model.refresh()
+        try await waitUntil("both writing tools are reachable after the settings source changes and ink commits") {
+            host.view.layoutIfNeeded()
+            guard let field, panels().count >= 2,
+                  panels().allSatisfy({ !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden }) else { return false }
+            return ["pen", "pencil"].allSatisfy { id in
+                guard let slot = field.anchorRect("toolbar.palette." + id),
+                      let hit = window.hitTest(host.view.convert(CGPoint(x: slot.midX, y: slot.midY), to: window), with: nil)
+                else { return false }
+                return !panels().contains { hit === $0 || hit.isDescendant(of: $0) }
+            }
+        }
+        // NibToolPalette calls onReselect, then toggles the settings binding.
+        model.toolReselected("pencil")
+        model.settingsOpen.toggle()
+        try await waitUntil("the selected Pencil settings becomes interactive again") {
+            host.view.layoutIfNeeded()
+            return panels().contains { $0.isUserInteractionEnabled && $0.bounds.height > 400 }
+        }
+        XCTAssertEqual(h.session.tool, "pencil", "Opening settings must preserve the writing tool")
+        XCTAssertEqual(model.shown.first { $0.id == "pen" }?.title, "Fountain Pen")
+    }
+
+    /// Closed settings and More remain mounted for their bud animations. Their native scroll views must
+    /// release touches, including after ink/commit refreshes, so a visible Lasso button can receive its tap.
+    func testPaletteClosedPopoversReleaseHitTargetsAfterDrawingAndSettingsDismissal() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.settings = { _ in AnyView(Text("Pen settings").frame(height: 320)) }
+        h.app.ui.toolbar.register(pen)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let inking = NibInkingState()
+        let size = Self.landscape
+        let host = UIHostingController(rootView:
+            NibDropletContainer(inking: inking) {
+                ToolbarRootView(model: model, size: size, compact: false)
+            })
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+
+        func popovers() -> [UIScrollView] {
+            // The fused options bar is 44 pt high; these are the settings and More panels.
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        func checkClosed() async throws {
+            try await waitUntil("closed palette popovers release their native hit targets") {
+                host.view.layoutIfNeeded()
+                let panels = popovers()
+                return panels.count >= 2 && panels.allSatisfy { !$0.isUserInteractionEnabled }
+            }
+            XCTAssertGreaterThanOrEqual(popovers().count, 2)
+            for scroll in popovers() {
+                XCTAssertTrue(scroll.accessibilityElementsHidden)
+                XCTAssertNil(scroll.hitTest(CGPoint(x: scroll.bounds.midX, y: scroll.bounds.midY), with: nil),
+                             "An invisible settings/More panel must not intercept a palette tap")
+            }
+        }
+        try await checkClosed()
+        inking.isInking = true
+        try await h.run(TestTouch.descriptor.id)
+        inking.isInking = false
+        model.refresh()
+        try await checkClosed()
+
+        model.openSettings()
+        try await waitUntil("Pen settings becomes interactive") {
+            host.view.layoutIfNeeded()
+            return popovers().contains { $0.isUserInteractionEnabled }
+        }
+        model.settingsOpen = false
+        try await checkClosed()
+        model.moreOpen = true
+        try await waitUntil("More becomes interactive") {
+            host.view.layoutIfNeeded()
+            return popovers().contains { $0.isUserInteractionEnabled }
+        }
+        model.moreOpen = false
+        try await checkClosed()
+    }
+
+    func testLassoPaletteActionAfterCommitSelectsItsWindowAndPreservesContent() async throws {
+        let h = harness()
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        try await h.run(TestTouch.descriptor.id)
+        let before = try h.app.workspace.content(Fixtures.docID)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let selection = h.session.selection
+        model.refresh()
+        XCTAssertEqual(model.shown.first?.id, "lasso")
+        XCTAssertEqual(model.shown.first?.accessibilityID, "tool.lasso")
+        model.select("lasso")
+        try await waitUntil("the palette selects Lasso through tool.select") { h.session.tool == "lasso" }
+        XCTAssertEqual(model.tool, "lasso")
+        XCTAssertEqual(other.tool, "pen", "The palette targets its own session, even when another window is active")
+        XCTAssertEqual(h.session.selection, selection)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), before)
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), items)
+        try await waitUntil("Lasso is the remembered sticky tool") {
+            h.app.settings.json("toolbar.lastTool.notebook")?.stringValue == "lasso"
+        }
+        try await h.run(TestTouch.descriptor.id)
+        model.refresh()
+        XCTAssertEqual(h.session.tool, "lasso", "A later commit must not restore Pen")
+    }
+
+    /// Insert tools share the palette's input path. Exercise the retained native panels in an active
+    /// scene, including the lower rows of More, then dispatch to the owning window.
+    func testInsertToolsRemainReachableAfterPopoverRelayoutAndSelectTheirWindow() async throws {
+        let h = harness()
+        // Keep insert tools in the lower rows, as in the fully registered app's More grid.
+        for index in 0..<8 {
+            h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                id: "extra.\(index)", title: "Accessory \(index)", icon: "ruler", group: .accessories,
+                order: 31 + index, owner: TestToolsFeature.id, command: "ruler.toggle"))
+        }
+        let inserts = ["shape", "image", "sticky", "tape", "elements"]
+        for (index, id) in inserts.enumerated() {
+            h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                id: id + ".item", title: id, icon: "square", group: .tools, order: 40 + index,
+                owner: TestToolsFeature.id, toolID: id,
+                settings: { _ in AnyView(Text(id + " settings").frame(height: 600)) }))
+            h.app.ui.canvasTools.register(CanvasToolDescriptor(id: id, title: id, owner: TestToolsFeature.id) {
+                TestTool(id: id, isSticky: false)
+            })
+        }
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let host = UIHostingController(rootView:
+            NibDropletContainer {
+                ToolbarRootView(model: model, size: Self.landscape, compact: false)
+            }
+            .environment(\.scenePhase, .active))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: Self.landscape))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+
+        func panels() -> [UIScrollView] {
+            scrollViews(in: host.view).filter { $0.bounds.height > NibMetrics.barHeight + 1 }
+        }
+        for id in ["text"] + inserts {
+            print("Insert palette regression: \(id)")
+            let item = try XCTUnwrap((model.shown + model.more).first { $0.id == id })
+            XCTAssertEqual(item.accessibilityID, "tool." + id)
+            XCTAssertTrue(item.isEnabled)
+            if model.more.contains(where: { $0.id == id }) {
+                model.openSettings()
+                model.moreOpen = true
+                model.refresh()
+                var inputRoute = "More has not laid out"
+                try await waitUntil("More owns its native hit target for \(id)") {
+                    host.view.layoutIfNeeded()
+                    let open = panels().filter { $0.isUserInteractionEnabled }
+                    inputRoute = "\(open.count) enabled panels; More=\(model.moreOpen), settings=\(model.settingsOpen)"
+                    guard open.count == 1, let panel = open.first else { return false }
+                    // Check both the first and last grid rows; the centre alone can miss an overlap.
+                    return [CGFloat(0.25), 0.8].allSatisfy { fraction in
+                        let point = panel.convert(CGPoint(x: panel.bounds.midX,
+                                                          y: panel.bounds.minY + panel.bounds.height * fraction), to: window)
+                        let hit = window.hitTest(point, with: nil)
+                        let reachesPanel = hit === panel || hit?.isDescendant(of: panel) == true
+                        if !reachesPanel { inputRoute += "; row \(fraction): hit \(String(describing: hit)) at \(point), panel \(panel)" }
+                        return reachesPanel
+                    }
+                }
+                print("Insert palette input: \(id): \(inputRoute)")
+            }
+            model.select(id)
+            XCTAssertFalse(model.moreOpen, "Choosing a tool releases More before command execution")
+            XCTAssertFalse(model.settingsOpen, "Choosing a tool releases settings before command execution")
+            try await waitUntil("\(id) activates in the palette's window") { h.session.tool == id }
+            XCTAssertEqual(model.tool, id)
+            XCTAssertEqual(other.tool, "pen")
+            XCTAssertFalse(model.moreOpen)
+            XCTAssertFalse(model.settingsOpen)
+            try await waitUntil("\(id)'s closed menus release the next input") {
+                host.view.layoutIfNeeded()
+                return !panels().isEmpty && panels().allSatisfy {
+                    !$0.isUserInteractionEnabled && $0.accessibilityElementsHidden
+                }
+            }
+            XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1), before)
+            // Insert tools hand back only when the canvas explicitly finishes their use.
+            model.refresh()
+            XCTAssertEqual(h.session.tool, id)
+            model.select("pen")
+            try await waitUntil("return to Pen before the next insert tool") { h.session.tool == "pen" }
+        }
+    }
+
+    func testMoreGridRoundingNoiseDoesNotRestartLayoutButRealMovementDoes() throws {
+        let field = DropletField()
+        field.setActive(false)
+        field.reduceMotion = true
+        let id = "toolbar.palette.more"
+        let rest = CGRect(x: 92, y: 433.33333333333337, width: 312, height: 236.33333333333337)
+        field.setRest(id, rest, style: .popover)
+        field.setBud(id, source: "toolbar.palette.more.source", presented: true, instant: true, dismiss: {})
+        let settled = field.node(id).presentation
+        let settledFrame = try XCTUnwrap(field.visualFrame(id))
+        // Frames captured from the native three-row More grid's layout feedback loop.
+        let rounded = CGRect(x: 92, y: 433.5, width: 312, height: 236.33333333333326)
+        let roundedHeight = CGRect(x: 92, y: 433.5, width: 312, height: 236)
+        for frame in [rounded, rest, roundedHeight, rest, rounded, rest, rest.offsetBy(dx: 0, dy: 0.25)] {
+            field.setRest(id, frame, style: .popover)
+            XCTAssertEqual(field.node(id).presentation, settled,
+                           "Rounding noise must not republish presentation and restart SwiftUI layout")
+            XCTAssertEqual(field.visualFrame(id), settledFrame)
+        }
+        for delta in [CGFloat(0.1), 0.2] {
+            field.setRest(id, rest.offsetBy(dx: delta, dy: 0), style: .popover)
+            XCTAssertEqual(field.visualFrame(id), settledFrame)
+        }
+        field.setRest(id, rest.offsetBy(dx: 0.3, dy: 0), style: .popover)
+        XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).minX, rest.minX + 0.3, accuracy: 1e-9,
+                       "Small real moves accumulate against the retained frame instead of being lost")
+        let moved = rest.offsetBy(dx: 12, dy: 24)
+        field.setRest(id, moved, style: .popover)
+        let movedFrame = try XCTUnwrap(field.visualFrame(id))
+        XCTAssertEqual(movedFrame.minX, moved.minX, accuracy: 1e-9)
+        XCTAssertEqual(movedFrame.minY, moved.minY, accuracy: 1e-9,
+                       "An actual dock/layout change must still take effect")
+        let resized = CGRect(origin: moved.origin, size: CGSize(width: moved.width + 1, height: moved.height + 1))
+        field.setRest(id, resized, style: .popover)
+        XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).width, resized.width, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(field.visualFrame(id)).height, resized.height, accuracy: 1e-9)
+        field.unregister(id)
+    }
+
+    func testMoreOpeningCatchesUpAfterADelayedDisplayFrame() throws {
+        let field = DropletField()
+        field.setActive(false)
+        let id = "toolbar.palette.more"
+        let rest = CGRect(x: 92, y: 320, width: 312, height: 236)
+        field.setWorldAnchor("more.source", CGRect(x: 16, y: 400, width: 56, height: 56))
+        field.setRest(id, rest, style: .popover)
+        field.setBud(id, source: "more.source", presented: true, instant: false, dismiss: {})
+        var steps: [TimeInterval] = []
+        let driver = DisplayLinkDriver { dt in
+            steps.append(dt)
+            _ = field.tick(dt)
+            return true
+        }
+        driver.start()
+        defer { driver.stop(); field.unregister(id) }
+        driver.advance(at: 10)
+        driver.advance(at: 11)
+        XCTAssertEqual(steps.last, 1, "A delayed frame must advance the full elapsed animation time")
+        let frame = try XCTUnwrap(field.visualFrame(id))
+        XCTAssertEqual(frame.midX, rest.midX, accuracy: 0.5,
+                       "More must reach its own hit targets after a stalled frame")
+        XCTAssertEqual(frame.midY, rest.midY, accuracy: 0.5)
+        XCTAssertEqual(frame.width, rest.width, accuracy: 0.5)
+        XCTAssertEqual(frame.height, rest.height, accuracy: 0.5)
+        driver.advance(at: 20)
+        XCTAssertEqual(steps.last, 1, "Long stalls stay within the spring integrator's safe bound")
     }
 
     func testConformance() async {
@@ -333,6 +843,42 @@ final class FeatToolbarTests: XCTestCase {
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
         }
+    }
+
+    func testApplySavedReorderedLayoutRestoresHighlighterBeforeFountainPenAndKeepsLassoFirst() async throws {
+        let h = harness()
+        var pen = try XCTUnwrap(h.app.ui.toolbar.get("pen.item"))
+        pen.title = "Fountain Pen"
+        h.app.ui.toolbar.register(pen)
+        h.app.ui.toolbar.register(ToolbarItemDescriptor(
+            id: "highlighter.item", title: "Highlighter", icon: "highlighter", group: .tools, order: 15,
+            owner: TestToolsFeature.id, toolID: "highlighter"))
+        let sheet = ToolbarCustomizationModel(app: h.app)
+        XCTAssertEqual(sheet.shown.prefix(2).map(\.title), ["Fountain Pen", "Highlighter"])
+        XCTAssertEqual(sheet.fixed.map(\.id), ["lasso.item"])
+        XCTAssertFalse(try XCTUnwrap(sheet.fixed.first).hideable)
+
+        sheet.move(.palette, from: IndexSet(integer: 1), to: 0)
+        try await waitUntil("the reordered rows are stored") {
+            ToolbarStore.current(h.app.settings)?.order.prefix(3) == ["lasso.item", "highlighter.item", "pen.item"]
+        }
+        sheet.save("Reordered chrome")
+        try await waitUntil("the saved layout appears") { sheet.savedNames.contains("Reordered chrome") }
+        sheet.reset(.tools)
+        try await waitUntil("reset restores registry order") {
+            sheet.shown.prefix(2).map(\.id) == ["pen.item", "highlighter.item"]
+        }
+        sheet.apply("Reordered chrome")
+        try await waitUntil("apply restores the reordered rows") {
+            sheet.shown.prefix(2).map(\.id) == ["highlighter.item", "pen.item"]
+        }
+        let reopened = ToolbarCustomizationModel(app: h.app)
+        XCTAssertEqual(reopened.shown.prefix(2).map(\.title), ["Highlighter", "Fountain Pen"])
+        XCTAssertEqual(reopened.fixed.map(\.id), ["lasso.item"])
+        XCTAssertFalse(try XCTUnwrap(reopened.fixed.first).hideable)
+        let palette = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(palette.shown.prefix(3).map(\.id), ["lasso", "highlighter", "pen"])
+        XCTAssertEqual(palette.shown.first { $0.id == "pen" }?.accessibilityID, "tool.pen")
     }
 
     /// Plugins and the AI write the synced layout: over-long lists and ids are refused, never stored or truncated.
@@ -601,6 +1147,96 @@ final class FeatToolbarTests: XCTestCase {
         let model = ToolbarModel(app: h.app, session: h.session)
         XCTAssertEqual(model.quickInks(compact: false).map { $0.index }, [0, 1, 2])
         XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [2])
+    }
+
+    func testCompactInkFollowsSelectionsBeyondTheThreeQuickSlots() async throws {
+        let h = harness()
+        var presets = ToolPresets.defaults(for: "pen")
+        presets.swatches += (3..<ToolPresets.maxSwatches).map {
+            PresetSwatch(color: RGBA(UInt8($0 * 20), 80, 160))
+        }
+        h.app.settings.set(NibSettings.presets("pen"), presets)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let regular = model.quickInks(compact: false)
+
+        for index in [3, 11, 1] {
+            presets.selectedSwatch = index
+            h.app.settings.set(NibSettings.presets("pen"), presets)
+            try await waitUntil("the selected ink refreshes") { model.swatchIndex == index }
+            XCTAssertEqual(model.quickInks(compact: true),
+                           [QuickSwatch(index: index, color: presets.swatches[index].color)])
+            XCTAssertEqual(model.quickInks(compact: false), regular)
+        }
+        // Editing the selected slot also refreshes the compact colour without changing its selection.
+        presets.swatches[1].color = RGBA(40, 90, 130)
+        h.app.settings.set(NibSettings.presets("pen"), presets)
+        try await waitUntil("the edited ink refreshes") {
+            model.quickInks(compact: true).first?.color == presets.swatches[1].color
+        }
+    }
+
+    func testHighlighterSwatchesAreOpaqueWithoutChangingStoredStrokeColours() {
+        let h = harness()
+        var presets = ToolPresets.defaults(for: "highlighter")
+        presets.swatches.append(PresetSwatch(color: RGBA(120, 180, 240, 64)))
+        presets.selectedSwatch = 3
+        h.app.settings.set(NibSettings.presets("highlighter"), presets)
+        h.session.tool = "highlighter"
+        let model = ToolbarModel(app: h.app, session: h.session)
+        for compact in [false, true] {
+            for swatch in model.quickInks(compact: compact) {
+                let stored = presets.swatches[swatch.index].color
+                XCTAssertEqual(swatch.color, RGBA(stored.r, stored.g, stored.b, 255))
+            }
+        }
+        XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [3])
+        XCTAssertEqual(h.app.settings.get(NibSettings.presets("highlighter")), presets)
+
+        var pen = ToolPresets.defaults(for: "pen")
+        pen.swatches[0].color = RGBA(40, 90, 130, 100)
+        h.app.settings.set(NibSettings.presets("pen"), pen)
+        h.session.tool = "pen"
+        XCTAssertEqual(model.quickInks(compact: false).first?.color, pen.swatches[0].color)
+    }
+
+    func testToolValueUsesLocalisedMillimetresAndPreservesAccessoryStates() {
+        XCTAssertEqual(ToolbarModel.accessibilityValue(colour: "Carbon", width: 1.2, isOn: true,
+                                                       isEnabled: false, locale: Locale(identifier: "en_GB")),
+                       "Carbon, 0.42 millimetres, On, Unavailable")
+        let french = ToolbarModel.accessibilityValue(colour: nil, width: 1.2, isOn: false,
+                                                      isEnabled: true, locale: Locale(identifier: "fr_FR"))
+        XCTAssertTrue(french?.contains("0,42") == true)
+        XCTAssertNil(ToolbarModel.accessibilityValue(colour: nil, isOn: false, isEnabled: true))
+    }
+
+    func testToolThicknessValueRefreshesWhenSelectingAndEditingWidths() async throws {
+        for tool in ["pen", "pencil", "highlighter"] {
+            let h = harness()
+            if tool != "pen" {
+                h.app.ui.toolbar.register(ToolbarItemDescriptor(
+                    id: "\(tool).item", title: tool, icon: "pencil.tip", group: .tools, order: 15,
+                    owner: TestToolsFeature.id, toolID: tool))
+            }
+            h.session.tool = tool
+            var presets = ToolPresets.defaults(for: tool)
+            presets.widths = [72 / 25.4, 144 / 25.4, 216 / 25.4]
+            presets.selectedWidth = 0
+            h.app.settings.set(NibSettings.presets(tool), presets)
+            let model = ToolbarModel(app: h.app, session: h.session)
+            func value() -> String? { (model.shown + model.more).first { $0.id == tool }?.value }
+            func expected(_ millimetres: Double) -> String {
+                let width = String(format: String(localized: "%.2f millimetres"),
+                                   locale: Locale.current, millimetres)
+                return "\(ToolbarModel.colourName(presets.color, index: presets.selectedSwatch)), \(width)"
+            }
+            XCTAssertEqual(value(), expected(1), tool)
+            presets.selectedWidth = 2
+            h.app.settings.set(NibSettings.presets(tool), presets)
+            try await waitUntil("\(tool) announces the selected width") { value() == expected(3) }
+            presets.widths[2] = 288 / 25.4
+            h.app.settings.set(NibSettings.presets(tool), presets)
+            try await waitUntil("\(tool) announces the edited width") { value() == expected(4) }
+        }
     }
 
     /// A shared accessory and quick inks must never create palette chrome over a text document or study set.
@@ -952,6 +1588,15 @@ final class FeatToolbarTests: XCTestCase {
 final class PopoverFlag {
     var isOpen = false
     var binding: Binding<Bool> { Binding(get: { self.isOpen }, set: { self.isOpen = $0 }) }
+}
+
+private struct ToolbarFieldProbe: View {
+    @Environment(DropletField.self) private var field: DropletField?
+    let capture: (DropletField?) -> Void
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0).onAppear { capture(field) }
+    }
 }
 
 /// A toolbar item's live state, owned by the feature that registers it.

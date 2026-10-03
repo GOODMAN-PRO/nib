@@ -278,21 +278,8 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
         let session = ctx.activeSession
         let isCompact = parent.traitCollection.horizontalSizeClass == .compact
         if !isCompact, let host = session?.floatingHost ?? ctx.navigator?.floatingHost {
-            let anchorID = ExportPresentation.anchorID
-            // The document chrome owns Share's real bud anchor. Library exports use the registered fallback.
-            let source = session?.document != nil ? "chrome.anchor.share" : anchorID
-            let rect = ExportPresentation.anchorRect(in: parent)
-            guard let sourceRect = host.containerRect(rect, from: parent.view),
-                  host.setAnchor(anchorID, rect: rect, in: parent.view) else { throw NibError.unavailable("the export anchor") }
-            host.present("exportui.dialog", content: AnyView(ExportPopover(selection: selection, draft: draft,
-                printing: printing, app: app, session: session, host: host,
-                source: source, sourceRect: sourceRect, updateSourceRect: { [weak parent, weak host] in
-                    guard let parent, let host else { return nil }
-                    let rect = ExportPresentation.anchorRect(in: parent)
-                    guard let converted = host.containerRect(rect, from: parent.view),
-                          host.setAnchor(anchorID, rect: rect, in: parent.view) else { return nil }
-                    return converted
-                }, instant: instant)))
+            showPopover(selection: selection, draft: draft, printing: printing, instant: instant,
+                        app: app, session: session, host: host, parent: parent)
         } else {
             let controller = UIHostingController(rootView: ExportSheet(selection: selection, draft: draft, printing: printing,
                                                                         app: app, session: session))
@@ -301,6 +288,27 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
             controller.sheetPresentationController?.prefersGrabberVisible = true
             parent.present(controller, animated: !instant && !UIAccessibility.isReduceMotionEnabled)
         }
+    }
+    /// Anchor conversion is optional until the floating layer is attached to the window.
+    /// Present first; the popover refreshes the anchor on appearance and geometry changes.
+    @discardableResult
+    func showPopover(selection: ExportSelection, draft: ExportDraft, printing: Bool, instant: Bool,
+                     app: NibApp, session: EditorSession?, host: FloatingHosting,
+                     parent: UIViewController) -> ExportPopover {
+        let anchorID = ExportPresentation.anchorID
+        let updateSourceRect: @MainActor () -> CGRect? = { [weak parent, weak host] in
+            guard let parent, let host else { return nil }
+            let rect = ExportPresentation.anchorRect(in: parent)
+            guard let converted = host.containerRect(rect, from: parent.view),
+                  host.setAnchor(anchorID, rect: rect, in: parent.view) else { return nil }
+            return converted
+        }
+        let popover = ExportPopover(selection: selection, draft: draft, printing: printing,
+            app: app, session: session, host: host,
+            source: session?.document != nil ? "chrome.anchor.share" : anchorID,
+            sourceRect: updateSourceRect(), updateSourceRect: updateSourceRect, instant: instant)
+        host.present("exportui.dialog", content: AnyView(popover))
+        return popover
     }
     func showLocked(doc: DocumentID, retry: String, params: JSONValue, ctx: CommandContext) async throws {
         guard let app = ctx.app else { throw NibError.unavailable("the app") }
@@ -319,14 +327,15 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
     func deliver(_ urls: [URL], destination: String, ctx: CommandContext) async throws -> Bool {
         let parent = try ExportPresentation.topController(ctx)
         if destination == "files" {
+            guard parent.viewIfLoaded?.window != nil, !parent.isBeingDismissed,
+                  parent.presentedViewController == nil else {
+                throw NibError.unavailable("a window ready to export")
+            }
             let picker = UIDocumentPickerViewController(forExporting: urls, asCopy: true)
             picker.delegate = self
             ExportPresentation.anchor(picker, in: parent)
-            guard fileCompletion == nil else { throw NibError.unavailable("a free file picker") }
-            return try await withCheckedThrowingContinuation { continuation in
-                fileCompletion = continuation
+            return try await waitForFiles {
                 parent.present(picker, animated: !UIAccessibility.isReduceMotionEnabled)
-                if picker.presentingViewController == nil { finishFiles(false) }
             }
         }
         let activity = UIActivityViewController(activityItems: urls, applicationActivities: nil)
@@ -340,17 +349,30 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
                 if let error { continuation.resume(throwing: NibError.wrap(error)) }
                 else { continuation.resume(returning: complete) }
             }
-            parent.present(activity, animated: !UIAccessibility.isReduceMotionEnabled)
-            if activity.presentingViewController == nil && !resumed {
-                resumed = true
-                activity.completionWithItemsHandler = nil
-                continuation.resume(returning: false)
+            parent.present(activity, animated: !UIAccessibility.isReduceMotionEnabled) { [weak activity] in
+                if activity?.presentingViewController == nil && !resumed {
+                    resumed = true
+                    activity?.completionWithItemsHandler = nil
+                    continuation.resume(returning: false)
+                }
             }
+        }
+    }
+    /// Presentation is not delivery: Files reads these URLs later, after the user chooses
+    /// a destination. Only the picker delegate may release the command's staging files.
+    func waitForFiles(present: () -> Void) async throws -> Bool {
+        guard fileCompletion == nil else { throw NibError.unavailable("a free file picker") }
+        // UIDocumentPickerViewController.delegate is weak. Keep its owner alive until
+        // the delegate completes this operation, including while the task is suspended.
+        defer { withExtendedLifetime(self) {} }
+        return try await withCheckedThrowingContinuation { continuation in
+            fileCompletion = continuation
+            present()
         }
     }
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { finishFiles(false) }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { finishFiles(!urls.isEmpty) }
-    private func finishFiles(_ value: Bool) {
+    func finishFiles(_ value: Bool) {
         let completion = fileCompletion
         fileCompletion = nil
         completion?.resume(returning: value)

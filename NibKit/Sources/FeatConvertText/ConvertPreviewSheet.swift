@@ -201,6 +201,7 @@ struct ConvertPreviewSheet: View {
                                 context.app.perform(CommandIDs.revertGroup, params, session: context.session)
                                 close()
                             }
+                            .accessibilityIdentifier("cmd." + CommandIDs.revertGroup)
                         }
                     }
                 }.padding(.horizontal, NibSpacing.xl).padding(.bottom, NibSpacing.xxl)

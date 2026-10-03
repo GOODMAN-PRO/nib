@@ -121,6 +121,11 @@ final class WindowScenes {
     private var entries: [Entry] = []
     private var pagesBySession: [NibID: [DocumentID: PageID]] = [:]
     private var lastPages: [DocumentID: PageID] = [:]
+    private struct Viewport {
+        let zoom: Double
+    }
+    private var shownDocuments: [NibID: DocumentID] = [:]
+    private var viewports: [NibID: [DocumentID: Viewport]] = [:]
     private var pendingCloses: [NibID: PendingClose] = [:]
     private var subscription: EventSubscription?
 
@@ -142,7 +147,10 @@ final class WindowScenes {
 
     func add(_ navigator: SceneNavigator) {
         entries.removeAll { $0.navigator == nil }
-        if !entries.contains(where: { $0.navigator === navigator }) { entries.append(Entry(navigator: navigator)) }
+        if !entries.contains(where: { $0.navigator === navigator }) {
+            entries.append(Entry(navigator: navigator))
+            shownDocuments[navigator.session.id] = navigator.session.document
+        }
     }
 
     /// The window of `session`; else the most recently active window; else the only window.
@@ -184,6 +192,34 @@ final class WindowScenes {
             remember(page, doc: doc, session: session)
         }
         guard type == NibEventType.sessionDocument else { return }
+        // document changes before the shell replaces the editor or its page. Capture
+        // the departing viewport now, while the session still describes that canvas.
+        let previous = shownDocuments[id]
+        shownDocuments[id] = session.document
+        if let previous, previous != session.document, let page = session.page {
+            remember(page, doc: previous, session: session)
+            // Session zoom is throttled during a pinch; the departing host has the
+            // actual final scale even when Library is tapped before publication.
+            let editor = session.editor
+            let zoom = editor?.documentID == previous ? editor?.canvasHost?.zoomScale : nil
+            viewports[id, default: [:]][previous] = Viewport(zoom: zoom ?? session.zoom)
+        }
+        if let doc = session.document, let viewport = viewports[id]?[doc] {
+            Task { @MainActor [weak self, weak session] in
+                guard let self, let session, let app = self.app,
+                      session.document == doc, let editor = session.editor,
+                      editor.documentID == doc, editor.canvasHost != nil,
+                      app.commands.entry(CommandIDs.viewZoom) != nil else { return }
+                self.navigator(sessionID: id)?.rootViewController?.view.layoutIfNeeded()
+                do {
+                    _ = try await app.bus.execute(CommandIDs.viewZoom,
+                        ["scale": .number(viewport.zoom)], session: session)
+                } catch {
+                    NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                        userInfo: ["command": CommandIDs.viewZoom, "error": NibError.wrap(error)])
+                }
+            }
+        }
         // The window moved on: a close waiting for it runs if it now shows the awaited document, else it is dropped.
         if let pending = pendingCloses.removeValue(forKey: id), session.document == pending.shows,
            let origin = navigator(sessionID: pending.origin) {
@@ -261,7 +297,7 @@ final class WindowScenes {
         }
         let wasCurrent = navigator.activeDocument == doc
         navigator.closeDocument(doc)
-        if shown == nil, wasCurrent, next != nil {
+        if shown == nil, wasCurrent, next != nil, navigator.session.document != nil {
             // The shell opens another tab when the current one closes; the library stays on screen instead. This
             // window's navigator, not `window.showLibrary`, which acts on the active window: a tab dragged out of a
             // window closes here while the new window is the active one.

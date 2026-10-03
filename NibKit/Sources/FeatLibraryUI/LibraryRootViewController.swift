@@ -55,6 +55,8 @@ final class LibraryViewModel: ObservableObject {
     let reflow = NibReflow<String>(combines: true)
     let folderReflow = NibReflow<String>(combines: false)
     let floatingAdapter: LibraryFloatingAdapter
+    @Published var collection: LibraryCollection = .documents
+    @Published private(set) var sidebarCounts: [String: Int] = [:]
     @Published var folder: FolderID?
     @Published var layout: LibraryLayout = .grid
     @Published var sort: LibrarySort = .modified
@@ -67,6 +69,7 @@ final class LibraryViewModel: ObservableObject {
     @Published var modal: LibraryPanel?
     @Published var absorbing: [String: CGSize] = [:]
     var dropFrame: CGRect?
+    var dropTargets: [String: CGRect] = [:]
     @Published var dropTarget: String?
     let coverCache: LibraryCoverCache
     @Published var hasLibraryDrag = false
@@ -108,46 +111,112 @@ final class LibraryViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if event.type == NibEventType.syncStatus {
-                    self.syncText = event.payload?["message"]?.stringValue ?? String(localized: "Syncing library")
+                    if let status = event.decode(SyncStatusPayload.self) {
+                        self.syncText = LibrarySyncPresentation.text(status)
+                    }
                 } else {
                     await self.markDirty()
                 }
             }
         }
         NotificationCenter.default.publisher(for: .nibRegistryDidChange).sink { [weak self] _ in
-            Task { @MainActor in self?.registryRevision += 1 }
+            Task { @MainActor [weak self] in
+                self?.registryRevision += 1
+                self?.refreshSidebarCounts()
+            }
         }.store(in: &observations)
         NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate, object: app.ui)
             .filter { note in
                 (note.userInfo?["session"] as? String).map { $0 == session.id.raw } ?? true
             }
             .sink { [weak self] _ in
-                Task { @MainActor in self?.registryRevision += 1 }
+                Task { @MainActor [weak self] in self?.registryRevision += 1 }
             }.store(in: &observations)
         session.objectWillChange.sink { [weak self] _ in
             // Published session properties notify before changing; evaluate visibility on the next actor turn.
-            Task { @MainActor in self?.registryRevision += 1 }
+            Task { @MainActor [weak self] in self?.registryRevision += 1 }
         }.store(in: &observations)
         NotificationCenter.default.publisher(for: .nibCommandFailed, object: app).sink { [weak self] notification in
             guard let command = notification.userInfo?["command"] as? String,
                   command.hasPrefix("library.") || command.hasPrefix("folder.") else { return }
-            Task { @MainActor in await self?.markDirty() }
+            Task { @MainActor [weak self] in await self?.markDirty() }
         }.store(in: &observations)
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings).sink { [weak self] note in
             let name = note.userInfo?["name"] as? String
-            Task { @MainActor in
-                guard let self else { return }
-                self.liquidMode = NibLiquidMode(rawValue: self.app.settings.get(NibSettings.liquidMode)) ?? .full
-                if name == LibraryOrder.viewKey(self.folder) { self.restoreView() }
-                if name == LibraryOrder.viewKey(self.folder) || name == LibraryOrder.key(self.folder) { self.applySort() }
+            // Commands already publish these notifications on main. Reconcile
+            // before returning instead of retaining a window in a suspended task.
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.settingsDidChange(name) }
+            } else {
+                Task { @MainActor [weak self] in self?.settingsDidChange(name) }
             }
         }.store(in: &observations)
     }
 
+    private func settingsDidChange(_ name: String?) {
+        liquidMode = NibLiquidMode(rawValue: app.settings.get(NibSettings.liquidMode)) ?? .full
+        if name?.hasPrefix("searchui.recent.") == true || name?.hasPrefix("collab.shared.") == true {
+            refreshSidebarCounts()
+            if collection == .recents {
+                Task { @MainActor [weak self] in await self?.markDirty() }
+            }
+        }
+        if collection == .documents && name == LibraryOrder.viewKey(folder) { restoreView() }
+        if name == LibraryOrder.viewKey(folder) || name == LibraryOrder.key(folder) { applySort() }
+    }
+
     deinit { eventSubscription?.cancel() }
     var folderRef: JSONValue { .string(folder.map { NodeRef.folder($0).description } ?? "lib") }
-    var title: String { folder.flatMap { id in allFolders.first { $0.nodeID == id }?.name } ?? String(localized: "Documents") }
+    var title: String {
+        if collection != .documents { return collection.title }
+        return folder.flatMap { id in allFolders.first { $0.nodeID == id }?.name } ?? String(localized: "Documents")
+    }
     var tabs: [PanelDescriptor] { app.ui.panels.all.filter { $0.placement == .libraryTab } }
+    var sidebarPlaces: [LibrarySidebarPlace] {
+        let builtins = LibraryCollection.allCases.map { LibrarySidebarPlace(id: $0.rawValue, title: $0.title, symbol: $0.symbol, collection: $0) }
+        let panels = tabs.map { LibrarySidebarPlace(id: $0.id, title: $0.title, symbol: NibSymbol(systemName: $0.icon) ?? .library) }
+        let order = ["documents", PanelIDs.favourites, "collabpresence.shared", "recents", "studySets", PanelIDs.gallery, PanelIDs.trash]
+        return (builtins + panels).sorted {
+            let a = order.firstIndex(of: $0.id) ?? order.count
+            let b = order.firstIndex(of: $1.id) ?? order.count
+            return a == b ? $0.title.localizedStandardCompare($1.title) == .orderedAscending : a < b
+        }
+    }
+    var parentNavigation: (title: String, ref: String)? {
+        guard folder != nil else { return nil }
+        if let parent = breadcrumbs.dropLast().last { return (parent.name, parent.ref) }
+        return (String(localized: "Documents"), "lib")
+    }
+    private func refreshSidebarCounts() {
+        let nodes = app.services.library?.allNodes() ?? []
+        let documents = nodes.filter { $0.kind == .document }
+        var counts: [String: Int] = [:]
+        counts["documents"] = documents.count
+        counts["recents"] = documents.filter { recentDate($0.id) != nil }.count
+        counts["studySets"] = documents.filter { $0.documentKind == .studySet }.count
+        counts[PanelIDs.favourites] = nodes.filter(\.favorite).count
+        counts[PanelIDs.trash] = app.services.library?.trashedNodes().count ?? 0
+        counts["collabpresence.shared"] = app.settings.names(prefix: "collab.shared.").filter {
+            app.settings.json($0)?["local"]?.stringValue != nil
+        }.count
+        if let plugins = app.services.get(ServiceKeys.pluginHost, as: (any PluginHosting).self) {
+            counts[PanelIDs.gallery] = plugins.installed.count
+        } else { counts[PanelIDs.gallery] = 0 }
+        let children = Dictionary(grouping: nodes, by: \.parent)
+        for node in nodes where node.kind == .folder {
+            counts[NodeRef.folder(node.id).description] = children[node.id]?.count ?? 0
+        }
+        sidebarCounts = counts
+    }
+    func openStorageDetails() {
+        // The destination retains the full signer warning and the Move/Copy recovery choices.
+        if app.ui.panels.get(PanelIDs.cloudBackup) != nil {
+            setView(["panel": .string(PanelIDs.cloudBackup)])
+        } else { perform(CommandIDs.libraryRelocate, ["copy": false]) }
+    }
+    func recentDate(_ id: NibID) -> Double? {
+        app.settings.json("searchui.recent." + id.raw)?.doubleValue
+    }
     func chromeContext(isCompact: Bool) -> ChromeContext {
         ChromeContext(app: app, session: session, navigator: navigator, kind: nil, isCompact: isCompact)
     }
@@ -182,11 +251,15 @@ final class LibraryViewModel: ObservableObject {
         filter = LibraryFilter(rawValue: value?["filter"]?.stringValue ?? "") ?? .all
     }
     func applySort() {
-        let manual = app.settings.json(LibraryOrder.key(folder))?.arrayValue?.compactMap(\.stringValue) ?? []
+        let recentOrder = collection == .recents && sort == .modified
+        let manual = recentOrder ? rows.sorted {
+            let a = recentDate($0.nodeID) ?? 0, b = recentDate($1.nodeID) ?? 0
+            return a == b ? $0.ref < $1.ref : a > b
+        }.map(\.ref) : app.settings.json(LibraryOrder.key(folder))?.arrayValue?.compactMap(\.stringValue) ?? []
         let inputs = SortInputs(sort: sort, filter: filter, manual: manual, search: search)
         guard sortedRows != rows || sortInputs != inputs else { return }
         sortedRows = rows; sortInputs = inputs; sortPasses += 1
-        visibleRows = LibrarySorting.rows(rows, sort: sort, filter: filter, manual: manual, search: search)
+        visibleRows = LibrarySorting.rows(rows, sort: recentOrder ? .manual : sort, filter: filter, manual: manual, search: search)
         splitSections()
         selection.retain(rows.map(\.ref))
     }
@@ -221,13 +294,18 @@ final class LibraryViewModel: ObservableObject {
     }
     func reload() async {
         loadGeneration += 1
-        let generation = loadGeneration, current = folder
+        let generation = loadGeneration, current = folder, currentCollection = collection
         isLoading = true
         do {
-            let children = try await queryRows(folder: current)
+            var children = try await queryRows(folder: current, recursive: currentCollection != .documents)
+            if currentCollection == .studySets { children = children.filter { $0.kind == "studySet" } }
+            if currentCollection == .recents {
+                children = children.filter { !$0.isFolder && recentDate($0.nodeID) != nil }
+            }
             let catalog = try await queryRows(folder: nil, recursive: true, foldersOnly: true)
-            guard generation == loadGeneration, current == folder else { return }
+            guard generation == loadGeneration, current == folder, currentCollection == collection else { return }
             rows = children; allFolders = catalog; isDirty = false
+            refreshSidebarCounts()
             error = nil; isLoading = false; applySort()
         } catch {
             guard generation == loadGeneration else { return }
@@ -235,6 +313,8 @@ final class LibraryViewModel: ObservableObject {
         }
     }
     func openPanel(_ descriptor: PanelDescriptor, params: JSONValue) {
+        menu = nil
+        renaming = nil
         let presentation: PanelPresentation = descriptor.placement == .libraryTab ? .libraryTab : descriptor.placement == .fullScreen ? .fullScreen : .sheet
         let panel = LibraryPanel(id: descriptor.id, params: params, presentation: presentation)
         if presentation == .libraryTab {
@@ -297,8 +377,16 @@ final class LibraryViewModel: ObservableObject {
         }
     }
 
-    func drop(_ drop: NibReflowDrop<String>) {
-        if let destination = dropTarget, let carried = reflow.carried ?? folderReflow.carried {
+    func drop(_ drop: NibReflowDrop<String>) { self.drop(drop, from: nil) }
+
+    func drop(_ drop: NibReflowDrop<String>, from source: NibReflow<String>?) {
+        // onChange coalesces finger updates. Resolve the final point synchronously
+        // before the released carrier/monitor clears its hover state.
+        if let lift = source?.lift {
+            let match = LibraryDropDestination.match(lift.location, carried: lift.id, targets: dropTargets)
+            dropTarget = match?.key; dropFrame = match?.value
+        }
+        if let destination = dropTarget, let carried = source?.carried ?? reflow.carried ?? folderReflow.carried {
             let refs = selection.refs.contains(carried) ? selection.refs.sorted() : [carried]
             if let frame = dropFrame, let source = reflow.carrierFrame {
                 absorbing[carried] = CGSize(width: frame.midX - source.midX, height: frame.midY - source.midY)
@@ -315,8 +403,12 @@ final class LibraryViewModel: ObservableObject {
         case .none: break
         case .combine(let ref, into: let target):
             let refs = selection.refs.contains(ref) ? documentRefs.filter { selection.refs.contains($0) && $0 != target } : [ref]
-            moveDrop(refs: refs, destination: target)
+            confirmation = LibraryConfirmation(title: String(localized: "Combine"), command: CommandIDs.libraryMove,
+                params: ["refs": .array(refs.map(JSONValue.string)), "folder": .string(target)],
+                message: LibraryConfirmation.combineMessage(names: refs.compactMap { ref in rows.first { $0.ref == ref }?.name },
+                    destination: rows.first { $0.ref == target }?.name ?? String(localized: "the destination document")))
         case .reorder(let move):
+            guard collection == .documents else { return }
             // Apply immediately, in the same update that clears reflow's offsets.
             let isFolder = visibleRows.first { $0.ref == move.id }?.isFolder ?? false
             let subset = visibleRows.filter { $0.isFolder == isFolder }.map(\.ref)
@@ -379,6 +471,27 @@ final class LibraryRootViewController: UIViewController {
             host.view.topAnchor.constraint(equalTo: view.topAnchor), host.view.bottomAnchor.constraint(equalTo: view.bottomAnchor)])
         host.didMove(toParent: self)
     }
+    override var keyCommands: [UIKeyCommand]? {
+        LibrarySelectionShortcuts.descriptors(model).map {
+            LibrarySelectionShortcuts.command($0, action: #selector(runLibraryKeyCommand(_:)))
+        }
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(runLibraryKeyCommand(_:)) else {
+            return super.canPerformAction(action, withSender: sender)
+        }
+        let descriptors = LibrarySelectionShortcuts.descriptors(model)
+        guard let command = sender as? UIKeyCommand else { return !descriptors.isEmpty }
+        return descriptors.contains { $0.id == command.propertyList as? String }
+    }
+    @objc private func runLibraryKeyCommand(_ sender: UIKeyCommand) {
+        guard let descriptor = LibrarySelectionShortcuts.descriptors(model).first(where: {
+            $0.id == sender.propertyList as? String
+        }) else { return }
+        if let navigator = model.navigator { model.app.ui.activeNavigator = navigator }
+        model.app.services.sessions.activate(model.session)
+        model.perform(descriptor.command, descriptor.resolvedParams(for: model.session))
+    }
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
@@ -391,6 +504,9 @@ final class LibraryRootViewController: UIViewController {
 }
 
 enum LibraryPresentation {
+    static func usesInlineSidebar(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
+        !isCompact(size: size, idiom: idiom) && size.width > size.height && size.width >= NibMetrics.librarySidebarBreakpoint
+    }
     static var actionPairWidth: CGFloat { 2 * NibMetrics.hitTarget + NibMetrics.minimumRestingGap }
     static func isCompactHeight(size: CGSize) -> Bool {
         size.height < NibMetrics.compactBreakpoint && size.width > size.height
@@ -412,9 +528,13 @@ struct LibraryRootView: View {
     @State private var searchText = ""
     var body: some View {
         GeometryReader { geometry in
-            let compact = LibraryPresentation.isCompact(size: geometry.size, idiom: idiom)
+            // Keyboard avoidance changes the available content height, not the window's
+            // navigation mode. Switching stacks here destroys a focused inline editor.
+            let windowSize = model.controller?.viewIfLoaded?.window?.bounds.size
+                ?? model.controller?.viewIfLoaded?.bounds.size ?? geometry.size
+            let compact = LibraryPresentation.isCompact(size: windowSize, idiom: idiom)
             let short = LibraryPresentation.isCompactHeight(size: geometry.size)
-            let inlineSidebar = !compact && geometry.size.width >= NibMetrics.librarySidebarBreakpoint
+            let inlineSidebar = LibraryPresentation.usesInlineSidebar(size: windowSize, idiom: idiom)
             ZStack {
                 let context = model.chromeContext(isCompact: compact)
                 let overlays = model.visibleChromeOverlays(context)
@@ -431,14 +551,20 @@ struct LibraryRootView: View {
                                     .libraryFolderSearch(text: $searchText, enabled: !short)
                                     .toolbar {
                                         ToolbarItem(placement: .topBarLeading) {
-                                            NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                            if model.parentNavigation != nil { parentNavigation }
+                                            else {
+                                                NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                                .accessibilityIdentifier("cmd.library.setView")
+                                            }
                                         }
                                         ToolbarItemGroup(placement: .topBarTrailing) {
                                             NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                                            .accessibilityIdentifier("cmd.library.setView")
                                                 .libraryChromeFrame("anchor.library.sort")
                                             NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) {
                                                 model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"])
                                             }
+                                            .accessibilityIdentifier("cmd.library.setView")
                                         }
                                     }
                             }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -459,6 +585,7 @@ struct LibraryRootView: View {
                                                     : NibSpacing.x6 + NibSpacing.l) {
                             if !inlineSidebar && !compact {
                                 NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                .accessibilityIdentifier("cmd.library.setView")
                                     .libraryChromeFrame("top.sidebar")
                                     .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topLeading, isControls: true))
                             }
@@ -506,7 +633,7 @@ struct LibraryRootView: View {
                 .environment(\.horizontalSizeClass, compact ? .compact : .regular)
             }
             .coordinateSpace(name: "library.chrome")
-            .onPreferenceChange(LibraryTargets.self) { targets = $0 }
+            .onPreferenceChange(LibraryTargets.self) { targets = $0; model.dropTargets = $0 }
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
                 chromeFrames = frames
                 model.updateMenuAnchors(from: frames)
@@ -520,9 +647,23 @@ struct LibraryRootView: View {
                         model.confirmation = nil
                         model.perform(confirmation.command, confirmation.params)
                     }
+                    .accessibilityIdentifier("cmd." + confirmation.command)
                 }
+            } message: {
+                if let message = model.confirmation?.message { Text(message) }
+            }
+            .onChange(of: !inlineSidebar && !compact, initial: true) { _, overlay in
+                // Both compact and overlay layouts have inlineSidebar == false.
+                // Observe entering overlay mode itself, including the first real
+                // iPad layout after a compact/zero-sized hosting-controller layout.
+                if overlay && model.sidebarVisible { model.setView(["sidebar": false]) }
             }
             .onAppear { searchText = model.search }
+            .onChange(of: model.rows.count, initial: true) { _, _ in
+                if NibUITestMode.isEnabled {
+                    DispatchQueue.main.async { UIAccessibility.post(notification: .layoutChanged, argument: nil) }
+                }
+            }
             .onChange(of: model.search) { _, value in if value != searchText { searchText = value } }
             .task(id: searchText) {
                 guard searchText != model.search else { return }
@@ -551,21 +692,25 @@ struct LibraryRootView: View {
                 .libraryChromeFrame(compact ? "title" : "sidebar.title")
             ScrollView {
                 VStack(spacing: NibSpacing.xs) {
-                    Button { model.setView(["panel": "documents", "folder": "lib", "sidebar": false]) } label: {
-                        NibSidebarRow(String(localized: "Documents"), symbol: .library, isSelected: model.tab == nil)
-                    }
-                    ForEach(model.tabs, id: \.id) { panel in
-                        Button { model.setView(["panel": .string(panel.id)]) } label: {
-                            NibSidebarRow(panel.title, symbol: NibSymbol(systemName: panel.icon) ?? .library, isSelected: model.tab?.id == panel.id)
+                    ForEach(model.sidebarPlaces) { place in
+                        Button {
+                            if let collection = place.collection {
+                                model.setView(["collection": .string(collection.rawValue), "sidebar": false])
+                            } else { model.setView(["panel": .string(place.id)]) }
+                        } label: {
+                            NibSidebarRow(place.title, symbol: place.symbol, count: model.sidebarCounts[place.id],
+                                          isSelected: place.collection.map { model.tab == nil && model.folder == nil && model.collection == $0 } ?? (model.tab?.id == place.id))
                         }
-                        .libraryDropTarget(panel.id == PanelIDs.trash ? "trash" : "card:tab:" + panel.id)
+                        .accessibilityIdentifier("cmd.library.setView")
+                        .libraryDropTarget(place.id == PanelIDs.trash ? "trash" : "card:tab:" + place.id)
                     }
                     DisclosureGroup(String(localized: "Folders")) {
                         ForEach(model.allFolders) { row in
                             Button { model.setView(["folder": .string(row.ref), "sidebar": false]) } label: {
-                                NibSidebarRow(row.name, symbol: .folderFill, isSelected: model.folder == row.nodeID,
+                                NibSidebarRow(row.name, symbol: .folderFill, count: model.sidebarCounts[row.ref], isSelected: model.tab == nil && model.collection == .documents && model.folder == row.nodeID,
                                               glyphTint: row.color.flatMap { RGBA(hex: $0) }.map { Color(uiColor: $0.uiColor) })
                             }
+                            .accessibilityIdentifier("cmd.library.setView")
                             .libraryDropTarget("sidebarFolder:" + row.ref)
                         }
                     }.font(NibFont.body).foregroundStyle(NibColor.label).padding(NibSpacing.m)
@@ -575,6 +720,7 @@ struct LibraryRootView: View {
                 Text(model.syncText).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                 Spacer()
                 NibIconButton(.settings, label: String(localized: "App Menu")) { model.setView(["menu": "app"]) }
+                .accessibilityIdentifier("cmd.library.setView")
                     .libraryChromeFrame("anchor.library.app")
             }
         }
@@ -587,26 +733,21 @@ struct LibraryRootView: View {
         else {
             ScrollView {
                 VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.xs : NibSpacing.s) {
-                    if compactHeight, model.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true {
+                    if compact, model.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true {
                         compactContainerWarning
                     } else if let banner = model.libraryBanner(isCompact: compact) {
                         banner.frame(maxWidth: .infinity, alignment: .leading)
                     }
                     if !compact {
-                        Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
-                            .libraryChromeFrame("title")
-                    }
-                    if compactHeight {
                         HStack(spacing: NibSpacing.s) {
-                            itemCount
-                            ancestorNavigation
+                            parentNavigation
+                            Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
+                                .libraryChromeFrame("title")
                         }
-                    } else {
-                        itemCount
-                        ancestorNavigation
                     }
+                    itemCount.libraryChromeFrame("metadata")
                     if let error = model.error {
-                        NibBanner(error, action: NibAction(String(localized: "Try Again")) { model.setView(["folder": model.folderRef]) })
+                        NibBanner(error, action: NibAction(String(localized: "Try Again"), command: "library.setView") { model.setView(["folder": model.folderRef]) })
                             .libraryChromeFrame("banner")
                     }
                     LibraryGridView(model: model, compactHeight: compactHeight)
@@ -626,52 +767,42 @@ struct LibraryRootView: View {
         }
     }
     private var itemCount: some View {
-        Text(LibraryRow.itemCount(model.visibleRows.count) + " · " + model.sort.title)
+        Text(model.selection.isSelecting ? model.selection.statusText : LibraryRow.itemCount(model.visibleRows.count) + " · " + (model.collection == .recents && model.sort == .modified ? String(localized: "Last opened") : model.sort.title))
             .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             .fixedSize(horizontal: false, vertical: true)
     }
-    @ViewBuilder private var ancestorNavigation: some View {
-        if model.folder != nil {
-            ScrollView(.horizontal) {
-                HStack(spacing: NibSpacing.s) {
-                    breadcrumb(String(localized: "Documents"), ref: "lib")
-                    ForEach(model.breadcrumbs.dropLast()) { row in
-                        Image(nib: .forward).foregroundStyle(NibColor.labelTertiary).accessibilityHidden(true)
-                        breadcrumb(row.name, ref: row.ref)
-                    }
-                }
+    @ViewBuilder var parentNavigation: some View {
+        if let parent = model.parentNavigation {
+            NibButton(parent.title, symbol: .back, kind: .plain, size: .compact) {
+                model.setView(["folder": .string(parent.ref)])
             }
-            .scrollIndicators(.hidden)
+            .accessibilityIdentifier("cmd.library.setView")
+            .accessibilityLabel(String(localized: "Back to \(parent.title)"))
+            .libraryDropTarget("breadcrumb:" + parent.ref)
+            .libraryChromeFrame("parent.navigation")
         }
     }
-    private var compactContainerWarning: some View {
-        HStack(spacing: NibSpacing.s) {
-            Image(nib: .warningTriangle).foregroundStyle(NibColor.warning).accessibilityHidden(true)
-            Text(String(localized: "Your library is inside Nib. Reinstalling with another signer can delete it. Move it outside the app."))
-                .font(NibFont.caption1).foregroundStyle(NibColor.label)
-                .fixedSize(horizontal: false, vertical: true)
-            NibButton(String(localized: "Move Library…"), kind: .plain) {
-                model.perform(CommandIDs.libraryRelocate, ["copy": false])
-            }.fixedSize(horizontal: true, vertical: false)
+    var compactContainerWarning: some View {
+        LibraryStorageNotice {
+            model.openStorageDetails()
         }
-        .padding(.horizontal, NibSpacing.s)
-        .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.proposal))
-    }
-    private func breadcrumb(_ title: String, ref: String) -> some View {
-        NibButton(title, kind: .plain) { model.setView(["folder": .string(ref)]) }.libraryDropTarget("breadcrumb:" + ref)
     }
     func chrome(compact: Bool) -> some View {
         HStack(spacing: NibSpacing.l) {
             if compact {
                 NibDropletButton(id: "library.controls", symbol: .search, label: String(localized: "Search Library")) {
-                    model.perform(CommandIDs.searchOpen)
+                    model.perform(CommandIDs.searchOpen, ["scope": "lib"])
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
             } else {
                 NibBarGroup(id: "library.controls") {
-                    NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen) }
+                    NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen, ["scope": "lib"]) }
+                    .accessibilityIdentifier("cmd." + CommandIDs.searchOpen)
                     NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                    .accessibilityIdentifier("cmd.library.setView")
                         .libraryChromeFrame("anchor.library.sort")
                     NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
+                    .accessibilityIdentifier("cmd.library.setView")
                 }
             }
             LibraryNewButton(model: model, compact: compact)
@@ -679,9 +810,54 @@ struct LibraryRootView: View {
     }
     private var selectionBar: some View {
         NibBarGroup(id: "library.selection") {
+            Text(model.selection.statusText).font(NibFont.hud).foregroundStyle(NibColor.label)
             LibraryMenuEntries(model: model, location: .librarySelection, rows: model.rows.filter { model.selection.refs.contains($0.ref) }, compact: true)
             NibIconButton(.xmark, label: String(localized: "Finish Selecting")) { model.setView(["selection": "clear"]) }
+            .accessibilityIdentifier("cmd.library.setView")
         }
+    }
+}
+
+/// Native commands remain in the hosting controller's responder chain. Invisible
+/// SwiftUI shortcut buttons can claim a key without delivering their action in an
+/// embedded host, so they must not compete with this table or the shell's table.
+@MainActor
+enum LibrarySelectionShortcuts {
+    static func isEnabled(_ model: LibraryViewModel) -> Bool {
+        model.selection.isSelecting && canRoute(model)
+    }
+    private static func canRoute(_ model: LibraryViewModel) -> Bool {
+        model.tab == nil && model.modal == nil && model.menu == nil && model.confirmation == nil &&
+            model.renaming == nil && model.floating.presentedIDs.isEmpty && !model.session.isEditingText &&
+            !hasTextFocus(model.controller?.viewIfLoaded)
+    }
+    private static func hasTextFocus(_ view: UIView?) -> Bool {
+        guard let view else { return false }
+        if view.isFirstResponder && view is any UITextInput { return true }
+        return view.subviews.contains { hasTextFocus($0) }
+    }
+    static func descriptors(_ model: LibraryViewModel) -> [KeyCommandDescriptor] {
+        guard canRoute(model) else { return [] }
+        let context = KeyCommandContext(inDocument: false, docKind: nil)
+        return KeyCommandRouting.active(model.app.content.keyCommands.all, in: context).filter {
+            $0.scope == .library && ($0.owner != FeatLibraryUIFeature.id || isEnabled(model))
+        }
+    }
+    static func command(_ descriptor: KeyCommandDescriptor, action: Selector) -> UIKeyCommand {
+        let key = descriptor.shortcut
+        let special = ["escape": UIKeyCommand.inputEscape, "return": "\r", "tab": "\t",
+                       "delete": UIKeyCommand.inputDelete, "space": " ",
+                       "up": UIKeyCommand.inputUpArrow, "down": UIKeyCommand.inputDownArrow,
+                       "left": UIKeyCommand.inputLeftArrow, "right": UIKeyCommand.inputRightArrow]
+        var modifiers: UIKeyModifierFlags = []
+        if key.modifiers.contains(.command) { modifiers.insert(.command) }
+        if key.modifiers.contains(.shift) { modifiers.insert(.shift) }
+        if key.modifiers.contains(.option) { modifiers.insert(.alternate) }
+        if key.modifiers.contains(.control) { modifiers.insert(.control) }
+        let command = UIKeyCommand(title: descriptor.title, action: action,
+            input: special[key.key] ?? key.key, modifierFlags: modifiers, propertyList: descriptor.id)
+        command.wantsPriorityOverSystemBehavior = true
+        return command.nibCommand(descriptor.command)
     }
 }
 
@@ -916,12 +1092,24 @@ struct LibraryPanelView: View {
             }.background(NibColor.background)
         } else {
             NibEmptyState(symbol: .warningTriangle, title: String(localized: "Panel unavailable"),
-                primary: NibAction(String(localized: "Close")) { model.setView(["panel": .string(panel.id), "close": true]) })
+                primary: NibAction(String(localized: "Close"), command: "library.setView") { model.setView(["panel": .string(panel.id), "close": true]) })
         }
     }
 }
 
 /// Only this leaf observes finger locations; the grid publishes a change when its target or drag phase changes.
+enum LibraryDropDestination {
+    static func match(_ point: CGPoint, carried: String, targets: [String: CGRect]) -> (key: String, value: CGRect)? {
+        let match = targets.filter {
+            $0.key != "sidebar" && !$0.key.hasPrefix("card:") && $0.key != carried &&
+            $0.key != "sidebarFolder:" + carried &&
+            $0.value.insetBy(dx: -(NibSpacing.m + NibStroke.thin), dy: -(NibSpacing.m + NibStroke.thin)).contains(point)
+        }.min { $0.value.width * $0.value.height < $1.value.width * $1.value.height }
+        return match.map { ($0.key.replacingOccurrences(of: "sidebarFolder:", with: "")
+            .replacingOccurrences(of: "breadcrumb:", with: ""), $0.value) }
+    }
+}
+
 private struct LibraryDragMonitor: View {
     @ObservedObject var model: LibraryViewModel
     var targets: [String: CGRect]
@@ -940,11 +1128,8 @@ private struct LibraryDragMonitor: View {
             reflow.isPaused = false; reflow.isCondensed = false
             return
         }
-        let match = targets.filter {
-            $0.key != "sidebar" && !$0.key.hasPrefix("card:") && $0.key != lift.id &&
-            $0.key != "sidebarFolder:" + lift.id && $0.value.insetBy(dx: -(NibSpacing.m + NibStroke.thin), dy: -(NibSpacing.m + NibStroke.thin)).contains(lift.location)
-        }.min { $0.value.width * $0.value.height < $1.value.width * $1.value.height }
-        let destination = match?.key.replacingOccurrences(of: "sidebarFolder:", with: "").replacingOccurrences(of: "breadcrumb:", with: "")
+        let match = LibraryDropDestination.match(lift.location, carried: lift.id, targets: targets)
+        let destination = match?.key
         if model.dropTarget != destination { model.dropTarget = destination }
         model.dropFrame = match?.value
         let paused = match != nil, condensed = targets["sidebar"]?.contains(lift.location) == true
@@ -985,6 +1170,45 @@ struct LibraryConfirmation {
     var title: String
     var command: String
     var params: JSONValue
+    var message: String? = nil
+
+    static func itemSummary(names: [String]) -> String {
+        if names.count == 1 { return "“\(names[0])”" }
+        if names.count == 2 { return String(localized: "“\(names[0])” and “\(names[1])”") }
+        return LibraryRow.itemCount(names.count)
+    }
+    static func trashMessage(names: [String]) -> String {
+        String(localized: "Move \(itemSummary(names: names)) to Trash? You can restore them from Trash.")
+    }
+    static func combineMessage(names: [String], destination: String) -> String {
+        String(localized: "Add the contents of \(itemSummary(names: names)) to “\(destination)”. The source documents will move to Trash.")
+    }
+}
+
+enum LibrarySyncPresentation {
+    static func text(_ status: SyncStatusPayload) -> String {
+        if let message = status.message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return message }
+        let source: String
+        switch status.source {
+        case "backup": source = String(localized: "Backup")
+        case "webdav": source = "WebDAV"
+        case "store": source = String(localized: "Storage")
+        default: source = String(localized: "Library")
+        }
+        let state: String
+        switch status.state {
+        case "syncing": state = status.source == "backup" ? String(localized: "Backing up") : String(localized: "Syncing")
+        case "checking": state = String(localized: "Checking for changes")
+        case "downloading": state = String(localized: "Downloading")
+        case "ok": state = status.source == "backup" ? String(localized: "Backup complete") : String(localized: "Up to date")
+        case "idle": state = status.source == "backup" ? String(localized: "No backup in progress") : String(localized: "Up to date")
+        case "offline": state = String(localized: "Offline")
+        case "error": state = String(localized: "Couldn't complete. Review Cloud & Backup.")
+        case "warning": state = status.reason == "offline" ? String(localized: "Offline") : String(localized: "Needs attention. Review Cloud & Backup.")
+        default: state = String(localized: "Status unavailable")
+        }
+        return source + " · " + state
+    }
 }
 
 /// One app-wide cache; commits evict only the affected document, without a catalog query.
@@ -1044,7 +1268,8 @@ final class LibraryCoverCache: ObservableObject {
 
 // Library-specific tokens stay in F019's ownership until NibDesign adopts them.
 extension NibMetrics {
-    static let librarySidebarBreakpoint = compactBreakpoint + sidebarWidth
+    static let librarySidebarBreakpoint: CGFloat = 900
+    static let libraryRowPitch: CGFloat = 250
     static let libraryThumbnailMaxPixels = 512
     static let libraryCoverCacheCount = 96
     static let libraryCoverCacheBytes = 64 * 1024 * 1024
@@ -1059,5 +1284,59 @@ private extension View {
             searchable(text: text, placement: .navigationBarDrawer(displayMode: .automatic),
                        prompt: String(localized: "Search this folder"))
         } else { self }
+    }
+}
+
+
+enum LibraryCollection: String, Codable, CaseIterable {
+    case documents, recents, studySets
+    var title: String {
+        switch self {
+        case .documents: return String(localized: "Documents")
+        case .recents: return String(localized: "Recents")
+        case .studySets: return String(localized: "Study Sets")
+        }
+    }
+    var symbol: NibSymbol {
+        switch self {
+        case .documents: return .library
+        case .recents: return .recents
+        case .studySets: return .studySets
+        }
+    }
+}
+
+struct LibrarySidebarPlace: Identifiable {
+    var id: String
+    var title: String
+    var symbol: NibSymbol
+    var collection: LibraryCollection? = nil
+}
+
+struct LibraryStorageNotice: View {
+    static var message: String { String(localized: "Risk of note loss.") }
+    let move: () -> Void
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    var body: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            NibBanner(Self.message, action: NibAction(String(localized: "Review storage"), handler: move))
+        } else {
+            HStack(spacing: NibSpacing.s) {
+                Image(nib: .warningTriangle).font(NibFont.glyph(.panel))
+                    .foregroundStyle(NibColor.warning).accessibilityHidden(true)
+                Text(Self.message).font(NibFont.callout).foregroundStyle(NibColor.label)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .libraryChromeFrame("storage.message")
+                Button(String(localized: "Review storage"), action: move)
+                    .font(NibFont.button).foregroundStyle(NibColor.accent)
+                    .fixedSize().frame(minHeight: NibMetrics.hitTarget)
+                    .buttonStyle(NibPressStyle())
+                    .libraryChromeFrame("storage.action")
+            }
+            .padding(.horizontal, NibSpacing.m)
+            .padding(.vertical, NibSpacing.xs)
+            .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.proposal))
+        }
     }
 }

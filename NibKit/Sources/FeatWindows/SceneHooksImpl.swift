@@ -45,8 +45,13 @@ final class SceneHooksImpl: SceneHooks {
     // MARK: SceneHooks
 
     func documentTabsMenu(_ context: ChromeContext) -> AnyView? {
-        guard let presentation = tabPresentations[context.session.id], let model = presentation.model,
-              model.isVisible else { return nil }
+        // The switcher is essential on iPhone, where no capsule may fit. Chrome can ask for it before
+        // the shell has attached the floating host, so its visibility must not depend on that host.
+        guard let app, let navigator = context.navigator, context.session.document != nil,
+              TabStripLayout.showsStrip(tabCount: navigator.openDocuments.count,
+                                       enabled: app.settings.get(WindowSettings.showTabs)) else { return nil }
+        let presentation = tabPresentations[context.session.id]
+        let model = presentation?.model ?? TabStripModel(app: app, navigator: navigator, scenes: scenes)
         return AnyView(DocumentTabsMenu(model: model, placement: presentation, compact: context.isCompact))
     }
 
@@ -106,15 +111,18 @@ final class SceneHooksImpl: SceneHooks {
     // MARK: Opening a window
 
     /// The decision behind `sceneDidConnect`, free of UIKit types so it can be tested.
-    func connect(_ navigator: SceneNavigator, requested: WindowState?, restored: WindowState?, external: Bool) {
+    func connect(_ navigator: SceneNavigator, requested: WindowState?, restored: WindowState?, external: Bool,
+                 allowsRestoration: Bool = !NibUITestMode.isEnabled) {
         scenes.add(navigator)
         let coldLaunch = !launchHandled
         launchHandled = true
+        // Fixture launches ignore saved sessions, which may refer to a previous fixture's documents. Explicit
+        // new-window requests still use the normal opening path, including their chosen page and lock gate.
         if let state = requested {
             restore(state, into: navigator, reason: .request)
-        } else if let state = restored {
+        } else if allowsRestoration, let state = restored {
             restore(state, into: navigator, reason: .restoration)
-        } else if coldLaunch, !external, let doc = scenes.lastSession.active {
+        } else if allowsRestoration, coldLaunch, !external, let doc = scenes.lastSession.active {
             restore(WindowState(tabs: [doc], active: doc, page: scenes.lastSession.page), into: navigator, reason: .coldLaunch)
         } else {
             scenes.updateSceneTitle(navigator)

@@ -364,8 +364,9 @@ final class CanvasInputTests: XCTestCase {
         }
     }
 
-    private func installed(_ tool: Tool) throws -> (Harness, CanvasViewController, WetInkController) {
+    private func installed(_ tool: Tool, stylusMode: StylusMode = .pencilOnly) throws -> (Harness, CanvasViewController, WetInkController) {
         let harness = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+        harness.app.settings.set(NibSettings.stylusMode, stylusMode)
         harness.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Test Ink", owner: "test", make: { tool }))
         harness.session.tool = tool.id
         let editor = CanvasViewController(documentID: Fixtures.docID, session: harness.session, app: harness.app)
@@ -377,6 +378,36 @@ final class CanvasInputTests: XCTestCase {
         let input = try XCTUnwrap(editor.host.inputController as? WetInkController)
         return (harness, editor, input)
     }
+    func testWetInkHasNoNativeUndoAndKeepsPageCoordinatesThroughLayout() async throws {
+        let tool = Tool(); tool.inputMode = .pencilKit
+        let (_, editor, input) = try installed(tool)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = editor
+        window.isHidden = false
+        defer { editor.closeCanvas(); window.isHidden = true }
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1032),
+                     CGSize(width: 1376, height: 1032)] {
+            editor.view.frame = CGRect(origin: .zero, size: size)
+            editor.view.setNeedsLayout()
+            editor.view.layoutIfNeeded()
+            input.canvasDidChange(editor.host)
+            await Task.yield()
+            let nativeCanvases = canvases(editor.host.wetInkContainer)
+            XCTAssertEqual(nativeCanvases.count, 2)
+            for canvas in nativeCanvases {
+                XCTAssertNil(canvas.undoManager, "Transient PencilKit drawing must never enter the window undo stack")
+                XCTAssertEqual(canvas.contentOffset, .zero, "Native capture origin must remain the page origin")
+                XCTAssertEqual(canvas.adjustedContentInset, .zero, "Native capture must not inherit chrome clearance")
+                let point = Point(200, 320)
+                let wet = canvas.convert(CGPoint(x: point.x * Double(canvas.zoomScale),
+                                                 y: point.y * Double(canvas.zoomScale)), to: editor.host.canvasView)
+                let dry = editor.host.viewPoint(point, page: Fixtures.page1)
+                XCTAssertEqual(wet.x, dry.x, accuracy: 0.5, "Wet and committed ink must share page coordinates")
+                XCTAssertEqual(wet.y, dry.y, accuracy: 0.5, "A sidebar round trip must not displace surviving ink")
+            }
+        }
+    }
+
     private func event(_ host: CanvasHostImpl, id: Int, pencil: Bool = true, point: Point = Point(140, 220),
                        timestamp: Double = ProcessInfo.processInfo.systemUptime) -> CanvasSample {
         CanvasSample(page: host.session.page ?? Fixtures.page1, location: point, timestamp: timestamp, isPencil: pencil, touchID: id)
@@ -385,6 +416,307 @@ final class CanvasInputTests: XCTestCase {
         view.subviews.flatMap { ($0 as? PKCanvasView).map { [$0] } ?? canvases($0) }
     }
     private func waitForGesture() async throws { try await Task.sleep(nanoseconds: 380_000_000) }
+
+    func testWetInkSurfacesLeavePinchAndPanToDocumentInBothInputModes() throws {
+        for mode in [StylusMode.anyInput, .pencilOnly] {
+            let tool = Tool(); tool.inputMode = .pencilKit
+            let (_, editor, input) = try installed(tool, stylusMode: mode)
+            defer { editor.closeCanvas() }
+            for style in [InkStyle.defaultPen, .defaultHighlighter] {
+                tool.style = style
+                input.canvasActiveToolDidChange(editor.host)
+                editor.scrollView.setZoomScale(CGFloat(editor.host.zoomScale * 1.2), animated: false)
+                input.canvasDidChange(editor.host)
+                for canvas in canvases(editor.host.wetInkContainer) {
+                    XCTAssertFalse(canvas.panGestureRecognizer.isEnabled)
+                    XCTAssertFalse(try XCTUnwrap(canvas.pinchGestureRecognizer).isEnabled,
+                                   "A nested wet-ink scroll view must not capture the document pinch")
+                    XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+                    XCTAssertEqual(Double(canvas.zoomScale), editor.host.zoomScale, accuracy: 0.001)
+                }
+                XCTAssertTrue(editor.scrollView.panGestureRecognizer.isEnabled)
+                XCTAssertTrue(try XCTUnwrap(editor.scrollView.pinchGestureRecognizer).isEnabled)
+            }
+        }
+    }
+
+    func testDoubleTapWaitsForSecondLiftAcrossScrollChangesAndNeverCommitsDots() async throws {
+        for mode in [StylusMode.anyInput, .pencilOnly] {
+            let tool = Tool(); tool.inputMode = .pencilKit
+            let (harness, editor, input) = try installed(tool, stylusMode: mode)
+            defer { editor.closeCanvas() }
+            var commits = 0
+            harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Ink", summary: "Records ink.",
+                params: .anything(), effect: .edit)) { _, _ in commits += 1; return ["refs": []] }
+            let fit = editor.host.zoomScale
+            let screen = CGPoint(x: 400, y: 450)
+            for round in 0..<2 {
+                let base = ProcessInfo.processInfo.systemUptime
+                for tap in 0..<2 {
+                    if tap == 1 {
+                        // Insets/chrome or a settling scroll can move page coordinates beneath a
+                        // stationary finger. Recognition must measure the fixed window instead.
+                        editor.scrollView.contentOffset.y += 32
+                    }
+                    let viewPoint = editor.host.canvasView.convert(screen, from: nil)
+                    let target = try XCTUnwrap(editor.host.pagePoint(viewPoint))
+                    let sample = event(editor.host, id: 200 + round * 2 + tap, pencil: false,
+                                       point: target.point, timestamp: base + Double(tap) * 0.25)
+                    let contact = NSObject()
+                    let canvas = try XCTUnwrap(input.acceptContact(ObjectIdentifier(contact), sample: sample))
+                    let dot = PKBridge.pkStroke(Stroke(style: .defaultPen,
+                        points: [StrokePoint(x: Float(target.point.x), y: Float(target.point.y))],
+                        t0: Date().timeIntervalSince1970))
+                    input.begin(sample, screenPoint: Point(screen), route: .tool(tool),
+                                contact: ObjectIdentifier(contact), startedAt: dot.path.creationDate)
+                    input.canvasViewDidBeginUsingTool(canvas)
+                    canvas.drawing = PKDrawing(strokes: canvas.drawing.strokes + [dot])
+                    input.canvasViewDrawingDidChange(canvas)
+                    var end = sample
+                    if tap == 1 {
+                        try await Task.sleep(nanoseconds: 350_000_000)
+                        end.timestamp += 0.35
+                        XCTAssertEqual(tool.finished, 0, "First dot stays provisional while the second tap is down")
+                    }
+                    input.end(end)
+                    input.canvasViewDidEndUsingTool(canvas)
+                }
+                try await waitForGesture()
+                XCTAssertEqual(editor.host.zoomScale, round == 0 ? fit * 2 : fit, accuracy: 0.001)
+                XCTAssertEqual(tool.finished, 0)
+                XCTAssertEqual(commits, 0)
+                XCTAssertFalse(harness.session.inking.isInking)
+                XCTAssertTrue(canvases(editor.host.wetInkContainer).allSatisfy { $0.drawing.strokes.isEmpty })
+            }
+        }
+    }
+
+    func testSecondTapBecomingDragOrCancellationReleasesFirstSampleDot() async throws {
+        for cancelled in [false, true] {
+            let tool = Tool()
+            let (_, editor, input) = try installed(tool, stylusMode: .anyInput)
+            defer { editor.closeCanvas() }
+            let first = event(editor.host, id: 210, pencil: false)
+            var second = event(editor.host, id: 211, pencil: false, timestamp: first.timestamp + 0.2)
+            input.begin(first, screenPoint: first.location, route: .tool(tool)); input.end(first)
+            input.begin(second, screenPoint: second.location, route: .tool(tool))
+            if !cancelled {
+                second.location.x += 40
+                input.move([second], screenPoint: second.location, id: second.touchID)
+            }
+            input.end(second, cancelled: cancelled)
+            try await waitForGesture()
+            XCTAssertTrue(tool.beganIDs.contains(first.touchID))
+            XCTAssertTrue(tool.endedIDs.contains(first.touchID), "An abandoned second tap must not discard the first dot")
+            XCTAssertEqual(tool.endedIDs.contains(second.touchID), !cancelled)
+        }
+    }
+
+    func testInterruptedSecondTapDoesNotPairWithANewTouchStream() async throws {
+        let tool = Tool()
+        let (harness, editor, input) = try installed(tool, stylusMode: .anyInput)
+        defer { editor.closeCanvas() }
+        var doubles = 0
+        registerTap(harness, id: "test.interrupted.double", gesture: .doubleTap, order: 0) { _, _ in
+            doubles += 1; return ["handled": true]
+        }
+        let first = event(editor.host, id: 220, pencil: false)
+        let second = event(editor.host, id: 221, pencil: false, timestamp: first.timestamp + 0.1)
+        input.begin(first, screenPoint: first.location, route: .tool(tool)); input.end(first)
+        input.begin(second, screenPoint: second.location, route: .tool(tool))
+        let observer = try XCTUnwrap(editor.host.canvasView.gestureRecognizers?.compactMap { $0 as? TouchTap }.first)
+        observer.reset()
+        let next = event(editor.host, id: 222, pencil: false, timestamp: first.timestamp + 0.2)
+        input.begin(next, screenPoint: next.location, route: .tool(tool)); input.end(next)
+        try await waitForGesture()
+        XCTAssertEqual(doubles, 0)
+        XCTAssertEqual(tool.beganIDs, [next.touchID])
+        XCTAssertEqual(tool.endedIDs, [next.touchID])
+        XCTAssertFalse(harness.session.inking.isInking)
+    }
+
+    private final class HitTestTouch: UITouch {
+        let target: UIView
+        let point: CGPoint
+        var contactPhase: UITouch.Phase = .began
+        init(target: UIView, point: CGPoint) { self.target = target; self.point = point; super.init() }
+        override var type: UITouch.TouchType { .pencil }
+        override var phase: UITouch.Phase { contactPhase }
+        override var view: UIView? { target }
+        override func location(in view: UIView?) -> CGPoint { target.convert(point, to: view) }
+    }
+    private final class HitTestEvent: UIEvent {
+        let contact: UITouch
+        init(_ contact: UITouch) { self.contact = contact; super.init() }
+        override var allTouches: Set<UITouch>? { [contact] }
+    }
+
+    func testSpeculativeAndEndedHitTestsDoNotReserveTheNextDrawingContact() throws {
+        let tool = Tool(); tool.inputMode = .pencilKit
+        let (_, editor, input) = try installed(tool)
+        defer { editor.closeCanvas() }
+        let canvas = try XCTUnwrap(canvases(editor.host.wetInkContainer).first { $0.isUserInteractionEnabled })
+        let start = event(editor.host, id: 190)
+        let point = canvas.convert(editor.host.viewPoint(start.location, page: start.page), from: editor.host.canvasView)
+        let probe = HitTestTouch(target: canvas, point: point)
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(probe)))
+        probe.contactPhase = .ended
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(probe)))
+        let delivered = HitTestTouch(target: canvas, point: point)
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(delivered)),
+                        "Hit testing must not reserve a contact that UIKit never delivered")
+        XCTAssertTrue(input.acceptContact(ObjectIdentifier(delivered), sample: start) === canvas)
+        input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(delivered))
+        input.canvasViewDidBeginUsingTool(canvas)
+        input.end(start)
+        input.canvasViewDidEndUsingTool(canvas)
+        // UIKit may ask about the old touch once more after the observer has released it.
+        delivered.contactPhase = .ended
+        XCTAssertNotNil(canvas.hitTest(point, with: HitTestEvent(delivered)))
+        let next = NSObject()
+        XCTAssertTrue(input.acceptContact(ObjectIdentifier(next), sample: start) === canvas,
+                      "A post-lift hit test must not block the next word")
+    }
+
+    func testConsecutiveNativeFirstStrokesCommitOnceAndRemainUndoable() async throws {
+        for style in [InkStyle.defaultPen, .defaultHighlighter] {
+            let tool = Tool(); tool.inputMode = .pencilKit; tool.style = style
+            let (harness, editor, input) = try installed(tool)
+            defer { editor.closeCanvas() }
+            var received: [Stroke] = []
+            harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Add Ink", summary: "Adds test ink.",
+                params: .obj(["page": .ref, "strokes": .arr(.anything())], required: ["page", "strokes"]), examples: [], effect: .edit)) { params, ctx in
+                    guard case let .page(doc, page)? = NodeRef(params["page"]?.stringValue ?? "") else { throw NibError.notFound("page") }
+                    let strokes = try (params["strokes"] ?? []).decode([Stroke].self)
+                    received += strokes
+                    var refs: [JSONValue] = []
+                    try ctx.mutate("Add Ink") { tx in
+                        for stroke in strokes {
+                            let item = try tx.put(Item(id: NibID.make(), kind: .stroke, stroke: stroke), doc: doc, page: page)
+                            refs.append(.string(NodeRef.item(doc, page, item.id).description))
+                        }
+                    }
+                    return ["refs": .array(refs)]
+                }
+            let before = try harness.snapshot()
+            let canvas = try XCTUnwrap(canvases(editor.host.wetInkContainer).first { $0.isUserInteractionEnabled })
+            for index in 0..<3 {
+                let start = event(editor.host, id: 191 + index, pencil: index == 1,
+                                  point: Point(140 + Double(index) * 50, 220))
+                let contact = NSObject()
+                // Native recognition precedes TouchTap. No speculative hit-test reservation is needed.
+                input.canvasViewDidBeginUsingTool(canvas)
+                XCTAssertTrue(input.acceptContact(ObjectIdentifier(contact), sample: start) === canvas)
+                input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(contact))
+                var end = start; end.location.x += 30; end.timestamp += 0.1
+                input.move([end], screenPoint: end.location, id: start.touchID)
+                if index == 1 { input.canvasViewDidEndUsingTool(canvas); input.end(end) }
+                else { input.end(end); input.canvasViewDidEndUsingTool(canvas) }
+                let pk = PKBridge.pkStroke(Stroke(style: style,
+                    points: [StrokePoint(x: Float(start.location.x), y: 220),
+                             StrokePoint(x: Float(end.location.x), y: 220, t: 0.1)], t0: Date().timeIntervalSince1970))
+                canvas.drawing = PKDrawing(strokes: canvas.drawing.strokes + [pk])
+                input.canvasViewDrawingDidChange(canvas)
+                input.canvasViewDrawingDidChange(canvas)
+                for _ in 0..<200 {
+                    if received.count == index + 1 && canvas.drawing.strokes.isEmpty { break }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                XCTAssertEqual(received.count, index + 1, "Every word reaches ink.addStrokes exactly once")
+                XCTAssertEqual(tool.finished, index + 1)
+                XCTAssertTrue(canvas.drawing.strokes.isEmpty, "Wet ink retires after dry rendering")
+                XCTAssertFalse(harness.session.inking.isInking)
+            }
+            XCTAssertEqual(received.map(\.style), Array(repeating: style, count: 3))
+            let after = try harness.snapshot()
+            XCTAssertNotEqual(after, before)
+            for _ in 0..<3 { _ = try await harness.run("edit.undo", ["doc": .string(Fixtures.docID.raw)]) }
+            XCTAssertEqual(try harness.snapshot(), before)
+            for _ in 0..<3 { _ = try await harness.run("edit.redo", ["doc": .string(Fixtures.docID.raw)]) }
+            XCTAssertEqual(try harness.snapshot(), after)
+        }
+    }
+
+    func testNativeEndBeforeObserverAdmissionCommitsOnceAndSupportsUndoRedo() async throws {
+        for style in [InkStyle.defaultPen, .defaultHighlighter] {
+            for acceptedFirst in [false, true] {
+                for drawingFirst in [false, true] {
+                    let tool = Tool(); tool.inputMode = .pencilKit; tool.style = style
+                    let (harness, editor, input) = try installed(tool, stylusMode: .anyInput)
+                    defer { editor.closeCanvas() }
+                    var received: [Stroke] = []
+                    harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Add Ink", summary: "Adds test ink.",
+                        params: .obj(["page": .ref, "strokes": .arr(.anything())], required: ["page", "strokes"]), examples: [], effect: .edit)) { params, ctx in
+                            guard case let .page(doc, page)? = NodeRef(params["page"]?.stringValue ?? "") else { throw NibError.notFound("page") }
+                            let strokes = try (params["strokes"] ?? []).decode([Stroke].self)
+                            received += strokes
+                            var refs: [JSONValue] = []
+                            try ctx.mutate("Add Ink") { tx in
+                                for stroke in strokes {
+                                    let item = try tx.put(Item(id: NibID.make(), kind: .stroke, stroke: stroke), doc: doc, page: page)
+                                    refs.append(.string(NodeRef.item(doc, page, item.id).description))
+                                }
+                            }
+                            return ["refs": .array(refs)]
+                        }
+                    let before = try harness.snapshot()
+                    let canvas = try XCTUnwrap(canvases(editor.host.wetInkContainer).first { $0.isUserInteractionEnabled })
+                    // Follow a completed native-first stroke with a normal one on the same surface:
+                    // completion must survive admission, but must not leak into the next contact.
+                    for index in 0..<2 {
+                        let contact = NSObject()
+                        let start = event(editor.host, id: 201 + index, pencil: index == 1,
+                                          point: Point(140 + Double(index) * 50, 220))
+                        var end = start; end.location.x += 30; end.timestamp += 0.1
+                        let pk = PKBridge.pkStroke(Stroke(style: style,
+                            points: [StrokePoint(x: Float(start.location.x), y: 220),
+                                     StrokePoint(x: Float(end.location.x), y: 220, t: 0.1)],
+                            t0: Date().timeIntervalSince1970 + Double(index)))
+                        if acceptedFirst { XCTAssertTrue(input.acceptContact(ObjectIdentifier(contact), sample: start) === canvas) }
+                        input.canvasViewDidBeginUsingTool(canvas)
+                        if index == 0 {
+                            if drawingFirst {
+                                canvas.drawing = PKDrawing(strokes: [pk])
+                                input.canvasViewDrawingDidChange(canvas)
+                            }
+                            input.canvasViewDidEndUsingTool(canvas)
+                            await Task.yield()
+                            XCTAssertEqual(tool.finished, 0, "Native completion must wait for the observed contact")
+                        }
+                        if !acceptedFirst { XCTAssertTrue(input.acceptContact(ObjectIdentifier(contact), sample: start) === canvas) }
+                        input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(contact))
+                        input.move([end], screenPoint: end.location, id: start.touchID)
+                        if index == 1 || !drawingFirst {
+                            canvas.drawing = PKDrawing(strokes: [pk])
+                            input.canvasViewDrawingDidChange(canvas)
+                        }
+                        input.end(end)
+                        if index == 1 {
+                            XCTAssertEqual(tool.finished, 1, "The next stroke still needs its own native end")
+                            input.canvasViewDidEndUsingTool(canvas)
+                        }
+                        input.canvasViewDrawingDidChange(canvas)
+                        input.canvasViewDrawingDidChange(canvas)
+                        XCTAssertEqual(tool.finished, index + 1, "A native end before admission must not strand retained ink")
+                        for _ in 0..<200 {
+                            if received.count == index + 1 && canvas.drawing.strokes.isEmpty { break }
+                            try await Task.sleep(nanoseconds: 10_000_000)
+                        }
+                        XCTAssertEqual(received.count, index + 1)
+                        XCTAssertTrue(canvas.drawing.strokes.isEmpty, "Retire only after the committed stroke renders")
+                        XCTAssertFalse(harness.session.inking.isInking)
+                    }
+                    XCTAssertEqual(received.map(\.style), [style, style])
+                    let after = try harness.snapshot()
+                    XCTAssertNotEqual(after, before)
+                    for _ in 0..<2 { _ = try await harness.run("edit.undo", ["doc": .string(Fixtures.docID.raw)]) }
+                    XCTAssertEqual(try harness.snapshot(), before)
+                    for _ in 0..<2 { _ = try await harness.run("edit.redo", ["doc": .string(Fixtures.docID.raw)]) }
+                    XCTAssertEqual(try harness.snapshot(), after)
+                }
+            }
+        }
+    }
 
     func testLedgerMatchesNativeStrokeIdentityAcrossMissingAndOverlappingCaptures() {
         var ledger = WetInkLedger<String, String>()
@@ -409,6 +741,131 @@ final class CanvasInputTests: XCTestCase {
         ledger.markReady(second)
         XCTAssertTrue(ledger.retire())
         XCTAssertTrue(ledger.isEmpty, "An inactive surface is now reusable/prunable")
+    }
+
+    func testLedgerTimestampSkewNeverDiscardsAnAdmittedStroke() throws {
+        // Real input can be delivered late; synthesized input can have a different clock origin.
+        for offset in [-10_000.0, -0.3, 0, 0.3, 10_000] {
+            var ledger = WetInkLedger<String, Int>()
+            let id = UUID(), nativeDate = Date(timeIntervalSince1970: 100_000)
+            ledger.register(id: id, startedAt: nativeDate.addingTimeInterval(offset), payload: "ink", nativeStarted: true)
+            ledger.end(id)
+            ledger.nativeEnd()
+            ledger.append(identity: nativeDate, ink: 42)
+            let delivery = try XCTUnwrap(ledger.takeDeliveries().first, "Clock offset \(offset) must not lose ink")
+            XCTAssertEqual(delivery.capture?.id, id)
+            XCTAssertEqual(delivery.ink, 42)
+            XCTAssertFalse(ledger.retire(), "Keep wet ink until the dry render fence")
+            ledger.append(identity: nativeDate, ink: 43)
+            XCTAssertTrue(ledger.takeDeliveries().isEmpty, "A repeated native notification must not duplicate a commit")
+            ledger.markReady(id)
+            XCTAssertTrue(ledger.retire())
+            XCTAssertTrue(ledger.isEmpty)
+        }
+    }
+
+    func testNativeContactOwnershipWinsOverNearestTimestamp() {
+        var ledger = WetInkLedger<String, Int>()
+        let old = UUID(), current = UUID(), date = Date(timeIntervalSince1970: 100)
+        ledger.register(id: old, startedAt: date, payload: "no drawing", nativeStarted: true)
+        ledger.end(old)
+        ledger.nativeEnd()
+        ledger.register(id: current, startedAt: date.addingTimeInterval(-0.3), payload: "current", nativeStarted: true)
+        ledger.append(identity: date, ink: 42, captureID: current)
+        ledger.end(current)
+        ledger.nativeEnd()
+        XCTAssertEqual(ledger.takeDeliveries().map { $0.capture?.payload }, ["current"])
+    }
+
+    func testDrawingBeforeContactAdmissionIsRetainedAndReconciled() {
+        var ledger = WetInkLedger<String, Int>()
+        let id = UUID(), date = Date(timeIntervalSince1970: 100)
+        ledger.append(identity: date, ink: 1)
+        XCTAssertFalse(ledger.retire(), "An early drawing callback is not permission to erase ink")
+        ledger.register(id: id, startedAt: date.addingTimeInterval(-0.3), payload: "ink", nativeStarted: true)
+        ledger.end(id)
+        ledger.nativeEnd()
+        ledger.append(identity: date, ink: 2, captureID: id)
+        XCTAssertEqual(ledger.takeDeliveries().map(\.ink), [2])
+        XCTAssertTrue(ledger.takeDeliveries().isEmpty)
+    }
+
+    func testTouchSamplesKeepCurrentTouchAndIndividualTimestamps() {
+        let current = CanvasSample(page: Fixtures.page1, location: Point(30, 40), timestamp: 12, touchID: 1)
+        var earlier = current; earlier.timestamp = 11; earlier.location.x = 20
+        var predicted = current; predicted.timestamp = 13; predicted.location.x = 50; predicted.isPredicted = true
+        XCTAssertEqual(TouchTap.samples(current: current, coalesced: [], predicted: []).map(\.timestamp), [12])
+        XCTAssertEqual(TouchTap.samples(current: current, coalesced: [earlier], predicted: [predicted]).map(\.timestamp), [11, 12, 13])
+        let batch = TouchTap.samples(current: current, coalesced: [earlier, current], predicted: [predicted])
+        XCTAssertEqual(batch.map(\.timestamp), [11, 12, 13], "Do not duplicate the coalesced tip or replace per-touch timestamps with event time")
+        XCTAssertEqual(batch.map(\.isPredicted), [false, false, true])
+    }
+
+    func testClosedFingerLoopWithoutCoalescedHistoryReachesSampleTool() throws {
+        let tool = Tool()
+        let (_, editor, input) = try installed(tool)
+        defer { editor.closeCanvas() }
+        let start = event(editor.host, id: 180, pencil: false, timestamp: 10)
+        input.begin(start, screenPoint: start.location, route: .tool(tool))
+        XCTAssertTrue(tool.beganIDs.isEmpty, "Finger taps wait for tap-handler arbitration")
+        let loop = [Point(240, 220), Point(240, 320), Point(140, 320), start.location]
+        for (index, point) in loop.enumerated() {
+            var current = start; current.location = point; current.timestamp += Double(index + 1) * 0.1
+            var prediction = current; prediction.location.x += 10; prediction.isPredicted = true
+            let samples = TouchTap.samples(current: current, coalesced: [], predicted: [prediction])
+            input.move(samples, screenPoint: point, id: start.touchID)
+        }
+        var end = start; end.timestamp += 0.5
+        input.end(end)
+        XCTAssertEqual(tool.beganIDs, [180])
+        XCTAssertEqual(tool.moved.filter { !$0.isPredicted }.map(\.location), loop)
+        XCTAssertEqual(tool.endedIDs, [180])
+        XCTAssertEqual(tool.taps, 0, "A closed drag is not a tap even though its endpoints coincide")
+    }
+
+    func testControllerCommitsSkewedFingerPencilAndHighlighterAfterLateNativeDrawing() async throws {
+        for style in [InkStyle.defaultPen, .defaultHighlighter] {
+            for pencil in [false, true] {
+                for offset in [-0.3, 0.3, 10_000.0] {
+                    let tool = Tool(); tool.inputMode = .pencilKit; tool.style = style
+                    let (harness, editor, input) = try installed(tool)
+                    defer { editor.closeCanvas() }
+                    var received: [Stroke] = []
+                    let committed = expectation(description: "Skewed native ink reaches ink.addStrokes")
+                    harness.app.commands.register(CommandDescriptor(id: CommandIDs.inkAddStrokes, title: "Add Ink", summary: "Records ink.",
+                        params: .obj(["page": .ref, "strokes": .arr(.anything())], required: ["page", "strokes"]), examples: [], effect: .edit)) { params, _ in
+                            received += try (params["strokes"] ?? []).decode([Stroke].self)
+                            committed.fulfill()
+                            return ["refs": []]
+                        }
+                    let nativeDate = Date()
+                    let start = event(editor.host, id: 181, pencil: pencil,
+                                      timestamp: ProcessInfo.processInfo.systemUptime + offset)
+                    let contact = NSObject()
+                    let canvas = try XCTUnwrap(input.acceptContact(ObjectIdentifier(contact), sample: start))
+                    input.begin(start, screenPoint: start.location, route: .tool(tool), contact: ObjectIdentifier(contact))
+                    input.canvasViewDidBeginUsingTool(canvas)
+                    var end = start; end.location.x += 30; end.timestamp += 0.1
+                    input.move([end], screenPoint: end.location, id: start.touchID)
+                    // Exercise both UIKit/native-end callback orders, then let cleanup run with no drawing.
+                    if pencil { input.canvasViewDidEndUsingTool(canvas); input.end(end) }
+                    else { input.end(end); input.canvasViewDidEndUsingTool(canvas) }
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                    XCTAssertEqual(tool.finished, 0)
+                    let pk = PKBridge.pkStroke(Stroke(style: style,
+                        points: [StrokePoint(x: 140, y: 220), StrokePoint(x: 170, y: 220, t: 0.1)],
+                        t0: nativeDate.timeIntervalSince1970))
+                    canvas.drawing = PKDrawing(strokes: [pk])
+                    input.canvasViewDrawingDidChange(canvas)
+                    input.canvasViewDrawingDidChange(canvas)
+                    await fulfillment(of: [committed], timeout: 5)
+                    XCTAssertEqual(tool.finished, 1)
+                    XCTAssertEqual(received.count, 1)
+                    XCTAssertEqual(received.first?.style, style)
+                    XCTAssertFalse(harness.session.inking.isInking)
+                }
+            }
+        }
     }
 
     func testLedgerLiveCancellationEndedCancellationAndPendingDot() {
@@ -607,12 +1064,18 @@ final class CanvasInputTests: XCTestCase {
         XCTAssertTrue(canvas.drawing.strokes.isEmpty)
         let a = event(editor.host, id: 141, pencil: false, timestamp: first.timestamp + 1)
         let b = event(editor.host, id: 142, pencil: false, point: Point(140 + 23 / editor.host.zoomScale, 220), timestamp: a.timestamp + 0.29)
-        for sample in [a, b] { input.begin(sample, screenPoint: sample.location, route: .tool(tool)); input.end(sample) }
+        for sample in [a, b] {
+            let screen = editor.host.canvasView.convert(editor.host.viewPoint(sample.location, page: sample.page), to: nil)
+            input.begin(sample, screenPoint: Point(screen), route: .tool(tool)); input.end(sample)
+        }
         try await waitForGesture()
         XCTAssertEqual(gestures, [.tap, .doubleTap])
         let c = event(editor.host, id: 143, pencil: false, timestamp: a.timestamp + 1)
         let d = event(editor.host, id: 144, pencil: false, point: Point(140 + 25 / editor.host.zoomScale, 220), timestamp: c.timestamp + 0.2)
-        for sample in [c, d] { input.begin(sample, screenPoint: sample.location, route: .tool(tool)); input.end(sample) }
+        for sample in [c, d] {
+            let screen = editor.host.canvasView.convert(editor.host.viewPoint(sample.location, page: sample.page), to: nil)
+            input.begin(sample, screenPoint: Point(screen), route: .tool(tool)); input.end(sample)
+        }
         try await waitForGesture()
         XCTAssertEqual(gestures, [.tap, .doubleTap, .tap, .tap])
     }

@@ -495,6 +495,7 @@ struct StudySessionView: View {
                                 model.send(CommandIDs.studyResetProgress, ["doc": .string(model.docRef)])
                                 resetConfirmed = false
                             }
+                            .accessibilityIdentifier("cmd." + CommandIDs.studyResetProgress)
                             NibButton(String(localized: "Keep Progress"), kind: .plain) { resetConfirmed = false }
                         }
                     } else {

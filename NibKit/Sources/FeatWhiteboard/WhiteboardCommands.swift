@@ -468,6 +468,12 @@ struct BoardAdd: NibCommand {
                                                  BoardInsertTemplate.Params(page: ref, template: template))
             items = inserted.refs
         }
+        // All user entry points (including the Add Page menu) reveal the new board in the invoking window.
+        // Automation, previews, and additions to another document must not move a user's canvas.
+        if ctx.principal.isUser, !ctx.dryRun, ctx.session?.document == doc {
+            // Canvas navigation is an optional feature; its absence must not fail a successful insertion.
+            _ = try? await ctx.execute(CommandIDs.viewGoToPage, ["page": .string(ref)])
+        }
         return Output(ref: ref, items: items)
     }
 }

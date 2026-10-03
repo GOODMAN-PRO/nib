@@ -169,6 +169,117 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["WALSTROKE002"])
     }
 
+    func testReadsAndUndoSnapshotStayCurrentWhileCoordinatedWriteIsHeld() async throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        var other = content
+        other.meta.id = "OTHERREAD001"
+        lib.package(other.meta.id)
+        store.didChange(other.meta.id, head: other, pages: items)
+        store.flush(other.meta.id)
+
+        // Simulate a provider holding the head until the UI has finished reading. The watchdog prevents a broken
+        // implementation from hanging the test process; waiting for it is a failure, not the synchronization path.
+        let holding = expectation(description: "provider holds the head")
+        let finished = expectation(description: "provider released the head")
+        let release = DispatchSemaphore(value: 0)
+        let url = pkg.appendingPathComponent("doc.0000000a.json")
+        DispatchQueue.global().async {
+            var error: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: url, options: [], error: &error) { _ in
+                holding.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success,
+                               "Main-actor reads must finish before the coordinated writer is released")
+            }
+            XCTAssertNil(error)
+            finished.fulfill()
+        }
+        await fulfillment(of: [holding], timeout: 5)
+        defer { release.signal(); store.flush(doc) }
+
+        let clock = HLCClock(device: 10)
+        var head = content
+        head.meta.favorite = true
+        head.meta.rev = clock.tick()
+        let original = walStroke("NUDGEUNDO001")
+        var nudged = original
+        nudged.stroke?.points[0].x += 10
+        nudged.rev = clock.tick()
+        store.didChange(doc, head: head, pages: [Fixtures.page2: [nudged]])
+        store.write(doc, synchronously: false)
+
+        XCTAssertEqual(try store.loadHead(doc), head)
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [nudged])
+        XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), nudged.rev)
+        XCTAssertEqual(try store.loadHead(other.meta.id), other, "one busy package must not stall library reads")
+
+        // Undo arrives while the nudge is still queued/in flight, with its own fresh revision. Both pending and
+        // submitted undo snapshots must beat the earlier write, even though no new WAL append can run yet.
+        var undone = original
+        undone.rev = clock.tick()
+        store.didChange(doc, head: nil, pages: [Fixtures.page2: [undone]])
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [undone])
+        store.write(doc, synchronously: false)
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [undone])
+        XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), undone.rev)
+
+        release.signal()
+        await fulfillment(of: [finished], timeout: 5)
+        store.flush(doc)
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+        let fresh = lib.store("0000000a")
+        XCTAssertEqual(try fresh.loadHead(doc), head)
+        XCTAssertEqual(try fresh.loadItems(doc, page: Fixtures.page2), [undone])
+    }
+
+    func testOlderWriteCompletionKeepsNewerReadableSnapshot() {
+        let readable = ReadableWrites()
+        let doc = Fixtures.docID
+        var first = PendingWrite()
+        first.pages[Fixtures.page1] = [walStroke("FIRSTWRITE01")]
+        let firstToken = readable.submit(first, for: doc)
+        var second = PendingWrite()
+        second.pages[Fixtures.page2] = [walStroke("SECONDWRITE1")]
+        let secondToken = readable.submit(second, for: doc)
+        readable.completed(doc, token: firstToken)
+        XCTAssertEqual(readable.snapshot(doc)?.pages[Fixtures.page1], first.pages[Fixtures.page1])
+        XCTAssertEqual(readable.snapshot(doc)?.pages[Fixtures.page2], second.pages[Fixtures.page2])
+        readable.completed(doc, token: secondToken)
+        XCTAssertNil(readable.snapshot(doc), "successful persistence releases the retained page snapshots")
+    }
+
+    func testReadsKeepFailedWriteEvenWhenWALAppendFails() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        let blocked = try blockPageFolder(pkg, Fixtures.page2)
+        try FileManager.default.removeItem(at: store.wal.directory)
+        try Data("blocked log".utf8).write(to: store.wal.directory)
+        let stroke = walStroke("UNLOGGED0001")
+        store.didChange(doc, head: nil, pages: [Fixtures.page2: [stroke]])
+        store.write(doc, synchronously: false)
+        store.waitForIO()
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [stroke])
+        XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), stroke.rev)
+
+        try FileManager.default.removeItem(at: blocked)
+        try FileManager.default.removeItem(at: store.wal.directory)
+        store.flush(doc)
+        XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [stroke])
+    }
+
     /// Another writer holds `url` for `seconds` (coordinated writes to it wait); returns once it holds it.
     private func holdCoordinatedWrite(_ url: URL, seconds: TimeInterval) {
         let held = DispatchSemaphore(value: 0)

@@ -80,7 +80,7 @@ struct MathEditorSheet: View {
                     }.disabled(lines.count >= 64 || busy)
                     if applied, let undoGroup {
                         NibBanner(String(localized: "Maths updated."), style: .info,
-                            action: NibAction(String(localized: "Undo")) {
+                            action: NibAction(String(localized: "Undo"), command: CommandIDs.revertGroup) {
                                 if let doc = ref.flatMap({ NodeRef($0)?.documentID }) ?? context.session?.document {
                                     context.app.perform(CommandIDs.revertGroup, ["group": .string(undoGroup), "doc": .string(NodeRef.document(doc).description)], session: context.session)
                                 }

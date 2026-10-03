@@ -225,7 +225,8 @@ struct MathAssistOptions: View {
                     NibButton(String(localized: "Write answer"), kind: .primary, shortcut: KeyboardShortcut(.return, modifiers: .command)) {
                         app.perform(CommandIDs.mathAssist, ["page": .string(page), "line": .number(Double(index)),
                             "format": .string(format), "latex": .string(latex), "refs": .array(line.refs.map(JSONValue.string))], session: session)
-                    }.disabled(evaluating || preview == nil || !latex.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("="))
+                    }
+                    .accessibilityIdentifier("cmd." + CommandIDs.mathAssist).disabled(evaluating || preview == nil || !latex.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("="))
                     NibInspectorSection(String(localized: "Strategies")) {
                         NibButton(String(localized: "Calculate on device"), kind: .plain) { Task { await evaluatePreview() } }
                         NibButton(String(localized: "Show steps"), kind: .plain) { solve("solve") }

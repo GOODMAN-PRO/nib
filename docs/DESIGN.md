@@ -87,7 +87,7 @@ The feel (every spring, stretch cap, neck, bud and haptic) is identical on both.
 - Glass never sits on glass. A Deep panel can hold controls, never another droplet. A search field inside a Clear droplet has no fill of its own.
 - One Tinted droplet per screen at most.
 - **Contrast is measured over the worst case beneath: black ink at 100 % under the droplet.** Over black ink the light Clear body (46 % white) is `#757575`; in dark mode over white paper the 80 % body is about `#454546` (white text 9.6:1).
-- **Text of 14 pt or less on any droplet needs ≥ 4.5:1 against that worst case; text of 15 pt semibold or more needs ≥ 3:1.** On light Clear only `label` at full strength passes (4.6:1 on `#757575`); `labelSecondary` there is about 1.7:1 and is **banned on Clear**. Body text belongs on Deep.
+- **Text of 14 pt or less on any droplet needs ≥ 4.5:1 against that worst case; text of 15 pt semibold or more needs ≥ 3:1.** On light Clear only `label` at full strength passes (4.6:1 on `#757575`); the strengthened `labelSecondary` still falls below 4.5:1 there and is **banned on Clear**. Body text belongs on Deep.
 - The listed exceptions to "≥ 15 pt on Clear", each in `label` and semibold: the bar subtitle (caption1, 12 pt), HUD numbers (`hud`, 13 pt, both parts in `label`) and the proposal chip (15 pt). Nothing else puts text under 15 pt on Clear.
 - Icons on Clear are ≥ 21 pt.
 - Resting droplets are either fused (1 pt overlap) or ≥ 16 pt apart. A 12–15 pt gap reads as a mistake and is banned (the docking code pushes it to 16).
@@ -103,7 +103,7 @@ UI neutrals are Apple's semantic colours. In code they are `NibColor` / `NibUICo
 | Token | Light | Dark | Use |
 |---|---|---|---|
 | `label` | `#000000` | `#FFFFFF` | Primary text, icons on droplets |
-| `labelSecondary` | `#3C3C43` 60 % | `#EBEBF5` 60 % | Subtitles, section labels, counts |
+| `labelSecondary` | `#3C3C43` 94 % | `#EBEBF5` 80 % | Small secondary text: subtitles, section labels, counts, metadata and footers; 100 % under Increase Contrast |
 | `labelTertiary` | `#3C3C43` 30 % | `#EBEBF5` 30 % | Placeholders, disabled, empty-state glyphs |
 | `labelQuaternary` | `#3C3C43` 18 % | `#EBEBF5` 16 % | Watermark numbers |
 | `separator` | `#3C3C43` 29 % | `#545458` 65 % | 0.5 pt hairlines inside droplets |
@@ -118,6 +118,8 @@ UI neutrals are Apple's semantic colours. In code they are `NibColor` / `NibUICo
 | `desk` | `#E7E7EC` | `#121214` | Behind pages (never pure white or black: the page edge must read) |
 | `chromeOpaque` | `#F4F4F6` | `#2C2C2E` | Reduce Transparency droplet fill |
 | `scrim` | `#000000` 18 % | `#000000` 45 % | Behind sheets |
+
+Small secondary text uses the strengthened shared role above to meet ≥ 4.5:1 on opaque backgrounds and worst-case Deep. Clear still requires full-strength `label` (§2.4). Hierarchy comes from size and weight rather than reducing text opacity.
 
 ### 3.2 Accent and semantic
 

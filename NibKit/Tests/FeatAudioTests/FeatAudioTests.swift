@@ -1,9 +1,22 @@
 import XCTest
 import AVFoundation
 import AudioToolbox
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatAudio
+
+/// Observe rendered clock values without a microphone or an XCUITest session.
+private struct AudioClockProbe: UIViewRepresentable {
+    let value: Double
+    let rendered: (Double) -> Void
+
+    func makeUIView(context: Context) -> UILabel { UILabel() }
+    func updateUIView(_ view: UILabel, context: Context) {
+        view.text = String(value)
+        rendered(value)
+    }
+}
 
 /// Synthetic PCM instead of the microphone (hostless tests have none): the test pushes seconds of a tone or of
 /// silence in tap-sized buffers.
@@ -13,14 +26,20 @@ final class SyntheticSource: AudioSampleSource {
     private var phase = 0.0
     private(set) var starts = 0
     private(set) var closed = false
+    var onPrepare: (() throws -> Void)?
+    var onStart: (() throws -> Void)?
 
     init(sampleRate: Double = 44_100) {
         self.sampleRate = sampleRate
     }
 
-    func prepare() throws -> Double { sampleRate }
+    func prepare() throws -> Double {
+        try onPrepare?()
+        return sampleRate
+    }
 
     func start(_ deliver: @escaping (AVAudioPCMBuffer) -> Void) throws {
+        try onStart?()
         self.deliver = deliver
         starts += 1
     }
@@ -214,6 +233,89 @@ final class FeatAudioTests: XCTestCase {
 
     // MARK: Recording
 
+    func testRecordingTimelineRendersAndRefreshesWithoutPublishedAudioChanges() async throws {
+        let (h, audio) = try harness()
+        var now = 100.0
+        audio.clock = { now }
+        audio.recording = .init(doc: Fixtures.docID, clip: NibID("CLOCK"), startedAt: now)
+        var displayed: Double?
+        let activity = AudioForegroundActivity(active: true, notifications: NotificationCenter())
+        let view = AudioTimelineView(interval: 0.05, paused: false, activity: activity) {
+            AudioClockProbe(value: audio.elapsed) { displayed = $0 }
+        }.environment(\.scenePhase, .inactive) // Embedded UIKit hosts need not supply a SwiftUI Scene.
+        let host = UIHostingController(rootView: view)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await waitUntil { displayed == 0 }
+        now += 3
+        try await waitUntil { displayed == 3 }
+        XCTAssertEqual(audio.recording?.startedAt, 100)
+        _ = h // Keep the app alive while its view is hosted.
+    }
+
+    func testPausedAudioTimelineRendersThenResumesAndParksInBackground() async throws {
+        var value = 0.0
+        var displayed: Double?
+        let notifications = NotificationCenter()
+        let activity = AudioForegroundActivity(active: true, notifications: notifications)
+        func view(paused: Bool) -> some View {
+            AudioTimelineView(interval: 0.05, paused: paused, activity: activity) {
+                AudioClockProbe(value: value) { displayed = $0 }
+            }
+        }
+        let host = UIHostingController(rootView: view(paused: true))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await waitUntil { displayed == 0 }
+        value = 3
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(displayed, 0, "Paused controls remain visible without periodic refreshes")
+        host.rootView = view(paused: false)
+        try await waitUntil { displayed == 3 }
+        value = 5
+        try await waitUntil { displayed == 5 }
+        notifications.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        try await waitUntil { !activity.isActive }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        value = 7
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(displayed, 5, "Background chrome must not keep ticking")
+        notifications.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        try await waitUntil { displayed == 7 }
+    }
+
+    func testMicrophoneReadinessWaitsForPermissionDialogToReturnToForeground() async throws {
+        let notifications = NotificationCenter()
+        let activity = AudioForegroundActivity(active: false, notifications: notifications)
+        var ready = false
+        let startup = Task { try await activity.waitUntilActive(); ready = true }
+        defer { startup.cancel() }
+        await Task.yield()
+        XCTAssertFalse(ready, "Permission granted is not sufficient while UIKit is still inactive")
+        notifications.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        try await waitUntil { ready }
+        try await startup.value
+        // No notification is needed when activation preceded the recording request.
+        try await activity.waitUntilActive()
+        notifications.post(name: UIApplication.willResignActiveNotification, object: nil)
+        try await waitUntil { !activity.isActive }
+        let cancelled = Task { try await activity.waitUntilActive() }
+        cancelled.cancel()
+        do {
+            try await cancelled.value
+            XCTFail("Cancelling a pending start must not activate the microphone")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
     func testRecordThenStopWithSyntheticSourceCreatesClipWithTheRightDuration() async throws {
         let (h, audio) = try harness()
         let source = SyntheticSource()
@@ -272,6 +374,61 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(events.map { $0.state }, ["recording", "stopped"])
         XCTAssertEqual(events.last?.clip, ref)
         XCTAssertEqual(events.last?.duration ?? 0, 2.5, accuracy: 0.001)
+    }
+
+    func testMicrophoneStartupKeepsTheMainActorFreeAndRejectsASecondStart() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        let preparing = expectation(description: "microphone preparation began")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        source.onPrepare = {
+            preparing.fulfill()
+            guard !Thread.isMainThread else {
+                throw NibError(.internalError, "microphone preparation must not block the main thread")
+            }
+            guard release.wait(timeout: .now() + 10) == .success else {
+                throw NibError(.internalError, "the main actor could not run during microphone preparation")
+            }
+        }
+        source.onStart = { XCTAssertFalse(Thread.isMainThread, "engine startup also makes audio RPCs") }
+        audio.makeSource = { source }
+        let start = Task { try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start"]) }
+        await fulfillment(of: [preparing], timeout: 15)
+        XCTAssertTrue(audio.starting)
+        XCTAssertNil(audio.recording)
+        await assertThrows(.conflict) {
+            _ = try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start"])
+        }
+        release.signal()
+        let result = try await start.value
+        XCTAssertEqual(result["state"]?.stringValue, "recording")
+        XCTAssertEqual(source.starts, 1)
+        XCTAssertFalse(audio.starting)
+        source.feed(seconds: 0.25)
+        _ = try await h.run("audio.record", ["action": "stop"])
+    }
+
+    func testFailedMicrophonePreparationOrStartCleansUpAndAllowsRetry() async throws {
+        for failsDuringPrepare in [true, false] {
+            let (h, audio) = try harness()
+            let source = SyntheticSource()
+            let fail: () throws -> Void = { throw NibError(.unavailable, "The microphone is busy") }
+            if failsDuringPrepare { source.onPrepare = fail } else { source.onStart = fail }
+            audio.makeSource = { source }
+            await assertThrows(.unavailable) {
+                _ = try await h.run("audio.record", ["doc": "doc:FIXTUREDOC01", "action": "start", "id": "FAILEDSTART"])
+            }
+            XCTAssertTrue(source.closed, "release the session even when prepare fails")
+            XCTAssertFalse(audio.starting)
+            XCTAssertNil(audio.recorder)
+            XCTAssertNil(audio.recording)
+            XCTAssertFalse(exists(try file(h, "audio/FAILEDSTART.aac")))
+            XCTAssertFalse(try h.app.workspace.content(Fixtures.docID).audio.contains { $0.id.raw == "FAILEDSTART" })
+            let retry = SyntheticSource()
+            audio.makeSource = { retry }
+            _ = try await record(h, retry, seconds: 0.25)
+        }
     }
 
     func testPauseFillsTheGapSoTheRecordingMatchesTheWallClock() async throws {
@@ -821,6 +978,7 @@ final class FeatAudioTests: XCTestCase {
         // doc.create belongs to the library feature; a stand-in keeps these tests to FeatAudio.
         h.app.commands.register(CommandDescriptor(id: "doc.create", title: "Create", summary: "Test stand-in.",
                                                   effect: .library, target: .library)) { params, _ in
+            XCTAssertEqual(params["kind"]?.stringValue, "textDocument")
             let id = NibID(params["id"]?.stringValue ?? NibID.make().raw)
             _ = try library.createDocument(DocumentContent(meta: DocumentMeta(id: id, kind: .textDocument)),
                                            title: params["title"]?.stringValue ?? "", in: nil)
@@ -833,16 +991,85 @@ final class FeatAudioTests: XCTestCase {
         let (h, audio) = try harness()
         let source = SyntheticSource()
         audio.makeSource = { source }
-        audio.clock = { 1_800_000_000 }
+        var now = 1_800_000_000.0
+        audio.clock = { now }
+        h.session.document = nil
+        h.session.page = nil
         standInDocCreate(h)
+        var opened: [DocumentID] = []
+        h.app.commands.register(CommandDescriptor(id: "doc.open", title: "Open", summary: "Test stand-in.",
+                                                  effect: .session, target: .app)) { params, ctx in
+            XCTAssertTrue(ctx.session === h.session, "open in the window that invoked Quick Record")
+            let ref = try XCTUnwrap(params["doc"]?.stringValue)
+            let doc = NodeRef.documentID(from: ref)
+            let content = try ctx.workspace.content(doc)
+            XCTAssertEqual(content.meta.kind, .textDocument)
+            XCTAssertTrue(content.livePages.isEmpty)
+            XCTAssertEqual(audio.recording?.doc, doc, "Quick Record must be recording before presenting its editor")
+            XCTAssertEqual(content.liveAudio.count, 1, "The recording clip must be persisted before opening")
+            XCTAssertEqual(self.overlays(h, kind: .textDocument), ["audio.recorder"],
+                           "The editor's initial chrome must include the recording HUD")
+            h.session.document = doc
+            opened.append(doc)
+            return [:]
+        }
         let result = try await h.run("audio.quickRecord", ["id": "QUICKDOC0001"])
         XCTAssertEqual(result["ref"]?.stringValue, "doc:QUICKDOC0001")
+        XCTAssertEqual(opened, [NibID("QUICKDOC0001")])
+        XCTAssertEqual(h.session.document, NibID("QUICKDOC0001"))
         let clipRef = try XCTUnwrap(result["clip"]?.stringValue)
         XCTAssertEqual(audio.recording?.doc, NibID("QUICKDOC0001"))
         XCTAssertNil(try clip(h, clipRef).page, "a text document has no pages")
         let title = try XCTUnwrap(h.library.node(NibID("QUICKDOC0001"))?.title)
         XCTAssertFalse(title.contains(":"), "a title is a file name")
         XCTAssertEqual(overlays(h, kind: .textDocument), ["audio.recorder"], "the HUD shows the recording")
+        source.feed(seconds: 1.25)
+        now += 1.25
+        XCTAssertEqual(audio.recordingStatus?.duration ?? 0, 1.25, accuracy: 0.001, "the HUD timer advances")
+        _ = try await h.run("audio.record", ["action": "stop"])
+    }
+
+    func testQuickRecordWaitsForLiveRecordingBeforeOpeningTheEditor() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        let preparing = expectation(description: "Quick Record is preparing input")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        source.onPrepare = {
+            preparing.fulfill()
+            guard release.wait(timeout: .now() + 30) == .success else {
+                throw NibError(.internalError, "Quick Record startup was not released")
+            }
+        }
+        audio.makeSource = { source }
+        var now = 100.0
+        audio.clock = { now }
+        h.session.document = nil
+        h.session.page = nil
+        standInDocCreate(h)
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: "doc.open", title: "Open", summary: "Test stand-in.",
+                                                  effect: .session, target: .app)) { params, _ in
+            h.session.document = NodeRef.documentID(from: try XCTUnwrap(params["doc"]?.stringValue))
+            opened = true
+            return [:]
+        }
+        let start = Task { try await h.run("audio.quickRecord", ["id": "QUICKDELAYED"]) }
+        await fulfillment(of: [preparing], timeout: 15)
+        XCTAssertTrue(audio.starting)
+        XCTAssertNil(audio.recording)
+        XCTAssertFalse(opened, "Slow microphone startup must not present an editor without a recording HUD")
+        XCTAssertNil(h.session.document, "Keep the invoking library visible until recording is live")
+        release.signal()
+        let result = try await start.value
+        XCTAssertEqual(result["ref"]?.stringValue, "doc:QUICKDELAYED")
+        XCTAssertTrue(opened)
+        XCTAssertEqual(h.session.document, NibID("QUICKDELAYED"))
+        XCTAssertEqual(audio.recording?.doc, h.session.document)
+        XCTAssertEqual(overlays(h, kind: .textDocument), ["audio.recorder"])
+        source.feed(seconds: 1)
+        now += 1
+        XCTAssertEqual(audio.elapsed, 1, accuracy: 0.001, "The presented HUD reads the live recording clock")
         _ = try await h.run("audio.record", ["action": "stop"])
     }
 
@@ -850,6 +1077,12 @@ final class FeatAudioTests: XCTestCase {
         let (h, audio) = try harness()
         var created: [String] = []
         standInDocCreate(h) { created.append($0) }
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: "doc.open", title: "Open", summary: "Test stand-in.",
+                                                  effect: .session, target: .app)) { _, _ in
+            opened = true
+            return [:]
+        }
         // No microphone (hostless, no source): refused before any document is made.
         await assertThrows(.unavailable) { try await h.run("audio.quickRecord", ["id": "QUICKDOC0002"]) }
         XCTAssertEqual(created, [])
@@ -866,6 +1099,7 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(created, ["QUICKDOC0003"])
         XCTAssertEqual(trashed, [["doc:QUICKDOC0003"]])
         XCTAssertNil(audio.recording)
+        XCTAssertFalse(opened, "A microphone failure must not leave a trashed Quick Record open")
     }
 
     // MARK: Pure logic

@@ -20,6 +20,37 @@ struct SearchMatch: Codable, Equatable, Identifiable {
     var alternative: String?
     var time: Double?
     var score: Double
+    var isTitleMatch: Bool { kind == "title" }
+    var displayTitle: String {
+        guard title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return title }
+        switch DocumentKind(rawValue: docKind) {
+        case .notebook: return String(localized: "Untitled notebook")
+        case .whiteboard: return String(localized: "Untitled whiteboard")
+        case .textDocument: return String(localized: "Untitled text document")
+        case .studySet: return String(localized: "Untitled study set")
+        case nil: return String(localized: "Untitled document")
+        }
+    }
+    var documentKindLabel: String {
+        switch DocumentKind(rawValue: docKind) {
+        case .notebook: return String(localized: "Notebook")
+        case .whiteboard: return String(localized: "Whiteboard")
+        case .textDocument: return String(localized: "Text document")
+        case .studySet: return String(localized: "Study set")
+        case nil: return String(localized: "Document")
+        }
+    }
+    var symbol: NibSymbol {
+        guard isTitleMatch else { return group.symbol }
+        switch DocumentKind(rawValue: docKind) {
+        case .notebook: return .notebook
+        case .whiteboard: return .whiteboard
+        case .textDocument: return .textDocument
+        case .studySet: return .studySets
+        case nil: return .library
+        }
+    }
+    var detailSnippet: String? { isTitleMatch ? nil : snippet }
     var id: String {
         // Exact duplicate hits share an id; every field, including geometry, participates.
         let encoder = JSONEncoder()
@@ -131,6 +162,26 @@ struct SearchSnippet {
     var scale: Double
 }
 
+/// A query with no visible matches always explains whether work is pending or complete.
+enum SearchEmptyPresentation: Equatable {
+    case searching, indexing, noResults(String)
+
+    var title: String {
+        switch self {
+        case .searching: return String(localized: "Searching your notes…")
+        case .indexing: return String(localized: "Handwriting is still being indexed.")
+        case .noResults(let query): return String(localized: "No results for “\(query)”")
+        }
+    }
+    var message: String {
+        switch self {
+        case .searching: return String(localized: "Results will appear here as the search finishes.")
+        case .indexing: return String(localized: "Try typed text or check again when recognition finishes.")
+        case .noResults: return String(localized: "Try fewer words or choose All to search every source.")
+        }
+    }
+}
+
 @MainActor
 final class SearchState: ObservableObject {
     @Published var scope = "lib"
@@ -156,8 +207,29 @@ final class SearchState: ObservableObject {
     var visibleMatches: [SearchMatch] { matches.filter { filter.includes($0) } }
     var selectedIndex: Int? { visibleMatches.firstIndex { $0.id == selectedID } }
     var isLibraryScope: Bool { scope == "lib" || scope.hasPrefix("folder:") }
+    var searchPrompt: String {
+        isLibraryScope ? String(localized: "Search your notes") : String(localized: "Find in this document")
+    }
+    var canStepMatches: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !loading && error == nil && !visibleMatches.isEmpty
+    }
     var remainingPages: Int { max(0, progress?.pending ?? 0) }
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
+    var emptyPresentation: SearchEmptyPresentation? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, error == nil, visibleMatches.isEmpty else { return nil }
+        if loading { return .searching }
+        if isIndexing { return .indexing }
+        return .noResults(trimmed)
+    }
+    var indexingMessage: String? {
+        guard isIndexing else { return nil }
+        if remainingPages > 0 {
+            return String(AttributedString(localized: "Handwriting in ^[\(remainingPages) page](inflect: true) is still being indexed.").characters)
+        }
+        return String(localized: "Handwriting is still being indexed.")
+    }
     /// Document navigation always has an active hit as soon as results arrive. Library search
     /// keeps its unselected count until a row is opened. Preserve selection across refreshes.
     func reconcileSelection() {
@@ -203,10 +275,10 @@ final class SearchRuntime {
         let state = SearchState()
         state.progress = progress
         states[session.id] = state
-        var wasOpen = session.openPanels.contains(SearchOpen.documentPanel)
+        var wasOpen = session.openPanels.contains(SearchOpen.documentPanel) || session.openPanels.contains(SearchOpen.libraryPanel)
         panelSubscriptions[session.id] = session.$openPanels.sink { [weak self, weak state, weak session] panels in
-            let open = panels.contains(SearchOpen.documentPanel)
-            if wasOpen && !open, let state, !state.isLibraryScope {
+            let open = panels.contains(SearchOpen.documentPanel) || panels.contains(SearchOpen.libraryPanel)
+            if wasOpen && !open, let state {
                 state.isPresented = false
                 state.generation += 1
                 state.loading = false

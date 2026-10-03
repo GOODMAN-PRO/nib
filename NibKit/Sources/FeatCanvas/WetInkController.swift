@@ -2,6 +2,7 @@ import UIKit
 import PencilKit
 import NibContracts
 import NibDesign
+import os
 
 /// Pure capture ledger. A native tool-begin admits a capture; creationDate identifies the resulting
 /// stroke independently of its position in PKDrawing. Contacts that never draw cannot shift the queue.
@@ -28,8 +29,10 @@ struct WetInkLedger<Payload, Ink> {
     var isEmpty: Bool { captures.isEmpty && entries.isEmpty }
     var hasLiveCapture: Bool { captures.contains { !$0.ended } }
 
-    mutating func register(id: UUID, startedAt: Date, payload: Payload, nativeStarted: Bool = false) {
-        captures.append(Capture(id: id, startedAt: startedAt, payload: payload, nativeStarted: nativeStarted))
+    mutating func register(id: UUID, startedAt: Date, payload: Payload, nativeStarted: Bool = false,
+                           nativeEnded: Bool = false) {
+        captures.append(Capture(id: id, startedAt: startedAt, payload: payload,
+                                nativeStarted: nativeStarted, nativeEnded: nativeStarted && nativeEnded))
     }
     mutating func nativeBegin(_ id: UUID) {
         if let i = captures.firstIndex(where: { $0.id == id }) { captures[i].nativeStarted = true }
@@ -49,19 +52,28 @@ struct WetInkLedger<Payload, Ink> {
         for i in captures.indices where captures[i].nativeStarted { captures[i].nativeEnded = true }
         for i in entries.indices where entries[i].capture?.nativeStarted == true { entries[i].capture?.nativeEnded = true }
     }
-    mutating func append(identity: Date, ink: Ink) {
+    mutating func append(identity: Date, ink: Ink, captureID: UUID? = nil) {
         if let i = entries.firstIndex(where: { $0.identity == identity }) {
-            if !entries[i].delivered { entries[i].ink = ink }
-            return
+            if entries[i].delivered { return }
+            entries[i].ink = ink
+            if entries[i].capture != nil { return }
         }
-        let nearest = captures.indices.filter { captures[$0].nativeStarted }.min {
+        // Native contact ownership wins over clocks. UIKit touch uptime, delivery time and
+        // PKStrokePath.creationDate are not a shared stroke identifier (synthesis and delayed
+        // recognition can differ by hundreds of milliseconds). Never reject ink for that skew.
+        let owner = captures.firstIndex { $0.id == captureID && $0.nativeStarted }
+        let nearest = owner ?? captures.indices.filter { captures[$0].nativeStarted }.min {
             abs(captures[$0].startedAt.timeIntervalSince(identity)) < abs(captures[$1].startedAt.timeIntervalSince(identity))
         }
-        let capture: Capture?
-        if let i = nearest, abs(captures[i].startedAt.timeIntervalSince(identity)) < 0.25 {
-            capture = captures.remove(at: i)
-        } else { capture = nil }
-        entries.append(Entry(identity: identity, capture: capture, ink: ink, ready: capture == nil || capture?.cancelled == true))
+        let capture = nearest.map { captures.remove(at: $0) }
+        if let i = entries.firstIndex(where: { $0.identity == identity }) {
+            entries[i].capture = capture
+            entries[i].ready = capture?.cancelled == true
+        } else {
+            // Drawing notifications may precede contact admission. Retain unmatched ink until
+            // reconciliation can bind it, rather than treating it as already safe to erase.
+            entries.append(Entry(identity: identity, capture: capture, ink: ink, ready: capture?.cancelled == true))
+        }
     }
     /// Called after a native end and drawing reconciliation. No-stroke captures cease blocking retirement.
     mutating func discardUnstartedEnded() { captures.removeAll { $0.ended && !$0.nativeStarted } }
@@ -146,6 +158,22 @@ private final class InputSurfaceContainer: UIView {
 /// Gate before PencilKit's private drawing recogniser sees a contact. Its delegate remains PencilKit-owned.
 @MainActor
 private final class InputInkCanvas: PKCanvasView {
+    // PencilKit holds only the transient wet drawing. The document command records the
+    // stroke once; native drawing/retirement must not add a second step to the window.
+    override var undoManager: UndoManager? { nil }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        pinchGestureRecognizer?.isEnabled = false
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // PencilKit can recreate/re-enable its scroll gestures when attached or
+        // laid out. This surface only captures ink; its parent owns navigation.
+        if pinchGestureRecognizer?.isEnabled == true { pinchGestureRecognizer?.isEnabled = false }
+    }
+
     var acceptsContact: ((CGPoint, UIEvent?) -> Bool)?
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard acceptsContact?(point, event) != false else { return nil }
@@ -209,6 +237,12 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         var ledger = WetInkLedger<Capture, PKStroke>()
         var acceptedContacts: Set<ObjectIdentifier> = []
         var startedContact: ObjectIdentifier?
+        var pendingNativeContact: ObjectIdentifier?
+        var awaitingContact = false
+        var nativeCaptureID: UUID?
+        // Touch observation can finish before PencilKit admits a short first stroke. Keep
+        // that one contact's metadata until native admission, without admitting no-ink taps.
+        var unrecognisedCapture: Capture?
         var toolEnded = false
         var active = true
         var replacingDrawing = false
@@ -248,7 +282,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     private var decisions: [ObjectIdentifier: GestureRouter.Route] = [:]
     private var delivering: WetStrokeHandoff?
     private var notification: NSObjectProtocol?
-    private var pendingTap: (sample: CanvasSample, route: GestureRouter.Route, capture: Capture?)?
+    private var pendingTap: (sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route, capture: Capture?)?
+    private var secondTapID: Int?
     private var tapTask: Task<Void, Never>?
     private var gestureTasks: [UUID: Task<Void, Never>] = [:]
     private var closing = false
@@ -293,7 +328,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                   self.tracks.isEmpty, let touches = event.allTouches,
                   let touch = touches.first(where: { $0.phase == .began }),
                   let target = host.pagePoint(self.surfaceContainer.convert(point, to: host.canvasView)),
-                  case .tool(let tool) = self.decision(touch), tool.inputMode == .pencilKit,
+                  case .tool(let tool) = self.decision(touch, remember: false), tool.inputMode == .pencilKit,
                   self.inputPage != target.page else { return }
             self.inputPage = target.page
             self.updateSurfaces()
@@ -403,6 +438,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             surface.active = true
             surface.acceptedContacts.removeAll()
             surface.startedContact = nil
+            surface.pendingNativeContact = nil
+            surface.awaitingContact = false
+            surface.nativeCaptureID = nil
+            surface.unrecognisedCapture = nil
             surface.toolEnded = false
             return
         }
@@ -416,6 +455,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         canvas.showsVerticalScrollIndicator = false
         canvas.minimumZoomScale = 0.01
         canvas.maximumZoomScale = 8
+        // This nested scroll view only renders wet ink at the document's scale. Leaving its
+        // pinch enabled lets UIKit give the descendant scroll view ownership of a pinch,
+        // even though isScrollEnabled is false. Programmatic zoomScale still works.
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.delegate = self
         canvas.isAccessibilityElement = false // F006 owns the labelled, scrollable document accessibility surface.
         canvas.accessibilityElementsHidden = true
@@ -434,10 +478,10 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             guard surface.acceptedContacts.isEmpty || surface.acceptedContacts.contains(contact),
                   let sample = TouchTap.sample(touch, event: event, touchID: 0, host: host),
                   sample.page == surface.page, surface.region.contains(sample.location) else { return false }
-            if case .tool(let tool) = self.decision(touch), tool.inputMode == .pencilKit {
-                surface.acceptedContacts.insert(contact)
-                return true
-            }
+            // UIKit may hit-test speculatively, or again after touchesEnded. A probe is not
+            // contact delivery: reserving it here can permanently exclude the next finger.
+            // TouchTap admits the contact from its actual hit view in begin(_:event:id:).
+            if case .tool(let tool) = self.decision(touch, remember: false), tool.inputMode == .pencilKit { return true }
             return false
         }
         surfaces.append(surface)
@@ -488,7 +532,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     // MARK: Routing and palm rejection
 
-    private func decision(_ touch: UITouch) -> GestureRouter.Route {
+    private func decision(_ touch: UITouch, remember: Bool = true) -> GestureRouter.Route {
         let key = ObjectIdentifier(touch)
         if let route = decisions[key] { return route }
         guard let host = host else { return .rejected }
@@ -501,7 +545,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         if case .attachment = candidate { route = candidate }
         else if rejectsPalm(touch, host: host) { route = .rejected }
         else { route = candidate }
-        decisions[key] = route
+        if remember { decisions[key] = route }
         return route
     }
 
@@ -510,7 +554,13 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         let at = touch.location(in: host.canvasView)
         let pencilPoint = tracks.values.first(where: { $0.last.isPencil }).map { host.viewPoint($0.last.location, page: $0.last.page) }
         let kind: PalmRejection.ContactKind = touch.type == .pencil ? .pencil : (touch.type == .direct ? .finger : .pointer)
-        return palmRejection.rejects(.init(kind: kind, majorRadius: Double(touch.majorRadius), location: Point(at)),
+        var radius = Double(touch.majorRadius)
+        #if targetEnvironment(simulator)
+        // XCTest's public drag/pinch APIs report ~37 pt contacts on iPad, larger than a real fingertip.
+        // Normalize that synthetic metadata only for the explicit fixture launch; retain all input routing.
+        if NibUITestMode.isEnabled { radius = 8 }
+        #endif
+        return palmRejection.rejects(.init(kind: kind, majorRadius: radius, location: Point(at)),
                                  pencilLocation: pencilPoint.map { Point($0) })
     }
 
@@ -523,20 +573,43 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     private func begin(_ touch: UITouch, event: UIEvent, id: Int) {
         guard let host = host, let sample = TouchTap.sample(touch, event: event, touchID: id, host: host) else { return }
-        begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: decision(touch),
+        let route = decision(touch)
+        // Hit-testing may have no touches yet, and native tool-begin can precede TouchTap.
+        // Admit the actual hit view's contact once UIKit provides it, for every input source.
+        if case .tool(let tool) = route, tool.inputMode == .pencilKit,
+           let hit = touch.view, let surface = surfaces.first(where: {
+               $0.active && $0.canvas.isUserInteractionEnabled && hit.isDescendant(of: $0.canvas)
+           }) {
+            let contact = ObjectIdentifier(touch)
+            surface.acceptedContacts.insert(contact)
+        }
+        begin(sample, screenPoint: Point(touch.location(in: nil)), route: route,
               contact: ObjectIdentifier(touch))
     }
 
-    /// UIKit edges translate contacts into these deterministic events; tests exercise the production state machine.
+    /// UIKit edges translate contacts into these deterministic events; screenPoint is in the fixed
+    /// window, never the scroll view's moving bounds. Tests exercise the same production state machine.
     func begin(_ sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route,
                contact: ObjectIdentifier? = nil, startedAt: Date? = nil) {
         guard let host = host else { return }
         let id = sample.touchID
         let track = Track(sample: sample, screenStart: screenPoint, route: route)
         tracks[id] = track
+        if !sample.isPencil, let pending = pendingTap,
+           pending.sample.page == sample.page,
+           sample.timestamp >= pending.sample.timestamp,
+           sample.timestamp - pending.sample.timestamp <= 0.3,
+           pending.screenPoint.distance(to: screenPoint) <= 24,
+           !isRejected(route) {
+            // A double tap's interval ends at the second DOWN, not its lift. Keep the
+            // provisional dot pending while that contact completes (or becomes a drag).
+            secondTapID = id
+            tapTask?.cancel()
+        }
         router?.begin(sample, route: route)
         let fingers = tracks.values.filter { !$0.sample.isPencil && !isRejectedOrClaimed($0.route) }
         if fingers.count > 1 {
+            flushPendingTap()
             navigating = true
             for finger in fingers {
                 finger.moved = true
@@ -563,8 +636,23 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             track.capture = capture
             if tool.inputMode == .pencilKit {
                 capture.surface = surface
-                surface?.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
-                                         nativeStarted: surface?.startedContact == capture.contact)
+                // Native callbacks and the observing recognizer can arrive in either order.
+                // A completed native contact still belongs to this capture; startedContact
+                // alone cannot identify it because native end clears that live-contact gate.
+                if let surface = surface {
+                    surface.unrecognisedCapture = nil
+                    let pendingNative = surface.awaitingContact
+                        && (surface.pendingNativeContact == nil || surface.pendingNativeContact == contact)
+                    let nativeStarted = surface.startedContact == contact || pendingNative
+                    if pendingNative {
+                        surface.startedContact = surface.toolEnded ? nil : contact
+                        surface.pendingNativeContact = nil
+                        surface.awaitingContact = false
+                    }
+                    surface.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
+                                            nativeStarted: nativeStarted, nativeEnded: surface.toolEnded)
+                    if nativeStarted { surface.nativeCaptureID = capture.id }
+                }
             }
             beginInking(capture)
         }
@@ -585,13 +673,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
         let samples = TouchTap.samples(touch: touch, event: event, touchID: id,
                                       reduceLatency: reduceLatency, host: host)
-        move(samples, screenPoint: Point(touch.location(in: host.canvasView)), id: id)
+        move(samples, screenPoint: Point(touch.location(in: nil)), id: id)
     }
 
     func move(_ samples: [CanvasSample], screenPoint: Point, id: Int) {
         guard let host = host, let track = tracks[id], let last = samples.last(where: { !$0.isPredicted }) else { return }
         track.last = last
         if track.screenStart.distance(to: screenPoint) > 8 { track.moved = true }
+        if track.moved && secondTapID == id { flushPendingTap() }
         if let capture = track.capture, !capture.cancelled || capture.handedOff {
             let previousMotion = capture.stillness.lastMotion
             for sample in samples where !sample.isPredicted {
@@ -602,7 +691,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 capture.last = sample
                 if sample.timestamp > (capture.points.last?.timestamp ?? -.infinity) { capture.points.append(sample) }
                 capture.bounds = capture.bounds.union(Rect(x: point.x, y: point.y, width: 0, height: 0).insetBy(-capture.style.width / 2))
-                let screen = Point(host.viewPoint(point, page: capture.page))
+                let screen = Point(host.canvasView.convert(host.viewPoint(point, page: capture.page), to: nil))
                 capture.stillness.update(point: screen, timestamp: sample.timestamp)
             }
             host.updateInking(page: capture.page, strokeBounds: capture.bounds)
@@ -629,6 +718,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
         track.holdTask?.cancel()
         let route = track.route
+        #if DEBUG
+        if let capture = track.capture {
+            Logger(subsystem: "app.nib", category: "canvasinput").debug("Touch ended: tool=\(capture.tool.id, privacy: .public) samples=\(capture.points.count) moved=\(track.moved) cancelled=\(cancelled) deliveryLag=\(ProcessInfo.processInfo.systemUptime - sample.timestamp)")
+        }
+        #endif
         if cancelled {
             router?.cancel(id)
             if let capture = track.capture { cancel(capture) }
@@ -645,19 +739,23 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                     else if case .tool(let tool) = route, tool.inputMode == .taps { tool.tap(sample, host: host) }
                 } else {
                     track.capture?.gesturePending = true
-                    queueTap(sample, route: route, capture: track.capture)
+                    queueTap(sample, screenPoint: track.screenStart, route: route, capture: track.capture)
                 }
             }
         }
+        if secondTapID == id { flushPendingTap() }
         endInkingIfIdle()
         if tracks.isEmpty { navigating = false }
         if let capture = track.capture, let surface = capture.surface {
             surface.ledger.end(capture.id, pendingGesture: capture.gesturePending)
+            if !capture.cancelled,
+               surface.ledger.captures.contains(where: { $0.id == capture.id && !$0.nativeStarted }) {
+                surface.unrecognisedCapture = capture
+            }
         }
         for surface in surfaces {
             process(surface)
             surface.ledger.discardUnstartedEnded()
-            if surface.toolEnded { surface.ledger.discardUnproduced() }
             removeReady(surface)
         }
         if tracks.isEmpty { updateSurfaces() }
@@ -691,6 +789,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             if capture.tool.strokeHeld(capture.stroke(), page: capture.page, host: host) { cancel(capture) }
             else { capture.handedOff = false; endInkingIfIdle() }
         } else if !track.moved && !track.longPressed {
+            if secondTapID == id { flushPendingTap() }
             track.longPressed = true
             track.capture?.longPressed = true
             if !track.sample.isPencil {
@@ -707,19 +806,17 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
     }
 
-    private func queueTap(_ sample: CanvasSample, route: GestureRouter.Route, capture: Capture?) {
+    private func queueTap(_ sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route, capture: Capture?) {
         if let pending = pendingTap,
-           pending.sample.page == sample.page,
-           sample.timestamp >= pending.sample.timestamp,
-           sample.timestamp - pending.sample.timestamp <= 0.3,
-           pending.sample.location.distance(to: sample.location) * (host?.zoomScale ?? 1) <= 24 {
+           secondTapID == sample.touchID {
             tapTask?.cancel()
             pendingTap = nil
+            secondTapID = nil
             dispatchGesture(.doubleTap, sample: sample, route: route, captures: [pending.capture, capture].compactMap { $0 })
             return
         }
         flushPendingTap()
-        pendingTap = (sample, route, capture)
+        pendingTap = (sample, screenPoint, route, capture)
         tapTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
@@ -728,6 +825,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     }
 
     private func flushPendingTap() {
+        secondTapID = nil
         guard let pending = pendingTap else { return }
         pendingTap = nil
         tapTask?.cancel()
@@ -771,8 +869,35 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         guard let surface = surfaces.first(where: { $0.canvas === canvasView }) else { return }
         surface.toolEnded = false
         surface.startedContact = surface.acceptedContacts.first
+        surface.pendingNativeContact = surface.startedContact
+        surface.awaitingContact = true
+        surface.nativeCaptureID = nil
         if let capture = surface.ledger.captures.first(where: { $0.payload.contact == surface.startedContact }) {
             surface.ledger.nativeBegin(capture.id)
+            surface.nativeCaptureID = capture.id
+            surface.pendingNativeContact = nil
+            surface.awaitingContact = false
+        }
+        if surface.awaitingContact {
+            // Let an observer begin from this same UIKit delivery claim native admission
+            // first. If it already lifted, recover only its retained, actually hit contact.
+            // A native-first NEXT contact must never inherit the preceding no-ink tap.
+            Task { @MainActor [weak self, weak surface] in
+                await Task.yield()
+                guard let self, let surface, !self.closing, surface.awaitingContact,
+                      let capture = surface.unrecognisedCapture, !capture.cancelled,
+                      surface.pendingNativeContact == nil || surface.pendingNativeContact == capture.contact else { return }
+                surface.unrecognisedCapture = nil
+                surface.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
+                                        nativeStarted: true, nativeEnded: surface.toolEnded)
+                surface.ledger.end(capture.id, pendingGesture: capture.gesturePending)
+                surface.nativeCaptureID = capture.id
+                surface.startedContact = surface.toolEnded ? nil : capture.contact
+                surface.pendingNativeContact = nil
+                surface.awaitingContact = false
+                self.process(surface)
+                self.removeReady(surface)
+            }
         }
     }
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
@@ -785,7 +910,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             await Task.yield()
             guard let self = self, let surface = surface else { return }
             self.process(surface)
-            surface.ledger.discardUnproduced(completedOnly: true)
+            // Native end is not a drawing fence. Final PKDrawing callbacks can arrive on a
+            // later render turn; keep their admitted captures until that drawing is delivered.
             self.removeReady(surface)
             self.pruneSurfaces()
         }
@@ -797,9 +923,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     private func process(_ surface: Surface) {
         guard let host = host, !closing, !surface.replacingDrawing else { return }
-        for pk in surface.canvas.drawing.strokes { surface.ledger.append(identity: pk.path.creationDate, ink: pk) }
+        for pk in surface.canvas.drawing.strokes {
+            surface.ledger.append(identity: pk.path.creationDate, ink: pk, captureID: surface.nativeCaptureID)
+        }
         for entry in surface.ledger.takeDeliveries() {
             guard let capture = entry.capture?.payload else { continue }
+            #if DEBUG
+            Logger(subsystem: "app.nib", category: "canvasinput").debug("Native stroke delivered: tool=\(capture.tool.id, privacy: .public) clockSkew=\(entry.identity.timeIntervalSince(capture.startedAt))")
+            #endif
             let handoff = WetStrokeHandoff()
             delivering = handoff
             if host.isReadOnly { surface.ledger.markReady(capture.id) }
@@ -914,11 +1045,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     }
     private func resetTouches(clearGestures: Bool = true) {
         if !clearGestures && tracks.isEmpty { decisions.removeAll(); navigating = false; return }
-        if clearGestures {
+        // A stream reset without a second lift aborts the reserved pair as well. Its timer
+        // was stopped on second-down, so retaining it would leave an orphaned pending dot.
+        if clearGestures || secondTapID != nil {
             tapTask?.cancel()
             tapTask = nil
             if let capture = pendingTap?.capture { cancel(capture) }
             pendingTap = nil
+            secondTapID = nil
             for task in gestureTasks.values { task.cancel() }
             gestureTasks.removeAll()
             for surface in surfaces {
@@ -939,6 +1073,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         for surface in surfaces {
             surface.acceptedContacts.removeAll()
             surface.startedContact = nil
+            surface.pendingNativeContact = nil
+            surface.awaitingContact = false
+            surface.nativeCaptureID = nil
+            surface.unrecognisedCapture = nil
+            surface.toolEnded = false
             surface.ledger.discardUnproduced()
             removeReady(surface)
         }

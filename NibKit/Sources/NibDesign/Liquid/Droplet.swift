@@ -71,11 +71,19 @@ struct AttachedDroplet<Content: View>: View {
     let namespace: Namespace.ID?
     let bud: NibBudRequest?
 
+    /// Presentation can lag the binding until onChange runs and throughout retraction.
+    /// Retain the visual content, but release input and accessibility at dismissal.
+    var acceptsInteraction: Bool {
+        guard bud?.isPresented.wrappedValue ?? true else { return false }
+        let p = node.presentation
+        return !p.hasBud || !p.hidden
+    }
+
     var body: some View {
         let p = node.presentation
         let requestedHidden = bud.map { !$0.isPresented.wrappedValue } ?? false
-        let hidden = p.hasBud ? p.hidden : requestedHidden
-        let isOpenBud = bud != nil && !hidden
+        let hidden = !acceptsInteraction
+        let isOpenBud = bud != nil && !hidden && style.modalWhenBudded
         let draggable = managesDrag && style.drag != .fixed
         let recede = p.recedes ? NibLiquid.recedeOpacity : 1
         return content
@@ -221,6 +229,8 @@ struct DropletBodyModifier: ViewModifier {
                     .padding(.vertical, dy)
             }
             .modifier(GlassIDModifier(id: id, namespace: namespace))
+            .modifier(NibGlassBackdropModifier(kind: style.glassKind, shape: shape, frozen: field.isFrozen,
+                                               recedes: presentation.recedes))
             // The container draws the contrast/frozen body behind GlassEffectContainer. A background
             // here belongs to that container's content, above its combined native backdrop effect.
             .overlay {

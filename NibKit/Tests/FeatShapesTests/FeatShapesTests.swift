@@ -276,6 +276,19 @@ final class FeatShapesTests: XCTestCase {
 
     // MARK: Drawer
 
+    func testHeldPenShapesPaintInTheirPageRegion() throws {
+        let origin = Point(160, 400)
+        for kind in [ShapeKind.line, .arrow, .arc, .curve, .rectangle, .ellipse, .triangle, .polygon] {
+            let shape = try ShapeGeometry.make(kind, frame: Frame(x: origin.x + 20, y: origin.y + 20, w: 120, h: 80),
+                points: nil, style: ShapeItemStyle(strokeWidth: 1.2, cornerRadius: 0, drawnWith: .pen))
+            let pixels = inkedPixels(name: "Held \(kind)") { cg in
+                cg.translateBy(x: -origin.x, y: -origin.y)
+                ShapeRenderer.draw(shape, in: cg, scale: 1, darkPaper: false)
+            }
+            XCTAssertGreaterThan(pixels, 60, "Held \(kind) must paint where it was drawn")
+        }
+    }
+
     func testDrawerPaintsEveryKind() throws {
         let drawer = ShapeDrawer()
         for kind in ShapeKind.allCases {
@@ -344,7 +357,7 @@ final class FeatShapesTests: XCTestCase {
 
     // MARK: Tool
 
-    func testToolDragCreatesTheChosenShapeAndATapPlacesOne() async throws {
+    func testToolDragCreatesTheChosenShapeAndATapLeavesItReady() async throws {
         let h = Harness(features: [FeatShapesFeature.self])
         h.app.settings.set(ShapeSettings.kind, ShapeLibraryEntry.ellipse.rawValue)
         h.app.settings.set(ShapeSettings.fill, "#2156D9")
@@ -353,27 +366,190 @@ final class FeatShapesTests: XCTestCase {
         h.session.selectTool("pen")
         h.session.selectTool(ShapeTool.toolID)
         tool.activate(host)
+        let before = try h.snapshot()
         tool.tap(CanvasSample(page: Fixtures.page2, location: Point(300, 400)), host: host)
         await tool.pendingCreate?.value
-        var items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(items.first?.shape?.frame.center, Point(300, 400))
-        XCTAssertEqual(host.renderWaits, [Fixtures.page2], "the preview waits for the tiles")
-        XCTAssertEqual(h.session.tool, "pen", "non-sticky: one shape, then back to the previous tool")
+        XCTAssertEqual(try h.snapshot(), before, "F031 specifies drag-to-create, not tap-to-place")
+        XCTAssertTrue(host.renderWaits.isEmpty)
+        XCTAssertEqual(h.session.tool, ShapeTool.toolID, "a tap must not consume the non-sticky tool")
 
         tool.touchesBegan(CanvasSample(page: Fixtures.page2, location: Point(100, 100)), host: host)
         tool.touchesMoved([CanvasSample(page: Fixtures.page2, location: Point(220, 180))], host: host)
         tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: Point(220, 180)), host: host)
         tool.tap(CanvasSample(page: Fixtures.page2, location: Point(220, 180)), host: host)   // the same touch: ignored
         await tool.pendingCreate?.value
-        items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
-        XCTAssertEqual(items.count, 2)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(items.count, 1)
         let s = try XCTUnwrap(items.last?.shape)
         XCTAssertEqual(s.shape, .ellipse)
         XCTAssertEqual(s.frame, Frame(x: 100, y: 100, w: 120, h: 80))
         XCTAssertEqual(s.style.fillColor?.sameHue(NibInk.cobalt.rgba), true)
         XCTAssertEqual(s.style.fillColor?.alpha ?? 0, 0.35, accuracy: 0.01)
+        XCTAssertEqual(host.renderWaits, [Fixtures.page2], "the preview waits for the tiles")
+        XCTAssertEqual(h.session.tool, "pen", "non-sticky: one shape, then back to the previous tool")
         tool.deactivate(host)
+    }
+
+    func testStationaryTouchesThenRectangleDragCreateOnlyOneShapeAndUndoInOneStep() async throws {
+        for isPencil in [false, true] {
+            let h = Harness(features: [FeatShapesFeature.self])
+            let host = FakeCanvasHost(h)
+            let tool = ShapeTool()
+            h.session.selectTool("pen")
+            h.session.selectTool(ShapeTool.toolID)
+            tool.activate(host)
+            let before = try h.snapshot()
+            let initialItems = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+            let initialSelection = h.session.selection
+
+            // Outside-library taps can arrive as a gesture or a sample stream, with a little finger jitter.
+            for jitter in [0.0, 2.0] {
+                let start = CanvasSample(page: Fixtures.page1, location: Point(500, 700), isPencil: isPencil)
+                let end = CanvasSample(page: Fixtures.page1, location: Point(500 + jitter, 700), isPencil: isPencil)
+                tool.touchesBegan(start, host: host)
+                tool.touchesMoved([end], host: host)
+                tool.touchesEnded(end, host: host)
+                tool.tap(end, host: host)
+                await tool.pendingCreate?.value
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.session.selection, initialSelection)
+                XCTAssertEqual(h.session.tool, ShapeTool.toolID)
+                XCTAssertTrue(host.renderWaits.isEmpty)
+            }
+
+            let start = CanvasSample(page: Fixtures.page1, location: Point(300, 550), isPencil: isPencil)
+            let end = CanvasSample(page: Fixtures.page1, location: Point(420, 650), isPencil: isPencil)
+            tool.touchesBegan(start, host: host)
+            tool.touchesMoved([end], host: host)
+            tool.touchesEnded(end, host: host)
+            await tool.pendingCreate?.value
+            // A separately delivered tap after the commit must not insert another default shape.
+            tool.tap(end, host: host)
+            await tool.pendingCreate?.value
+            let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+            let created = try XCTUnwrap(items.first { item in !initialItems.contains { $0.id == item.id } })
+            XCTAssertEqual(items.count, initialItems.count + 1)
+            XCTAssertEqual(items.filter { $0.kind == .stroke }.count, initialItems.filter { $0.kind == .stroke }.count)
+            XCTAssertEqual(created.shape?.shape, .rectangle)
+            XCTAssertEqual(created.shape?.frame, Frame(x: 300, y: 550, w: 120, h: 100))
+            XCTAssertEqual(h.session.tool, "pen")
+            XCTAssertEqual(host.renderWaits, [Fixtures.page1])
+            let after = try h.snapshot()
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), after)
+            tool.deactivate(host)
+        }
+    }
+
+    func testLineDragSurvivesADeferredDismissalTouch() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        h.app.settings.set(ShapeSettings.kind, ShapeLibraryEntry.line.rawValue)
+        let host = FakeCanvasHost(h)
+        let tool = ShapeTool()
+        h.session.selectTool("pen")
+        h.session.selectTool(ShapeTool.toolID)
+        tool.activate(host)
+        let before = try h.snapshot()
+        let start = CanvasSample(page: Fixtures.page2, location: Point(100, 100), isPencil: false, touchID: 2)
+        let end = CanvasSample(page: Fixtures.page2, location: Point(220, 180), isPencil: false, touchID: 2)
+        let dismissal = CanvasSample(page: Fixtures.page2, location: Point(500, 700), isPencil: false, touchID: 1)
+        tool.touchesBegan(start, host: host)
+        tool.touchesMoved([end], host: host)
+        // The canvas resolves finger taps asynchronously after its command handlers. Replaying
+        // the earlier outside tap must not overwrite or end the line's in-flight sample stream.
+        tool.touchesBegan(dismissal, host: host)
+        tool.touchesMoved([dismissal], host: host)
+        tool.touchesEnded(dismissal, host: host)
+        tool.tap(dismissal, host: host)
+        tool.touchesEnded(end, host: host)
+        await tool.pendingCreate?.value
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items.first?.shape?.shape, .line)
+        XCTAssertEqual(items.first?.shape?.points, [start.location, end.location])
+        XCTAssertTrue(host.committed.isEmpty)
+        XCTAssertEqual(h.session.tool, "pen")
+        XCTAssertEqual(host.renderWaits, [Fixtures.page2])
+        let after = try h.snapshot()
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), after)
+        tool.deactivate(host)
+    }
+
+    func testPolygonDismissalIgnoresPredictionsAndPageRelayoutBeforeOneDrag() async throws {
+        for isPencil in [false, true] {
+            let h = Harness(features: [FeatShapesFeature.self])
+            h.app.settings.set(ShapeSettings.kind, ShapeLibraryEntry.polygon.rawValue)
+            let host = FakeCanvasHost(h)
+            let tool = ShapeTool()
+            h.session.selectTool("pen")
+            h.session.selectTool(ShapeTool.toolID)
+            tool.activate(host)
+            let before = try h.snapshot()
+            let dismissal = CanvasSample(page: Fixtures.page2, location: Point(500, 700), isPencil: isPencil)
+            tool.touchesBegan(dismissal, host: host)
+            tool.touchesMoved([CanvasSample(page: Fixtures.page2, location: Point(550, 750),
+                                           isPencil: isPencil, isPredicted: true)], host: host)
+            // A tiny real jitter after a predicted excursion is still a tap. A change in the
+            // page's view transform must not consume the non-sticky tool either.
+            host.zoomScale = 1.5
+            var lift = dismissal
+            lift.location.x += 2
+            tool.touchesEnded(lift, host: host)
+            tool.tap(lift, host: host)
+            await tool.pendingCreate?.value
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.session.tool, ShapeTool.toolID)
+            XCTAssertTrue(host.renderWaits.isEmpty)
+
+            let start = CanvasSample(page: Fixtures.page2, location: Point(100, 100), isPencil: isPencil)
+            let end = CanvasSample(page: Fixtures.page2, location: Point(220, 180), isPencil: isPencil)
+            tool.touchesBegan(start, host: host)
+            tool.touchesMoved([end], host: host)
+            tool.touchesEnded(end, host: host)
+            await tool.pendingCreate?.value
+            let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+            XCTAssertEqual(items.count, 1)
+            XCTAssertEqual(items.first?.shape?.shape, .polygon)
+            XCTAssertEqual(items.first?.shape?.points.count, 6)
+            XCTAssertEqual(items.first?.shape?.frame, Frame(x: 100, y: 100, w: 120, h: 80))
+            XCTAssertTrue(host.committed.isEmpty)
+            XCTAssertEqual(h.session.tool, "pen")
+            XCTAssertEqual(host.renderWaits, [Fixtures.page2])
+            let after = try h.snapshot()
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), after)
+            tool.deactivate(host)
+        }
+    }
+
+    func testLineDragUsesEveryActualCoalescedSampleAndItsLiftEndpoint() async throws {
+        for end in [Point(103, 103), Point(220, 100), Point(100, 180)] {
+            let h = Harness(features: [FeatShapesFeature.self])
+            h.app.settings.set(ShapeSettings.kind, ShapeLibraryEntry.line.rawValue)
+            let host = FakeCanvasHost(h)
+            let tool = ShapeTool()
+            h.session.selectTool(ShapeTool.toolID)
+            tool.activate(host)
+            let start = CanvasSample(page: Fixtures.page2, location: Point(100, 100))
+            let lift = CanvasSample(page: Fixtures.page2, location: end)
+            tool.touchesBegan(start, host: host)
+            tool.touchesMoved([CanvasSample(page: Fixtures.page2, location: Point(220, 180)), lift,
+                              CanvasSample(page: Fixtures.page2, location: Point(400, 400), isPredicted: true)], host: host)
+            tool.touchesEnded(lift, host: host)
+            await tool.pendingCreate?.value
+            let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+            XCTAssertEqual(items.count, 1)
+            XCTAssertEqual(items.first?.shape?.points, [start.location, end])
+            XCTAssertTrue(host.committed.isEmpty)
+            tool.deactivate(host)
+        }
     }
 
     func testLibraryEntriesBuildTheirShapes() {
@@ -944,11 +1120,17 @@ final class FeatShapesTests: XCTestCase {
     }
 
     /// Pixels with visible alpha after drawing into a transparent 160 × 120 pt bitmap at 1×.
-    private func inkedPixels(_ draw: (CGContext) -> Void) -> Int {
+    private func inkedPixels(name: String? = nil, _ draw: (CGContext) -> Void) -> Int {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = false
         let image = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 120), format: format).image { draw($0.cgContext) }
+        if let name {
+            let attachment = XCTAttachment(image: image)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
         guard let cg = image.cgImage else { return 0 }
         let w = cg.width, h = cg.height
         var data = [UInt8](repeating: 0, count: w * h * 4)

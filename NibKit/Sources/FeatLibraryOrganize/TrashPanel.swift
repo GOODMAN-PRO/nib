@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NibContracts
 import NibDesign
 
@@ -388,10 +389,14 @@ struct TrashPanel: View {
         if isSelecting {
             rowContent(entry)
         } else {
-            Menu {
-                actions([entry])
-            } label: {
-                rowContent(entry)
+            rowContent(entry)
+            .accessibilityHidden(true)
+            .overlay {
+                TrashRowMenu(label: entry.title + ", " + details(entry),
+                             recover: { recover([entry]) },
+                             move: { moving = [entry] },
+                             delete: { confirmDelete = [entry] })
+                    .accessibilityHidden(false)
             }
             .disabled(isWorking)
         }
@@ -460,20 +465,6 @@ struct TrashPanel: View {
         guard let at = entry.trashedAt else { return type }
         let date = Date(timeIntervalSince1970: at).formatted(date: .abbreviated, time: .omitted)
         return String(localized: "\(type) · Deleted \(date)")
-    }
-
-    @ViewBuilder private func actions(_ entries: [TrashEntry]) -> some View {
-        Button { recover(entries) } label: {
-            Label { Text(String(localized: "Recover")) } icon: { Image(nib: .undo) }
-        }
-        if Trash.moveTarget(entries) != nil {
-            Button { moving = entries } label: {
-                Label { Text(String(localized: "Move")) } icon: { Image(nib: .folder) }
-            }
-        }
-        Button(role: .destructive) { confirmDelete = entries } label: {
-            Label { Text(String(localized: "Delete Permanently")) } icon: { Image(nib: .trash) }
-        }
     }
 
     // MARK: Selection bar
@@ -574,5 +565,77 @@ struct TrashPanel: View {
         let window = self.window
         let params: JSONValue = ["name": .string(OrganizeSettings.trashSort.name), "value": .string(value.rawValue)]
         Task { await Organize.run(window, CommandIDs.settingsSet, params) }
+    }
+}
+
+/// One native interaction handles both tap and long press. A row must stay alive until UIKit has
+/// removed its menu preview; mutating the list in a menu action can strand the dismissal overlay
+/// over the remaining rows. Sheets and confirmations also wait for that transition to finish.
+struct TrashRowMenu: UIViewRepresentable {
+    let label: String
+    let recover: () -> Void
+    let move: () -> Void
+    let delete: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeUIView(context: Context) -> TrashMenuButton {
+        let button = TrashMenuButton(type: .custom)
+        button.showsMenuAsPrimaryAction = true
+        return button
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: TrashMenuButton, context: Context) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else { return nil }
+        // The visual label is SwiftUI content underneath; the native button covers its whole row.
+        return CGSize(width: width, height: height)
+    }
+
+    func updateUIView(_ button: TrashMenuButton, context: Context) {
+        button.accessibilityLabel = label
+        button.isEnabled = isEnabled
+        button.configure(recover: recover, move: move, delete: delete)
+    }
+}
+
+final class TrashMenuButton: UIButton {
+    private(set) var isPresentingMenu = false
+    private var afterDismissal: (() -> Void)?
+
+    func configure(recover: @escaping () -> Void, move: @escaping () -> Void, delete: @escaping () -> Void) {
+        guard !isPresentingMenu else { return }
+        func action(_ title: String, _ symbol: NibSymbol, destructive: Bool = false,
+                    perform: @escaping () -> Void) -> UIAction {
+            UIAction(title: title, image: UIImage(nib: symbol),
+                     attributes: destructive ? .destructive : []) { [weak self] _ in
+                self?.afterDismissal = perform
+            }
+        }
+        menu = UIMenu(children: [
+            action(String(localized: "Recover"), .undo, perform: recover),
+            action(String(localized: "Move"), .folder, perform: move),
+            action(String(localized: "Delete Permanently"), .trash, destructive: true, perform: delete),
+        ])
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willDisplayMenuFor configuration: UIContextMenuConfiguration,
+                                         animator: UIContextMenuInteractionAnimating?) {
+        super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+        isPresentingMenu = true
+        afterDismissal = nil
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willEndFor configuration: UIContextMenuConfiguration,
+                                         animator: UIContextMenuInteractionAnimating?) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        // Retain the source through dismissal even if an unrelated library update removes its row.
+        let finish: () -> Void = { [self] in
+            isPresentingMenu = false
+            let action = afterDismissal
+            afterDismissal = nil
+            action?()
+        }
+        if let animator { animator.addCompletion(finish) } else { finish() }
     }
 }

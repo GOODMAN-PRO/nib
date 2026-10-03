@@ -224,6 +224,7 @@ private struct SolvePanelContent: View {
                 NibButton(String(localized: "Set Up AI"), kind: .plain) {
                     context.app.perform(CommandIDs.settingsOpen, ["page": "ai"], session: context.session)
                 }
+                .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
             }
         }.disabled(model.busy)
     }
