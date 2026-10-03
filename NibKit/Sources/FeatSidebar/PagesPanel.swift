@@ -472,11 +472,11 @@ final class PagesPanelModel: ObservableObject {
         await run(CommandIDs.pageAdd, .object(o))
     }
 
-    /// Full-window grid → back to the sidebar after choosing a page (FeatDocChrome's `sidebar.toggle {mode}`).
-    /// False when the chrome has no such command (the caller closes the panel instead).
-    func showAsSidebar() async -> Bool {
-        guard app.commands.descriptor(SidebarIDs.sidebarToggle) != nil else { return false }
-        return await run(SidebarIDs.sidebarToggle, ["mode": "sidebar"]) != nil
+    /// Choosing a page preserves the user's navigator mode. Only a compact sheet
+    /// closes to reveal the page; Sidebar / Window remains an explicit choice.
+    func navigate(_ page: PageID, presentation: PanelPresentation?, compact: Bool) async -> Bool {
+        await goTo(page)
+        return compact || presentation == .sheet
     }
 
     /// A reorder shown in the list, waiting for its command.
@@ -630,22 +630,19 @@ struct PagesPanel: View {
                           message: String(localized: "Bookmark a page with the Bookmark button in the bar."),
                           primary: NibAction(String(localized: "Show All Pages")) { model.filter = .all })
         } else {
-            ThumbnailGridView(model: model, presentation: context.presentation) { page, fullWindow in
-                open(page, fullWindow: fullWindow)
+            ThumbnailGridView(model: model, presentation: context.presentation) { page, _ in
+                open(page)
             }
         }
     }
 
-    /// Tapping a thumbnail shows its page; on iPhone the sheet closes, in Window mode the chrome goes back to the sidebar.
-    private func open(_ page: PageID, fullWindow: Bool) {
+    /// Tapping a thumbnail shows its page and dismisses only compact navigation.
+    private func open(_ page: PageID) {
         let compact = sizeClass == .compact || context.presentation == .sheet
         let dismiss = context.dismiss
         let model = self.model
         Task { @MainActor in
-            await model.goTo(page)
-            if compact {
-                dismiss()
-            } else if fullWindow, !(await model.showAsSidebar()) {
+            if await model.navigate(page, presentation: context.presentation, compact: compact) {
                 dismiss()
             }
         }

@@ -105,7 +105,8 @@ final class FeatTemplateUITests: XCTestCase {
             let doc = try XCTUnwrap(NodeRef(p["doc"]?.stringValue ?? "")?.documentID)
             let url = try await ctx.inputFile(XCTUnwrap(p["url"]?.stringValue))
             let ref = try h.assets.put(Data(contentsOf: url), ext: p["ext"]?.stringValue ?? "png", doc: doc)
-            return try JSONValue.from(ref)
+            return ["asset": .string(ref.name), "doc": .string(NodeRef.document(doc).description),
+                    "bytes": .number(Double(try Data(contentsOf: url).count))]
         }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.nodeSet, title: "Set Node", summary: "Test node stand-in.", effect: .edit)) { p, ctx in
             let node = try XCTUnwrap(NodeRef(p["ref"]?.stringValue ?? ""))
@@ -322,6 +323,10 @@ final class FeatTemplateUITests: XCTestCase {
         let covered = try h.snapshot()
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
         XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
+        let background = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.background)
+        let asset = try XCTUnwrap(background.asset)
+        XCTAssertFalse(try h.assets.data(asset, doc: Fixtures.docID).isEmpty,
+                       "The asset.put receipt must resolve to the stored cover bytes")
         XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.ext?[TemplateChange.customCoverKey], "cover01")
         h.app.bus.undo(Fixtures.docID); XCTAssertEqual(try h.snapshot(), before)
         h.app.bus.redo(Fixtures.docID); XCTAssertEqual(try h.snapshot(), covered)

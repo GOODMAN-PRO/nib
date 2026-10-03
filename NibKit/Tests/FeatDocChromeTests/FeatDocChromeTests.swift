@@ -12,6 +12,35 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(FeatDocChromeFeature.id, "chrome")
     }
 
+    func testLiveStatusProviderReevaluatesWhenItsVisibilityChanges() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        var visible = true
+        var evaluations: [Bool] = []
+        var status = ToolbarItemDescriptor(id: "test.liveStatus", title: "Live status", icon: "circle",
+                                          group: .navLeading, order: 40, owner: "tests", hideable: false)
+        status.navSlot = .afterTitle
+        status.compactStatus = { _ in
+            evaluations.append(visible)
+            return visible ? AnyView(Text("Live status")) : nil
+        }
+        h.app.ui.toolbar.register(status)
+        let navigator = TestNavigator(session: h.session)
+        let container = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.docID,
+                                                        app: h.app, navigator: navigator)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = container
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        container.view.layoutIfNeeded()
+        try await waitUntil { evaluations.last == true }
+        visible = false
+        h.app.ui.setNeedsChromeUpdate()
+        try await waitUntil { evaluations.last == false }
+        visible = true
+        h.app.ui.setNeedsChromeUpdate()
+        try await waitUntil { evaluations.last == true }
+    }
+
     func testSingleLineDocumentTitlesKeepAFullHeightTarget() throws {
         let chrome = try makeWindow(Harness(features: [FeatDocChromeFeature.self]))
         for kind in [DocumentKind.whiteboard, .textDocument] {
@@ -581,6 +610,21 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
+    func testWindowNavigatorSuppressesPaletteUntilCanvasIsRevealed() {
+        for mode in [SidebarMode.window, .sidebar] {
+            let layout = ChromeLayout(size: CGSize(width: 1376, height: 1032), safeArea: .zero,
+                                      left: NibMetrics.navigatorWidth, right: nil, mode: mode, idiom: .pad)
+            XCTAssertEqual(ChromePalettePolicy.showsPalette(reservesSpace: true, compact: layout.isCompact,
+                                                            sheet: nil, windowNavigator: layout.window != nil),
+                           mode == .sidebar,
+                           "Drawing controls must not intercept full-window thumbnail taps or drags")
+        }
+        let closed = ChromeLayout(size: CGSize(width: 1376, height: 1032), safeArea: .zero,
+                                  left: nil, right: nil, mode: .window, idiom: .pad)
+        XCTAssertTrue(ChromePalettePolicy.showsPalette(reservesSpace: true, compact: closed.isCompact,
+                                                       sheet: nil, windowNavigator: closed.window != nil))
+    }
+
     func testCompactAssistantSheetsSuppressPaletteAndRestoreItWithoutChangingReservation() {
         let state = ChromeState()
         let layout = ChromeLayout(size: CGSize(width: 393, height: 852), safeArea: .zero,
@@ -945,6 +989,25 @@ final class FeatDocChromeTests: XCTestCase {
 
     // MARK: Commands
 
+    func testRetainedDocumentChromeDoesNotEraseLibraryPanelState() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let store = try XCTUnwrap(h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self))
+        let state = store.state(for: h.session)
+        state.open("test.pages", at: .left)
+        h.session.document = nil
+        h.session.openPanels = [PanelIDs.templates]
+        store.adopt(h.session)
+        XCTAssertEqual(h.session.openPanels, [PanelIDs.templates], "The visible library sheet owns session state")
+        XCTAssertEqual(state.openPanels, ["test.pages"], "The document navigator remains saved for reopening")
+        h.session.openPanels = [PanelIDs.trash]
+        store.adopt(h.session)
+        XCTAssertEqual(h.session.openPanels, [PanelIDs.trash])
+        h.session.openPanels = []
+        store.adopt(h.session)
+        XCTAssertTrue(h.session.openPanels.isEmpty)
+        XCTAssertEqual(state.openPanels, ["test.pages"])
+    }
+
     func testPanelCommandsPlacePanelsWhereTheSettingsSay() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         h.app.ui.panels.register(panel("test.pages", .sidebarTab, kinds: [.notebook]))
@@ -1148,6 +1211,24 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(r["panel"], "test.outline", "the sidebar comes back on the tab it showed")
 
         await assertCode(.invalidParams) { try await h.run("sidebar.toggle", ["mode": "grid"]) }
+    }
+
+    func testSidebarToggleRestoresAndHidesTheRememberedFloatingNavigator() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        h.app.ui.panels.register(panel("test.pages", .sidebarTab, order: 0))
+        h.app.ui.panels.register(panel("test.outline", .sidebarTab, order: 10))
+        let state = try chromeState(h)
+        try await h.run("sidebar.toggle")
+        try await h.run("settings.set", ["name": "chrome.panelPlacement.test.pages", "value": "floating"])
+        try await h.run("panel.open", ["id": "test.pages"])
+        try await h.run("panel.close", ["id": "test.pages"])
+        let reopened = try await h.run("sidebar.toggle")
+        XCTAssertEqual(reopened["panel"], "test.pages")
+        XCTAssertEqual(state.spot(of: "test.pages"), .floating)
+        XCTAssertTrue(state.tabs.isEmpty)
+        let hidden = try await h.run("sidebar.toggle")
+        XCTAssertEqual(hidden["visible"], false)
+        XCTAssertTrue(state.openPanels.isEmpty)
     }
 
     func testBoardsNavigatorOpensAndRemainsAvailableAfterReopeningWhiteboard() async throws {

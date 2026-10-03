@@ -124,6 +124,21 @@ final class FeatSidebarTests: XCTestCase {
 
     // MARK: Layout
 
+    func testPageNavigationPreservesWindowModeAndDismissesCompactSheets() async throws {
+        let h = harness(), log = CallLog()
+        stub(h, [CommandIDs.viewGoToPage, CommandIDs.sidebarToggle], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        for presentation in [PanelPresentation.window, .sidebar, .sheet] {
+            let dismiss = await model.navigate(p2, presentation: presentation, compact: false)
+            XCTAssertEqual(dismiss, presentation == .sheet)
+        }
+        let dismissCompact = await model.navigate(p1, presentation: .window, compact: true)
+        XCTAssertTrue(dismissCompact)
+        XCTAssertEqual(log.calls.map(\.command), Array(repeating: CommandIDs.viewGoToPage, count: 4),
+                       "Selecting a page must not silently change the navigator presentation")
+        XCTAssertEqual(log.calls.first?.params["page"]?.stringValue, ref(p2))
+    }
+
     /// The chrome's `PanelContext.presentation` alone picks the layout (contracts-v2 G16), whatever width it gives.
     func testWindowPresentationIsTheFullWindowGrid() {
         XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .window, compact: false), .grid)
@@ -976,6 +991,28 @@ final class FeatSidebarTests: XCTestCase {
         grid.view.frame = CGRect(x: 0, y: 0, width: 240, height: 900)
         grid.view.layoutIfNeeded()
         return grid
+    }
+
+    func testPageSelectionOwnsNativeSelectAllAndCopyActions() throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        XCTAssertFalse(grid.canPerformAction(#selector(UIResponderStandardEditActions.selectAll(_:)), withSender: nil))
+        model.setSelecting(true)
+        grid.update()
+        XCTAssertTrue(grid.canPerformAction(#selector(UIResponderStandardEditActions.selectAll(_:)), withSender: nil))
+        XCTAssertFalse(grid.canPerformAction(#selector(UIResponderStandardEditActions.copy(_:)), withSender: nil))
+        grid.selectAll(nil)
+        XCTAssertEqual(model.selection, Set(model.rows.map(\.id)))
+        XCTAssertTrue(grid.canPerformAction(#selector(UIResponderStandardEditActions.copy(_:)), withSender: nil))
+        XCTAssertTrue(h.session.selection.items.isEmpty, "Page Select All must leave canvas item selection alone")
+    }
+
+    func testHeldThumbnailDragWinsOverSwipeSelection() {
+        XCTAssertTrue(SwipeSelection.mayBegin(velocity: CGPoint(x: 100, y: 10), heldDuration: 0.05, isDragging: false))
+        XCTAssertFalse(SwipeSelection.mayBegin(velocity: CGPoint(x: 100, y: 10), heldDuration: 0.8, isDragging: false))
+        XCTAssertFalse(SwipeSelection.mayBegin(velocity: CGPoint(x: 100, y: 10), heldDuration: 0.05, isDragging: true))
+        XCTAssertFalse(SwipeSelection.mayBegin(velocity: CGPoint(x: 10, y: 100), heldDuration: 0.05, isDragging: false))
     }
 
     func testThumbnailActivationAndTouchUseTheCollectionCell() async throws {

@@ -272,6 +272,8 @@ public struct NibSidebarRow: View {
                     in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(title)
+        .accessibilityValue(count.map { $0 == 1 ? String(localized: "1 item") : String(localized: "\($0) items") } ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

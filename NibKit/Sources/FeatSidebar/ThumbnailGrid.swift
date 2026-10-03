@@ -93,6 +93,11 @@ struct ThumbnailLayoutMetrics: Equatable {
 /// Select mode's swipe: starting on a thumbnail, sweeping across others selects them all (or deselects them all when
 /// the swipe started on a selected one), relative to the selection before the swipe, so sweeping back undoes.
 struct SwipeSelection {
+    /// A quick sweep selects; a held thumbnail belongs to UIKit's native drag.
+    static func mayBegin(velocity: CGPoint, heldDuration: TimeInterval, isDragging: Bool) -> Bool {
+        !isDragging && heldDuration < 0.5 && abs(velocity.x) > abs(velocity.y)
+    }
+
     let order: [PageID]
     let base: Set<PageID>
     let anchor: Int
@@ -321,6 +326,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var deferredRefresh = false
     private var retryUpdate: Task<Void, Never>?
     private let swipePan = UIPanGestureRecognizer()
+    private var swipeTouchBegan: TimeInterval = 0
     private var swipe: SwipeSelection?
     private var swipeLocation: CGPoint?
     private var autoScroll: CADisplayLink?
@@ -472,10 +478,10 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
             dataSource.apply(snapshot, animatingDifferences: animate)
         }
 
-        if state.selecting != shown.selecting {
+        if state.selecting != shown.selecting || state.selection != shown.selection {
             if state.selecting {
                 becomeFirstResponder()
-            } else {
+            } else if shown.selecting {
                 resignFirstResponder()
             }
         }
@@ -950,11 +956,18 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     // MARK: Swipe to select
 
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if gestureRecognizer === swipePan { swipeTouchBegan = touch.timestamp }
+        return true
+    }
+
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === swipePan else { return true }
         guard model.isSelecting, let collectionView = collectionView else { return false }
         let velocity = swipePan.velocity(in: collectionView)
-        guard abs(velocity.x) > abs(velocity.y) else { return false }
+        guard SwipeSelection.mayBegin(velocity: velocity,
+                                      heldDuration: ProcessInfo.processInfo.systemUptime - swipeTouchBegan,
+                                      isDragging: collectionView.hasActiveDrag) else { return false }
         return pageID(at: swipePan.location(in: collectionView)) != nil
     }
 
@@ -1035,9 +1048,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     override var keyCommands: [UIKeyCommand]? {
         guard model.isSelecting else { return nil }
-        let selectAll = UIKeyCommand(title: String(localized: "Select All Pages"), action: #selector(selectAllPages),
+        let selectAll = UIKeyCommand(title: String(localized: "Select All Pages"), action: #selector(selectAll(_:)),
                                      input: "a", modifierFlags: .command)
-        let copy = UIKeyCommand(title: String(localized: "Copy Pages"), action: #selector(copyPages),
+        let copy = UIKeyCommand(title: String(localized: "Copy Pages"), action: #selector(copy(_:)),
                                 input: "c", modifierFlags: .command)
         let trash = UIKeyCommand(title: String(localized: "Move Pages to Trash"), action: #selector(trashPages),
                                  input: UIKeyCommand.inputDelete)
@@ -1047,9 +1060,21 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         return [selectAll, copy, trash, done]
     }
 
-    @objc private func selectAllPages() { model.selectAll() }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(selectAll(_:)) { return model.isSelecting && !model.rows.isEmpty }
+        if action == #selector(copy(_:)) { return model.isSelecting && !model.selection.isEmpty }
+        return super.canPerformAction(action, withSender: sender)
+    }
 
-    @objc private func copyPages() { runSelectionAction("copy") }
+    override func selectAll(_ sender: Any?) {
+        guard model.isSelecting else { return }
+        model.selectAll()
+    }
+
+    override func copy(_ sender: Any?) {
+        guard model.isSelecting, !model.selection.isEmpty else { return }
+        runSelectionAction("copy")
+    }
 
     @objc private func trashPages() { runSelectionAction("trash") }
 
