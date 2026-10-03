@@ -176,13 +176,15 @@ The tests live in NibUITests/${cls}.swift (read them to see exactly what the use
       if (minutesUntil(A.shipBy) < 150 && !alive(`${TAG}-verify-${a.key}-${round}`)) { say(`verify ${a.key} r${round}: skipped — out of time; the final verify covers the critical classes`); st.remaining = failures; save(); break }
       const verifyPrompt = `Verify the ${a.key} fixes (round ${round}). Run ${UIRUN(target, 2)} (${target.includes('/test') ? `the ${cls} tests that failed before the fixes` : `the WHOLE ${cls} class — most of it has never run yet`}; identifiers are NibUITests/<Class>/<testMethod>). If the build fails, report the compile errors as a failure with the owning feature. For every failing test decide: test wrong per spec -> fix the test in NibUITests/${cls}.swift (and rerun once if budget allows); app wrong -> report it (do not change app code here). Never git add/commit/stash/checkout/reset. Answer status "green" (all those tests pass) or "red", file "NibUITests/${cls}.swift", tests/passed/failed, failures (test = "${cls}/<testMethod>", owner = feature id or "shared", problem, evidence), notes.`
       let v = await codex(`verify-${a.key}-${round}`, verifyPrompt, 'uiwrite', 'high', 2).catch((e) => ({ status: 'blocked', failures, notes: e.message }))
-      if (!v.tests && minutesUntil(A.shipBy) > 150) {   // nothing executed (build broken by a concurrent edit, runner death): run the verify again
+      const executed = (v.passed || 0) + (v.failed || 0)
+      if (!executed && minutesUntil(A.shipBy) > 150) {   // nothing executed (build broken by a concurrent edit, runner death): run the verify again
         say(`verify ${a.key} r${round}: no tests executed — running the verify again`)
         v = await codex(`verify-${a.key}-${round}b`, verifyPrompt, 'uiwrite', 'high', 2).catch((e) => ({ status: 'blocked', failures, notes: e.message }))
       }
       say(`verify ${a.key} r${round}: ${v.status} — ${v.passed ?? '?'}/${v.tests ?? '?'} pass, ${v.failed ?? '?'} fail`)
       failures = (v.failures || []).map((f) => ({ ...f, test: qual(v, f) }))
-      st.lastTests = v.tests || 0
+      st.lastTests = (v.passed || 0) + (v.failed || 0)
+      if (!st.lastTests && !failures.length) failures = Object.values(groups).flat().map((t) => ({ test: t.split(':')[0], owner: 'shared', problem: 'not verified (no test executed)', evidence: '' }))
       st.rounds.push({ round, before: Object.values(groups).flat().length, after: failures.length, status: v.status }); st.remaining = failures; save()
       if (v.status === 'green') break
     }
