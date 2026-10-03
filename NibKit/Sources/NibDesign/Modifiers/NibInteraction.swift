@@ -185,6 +185,11 @@ private struct NibNativeActionModifier: ViewModifier {
         // Accessibility and keyboard actions remain on the original control.
         content.allowsHitTesting(false).background {
             NibActionTouchTarget(isEnabled: isEnabled, action: action)
+                // The surface owns input, never artwork. Isolate destination-out
+                // compositing so SwiftUI's offscreen platform-view placeholder
+                // is transparent too, without masking or disabling native hits.
+                .blendMode(.destinationOut)
+                .compositingGroup()
                 .accessibilityHidden(true)
         }
     }
