@@ -89,7 +89,7 @@ final class PagesUITests: XCTestCase {
         try wait("Select All must check every thumbnail") { self.ui.app.staticTexts["4 Selected"].exists || (1...4).allSatisfy { self.thumb($0).isSelected } }
         try tap("Deselect All")
         XCTAssertFalse(thumb(2).isSelected)
-        ui.app.typeKey("a", modifierFlags: .command)
+        ui.app.nibTypeKey("a", modifierFlags: .command)
         try selectionAction("Bookmark")
         try wait("Cmd-A batch action must include all four pages") { (try? self.live().allSatisfy { $0["bookmarked"] as? Bool == true }) == true }
     }
@@ -173,11 +173,16 @@ final class PagesUITests: XCTestCase {
         ui.coordinate(CGPoint(x: 0.38, y: 0.85)).tap()
         let before = try ids()
         try more("Image")
-        let photo = ui.app.images.matching(NSPredicate(format: "label BEGINSWITH 'Photo' OR label BEGINSWITH 'Image'")).firstMatch
+        // The document also exposes an Image element; only a Photos asset is
+        // a selectable picker result (F034 / Add Page > Image).
+        let photo = ui.app.images.matching(NSPredicate(format: "label BEGINSWITH 'Photo,'")).firstMatch
         try require(photo, "Add Page > Image must present selectable Photos assets")
         photo.tap()
-        let add = button("Add")
-        if add.exists && add.isHittable { add.tap() }
+        // PHPicker's multi-selection confirmation is Done on iPadOS 26.
+        // Selecting a thumbnail alone does not import the chosen photo.
+        let finish = ui.app.navigationBars["Photos"].buttons
+            .matching(NSPredicate(format: "label == 'Done' OR label == 'Add'")).firstMatch
+        try require(finish, "Confirm the selected Photos asset").tap()
         try count(5)
         XCTAssertEqual(Set(try ids()).intersection(before).count, 4)
         let newImages = try live().filter { background($0)["kind"] as? String == "image" }
@@ -314,6 +319,11 @@ final class PagesUITests: XCTestCase {
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch
         try require(other, "Select the second Nib window in Split View").tap()
+        // F019 shows the current folder's contents. The fixture places Lecture
+        // notes inside Semester Notes, so navigate there in the destination.
+        let folder = ui.app.buttons.matching(identifier: "cmd.library.setView")
+            .matching(NSPredicate(format: "label == 'Semester Notes'")).firstMatch
+        try require(folder, "Open the destination notebook's folder").tap()
         let openTarget = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(format: "label BEGINSWITH 'Lecture notes'")).firstMatch
         try require(openTarget).tap()
         let toggles = ui.app.buttons.matching(identifier: "cmd.sidebar.toggle").allElementsBoundByIndex.filter { $0.isHittable }
@@ -356,7 +366,20 @@ final class PagesUITests: XCTestCase {
     func testPurgePageRequiresConfirmationAndCancelRetainsTrash() throws {
         let removed = try ids()[0]
         try more("Move to Trash"); try count(3)
-        try openTrash(); try trashMenu("Delete Permanently"); try tap("Cancel")
+        try openTrash(); try trashMenu("Delete Permanently")
+        let confirmation = try require(ui.app.sheets["Delete permanently?"])
+        if button("Cancel").exists && button("Cancel").isHittable {
+            try tap("Cancel")
+        } else {
+            // DESIGN §13 uses the native confirmation dialog. On iPad its
+            // popover cancels by tapping outside instead of showing Cancel.
+            let window = ui.app.windows.firstMatch
+            let point = window.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.15))
+            XCTAssertFalse(confirmation.frame.contains(CGPoint(x: window.frame.minX + window.frame.width * 0.95,
+                                                               y: window.frame.minY + window.frame.height * 0.15)))
+            point.tap()
+        }
+        XCTAssertTrue(confirmation.waitForNonExistence(timeout: 5))
         XCTAssertTrue(try allPages().contains { $0["id"] as? String == removed && $0["deleted"] as? Bool == true })
         try trashMenu("Delete Permanently"); try tap("Delete 1 item")
         try wait("Permanently deleted page must no longer be recoverable") {
@@ -425,8 +448,8 @@ final class PagesUITests: XCTestCase {
         try require(label("D")).press(forDuration: 0.8); try tap("Move")
         let tooDeep = button("Nest in Previous Entry")
         XCTAssertFalse(tooDeep.exists && tooDeep.isEnabled, "Outline must not offer a fourth nesting level")
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        ui.app.nibTypeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        ui.app.nibTypeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try outlineMenu("C", "Move Out a Level", move: true)
         try wait("Outdent must move C back under A") { (try? self.entry("C")["parent"] as? String) == (try? self.entry("A")["id"] as? String) }
         let parent = try XCTUnwrap(entry("A")["id"] as? String)
@@ -596,7 +619,7 @@ final class PagesUITests: XCTestCase {
         if !state.openPanels.contains(where: navigatorIDs.contains) {
             // Other page tests use the real navigator shortcut so a HUD regression does not mask them.
             // The sidebar button and HUD have their own direct-tap acceptance tests above.
-            ui.app.typeKey("s", modifierFlags: [.control, .command])
+            ui.app.nibTypeKey("s", modifierFlags: [.control, .command])
             try ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
         }
         if !(try ui.state().openPanels.contains("sidebar.pages")) { try tab("Pages", id: "sidebar.pages") }
@@ -612,7 +635,7 @@ final class PagesUITests: XCTestCase {
     }
     private func closeNavigator() throws {
         if try ui.state().openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) {
-            ui.app.typeKey("s", modifierFlags: [.control, .command])
+            ui.app.nibTypeKey("s", modifierFlags: [.control, .command])
             try ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
         }
     }
@@ -655,7 +678,7 @@ final class PagesUITests: XCTestCase {
         try wait("Live persisted page count must equal \(count)") { (try? self.live().count) == count }
     }
     private func replace(_ field: XCUIElement, _ text: String) throws {
-        try require(field).tap(); field.typeKey("a", modifierFlags: .command); field.typeText(text)
+        try require(field).tap(); field.nibTypeKey("a", modifierFlags: .command); field.typeText(text)
         if !ui.app.alerts.firstMatch.exists, ui.app.keyboards.firstMatch.exists {
             let hide = ui.app.keyboards.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
             if hide.exists { hide.tap() } else { ui.app.keyboards.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.94)).tap() }
@@ -686,7 +709,7 @@ final class PagesUITests: XCTestCase {
         let before = try ids(), kinds = try itemKinds(try ids()[0]), content = try contentSignature(try ids()[0])
         try pages(); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let revision = try ui.state().clipboardChangeCount ?? 0
-        if keyboard { ui.app.typeKey("c", modifierFlags: .command) } else { try selectionAction("Copy") }
+        if keyboard { ui.app.nibTypeKey("c", modifierFlags: .command) } else { try selectionAction("Copy") }
         try ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision }
         XCTAssertEqual(try ids(), before)
         XCTAssertEqual(try itemKinds(before[0]), kinds)
@@ -792,7 +815,7 @@ final class PagesUITests: XCTestCase {
         try wait("Undo must restore all page backgrounds") { (try? self.live().map { self.canonical(self.background($0)) }) == before.map { self.canonical(self.background($0)) } }
     }
     private func manageTemplates() throws {
-        ui.app.typeKey("t", modifierFlags: [.command, .option, .shift])
+        ui.app.nibTypeKey("t", modifierFlags: [.command, .option, .shift])
         try ui.waitForState { $0.openPanels.contains("templateui.manage") }
         try require(button("Import Template"))
     }
@@ -912,7 +935,8 @@ final class PagesUITests: XCTestCase {
     }
     private func assetFile(_ page: [String: Any], in id: String? = nil) throws -> URL {
         let name = try XCTUnwrap(background(page)["asset"] as? String, "Page must retain its background asset reference")
-        let file = try package(id).appendingPathComponent(name)
+        // ARCHITECTURE §4.1: background asset references are names within assets/.
+        let file = try package(id).appendingPathComponent("assets", isDirectory: true).appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: file.path) else { throw NibUI.Failure.message("Missing referenced asset: \(name)") }
         return file
     }

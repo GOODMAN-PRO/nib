@@ -91,6 +91,7 @@ final class NibUI {
     }
 
     func launchFixture(scenario: FixtureScenario = .standard) throws {
+        try NibUIMultitasking.setWindowed(false)
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
         app.launch()
