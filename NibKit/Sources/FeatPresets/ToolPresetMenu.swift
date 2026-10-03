@@ -100,6 +100,9 @@ final class PresetMenuModel {
     private(set) var shown: PresetPopover = .width(1)
     /// Remove and reorder colour slots, restore the defaults (a mode of the bar itself).
     private(set) var arranging = false
+    /// Drag ownership belongs to the window's menu, not a transient SwiftUI
+    /// rendering of it. Glass hosting may retain/rebuild the bar during a drag.
+    @ObservationIgnored var draggedSwatch: Int?
     /// The thickness slider (0…1 on the tool's logarithmic scale) of the thickness slot `shown` names.
     private(set) var widthPosition: Double = 0
 
@@ -187,11 +190,13 @@ final class PresetMenuModel {
 
     func beginArranging() {
         close()
+        draggedSwatch = nil
         arranging = true
         UIAccessibility.post(notification: .layoutChanged, argument: nil)
     }
 
     func endArranging() {
+        draggedSwatch = nil
         arranging = false
         UIAccessibility.post(notification: .layoutChanged, argument: nil)
     }
@@ -378,7 +383,6 @@ struct ToolPresetMenu: View {
     let model: PresetMenuModel
 
     @State private var confirmReset = false
-    @State private var dragged: Int?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var presets: ToolPresets { model.presets }
@@ -393,7 +397,6 @@ struct ToolPresetMenu: View {
             }
         }
         .onAppear { model.reload() }
-        .onChange(of: model.arranging) { _, _ in dragged = nil }
         .confirmationDialog(String(localized: "Restore the default colours and thicknesses?"),
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button(String(localized: "Restore Defaults"), role: .destructive) { model.reset() }
@@ -500,10 +503,11 @@ struct ToolPresetMenu: View {
                 if removable { RemoveBadge() }
             }
             .onDrag {
-                dragged = i
+                model.draggedSwatch = i
                 return NSItemProvider(object: SwatchDropDelegate.payload(i) as NSString)
             }
-            .onDrop(of: [UTType.plainText], delegate: SwatchDropDelegate(index: i, dragged: $dragged) { from, to in
+            .onDrop(of: [UTType.plainText], delegate: SwatchDropDelegate(index: i,
+                dragged: Binding(get: { model.draggedSwatch }, set: { model.draggedSwatch = $0 })) { from, to in
                 model.move(from, to)
             })
             .accessibilityAction(named: Text(String(localized: "Move Left"))) {
@@ -625,6 +629,7 @@ struct LineSampleButton: View {
         .accessibilityValue(value ?? "")
         .accessibilityHint(hint ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .nibNativeAction(action)
     }
 }
 

@@ -52,6 +52,15 @@ final class InkUITests: XCTestCase {
         let predicate = NSPredicate(format: "identifier == %@ OR label == %@", label, label)
         let query = ui.app.descendants(matching: type).matching(predicate)
         for attempt in 0..<(scroll ? 12 : 2) {
+            // Native menus expose transient, same-labelled noninteractive wrappers.
+            // Query the actual control first: inspecting a wrapper's hit point can
+            // fail while UIKit replaces it, although its action remains available.
+            for kind in [XCUIElement.ElementType.button, .switch, .slider, .textField, .segmentedControl]
+                where type == .any || type == kind {
+                let action = ui.app.descendants(matching: kind).matching(predicate).matching(
+                    NSPredicate(format: "NOT identifier BEGINSWITH 'tool.' OR identifier == %@", label)).firstMatch
+                if action.exists && (action.isHittable || !action.isEnabled) { return action }
+            }
             let matches = query.allElementsBoundByIndex.filter {
                 ($0.isHittable || !$0.isEnabled) && (label.hasPrefix("tool.") || !$0.identifier.hasPrefix("tool."))
             }
@@ -195,7 +204,8 @@ final class InkUITests: XCTestCase {
     }
 
     private func undo(to before: QAState) throws {
-        try ui.tapCommand("edit.undo")
+        let button = try control("cmd.edit.undo", type: .button)
+        button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         _ = try ui.waitForState(timeout: 12) {
             $0.strokeCountOnPage == before.strokeCountOnPage && $0.itemCountOnPage == before.itemCountOnPage && $0.redoAvailable
         }
@@ -207,8 +217,8 @@ final class InkUITests: XCTestCase {
         // The main palette mirrors quick inks using the same command ID. Count/edit only the slots in
         // the active tool's options bar; the mirrored buttons are not additional stored presets.
         let group = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", (names[tool] ?? tool) + " presets")).firstMatch
-        return group.buttons.matching(identifier: "cmd.preset.select").allElementsBoundByIndex
-            .filter { !$0.label.hasPrefix("Thickness ") }
+        return group.buttons.matching(NSPredicate(format:
+            "identifier == 'cmd.preset.select' AND NOT label BEGINSWITH 'Thickness '")).allElementsBoundByIndex
     }
 
     private func width(_ slot: Int, edit: Bool = false) throws {
@@ -235,7 +245,7 @@ final class InkUITests: XCTestCase {
 
     private func closeColourPicker() throws {
         // UIKit labels the colour picker's dismissal Close on current iPadOS, Done on older releases.
-        if let close = ui.app.buttons.matching(identifier: "Close").allElementsBoundByIndex.last(where: { $0.isHittable }) {
+        if let close = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'")).allElementsBoundByIndex.last(where: { $0.isHittable }) {
             close.tap()
         } else {
             try tap("Done")
@@ -305,8 +315,15 @@ final class InkUITests: XCTestCase {
 
     private func raster(_ region: CGRect? = nil) throws -> Raster {
         let r = region ?? inkRegion, f = ui.canvas.frame
-        return try Raster(XCUIScreen.main.screenshot(), screenSize: ui.app.frame.size, rect: CGRect(x: f.minX + r.minX * f.width, y: f.minY + r.minY * f.height,
-                                                           width: r.width * f.width, height: r.height * f.height))
+        return try raster(screenRect: CGRect(x: f.minX + r.minX * f.width, y: f.minY + r.minY * f.height,
+                                            width: r.width * f.width, height: r.height * f.height))
+    }
+
+    private func raster(screenRect: CGRect) throws -> Raster {
+        // Device captures use display coordinates even in a resized iPad window.
+        // Scaling the whole display to the app window moves the measured endpoints.
+        let displaySize = XCUIApplication(bundleIdentifier: "com.apple.springboard").frame.size
+        return try Raster(XCUIScreen.main.screenshot(), screenSize: displaySize, rect: screenRect)
     }
 
     private func visibleInk(after before: Raster, region: CGRect? = nil) throws -> Raster {
@@ -428,10 +445,15 @@ final class InkUITests: XCTestCase {
             for value: CGFloat in [0.01, 0.99] {
                 try settings(tool); _ = try slider("Stabilisation", to: value); closePopover()
                 let before = try ui.state(), blank = try raster()
+                let endpoints = [zigzag.first!, zigzag.last!].map {
+                    CGRect(x: $0.x - 0.01, y: $0.y - 0.01, width: 0.02, height: 0.02)
+                }
+                let emptyEndpoints = try endpoints.map { try raster($0) }
                 try draw(zigzag); images.append(try visibleInk(after: blank))
-                for p in [zigzag.first!, zigzag.last!] {
-                    let endpoint = CGRect(x: p.x - 0.01, y: p.y - 0.01, width: 0.02, height: 0.02)
-                    XCTAssertGreaterThan(try raster(endpoint).darkPixels, 0, "Stabilisation must retain both endpoints")
+                for (endpoint, empty) in zip(endpoints, emptyEndpoints) {
+                    // F007 uses native graphite. Its translucent tip must leave a mark,
+                    // but need not cross the opaque-ink darkness threshold.
+                    XCTAssertGreaterThan(try raster(endpoint).changed(from: empty), 0, "Stabilisation must retain both endpoints")
                 }
                 try undo(to: before)
             }
@@ -607,7 +629,8 @@ final class InkUITests: XCTestCase {
         try settings("highlighter"); try tap("Custom…")
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
-        let spectrum = try control("Color spectrum")
+        let spectrum = ui.app.otherElements.matching(NSPredicate(format: "label ==[c] 'Color Spectrum'")).firstMatch
+        XCTAssertTrue(spectrum.waitForExistence(timeout: 5) && spectrum.isHittable)
         spectrum.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.35)).tap()
         try closeColourPicker()
         closePopover()
@@ -1196,6 +1219,8 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try draw()
         try draw([CGPoint(x: 0.4, y: 0.72), CGPoint(x: 0.6, y: 0.72)])
+        let page = ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 1 of 4'")).firstMatch
+        let drawnPage = page.frame, drawnCanvas = ui.canvas.frame
         try ui.tapCommand("sidebar.toggle"); try tap("Panel Options"); try tap("History")
         _ = try ui.waitForState { $0.openPanels.contains("undo.history") }
         let reverts = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Revert '"))
@@ -1203,8 +1228,18 @@ final class InkUITests: XCTestCase {
         reverts.element(boundBy: 1).tap() // newest first: choose the older stroke
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try ui.tapCommand("sidebar.toggle")
-        XCTAssertGreaterThan(try raster(CGRect(x: 0.42, y: 0.71, width: 0.16, height: 0.02)).darkPixels, 10, "Later unrelated stroke must survive selective revert")
-        XCTAssertEqual(try raster(CGRect(x: 0.42, y: 0.61, width: 0.16, height: 0.02)).darkPixels, 0, "Chosen earlier stroke must disappear")
+        // Sidebar navigation can fold chrome and move paper inside the viewport.
+        // Ink stays in page coordinates, so follow the same piece of paper.
+        func sample(_ y: CGFloat) throws -> Raster {
+            let currentPage = page.frame
+            let sx = currentPage.width / drawnPage.width, sy = currentPage.height / drawnPage.height
+            return try raster(screenRect: CGRect(
+                x: currentPage.minX + (drawnCanvas.minX + 0.42 * drawnCanvas.width - drawnPage.minX) * sx,
+                y: currentPage.minY + (drawnCanvas.minY + y * drawnCanvas.height - drawnPage.minY) * sy,
+                width: 0.16 * drawnCanvas.width * sx, height: 0.02 * drawnCanvas.height * sy))
+        }
+        XCTAssertGreaterThan(try sample(0.71).darkPixels, 10, "Later unrelated stroke must survive selective revert")
+        XCTAssertEqual(try sample(0.61).darkPixels, 0, "Chosen earlier stroke must disappear")
     }
 
     // MARK: Pencil palette and simulator-testable Pencil preferences
@@ -1280,8 +1315,10 @@ final class InkUITests: XCTestCase {
         let first = choices.firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 5)); first.tap()
         XCTAssertTrue(first.isSelected, "Double-tap binding must persist its choice")
-        // Both gesture sections offer the same choices. Select the second section's palette binding.
-        let squeeze = ui.app.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).element(boundBy: 1)
+        // Native lists recycle offscreen rows; the second matching row can become
+        // the first as Double-tap scrolls away. Use its accessible gesture context.
+        let squeeze = ui.app.buttons.matching(NSPredicate(format:
+            "label == 'Show tool palette' AND value == 'Squeeze'")).firstMatch
         for _ in 0..<12 {
             if squeeze.exists && squeeze.isHittable { break }
             let detail = try XCTUnwrap(scrollPanels.max(by: { $0.frame.minX < $1.frame.minX }))
