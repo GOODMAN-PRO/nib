@@ -211,22 +211,110 @@ struct EraserSettingsView: View {
                 confirmingClear = true
             }
             .disabled(session.document == nil || session.page == nil || session.readOnly)
-            // An iPad confirmationDialog hides Cancel and relies on outside taps while another
-            // popover (the retained eraser settings bud) already owns outside dismissal. Use a
-            // system alert so cancellation is an explicit, accessible action on every device.
-            .alert(String(localized: "Clear this page?"), isPresented: $confirmingClear) {
-                Button(String(localized: "Clear Page"), role: .destructive) { clearPage() }
-                Button(String(localized: "Cancel"), role: .cancel) { confirmingClear = false }
-            } message: {
-                Text(String(localized: "Everything on this page is removed. You can undo this."))
-            }
         }
-        .onDisappear { model.flushSizeWrite() }
+        .background(ClearPageConfirmation(isPresented: $confirmingClear, clear: clearPage))
+        .onDisappear { confirmingClear = false; model.flushSizeWrite() }
     }
 
     private func clearPage() {
         guard let doc = session.document, let page = session.page else { return }
         app.perform(CommandIDs.pageClear, ["page": .string(NodeRef.page(doc, page).description)], session: session)
+    }
+}
+
+/// Mount above the moving bud, directly in the editor. Child containment and window attachment work in
+/// package tests too, where UIKit has no application in which to complete a modal presentation.
+struct ClearPageConfirmation: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
+    let clear: () -> Void
+
+    func makeUIViewController(context: Context) -> Presenter { Presenter() }
+    func updateUIViewController(_ controller: Presenter, context: Context) {
+        guard isPresented else { controller.tearDown(); return }
+        controller.requested = true
+        controller.dismissed = { isPresented = false }
+        controller.clear = clear
+        controller.schedulePresentation()
+    }
+    static func dismantleUIViewController(_ controller: Presenter, coordinator: ()) {
+        controller.tearDown()
+    }
+
+    final class Presenter: UIViewController {
+        var requested = false
+        var dismissed: (() -> Void)?
+        var clear: (() -> Void)?
+        private var panel: NibConfirmationPanel?
+        private var appeared = false
+
+        override func loadView() {
+            view = UIView()
+            view.backgroundColor = .clear
+            view.isUserInteractionEnabled = false
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            appeared = true
+            schedulePresentation()
+        }
+        override func viewDidDisappear(_ animated: Bool) {
+            super.viewDidDisappear(animated)
+            appeared = false
+            finish(confirmed: false)
+        }
+        func tearDown() {
+            requested = false
+            panel?.invalidate()
+            panel?.removeFromSuperview()
+            panel = nil
+            dismissed = nil
+            clear = nil
+        }
+        private func finish(confirmed: Bool) {
+            let action = confirmed ? clear : nil
+            // Native glass can host the same settings content more than once. Finish every bridge in
+            // this editor together, so its retained copy cannot reopen a second prompt after Cancel.
+            var owner: UIViewController = self
+            while let parent = owner.parent { owner = parent }
+            func close(_ controller: UIViewController) {
+                if let presenter = controller as? Presenter {
+                    let dismiss = presenter.dismissed
+                    presenter.tearDown()
+                    dismiss?()
+                }
+                for child in controller.children { close(child) }
+            }
+            close(owner)
+            action?()
+        }
+        func schedulePresentation() {
+            DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+        }
+        private func updatePresentation() {
+            guard requested, appeared, panel == nil, viewIfLoaded?.window != nil else { return }
+            var owner: UIViewController = self
+            while let parent = owner.parent { owner = parent }
+            // SwiftUI owns the hosting view's subviews and may replace them during a glass update.
+            // Keep this editor-owned overlay above that view in its existing container instead.
+            guard let container = owner.view.superview,
+                  !container.subviews.contains(where: { $0 is NibConfirmationPanel }) else { return }
+            let prompt = NibConfirmationPanel(title: String(localized: "Clear this page?"),
+                message: String(localized: "Everything on this page is removed. You can undo this."),
+                confirmTitle: String(localized: "Clear Page")) { [weak self] confirmed in
+                    self?.finish(confirmed: confirmed)
+                }
+            prompt.accessibilityIdentifier = "eraser.clearPage.confirmation"
+            prompt.traitOverrides.preferredContentSizeCategory = traitCollection.preferredContentSizeCategory
+            prompt.traitOverrides.userInterfaceStyle = traitCollection.userInterfaceStyle
+            prompt.traitOverrides.accessibilityContrast = traitCollection.accessibilityContrast
+            prompt.frame = owner.view.convert(owner.view.bounds, to: container)
+            prompt.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            container.addSubview(prompt)
+            panel = prompt
+            prompt.becomeFirstResponder()
+            UIAccessibility.post(notification: .screenChanged, argument: prompt)
+        }
     }
 }
 

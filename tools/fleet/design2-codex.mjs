@@ -53,6 +53,19 @@ async function main () {
   for (let round = 1; round <= ROUNDS; round++) {
     const known = round === 1 ? (A.known || []) : []
     const preset = round === 1 && A.issues ? [{ issues: A.issues }] : null
+    // resumeAt "capture": round 1's fixes are already committed and the full build is green; go straight to its capture.
+    if (round === 1 && A.resumeAt === 'capture') {
+      const owners = [...new Set((A.issues || []).map((i) => normOwner(i.owner)))]
+      say(`round 1: resuming at capture (owners ${owners.join(', ')})`)
+      const next = `${ROOT}-design/${A.pass || 'pass2'}-r1`
+      const cap = await codex('capture-1', `Re-capture for verification: the screens the fixes touched (owners ${owners.join(', ')}), plus the library (grid, list, folder), the document canvas with the palette docked left and top, the AI assistant panel, search and one sheet. ${SIM}
+Save PNGs (xcrun simctl io <udid> screenshot) to ${next}/<n>-<screen>-<light|dark>-<orientation>.png in light AND dark, iPad portrait AND landscape, plus the iPhone 17 Pro (portrait AND landscape) for the library, canvas and search. Write ${next}/index.md listing each file, screen, state and how you reached it. Answer status "ok", details = the file list.`, 'result', 'medium')
+      say(`round 1: capture ${cap.status} (${(cap.details || []).length} files)`)
+      history.push({ round: 1, issues: (A.issues || []).length, resumed: true })
+      if (cap.status === 'blocked') break
+      shots = next
+      continue
+    }
     if (!preset) say(`round ${round}: reviewing ${shots}`)
     const reviews = preset || await Promise.all(LENSES.map(([key, lens]) => codex(`review-${round}-${key}`, `Design review (pass 2, round ${round}) of the real Nib app. Read docs/DESIGN.md fully, then open EVERY screenshot in ${shots} with your image viewing tool (index.md / manifest.json explain each). Lens: ${lens}
 ${known.length ? 'Already-known leftovers: confirm each against the screenshots and include it if still visible:\n' + known.map((k) => '- ' + k).join('\n') + '\n' : ''}For each real problem you can SEE: screen/file, the DESIGN.md rule, owner (${OWNERS} — find the view code in ${DIR}) and the concrete code fix. Severity blocker / major / minor. No speculation. Do not change any file.`, 'review', 'high')))

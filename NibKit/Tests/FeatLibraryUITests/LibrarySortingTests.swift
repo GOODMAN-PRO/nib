@@ -71,6 +71,31 @@ final class LibrarySortingTests: XCTestCase {
         XCTAssertEqual(sections.documents.last?.ref, refs[0])
         XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, 0.300)
     }
+    func testLibraryWireDecodingMatchesCodableForEveryField() throws {
+        let wire: JSONValue = .array([
+            ["ref": "doc:A", "kind": "notebook", "title": "Café 10", "path": "/Notes", "parent": "folder:F",
+             "modified": 123.5, "created": 12, "favorite": true, "locked": false, "sync": "localOnly",
+             "color": "blue", "icon": "star", "items": 3, "pages": 42, "futureField": "ignored"],
+            ["ref": "folder:F", "kind": "folder", "title": .null, "pages": .null]
+        ])
+        let expected = try JSONDecoder().decode([LibraryRow].self, from: JSONEncoder().encode(wire))
+        XCTAssertEqual(try wire.decode([LibraryRow].self), expected)
+        XCTAssertEqual(try JSONValue.array([]).decode([LibraryRow].self), [])
+    }
+    func testLibraryWireDecodingRejectsMalformedRowsAndFields() {
+        for wire: JSONValue in [.null, .object([:]), .array([.null]), .array([[:]]),
+                                .array([["ref": .null, "kind": "folder"]])] {
+            XCTAssertThrowsError(try wire.decode([LibraryRow].self))
+        }
+        let valid: JSONValue = ["ref": "doc:A", "kind": "notebook"]
+        for key in ["ref", "kind", "title", "path", "parent", "modified", "created", "favorite", "locked", "sync", "color", "icon", "items", "pages"] {
+            let wire = JSONValue.array([valid.merging(.object([key: .array([])]))])
+            XCTAssertThrowsError(try wire.decode([LibraryRow].self), key)
+        }
+        for value: JSONValue in [1.5, .number(Double.infinity), .number(Double(Int.max)), true, "2"] {
+            XCTAssertThrowsError(try JSONValue.array([valid.merging(["pages": value])]).decode([LibraryRow].self))
+        }
+    }
     func testNilAndZeroDatesUseStableNameAndRefTies() {
         var a = row("doc:A", "Same"), b = row("doc:B", "Same")
         a.modified = nil; a.created = nil; b.modified = 0; b.created = 0

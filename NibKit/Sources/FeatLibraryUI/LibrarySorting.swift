@@ -96,6 +96,60 @@ struct LibraryRow: Codable, Identifiable, Hashable {
     }
 }
 
+extension JSONValue {
+    /// library.list already supplies parsed JSON. Decode its flat rows without
+    /// serializing all 5,000 objects to bytes and parsing those bytes again.
+    func decode(_ type: [LibraryRow].Type) throws -> [LibraryRow] {
+        guard case .array(let values) = self else {
+            throw DecodingError.typeMismatch(type, .init(codingPath: [], debugDescription: "Expected library rows"))
+        }
+        return try values.enumerated().map { index, value in
+            let path: [CodingKey] = [LibraryRowKey(index: index)]
+            guard case .object(let fields) = value else {
+                throw DecodingError.typeMismatch(LibraryRow.self, .init(codingPath: path, debugDescription: "Expected library row"))
+            }
+            func field<T>(_ key: String, _ extract: (JSONValue) -> T?) throws -> T? {
+                guard let value = fields[key], !value.isNull else { return nil }
+                guard let result = extract(value) else {
+                    throw DecodingError.typeMismatch(T.self, .init(codingPath: path + [LibraryRowKey(key)],
+                                                                  debugDescription: "Invalid library row field"))
+                }
+                return result
+            }
+            func requiredString(_ key: String) throws -> String {
+                if let result = try field(key, { $0.stringValue }) { return result }
+                let context = DecodingError.Context(codingPath: path + [LibraryRowKey(key)], debugDescription: "Missing library row field")
+                if fields[key] != nil { throw DecodingError.valueNotFound(String.self, context) }
+                throw DecodingError.keyNotFound(LibraryRowKey(key), .init(codingPath: path, debugDescription: context.debugDescription))
+            }
+            func integer(_ value: JSONValue) -> Int? {
+                guard let number = value.doubleValue else { return nil }
+                return Int(exactly: number)
+            }
+            func number(_ value: JSONValue) -> Double? {
+                guard let number = value.doubleValue, number.isFinite else { return nil }
+                return number
+            }
+            return try LibraryRow(ref: requiredString("ref"), kind: requiredString("kind"),
+                title: field("title", { $0.stringValue }), path: field("path", { $0.stringValue }),
+                parent: field("parent", { $0.stringValue }), modified: field("modified", number),
+                created: field("created", number), favorite: field("favorite", { $0.boolValue }),
+                locked: field("locked", { $0.boolValue }), sync: field("sync", { $0.stringValue }),
+                color: field("color", { $0.stringValue }), icon: field("icon", { $0.stringValue }),
+                items: field("items", integer), pages: field("pages", integer))
+        }
+    }
+}
+
+private struct LibraryRowKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+    init(_ key: String) { stringValue = key; intValue = nil }
+    init(index: Int) { stringValue = "Index \(index)"; intValue = index }
+    init?(stringValue: String) { self.init(stringValue) }
+    init?(intValue: Int) { self.init(index: intValue) }
+}
+
 enum LibraryLayout: String, Codable, CaseIterable { case grid, list }
 enum LibraryFilter: String, Codable, CaseIterable {
     case all, documents, folders
@@ -124,37 +178,53 @@ enum LibrarySort: String, Codable, CaseIterable {
 }
 
 enum LibrarySorting {
+    private struct SortRow {
+        let row: LibraryRow
+        let folder: Bool
+        let name: String
+        let rank: Int
+    }
+
     static func rows(_ input: [LibraryRow], sort: LibrarySort, filter: LibraryFilter = .all,
                      manual: [String] = [], search: String = "") -> [LibraryRow] {
-        let ranks = Dictionary(manual.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        var ranks: [String: Int] = [:]
+        if sort == .manual {
+            ranks.reserveCapacity(manual.count)
+            for (index, ref) in manual.enumerated() where ranks[ref] == nil { ranks[ref] = index }
+        }
         let needle = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rows = input.filter {
-            (filter == .all || (filter == .folders ? $0.isFolder : !$0.isFolder)) &&
+        var rows: [SortRow] = []
+        rows.reserveCapacity(input.count)
+        for row in input {
+            let folder = row.isFolder
+            guard filter == .all || (filter == .folders ? folder : !folder) else { continue }
+            let name = row.name
             // Literal matches already satisfy the search; reserve locale-aware
             // comparison for case/diacritic variants in large libraries.
-            (needle.isEmpty || $0.name.contains(needle) || $0.name.localizedStandardContains(needle))
+            guard needle.isEmpty || name.contains(needle) || name.localizedStandardContains(needle) else { continue }
+            rows.append(SortRow(row: row, folder: folder, name: name, rank: ranks[row.ref] ?? Int.max))
         }
-        return rows.sorted { a, b in
+        rows.sort { a, b in
             // Folders and notebooks occupy separate sections, including in Manual.
-            if a.isFolder != b.isFolder { return a.isFolder }
+            if a.folder != b.folder { return a.folder }
             switch sort {
             case .manual:
-                let x = ranks[a.ref] ?? Int.max, y = ranks[b.ref] ?? Int.max
-                if x != y { return x < y }
+                if a.rank != b.rank { return a.rank < b.rank }
             case .modified, .modifiedAscending:
-                let x = a.modified ?? 0, y = b.modified ?? 0
+                let x = a.row.modified ?? 0, y = b.row.modified ?? 0
                 if x != y { return sort == .modified ? x > y : x < y }
             case .created, .createdAscending:
-                let x = a.created ?? 0, y = b.created ?? 0
+                let x = a.row.created ?? 0, y = b.row.created ?? 0
                 if x != y { return sort == .created ? x > y : x < y }
             case .type:
-                if a.kind != b.kind { return a.kind < b.kind }
+                if a.row.kind != b.row.kind { return a.row.kind < b.row.kind }
             case .name, .nameDescending: break
             }
             let comparison = a.name.localizedStandardCompare(b.name)
             if comparison != .orderedSame { return sort == .nameDescending ? comparison == .orderedDescending : comparison == .orderedAscending }
-            return a.ref < b.ref
+            return a.row.ref < b.row.ref
         }
+        return rows.map(\.row)
     }
 
     static func compactColumns(width: CGFloat) -> Int {
@@ -184,11 +254,11 @@ enum LibraryOrder {
     }
 
     static func inserting(_ refs: [String], into order: [String], after: String?, before: String?) throws -> [String] {
-        guard !refs.isEmpty, Set(refs).count == refs.count, Set(refs).isSubset(of: Set(order)) else {
+        let moving = Set(refs)
+        guard !refs.isEmpty, moving.count == refs.count, moving.isSubset(of: Set(order)) else {
             throw NibError.invalid("refs must be distinct siblings in this folder", path: "$.refs")
         }
         guard after == nil || before == nil else { throw NibError.invalid("provide after or before", path: "$.before") }
-        let moving = Set(refs)
         var result = order.filter { !moving.contains($0) }
         var index = result.count
         if let anchor = after ?? before {

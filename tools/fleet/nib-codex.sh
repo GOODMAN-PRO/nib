@@ -25,7 +25,7 @@ if [ "$MODE" = run ]; then
           sleep 10
         done
         echo "$BASE" > "$L/base"; trap 'rm -rf "$L"' EXIT; fi
-      cd "$WT" && codex exec --ignore-user-config -m "${NIB_CODEX_MODEL:-gpt-6.1-sol}" -c "model_reasoning_effort=\"$EFFORT\"" \
+      export NIB_JOB="$NAME"; cd "$WT" && codex exec --ignore-user-config -m "${NIB_CODEX_MODEL:-gpt-6-astra}" -c "model_reasoning_effort=\"$EFFORT\"" \
         --dangerously-bypass-approvals-and-sandbox -C "$WT" --output-schema "$SCHEMA" -o "$BASE.json" - < "$PROMPT" > "$BASE.log" 2>&1
       echo $? > "$BASE.exit" ) &
     echo $! > "$BASE.pid"; date +%s > "$BASE.start"
@@ -39,6 +39,10 @@ for i in $(seq 1 54); do
       echo "RESULT $(tr -d '\n' < "$BASE.json")"; exit 0
     fi
     echo "CODEX_FAILED rc=$rc: $(grep -iE 'error|limit|quota|unauthor' "$BASE.log" | tail -3 | tr '\n' ' ' | cut -c1-400)"; exit 1
+  fi
+  # The job died without recording an exit code (e.g. the disk filled up): report it instead of waiting forever.
+  if [ -f "$BASE.pid" ] && ! kill -0 "$(cat "$BASE.pid")" 2>/dev/null && [ ! -f "$BASE.exit" ]; then
+    sleep 5; [ -f "$BASE.exit" ] || { echo 1 > "$BASE.exit"; echo "CODEX_FAILED job process died without an exit code: $(tail -3 "$BASE.log" | tr '\n' ' ' | cut -c1-300)"; exit 1; }
   fi
   sleep 10
 done
