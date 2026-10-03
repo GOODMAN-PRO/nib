@@ -50,7 +50,10 @@ enum UITestFixture {
         guard NibUITestMode.isEnabled else { return }
         @discardableResult
         func run(_ command: String, _ params: JSONValue) async throws -> JSONValue {
-            try await app.bus.execute(command, params)
+            print("NIB_START seed command begin \(command) \(Date())")
+            let result = try await app.bus.execute(command, params)
+            print("NIB_START seed command end \(command) \(Date())")
+            return result
         }
         func create(_ kind: String, _ title: String, pages: Int = 1, folder: String? = nil) async throws -> JSONValue {
             var params: [String: JSONValue] = ["kind": .string(kind), "title": .string(title)]

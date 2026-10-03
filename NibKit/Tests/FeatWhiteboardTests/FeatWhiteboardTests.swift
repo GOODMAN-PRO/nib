@@ -927,6 +927,7 @@ final class FeatWhiteboardTests: XCTestCase {
         sheet.onDismiss = { dismissRequested.fulfill() }
         var createdID: String?
         var openedID: String?
+        var languageID: String?
         var panelClosed = false
         h.app.commands.register(CommandDescriptor(id: CommandIDs.docCreate, title: "Create", summary: "Stand-in.",
                                                   effect: .library)) { params, _ in
@@ -944,6 +945,7 @@ final class FeatWhiteboardTests: XCTestCase {
         }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.docSetLanguage, title: "Language", summary: "Stand-in.",
                                                   effect: .edit)) { params, _ in
+            languageID = params["doc"]?.stringValue
             XCTAssertEqual(params["doc"]?.stringValue, createdID.map { "doc:" + $0 })
             XCTAssertEqual(params["language"], "fr-FR")
             return [:]
@@ -965,6 +967,8 @@ final class FeatWhiteboardTests: XCTestCase {
         let id = try await creation.value
         XCTAssertEqual(createdID, id.raw)
         XCTAssertEqual(openedID, NodeRef.document(id).description)
+        XCTAssertEqual(languageID, NodeRef.document(id).description,
+                       "A head unavailable to the initial read must not silently skip the chosen language")
     }
 
     func testCreationPersistsSelectedLanguageBeforeDismissalAndNavigation() async throws {
