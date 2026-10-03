@@ -10,38 +10,23 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        print("NIB_START launch begin \(Date())")
         if !NibUITestMode.isEnabled { SafeMode.beginLaunch() }
         do { try NibUITestMode.prepareStorage() }
         catch { UITestFixture.failure = "Could not prepare fixture storage: \(error)" }
-        print("NIB_START app begin \(Date())")
         let app = NibApp(defaults: UITestFixture.defaults())
-        print("NIB_START app end \(Date())")
         app.gateway.presenter = AppDelegate.confirmer
         let disabled = NibUITestMode.isEnabled ? Set<String>() : SafeMode.disabledFeatures
         let features = FeatureList.all.filter { !disabled.contains($0.id) }
-        for feature in features {
-            print("NIB_START register begin \(feature.id) \(Date())")
-            app.register([feature])
-            print("NIB_START register end \(feature.id) \(Date())")
-        }
-        print("NIB_START register end \(Date())")
+        app.register(features)
         UITestFixture.configure(app)
         DesignGallery.registerSettingsPage(in: app)   // Settings › Advanced › Developer (NibDesign is not a feature)
         registerBackgroundTasks(app)   // must run before this method returns
         Task { @MainActor in
             guard UITestFixture.failure == nil else { return }
-            for feature in features {
-                print("NIB_START begin \(feature.id) \(Date())")
-                await feature.start(app)
-                print("NIB_START end \(feature.id) \(Date())")
-            }
-            await app.start([])
+            await app.start(features)
             if NibUITestMode.isEnabled {
                 do {
-                    print("NIB_START seed begin \(Date())")
                     try await UITestFixture.seed(app)
-                    print("NIB_START seed end \(Date())")
                     UITestFixture.isReady = true
                     app.ui.activeNavigator?.showLibrary(folder: nil)
                 } catch {

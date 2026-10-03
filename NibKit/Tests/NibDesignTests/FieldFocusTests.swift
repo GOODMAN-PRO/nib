@@ -27,12 +27,12 @@ final class FieldFocusTests: XCTestCase {
         // registered editing-change actions directly to SwiftUI's coordinator.
         field.text = "3"
         var deliveredChange = false
-        field.enumerateEventHandlers { action, target, selector, events, _ in
+        field.enumerateEventHandlers { action, targetAction, events, _ in
             guard events.contains(.editingChanged) else { return }
             if let action {
                 field.sendAction(action)
                 deliveredChange = true
-            } else if let receiver = target as? NSObject, let selector {
+            } else if let (target, selector) = targetAction, let receiver = target as? NSObject {
                 _ = receiver.perform(selector, with: field)
                 deliveredChange = true
             }

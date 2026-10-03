@@ -36,14 +36,24 @@ final class AgentDiscovery: NSObject, ObservableObject, NetServiceDelegate {
     @Published var hint: String?
     private var browser: NWBrowser?
     private var resolving: [NetService] = []
+    private let allowsDiscovery: Bool
+    private let makeBrowser: () -> NWBrowser?
+
+    init(isFixture: Bool = NibUITestMode.isEnabled, isHostlessTest: Bool? = nil,
+         makeBrowser: @escaping () -> NWBrowser? = {
+             NWBrowser(for: .bonjour(type: "_nib-agent._tcp", domain: nil), using: .tcp)
+         }) {
+        allowsDiscovery = !isFixture && !(isHostlessTest ?? NibApp.isHostlessTest)
+        self.makeBrowser = makeBrowser
+        super.init()
+    }
     static func endpoint(host: String, port: Int) -> URL? {
         guard !host.isEmpty, (1...65535).contains(port) else { return nil }
         var c = URLComponents(); c.scheme = "http"; c.host = host; c.port = port; c.path = "/"
         return c.url
     }
     func start() {
-        guard browser == nil, !NibApp.isHostlessTest else { return }
-        let browser = NWBrowser(for: .bonjour(type: "_nib-agent._tcp", domain: nil), using: .tcp)
+        guard browser == nil, allowsDiscovery, let browser = makeBrowser() else { return }
         self.browser = browser
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             Task { @MainActor in

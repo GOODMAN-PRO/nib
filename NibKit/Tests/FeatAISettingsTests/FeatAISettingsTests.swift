@@ -5,8 +5,33 @@ import NibDesign
 import NibTesting
 @testable import FeatAISettings
 
+private final class StartupSecretStore: SecretStore {
+    private(set) var accesses = 0
+    func get(service: String, account: String) -> Data? { accesses += 1; return nil }
+    func set(_ data: Data?, service: String, account: String) -> Bool { accesses += 1; return false }
+}
+
 @MainActor
 final class FeatAISettingsTests: XCTestCase {
+    func testStartCompletesWithoutAccessingKeychain() async {
+        let h = Harness()
+        let previous = Keychain.store
+        let secrets = StartupSecretStore()
+        Keychain.store = secrets
+        defer { Keychain.store = previous }
+        h.app.register([FeatAISettingsFeature.self])
+        let completed = expectation(description: "AI settings startup completes without external services")
+        Task { @MainActor in
+            await h.app.start([FeatAISettingsFeature.self])
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 4)
+        // Also catch work scheduled by start rather than directly awaited by it.
+        await Task.yield()
+        XCTAssertTrue(h.app.isStarted)
+        XCTAssertEqual(secrets.accesses, 0)
+    }
+
     private func setupStore() -> (Harness, SettingsProviderStore) {
         let h = Harness(features: [FeatAISettingsFeature.self])
         Keychain.store = InMemorySecretStore()

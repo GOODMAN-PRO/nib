@@ -3,6 +3,20 @@ import NibContracts
 @testable import FeatAISettings
 
 final class SubscriptionSetupTests: XCTestCase {
+    @MainActor
+    func testDiscoveryIsLazyAndNeverCreatesABrowserInFixtureOrHostlessMode() {
+        for mode in [(fixture: true, hostless: false), (fixture: false, hostless: true),
+                     (fixture: true, hostless: true), (fixture: false, hostless: false)] {
+            var requests = 0
+            let discovery = AgentDiscovery(isFixture: mode.fixture, isHostlessTest: mode.hostless,
+                                           makeBrowser: { requests += 1; return nil })
+            XCTAssertEqual(requests, 0, "Constructing the settings view must not start discovery")
+            discovery.start()
+            XCTAssertEqual(requests, mode.fixture || mode.hostless ? 0 : 1)
+            XCTAssertTrue(discovery.agents.isEmpty)
+        }
+    }
+
     func testSubscriptionPresetsLeadAndUseNibHTTP() throws {
         XCTAssertEqual(Array(ProviderPreset.allCases.prefix(2)), [.claudeSubscription, .chatGPTSubscription])
         for preset in [ProviderPreset.claudeSubscription, .chatGPTSubscription] {

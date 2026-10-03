@@ -2,7 +2,8 @@ import UIKit
 import NibContracts
 
 /// A transparent, non-interactive accessibility element. Its value is a live snapshot, evaluated on demand by
-/// accessibility (including during a gesture); no cached state, timers, subscriptions or production polling.
+/// accessibility (including during a gesture). Clipboard state is sampled outside the accessibility RPC below;
+/// document state remains live, with no timers or production polling.
 @MainActor
 final class QAStateProbe: UIView {
     private weak var shell: ShellViewController?
@@ -54,7 +55,7 @@ final class QAStateProbe: UIView {
                 "itemCountOnPage": .number(Double(items.filter { !$0.deleted }.count)),
                 "strokeCountOnPage": .number(Double(items.filter { !$0.deleted && $0.kind == .stroke }.count)),
                 "selectionCount": .number(Double(session.selection.items.count)),
-                "clipboardChangeCount": .number(Double(UIPasteboard.general.changeCount)),
+                "clipboardChangeCount": clipboardProbe.changeCount.map { .number(Double($0)) } ?? .null,
                 "undoAvailable": .bool(UndoRoute.resolve(redo: false, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
                 "redoAvailable": .bool(UndoRoute.resolve(redo: true, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
                 "openPanels": .array(session.openPanels.sorted().map(JSONValue.string)),
@@ -88,6 +89,7 @@ final class QAStateProbe: UIView {
 @MainActor
 final class QAClipboardProbe: UIView {
     private var snapshot: String?
+    private var observedRevision: Int?
     private var loadedRevision: Int?
     private var loadingRevision: Int?
     private var refreshScheduled = false
@@ -98,8 +100,9 @@ final class QAClipboardProbe: UIView {
         isAccessibilityElement = true
         accessibilityIdentifier = "nib.qa.clipboard"
         accessibilityLabel = "QA copied fragment"
-        NotificationCenter.default.addObserver(self, selector: #selector(scheduleRefresh),
+        NotificationCenter.default.addObserver(self, selector: #selector(pasteboardDidChange),
                                                name: UIPasteboard.changedNotification, object: nil)
+        scheduleRefresh()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -109,10 +112,25 @@ final class QAClipboardProbe: UIView {
             // XCTest evaluates values while matching unrelated identifiers too. A
             // synchronous pasteboard read here can deadlock its accessibility RPC.
             scheduleRefresh()
-            guard loadedRevision == UIPasteboard.general.changeCount else { return nil }
+            guard loadedRevision == observedRevision else { return nil }
             return snapshot
         }
         set { }
+    }
+
+    /// Even changeCount can synchronously contact the pasteboard service. Accessibility getters must only read
+    /// memory; their next main-queue turn samples the real revision and the copied bytes together.
+    var changeCount: Int? {
+        scheduleRefresh()
+        return observedRevision
+    }
+
+    @objc private func pasteboardDidChange() {
+        observedRevision = nil
+        snapshot = nil
+        // Re-read the bytes after a notification; finish also validates any in-flight provider's revision.
+        loadedRevision = nil
+        scheduleRefresh()
     }
 
     @objc private func scheduleRefresh() {
@@ -128,6 +146,10 @@ final class QAClipboardProbe: UIView {
     private func refresh() {
         let board = UIPasteboard.general
         let revision = board.changeCount
+        if observedRevision != revision {
+            observedRevision = revision
+            snapshot = nil
+        }
         guard revision != loadedRevision, revision != loadingRevision else { return }
         loadingRevision = revision
         let type = "app.nib.fragment"
@@ -147,6 +169,7 @@ final class QAClipboardProbe: UIView {
         let value: JSONValue = ["changeCount": .number(Double(revision)),
                                 "fragment": data.map { .string($0.base64EncodedString()) } ?? .null]
         snapshot = value.jsonString()
+        observedRevision = revision
         loadedRevision = revision
     }
 
