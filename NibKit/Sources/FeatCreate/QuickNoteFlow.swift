@@ -857,6 +857,9 @@ enum QuickNotePresenter {
         let controller = UIHostingController(rootView: QuickNoteExitSheet(model: model))
         controller.modalPresentationStyle = .formSheet
         controller.view.backgroundColor = NibUIColor.backgroundSecondary
+        // A form sheet leaves the library visible, but VoiceOver must navigate
+        // only its choices, never the identically named document cards behind it.
+        controller.view.accessibilityViewIsModal = true
         if let sheet = controller.sheetPresentationController {
             sheet.detents = [.medium(), .large()]
             sheet.prefersGrabberVisible = true

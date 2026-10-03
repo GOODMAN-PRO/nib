@@ -955,7 +955,12 @@ final class CreateUITests: XCTestCase {
         try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
         try replace(title, with: eventTitle)
-        calendar.buttons["Add"].tap()
+        // EventKit's iOS 26 editor labels this action Done. The system identifier
+        // names the save action consistently; the spec requires a saved event,
+        // not a particular version of Apple's button copy.
+        let saveEvent = calendar.buttons["add-button"]
+        try require(saveEvent, "Calendar must offer its save-event action")
+        saveEvent.tap()
         ui.app.activate()
         try tap("Calendar")
         let connect = button("Connect Calendars")
