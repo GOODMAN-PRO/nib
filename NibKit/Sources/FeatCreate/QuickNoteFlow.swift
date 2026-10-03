@@ -854,9 +854,21 @@ final class QuickNoteExitModel: ObservableObject {
 @MainActor
 enum QuickNotePresenter {
     static func present(_ model: QuickNoteExitModel, on navigator: SceneNavigator) {
-        let controller = UIHostingController(rootView: QuickNoteExitSheet(model: model))
+        let controller = controller(for: model)
+        // Present after the navigation that left the QuickNote has finished.
+        Task { @MainActor in
+            navigator.presentModal(controller)
+            if controller.presentingViewController == nil { model.abandon() }
+        }
+    }
+
+    static func controller(for model: QuickNoteExitModel) -> UIViewController {
+        let controller = QuickNoteSheetController(rootView: QuickNoteExitSheet(model: model))
         controller.modalPresentationStyle = .formSheet
         controller.view.backgroundColor = NibUIColor.backgroundSecondary
+        // A form sheet leaves the library visible, but VoiceOver must navigate
+        // only its choices, never the identically named document cards behind it.
+        controller.view.accessibilityViewIsModal = true
         if let sheet = controller.sheetPresentationController {
             sheet.detents = [.medium(), .large()]
             sheet.prefersGrabberVisible = true
@@ -866,12 +878,30 @@ enum QuickNotePresenter {
         model.presentationDelegate = delegate
         controller.presentationController?.delegate = delegate
         model.dismiss = { [weak controller] in controller?.dismiss(animated: true) }
-        // After the navigation that left the QuickNote has finished. UIKit refuses (and only logs) a presentation from
-        // a sheet that is being dismissed; the tracker then asks again on the next change.
-        Task { @MainActor in
-            navigator.presentModal(controller)
-            if controller.presentingViewController == nil { model.abandon() }
+        return controller
+    }
+}
+
+/// UIKit's sheet and the presenter's hosting tree live in different containers.
+/// Marking only the sheet modal does not hide that separate library tree.
+@MainActor
+class QuickNoteSheetController: UIHostingController<QuickNoteExitSheet> {
+    private weak var backgroundView: UIView?
+    private var backgroundWasHidden = false
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        if backgroundView == nil, let background = presentingViewController?.viewIfLoaded {
+            backgroundView = background
+            backgroundWasHidden = background.accessibilityElementsHidden
+            background.accessibilityElementsHidden = true
         }
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        backgroundView?.accessibilityElementsHidden = backgroundWasHidden
+        backgroundView = nil
     }
 }
 

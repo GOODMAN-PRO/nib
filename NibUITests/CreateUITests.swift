@@ -34,7 +34,11 @@ final class CreateUITests: XCTestCase {
             shot.name = "Create-\(name)-screen"
             shot.lifetime = .keepAlways
             add(shot)
-            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(ui.app.debugDescription)")
+            // A modal correctly hides the background accessibility tree, including
+            // this diagnostic probe. Capture the visible tree without making a
+            // successful modal test fail while collecting optional diagnostics.
+            let probe = ui.probe.exists ? "\(ui.probe.value ?? "no probe")" : "background probe hidden by modal"
+            let state = XCTAttachment(string: "\(probe)\n\(ui.app.debugDescription)")
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
@@ -45,7 +49,7 @@ final class CreateUITests: XCTestCase {
     // MARK: Entry, title, kind and cancellation
 
     func testNotebookKeyboardShortcutOpensDraftAndEscapeCancels() throws {
-        ui.app.typeKey("n", modifierFlags: [.command, .alternate])
+        creationShortcut("n", modifiers: [.command, .alternate])
         try require(ui.app.textFields["Title"], "create.newNotebook: Option-Command-N must open the creation sheet")
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
@@ -400,7 +404,7 @@ final class CreateUITests: XCTestCase {
     }
 
     func testWhiteboardKeyboardShortcutOpensOptionsWithoutCreating() throws {
-        ui.app.typeKey("w", modifierFlags: [.command, .shift])
+        creationShortcut("w", modifiers: [.command, .shift])
         try require(ui.app.textFields["Whiteboard name"], "whiteboard.create: Shift-Command-W must open board options")
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
@@ -412,7 +416,7 @@ final class CreateUITests: XCTestCase {
     }
 
     func testTextDocumentKeyboardShortcutCreatesEditableFirstBlock() throws {
-        ui.app.typeKey("t", modifierFlags: [.command, .shift])
+        creationShortcut("t", modifiers: [.command, .shift])
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "textDocument", pages: 0)
         let block = ui.app.textViews.firstMatch
@@ -481,7 +485,7 @@ final class CreateUITests: XCTestCase {
     }
 
     func testQuickNoteKeyboardShortcutCreatesUntitledDefaultPaper() throws {
-        ui.app.typeKey("n", modifierFlags: [.command, .shift])
+        creationShortcut("n", modifiers: [.command, .shift])
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "notebook", pages: 1)
         XCTAssertEqual(try livePages(id).map(template), ["builtin.ruled"])
@@ -566,7 +570,12 @@ final class CreateUITests: XCTestCase {
         }
         defer { removeUIInterruptionMonitor(monitor) }
         try newMenu("Quick Record")
-        ui.app.tap()
+        // F052 requires the user's microphone permission before recording. The
+        // request is asynchronous: an immediate app tap can precede the alert
+        // (and open a folder), leaving the interruption monitor untriggered.
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allowMicrophone = springboard.alerts.buttons["Allow"]
+        if allowMicrophone.waitForExistence(timeout: 15) { allowMicrophone.tap() }
         let state = try ui.waitForState { $0.document != nil }
         let id = try XCTUnwrap(state.document)
         try assertDocument(id, kind: "textDocument", pages: 0)
@@ -608,6 +617,7 @@ final class CreateUITests: XCTestCase {
         try tap("Daily")
         let picker = ui.app.datePickers.firstMatch
         try scrollTo(picker, name: "Planner start date")
+        let dateRow = picker.frame
         picker.tap()
         // Choose a different day in the displayed month through the native calendar, without setting app state.
         var calendar = Calendar(identifier: .gregorian)
@@ -627,7 +637,11 @@ final class CreateUITests: XCTestCase {
         // Create as hittable. Dismiss that system popover before invoking the create action;
         // tapping the covered header instead can open the picker's month/year controls.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
-            ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).tap()
+            // Stay inside the creation sheet. An outside-sheet tap cancels the
+            // draft on iPad, which contradicts this test's intent to create it.
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                dx: dateRow.minX + 12 - ui.app.frame.minX,
+                dy: dateRow.midY - ui.app.frame.minY)).tap()
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
@@ -733,6 +747,15 @@ final class CreateUITests: XCTestCase {
 
     private func button(_ label: String, prefix: Bool = false) -> XCUIElement {
         ui.app.buttons.matching(NSPredicate(format: prefix ? "label BEGINSWITH %@" : "label == %@", label)).firstMatch
+    }
+
+    private func creationShortcut(_ key: String, modifiers: XCUIElement.KeyModifierFlags) {
+        // On iOS 26, typeKey on a non-text application target can deliver the
+        // printable key with zero UIKit modifier flags. Hold the physical chord
+        // explicitly; a plain letter does not exercise the specified shortcut.
+        XCUIElement.perform(withKeyModifiers: modifiers) {
+            ui.app.typeKey(key, modifierFlags: modifiers)
+        }
     }
 
     private func tap(_ label: String, prefix: Bool = false) throws {
@@ -903,6 +926,9 @@ final class CreateUITests: XCTestCase {
         let id = try create()
         for _ in 0..<3 { try ui.tapCommand("page.add") }
         try ui.waitForState { $0.pageCount == 4 }
+        // WorkspacePersistence is debounced and off-main (CONTRACTS). The live
+        // page count can advance before the last head write reaches the package.
+        try wait("All added pages must be persisted") { (try? self.livePages(id).count) == 4 }
         let papers = try livePages(id).map(template)
         XCTAssertEqual(papers.count, 4)
         if choice == "All pages" { XCTAssertEqual(papers, Array(repeating: "builtin.graph", count: 4)) }
@@ -954,8 +980,18 @@ final class CreateUITests: XCTestCase {
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
         try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
-        try replace(title, with: eventTitle)
-        calendar.buttons["Add"].tap()
+        // This editor belongs to Calendar. The creation-form scrolling helper
+        // targets Nib's window and would bring the background app forward.
+        try require(title, "Calendar must offer its event title field")
+        title.tap()
+        title.typeKey("a", modifierFlags: [.command])
+        title.typeText(eventTitle)
+        // EventKit's iOS 26 editor labels this action Done. The system identifier
+        // names the save action consistently; the spec requires a saved event,
+        // not a particular version of Apple's button copy.
+        let saveEvent = calendar.buttons["add-button"]
+        try require(saveEvent, "Calendar must offer its save-event action")
+        saveEvent.tap()
         ui.app.activate()
         try tap("Calendar")
         let connect = button("Connect Calendars")

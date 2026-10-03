@@ -327,6 +327,9 @@ struct NavBarView: View {
     let compact: Bool
     let sidebarMode: SidebarMode
     @Binding var openMenu: ChromeMenu?
+    // Status providers read feature state outside NavBarItems. Carry its revision
+    // across this view boundary even when the list of registered items is unchanged.
+    var liveRevision = 0
 
     var body: some View {
         HStack(spacing: 0) {
@@ -410,9 +413,11 @@ struct NavBarView: View {
         switch item.action {
         case .library:
             NibToolbarItem(item.symbol, label: item.title) { chrome.goToLibrary() }
+                .nibNativeAction { chrome.goToLibrary() }
                 .accessibilityIdentifier("cmd.window.showLibrary")
         case .menu(let menu):
             NibToolbarItem(item.symbol, label: item.title, isOn: openMenu == menu) { toggle(menu) }
+                .nibNativeAction { toggle(menu) }
                 .nibBudAnchor(menu.anchor)
                 .accessibilityIdentifier("menu." + menu.rawValue)
         case .command(let command, let params):
@@ -487,7 +492,8 @@ struct NavBarHost: View {
         NavBarView(chrome: chrome, items: items, title: snapshot.title, kind: snapshot.kind,
                    subtitle: NavBarModel.subtitle(snapshot), readOnly: snapshot.readOnly,
                    titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
-                   compact: layout.isCompact, sidebarMode: sidebarMode, openMenu: $openMenu)
+                   compact: layout.isCompact, sidebarMode: sidebarMode, openMenu: $openMenu,
+                   liveRevision: live.tick)
             .frame(width: layout.bar.width, height: layout.bar.height)
             .position(x: layout.bar.midX, y: layout.bar.midY)
     }
@@ -543,8 +549,7 @@ struct ChromePopovers: View {
             ForEach(ChromeMenu.allCases) { menu in
                 NibBudPopover(id: "chrome.popover." + menu.rawValue, source: menu.anchor,
                               isPresented: presented(menu), title: title(menu), width: width, placement: .below) {
-                    // Only the open menu builds its rows: every entry's isVisible and params run per build.
-                    if openMenu == menu { ChromeMenuList(rows: rows(menu)) }
+                    ChromeMenuContent(isPresented: openMenu == menu) { rows(menu) }
                 }
             }
         }
@@ -568,6 +573,22 @@ struct ChromePopovers: View {
         case .share: return String(localized: "Share and Export")
         case .more: return String(localized: "More")
         }
+    }
+}
+
+/// Keep the last layout during retraction. Emptying a retained scroll view on
+/// close clamps its offset to zero, making repeated page actions start at the
+/// top of More every time. Opening still resolves current visibility and params.
+struct ChromeMenuContent: View {
+    let isPresented: Bool
+    let rows: () -> [ChromeMenuRow]
+    @State private var retainedRows: [ChromeMenuRow] = []
+
+    var body: some View {
+        ChromeMenuList(rows: isPresented ? rows() : retainedRows)
+            .onChange(of: isPresented, initial: true) { _, presented in
+                if presented { retainedRows = rows() }
+            }
     }
 }
 
