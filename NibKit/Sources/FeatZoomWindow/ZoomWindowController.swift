@@ -683,6 +683,7 @@ struct ZoomPane: View {
         NibIconButton(.more, label: String(localized: "Zoom Window options"), size: .round) {
             controller.toggleOptions()
         }
+        .nibNativeAction { controller.toggleOptions() }
         .nibBudAnchor(ZoomWindowController.optionsAnchor)
     }
 }
@@ -755,10 +756,11 @@ final class ZoomOptionsKeyView: UIControl {
 
     init() {
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        isUserInteractionEnabled = true
         accessibilityElementsHidden = true
     }
     required init?(coder: NSCoder) { nil }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
     override var canBecomeFirstResponder: Bool { true }
 
     override func didMoveToWindow() {
@@ -805,6 +807,24 @@ final class ZoomOptionsKeyView: UIControl {
         guard presented else { return }
         setPresented(false)
         onDismiss?()
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // A hosting boundary can forward Escape instead of invoking UIKeyCommand.
+        // The open popover still owns it, ahead of canvas selection dismissal.
+        let escapes = presses.filter {
+            guard let key = $0.key, key.keyCode == .keyboardEscape else { return false }
+            let modifiers = key.modifierFlags.union(event?.modifierFlags ?? [])
+            return modifiers.intersection([.command, .alternate, .control, .shift]).isEmpty
+        }
+        if presented, !escapes.isEmpty {
+            setPresented(false)
+            onDismiss?()
+            let remaining = presses.subtracting(escapes)
+            if !remaining.isEmpty { super.pressesBegan(remaining, with: event) }
+        } else {
+            super.pressesBegan(presses, with: event)
+        }
     }
 }
 
@@ -1062,6 +1082,7 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     private var region: Rect?
     private var knownStrokes = 0
     private var ignoresChanges = false
+    private var toolIsActive = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1145,7 +1166,7 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         let strokes = canvas.drawing.strokes
         let k = min(max(n, 0), strokes.count)
         guard k > 0 else { return }
-        replaceWet(Array(strokes.dropFirst(k)))
+        replaceWet(Array(strokes.dropFirst(k)), processed: max(0, knownStrokes - k))
     }
 
     /// Removes the wet stroke at `index` (oldest first): its commit failed, so it must not look saved.
@@ -1153,14 +1174,14 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         var strokes = canvas.drawing.strokes
         guard strokes.indices.contains(index) else { return }
         strokes.remove(at: index)
-        replaceWet(strokes)
+        replaceWet(strokes, processed: max(0, knownStrokes - (index < knownStrokes ? 1 : 0)))
     }
 
-    private func replaceWet(_ strokes: [PKStroke]) {
+    private func replaceWet(_ strokes: [PKStroke], processed: Int? = nil) {
         ignoresChanges = true
         canvas.drawing = PKDrawing(strokes: strokes)
         ignoresChanges = false
-        knownStrokes = strokes.count
+        knownStrokes = processed ?? strokes.count
     }
 
     override func layoutSubviews() {
@@ -1193,7 +1214,9 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     // MARK: PKCanvasViewDelegate
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        guard !ignoresChanges else { return }
+        // PencilKit publishes incremental paths before the tool lifts. Commit
+        // only a finished path, so auto-advance cannot move the paper mid-stroke.
+        guard !ignoresChanges, !toolIsActive else { return }
         let strokes = canvasView.drawing.strokes
         guard strokes.count > knownStrokes else {
             knownStrokes = strokes.count
@@ -1215,8 +1238,21 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         }
     }
 
-    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { NibHaptics.isInking = true }
-    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) { NibHaptics.isInking = false }
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        toolIsActive = true
+        NibHaptics.isInking = true
+    }
+
+    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        toolIsActive = false
+        NibHaptics.isInking = false
+        // Allow PencilKit's final pressure/path update in this delivery to land.
+        // A later drawing callback takes the same path and knownStrokes deduplicates it.
+        DispatchQueue.main.async { [weak self, weak canvasView] in
+            guard let self, let canvasView else { return }
+            self.canvasViewDrawingDidChange(canvasView)
+        }
+    }
 
     // MARK: Eraser
 
