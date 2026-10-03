@@ -15,10 +15,9 @@ final class CaptureUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         ui?.app.terminate()
-        XCUIDevice.shared.orientation = .portrait
     }
 
-    private func variants(scenario: NibUI.FixtureScenario = .standard,
+    private func variants(scenario: NibUI.FixtureScenario = .standard, onboarding: Bool = false, agent: Bool = false,
                           _ body: () throws -> Void) {
         for style in ["light", "dark"] {
             for direction in ["portrait", "landscape"] {
@@ -31,16 +30,19 @@ final class CaptureUITests: XCTestCase {
                     ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
                                               "-NibUITestAppearance", style,
                                               "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
-                    XCUIDevice.shared.orientation = .portrait
+                    if onboarding { ui.app.launchArguments.append("-NibUITestOnboarding") }
+                    if agent { ui.app.launchArguments.append("-NibUITestAgent") }
                     ui.app.launch()
-                    _ = try ui.waitForState { $0.screen == "library" }
-                    // Publish a populated accessibility layout, as NibUI.launchFixture does.
-                    XCUIDevice.shared.orientation = .landscapeLeft
-                    if direction == "portrait" { XCUIDevice.shared.orientation = .portrait }
-                    try wait("The scene must reach \(direction)") {
-                        let frame = self.ui.app.frame
-                        return direction == "portrait" ? frame.height > frame.width : frame.width > frame.height
+                    if onboarding {
+                        _ = try require("Your notes live in a folder you choose.")
+                    } else {
+                        _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
                     }
+                    ui.app.activate()
+                    // Rotate the foreground scene, then await its window geometry before
+                    // delivering another orientation. The application's union frame can
+                    // contain stale keyboard/system windows after a previous variant.
+                    try rotate(to: direction)
                     try body()
                 } catch {
                     let reason = "\(name) / \(style) / \(direction): \(error)"
@@ -52,6 +54,18 @@ final class CaptureUITests: XCTestCase {
                 }
                 ui.app.terminate()
             }
+        }
+    }
+
+    private func rotate(to direction: String) throws {
+        let target: UIDeviceOrientation = direction == "portrait" ? .portrait : .landscapeLeft
+        XCUIDevice.shared.orientation = target
+        try wait("The scene must reach \(direction)", timeout: 30) {
+            let window = self.ui.app.windows.firstMatch
+            guard window.exists else { return false }
+            let frame = window.frame
+            return frame.width > 0 && frame.height > 0 &&
+                (direction == "portrait" ? frame.height > frame.width : frame.width > frame.height)
         }
     }
 
@@ -71,7 +85,7 @@ final class CaptureUITests: XCTestCase {
 
     private func query(_ name: String) -> XCUIElementQuery {
         ui.app.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == %@ OR label == %@ OR label BEGINSWITH %@", name, name, name + ","))
+            format: "identifier == %@ OR label ==[c] %@ OR label BEGINSWITH[c] %@", name, name, name + ","))
     }
 
     @discardableResult
@@ -104,6 +118,7 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func capture(_ number: Int, _ screen: String, state: @escaping (QAState) -> Bool) throws {
+        try rotate(to: orientation)
         _ = try ui.waitForState(timeout: 15, state)
         let stem = String(format: "%02d", number) + "-\(screen)-\(appearance)-\(orientation)"
         // XCTest waits for UI idleness before taking the full device screenshot.
@@ -145,15 +160,17 @@ final class CaptureUITests: XCTestCase {
     func test01Library() {
         variants {
             _ = try self.require(self.notebook)
-            try self.libraryCapture(1, "library-grid")
+            try self.libraryCapture(10, "library-grid")
             try self.tap("Sort and View")
+            _ = try self.require("List")
+            try self.libraryCapture(13, "library-sort-view-menu")
             try self.tap("List")
             self.ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
             _ = try self.require(self.notebook)
-            try self.libraryCapture(2, "library-list")
+            try self.libraryCapture(11, "library-list")
             try self.folder("Semester Notes")
             _ = try self.require("Lecture notes")
-            try self.libraryCapture(3, "open-folder")
+            try self.libraryCapture(12, "open-folder")
         }
     }
 
@@ -163,7 +180,12 @@ final class CaptureUITests: XCTestCase {
             let field = try self.searchField()
             field.tap(); field.typeText("Physics")
             _ = try self.require(self.notebook)
-            try self.libraryCapture(4, "library-search")
+            try self.libraryCapture(15, "library-search")
+            field.tap(); field.typeKey("a", modifierFlags: .command); field.typeText("No matching capture notebook")
+            try self.wait("Search must show no matching document") {
+                !self.query(self.notebook).firstMatch.exists
+            }
+            try self.libraryCapture(16, "library-search-empty")
         }
     }
 
@@ -171,20 +193,24 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.tap("New")
             _ = try self.require("Notebook")
-            try self.libraryCapture(5, "new-menu")
+            try self.libraryCapture(20, "new-menu")
             try self.tap("Notebook")
             _ = try self.require("New Notebook")
-            try self.capture(6, "new-notebook") { $0.screen == "library" && !$0.openPanels.isEmpty }
+            try self.capture(21, "new-notebook") { $0.screen == "library" && !$0.openPanels.isEmpty }
         }
     }
 
     private func dock(_ edge: String) throws {
         if try ui.state().paletteDock?.edge == edge { return }
         let tools = try require("Tools")
-        // Start in the end padding, away from the selected-tool bead's scrub gesture.
+        // Use the bare rim. Never drag a stale/offscreen accessibility union into
+        // iPadOS window controls: that resizes the scene for every later test.
         let frame = tools.frame
+        guard ui.app.windows.firstMatch.frame.contains(frame) else {
+            throw NibUI.Failure.message("Palette left its app window after docking: \(frame)")
+        }
         let start = tools.coordinate(withNormalizedOffset: frame.height > frame.width
-            ? CGVector(dx: 0.5, dy: 0.01) : CGVector(dx: 0.01, dy: 0.5))
+            ? CGVector(dx: 0.1, dy: 0.5) : CGVector(dx: 0.5, dy: 0.1))
         let destination: CGVector
         switch edge {
         case "left": destination = CGVector(dx: 0.025, dy: 0.5)
@@ -199,7 +225,7 @@ final class CaptureUITests: XCTestCase {
     func test04CanvasPalette() {
         variants {
             try self.openNotebook()
-            for (number, edge) in [(7, "left"), (8, "top"), (9, "bottom")] {
+            for (number, edge) in UIDevice.current.userInterfaceIdiom == .pad ? [(30, "left"), (31, "top"), (32, "bottom")] : [(31, "top"), (32, "bottom")] {
                 try self.dock(edge)
                 try self.capture(number, "canvas-palette-" + edge) {
                     $0.screen == "document" && $0.paletteDock?.edge == edge
@@ -207,7 +233,7 @@ final class CaptureUITests: XCTestCase {
             }
             try self.ui.selectTool("pen")
             _ = try self.require("menu.toolSettings")
-            try self.capture(10, "options-bar") { $0.screen == "document" && $0.tool == "pen" }
+            try self.capture(33, "options-bar") { $0.screen == "document" && $0.tool == "pen" }
         }
     }
 
@@ -216,7 +242,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.ui.selectTool(id)
             try self.tap("menu.toolSettings")
-            guard self.ui.app.staticTexts[title].firstMatch.waitForExistence(timeout: 12) else {
+            guard self.query(title).firstMatch.waitForExistence(timeout: 12) else {
                 throw NibUI.Failure.message("\(title) options did not open")
             }
             try self.capture(number, id == "shape" ? "shapes-options" : id + "-options") {
@@ -225,12 +251,12 @@ final class CaptureUITests: XCTestCase {
         }
     }
 
-    func test05PenOptions() { toolOptions("pen", title: "Pen", number: 11) }
-    func test06HighlighterOptions() { toolOptions("highlighter", title: "Highlighter", number: 12) }
-    func test07EraserOptions() { toolOptions("eraser", title: "Eraser", number: 13) }
-    func test08LassoOptions() { toolOptions("lasso", title: "Lasso", number: 14) }
-    func test09ShapesOptions() { toolOptions("shape", title: "Shapes", number: 15) }
-    func test10TextOptions() { toolOptions("text", title: "Text", number: 16) }
+    func test05PenOptions() { toolOptions("pen", title: "Fountain Pen", number: 34) }
+    func test06HighlighterOptions() { toolOptions("highlighter", title: "Straight line", number: 35) }
+    func test07EraserOptions() { toolOptions("eraser", title: "Whole stroke", number: 36) }
+    func test08LassoOptions() { toolOptions("lasso", title: "Lasso", number: 37) }
+    func test09ShapesOptions() { toolOptions("shape", title: "Shapes", number: 38) }
+    func test10TextOptions() { toolOptions("text", title: "Text", number: 39) }
 
     func test11LassoSelection() {
         variants {
@@ -245,7 +271,7 @@ final class CaptureUITests: XCTestCase {
                                     CGPoint(x: 0.36, y: 0.54)], duration: 0.7)
             _ = try self.ui.waitForState { $0.selectionCount > 0 }
             _ = try self.require("cmd.item.duplicate")
-            try self.capture(17, "lasso-object-menu") { $0.screen == "document" && $0.selectionCount > 0 }
+            try self.capture(45, "lasso-object-menu") { $0.screen == "document" && $0.selectionCount > 0 }
         }
     }
 
@@ -253,10 +279,10 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.ui.tapCommand("sidebar.toggle")
-            try self.capture(18, "page-sidebar") { $0.openPanels.contains("sidebar.pages") }
+            try self.capture(50, "page-sidebar") { $0.openPanels.contains("sidebar.pages") }
             try self.tap("Outline")
             _ = try self.require("No outline yet")
-            try self.capture(19, "outline") { $0.openPanels.contains("outline.tab") }
+            try self.capture(51, "outline") { $0.openPanels.contains("outline.tab") }
         }
     }
 
@@ -270,7 +296,12 @@ final class CaptureUITests: XCTestCase {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
                     format: "label BEGINSWITH 'Search result ' AND label CONTAINS ' of '")).firstMatch.exists
             }
-            try self.documentCapture(20, "document-search-matches")
+            try self.documentCapture(55, "document-search-matches")
+            field.tap(); field.typeKey("a", modifierFlags: .command); field.typeText("zzzznomatch")
+            try self.wait("Document search must clear its matches") {
+                !self.ui.app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Search result '")).firstMatch.exists
+            }
+            try self.documentCapture(56, "document-search-empty")
         }
     }
 
@@ -278,8 +309,15 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.tap("Assistant")
-            try self.capture(21, "ai-assistant") { $0.openPanels.contains("aichat.panel") }
+            try self.capture(60, "ai-assistant") { $0.openPanels.contains("aichat.panel") }
         }
+    }
+
+    private func shareMenu() throws {
+        if !query("menu.share").allElementsBoundByIndex.contains(where: { $0.isHittable }) {
+            try tap("menu.more")
+        }
+        try tap("Share and Export", scroll: true)
     }
 
     private func settings() throws {
@@ -291,41 +329,41 @@ final class CaptureUITests: XCTestCase {
     func test15PluginManager() {
         variants {
             try self.settings()
-            try self.tap("Plugins", scroll: true)
+            try self.openSettingsPage("Plugins")
             _ = try self.require("Install from…")
-            try self.libraryCapture(22, "plugin-manager")
+            try self.libraryCapture(140, "plugin-manager")
         }
     }
 
     func test16Settings() {
         variants {
             try self.settings()
-            try self.libraryCapture(23, "settings-general")
-            try self.tap("Editing", scroll: true)
-            try self.tap("Document Editing", scroll: true)
+            try self.libraryCapture(100, "settings-general")
+            try self.openSettingsPage("Document Editing")
             _ = try self.require("Open documents in tabs")
-            try self.libraryCapture(24, "settings-editing")
-            try self.tap("Stylus", scroll: true)
-            try self.tap("Stylus & Palm Rejection", scroll: true)
-            try self.libraryCapture(25, "settings-stylus")
+            try self.libraryCapture(112, "settings-editing")
+            try self.closeSettings()
+            try self.settings()
+            try self.openSettingsPage("Stylus & Palm Rejection")
+            try self.libraryCapture(121, "settings-stylus")
         }
     }
 
     func test17Export() {
         variants {
             try self.openNotebook()
-            try self.tap("Share and Export")
+            try self.shareMenu()
             // The share menu contains the production export action; open the format sheet.
             try self.ui.tapCommand("export.present")
             _ = try self.require("Save to Files")
-            try self.documentCapture(26, "export-sheet")
+            try self.documentCapture(70, "export-sheet")
         }
     }
 
     func test18Whiteboard() {
         variants {
             try self.ui.openDocument("Concept map")
-            try self.capture(27, "whiteboard") { $0.screen == "document" && $0.itemCountOnPage == 3 }
+            try self.capture(80, "whiteboard") { $0.screen == "document" && $0.itemCountOnPage == 3 }
         }
     }
 
@@ -337,35 +375,47 @@ final class CaptureUITests: XCTestCase {
                     format: "value CONTAINS %@ OR label CONTAINS %@", "Measure distance and time", "Measure distance and time"
                 )).firstMatch.exists
             }
-            try self.documentCapture(28, "text-document")
+            try self.documentCapture(81, "text-document")
         }
     }
 
     func test20StudySession() {
         variants {
             try self.ui.openDocument("Motion flashcards")
+            _ = try self.require("Practice")
+            try self.documentCapture(82, "study-set-editor")
             try self.tap("Practice")
-            try self.capture(29, "study-session") { $0.openPanels.contains("studysession.practice") }
+            _ = try self.require("Question side")
+            try self.capture(83, "study-session-front") { $0.openPanels.contains("studysession.practice") }
+            try self.tap("Flip Card")
+            _ = try self.require("Answer side")
+            try self.documentCapture(84, "study-session-back")
+            for _ in 0..<3 { try self.tap("Good") }
+            _ = try self.require("Review complete")
+            try self.documentCapture(85, "study-session-summary")
         }
     }
 
     func test21Presentation() {
         variants {
             try self.openNotebook()
-            try self.tap("Share and Export")
-            // Production exposes this only with an external display. Do not simulate one
-            // or relabel the ordinary canvas as presentation when a lane lacks a display.
-            try self.tap("Presenter Page", scroll: true)
-            _ = try self.require("Stop Presenting")
-            try self.documentCapture(30, "presentation-mode")
+            try self.shareMenu()
+            if self.query("Presenter Page").firstMatch.exists {
+                try self.tap("Presenter Page", scroll: true)
+                _ = try self.require("Stop Presenting")
+                try self.documentCapture(73, "presentation-mode")
+            } else {
+                XCTAssertFalse(self.query("Full Page").firstMatch.exists)
+                XCTAssertFalse(self.query("Stop Presenting").firstMatch.exists)
+                try self.documentCapture(73, "presentation-disconnected-share-menu")
+            }
         }
     }
 
     func test22ThreeDocumentTabs() {
         variants {
             try self.settings()
-            try self.tap("Editing", scroll: true)
-            try self.tap("Tabs", scroll: true)
+            try self.openSettingsPage("Tabs")
             let toggle = self.ui.app.switches.matching(NSPredicate(format: "label == 'Show document tabs'")).firstMatch
             guard toggle.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("Tab visibility setting missing") }
             if toggle.value as? String != "1" { toggle.tap() }
@@ -379,7 +429,7 @@ final class CaptureUITests: XCTestCase {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
                     format: "value == 'Tab 3 of 3' OR value == '3 open documents'")).firstMatch.exists
             }
-            try self.documentCapture(31, "three-document-tabs")
+            try self.documentCapture(46, "three-document-tabs")
         }
     }
 
@@ -396,7 +446,7 @@ final class CaptureUITests: XCTestCase {
             try self.wait("The new folder must contain no documents") {
                 self.ui.app.descendants(matching: .any).matching(identifier: "cmd.doc.open").count == 0
             }
-            try self.libraryCapture(32, "empty-folder")
+            try self.libraryCapture(17, "empty-folder")
         }
     }
 
@@ -404,9 +454,214 @@ final class CaptureUITests: XCTestCase {
         variants(scenario: .failedRender) {
             try self.openNotebook()
             _ = try self.require("Try Again")
-            try self.capture(33, "page-render-error") {
+            try self.capture(79, "page-render-error") {
                 $0.screen == "document" && $0.fixtureScenario == "failedRender" && $0.renderFailureCount == 1
             }
         }
     }
+
+    private func closeSettings() throws {
+        try tap("sheet.dismiss")
+        try wait("Settings must dismiss") { !self.query("sheet.dismiss").firstMatch.exists }
+    }
+
+    private func openSettingsPage(_ title: String) throws {
+        let field = try searchField()
+        field.tap(); field.typeKey("a", modifierFlags: .command); field.typeText(title)
+        try tap(title, scroll: true)
+        try wait("Settings must open \(title)") {
+            self.ui.app.navigationBars[title].exists
+        }
+    }
+
+    private func settingsPages(_ pages: [(Int, String, String)]) {
+        variants {
+            for (number, title, stem) in pages {
+                try self.settings()
+                try self.openSettingsPage(title)
+                try self.libraryCapture(number, "settings-" + stem)
+                try self.closeSettings()
+            }
+        }
+    }
+
+    func test25LibraryContextMenu() {
+        variants {
+            let document = self.ui.app.buttons.matching(identifier: "cmd.doc.open")
+                .matching(NSPredicate(format: "label BEGINSWITH %@", self.notebook)).firstMatch
+            _ = try self.require(self.notebook)
+            document.press(forDuration: 1)
+            _ = try self.require("Rename")
+            try self.libraryCapture(14, "library-document-context-menu")
+        }
+    }
+
+    func test26CreationCoversAndPaper() {
+        variants {
+            try self.tap("New"); try self.tap("Notebook")
+            _ = try self.require("No cover")
+            try self.libraryCapture(22, "new-notebook-covers")
+            try self.tap("More Templates…", scroll: true)
+            _ = try self.require("Templates")
+            try self.libraryCapture(23, "paper-template-library")
+        }
+    }
+
+    private func creation(_ title: String, heading: String, number: Int, stem: String) {
+        variants {
+            try self.tap("New"); try self.tap(title)
+            _ = try self.require(heading)
+            try self.libraryCapture(number, stem)
+        }
+    }
+    func test27CreateWhiteboard() { creation("Whiteboard", heading: "New Whiteboard", number: 24, stem: "new-whiteboard") }
+    func test28CreateTextDocument() { creation("Text Document", heading: "New Text Document", number: 25, stem: "new-text-document") }
+    func test29CreateStudySet() { creation("Study Set", heading: "New Study Set", number: 26, stem: "new-study-set") }
+
+    func test30StickyNote() {
+        variants {
+            try self.openNotebook(); try self.ui.selectTool("sticky")
+            try self.documentCapture(40, "sticky-note-tool")
+            self.ui.coordinate(CGPoint(x: 0.5, y: 0.6)).tap()
+            let editor = self.ui.app.textViews["Sticky note"]
+            guard editor.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("Sticky editor missing") }
+            editor.tap(); editor.typeText("Review Newton’s second law")
+            try self.documentCapture(41, "sticky-note-editor")
+        }
+    }
+
+    func test31ImageInsertion() {
+        variants {
+            try self.openNotebook(); try self.ui.selectTool("image")
+            self.ui.coordinate(CGPoint(x: 0.5, y: 0.6)).tap()
+            _ = try self.require("Files")
+            try self.documentCapture(42, "image-source-picker")
+        }
+    }
+
+    func test32Ruler() {
+        variants {
+            try self.openNotebook(); try self.ui.tapCommand("ruler.set")
+            let ruler = try self.require("Ruler")
+            try self.documentCapture(43, "ruler")
+            ruler.doubleTap()
+            _ = try self.require("Set Angle…")
+            try self.documentCapture(44, "ruler-menu")
+        }
+    }
+
+    func test33ZoomWindowAndScales() {
+        variants {
+            try self.openNotebook(); try self.ui.tapCommand("zoom.toggle")
+            _ = try self.require("Zoom Window writing area")
+            try self.documentCapture(47, "zoom-window")
+            try self.tap("Close Zoom Window")
+            try self.ui.selectTool("lasso")
+            let initial = try self.ui.state().zoom
+            try self.ui.pinchZoom(scale: 1.5)
+            let zoomed = try self.ui.waitForState { $0.zoom > initial + 0.05 }
+            try self.documentCapture(48, "canvas-zoomed-in")
+            try self.ui.pinchZoom(scale: 0.4)
+            _ = try self.ui.waitForState { $0.zoom < zoomed.zoom - 0.05 }
+            try self.documentCapture(49, "canvas-zoomed-out")
+        }
+    }
+
+    func test34PageMenu() {
+        variants {
+            try self.openNotebook(); try self.ui.tapCommand("sidebar.toggle")
+            let page = self.ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Page 1'")).firstMatch
+            guard page.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("First thumbnail missing") }
+            page.press(forDuration: 1)
+            _ = try self.require("Duplicate")
+            try self.documentCapture(52, "page-context-menu")
+        }
+    }
+
+    func test35GoToPage() {
+        variants {
+            try self.openNotebook(); try self.tap("menu.more")
+            try self.tap("Go to Page…", scroll: true)
+            _ = try self.require("Page number or title")
+            try self.documentCapture(53, "go-to-page")
+        }
+    }
+
+    func test36ClearPageConfirmation() {
+        variants {
+            try self.openNotebook(); try self.ui.selectTool("eraser")
+            try self.tap("menu.toolSettings"); try self.tap("Clear Page", scroll: true)
+            _ = try self.require("eraser.clearPage.confirmation")
+            try self.documentCapture(54, "clear-page-confirmation")
+        }
+    }
+
+    func test37AssistantAnswer() {
+        variants(agent: true) {
+            try self.openNotebook(); try self.tap("Assistant")
+            let composer = try self.require("Question or instruction")
+            composer.tap(); composer.typeText("Explain velocity and acceleration")
+            try self.tap("Send to assistant")
+            try self.wait("The real agent must display the fixture model answer", timeout: 60) {
+                self.ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Velocity is displacement per unit time'")).firstMatch.exists
+            }
+            try self.capture(61, "ai-assistant-answer") { $0.openPanels.contains("aichat.panel") }
+        }
+    }
+
+    func test38SettingsGeneralPages() {
+        settingsPages([(101,"Profile","profile"), (102,"Appearance","appearance"),
+            (103,"Password Protection","password"), (104,"Accessibility","accessibility"),
+            (105,"Language","language"), (106,"Recording Settings","recording"),
+            (107,"Keyboard and Pointer","keyboard"), (108,"Calendar","calendar"),
+            (109,"Collaboration","collaboration"), (110,"Notifications","notifications")])
+    }
+    func test39SettingsEditingPages() {
+        settingsPages([(113,"Tabs","tabs"), (114,"Toolbar","toolbar"), (115,"Undo and Redo","undo"),
+            (116,"Alignment and snapping","snapping"), (117,"Elements and GIFs","elements"), (118,"Layers","layers")])
+    }
+    func test40SettingsWritingPages() {
+        settingsPages([(120,"Apple Pencil","apple-pencil"), (122,"Smart Ink","smart-ink"),
+            (123,"Handwriting Recognition","recognition"), (124,"Shape Recognition","shape-recognition"),
+            (125,"Writing Aids","writing-aids")])
+    }
+    func test41SettingsAIPages() {
+        settingsPages([(130,"AI","ai"), (131,"Use my Claude subscription","claude-subscription"),
+            (132,"Use my ChatGPT subscription","chatgpt-subscription"), (133,"Add provider","other-provider"),
+            (134,"Meeting AI","meeting-ai")])
+    }
+    func test42SettingsSyncPages() {
+        settingsPages([(135,"Backup","backup"), (136,"WebDAV","webdav"),
+            (137,"Collaboration Relay","relay"), (138,"Library Repair","repair"), (141,"Bridge","bridge")])
+    }
+    func test43SettingsAboutPages() {
+        settingsPages([(142,"Troubleshooting","troubleshooting"), (143,"Developer","developer"),
+            (144,"About Nib","about"), (145,"Privacy & Data","privacy"), (146,"Goodnotes Parity","parity")])
+    }
+
+    func test44FirstRun() {
+        variants(onboarding: true) {
+            try self.capture(1, "onboarding-library") { _ in true }
+            // The isolated fixture already lives outside the app container; the regular
+            // first-run flow therefore offers Continue after validating that location.
+            if self.query("Continue").firstMatch.isHittable {
+                try self.tap("Continue")
+            } else {
+                try self.tap("Keep Notes in Nib")
+                try self.capture(2, "onboarding-storage-confirmation") { _ in true }
+                try self.tap("Keep Notes in Nib")
+            }
+            _ = try self.require("Practice lines")
+            try self.capture(3, "onboarding-pencil") { _ in true }
+            try self.tap("Continue")
+            _ = try self.require("Set Up AI")
+            try self.capture(4, "onboarding-ai") { _ in true }
+            try self.tap("Skip")
+            _ = try self.require("Start Writing")
+            try self.capture(5, "onboarding-ready") { _ in true }
+            try self.tap("Open Library")
+            _ = try self.ui.waitForState { $0.screen == "library" }
+        }
+    }
+
 }
