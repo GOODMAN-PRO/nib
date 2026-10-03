@@ -782,6 +782,20 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertEqual(refs, model.order.prefix(500).map { ref($0) })
     }
 
+    func testMenuPageLookupHintAlwaysChecksTheCurrentHead() throws {
+        let h = harness()
+        var content = try h.app.workspace.content(doc)
+        XCTAssertTrue(SidebarMenuTarget.isLive(p1, in: content, doc: doc))
+        content.pages.reverse()
+        XCTAssertTrue(SidebarMenuTarget.isLive(p1, in: content, doc: doc), "a moved record invalidates the index hint")
+        let index = try XCTUnwrap(content.pages.firstIndex { $0.id == p1 })
+        content.pages[index].deleted = true
+        XCTAssertFalse(SidebarMenuTarget.isLive(p1, in: content, doc: doc), "a cached location must not hide a tombstone")
+        content.pages.remove(at: index)
+        XCTAssertFalse(SidebarMenuTarget.isLive(p1, in: content, doc: doc), "a removed page must not resolve to its neighbour")
+        XCTAssertTrue(SidebarMenuTarget.isLive(p2, in: content, doc: doc))
+    }
+
     // MARK: Model
 
     func testSelectModeSelectAllAndLeavingClearsTheSelection() {
@@ -954,6 +968,107 @@ final class FeatSidebarTests: XCTestCase {
     }
 
     // MARK: Views
+
+    private func laidOutGrid(_ model: PagesPanelModel) -> ThumbnailGridController {
+        let grid = ThumbnailGridController(model: model)
+        grid.traitOverrides.horizontalSizeClass = .regular
+        grid.loadViewIfNeeded()
+        grid.view.frame = CGRect(x: 0, y: 0, width: 240, height: 900)
+        grid.view.layoutIfNeeded()
+        return grid
+    }
+
+    func testThumbnailActivationAndTouchUseTheCollectionCell() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [CommandIDs.viewGoToPage], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        grid.onOpen = { page, _ in Task { await model.goTo(page) } }
+        let collection = try XCTUnwrap(grid.view as? UICollectionView)
+        let second = IndexPath(item: 1, section: 0)
+        let cell = try XCTUnwrap(collection.cellForItem(at: second) as? ThumbnailCell)
+        XCTAssertTrue(cell.isAccessibilityElement)
+        XCTAssertFalse(cell.contentView.isUserInteractionEnabled,
+                       "the hosted drawing must not intercept UIKit's page selection or drag")
+        let hit = try XCTUnwrap(cell.hitTest(CGPoint(x: cell.bounds.midX, y: cell.bounds.midY), with: nil))
+        XCTAssertFalse(hit.isDescendant(of: cell.contentView))
+        XCTAssertTrue(cell.accessibilityActivate())
+        try await waitUntil { log.calls.count == 1 }
+        XCTAssertEqual(log.calls[0].command, CommandIDs.viewGoToPage)
+        XCTAssertEqual(log.calls[0].params, ["page": .string(ref(p2))])
+        grid.collectionView(collection, didSelectItemAt: second)
+        try await waitUntil { log.calls.count == 2 }
+        XCTAssertEqual(log.calls[1].params, log.calls[0].params, "touch and accessibility activate the same page")
+
+        model.setSelecting(true)
+        grid.update()
+        XCTAssertTrue(cell.accessibilityActivate())
+        XCTAssertEqual(model.orderedSelection, [p2])
+        XCTAssertEqual(log.calls.count, 2, "selection mode must not navigate")
+    }
+
+    func testThumbnailRefreshWaitsUntilTheHeldTouchEnds() async throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        // Let the initial layout's scheduled size refresh settle before holding a cell.
+        await Task.yield()
+        let collection = try XCTUnwrap(grid.view as? UICollectionView)
+        let first = IndexPath(item: 0, section: 0)
+        let cell = try XCTUnwrap(collection.cellForItem(at: first) as? ThumbnailCell)
+        XCTAssertTrue(cell.accessibilityValue?.contains("Current page") == true)
+        grid.collectionView(collection, didHighlightItemAt: first)
+        h.session.page = p2
+        model.refreshNow()
+        grid.update()
+        XCTAssertTrue(cell.accessibilityValue?.contains("Current page") == true,
+                      "an arriving render or session update must not rebuild the held thumbnail")
+        let drag = try XCTUnwrap(grid.dragItem(p1, doc: doc))
+        XCTAssertEqual(drag.localObject as? PageDragItem, PageDragItem(doc: doc, page: p1))
+        grid.collectionView(collection, didUnhighlightItemAt: first)
+        try await waitUntil { cell.accessibilityValue?.contains("Current page") == false }
+    }
+
+    func testReorderUsesTheProposedGapInsteadOfDisplacedCellFrames() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.pageReorder], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        // UIKit's preview has moved cells under the finger. The insertion destination still
+        // is in the remaining order: slot 1 is before page 3 after lifting page 1.
+        let target = grid.dropTarget(at: .zero, destination: IndexPath(item: 1, section: 0), moving: [p1])
+        XCTAssertEqual(target, .before(p3))
+        XCTAssertEqual(grid.dropTarget(at: .zero, destination: IndexPath(item: 2, section: 0), moving: [p1]), .end)
+        XCTAssertEqual(grid.dropTarget(at: .zero, destination: IndexPath(item: 0, section: 0), moving: [p3]), .before(p1))
+        XCTAssertEqual(grid.dropTarget(at: .zero, destination: IndexPath(item: 1, section: 0), moving: [p1, p2]), .end)
+        await model.reorder([p1], to: target)
+        XCTAssertEqual(model.rows.map(\.id), [p2, p1, p3])
+        XCTAssertEqual(log.calls.count, 1)
+        XCTAssertEqual(log.calls[0].params, ["pages": [.string(ref(p1))], "before": .string(ref(p3))])
+        XCTAssertEqual(grid.dropTarget(at: .zero, destination: IndexPath(item: 3, section: 0), moving: [p1]), .end)
+        XCTAssertEqual(grid.dropTarget(at: .zero, destination: IndexPath(item: 0, section: 1), moving: [p1]), .end)
+    }
+
+    func testHeldThumbnailOffersPNGWithoutChangingSourcePagesOrItems() async throws {
+        let h = harness()
+        h.app.services.renderer = FakeRenderer()
+        let before = try h.snapshot(doc)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = laidOutGrid(model)
+        let collection = try XCTUnwrap(grid.view as? UICollectionView)
+        let first = IndexPath(item: 0, section: 0)
+        grid.collectionView(collection, didHighlightItemAt: first)
+        defer { grid.collectionView(collection, didUnhighlightItemAt: first) }
+        let drag = try XCTUnwrap(grid.dragItem(p1, doc: doc))
+        let bytes = await loadData(drag.itemProvider, UTType.png.identifier)
+        let png = try XCTUnwrap(bytes)
+        XCTAssertNotNil(UIImage(data: png))
+        XCTAssertEqual(Array(png.prefix(8)), [137, 80, 78, 71, 13, 10, 26, 10])
+        XCTAssertFalse(drag.itemProvider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier))
+        XCTAssertEqual(try h.snapshot(doc), before, "a canvas receives an image copy; the source page is retained")
+    }
 
     func testGridShowsEveryPageAndAddPageAndTakesKeysInSelectMode() throws {
         let h = harness()

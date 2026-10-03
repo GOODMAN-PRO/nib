@@ -161,7 +161,20 @@ final class NibUI {
         // Only the command-bearing outer button owns document navigation.
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true AND enabled == true"), object: document)
         guard XCTWaiter.wait(for: [ready], timeout: 15) == .completed else { throw Failure.message("Document is not hittable: \(title)") }
-        document.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        // Hittable means that some of the card is visible, not that its centre
+        // lies in the library's scroll viewport. A clipped card must receive the
+        // same visible tap a person can make, never a tap on chrome below it.
+        var visible = app.windows.firstMatch.frame
+        for scroll in app.scrollViews.allElementsBoundByIndex + app.collectionViews.allElementsBoundByIndex {
+            let cards = scroll.buttons.matching(identifier: "cmd.doc.open")
+                .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ","))
+            if cards.count > 0 { visible = visible.intersection(scroll.frame) }
+        }
+        guard let point = NibUITestScrollGeometry.tapPoint(control: document.frame, viewport: visible) else {
+            throw Failure.message("Document has no visible tap area: \(title)")
+        }
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 

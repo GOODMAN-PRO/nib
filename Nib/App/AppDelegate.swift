@@ -11,6 +11,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         if !NibUITestMode.isEnabled { SafeMode.beginLaunch() }
+        do {
+            let documents = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                                        appropriateFor: nil, create: true)
+            try LocalDocumentStorage.prepare(documents: documents)
+        } catch {
+            NSLog("Could not prepare local document storage: %@", String(describing: error))
+        }
         do { try NibUITestMode.prepareStorage() }
         catch { UITestFixture.failure = "Could not prepare fixture storage: \(error)" }
         let app = NibApp(defaults: UITestFixture.defaults())

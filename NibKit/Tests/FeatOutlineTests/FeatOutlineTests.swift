@@ -718,6 +718,98 @@ final class FeatOutlineTests: XCTestCase {
         try await waitUntil { model.sections.map { $0.kind } == [.custom] }
     }
 
+    func testBookmarkControlHitTargetCoversPreviewTitleAndWhitespace() throws {
+        let control = BookmarkRowControl()
+        var activations = 0
+        var row = BookmarkRow(page: Fixtures.page1, number: 1, title: nil, isCurrent: false, aspect: 595 / 842)
+        control.configure(row: row, image: nil) { activations += 1 }
+        for width in [NibMetrics.navigatorWidth, NibMetrics.panelWidthAccessibility] {
+            let size = control.systemLayoutSizeFitting(CGSize(width: width, height: 0),
+                withHorizontalFittingPriority: .required, verticalFittingPriority: .fittingSizeLevel)
+            XCTAssertEqual(size.width, width, accuracy: 1)
+            XCTAssertGreaterThanOrEqual(size.height, NibMetrics.hitTarget)
+            control.frame = CGRect(origin: .zero, size: size)
+            control.layoutIfNeeded()
+            // The failing tap was at the row's centre, beyond the short "Page 1" text.
+            for x in [NibSpacing.m, width / 2, width - NibSpacing.m] {
+                let hit = try XCTUnwrap(control.hitTest(CGPoint(x: x, y: size.height / 2), with: nil))
+                XCTAssertTrue(hit === control, "The decorative hosted label must not consume selection")
+            }
+        }
+        control.sendActions(for: .primaryActionTriggered)
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(control.accessibilityLabel, "Page 1")
+        XCTAssertTrue(control.accessibilityTraits.contains(.button))
+        XCTAssertFalse(control.accessibilityTraits.contains(.selected))
+
+        // Reconfiguration (navigation or a new thumbnail) retains one action and updates its destination.
+        row.isCurrent = true
+        row.title = "Introduction"
+        var replacementActivations = 0
+        control.configure(row: row, image: nil) { replacementActivations += 1 }
+        XCTAssertEqual(control.accessibilityLabel, "Page 1, Introduction")
+        XCTAssertEqual(control.accessibilityValue, "Current page")
+        XCTAssertTrue(control.accessibilityTraits.contains(.selected))
+        XCTAssertTrue(control.accessibilityActivate())
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(replacementActivations, 1)
+        control.isEnabled = false
+        XCTAssertFalse(control.accessibilityActivate())
+        XCTAssertEqual(replacementActivations, 1)
+    }
+
+    func testBookmarkActivationNavigatesInvokingSessionThenCanUnbookmark() async throws {
+        let h = harness()
+        try await h.run("page.setBookmarked", ["pages": [pageRef(Fixtures.page1)], "on": true])
+        h.session.page = Fixtures.page2
+        let model = BookmarksPanelModel(app: h.app, session: h.session)
+        let row = try XCTUnwrap(model.rows.first)
+        XCTAssertFalse(row.isCurrent)
+        let other = EditorSession()
+        other.document = doc
+        other.page = Fixtures.pdfPage
+        h.app.services.sessions.add(other)
+        var calls = 0
+        // F006 owns navigation; verify the actual command boundary without importing another feature.
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Go to Page",
+            summary: "Test navigation receiver.", effect: .session)) { params, context in
+            calls += 1
+            XCTAssertTrue(context.session === h.session)
+            XCTAssertEqual(params["page"], self.pageRef(Fixtures.page1))
+            context.session?.page = Fixtures.page1
+            return .null
+        }
+        let context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        let host = UIHostingController(rootView: BookmarksPanel(context: context)
+            .environment(\.horizontalSizeClass, .regular))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: NibMetrics.navigatorWidth, height: 640))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        func controls(in view: UIView) -> [BookmarkRowControl] {
+            (view as? BookmarkRowControl).map { [$0] } ?? view.subviews.flatMap { controls(in: $0) }
+        }
+        try await waitUntil {
+            host.view.layoutIfNeeded()
+            return controls(in: host.view).first?.bounds.width ?? 0 > 0
+        }
+        let control = try XCTUnwrap(controls(in: host.view).first)
+        XCTAssertEqual(control.accessibilityLabel, "Page 1")
+        XCTAssertGreaterThan(control.bounds.width, NibMetrics.navigatorWidth / 2)
+        let point = control.convert(CGPoint(x: control.bounds.midX, y: control.bounds.midY), to: window)
+        XCTAssertTrue(window.hitTest(point, with: nil) === control,
+                      "The actual List row must deliver its centre tap to the navigation control")
+        control.sendActions(for: .primaryActionTriggered)
+        try await waitUntil { model.rows.first?.isCurrent == true }
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertEqual(other.page, Fixtures.pdfPage)
+        model.remove(try XCTUnwrap(model.rows.first))
+        try await waitUntil { model.rows.isEmpty }
+        XCTAssertFalse(try XCTUnwrap(h.app.workspace.content(doc).page(Fixtures.page1)).bookmarked)
+    }
+
     func testBookmarksPanelFollowsBookmarksTrashAndTheCurrentPage() async throws {
         let h = harness()
         let model = BookmarksPanelModel(app: h.app, session: h.session)

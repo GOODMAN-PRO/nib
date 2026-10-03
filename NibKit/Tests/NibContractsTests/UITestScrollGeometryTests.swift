@@ -2,6 +2,15 @@ import XCTest
 import NibContracts
 
 final class UITestScrollGeometryTests: XCTestCase {
+    func testLibraryCardCanOpenWhenItsCentreIsClippedByTheScrollViewport() throws {
+        let library = CGRect(x: 280, y: 140, width: 1000, height: 600)
+        let card = CGRect(x: 320, y: 680, width: 176, height: 240)
+        XCTAssertFalse(library.contains(CGPoint(x: card.midX, y: card.midY)))
+        let point = try XCTUnwrap(NibUITestScrollGeometry.tapPoint(control: card, viewport: library))
+        XCTAssertTrue(library.contains(point))
+        XCTAssertTrue(card.contains(point))
+    }
+
     func testOffscreenAddPageMustScrollBeforeItCanBeTapped() throws {
         let viewport = try XCTUnwrap(NibUITestScrollGeometry.viewport(
             scroll: CGRect(x: 1048, y: 104, width: 312, height: 520),

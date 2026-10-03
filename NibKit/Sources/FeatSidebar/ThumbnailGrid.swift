@@ -247,6 +247,34 @@ struct ThumbnailGridView: UIViewControllerRepresentable {
 /// stale while a snapshot is being applied).
 final class ThumbnailCell: UICollectionViewCell {
     var page: PageID?
+    var activate: (() -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        // The hosting view only draws the thumbnail. UIKit owns selection, context menus and
+        // the page drag; a hosted SwiftUI interaction must not consume or replace that touch.
+        contentView.isUserInteractionEnabled = false
+        isAccessibilityElement = true
+    }
+
+    required init?(coder: NSCoder) { return nil }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // UIHostingConfiguration re-enables its container when installing/updating content.
+        contentView.isUserInteractionEnabled = false
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard let hit = super.hitTest(point, with: event) else { return nil }
+        return hit.isDescendant(of: contentView) ? self : hit
+    }
+
+    override func accessibilityActivate() -> Bool {
+        guard let activate else { return false }
+        activate()
+        return true
+    }
 }
 
 @MainActor
@@ -289,6 +317,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private(set) var metrics = ThumbnailLayoutMetrics(width: NibMetrics.navigatorWidth, mode: .column)
     private var shown = Shown()
     private var needsUpdate = false
+    private var highlightedPages = Set<PageID>()
+    private var deferredRefresh = false
+    private var retryUpdate: Task<Void, Never>?
     private let swipePan = UIPanGestureRecognizer()
     private var swipe: SwipeSelection?
     private var swipeLocation: CGPoint?
@@ -393,8 +424,8 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         // The model keeps the same array until its rows change, so this is O(1) on a stroke or a selection step.
         let rowsChanged = nextRows != rows
         let identityChanged = nextAdd != showsAdd || (rowsChanged && nextRows.map { $0.id } != rows.map { $0.id })
-        if identityChanged && !force && (collectionView.hasActiveDrag || collectionView.hasActiveDrop) {
-            needsUpdate = true
+        if !force && isInteracting {
+            deferUpdate()
             return
         }
         let old = dataSource.snapshot()
@@ -470,14 +501,43 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         Task { @MainActor [weak self] in self?.update() }
     }
 
+    private var isInteracting: Bool {
+        // Once the collection's swipe recognizer owns the touch, selection beads can update
+        // live. A pending tap/lift and an active native drag must keep their content intact.
+        (swipe == nil && (!highlightedPages.isEmpty || collectionView?.isTracking == true))
+            || collectionView?.hasActiveDrag == true || collectionView?.hasActiveDrop == true
+    }
+
+    /// Renders can land between touch-down and the drag lift. Keep the original hosting view
+    /// alive until the gesture ends, including when UIKit cancels selection to start a drag.
+    private func deferUpdate() {
+        needsUpdate = true
+        guard retryUpdate == nil else { return }
+        retryUpdate = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            guard let self else { return }
+            self.retryUpdate = nil
+            if self.isInteracting { self.deferUpdate(); return }
+            self.flushDeferredUpdate()
+            if self.deferredRefresh {
+                self.deferredRefresh = false
+                self.reconfigure(visibleOnly: false)
+            }
+        }
+    }
+
     private func visibleEntries() -> [Entry] {
         guard let collectionView = collectionView, let dataSource = dataSource else { return [] }
         return collectionView.indexPathsForVisibleItems.compactMap { dataSource.itemIdentifier(for: $0) }
     }
 
     private func reconfigure(visibleOnly: Bool) {
-        guard let collectionView = collectionView, let dataSource = dataSource,
-              !collectionView.hasActiveDrag, !collectionView.hasActiveDrop else { return }
+        guard let dataSource = dataSource else { return }
+        guard !isInteracting else {
+            deferredRefresh = true
+            deferUpdate()
+            return
+        }
         var snapshot = dataSource.snapshot()
         let items = visibleOnly ? visibleEntries() : snapshot.itemIdentifiers.filter { $0 != .add }
         guard !items.isEmpty else { return }
@@ -539,8 +599,25 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                                        isCurrent: model.current == page,
                                        isSelected: model.isSelecting ? model.selection.contains(page) : nil)
         let actions = ThumbnailGridController.assistiveTechRunning ? accessibilityActions(for: row) : []
+        cell.accessibilityLabel = row.title.map { String(localized: "Page \(row.number)") + ", " + $0 }
+            ?? String(localized: "Page \(row.number)")
+        var values: [String] = []
+        if state.isCurrent { values.append(String(localized: "Current page")) }
+        if let selected = state.isSelected {
+            values.append(selected ? String(localized: "Selected") : String(localized: "Not selected"))
+        }
+        if row.bookmarked { values.append(String(localized: "Bookmarked")) }
+        if row.unseen { values.append(String(localized: "Changed since you last looked")) }
+        cell.accessibilityValue = values.joined(separator: ", ")
+        cell.accessibilityTraits = state.isSelected == true ? [.button, .selected] : .button
+        cell.accessibilityHint = model.isSelecting ? String(localized: "Selects or deselects the page") : String(localized: "Shows the page")
+        cell.activate = { [weak self] in self?.activate(.page(raw)) }
+        cell.accessibilityCustomActions = actions.map { action in
+            UIAccessibilityCustomAction(name: action.name) { _ in action.handler(); return true }
+        }
         cell.contentConfiguration = UIHostingConfiguration { ThumbnailCellView(state: state, actions: actions) }
             .margins(.all, 0)
+        cell.contentView.isUserInteractionEnabled = false
     }
 
     private func requestThumbnail(_ row: PageRow) {
@@ -611,6 +688,10 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: false)
         guard let entry = dataSource?.itemIdentifier(for: indexPath) else { return }
+        activate(entry)
+    }
+
+    private func activate(_ entry: Entry) {
         switch entry {
         case .add:
             let model = self.model
@@ -623,6 +704,15 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                 onOpen?(page, metrics.isFullWindow)
             }
         }
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didHighlightItemAt indexPath: IndexPath) {
+        if let page = pageID(at: indexPath) { highlightedPages.insert(page) }
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didUnhighlightItemAt indexPath: IndexPath) {
+        if let page = pageID(at: indexPath) { highlightedPages.remove(page) }
+        flushDeferredUpdate()
     }
 
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
@@ -774,6 +864,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     }
 
     func collectionView(_ collectionView: UICollectionView, dragSessionDidEnd session: UIDragSession) {
+        highlightedPages.removeAll()
         flushDeferredUpdate()
     }
 
@@ -809,7 +900,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         switch kind {
         case .reorder:
             let pages = coordinator.items.compactMap { ($0.dragItem.localObject as? PageDragItem)?.page }
-            let target = dropTarget(at: location, moving: Set(pages))
+            let target = dropTarget(at: location, destination: coordinator.destinationIndexPath, moving: Set(pages))
             guard let request = model.beginReorder(pages, to: target) else { return }
             update(force: true)
             for item in coordinator.items {
@@ -821,11 +912,11 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
             Task { await model.finishReorder(request) }
         case .pages:
             let providers = coordinator.items.map { $0.dragItem.itemProvider }
-            let target = dropTarget(at: location, moving: [])
+            let target = dropTarget(at: location, destination: coordinator.destinationIndexPath, moving: [])
             Task { await model.pastePages(providers, into: doc, at: target) }
         case .files:
             let providers = coordinator.items.map { $0.dragItem.itemProvider }
-            let target = dropTarget(at: location, moving: [])
+            let target = dropTarget(at: location, destination: coordinator.destinationIndexPath, moving: [])
             Task { await model.importFiles(providers, into: doc, at: target) }
         }
     }
@@ -840,7 +931,14 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     }
 
     /// The gap the drop points at, from the thumbnails where they are on screen.
-    private func dropTarget(at location: CGPoint, moving: Set<PageID>) -> PageDropTarget {
+    func dropTarget(at location: CGPoint, destination: IndexPath?, moving: Set<PageID>) -> PageDropTarget {
+        // UIKit has already opened an insertion gap and moved the visible cells. Their frames
+        // no longer describe the order; remove the local stack before applying its insertion index.
+        if let destination {
+            let order = rows.map { $0.id }.filter { !moving.contains($0) }
+            return destination.section == 0 && order.indices.contains(destination.item)
+                ? .before(order[destination.item]) : .end
+        }
         guard let collectionView = collectionView else { return .end }
         var slots: [PageDropPlanner.Slot] = []
         for cell in collectionView.visibleCells {
@@ -895,6 +993,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        highlightedPages.removeAll()
         swipe = nil
         swipeLocation = nil
         stopAutoScroll()

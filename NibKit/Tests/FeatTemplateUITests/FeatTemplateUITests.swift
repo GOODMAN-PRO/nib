@@ -10,6 +10,53 @@ import NibTesting
 @MainActor
 final class FeatTemplateUITests: XCTestCase {
     private func harness() -> Harness { Harness(features: [FeatTemplateUIFeature.self]) }
+
+    func testChangeTemplateMenusDispatchTheRegisteredPanelWithPageTargets() async throws {
+        let h = harness()
+        let panel = try XCTUnwrap(h.app.ui.panels.get("templateui.change"))
+        XCTAssertEqual(panel.placement, .floating)
+        XCTAssertEqual(panel.docKinds, [.notebook])
+        XCTAssertTrue(panel.providesHeader)
+
+        var presented: JSONValue?
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel",
+            summary: "Capture the template menu's handoff to the document chrome.", effect: .session)) { params, ctx in
+            XCTAssertTrue(ctx.session === h.session)
+            XCTAssertNotNil(h.app.ui.panels.get(params["id"]?.stringValue ?? ""))
+            presented = params
+            return [:]
+        }
+
+        let page1 = Fixtures.page1
+        let page2 = NibID("FIXTUREPG002")
+        for (location, page, selection, expected) in [
+            (MenuLocation.documentMore, page1, [NibID](), [page1]),
+            (.sidebarPage, page2, [], [page2]),
+            (.sidebarSelection, page1, [page1, page2], [page1, page2])
+        ] {
+            let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID,
+                page: page, nodes: selection)
+            let action = try XCTUnwrap(h.app.ui.menuItems(location, context)
+                .first { $0.id == "templateui.change.\(location.rawValue)" })
+            XCTAssertEqual(action.command, CommandIDs.panelOpen)
+            presented = nil
+            _ = try await h.run(action.command, action.params(context))
+            XCTAssertEqual(presented?["id"], "templateui.change")
+            XCTAssertEqual(presented?["kind"], "paper")
+            XCTAssertEqual(presented?["pages"], .array(expected.map {
+                .string(NodeRef.page(Fixtures.docID, $0).description)
+            }))
+        }
+
+        // More must also work when the canvas has not published its current page yet;
+        // the sheet receives an empty selection and resolves the session's page on load.
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID)
+        let action = try XCTUnwrap(h.app.ui.menuItems(.documentMore, context)
+            .first { $0.id == "templateui.change.documentMore" })
+        _ = try await h.run(action.command, action.params(context))
+        XCTAssertEqual(presented?["pages"], [])
+    }
+
     private func store(_ h: Harness) -> CustomTemplateStore {
         CustomTemplateStore(root: h.library.metadataURL.appendingPathComponent("templates"), clock: h.app.clock)
     }

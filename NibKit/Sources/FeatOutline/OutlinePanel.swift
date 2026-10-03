@@ -1240,12 +1240,7 @@ struct BookmarksPanel: View {
         } else {
             List {
                 ForEach(model.rows) { row in
-                    Button {
-                        open(row)
-                    } label: {
-                        BookmarkRowView(row: row, image: model.image(row.page))
-                    }
-                    .buttonStyle(.plain)
+                    BookmarkRowButton(row: row, image: model.image(row.page)) { open(row) }
                     .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
                     .hoverEffect(.highlight)
                     .onAppear { model.requestThumbnail(row.page) }
@@ -1284,6 +1279,82 @@ struct BookmarksPanel: View {
     private func open(_ row: BookmarkRow) {
         model.open(row)
         if sizeClass == .compact { dismiss() }
+    }
+}
+
+/// A native row-wide control owns selection. A plain SwiftUI List button can expose the whole row to
+/// accessibility while its hosted label only accepts touches over the rendered thumbnail/text.
+/// Keep the preview decorative so whitespace, the title and the thumbnail all activate the same command.
+struct BookmarkRowButton: UIViewRepresentable {
+    let row: BookmarkRow
+    let image: UIImage?
+    let onOpen: @MainActor () -> Void
+
+    func makeUIView(context: Context) -> BookmarkRowControl {
+        let control = BookmarkRowControl()
+        control.configure(row: row, image: image, onOpen: onOpen)
+        return control
+    }
+
+    func updateUIView(_ control: BookmarkRowControl, context: Context) {
+        control.configure(row: row, image: image, onOpen: onOpen)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: BookmarkRowControl, context: Context) -> CGSize? {
+        uiView.systemLayoutSizeFitting(
+            CGSize(width: proposal.width ?? NibMetrics.navigatorWidth, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required, verticalFittingPriority: .fittingSizeLevel)
+    }
+}
+
+@MainActor
+final class BookmarkRowControl: UIButton {
+    private var preview: (UIView & UIContentView)?
+    private var onOpen: (@MainActor () -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        isPointerInteractionEnabled = true
+        isAccessibilityElement = true
+        addAction(UIAction { [weak self] _ in self?.onOpen?() }, for: .primaryActionTriggered)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(row: BookmarkRow, image: UIImage?, onOpen: @escaping @MainActor () -> Void) {
+        self.onOpen = onOpen
+        let configuration = UIHostingConfiguration {
+            BookmarkRowView(row: row, image: image)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }.margins(.all, 0)
+        if let preview {
+            preview.configuration = configuration
+        } else {
+            let preview = configuration.makeContentView()
+            preview.isUserInteractionEnabled = false
+            preview.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(preview)
+            NSLayoutConstraint.activate([
+                preview.leadingAnchor.constraint(equalTo: leadingAnchor),
+                preview.trailingAnchor.constraint(equalTo: trailingAnchor),
+                preview.topAnchor.constraint(equalTo: topAnchor),
+                preview.bottomAnchor.constraint(equalTo: bottomAnchor),
+                heightAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget)
+            ])
+            self.preview = preview
+        }
+        accessibilityLabel = row.title.map { String(localized: "Page \(row.number), \($0)") }
+            ?? String(localized: "Page \(row.number)")
+        accessibilityValue = row.isCurrent ? String(localized: "Current page") : ""
+        accessibilityTraits = row.isCurrent ? [.button, .selected] : .button
+        invalidateIntrinsicContentSize()
+    }
+
+    override func accessibilityActivate() -> Bool {
+        guard isEnabled else { return false }
+        sendActions(for: .primaryActionTriggered)
+        return true
     }
 }
 
