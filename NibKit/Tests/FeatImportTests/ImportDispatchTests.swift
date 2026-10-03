@@ -8,6 +8,20 @@ import NibTesting
 /// Dispatch, destinations, naming, sniffing and the other pure pieces of import.
 @MainActor
 final class ImportDispatchTests: XCTestCase {
+    func testPickerDoesNotCancelBeforeDeferredPresentationAttaches() async {
+        let root = DeferredPickerRoot()
+        let picker = UIViewController()
+        let attach = Task { @MainActor in
+            await Task.yield()
+            root.modal = picker
+        }
+        let attached = await DocumentPicker.waitForPresentation(of: picker, in: root)
+        await attach.value
+        XCTAssertTrue(attached, "A valid delayed presentation must retain the pending selection")
+        let unrelated = await DocumentPicker.waitForPresentation(of: UIViewController(), in: root, attempts: 1)
+        XCTAssertFalse(unrelated, "Another window's modal must not count as this picker's presentation")
+    }
+
     // MARK: Helpers
 
     private func registries() -> ContentRegistries {
@@ -792,4 +806,10 @@ final class ImportDispatchTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: destination.appendingPathComponent("trash").path))
         XCTAssertFalse(fm.fileExists(atPath: destination.appendingPathComponent("plugins").path))
     }
+}
+
+@MainActor
+private final class DeferredPickerRoot: UIViewController {
+    var modal: UIViewController?
+    override var presentedViewController: UIViewController? { modal ?? super.presentedViewController }
 }

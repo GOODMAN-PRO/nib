@@ -265,6 +265,15 @@ enum ChromeRegion {
         guard let keyboard, keyboard.intersects(region) else { return region }
         return above(keyboard.minY - NibSpacing.l, in: region)
     }
+
+    /// Bottom-docked editors keep their composer above the keyboard. Preserve the
+    /// chosen detent's height where it fits, then shorten it at the navigation bar.
+    static func raisingPanel(_ panel: CGRect, above keyboard: CGRect?, top: CGFloat) -> CGRect {
+        guard let keyboard, keyboard.intersects(panel) else { return panel }
+        let bottom = max(top, keyboard.minY - NibSpacing.l)
+        let height = min(panel.height, max(0, bottom - top))
+        return CGRect(x: panel.minX, y: bottom - height, width: panel.width, height: height)
+    }
 }
 
 // MARK: - Shared context
@@ -703,10 +712,12 @@ final class ChromeInkingMirror: ObservableObject {
 }
 
 /// What a sheet shows: a modal panel anywhere, and in compact windows the sidebar or the front floating panel.
-enum PresentedSheet: Hashable {
+enum PresentedSheet: Hashable, Identifiable {
     case modal(String)
     case sidebar(SidebarSide)
     case floating(String)
+
+    var id: Self { self }
 
     @MainActor
     static func current(_ state: ChromeState, compact: Bool) -> PresentedSheet? {
@@ -733,11 +744,11 @@ enum ChromePalettePolicy {
             && (!bottomAssistant || detent == .medium)
     }
 
-    /// Remove the underlying droplets while a compact sheet or full-width search occupies their region,
+    /// Remove the underlying droplets while navigation or search occupies their region,
     /// including options and buds. Keep the reservation and saved dock so dismissal does not refit the paper.
     static func showsPalette(reservesSpace: Bool, compact: Bool, sheet: PresentedSheet?,
-                             documentSearchRegion: CGRect? = nil) -> Bool {
-        reservesSpace && !(compact && sheet != nil) && documentSearchRegion == nil
+                             documentSearchRegion: CGRect? = nil, windowNavigator: Bool = false) -> Bool {
+        reservesSpace && !(compact && sheet != nil) && documentSearchRegion == nil && !windowNavigator
     }
 }
 
@@ -979,7 +990,7 @@ struct ChromeRootView: View {
         .frame(width: geometry.size.width, height: geometry.size.height)
         .ignoresSafeArea(.container)
         .ignoresSafeArea(.keyboard)
-        .nibSheet(isPresented: sheetBinding(compact: layout.isCompact)) { sheetContent }
+        .nibSheet(item: sheetBinding(compact: layout.isCompact)) { sheet in sheetContent(sheet) }
         .onChange(of: paletteCorrection(layout), initial: true) { _, correction in
             guard let correction else { return }
             chrome.run(CommandIDs.toolbarDock, ["dock": .string(correction.edge.commandValue),
@@ -1035,7 +1046,8 @@ struct ChromeRootView: View {
     private func showsPalette(_ layout: ChromeLayout) -> Bool {
         ChromePalettePolicy.showsPalette(reservesSpace: reservesPaletteSpace(layout), compact: layout.isCompact,
                                         sheet: PresentedSheet.current(state, compact: layout.isCompact),
-                                        documentSearchRegion: layout.documentSearchRegion)
+                                        documentSearchRegion: layout.documentSearchRegion,
+                                        windowNavigator: layout.window != nil)
     }
 
     private var liquidMode: NibLiquidMode {
@@ -1093,6 +1105,8 @@ struct ChromeRootView: View {
     @ViewBuilder
     private func sidebars(_ layout: ChromeLayout) -> some View {
         if let frame = layout.assistantBottom, let panel = chrome.assistantPanel(kind: model.snapshot.kind) {
+            let frame = ChromeRegion.raisingPanel(frame, above: geometry.keyboardFrame,
+                                                 top: layout.bar.maxY + NibSpacing.l)
             AssistantDockView(chrome: chrome, panel: panel, detent: $state.assistantDetent)
                 .frame(width: frame.width, height: frame.height)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
@@ -1124,7 +1138,8 @@ struct ChromeRootView: View {
 
     private func panelFrame(_ frame: CGRect, id: String) -> CGRect {
         // F027's document results panel scrolls above the keyboard; its search-field overlay stays below the bars.
-        id == "searchui.document" ? ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: frame) : frame
+        id == "searchui.document" || id == PanelIDs.assistant
+            ? ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: frame) : frame
     }
 
     /// The side window mode shows: the preferred side when it is open.
@@ -1181,21 +1196,25 @@ struct ChromeRootView: View {
 
     // MARK: Sheets
 
-    private func sheetBinding(compact: Bool) -> Binding<Bool> {
+    private func sheetBinding(compact: Bool) -> Binding<PresentedSheet?> {
         let current = PresentedSheet.current(state, compact: compact)
-        return Binding(get: { current != nil }, set: { shown in
-            if !shown, let current { dismiss(current) }
+        return Binding(get: { current }, set: { next in
+            if next == nil, let current { dismiss(current) }
         })
     }
 
+    // Keep the presented identity throughout the system's dismissal transition.
+    // Reading state.sheet here instead replaces the form with EmptyView as soon
+    // as Close runs, collapsing its fitted height and accessibility frames while
+    // UIKit is still animating the sheet offscreen.
     @ViewBuilder
-    private var sheetContent: some View {
-        switch PresentedSheet.current(state, compact: geometry.isCompact) {
-        case .modal(let id)?:
+    private func sheetContent(_ sheet: PresentedSheet) -> some View {
+        switch sheet {
+        case .modal(let id):
             if let panel = chrome.app.ui.panels.get(id) {
                 panel.makeView(chrome.panelContext(id, presentation: .sheet))
             }
-        case .sidebar(let side)?:
+        case .sidebar(let side):
             if let content = sidebarContent(side) {
                 if content.selected.id == PanelIDs.assistant {
                     PanelSheetView(chrome: chrome, panel: content.selected)
@@ -1207,14 +1226,12 @@ struct ChromeRootView: View {
                         .presentationDetents([.large])
                 }
             }
-        case .floating(let id)?:
+        case .floating(let id):
             if let panel = chrome.app.ui.panels.get(id) {
                 PanelSheetView(chrome: chrome, panel: panel)
                     .environment(\.horizontalSizeClass, geometry.isCompact ? .compact : .regular)
                     .presentationDetents([.medium, .large])
             }
-        case nil:
-            EmptyView()
         }
     }
 
