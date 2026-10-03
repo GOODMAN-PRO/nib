@@ -208,6 +208,26 @@ final class LibraryCreationKeyboardResponder: UIView {
         guard let context, let descriptor = descriptors.first(where: { $0.id == command.propertyList as? String }) else { return }
         LibraryCreationShortcuts.perform(descriptor.id, in: context)
     }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // A hosting controller can forward the hardware press without invoking
+        // its UIKeyCommand. Handle it at this focused responder, where the held
+        // modifier keys are still available, just as the canvas responder does.
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key,
+                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard let context, let descriptor = descriptors.first(where: { $0.shortcut == shortcut }) else { return false }
+        LibraryCreationShortcuts.perform(descriptor.id, in: context)
+        return true
+    }
 }
 
 /// Keep native key dispatch inside the document's chrome hosting boundary. Invisible
@@ -239,6 +259,7 @@ enum CanvasChromeShortcuts {
         let keys = KeyCommandContext(docKind: kind, isEditingText: typing, hasTabs: true)
         return KeyCommandRouting.active(context.app.content.keyCommands.all, in: keys).filter {
             guard KeyCommandRouting.overridesSystemKeys($0, in: keys) else { return false }
+            if $0.scope == .global { return true }
             if catalogKeys.contains(ShortcutRules.normalized($0.shortcut)) { return true }
             guard $0.scope == .canvas || $0.scope == .document,
                   let kinds = $0.docKinds, !kinds.isEmpty else { return false }
@@ -253,8 +274,21 @@ enum CanvasChromeShortcuts {
         if let window = navigator.rootViewController?.viewIfLoaded?.window, !window.isKeyWindow { return }
         context.app.ui.activeNavigator = navigator
         context.app.services.sessions.activate(context.session)
-        context.app.perform(descriptor.command, descriptor.resolvedParams(for: context.session),
-                            session: context.session)
+        let params = descriptor.resolvedParams(for: context.session)
+        let manager = navigator.rootViewController?.viewIfLoaded?.window?.undoManager
+        switch UndoRoute.forCommand(descriptor.command, params: params, session: context.session,
+                                    history: context.app.bus.history, window: manager) {
+        case .window?:
+            // Native chrome can own focus after a panel closes. Preserve the
+            // shell's document-first undo policy at this responder as well.
+            guard let manager, manager.groupingLevel <= 1,
+                  !manager.isUndoing, !manager.isRedoing else { return }
+            if descriptor.command == CommandIDs.redo { manager.redo() } else { manager.undo() }
+        case .nothing?:
+            return
+        case .document?, nil:
+            context.app.perform(descriptor.command, params, session: context.session)
+        }
     }
 
     static func shortcut(_ key: KeyShortcut) -> KeyboardShortcut {

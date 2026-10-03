@@ -703,10 +703,12 @@ final class ChromeInkingMirror: ObservableObject {
 }
 
 /// What a sheet shows: a modal panel anywhere, and in compact windows the sidebar or the front floating panel.
-enum PresentedSheet: Hashable {
+enum PresentedSheet: Hashable, Identifiable {
     case modal(String)
     case sidebar(SidebarSide)
     case floating(String)
+
+    var id: Self { self }
 
     @MainActor
     static func current(_ state: ChromeState, compact: Bool) -> PresentedSheet? {
@@ -979,7 +981,7 @@ struct ChromeRootView: View {
         .frame(width: geometry.size.width, height: geometry.size.height)
         .ignoresSafeArea(.container)
         .ignoresSafeArea(.keyboard)
-        .nibSheet(isPresented: sheetBinding(compact: layout.isCompact)) { sheetContent }
+        .nibSheet(item: sheetBinding(compact: layout.isCompact)) { sheet in sheetContent(sheet) }
         .onChange(of: paletteCorrection(layout), initial: true) { _, correction in
             guard let correction else { return }
             chrome.run(CommandIDs.toolbarDock, ["dock": .string(correction.edge.commandValue),
@@ -1181,21 +1183,25 @@ struct ChromeRootView: View {
 
     // MARK: Sheets
 
-    private func sheetBinding(compact: Bool) -> Binding<Bool> {
+    private func sheetBinding(compact: Bool) -> Binding<PresentedSheet?> {
         let current = PresentedSheet.current(state, compact: compact)
-        return Binding(get: { current != nil }, set: { shown in
-            if !shown, let current { dismiss(current) }
+        return Binding(get: { current }, set: { next in
+            if next == nil, let current { dismiss(current) }
         })
     }
 
+    // Keep the presented identity throughout the system's dismissal transition.
+    // Reading state.sheet here instead replaces the form with EmptyView as soon
+    // as Close runs, collapsing its fitted height and accessibility frames while
+    // UIKit is still animating the sheet offscreen.
     @ViewBuilder
-    private var sheetContent: some View {
-        switch PresentedSheet.current(state, compact: geometry.isCompact) {
-        case .modal(let id)?:
+    private func sheetContent(_ sheet: PresentedSheet) -> some View {
+        switch sheet {
+        case .modal(let id):
             if let panel = chrome.app.ui.panels.get(id) {
                 panel.makeView(chrome.panelContext(id, presentation: .sheet))
             }
-        case .sidebar(let side)?:
+        case .sidebar(let side):
             if let content = sidebarContent(side) {
                 if content.selected.id == PanelIDs.assistant {
                     PanelSheetView(chrome: chrome, panel: content.selected)
@@ -1207,14 +1213,12 @@ struct ChromeRootView: View {
                         .presentationDetents([.large])
                 }
             }
-        case .floating(let id)?:
+        case .floating(let id):
             if let panel = chrome.app.ui.panels.get(id) {
                 PanelSheetView(chrome: chrome, panel: panel)
                     .environment(\.horizontalSizeClass, geometry.isCompact ? .compact : .regular)
                     .presentationDetents([.medium, .large])
             }
-        case nil:
-            EmptyView()
         }
     }
 

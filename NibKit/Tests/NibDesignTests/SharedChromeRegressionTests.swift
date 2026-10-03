@@ -8,6 +8,50 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testNativePaletteRelayoutKeepsItsRestFrameAndTouchTargetsInsideEachDock() async throws {
+        let field = DropletField()
+        field.usesSystemGlass = true
+        field.reduceMotion = true
+        let size = CGSize(width: 1376, height: 1032)
+        field.updateBounds(size)
+        let tools = (0..<6).map { NibTool(id: "tool\($0)", label: "Tool \($0)", symbol: .pen, hasSettings: false) }
+        func palette(_ edge: NibDock) -> some View {
+            NibToolPalette(tools: tools, selection: .constant("tool1"), swatches: [], swatch: .constant(0),
+                           dock: .constant(NibPaletteDock(edge: edge, along: 0.5))) { _ in EmptyView() }
+                .environment(field)
+                .environment(\.horizontalSizeClass, .regular)
+                .coordinateSpace(NibLiquid.space)
+        }
+        let host = UIHostingController(rootView: palette(.leading))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { field.setActive(false); window.isHidden = true; window.rootViewController = nil }
+        func targets(_ view: UIView) -> [UIView] {
+            let own = (view.gestureRecognizers ?? []).contains { $0 is NibActionTapRecognizer } ? [view] : []
+            return own + view.subviews.flatMap(targets)
+        }
+        for edge in [NibDock.leading, .top, .trailing, .bottom, .leading] {
+            host.rootView = palette(edge)
+            for frame in 0..<100 {
+                host.view.layoutIfNeeded()
+                _ = field.tick(1.0 / 60, now: CACurrentMediaTime() + Double(frame) / 60)
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let rect = try XCTUnwrap(field.visualFrame("palette"))
+            XCTAssertTrue(window.bounds.insetBy(dx: -1, dy: -1).contains(rect), "\(edge): \(rect)")
+            XCTAssertEqual(min(rect.width, rect.height), NibMetrics.paletteThickness, accuracy: 1)
+            XCTAssertEqual(edge.isVertical, rect.height > rect.width)
+            let buttons = targets(host.view)
+            XCTAssertEqual(buttons.count, tools.count)
+            for button in buttons {
+                let frame = button.convert(button.bounds, to: host.view)
+                XCTAssertTrue(rect.insetBy(dx: -1, dy: -1).contains(frame), "\(edge): \(frame) outside \(rect)")
+            }
+        }
+    }
+
     func testNativePopoverActionRemainsHittableAndTracksDisabledStateAcrossRefresh() async throws {
         var count = 0
         func content(_ enabled: Bool) -> AnyView {

@@ -429,6 +429,36 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertTrue(keyboard.keyCommands?.isEmpty == true, "A dismantled overlay must not dispatch")
     }
 
+    func testLibraryCreationForwardedPressKeepsModifiersAndDispatchesOnce() async throws {
+        let h = await started()
+        h.session.document = nil
+        let root = KeyboardWindowController(session: h.session)
+        let keyboard = LibraryCreationKeyboardResponder(context: ChromeContext(app: h.app, session: h.session, navigator: root))
+        root.view.addSubview(keyboard)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        keyboard.restoreFocus()
+        let recorder = stand(in: h, for: [CommandIDs.docQuickNote])
+        let shortcut = CanvasKeyPress.shortcut(code: .keyboardN, characters: "N", keyFlags: [],
+            eventFlags: [], heldKeys: [.keyboardLeftGUI, .keyboardRightShift])
+        XCTAssertEqual(shortcut, KeyShortcut("n", [.command, .shift]))
+        let ran = expectation(description: "Forwarded QuickNote chord")
+        recorder.onCall = { if $0 == CommandIDs.docQuickNote { ran.fulfill() } }
+        XCTAssertTrue(keyboard.performUnhandledPress(shortcut))
+        await fulfillment(of: [ran], timeout: 3)
+        recorder.onCall = nil
+        XCTAssertEqual(recorder.params(CommandIDs.docQuickNote).count, 1)
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("n")), "Plain typing is not creation")
+        root.modal = UIViewController()
+        XCTAssertFalse(keyboard.performUnhandledPress(shortcut), "A modal owns hardware input")
+        root.modal = nil
+        h.session.document = Fixtures.docID
+        XCTAssertFalse(keyboard.performUnhandledPress(shortcut), "The retained library must not create in a document")
+        XCTAssertEqual(recorder.params(CommandIDs.docQuickNote).count, 1)
+    }
+
     func testOtherOwnersKeepTheirKeysAndNothingIsDuplicated() async throws {
         let h = Harness(features: [])
         let registry = h.app.content.keyCommands
@@ -1042,6 +1072,26 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
     }
 
+    func testForwardedModifierEventsPersistUntilReleaseOrFocusChange() {
+        var held = CanvasHeldModifiers()
+        held.begin(.keyboardLeftGUI)
+        held.begin(.keyboardRightAlt)
+        held.begin(.keyboardZ)
+        func chord(_ held: CanvasHeldModifiers) -> KeyShortcut {
+            CanvasKeyPress.shortcut(code: .keyboardZ, characters: "z", keyFlags: [], eventFlags: [],
+                                    heldKeys: Array(held.keys))
+        }
+        XCTAssertEqual(chord(held), KeyShortcut("z", [.command, .option]))
+        XCTAssertEqual(held.keys.count, 2, "Printable keys must not become held modifiers")
+        held.end(.keyboardRightAlt)
+        XCTAssertEqual(chord(held), KeyShortcut("z", .command))
+        held.end(.keyboardLeftGUI)
+        XCTAssertEqual(chord(held), KeyShortcut("z"), "Release must restore an unmodified key")
+        held.begin(.keyboardRightGUI)
+        held = CanvasHeldModifiers()
+        XCTAssertEqual(chord(held), KeyShortcut("z"), "A new focus session must not inherit modifiers")
+    }
+
     func testCanvasHardwareInputSessionAndShiftedPlusRetainNavigationChords() {
         let responder = CanvasKeyboardResponder()
         XCTAssertFalse((responder as UIResponder) is UIKeyInput, "Navigation must not establish a text-input session")
@@ -1467,6 +1517,55 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertTrue(CanvasChromeShortcuts.descriptors(in: context).isEmpty)
         h.session.document = Fixtures.textDocID
         XCTAssertTrue(CanvasChromeShortcuts.descriptors(in: context).isEmpty, "A stale canvas host must stop routing")
+    }
+
+    func testChromeKeyboardFallsBackToWindowUndoAndRedoWhenDocumentHistoryIsEmpty() async throws {
+        let h = await started()
+        let root = KeyboardWindowController(session: h.session)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let manager = try XCTUnwrap(window.undoManager)
+        manager.groupsByEvent = false
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root, kind: .notebook)
+        h.app.content.keyCommands.register(descriptor("chrome.undo", "z", .command,
+            scope: .global, owner: "chrome.tests", command: CommandIDs.undo))
+        h.app.content.keyCommands.register(descriptor("chrome.redo", "z", [.command, .shift],
+            scope: .global, owner: "chrome.tests", command: CommandIDs.redo))
+        final class Position: NSObject {
+            var value = 0
+            func move(_ next: Int, manager: UndoManager) {
+                let old = value
+                manager.registerUndo(withTarget: self) { $0.move(old, manager: manager) }
+                value = next
+            }
+        }
+        let position = Position()
+        manager.beginUndoGrouping()
+        position.move(1, manager: manager)
+        manager.endUndoGrouping()
+        XCTAssertFalse(h.app.bus.history.canUndo(Fixtures.docID))
+        CanvasChromeShortcuts.perform("chrome.undo", in: context)
+        XCTAssertEqual(position.value, 0)
+        XCTAssertTrue(manager.canRedo)
+        CanvasChromeShortcuts.perform("chrome.redo", in: context)
+        XCTAssertEqual(position.value, 1)
+        XCTAssertTrue(manager.canUndo)
+
+        _ = try await h.insert([Item.makeSticky(StickyItem(frame: Frame(x: 1, y: 1, w: 50, h: 50)))])
+        CanvasChromeShortcuts.perform("chrome.undo", in: context)
+        for _ in 0..<100 where h.app.bus.history.canUndo(Fixtures.docID) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(h.app.bus.history.canUndo(Fixtures.docID))
+        XCTAssertEqual(position.value, 1, "Document edits take priority over window docking history")
+        CanvasChromeShortcuts.perform("chrome.redo", in: context)
+        for _ in 0..<100 where h.app.bus.history.canRedo(Fixtures.docID) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(h.app.bus.history.canRedo(Fixtures.docID))
+        XCTAssertEqual(position.value, 1)
     }
 
     func testNamedCanvasKeysMatchUIKitAndSwiftUIAndPanInAllDirections() async throws {
