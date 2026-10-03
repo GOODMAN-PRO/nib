@@ -235,7 +235,7 @@ final class InkUITests: XCTestCase {
 
     private func closeColourPicker() throws {
         // UIKit labels the colour picker's dismissal Close on current iPadOS, Done on older releases.
-        if let close = ui.app.buttons.matching(identifier: "Close").allElementsBoundByIndex.last(where: { $0.isHittable }) {
+        if let close = ui.app.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'")).allElementsBoundByIndex.last(where: { $0.isHittable }) {
             close.tap()
         } else {
             try tap("Done")
@@ -607,7 +607,8 @@ final class InkUITests: XCTestCase {
         try settings("highlighter"); try tap("Custom…")
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
-        let spectrum = try control("Color spectrum")
+        let spectrum = ui.app.otherElements.matching(NSPredicate(format: "label ==[c] 'Color Spectrum'")).firstMatch
+        XCTAssertTrue(spectrum.waitForExistence(timeout: 5) && spectrum.isHittable)
         spectrum.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.35)).tap()
         try closeColourPicker()
         closePopover()

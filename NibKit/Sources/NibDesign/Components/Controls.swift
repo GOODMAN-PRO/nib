@@ -249,6 +249,7 @@ public struct NibWidthPresetButton: View {
         .nibTooltip(label)
         .accessibilityLabel(label)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .nibNativeAction(action)
     }
 }
 

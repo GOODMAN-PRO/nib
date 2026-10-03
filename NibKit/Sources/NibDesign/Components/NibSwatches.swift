@@ -167,6 +167,7 @@ public struct NibSwatchGrid: View {
             }
             ForEach(swatches) { swatch in
                 NibPenSwatch(swatch, isSelected: swatch.id == selection, size: size) { selection = swatch.id }
+                    .nibNativeAction { selection = swatch.id }
             }
         }
         .accessibilityElement(children: .contain)
