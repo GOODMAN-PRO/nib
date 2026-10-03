@@ -310,6 +310,28 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         XCTAssertFalse(FolderDraft.isSingleEmoji("folder.fill"))
     }
 
+    func testHexFieldKeepsSelectAllOnItsNativeTextSelection() throws {
+        let controller = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 640, height: 480))
+        window.rootViewController = controller
+        let field = FolderHexTextField(frame: CGRect(x: 20, y: 20, width: 240, height: 44))
+        controller.view.addSubview(field)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        field.text = "#2156D9"
+        XCTAssertTrue(field.becomeFirstResponder())
+        let key = try XCTUnwrap(field.keyCommands?.first { $0.input == "a" && $0.modifierFlags == .command })
+        XCTAssertTrue(key.wantsPriorityOverSystemBehavior)
+        let action = try XCTUnwrap(key.action)
+        XCTAssertTrue(field.canPerformAction(action, withSender: key))
+        _ = field.perform(action, with: key)
+        let selected = try XCTUnwrap(field.selectedTextRange)
+        XCTAssertEqual(field.text(in: selected), "#2156D9")
+        field.insertText("#FF8800")
+        XCTAssertEqual(field.text, "#FF8800")
+        XCTAssertEqual(FolderDraft.parseHex(try XCTUnwrap(field.text)), RGBA(0xFF, 0x88, 0x00))
+    }
+
     func testPageIndexNumbersBookmarkedAndTrashedPages() {
         var (content, _) = Fixtures.sampleContent()
         // Page order is FIXTUREPG001 ("V"), FIXTUREPG002 ("k"), FIXTUREPG003 ("t").

@@ -454,7 +454,7 @@ final class LibraryFloatingAdapter: FloatingHosting {
 }
 
 @MainActor
-final class LibraryRootViewController: UIViewController {
+final class LibraryRootViewController: UIViewController, LibraryImportDestinationProviding {
     let model: LibraryViewModel
     init(app: NibApp, navigator: SceneNavigator) {
         model = LibraryModels.get(app).model(navigator.session)
@@ -462,6 +462,30 @@ final class LibraryRootViewController: UIViewController {
         model.navigator = navigator; model.controller = self
     }
     required init?(coder: NSCoder) { return nil }
+    func libraryImportDestination(at point: CGPoint) -> NodeRef? {
+        guard model.isVisible, model.tab == nil, model.modal == nil, model.confirmation == nil,
+              model.collection == .documents else { return nil }
+        if let target = LibraryDropDestination.match(point, carried: "", targets: model.dropTargets)?.key {
+            switch NodeRef(target) {
+            case .library?: return .library
+            case .folder(let id)?: return .folder(id)
+            default: return nil
+            }
+        }
+        return model.folder.map(NodeRef.folder) ?? .library
+    }
+    override var canBecomeFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool {
+        // The scene shell delegates library focus here after taps. Keep keys on
+        // the native view inside the host instead of bypassing its press handler.
+        func keyboard(in view: UIView) -> LibraryKeyboardResponder? {
+            if let keyboard = view as? LibraryKeyboardResponder { return keyboard }
+            return view.subviews.lazy.compactMap { keyboard(in: $0) }.first
+        }
+        guard let view = viewIfLoaded, let responder = keyboard(in: view) else { return false }
+        responder.restoreFocus()
+        return responder.isFirstResponder
+    }
     override func viewDidLoad() {
         super.viewDidLoad()
         let host = UIHostingController(rootView: LibraryRootView(model: model))
@@ -482,22 +506,46 @@ final class LibraryRootViewController: UIViewController {
         }
         let descriptors = LibrarySelectionShortcuts.descriptors(model)
         guard let command = sender as? UIKeyCommand else { return !descriptors.isEmpty }
-        return descriptors.contains { $0.id == command.propertyList as? String }
+        guard let descriptor = descriptors.first(where: { $0.id == command.propertyList as? String }) else { return false }
+        return UndoRoute.forCommand(descriptor.command, params: descriptor.resolvedParams(for: model.session),
+            session: model.session, history: model.app.bus.history,
+            window: model.testUndoManager ?? viewIfLoaded?.window?.undoManager) != .nothing
     }
     @objc private func runLibraryKeyCommand(_ sender: UIKeyCommand) {
+        #if DEBUG
+        NSLog("%@", "[Library root key] action \(String(describing: sender.propertyList)) input \(sender.input ?? "") flags \(sender.modifierFlags.rawValue)")
+        #endif
         guard let descriptor = LibrarySelectionShortcuts.descriptors(model).first(where: {
             $0.id == sender.propertyList as? String
         }) else { return }
         if let navigator = model.navigator { model.app.ui.activeNavigator = navigator }
         model.app.services.sessions.activate(model.session)
-        model.perform(descriptor.command, descriptor.resolvedParams(for: model.session))
+        let params = descriptor.resolvedParams(for: model.session)
+        let manager = model.testUndoManager ?? viewIfLoaded?.window?.undoManager
+        switch UndoRoute.forCommand(descriptor.command, params: params, session: model.session,
+                                    history: model.app.bus.history, window: manager) {
+        case .nothing?: return
+        case .window?:
+            guard let manager, manager.groupingLevel <= 1, !manager.isUndoing, !manager.isRedoing else { return }
+            if descriptor.command == CommandIDs.redo { manager.redo() }
+            else { manager.undo() }
+        case .document?, nil: model.perform(descriptor.command, params)
+        }
     }
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        model.isVisible = true
         model.session.floatingHost = model.floatingAdapter
+    }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
     }
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        // The session reuses its model when the shell replaces a controller.
+        // An outgoing controller must not disable the new library's key route.
+        guard model.controller === self else { return }
         model.isVisible = false
         if model.session.floatingHost === model.floatingAdapter { model.session.floatingHost = nil }
     }
@@ -672,8 +720,8 @@ struct LibraryRootView: View {
                 model.setView(["search": .string(searchText)])
             }
             .task { await model.appear() }
-            .onDisappear { model.isVisible = false }
         }
+        .background { LibraryKeyboardHost(model: model).frame(width: 0, height: 0) }
     }
     private var sheetBinding: Binding<LibraryPanel?> {
         Binding(get: { model.modal?.presentation == .sheet ? model.modal : nil }, set: { if $0 == nil, let modal = model.modal { model.setView(["panel": .string(modal.id), "close": true]) } })
@@ -826,7 +874,7 @@ enum LibrarySelectionShortcuts {
     static func isEnabled(_ model: LibraryViewModel) -> Bool {
         model.selection.isSelecting && canRoute(model)
     }
-    private static func canRoute(_ model: LibraryViewModel) -> Bool {
+    static func canRoute(_ model: LibraryViewModel) -> Bool {
         model.tab == nil && model.modal == nil && model.menu == nil && model.confirmation == nil &&
             model.renaming == nil && model.floating.presentedIDs.isEmpty && !model.session.isEditingText &&
             !hasTextFocus(model.controller?.viewIfLoaded)
@@ -838,9 +886,10 @@ enum LibrarySelectionShortcuts {
     }
     static func descriptors(_ model: LibraryViewModel) -> [KeyCommandDescriptor] {
         guard canRoute(model) else { return [] }
-        let context = KeyCommandContext(inDocument: false, docKind: nil)
-        return KeyCommandRouting.active(model.app.content.keyCommands.all, in: context).filter {
-            $0.scope == .library && ($0.owner != FeatLibraryUIFeature.id || isEnabled(model))
+        let context = KeyCommandContext(inDocument: false, docKind: nil,
+                                       hasTabs: !(model.navigator?.openDocuments.isEmpty ?? true))
+        return KeyCommandRouting.nativeCommands(model.app.content.keyCommands.all, in: context).filter {
+            $0.owner != FeatLibraryUIFeature.id || isEnabled(model)
         }
     }
     static func command(_ descriptor: KeyCommandDescriptor, action: Selector) -> UIKeyCommand {

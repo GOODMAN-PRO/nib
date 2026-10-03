@@ -165,9 +165,9 @@ enum LibrarySort: String, Codable, CaseIterable {
     case modified, modifiedAscending, created, createdAscending, name, nameDescending, type, manual
     var title: String {
         switch self {
-        case .modified: return String(localized: "Modified, newest first")
+        case .modified: return String(localized: "Date modified")
         case .modifiedAscending: return String(localized: "Modified, oldest first")
-        case .created: return String(localized: "Created, newest first")
+        case .created: return String(localized: "Date created")
         case .createdAscending: return String(localized: "Created, oldest first")
         case .name: return String(localized: "Name, A to Z")
         case .nameDescending: return String(localized: "Name, Z to A")

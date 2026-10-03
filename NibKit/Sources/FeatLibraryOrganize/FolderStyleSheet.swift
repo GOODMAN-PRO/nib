@@ -319,7 +319,7 @@ struct FolderStyleSheet: View {
                     }
                 }
                 Section {
-                    NibToggle(String(localized: "Show in Favourites"), isOn: $draft.favorite)
+                    favouriteRow
                 }
             }
             .listStyle(.insetGrouped)
@@ -344,6 +344,22 @@ struct FolderStyleSheet: View {
     }
 
     // MARK: Sections
+
+    private var favouriteRow: some View {
+        let title = String(localized: "Show in Favourites")
+        return HStack(spacing: NibSpacing.m) {
+            Text(title)
+                .font(NibFont.body)
+                .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                .contentShape(Rectangle())
+                .nibNativeAction { draft.favorite.toggle() }
+                .accessibilityHidden(true)
+            // Keep the system switch's tap, thumb drag and accessibility action.
+            // Its accessible hit area must be the control, not the inert row gap.
+            NibToggle(title, isOn: $draft.favorite)
+                .labelsHidden()
+        }
+    }
 
     private var preview: some View {
         VStack(spacing: NibSpacing.s) {
@@ -394,18 +410,10 @@ struct FolderStyleSheet: View {
                 Text(String(localized: "Hex"))
                     .font(NibFont.body)
                     .foregroundStyle(NibColor.label)
-                TextField(String(localized: "Hex colour"), text: $hexText)
-                    .font(NibFont.body.monospacedDigit())
-                    .multilineTextAlignment(.trailing)
-                    .textInputAutocapitalization(.characters)
-                    .autocorrectionDisabled()
-                    .keyboardType(.asciiCapable)
-                    .submitLabel(.done)
+                FolderHexField(text: $hexText, onSubmit: { hexText = draft.colorHex })
                     .onChange(of: hexText) { _, text in
                         if let parsed = FolderDraft.parseHex(text) { draft.color = parsed }
                     }
-                    .onSubmit { hexText = draft.colorHex }
-                    .accessibilityLabel(String(localized: "Hex colour"))
             }
             .frame(minHeight: NibMetrics.hitTarget)
             if FolderDraft.parseHex(hexText) == nil {
@@ -555,6 +563,55 @@ struct FolderStyleSheet: View {
                                        : String(localized: "Saved \(draft.trimmedTitle)."))
             onDone()
         }
+    }
+}
+
+/// Keep editing keys on the native colour field, ahead of the library's Select
+/// All command. The field still validates through FolderDraft and never silently
+/// accepts an invalid value.
+struct FolderHexField: UIViewRepresentable {
+    @Binding var text: String
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeUIView(context: Context) -> FolderHexTextField {
+        let field = FolderHexTextField()
+        field.placeholder = String(localized: "Hex colour")
+        field.accessibilityLabel = field.placeholder
+        field.textAlignment = .right
+        field.font = UIFont.monospacedDigitSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize, weight: .regular)
+        field.adjustsFontForContentSizeCategory = true
+        field.textColor = UIColor(NibColor.label)
+        field.keyboardType = .asciiCapable
+        field.autocapitalizationType = .allCharacters
+        field.autocorrectionType = .no
+        field.returnKeyType = .done
+        field.delegate = context.coordinator
+        field.addTarget(context.coordinator, action: #selector(Coordinator.changed(_:)), for: .editingChanged)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return field
+    }
+    func updateUIView(_ field: FolderHexTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.text != text { field.text = text }
+    }
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var parent: FolderHexField
+        init(_ parent: FolderHexField) { self.parent = parent }
+        @objc func changed(_ field: UITextField) { parent.text = field.text ?? "" }
+        func textFieldShouldReturn(_ field: UITextField) -> Bool {
+            parent.onSubmit()
+            field.resignFirstResponder()
+            return true
+        }
+    }
+}
+
+final class FolderHexTextField: UITextField {
+    override var keyCommands: [UIKeyCommand]? {
+        let select = UIKeyCommand(input: "a", modifierFlags: .command, action: #selector(selectAll(_:)))
+        select.wantsPriorityOverSystemBehavior = true
+        return [select] + (super.keyCommands ?? [])
     }
 }
 

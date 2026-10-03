@@ -15,6 +15,7 @@ final class LibraryUITests: XCTestCase {
         ui = NibUI()
         try ui.launchFixture()
         try visible(item(physics), "Seeded library must be ready")
+        ui.synchronizeHardwareKeyboard()
     }
 
     override func tearDownWithError() throws {
@@ -895,8 +896,13 @@ final class LibraryUITests: XCTestCase {
         // rather than an alert. This changes setup only; the real drop is still required.
         try ui.nameNewFilesFolder(fixtureFolder)
         let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", fixtureFolder)).firstMatch
-        try visible(directory, "Files must create the external fixture folder")
-        directory.tap()
+        let directoryTitle = app.buttons[fixtureFolder + ", Actions Menu"]
+        try eventually("Files must create and reveal the external fixture folder") {
+            directory.isHittable || directoryTitle.exists
+        }
+        // iPadOS 26 enters a newly created folder immediately. Older native
+        // pickers leave it selected in the parent. Both must save into that folder.
+        if !directoryTitle.exists { directory.tap() }
         try tap("Save")
         try eventually("Save to Files must finish or report an export error", timeout: 20) {
             !self.app.buttons["Save"].exists || self.app.alerts.firstMatch.exists
@@ -905,6 +911,9 @@ final class LibraryUITests: XCTestCase {
                        "External-drop fixture export failed: \(app.alerts.firstMatch.exists ? app.alerts.firstMatch.label : "")")
         try ui.dismissSheets()
         try openFolder(folder); try trash("Lecture notes")
+        try NibUIMultitasking.setWindowed(true)
+        defer { try? NibUIMultitasking.setWindowed(false) }
+        app.activate()
         let files = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
         files.activate()
         let browse = files.buttons["Browse"]
@@ -917,18 +926,17 @@ final class LibraryUITests: XCTestCase {
         if fixtureDirectory.isHittable { fixtureDirectory.tap() }
         let payload = files.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", physics)).firstMatch
         try visible(payload, "Exported PDF must be available as an external Files drag payload")
-        // Use iPad multitasking to expose the destination next to Files. Missing system
-        // multitasking controls are reported as shared setup limitations, never as import success.
-        let multitasking = files.buttons.matching(NSPredicate(format: "label CONTAINS[cd] 'multitasking'")).firstMatch
-        try visible(multitasking, "External drop setup requires iPad multitasking controls")
-        multitasking.tap()
-        let split = files.buttons.matching(NSPredicate(format: "label CONTAINS[cd] 'Split View'")).firstMatch
-        try visible(split, "External drop setup requires Split View")
-        split.tap()
+        // DESIGN §13 uses native system UI. iPadOS 26 replaced Split View's
+        // menu with Windowed Apps: drag the other app from the Dock to an edge.
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let filesWindow = files.windows.firstMatch
+        filesWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.995))
+            .press(forDuration: 0.05, thenDragTo: filesWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.84)),
+                   withVelocity: .slow, thenHoldForDuration: 0.3)
         let nib = springboard.icons["Nib"]
-        try visible(nib, "Split View must allow choosing Nib as the destination")
-        nib.tap()
+        try visible(nib, "The Dock must offer the recently used Nib destination")
+        nib.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: filesWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5)))
         let target = app.staticTexts[folder].firstMatch
         try visible(target, "Drop destination must remain visible alongside Files")
         payload.press(forDuration: 0.5, thenDragTo: target)
