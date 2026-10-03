@@ -239,12 +239,16 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
         controller.clear = clear
         controller.schedulePresentation()
     }
+    static func dismantleUIViewController(_ controller: Presenter, coordinator: ()) {
+        controller.tearDown()
+    }
 
     final class Presenter: UIViewController {
         var requested = false
         var dismissed: () -> Void = {}
         var clear: () -> Void = {}
         private weak var alert: ConfirmationAlert?
+        private var appeared = false
 
         override func loadView() {
             view = UIView()
@@ -254,7 +258,21 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
 
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
+            appeared = true
             schedulePresentation()
+        }
+        override func viewDidDisappear(_ animated: Bool) {
+            super.viewDidDisappear(animated)
+            appeared = false
+        }
+        func tearDown() {
+            requested = false
+            let prompt = alert
+            alert = nil
+            prompt?.finish()
+            prompt?.dismiss(animated: false)
+            dismissed = {}
+            clear = {}
         }
         func schedulePresentation() {
             DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
@@ -264,25 +282,32 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
                 alert?.dismiss(animated: false)
                 return
             }
-            guard alert == nil, let window = viewIfLoaded?.window else { return }
+            // Window attachment precedes the hosting controller's appearance.
+            // Wait for the editor's own appearance and transition to complete.
+            guard appeared, alert == nil, let window = viewIfLoaded?.window else { return }
+            var owner: UIViewController = self
+            while let parent = owner.parent { owner = parent }
+            guard owner.presentedViewController == nil, !owner.isBeingDismissed else { return }
+            if let transition = owner.transitionCoordinator {
+                transition.animate(alongsideTransition: nil) { [weak self] _ in self?.schedulePresentation() }
+                return
+            }
             let prompt = ConfirmationAlert(title: String(localized: "Clear this page?"),
                 message: String(localized: "Everything on this page is removed. You can undo this."),
                 preferredStyle: .alert)
             prompt.finished = { [weak self] in
                 guard let self else { return }
                 self.requested = false
+                self.alert = nil
                 self.dismissed()
             }
             prompt.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { [weak prompt] _ in
-                prompt?.finished()
+                prompt?.finish()
             })
             prompt.addAction(UIAlertAction(title: String(localized: "Clear Page"), style: .destructive) { [weak self, weak prompt] _ in
-                prompt?.finished()
+                prompt?.finish()
                 self?.clear()
             })
-            var owner: UIViewController = self
-            while let parent = owner.parent { owner = parent }
-            guard owner.presentedViewController == nil else { return }
             // A visible secondary window can still be non-key (for example after
             // another document held keyboard focus). System alerts need a key
             // presenting window to attach their actions and complete transitions.
@@ -293,10 +318,15 @@ private struct ClearPageConfirmation: UIViewControllerRepresentable {
     }
 
     final class ConfirmationAlert: UIAlertController {
-        var finished: () -> Void = {}
+        var finished: (() -> Void)?
+        func finish() {
+            let callback = finished
+            finished = nil
+            callback?()
+        }
         override func viewDidDisappear(_ animated: Bool) {
             super.viewDidDisappear(animated)
-            finished()
+            finish()
         }
     }
 }
