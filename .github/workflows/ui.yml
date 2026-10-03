@@ -277,10 +277,11 @@ jobs:
           for entry in manifest if isinstance(manifest, list) else []:
               test = re.sub(r'[^A-Za-z0-9_]+', '', str(entry.get('testIdentifier', 'unknown')).split('/')[-1].replace('()', '')) or 'unknown'
               files = [a for a in entry.get('attachments', []) if str(a.get('exportedFileName', '')).lower().endswith(images)]
-              if test in failed:   # failing test: the screenshots tied to the failure (else the last two), at most six
-                  keep = ([a for a in files if a.get('isAssociatedWithFailure')] or files[-2:])[-6:]
-              else:                # passing test: only explicitly kept attachments survive in the bundle (e.g. the screen tour)
-                  keep = files
+              # Explicitly named attachments (e.g. the capture tour's "<NN>-<screen>-...") are always kept; automatic
+              # screenshots ("Screenshot...") only when tied to a failure (else the last two), at most six per test.
+              named = [a for a in files if not str(a.get('suggestedHumanReadableName') or '').startswith('Screenshot')]
+              auto = [a for a in files if a not in named]
+              keep = named + (([a for a in auto if a.get('isAssociatedWithFailure')] or auto[-2:])[-6:] if test in failed else [])
               for i, a in enumerate(keep):
                   name = re.sub(r'[^A-Za-z0-9_.-]+', '-', pathlib.Path(a.get('suggestedHumanReadableName') or a['exportedFileName']).stem)[:90]
                   dest = out / test / f'{i:03d}-{name}.jpg'
