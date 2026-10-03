@@ -1094,6 +1094,56 @@ final class FeatBridgeUITests: XCTestCase {
 
     // MARK: Rendering
 
+    @available(iOS 26.0, *)
+    func testNativeBridgeSwitchDispatchesEnableAndDisableAndUpdatesChrome() async throws {
+        let (h, fake, monitor) = makeHarness()
+        let bridge = try XCTUnwrap(fake)
+        await monitor.refresh()
+        let host = UIHostingController(rootView: BridgeSettingsPage(app: h.app, monitor: monitor))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 834, height: 600))
+        window.rootViewController = host
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            monitor.stop()
+        }
+        host.view.frame = window.bounds
+
+        func switches(in view: UIView) -> [UISwitch] {
+            (view as? UISwitch).map { [$0] } ?? view.subviews.flatMap { switches(in: $0) }
+        }
+        // DESIGN §10.13 uses the system switch on iOS 26. The labelled accessibility
+        // row is wider than its actual control; exercise the control's valueChanged path.
+        let mounted = await eventually {
+            host.view.layoutIfNeeded()
+            return !switches(in: host.view).isEmpty
+        }
+        XCTAssertTrue(mounted)
+        let control = try XCTUnwrap(switches(in: host.view).first)
+        XCTAssertFalse(control.isOn, "the first section contains the initially off MCP bridge switch")
+        let document = ChromeContext(app: h.app, session: h.session, kind: .notebook)
+        let library = ChromeContext(app: h.app, session: h.session, kind: nil)
+        let status = try XCTUnwrap(h.app.ui.toolbar.get(BridgeUIIDs.statusItem)?.compactStatus)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(BridgeUIIDs.libraryStatusOverlay))
+
+        for enabled in [true, false] {
+            control.setOn(enabled, animated: false)
+            control.sendActions(for: .valueChanged)
+            let updated = await eventually {
+                host.view.layoutIfNeeded()
+                return bridge.enabled == enabled && monitor.snapshot?.enabled == enabled
+                    && monitor.pillVisible == enabled && control.isEnabled
+            }
+            XCTAssertTrue(updated, "the native switch must reach bridge.setEnabled and refresh chrome")
+            XCTAssertEqual(control.isOn, enabled)
+            XCTAssertEqual(bridge.setEnabledCalls.last, ["enabled": .bool(enabled)])
+            XCTAssertEqual(status(document) != nil, enabled)
+            XCTAssertEqual(overlay.isVisible(library), enabled)
+        }
+        XCTAssertEqual(bridge.setEnabledCalls, [["enabled": true], ["enabled": false]])
+    }
+
     func testEnabledBridgeSwitchIsGreenDespiteInheritedAccent() async throws {
         let (h, _, monitor) = makeHarness()
         for width: CGFloat in [390, 834] {

@@ -154,6 +154,7 @@ final class FeatKeyboardTests: XCTestCase {
         try check("print", "p", .command, "print.present", scope: .document)
         try check("share", "s", [.command, .shift], "export.present", scope: .document)
         try check("find", "f", .command, "search.open", scope: .document, ["scope": "document"])
+        try check("assistant", "j", .command, "ai.chat.open", scope: .document, [:])
         try check("findNext", "g", .command, "search.step", scope: .document, ["direction": "next"])
         try check("findPrevious", "g", [.command, .shift], "search.step", scope: .document, ["direction": "previous"])
         try check("goToPage", "g", [.command, .option], "panel.open", scope: .document, ["id": "keyboard.goToPage"])
@@ -583,6 +584,64 @@ final class FeatKeyboardTests: XCTestCase {
     }
 
     // MARK: Shortcuts that read the window
+
+    func testAssistantKeysRouteThroughCanvasResponderWithoutChangingSelectionOrOtherWindow() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let other = EditorSession()
+        other.document = Fixtures.whiteboardID
+        other.openPanels = [PanelIDs.assistant]
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(other)
+        h.session.selection = Selection(doc: doc, page: Fixtures.page1, items: [Fixtures.strokeID])
+        let selection = h.session.selection
+        let content = try h.app.workspace.content(doc)
+        var sessions: [EditorSession?] = []
+        var commands: [String] = []
+        let opened = expectation(description: "Assistant opened in the canvas window")
+        let closed = expectation(description: "Assistant closed in the canvas window")
+        for command in ["ai.chat.open", "ai.chat.close"] {
+            h.app.commands.register(CommandDescriptor(id: command, title: command, summary: "test double",
+                                                      effect: .session, target: .app)) { _, ctx in
+                sessions.append(ctx.activeSession)
+                commands.append(command)
+                if command == "ai.chat.open" {
+                    ctx.activeSession?.openPanels.insert(PanelIDs.assistant)
+                    opened.fulfill()
+                } else {
+                    ctx.activeSession?.openPanels.remove(PanelIDs.assistant)
+                    closed.fulfill()
+                }
+                return [:]
+            }
+        }
+        func send(_ input: String, _ modifiers: UIKeyModifierFlags) throws {
+            let key = try XCTUnwrap(attachment.keyboard.keyCommands?.first {
+                $0.input == input && $0.modifierFlags == modifiers
+            })
+            let action = try XCTUnwrap(key.action)
+            XCTAssertTrue(attachment.keyboard.canPerformAction(action, withSender: key))
+            _ = attachment.keyboard.perform(action, with: key)
+        }
+        try send("j", .command)
+        await fulfillment(of: [opened], timeout: 3)
+        try send(UIKeyCommand.inputEscape, [])
+        await fulfillment(of: [closed], timeout: 3)
+        XCTAssertEqual(commands, ["ai.chat.open", "ai.chat.close"])
+        XCTAssertTrue(sessions.allSatisfy { $0 === h.session })
+        XCTAssertFalse(h.session.openPanels.contains(PanelIDs.assistant))
+        XCTAssertEqual(other.openPanels, [PanelIDs.assistant])
+        XCTAssertEqual(h.session.selection, selection)
+        XCTAssertEqual(try h.app.workspace.content(doc), content)
+        // Closing restores Escape's ordinary page-selection behavior in this same window.
+        let recorder = stand(in: h, for: [CommandIDs.selectionClear])
+        try await press(h, "deselect")
+        XCTAssertEqual(recorder.params(CommandIDs.selectionClear), [[:]])
+        XCTAssertFalse(try key(h, "assistant").isActive(in: KeyCommandContext(docKind: nil)))
+    }
 
     func testSessionShortcutsResolveTheWindow() async throws {
         let h = await started()

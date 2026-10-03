@@ -38,7 +38,9 @@ final class ChromeUITests: XCTestCase {
     }
 
     private func query(_ name: String) -> XCUIElementQuery {
-        ui.app.descendants(matching: .any).matching(NSPredicate(format: "identifier == %@ OR label == %@", name, name))
+        // Native fields can expose their visible name as a placeholder (for example Title).
+        ui.app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name))
     }
 
     @discardableResult
@@ -69,7 +71,7 @@ final class ChromeUITests: XCTestCase {
             let containers = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
             guard let scroller = containers.first(where: {
                 $0.identifier != "nib.canvas" && $0.isHittable && $0.descendants(matching: .any)
-                    .matching(NSPredicate(format: "identifier == %@ OR label == %@", name, name)).count > 0
+                    .matching(NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).count > 0
             }) else { break }
             let dy: CGFloat = q.firstMatch.frame.midY < scroller.frame.minY ? 0.65 : -0.65
             let start = scroller.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: dy > 0 ? 0.2 : 0.8))
@@ -86,7 +88,15 @@ final class ChromeUITests: XCTestCase {
         try ui.openDocument(title ?? notebook)
         XCTAssertTrue(ui.canvas.waitForExistence(timeout: 15))
     }
-    private func menu(_ id: String, _ action: String) throws { try tap("menu." + id); try tap(action) }
+    private func openMenu(_ id: String) throws {
+        // DESIGN §14.2 keeps Add Page in More when it is not in the trailing bar.
+        if id == "addPage", !query("menu.addPage").firstMatch.exists {
+            try tap("menu.more")
+        } else {
+            try tap("menu." + id)
+        }
+    }
+    private func menu(_ id: String, _ action: String) throws { try openMenu(id); try tap(action) }
     private func more(_ action: String) throws { try menu("more", action) }
     private func panel(_ id: String, shown: Bool = true) throws {
         _ = try ui.waitForState(timeout: 12) { $0.openPanels.contains(id) == shown }
@@ -118,7 +128,12 @@ final class ChromeUITests: XCTestCase {
         let target = ui.app.switches.matching(NSPredicate(format: "label == %@", name)).firstMatch
         _ = try reachable(name)
         XCTAssertTrue(target.exists, "Expected switch \(name)")
-        if (target.value as? String == "1") != on { target.tap() }
+        if (target.value as? String == "1") != on {
+            // DESIGN §10.13 uses the native iOS 26 switch. Its labelled row can contain
+            // a separate switch; the row's centre is not the switch's touch target.
+            let control = target.descendants(matching: .switch).firstMatch
+            if control.exists { control.tap() } else { target.tap() }
+        }
         try wait("\(name) must become \(on)") { (target.value as? String == "1") == on }
     }
     private func settings(_ tool: String) throws {
@@ -206,7 +221,7 @@ final class ChromeUITests: XCTestCase {
     func testMenusOutsideDismissWithoutInkOrHistoryChanges() throws {
         try open(); let before = try ui.state()
         for (id, row) in [("title", "Rename"), ("addPage", "Current Template"), ("share", "Export all…"), ("more", "Document Editing Settings")] {
-            try tap("menu." + id); _ = try reachable(row)
+            try openMenu(id); _ = try reachable(row)
             outside()
             try wait("Outside tap must close \(id)") { !self.query(row).allElementsBoundByIndex.contains { $0.isHittable } }
             try sameContent(before)
@@ -234,7 +249,8 @@ final class ChromeUITests: XCTestCase {
     func testAssistantDropletToggleAndEscapeRestoreEditorFocus() throws {
         try open(); let before = try ui.state()
         try tap("Assistant"); try panel("aichat.panel")
-        try tap("Assistant"); try panel("aichat.panel", shown: false)
+        // DESIGN §14.9 transfers the droplet into the header, which has its own Close.
+        try tap("Close Assistant"); try panel("aichat.panel", shown: false)
         key("j", .command); try panel("aichat.panel")
         escape(); try panel("aichat.panel", shown: false)
         try sameContent(before); key("p"); try draw()
@@ -300,8 +316,11 @@ final class ChromeUITests: XCTestCase {
 
     func testSelectedToolTapOpensSettingsAndChangesPenType() throws {
         try open(); try ui.selectTool("pen"); try tap("tool.pen")
-        try tap("Pencil"); outside(); try draw()
-        try tap("tool.pen"); XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@ AND NOT identifier BEGINSWITH %@", "Pencil", "tool.")).firstMatch.isSelected)
+        // F007 defines Pencil as a separate canvas tool, not a pen.style value.
+        // Reopen the selected tool's settings after choosing it in the type grid.
+        try tap("Pencil"); _ = try ui.waitForState { $0.tool == "pencil" }
+        outside(); try draw()
+        try tap("tool.pencil"); XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@ AND NOT identifier BEGINSWITH %@", "Pencil", "tool.")).firstMatch.isSelected)
         outside(); try draw(y: 0.72)
     }
 
@@ -562,10 +581,10 @@ final class ChromeUITests: XCTestCase {
         try customize(); try tap("Show Highlighter")
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5), "Customise must expose a real reorder handle")
-        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.5, thenDragTo: try reachable("Hide Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)))
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)))
         try doneCustomizing(); try customize()
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
-        XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Pen").frame.minY, "Reordered layout must persist")
+        XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Fountain Pen").frame.minY, "Reordered layout must persist")
     }
     func testSaveLayoutRejectsBlankAndNamedLayoutAppears() throws {
         try open(); try customize(); try tap("Save Current Layout")
@@ -587,14 +606,14 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize()
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
-        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Pen"))
+        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen"))
         try wait("Reordering must move Highlighter above Pen") {
-            self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Pen").firstMatch.frame.minY
+            self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }
         try saveLayout("Reordered chrome")
         try tap("Reset Toolbar"); try tap("Reset Writing Tools")
         try tap("Apply Reordered chrome")
-        XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Pen").frame.minY)
+        XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Fountain Pen").frame.minY)
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
         try doneCustomizing()
         let lasso = try reachable("tool.lasso").frame, highlighter = try reachable("tool.highlighter").frame

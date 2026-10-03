@@ -1452,6 +1452,42 @@ final class FeatDocChromeTests: XCTestCase {
 
     // MARK: Container
 
+    func testRenameCancelAndSheetDismissOnlyCloseTheInvokingWindowsPanel() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let original = try h.app.workspace.content(Fixtures.docID)
+        let title = h.library.node(Fixtures.docID)?.title
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        h.app.services.sessions.add(other)
+        let store = try XCTUnwrap(h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self))
+        let otherState = store.state(for: other)
+        otherState.open(ChromePanels.rename, at: .sheet)
+        h.app.services.sessions.activate(other)
+        let renames = CallLog()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
+                                                  effect: .library, target: .app)) { params, _ in
+            renames.params.append(params)
+            return [:]
+        }
+
+        try await h.run(CommandIDs.panelOpen, ["id": .string(ChromePanels.rename)])
+        // Both the Cancel button and its Escape shortcut receive this exact panel context callback.
+        chrome.panelContext(ChromePanels.rename, presentation: .sheet).dismiss()
+        try await waitUntil { !h.session.openPanels.contains(ChromePanels.rename) }
+        XCTAssertTrue(other.openPanels.contains(ChromePanels.rename))
+
+        try await h.run(CommandIDs.panelOpen, ["id": .string(ChromePanels.rename)])
+        // Interactive dismissal settles the sheet binding immediately, then reports panel.close.
+        chrome.dismissPanel(ChromePanels.rename)
+        XCTAssertFalse(h.session.openPanels.contains(ChromePanels.rename))
+        await Task.yield()
+        XCTAssertTrue(renames.params.isEmpty)
+        XCTAssertEqual(h.library.node(Fixtures.docID)?.title, title)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), original)
+        XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "Cancelling must not add document history")
+    }
+
     func testContainerFollowsTheStatusBarSettingAndBackGoesToTheLibrary() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let navigator = TestNavigator(session: h.session)

@@ -139,9 +139,11 @@ struct ShortcutContext: Equatable {
     var readOnly: Bool
     /// Current zoom of the canvas (1 = 100 %).
     var zoom: Double
+    /// Panels in the invoking window, never the application's active window.
+    var openPanels: Set<String>
 
     init(doc: DocumentID? = nil, kind: DocumentKind? = nil, page: PageID? = nil, folder: FolderID? = nil,
-         selection: [String] = [], readOnly: Bool = false, zoom: Double = 1) {
+         selection: [String] = [], readOnly: Bool = false, zoom: Double = 1, openPanels: Set<String> = []) {
         self.doc = doc
         self.kind = kind
         self.page = page
@@ -149,6 +151,7 @@ struct ShortcutContext: Equatable {
         self.selection = selection
         self.readOnly = readOnly
         self.zoom = zoom
+        self.openPanels = openPanels
     }
 
     @MainActor
@@ -165,7 +168,7 @@ struct ShortcutContext: Equatable {
         let readOnly = session.readOnly || (doc.map { app?.isReadOnly($0) ?? false } ?? false)
         let zoom = session.editor?.canvasHost?.zoomScale ?? session.zoom
         self.init(doc: doc, kind: kind, page: session.page, folder: folder, selection: selection, readOnly: readOnly,
-                  zoom: zoom)
+                  zoom: zoom, openPanels: session.openPanels)
     }
 
     var isCanvas: Bool { kind.map { Self.canvasKinds.contains($0) } ?? false }
@@ -209,8 +212,12 @@ enum ShortcutActions {
         return batch([(CommandIDs.itemDelete, ["refs": .array(c.selection.map { .string($0) })])])
     }
 
-    /// Escape: drop the selection.
+    /// Escape closes the Assistant before changing the selection behind it (DESIGN §12).
+    /// Its command also stops a turn and denies pending requests; panel.close alone would bypass that cleanup.
     static func deselect(_ c: ShortcutContext) -> JSONValue {
+        if c.isCanvas, c.openPanels.contains(PanelIDs.assistant) {
+            return batch([("ai.chat.close", [:])])
+        }
         guard c.isCanvas, !c.selection.isEmpty else { return nothing }
         return batch([(CommandIDs.selectionClear, [:])])
     }
@@ -334,6 +341,10 @@ enum GlobalShortcuts {
             ["direction": "next"], scope: .document)
         key("findPrevious", String(localized: "Find Previous"), KeyShortcut("g", [.command, .shift]),
             CommandIDs.searchStep, ["direction": "previous"], scope: .document)
+
+        // DESIGN §12's document entry point supplements the Assistant owner's ⌥⌘A shortcut.
+        key("assistant", String(localized: "Assistant"), KeyShortcut("j", .command), "ai.chat.open",
+            scope: .document)
 
         // View and navigation (P-053).
         key("goToPage", String(localized: "Go to Page…"), KeyShortcut("g", [.command, .option]), CommandIDs.panelOpen,

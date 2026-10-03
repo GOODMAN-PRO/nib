@@ -164,6 +164,50 @@ final class FeatLayersTests: XCTestCase {
 
     // MARK: Active layer and visibility
 
+    func testActiveLayerShortcutsUpdateTheInvokingWindowAndNotifyCanvasObservers() async throws {
+        let h = harness()
+        await FeatLayersFeature.start(h.app)
+        let otherWindow = EditorSession()
+        otherWindow.document = Fixtures.whiteboardID
+        h.app.services.sessions.add(otherWindow)
+        let before = try h.snapshot()
+
+        // The native Layers switch runs this command. Enabling it must make the
+        // shortcuts available without reopening the document or restarting the app.
+        _ = try await h.run(CommandIDs.settingsSet, ["name": "layers.show", "value": true])
+        XCTAssertNotNil(h.app.ui.panels.get("layers"))
+        XCTAssertTrue(h.app.services.sessions.active === otherWindow)
+
+        var changes: [NibEvent] = []
+        let observer = h.app.events.subscribe { event in
+            if event.type == NibEventType.layersChanged { changes.append(event) }
+        }
+        defer { observer.cancel() }
+
+        // Match the panel's Layer 2 command, then the Option-Command-3 / -2
+        // sequence used while drawing and lassoing. The explicit calling window
+        // must win over the registry's most recently active window.
+        _ = try await h.run(CommandIDs.layerSetActive, ["layer": 1])
+        XCTAssertEqual(h.session.activeLayer, 1)
+        for layer in [2, 1] {
+            let key = try XCTUnwrap(h.app.content.keyCommands.get(LayersChrome.activeKeyID(layer)))
+            XCTAssertEqual(key.shortcut, KeyShortcut(String(layer + 1), [.command, .option]))
+            _ = try await h.run(key.command, key.params)
+            XCTAssertEqual(h.session.activeLayer, layer,
+                           "Ink and lasso must see the layer chosen by the registered shortcut")
+            XCTAssertEqual(h.app.settings.get(LayerSettings.view(Fixtures.docID)).active, layer)
+        }
+        XCTAssertEqual(otherWindow.activeLayer, 0)
+        XCTAssertEqual(changes.count, 3)
+        XCTAssertTrue(changes.allSatisfy { $0.payload?["session"]?.stringValue == h.session.id.raw })
+        XCTAssertEqual(try h.snapshot(), before, "Choosing a layer must not edit document content")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+
+        h.session.document = Fixtures.whiteboardID
+        h.session.document = Fixtures.docID
+        XCTAssertEqual(h.session.activeLayer, 1, "The chosen layer survives switching documents")
+    }
+
     func testVisibilityIsPerDocumentOnThisDeviceAndLeftOutOfRendering() async throws {
         let h = harness()
         await FeatLayersFeature.start(h.app)

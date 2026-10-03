@@ -862,6 +862,66 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testPortraitSidebarAndMenusReleaseTheRealGridWhenClosed() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        let controller = UIHostingController(rootView: LibraryRootView(model: model, idiom: .pad)
+            .environment(\.scenePhase, .active))
+        model.controller = controller
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1032, height: 1376))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        func settle() async throws {
+            for _ in 0..<20 {
+                controller.view.setNeedsLayout(); controller.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        func gridTarget() throws -> (CGPoint, UIScrollView) {
+            let probes = descendants(controller.view).compactMap { $0 as? NibReflowTouchTarget<String>.Probe }
+            let probe = try XCTUnwrap(probes.last)
+            var ancestor = probe.superview
+            while let view = ancestor, !(view is UIScrollView) { ancestor = view.superview }
+            return (probe.convert(CGPoint(x: probe.bounds.midX, y: probe.bounds.midY), to: controller.view),
+                    try XCTUnwrap(ancestor as? UIScrollView))
+        }
+        func assertGridReceivesTouches(_ receives: Bool, file: StaticString = #filePath, line: UInt = #line) throws {
+            let (point, scroll) = try gridTarget()
+            XCTAssertTrue(controller.view.bounds.contains(point), file: file, line: line)
+            let hit = controller.view.hitTest(point, with: nil)
+            XCTAssertEqual(hit === scroll || hit?.isDescendant(of: scroll) == true, receives,
+                           "Unexpected hit at \(point): \(String(describing: hit))", file: file, line: line)
+            if receives {
+                XCTAssertTrue(scroll.isUserInteractionEnabled, file: file, line: line)
+                XCTAssertFalse(scroll.accessibilityElementsHidden, file: file, line: line)
+            }
+        }
+        for mode in [NibLiquidMode.full, .off] {
+            model.liquidMode = mode
+            try await settle()
+            XCTAssertFalse(model.sidebarVisible, "Portrait starts with the sidebar collapsed")
+            try assertGridReceivesTouches(true)
+            for _ in 0..<2 {
+                _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sidebar": true], session: h.session)
+                try await settle()
+                try assertGridReceivesTouches(false)
+                _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sidebar": false], session: h.session)
+                try await settle()
+                try assertGridReceivesTouches(true)
+            }
+            for menu in ["new", "sort"] {
+                _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": .string(menu)], session: h.session)
+                try await settle()
+                try assertGridReceivesTouches(false)
+                _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["menu": "none"], session: h.session)
+                try await settle()
+                try assertGridReceivesTouches(true)
+            }
+        }
+    }
+
     func testLibraryRootChromeSnapshots() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)

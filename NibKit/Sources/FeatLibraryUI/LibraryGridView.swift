@@ -261,15 +261,9 @@ struct LibraryCell: View {
             if list { LibraryListRow(row: row, model: model, subtitle: visibleSubtitle) }
             else { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
         }
-        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
-        .modifier(LibraryItemReflow(row: row, model: model))
-        .contextMenu {
-            LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
-            if model.collection == .documents {
-                Button("Move earlier") { step(-1) }
-                Button("Move later") { step(1) }
-            }
-        } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+        // Attach identity and actions to the actual Button, before the reflow and
+        // context-menu hosts. Otherwise accessibility exposes a second command
+        // button around the card instead of the control that receives its touch.
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.accessibilityLabel)
         .accessibilityIdentifier(row.isFolder ? "cmd.library.setView" : "cmd.doc.open")
@@ -283,6 +277,15 @@ struct LibraryCell: View {
         }
         .accessibilityAddTraits(.isButton)
         .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
+        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
+        .modifier(LibraryItemReflow(row: row, model: model))
+        .contextMenu {
+            LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
+            if model.collection == .documents {
+                Button("Move earlier") { step(-1) }
+                Button("Move later") { step(1) }
+            }
+        } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {

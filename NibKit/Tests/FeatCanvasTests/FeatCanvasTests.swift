@@ -613,6 +613,34 @@ final class FeatCanvasTests: XCTestCase {
         await assertThrows(.invalidParams) { _ = try await h.run("view.zoom", ["fitMode": "invalid"]) }
     }
 
+    func testPaperHitTestingReachesWetInkAfterOpeningAndReopening() throws {
+        let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+        h.app.settings.set(NibSettings.stylusMode, .anyInput)
+        let tool = NavigationInkTool()
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+        h.session.tool = tool.id
+        let install = try XCTUnwrap(CanvasInputHooks.install)
+        let vc = try makeCanvas(h, input: install, size: CGSize(width: 1376, height: 1032))
+        defer { vc.closeCanvas() }
+        for reopening in [false, true] {
+            if reopening {
+                vc.closeCanvas()
+                vc.viewWillAppear(false)
+                vc.view.layoutIfNeeded()
+            }
+            let point = CGPoint(x: vc.view.bounds.width * 0.4, y: vc.view.bounds.height * 0.65)
+            XCTAssertNotNil(vc.host.pagePoint(vc.view.convert(point, to: vc.scrollView)))
+            let hit = try XCTUnwrap(vc.view.hitTest(point, with: nil))
+            var ancestor: UIView? = hit
+            while ancestor != nil, !(ancestor is PKCanvasView) { ancestor = ancestor?.superview }
+            let ink = try XCTUnwrap(ancestor as? PKCanvasView,
+                                   "Paper must reach PencilKit, got \(hit); reopening=\(reopening)")
+            XCTAssertTrue(ink.isDescendant(of: vc.host.wetInkContainer))
+            XCTAssertEqual(ink.drawingPolicy, .anyInput)
+            XCTAssertTrue(ink.drawingGestureRecognizer.isEnabled)
+        }
+    }
+
     func testDoubleTapThroughInputHandlerTogglesInAnyInputWithoutCommittingDots() async throws {
         let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
         h.app.settings.set(NibSettings.stylusMode, .anyInput)

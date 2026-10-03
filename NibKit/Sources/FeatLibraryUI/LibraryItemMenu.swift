@@ -85,7 +85,7 @@ struct LibraryMenuEntries: View {
                 }
                 if entries.count > 4 {
                     Menu {
-                        ForEach(Array(entries.dropFirst(4)), id: \.id) { entry in menuButton(entry, context) }
+                        ForEach(Array(entries.dropFirst(4)), id: \.id) { entry in menuButton(entry, context, native: true) }
                     } label: { Image(nib: .more).frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget) }
                     .accessibilityLabel(String(localized: "More Selection Actions"))
                 }
@@ -93,29 +93,48 @@ struct LibraryMenuEntries: View {
                 ForEach(entries.filter { $0.submenu == nil }, id: \.id) { entry in menuButton(entry, context) }
                 ForEach(Array(Set(entries.compactMap(\.submenu))).sorted(), id: \.self) { title in
                     Menu {
-                        ForEach(entries.filter { $0.submenu == title }, id: \.id) { entry in menuButton(entry, context) }
+                        ForEach(entries.filter { $0.submenu == title }, id: \.id) { entry in menuButton(entry, context, native: true) }
                     } label: {
-                        LibraryMenuRow(title: title)
-                            .frame(minHeight: max(NibMetrics.hitTarget, rowHeight ?? 0))
-                            .contentShape(Rectangle())
-                    }.buttonStyle(.plain)
+                        if location == .libraryItem {
+                            Text(title)
+                        } else {
+                            LibraryMenuRow(title: title)
+                                .frame(minHeight: max(NibMetrics.hitTarget, rowHeight ?? 0))
+                                .contentShape(Rectangle())
+                        }
+                    }
+                    .accessibilityLabel(title)
+                    .buttonStyle(.plain)
                 }
             }
         }
         .disabled(location == .librarySelection && rows.isEmpty)
 
     }
-    private func menuButton(_ entry: MenuItemDescriptor, _ context: MenuContext) -> some View {
+    private func menuButton(_ entry: MenuItemDescriptor, _ context: MenuContext, native: Bool = false) -> some View {
         Button(role: entry.destructive ? .destructive : nil) { activate(entry, context) } label: {
-            LibraryMenuRow(title: entry.resolvedTitle(for: context),
-                symbol: entry.icon.flatMap(NibSymbol.init(systemName:)),
-                shortcut: entry.shortcut.map(LibraryShortcut.label), checked: entry.isChecked?(context) == true,
-                destructive: entry.destructive)
-                .frame(minHeight: max(NibMetrics.hitTarget, rowHeight ?? 0))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+            if native || location == .libraryItem {
+                // UIKit synthesizes a UIAction from this label. Hidden decorative
+                // children in the custom droplet row can hide the synthesized
+                // action from accessibility, leaving a visibly populated but
+                // unlabelled system context menu.
+                if let icon = entry.icon {
+                    Label(entry.resolvedTitle(for: context), systemImage: icon)
+                } else {
+                    Text(entry.resolvedTitle(for: context))
+                }
+            } else {
+                LibraryMenuRow(title: entry.resolvedTitle(for: context),
+                    symbol: entry.icon.flatMap(NibSymbol.init(systemName:)),
+                    shortcut: entry.shortcut.map(LibraryShortcut.label), checked: entry.isChecked?(context) == true,
+                    destructive: entry.destructive)
+                    .frame(minHeight: max(NibMetrics.hitTarget, rowHeight ?? 0))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(entry.resolvedTitle(for: context))
         .accessibilityAddTraits(entry.isChecked?(context) == true ? .isSelected : [])
         .accessibilityIdentifier("cmd." + entry.command)
     }

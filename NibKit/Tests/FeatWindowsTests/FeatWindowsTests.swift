@@ -516,6 +516,76 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertNil(navigator.session.document)
     }
 
+    func testBackgroundSnapshotKeepsLiveTabPagesAndCommittedEdits() async throws {
+        let (h, scenes, hooks) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        h.app.commands.register(RetitlePage.self)
+        let navigator = window(h, scenes)
+        h.app.ui.activeNavigator = navigator
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.settingsSet,
+                      ["name": .string(WindowSettings.showTabs.name), "value": true], in: navigator)
+        navigator.session.page = Fixtures.page2
+        try await run(h, RetitlePage.descriptor.id, ["title": "Saved before background"], in: navigator)
+        try await run(h, CommandIDs.windowShowLibrary, in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let boardPage = navigator.session.page
+        let activity = try XCTUnwrap(hooks.restorationActivity(navigator))
+        let state = WindowState(userInfo: activity.userInfo ?? [:])
+        XCTAssertEqual(state.tabs, [notebook, board])
+        XCTAssertEqual(state.active, board)
+        XCTAssertEqual(state.page, boardPage)
+
+        // Background/foreground keeps the live session; saving its activity must not discard page memory.
+        let firstKey = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.tab1"))
+        try await run(h, firstKey.command, firstKey.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertEqual(navigator.session.document, notebook)
+        XCTAssertEqual(navigator.session.page, Fixtures.page2)
+        XCTAssertEqual(try h.app.workspace.content(notebook).livePages.first?.title, "Saved before background")
+        let lastKey = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.tab9"))
+        try await run(h, lastKey.command, lastKey.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertEqual(navigator.session.document, board)
+        XCTAssertEqual(navigator.session.page, boardPage)
+        XCTAssertNotNil(hooks.makeTabBar(navigator))
+    }
+
+    func testTabMenuCloseAndKeyboardCloseAllKeepLibraryDocuments() async throws {
+        let (h, scenes, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let navigator = window(h, scenes)
+        h.app.ui.activeNavigator = navigator
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.settingsSet,
+                      ["name": .string(WindowSettings.showTabs.name), "value": true], in: navigator)
+        try await run(h, CommandIDs.windowShowLibrary, in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
+        let tab = try XCTUnwrap(model.tabs.first { $0.id == board })
+        let close = try XCTUnwrap(model.menuItems(tab).first { $0.id == "windows.tab.close" })
+        try await run(h, close.command, close.params(model.menuContext(tab)), in: navigator)
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertEqual(navigator.session.document, notebook)
+
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let closeKey = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.closeTab"))
+        try await run(h, closeKey.command, closeKey.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertEqual(navigator.session.document, notebook)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let closeAll = try XCTUnwrap(h.app.content.keyCommands.get("windows.key.closeAllTabs"))
+        try await run(h, closeAll.command, closeAll.resolvedParams(for: navigator.session), in: navigator)
+        XCTAssertTrue(navigator.openDocuments.isEmpty)
+        XCTAssertNil(navigator.session.document)
+        for doc in [notebook, board] {
+            let node = try XCTUnwrap(h.library.node(doc))
+            XCTAssertNil(node.trashedAt)
+            try await run(h, CommandIDs.docOpen,
+                          ["doc": .string(NodeRef.document(doc).description)], in: navigator)
+            XCTAssertEqual(navigator.session.document, doc)
+            XCTAssertFalse(try h.app.workspace.content(doc).livePages.isEmpty)
+        }
+    }
+
     func testClosingTheCurrentTabFromTheLibraryKeepsTheLibrary() async throws {
         let (h, scenes, _) = try windows()
         let navigator = window(h, scenes)
@@ -727,6 +797,55 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertNil(hooks.makeTabBar(navigator))             // opening policy does not override visibility
         XCTAssertTrue(h.app.settings.get(NibSettings.openAsTabs))
         XCTAssertEqual(navigator.openDocuments, [notebook, board])
+    }
+
+    func testNativeTabsSwitchRunsSettingsCommandAndReflectsExternalChanges() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
+        let page = try XCTUnwrap(h.app.ui.settingsPages.get("windows.settings.tabs"))
+        let hosting = UIHostingController(rootView: page.makeView(h.app))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = hosting
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func nativeSwitch(in view: UIView) -> UISwitch? {
+            if let control = view as? UISwitch { return control }
+            return view.subviews.lazy.compactMap { nativeSwitch(in: $0) }.first
+        }
+        hosting.view.layoutIfNeeded()
+        try await waitUntil { nativeSwitch(in: hosting.view) != nil }
+        let control = try XCTUnwrap(nativeSwitch(in: hosting.view))
+        XCTAssertFalse(control.isOn)
+        XCTAssertFalse(model.isVisible)
+
+        // DESIGN §10.13 uses the native switch. Activate the control, not its enclosing labelled row.
+        control.setOn(true, animated: false)
+        control.sendActions(for: .valueChanged)
+        try await waitUntil { h.app.settings.get(WindowSettings.showTabs) && model.isVisible }
+        XCTAssertTrue(h.app.settings.get(WindowSettings.showTabs))
+        XCTAssertTrue(model.isVisible)
+        XCTAssertTrue(control.isOn)
+
+        // A synced/command-driven change must flow back into the already-presented native control.
+        try await run(h, CommandIDs.settingsSet,
+                      ["name": .string(WindowSettings.showTabs.name), "value": false], in: navigator)
+        try await waitUntil { !control.isOn && !model.isVisible }
+        XCTAssertFalse(control.isOn)
+        XCTAssertFalse(model.isVisible)
+        control.setOn(true, animated: false)
+        control.sendActions(for: .valueChanged)
+        try await waitUntil { h.app.settings.get(WindowSettings.showTabs) && model.isVisible }
+        XCTAssertTrue(h.app.settings.get(WindowSettings.showTabs))
+        XCTAssertTrue(model.isVisible)
+        XCTAssertTrue(h.app.settings.get(NibSettings.openAsTabs))
+        XCTAssertEqual(navigator.openDocuments, [notebook, board])
+        XCTAssertEqual(navigator.editorsBuilt, 2)
     }
 
     func testChangingTabsVisibilityUpdatesEveryDocumentWindowWithoutReopeningAnEditor() async throws {
