@@ -14,6 +14,11 @@ on:
         type: string
         required: false
         default: ''
+      device:
+        description: Simulator device name prefix; the newest available match is booted (created if missing)
+        type: string
+        required: false
+        default: 'iPad Pro 13-inch'
 
 permissions:
   contents: read
@@ -113,8 +118,10 @@ jobs:
       - name: Generate project
         run: xcodegen generate
 
-      - name: Boot newest iOS 26 iPad Pro 13-inch
+      - name: Boot newest iOS 26 ${{ inputs.device || 'iPad Pro 13-inch' }}
         id: sim
+        env:
+          DEVICE: ${{ inputs.device || 'iPad Pro 13-inch' }}
         run: |
           python3 - <<'PY'
           import json, os, subprocess
@@ -126,18 +133,18 @@ jobs:
               raise SystemExit('No available iOS 26 runtime')
           runtime = max(runtimes, key=lambda r: tuple(map(int, r['version'].split('.'))))
           devices = json.loads(sim('list', 'devices', 'available', '-j'))['devices'].get(runtime['identifier'], [])
-          candidates = [d for d in devices if d['name'].startswith('iPad Pro 13-inch')]
+          candidates = [d for d in devices if d['name'].startswith(os.environ['DEVICE'])]
           if candidates:
               device = sorted(candidates, key=lambda d: d['name'])[-1]
               udid = device['udid']
               booted = device['state'] == 'Booted'
           else:
               types = [d for d in json.loads(sim('list', 'devicetypes', '-j'))['devicetypes']
-                       if d['name'].startswith('iPad Pro 13-inch')]
+                       if d['name'].startswith(os.environ['DEVICE'])]
               if not types:
-                  raise SystemExit('No iPad Pro 13-inch device type')
+                  raise SystemExit('No device type named ' + os.environ['DEVICE'])
               device_type = sorted(types, key=lambda d: d['name'])[-1]
-              udid = sim('create', 'Nib UI iPad Pro 13-inch', device_type['identifier'], runtime['identifier']).strip()
+              udid = sim('create', 'Nib UI ' + os.environ['DEVICE'], device_type['identifier'], runtime['identifier']).strip()
               booted = False
           if not booted:
               sim('boot', udid)
