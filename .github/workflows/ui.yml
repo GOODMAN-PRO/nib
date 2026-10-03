@@ -259,12 +259,44 @@ jobs:
           print(json.dumps(report, indent=2))
           PY
 
+      - name: Export screenshots (explicit attachments + failure screenshots, as JPEG)
+        if: ${{ always() && steps.tests.outcome != 'skipped' }}
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, shutil, subprocess
+          att, out = pathlib.Path('att'), pathlib.Path('shots')
+          if not pathlib.Path('ui.xcresult').is_dir():
+              raise SystemExit(0)
+          subprocess.run(['xcrun', 'xcresulttool', 'export', 'attachments', '--path', 'ui.xcresult', '--output-path', str(att)], check=True)
+          manifest = json.loads((att / 'manifest.json').read_text())
+          summary = json.loads(pathlib.Path('summary.json').read_text()) if pathlib.Path('summary.json').exists() else {}
+          failed = {f['test'].split('/')[-1] for f in summary.get('failures', [])}
+          images = ('.png', '.jpg', '.jpeg', '.heic')
+          count = 0
+          for entry in manifest if isinstance(manifest, list) else []:
+              test = re.sub(r'[^A-Za-z0-9_]+', '', str(entry.get('testIdentifier', 'unknown')).split('/')[-1].replace('()', '')) or 'unknown'
+              files = [a for a in entry.get('attachments', []) if str(a.get('exportedFileName', '')).lower().endswith(images)]
+              if test in failed:   # failing test: the screenshots tied to the failure (else the last two), at most six
+                  keep = ([a for a in files if a.get('isAssociatedWithFailure')] or files[-2:])[-6:]
+              else:                # passing test: only explicitly kept attachments survive in the bundle (e.g. the screen tour)
+                  keep = files
+              for i, a in enumerate(keep):
+                  name = re.sub(r'[^A-Za-z0-9_.-]+', '-', pathlib.Path(a.get('suggestedHumanReadableName') or a['exportedFileName']).stem)[:90]
+                  dest = out / test / f'{i:03d}-{name}.jpg'
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  subprocess.run(['sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', '75', str(att / a['exportedFileName']), '--out', str(dest)], capture_output=True)
+                  count += 1
+          shutil.rmtree(att, ignore_errors=True)
+          print('exported', count, 'screenshots')
+          PY
+
       - name: Zip result bundle
         if: ${{ always() && steps.tests.outcome != 'skipped' }}
         run: |
           if [ -d ui.xcresult ]; then ditto -c -k --keepParent ui.xcresult ui.xcresult.zip; fi
 
-      - name: Upload UI results
+      - name: Upload UI results (small; the client downloads this)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -275,8 +307,18 @@ jobs:
             summary.json
             status.json
             timing.json
-            ui.xcresult.zip
             ui.log
+            shots/
+
+      - name: Upload result bundle (large; downloaded only on demand)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcresult-${{ matrix.class }}
+          retention-days: 2
+          if-no-files-found: ignore
+          compression-level: 0
+          path: ui.xcresult.zip
 
       - name: Fail if tests failed
         if: ${{ always() && steps.tests.outcome != 'skipped' }}
