@@ -566,7 +566,12 @@ final class CreateUITests: XCTestCase {
         }
         defer { removeUIInterruptionMonitor(monitor) }
         try newMenu("Quick Record")
-        ui.app.tap()
+        // F052 requires the user's microphone permission before recording. The
+        // request is asynchronous: an immediate app tap can precede the alert
+        // (and open a folder), leaving the interruption monitor untriggered.
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allowMicrophone = springboard.alerts.buttons["Allow"]
+        if allowMicrophone.waitForExistence(timeout: 15) { allowMicrophone.tap() }
         let state = try ui.waitForState { $0.document != nil }
         let id = try XCTUnwrap(state.document)
         try assertDocument(id, kind: "textDocument", pages: 0)
@@ -608,6 +613,7 @@ final class CreateUITests: XCTestCase {
         try tap("Daily")
         let picker = ui.app.datePickers.firstMatch
         try scrollTo(picker, name: "Planner start date")
+        let dateRow = picker.frame
         picker.tap()
         // Choose a different day in the displayed month through the native calendar, without setting app state.
         var calendar = Calendar(identifier: .gregorian)
@@ -627,7 +633,11 @@ final class CreateUITests: XCTestCase {
         // Create as hittable. Dismiss that system popover before invoking the create action;
         // tapping the covered header instead can open the picker's month/year controls.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
-            ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).tap()
+            // Stay inside the creation sheet. An outside-sheet tap cancels the
+            // draft on iPad, which contradicts this test's intent to create it.
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                dx: dateRow.minX + 12 - ui.app.frame.minX,
+                dy: dateRow.midY - ui.app.frame.minY)).tap()
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
@@ -954,8 +964,18 @@ final class CreateUITests: XCTestCase {
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
         try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
-        try replace(title, with: eventTitle)
-        calendar.buttons["Add"].tap()
+        // This editor belongs to Calendar. The creation-form scrolling helper
+        // targets Nib's window and would bring the background app forward.
+        try require(title, "Calendar must offer its event title field")
+        title.tap()
+        title.typeKey("a", modifierFlags: [.command])
+        title.typeText(eventTitle)
+        // EventKit's iOS 26 editor labels this action Done. The system identifier
+        // names the save action consistently; the spec requires a saved event,
+        // not a particular version of Apple's button copy.
+        let saveEvent = calendar.buttons["add-button"]
+        try require(saveEvent, "Calendar must offer its save-event action")
+        saveEvent.tap()
         ui.app.activate()
         try tap("Calendar")
         let connect = button("Connect Calendars")
