@@ -158,7 +158,7 @@ Spend at most ~45 minutes writing. The UI run may wait in a queue for a long tim
     let failures = st.rounds.length ? (st.remaining || []) : (r.failures || []).map((f) => ({ ...f, test: qual(r, f) }))
     for (let round = st.rounds.length + 1; round <= (A.fixRounds || 3); round++) {
       if (!failures.length) break
-      const roundGate = 60   // fixers need no simulator lane; verifies are gated separately (150 min) and the final verify re-runs the critical classes
+      const roundGate = 120   // fixers need no simulator lane; verifies are gated separately (150 min) and the final verify re-runs the critical classes
       if (minutesUntil(A.shipBy) < roundGate) { say(`fix ${a.key}: no time for round ${round} (final verify + ship by ${A.shipBy})`); break }
       const groups = {}
       for (const f of failures) (groups[normOwner(f.owner)] ||= []).push(`${f.test}: ${f.problem} [evidence: ${f.evidence}]`)
