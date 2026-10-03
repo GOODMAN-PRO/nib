@@ -633,6 +633,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.isZoomingNow = false
         finishViewChange(bake: true)
         growBoardIfNeeded()
+        if mode.isWorld { for page in scrollView.pageViews.values { page.invalidateAccessibility() } }
         flushSessionState()
         host.inputController?.canvasDidEndZooming(host)
     }

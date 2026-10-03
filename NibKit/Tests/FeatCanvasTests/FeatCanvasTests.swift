@@ -761,7 +761,8 @@ final class FeatCanvasTests: XCTestCase {
         scroll.layoutIfNeeded()
         let system = try XCTUnwrap(scroll.pinchGestureRecognizer)
         let document = scroll.documentPinchGestureRecognizer
-        XCTAssertTrue(system.isEnabled, "Keep UIKit's navigation recognizer available as a fallback")
+        XCTAssertFalse(system.isEnabled, "UIKit must not apply a second transform after focal compensation")
+        XCTAssertTrue(document.isEnabled, "Document pinch remains available")
         XCTAssertTrue(system.delegate?.gestureRecognizer?(system, shouldRequireFailureOf: document) == true)
         XCTAssertFalse(scroll.gestureRecognizer(system, shouldRecognizeSimultaneouslyWith: document))
         XCTAssertFalse(scroll.gestureRecognizer(document, shouldRecognizeSimultaneouslyWith: system))
@@ -865,7 +866,8 @@ final class FeatCanvasTests: XCTestCase {
         let vc = try makeCanvas(h)
         defer { vc.closeCanvas() }
         let pinch = vc.scrollView.documentPinchGestureRecognizer
-        XCTAssertTrue(pinch.isEnabled)
+        XCTAssertEqual(pinch.isEnabled, pinch === vc.scrollView.documentPinchGestureRecognizer,
+                       "Only the document recognizer may drive zoom")
         XCTAssertTrue(pinch.delegate === vc.scrollView)
         let ink = PKCanvasView()
         XCTAssertFalse(pinch.canBePrevented(by: ink.drawingGestureRecognizer))
@@ -918,7 +920,8 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(pan.delegate === vc.scrollView)
         XCTAssertTrue(pinch.delegate === vc.scrollView)
         XCTAssertTrue(pan.isEnabled)
-        XCTAssertTrue(pinch.isEnabled)
+        XCTAssertEqual(pinch.isEnabled, pinch === vc.scrollView.documentPinchGestureRecognizer,
+                       "Only the document recognizer may drive zoom")
         XCTAssertTrue(vc.scrollView.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pinch))
         XCTAssertTrue(vc.scrollView.gestureRecognizer(pinch, shouldRecognizeSimultaneouslyWith: pan))
         let ink = PKCanvasView()
@@ -973,7 +976,8 @@ final class FeatCanvasTests: XCTestCase {
                     vc.setZoom(1.5, anchor: nil, centreFit: false)
                     vc.view.layoutIfNeeded()
                     let pinch = try XCTUnwrap(vc.scrollView.pinchGestureRecognizer)
-                    XCTAssertTrue(pinch.isEnabled)
+                    XCTAssertEqual(pinch.isEnabled, pinch === vc.scrollView.documentPinchGestureRecognizer,
+                       "Only the document recognizer may drive zoom")
                     XCTAssertTrue(vc.scrollView.panGestureRecognizer.isEnabled)
                     let surfaces = canvases(vc.host.wetInkContainer)
                     XCTAssertEqual(surfaces.count, 2)
@@ -1670,6 +1674,32 @@ final class FeatCanvasTests: XCTestCase {
             _ = try await h.run("view.zoom", ["fit": true])
             try await assertRenderedItem()
         }
+    }
+
+    func testBoardFitRefreshesReadableItemsAfterPanningAway() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.boardText", title: "Board Text",
+                                                  summary: "Test helper.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var item = try ctx.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                item.id = NibID.make()
+                try tx.put(item, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
+            }
+            return .null
+        }
+        _ = try await h.run("test.boardText")
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        defer { vc.closeCanvas() }
+        _ = try await h.run("view.scrollBy", ["dx": 5000, "dy": 5000])
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+        page.invalidateAccessibility()
+        XCTAssertFalse((page.accessibilityElements ?? []).contains {
+            ($0 as? UIAccessibilityElement)?.accessibilityLabel == "Text"
+        })
+        _ = try await h.run("view.zoom", ["fit": true])
+        XCTAssertTrue((page.accessibilityElements ?? []).contains {
+            ($0 as? UIAccessibilityElement)?.accessibilityLabel == "Text"
+        }, "Fit All Content must refresh VoiceOver's visible content")
     }
 
     func testWhiteboardIsOneInfiniteWorldWithBoardZoomLimits() async throws {
