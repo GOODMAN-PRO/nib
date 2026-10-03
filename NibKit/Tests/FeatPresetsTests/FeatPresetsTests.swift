@@ -966,6 +966,21 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertEqual(picks, [hex, hex, hex], "Interactive dismissal must also read the native final selection")
     }
 
+    func testFinalHexSelectionSupersedesAnEarlierPickerCallback() {
+        let picker = UIColorPickerViewController()
+        picker.selectedColor = PresetColour.uiColor(.black)
+        var picks: [RGBA] = []
+        let delegate = SystemColourPicker(initial: .black, commitsOnFinishOnly: false) { picks.append($0) }
+        picker.selectedColor = PresetColour.uiColor(vermilion)
+        delegate.colorPickerViewController(picker, didSelect: picker.selectedColor, continuously: false)
+        let hex = RGBA(0xD0, 0x30, 0x80)
+        picker.selectedColor = PresetColour.uiColor(hex)
+        delegate.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [vermilion, hex])
+        delegate.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [vermilion, hex], "Dismissal cannot commit twice")
+    }
+
     func testSystemColourPickerCommitRules() {
         let vc = UIColorPickerViewController()
         let blue = UIColor(red: 0, green: 0, blue: 1, alpha: 1)

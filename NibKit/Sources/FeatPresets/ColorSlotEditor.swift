@@ -264,6 +264,7 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     private let commitsOnFinishOnly: Bool
     private let onPick: @MainActor (RGBA) -> Void
     private var latest: RGBA?
+    private var lastPickerSelection: RGBA?
     private var committed: RGBA?
     private var finished = false
 
@@ -300,6 +301,7 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor, continuously: Bool) {
         guard !finished else { return }
         latest = PresetColour.rgba(color)
+        lastPickerSelection = PresetColour.rgba(viewController.selectedColor)
         if !continuously && !commitsOnFinishOnly { commitLatest() }
     }
 
@@ -311,7 +313,10 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
 
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
         viewController.viewIfLoaded?.endEditing(true)
-        if latest == nil { latest = PresetColour.rgba(viewController.selectedColor) }
+        let finalSelection = PresetColour.rgba(viewController.selectedColor)
+        // HEX editing can settle after the last selection callback. A previous
+        // grid/slider callback must not mask a newer authoritative picker value.
+        if latest == nil || finalSelection != lastPickerSelection { latest = finalSelection }
         finish()
     }
 

@@ -37,6 +37,10 @@ final class SharedChromeRegressionTests: XCTestCase {
                 let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: host.view)
                 let hit = try XCTUnwrap(host.view.hitTest(point, with: nil))
                 XCTAssertTrue(hit.isDescendant(of: target), "The native gesture must receive the control's touches")
+                XCTAssertFalse(target.point(inside: CGPoint(x: -1, y: -1), with: nil))
+                target.isHidden = true
+                XCTAssertFalse(host.view.hitTest(point, with: nil) === target, "A hidden control cannot receive taps")
+                target.isHidden = false
                 let before = count
                 tap.activate()
                 XCTAssertEqual(count, before + 1)

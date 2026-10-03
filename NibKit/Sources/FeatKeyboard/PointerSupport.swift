@@ -250,16 +250,16 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
 /// after those transitions. This is a view, not a text input: it never opens a keyboard or intercepts a touch.
 /// Descriptors still come from the registry (including another owner's winning Delete or Go to Page command).
 @MainActor
-final class CanvasKeyboardResponder: UIView, UIKeyInput {
+final class CanvasKeyboardResponder: UIView {
     private weak var host: CanvasHost?
     private var observers: NotificationBag?
     private var focusScheduled = false
     private var shortcuts: Set<KeyShortcut> = []
     private let hardwareInputView = UIView(frame: .zero)
 
-    // Establish a window-local input session for hardware commands and modifier
-    // tracking across editor/scene changes. The empty input view and assistant
-    // groups keep this command surface from presenting a software keyboard.
+    // Navigation advertises key commands without accepting text insertion.
+    // Keep the empty input surface and no-op editing hooks, but do not expose
+    // those hooks to UIKit as a UIKeyInput text editor.
     var hasText: Bool { false }
     func insertText(_ text: String) {}
     func deleteBackward() {}

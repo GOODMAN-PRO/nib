@@ -772,6 +772,32 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(scroll.gestureRecognizer(try XCTUnwrap(scroll.pinchGestureRecognizer), shouldRequireFailureOf: document))
     }
 
+    func testPageAccessibilityFrameFollowsChromeRelayoutScrollAndPinch() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let size = CGSize(width: 1376, height: 1032)
+        let vc = try makeCanvas(h, size: size)
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = vc
+        window.makeKeyAndVisible()
+        defer { vc.closeCanvas(); window.isHidden = true; window.rootViewController = nil }
+        vc.view.layoutIfNeeded()
+        let paper = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        let summary = try XCTUnwrap(paper.accessibilityElements?.first as? UIAccessibilityElement)
+        _ = summary.accessibilityFrame
+        vc.additionalSafeAreaInsets.top = 70
+        vc.viewDidLayoutSubviews()
+        let focal = CGPoint(x: 688, y: 516)
+        vc.updatePinch(state: .began, scale: 1, centroid: focal)
+        vc.updatePinch(state: .changed, scale: 1.5, centroid: focal)
+        vc.updatePinch(state: .ended, scale: 1.5, centroid: focal)
+        vc.view.layoutIfNeeded()
+        let actual = window.convert(paper.convert(paper.bounds, to: window), to: window.screen.coordinateSpace)
+        XCTAssertEqual(summary.accessibilityFrame.minY, actual.minY, accuracy: 0.5)
+        XCTAssertEqual(summary.accessibilityFrame.minX, actual.minX, accuracy: 0.5)
+        XCTAssertEqual(summary.accessibilityFrame.width, actual.width, accuracy: 0.5)
+        XCTAssertEqual(summary.accessibilityFrame.height, actual.height, accuracy: 0.5)
+    }
+
     func testPinchPreservesUIKitPageCoordinatesThroughWindowLayout() throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let size = CGSize(width: 1376, height: 1032)

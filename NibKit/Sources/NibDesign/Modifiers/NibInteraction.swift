@@ -180,9 +180,10 @@ private struct NibNativeActionModifier: ViewModifier {
     let action: () -> Void
     @Environment(\.isEnabled) private var isEnabled
     func body(content: Content) -> some View {
-        // Behind the SwiftUI label: native input must never replace the visual
-        // content in snapshots, glass flattening, or accessibility previews.
-        content.background {
+        // Give native input sole ownership of touch without putting a UIKit
+        // overlay over artwork (which obscures it in SwiftUI/glass snapshots).
+        // Accessibility and keyboard actions remain on the original control.
+        content.allowsHitTesting(false).background {
             NibActionTouchTarget(isEnabled: isEnabled, action: action)
                 .accessibilityHidden(true)
         }

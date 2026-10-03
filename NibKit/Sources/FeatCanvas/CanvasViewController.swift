@@ -1292,9 +1292,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// (`comment.tapAt`); a link is followed (`link.follow`). A board lists the items near the window.
     private func accessibilityElements(for pageView: PageTileView) -> [Any] {
         guard let id = pageView.pageID, let record = shown[id] else { return [] }
-        let summary = UIAccessibilityElement(accessibilityContainer: pageView)
+        let summary = CanvasPageElement(accessibilityContainer: pageView)
         summary.accessibilityLabel = accessibilityName(record)
-        summary.accessibilityFrameInContainerSpace = record.size == nil ? visiblePageArea(id).cg : pageView.bounds
+        summary.localFrame = record.size == nil ? visiblePageArea(id).cg : pageView.bounds
         summary.accessibilityCustomActions = pageActions()
         var out: [Any] = [summary]
         guard let items = try? app.workspace.items(documentID, page: id) else { return out }
@@ -2018,8 +2018,20 @@ final class PageErrorView: UIView {
 
 // MARK: - Item accessibility
 
-/// A VoiceOver element for something on a page, positioned in the page view's (page point) coordinates, so it follows
-/// scrolling and zoom. Activating it runs the same command a finger would.
+/// Page elements are cached, but their screen geometry is not. Chrome docking,
+/// scrolling and zooming all move the paper without changing its local bounds.
+final class CanvasPageElement: UIAccessibilityElement {
+    var localFrame: CGRect = .zero
+    override var accessibilityFrame: CGRect {
+        get {
+            guard let page = accessibilityContainer as? UIView, let window = page.window else { return .zero }
+            return window.convert(page.convert(localFrame, to: window), to: window.screen.coordinateSpace)
+        }
+        set { super.accessibilityFrame = newValue }
+    }
+}
+
+/// A VoiceOver element for a page item. Activating it runs the same command a finger would.
 final class CanvasItemElement: UIAccessibilityElement {
     var onActivate: (() -> Void)?
 

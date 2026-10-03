@@ -1044,6 +1044,7 @@ final class FeatKeyboardTests: XCTestCase {
 
     func testCanvasHardwareInputSessionAndShiftedPlusRetainNavigationChords() {
         let responder = CanvasKeyboardResponder()
+        XCTAssertFalse((responder as UIResponder) is UIKeyInput, "Navigation must not establish a text-input session")
         XCTAssertFalse(responder.hasText)
         XCTAssertNotNil(responder.inputView)
         XCTAssertEqual(responder.inputView?.bounds.height, 0)

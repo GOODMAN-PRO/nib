@@ -409,6 +409,7 @@ public struct NibSheetHeader: View {
                 .buttonStyle(.plain)
                 .frame(minHeight: NibMetrics.hitTarget)
                 .keyboardShortcut(.cancelAction)
+                .nibNativeAction(onCancel)
             Text(title)
                 .font(NibFont.title3)
                 .foregroundStyle(NibColor.label)
@@ -419,6 +420,7 @@ public struct NibSheetHeader: View {
             if let primaryTitle {
                 NibButton(primaryTitle, kind: .primary, size: .compact, shortcut: .defaultAction, action: onPrimary)
                     .nibCommand(primaryCommand)
+                    .nibNativeAction(onPrimary)
                     .disabled(!isPrimaryEnabled)
             }
         }
