@@ -77,7 +77,7 @@ public struct NibPopoverPanel<Content: View>: View {
 
 /// SwiftUI can keep a hidden popover's native scroll view above neighbouring controls.
 /// Disable that UIKit hit target as well as the droplet's SwiftUI gestures, retaining its closing animation.
-private struct PopoverScrollInteraction: UIViewRepresentable {
+struct PopoverScrollInteraction: UIViewRepresentable {
     let isPresented: Bool
     func makeUIView(context: Context) -> Probe {
         let view = Probe()
@@ -88,17 +88,66 @@ private struct PopoverScrollInteraction: UIViewRepresentable {
         view.isPresented = isPresented
         view.updateScrollView()
     }
+    static func dismantleUIView(_ view: Probe, coordinator: ()) {
+        view.retire()
+    }
     final class Probe: UIView {
+        private static let owners = NSMapTable<UIScrollView, Probe>.weakToWeakObjects()
         var isPresented = true
+        private var retired = false
+        private weak var scrollHost: UIScrollView?
+        private var hideAfterFade: DispatchWorkItem?
         override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
         override func layoutSubviews() { super.layoutSubviews(); updateScrollView() }
         override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+        func retire() {
+            // Removing a floating entry can detach the probe before its closing
+            // task fires. Retire the native container while we still own it;
+            // SwiftUI may retain it for a transition after the content is gone.
+            retired = true
+            isPresented = false
+            hideAfterFade?.cancel()
+            hideAfterFade = nil
+            guard let scrollHost, Self.owners.object(forKey: scrollHost) === self else { return }
+            scrollHost.endEditing(true)
+            scrollHost.isUserInteractionEnabled = false
+            scrollHost.accessibilityElementsHidden = true
+            scrollHost.isHidden = true
+        }
         func updateScrollView() {
+            guard !retired else { return }
             var ancestor = superview
             while let view = ancestor {
                 if let scroll = view as? UIScrollView {
+                    if scrollHost !== scroll {
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scrollHost = scroll
+                    }
+                    Self.owners.setObject(self, forKey: scroll)
+                    // A retained closing popover must also release its text
+                    // responder, so subsequent hardware keys reach the editor.
+                    if !isPresented { scroll.endEditing(true) }
                     scroll.isUserInteractionEnabled = isPresented
                     scroll.accessibilityElementsHidden = !isPresented
+                    if isPresented {
+                        hideAfterFade?.cancel()
+                        hideAfterFade = nil
+                        scroll.isHidden = false
+                    } else if !scroll.isHidden, hideAfterFade == nil {
+                        // accessibilityElementsHidden hides children, but UIKit can
+                        // still expose the scroll container itself after the bud's
+                        // transform collapses its frame. Retain the view/offset and
+                        // the 120 ms closing fade (DESIGN §10.6), then hide it natively.
+                        let work = DispatchWorkItem { [weak self, weak scroll] in
+                            guard let self, let scroll, !self.isPresented,
+                                  Self.owners.object(forKey: scroll) === self else { return }
+                            scroll.isHidden = true
+                            self.hideAfterFade = nil
+                        }
+                        hideAfterFade = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+                    }
                     return
                 }
                 ancestor = view.superview

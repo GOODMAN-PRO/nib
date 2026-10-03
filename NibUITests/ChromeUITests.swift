@@ -60,9 +60,11 @@ final class ChromeUITests: XCTestCase {
     }
 
     /// Scroll the containing sheet/popover, never the document, to reach offscreen controls.
-    private func reachable(_ name: String) throws -> XCUIElement {
-        let q = query(name)
-        if !q.firstMatch.exists { ui.revealFormElement(q.firstMatch) }
+    private func reachable(_ name: String, editing: Bool = false) throws -> XCUIElement {
+        let q = editing ? query(name).matching(NSPredicate(format: "elementType IN %@",
+            [XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.secureTextField.rawValue,
+             XCUIElement.ElementType.textView.rawValue])) : query(name)
+        if !q.firstMatch.exists { revealNativeFormRow(q.firstMatch, name: name) }
         _ = try require(name)
         for _ in 0..<12 {
             let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
@@ -80,10 +82,62 @@ final class ChromeUITests: XCTestCase {
         throw NibUI.Failure.message("Chrome control is not actionable: \(name)\n\(ui.app.debugDescription)")
     }
 
+    /// DESIGN §14.3 uses a native, virtualized list. A row above the viewport
+    /// need not exist in its accessibility tree; search both ways without
+    /// scrolling the document or assuming every saved row remains mounted.
+    private func revealNativeFormRow(_ target: XCUIElement, name: String) {
+        let forms = ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
+        guard let list = forms.last(where: { $0.isHittable }) else { return }
+        let savedLayoutRow = name == "Save Current Layout" || name.hasPrefix("Apply ") || name == "Reset Toolbar"
+        for towardTop in savedLayoutRow ? [false, true] : [true, false] {
+            for _ in 0..<10 {
+                if target.exists { return }
+                let first = list.staticTexts.firstMatch
+                let marker = first.label + String(describing: first.frame)
+                let obstructions = ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
+                    + ui.app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
+                guard let viewport = NibUITestScrollGeometry.viewport(
+                    scroll: list.frame, window: ui.app.frame, obstructions: obstructions) else { return }
+                let origin = ui.app.coordinate(withNormalizedOffset: .zero)
+                let appFrame = ui.app.frame
+                let x = viewport.minX + viewport.width * 0.8 - appFrame.minX
+                let startY = viewport.minY + viewport.height * (towardTop ? 0.12 : 0.88) - appFrame.minY
+                let endY = viewport.minY + viewport.height * (towardTop ? 0.88 : 0.12) - appFrame.minY
+                origin.withOffset(CGVector(dx: x, dy: startY)).press(forDuration: 0.01,
+                    thenDragTo: origin.withOffset(CGVector(dx: x, dy: endY)),
+                    withVelocity: .default, thenHoldForDuration: 0.15)
+                if target.exists { return }
+                if first.label + String(describing: first.frame) == marker { break }
+            }
+        }
+    }
+
     private func tap(_ name: String) throws { try reachable(name).tap() }
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = []) { ui.app.typeKey(value, modifierFlags: modifiers) }
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = []) {
+        // Exercise the specified physical chord. CI's one-shot typeKey can
+        // deliver a bare letter (Cmd-J arrived as HID 13 with both flags zero).
+        XCUIElement.perform(withKeyModifiers: modifiers) {
+            ui.app.typeKey(value, modifierFlags: modifiers)
+        }
+    }
     private func escape() { key(XCUIKeyboardKey.escape.rawValue) }
-    private func outside() { ui.coordinate(CGPoint(x: 0.83, y: 0.82)).tap() }
+    private func outside() {
+        // Popovers follow their dock. The former fixed right-hand point falls
+        // inside right-docked pen settings, so it never performed an outside tap.
+        let covered = ui.app.scrollViews.allElementsBoundByIndex
+            .filter { $0.identifier != "nib.canvas" && $0.isHittable }.map(\.frame)
+        let canvas = ui.canvas.frame
+        for point in [CGPoint(x: 0.5, y: 0.86), CGPoint(x: 0.5, y: 0.5),
+                      CGPoint(x: 0.12, y: 0.86), CGPoint(x: 0.88, y: 0.86)] {
+            let screen = CGPoint(x: canvas.minX + canvas.width * point.x,
+                                 y: canvas.minY + canvas.height * point.y)
+            if !covered.contains(where: { $0.insetBy(dx: -8, dy: -8).contains(screen) }) {
+                ui.coordinate(point).tap()
+                return
+            }
+        }
+        XCTFail("No document point outside the presented popover")
+    }
     private func open(_ title: String? = nil) throws {
         try ui.openDocument(title ?? notebook)
         XCTAssertTrue(ui.canvas.waitForExistence(timeout: 15))
@@ -119,9 +173,20 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 12) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && $0.undoAvailable }
     }
     private func replace(_ name: String, _ text: String) throws {
-        let target = try reachable(name)
-        target.tap()
-        key("a", .command)
+        let alertField = ui.app.alerts.textFields.matching(NSPredicate(
+            format: "label == %@ OR placeholderValue == %@", name, name)).firstMatch
+        // An alert focuses its first field even when the floating number pad
+        // obscures its activation point. Other forms must target the editor,
+        // never a neighbouring static label with the same accessible name.
+        let target = try alertField.exists ? alertField : reachable(name, editing: true)
+        if target.isHittable { target.tap() }
+        // The field owns editing, including inside native alerts. Targeting
+        // the app can make XCTest dismiss that alert as an interruption.
+        if let value = target.value as? String, !value.isEmpty, value != target.placeholderValue {
+            XCUIElement.perform(withKeyModifiers: .command) {
+                target.typeKey("a", modifierFlags: .command)
+            }
+        }
         target.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
     }
     private func toggle(_ name: String, to on: Bool) throws {
@@ -215,7 +280,11 @@ final class ChromeUITests: XCTestCase {
         try menu("share", "Export all…")
         _ = try ui.waitForState { !$0.openPanels.isEmpty }
         _ = try require("PDF")
-        try ui.dismissSheets(); try sameContent(before)
+        // DESIGN §14.7 uses an export popover on iPad, with its own close control.
+        if query("Close export options").firstMatch.exists { try tap("Close export options") }
+        else { try ui.dismissSheets() }
+        _ = try ui.waitForState { $0.openPanels.isEmpty }
+        try sameContent(before)
     }
 
     func testMenusOutsideDismissWithoutInkOrHistoryChanges() throws {
@@ -260,7 +329,10 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try ui.tapCommand("sidebar.toggle")
         for (title, id) in [("Pages", "sidebar.pages"), ("Outline", "outline.tab"), ("Bookmarks", "outline.bookmarks"), ("History", "undo.history")] {
-            try tap("Panel Options"); try tap(title); try panel(id)
+            // DESIGN §14.4 places the three navigator tabs in the header;
+            // Panel Options contains additional registered panels.
+            if id == "undo.history" { try tap("Panel Options") }
+            try tap(title); try panel(id)
             _ = try require(title)
         }
         try tap("cmd.panel.close")
@@ -328,7 +400,11 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.drawShape")
         _ = try ui.waitForState { $0.tool == "drawShape" }
-        try draw()
+        // F030 AutoShape replaces a recognised line with a shape on lift.
+        // It must create undoable content, not retain the transient ink stroke.
+        try ui.drawStroke([CGPoint(x: 0.4, y: 0.65), CGPoint(x: 0.6, y: 0.68)])
+        _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.undoAvailable }
+        XCTAssertEqual(try ui.state().strokeCountOnPage, before.strokeCountOnPage)
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage && $0.strokeCountOnPage == before.strokeCountOnPage }
     }
@@ -431,7 +507,13 @@ final class ChromeUITests: XCTestCase {
     func testMoreImageOpensSourcePickerAndCancelDoesNotInsert() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.image"); ui.coordinate(CGPoint(x: 0.5, y: 0.65)).tap(); try tap("Files")
-        _ = try require("Browse"); try tap("Cancel"); try sameContent(before)
+        // The native iPad Files picker has a locations sidebar rather than the
+        // compact Browse tab. Both are the specified system document picker.
+        let locations = ui.app.cells["DOC.sidebar.item.On My iPad"]
+        try wait("Files must present its native document picker") {
+            locations.exists || self.query("Browse").firstMatch.exists
+        }
+        try tap("Cancel"); try sameContent(before)
     }
 
     func testMoreElementsOpensRegisteredPanel() throws {
@@ -606,7 +688,12 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize()
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
-        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen"))
+        // Native reordering uses the row's insertion boundary. Keep the drag
+        // in the handle column, above Pen's centre, rather than dropping on Hide.
+        let pen = try reachable("Hide Fountain Pen").frame
+        let start = handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        start.press(forDuration: 0.5, thenDragTo: start.withOffset(
+            CGVector(dx: 0, dy: pen.minY - handle.frame.midY)))
         try wait("Reordering must move Highlighter above Pen") {
             self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }

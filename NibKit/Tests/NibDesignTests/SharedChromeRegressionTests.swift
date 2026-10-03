@@ -8,6 +8,96 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testClosingRetainedPopoverReleasesItsTextResponder() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 600))
+        let root = UIViewController()
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        let scroll = UIScrollView(frame: root.view.bounds)
+        root.view.addSubview(scroll)
+        let field = UITextField(frame: CGRect(x: 20, y: 20, width: 200, height: 44))
+        let probe = PopoverScrollInteraction.Probe()
+        scroll.addSubview(field)
+        scroll.addSubview(probe)
+        probe.updateScrollView()
+        XCTAssertTrue(field.becomeFirstResponder())
+        probe.isPresented = false
+        probe.updateScrollView()
+        XCTAssertFalse(field.isFirstResponder)
+        XCTAssertFalse(scroll.isUserInteractionEnabled)
+        XCTAssertTrue(scroll.accessibilityElementsHidden)
+    }
+
+    func testReducedMotionReleaseRestoresHitGeometryEvenWhenTheDockDoesNotChange() throws {
+        for liquidOff in [false, true] {
+            let field = DropletField()
+            field.reduceMotion = !liquidOff
+            field.mode = liquidOff ? .off : .full
+            field.updateBounds(CGSize(width: 1376, height: 1032))
+            defer { field.setActive(false) }
+            let home = CGRect(x: 16, y: 300, width: 56, height: 469)
+            field.setRest("palette", home, style: .palette)
+            _ = field.tick(1.0 / 60)
+            field.beginDrag("palette", at: CGPoint(x: 20, y: home.midY))
+            field.drag("palette", to: CGPoint(x: 680, y: 520))
+            XCTAssertNotEqual(field.visualFrame("palette"), home)
+            field.endDrag("palette", velocity: CGVector(dx: 300, dy: 0))
+            XCTAssertEqual(field.visualFrame("palette"), home)
+            XCTAssertEqual(field.node("palette").presentation.contentTransform, .identity)
+            // A later cross-fade to another axis must publish the new body and
+            // content together, without depending on a display-link frame.
+            let top = CGRect(x: 450, y: 100, width: 469, height: 56)
+            field.setRest("palette", top, style: .palette)
+            XCTAssertEqual(field.visualFrame("palette"), top)
+            XCTAssertEqual(field.node("palette").presentation.contentTransform, .identity)
+        }
+    }
+
+    func testNativePaletteRelayoutKeepsItsRestFrameAndTouchTargetsInsideEachDock() async throws {
+        let field = DropletField()
+        field.usesSystemGlass = true
+        field.reduceMotion = true
+        let size = CGSize(width: 1376, height: 1032)
+        field.updateBounds(size)
+        let tools = (0..<6).map { NibTool(id: "tool\($0)", label: "Tool \($0)", symbol: .pen, hasSettings: false) }
+        func palette(_ edge: NibDock) -> some View {
+            NibToolPalette(tools: tools, selection: .constant("tool1"), swatches: [], swatch: .constant(0),
+                           dock: .constant(NibPaletteDock(edge: edge, along: 0.5))) { _ in EmptyView() }
+                .environment(field)
+                .environment(\.horizontalSizeClass, .regular)
+                .coordinateSpace(NibLiquid.space)
+        }
+        let host = UIHostingController(rootView: palette(.leading))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { field.setActive(false); window.isHidden = true; window.rootViewController = nil }
+        func targets(_ view: UIView) -> [UIView] {
+            let own = (view.gestureRecognizers ?? []).contains { $0 is NibActionTapRecognizer } ? [view] : []
+            return own + view.subviews.flatMap(targets)
+        }
+        for edge in [NibDock.leading, .top, .trailing, .bottom, .leading] {
+            host.rootView = palette(edge)
+            for frame in 0..<100 {
+                host.view.layoutIfNeeded()
+                _ = field.tick(1.0 / 60, now: CACurrentMediaTime() + Double(frame) / 60)
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let rect = try XCTUnwrap(field.visualFrame("palette"))
+            XCTAssertTrue(window.bounds.insetBy(dx: -1, dy: -1).contains(rect), "\(edge): \(rect)")
+            XCTAssertEqual(min(rect.width, rect.height), NibMetrics.paletteThickness, accuracy: 1)
+            XCTAssertEqual(edge.isVertical, rect.height > rect.width)
+            let buttons = targets(host.view)
+            XCTAssertEqual(buttons.count, tools.count)
+            for button in buttons {
+                let frame = button.convert(button.bounds, to: host.view)
+                XCTAssertTrue(rect.insetBy(dx: -1, dy: -1).contains(frame), "\(edge): \(frame) outside \(rect)")
+            }
+        }
+    }
+
     func testNativePopoverActionRemainsHittableAndTracksDisabledStateAcrossRefresh() async throws {
         var count = 0
         func content(_ enabled: Bool) -> AnyView {

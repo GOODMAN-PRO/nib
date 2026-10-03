@@ -327,6 +327,9 @@ struct NavBarView: View {
     let compact: Bool
     let sidebarMode: SidebarMode
     @Binding var openMenu: ChromeMenu?
+    // Status providers read feature state outside NavBarItems. Carry its revision
+    // across this view boundary even when the list of registered items is unchanged.
+    var liveRevision = 0
 
     var body: some View {
         HStack(spacing: 0) {
@@ -410,9 +413,11 @@ struct NavBarView: View {
         switch item.action {
         case .library:
             NibToolbarItem(item.symbol, label: item.title) { chrome.goToLibrary() }
+                .nibNativeAction { chrome.goToLibrary() }
                 .accessibilityIdentifier("cmd.window.showLibrary")
         case .menu(let menu):
             NibToolbarItem(item.symbol, label: item.title, isOn: openMenu == menu) { toggle(menu) }
+                .nibNativeAction { toggle(menu) }
                 .nibBudAnchor(menu.anchor)
                 .accessibilityIdentifier("menu." + menu.rawValue)
         case .command(let command, let params):
@@ -487,7 +492,8 @@ struct NavBarHost: View {
         NavBarView(chrome: chrome, items: items, title: snapshot.title, kind: snapshot.kind,
                    subtitle: NavBarModel.subtitle(snapshot), readOnly: snapshot.readOnly,
                    titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
-                   compact: layout.isCompact, sidebarMode: sidebarMode, openMenu: $openMenu)
+                   compact: layout.isCompact, sidebarMode: sidebarMode, openMenu: $openMenu,
+                   liveRevision: live.tick)
             .frame(width: layout.bar.width, height: layout.bar.height)
             .position(x: layout.bar.midX, y: layout.bar.midY)
     }

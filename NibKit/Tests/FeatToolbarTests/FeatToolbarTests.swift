@@ -881,6 +881,27 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(palette.shown.first { $0.id == "pen" }?.accessibilityID, "tool.pen")
     }
 
+    func testNativePaletteMoveOffsetsIncludeTheFixedLassoPrefix() async throws {
+        let h = harness()
+        h.app.ui.toolbar.register(ToolbarItemDescriptor(
+            id: "highlighter.item", title: "Highlighter", icon: "highlighter", group: .tools, order: 15,
+            owner: TestToolsFeature.id, toolID: "highlighter"))
+        let model = ToolbarCustomizationModel(app: h.app)
+        XCTAssertEqual(model.fixed.map(\.id), ["lasso.item"])
+        XCTAssertEqual(model.shown.prefix(2).map(\.id), ["pen.item", "highlighter.item"])
+        model.movePaletteRows(from: IndexSet(integer: 2), to: 1)
+        try await waitUntil("native move persists above Pen") {
+            ToolbarStore.current(h.app.settings)?.order.prefix(3) == ["lasso.item", "highlighter.item", "pen.item"]
+        }
+        model.movePaletteRows(from: IndexSet(integer: 0), to: 3)
+        XCTAssertEqual(model.fixed.map(\.id), ["lasso.item"])
+        XCTAssertEqual(model.shown.prefix(2).map(\.id), ["highlighter.item", "pen.item"])
+        model.movePaletteRows(from: IndexSet(integer: 2), to: 0)
+        try await waitUntil("a drop over Lasso clamps to the first movable slot") {
+            ToolbarStore.current(h.app.settings)?.order.prefix(3) == ["lasso.item", "pen.item", "highlighter.item"]
+        }
+    }
+
     /// Plugins and the AI write the synced layout: over-long lists and ids are refused, never stored or truncated.
     func testLayoutListsAndIdsAreCapped() async throws {
         let h = harness()
