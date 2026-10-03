@@ -1,4 +1,5 @@
 import UIKit
+import PencilKit
 import NibContracts
 
 /// A transparent, non-interactive accessibility element. Its value is a live snapshot, evaluated on demand by
@@ -54,6 +55,7 @@ final class QAStateProbe: UIView {
                 "contentOffset": ["x": .number(Double(offset.x)), "y": .number(Double(offset.y))],
                 "itemCountOnPage": .number(Double(items.filter { !$0.deleted }.count)),
                 "strokeCountOnPage": .number(Double(items.filter { !$0.deleted && $0.kind == .stroke }.count)),
+                "inkInput": .array(canvas.map { inkInput(in: $0) } ?? []),
                 "selectionCount": .number(Double(session.selection.items.count)),
                 "clipboardChangeCount": clipboardProbe.changeCount.map { .number(Double($0)) } ?? .null,
                 "undoAvailable": .bool(UndoRoute.resolve(redo: false, doc: doc, history: app.bus.history, window: shell.view.window?.undoManager) != .nothing),
@@ -81,6 +83,23 @@ final class QAStateProbe: UIView {
             if let canvas = findCanvas(in: child) { return canvas }
         }
         return nil
+    }
+
+    /// Read-only native input diagnostics distinguish a missed gesture from a
+    /// committed stroke missing in the document model in failure attachments.
+    private func inkInput(in view: UIView) -> [JSONValue] {
+        if let ink = view as? PKCanvasView {
+            return [[
+                "enabled": .bool(ink.isUserInteractionEnabled),
+                "hidden": .bool(ink.isHidden),
+                "mounted": .bool(ink.window != nil),
+                "anyInput": .bool(ink.drawingPolicy == .anyInput),
+                "nativeStrokeCount": .number(Double(ink.drawing.strokes.count)),
+                "drawingEnabled": .bool(ink.drawingGestureRecognizer.isEnabled),
+                "drawingState": .number(Double(ink.drawingGestureRecognizer.state.rawValue))
+            ]]
+        }
+        return view.subviews.flatMap { inkInput(in: $0) }
     }
 }
 

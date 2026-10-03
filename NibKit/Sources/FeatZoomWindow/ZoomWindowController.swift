@@ -43,6 +43,7 @@ final class ZoomWindowController: ObservableObject {
     /// Bumped when the document head changes (the return height the options menu shows).
     @Published private(set) var pageRevision = 0
     @Published var optionsPresented = false
+    private(set) var optionsDismissal: Task<Void, Never>?
     static let optionsID = "zoomwindow.options"
     static let optionsAnchor = "zoomwindow.options.anchor"
 
@@ -535,19 +536,34 @@ final class ZoomWindowController: ObservableObject {
         if optionsPresented {
             dismissOptions()
         } else {
-            floating.present(Self.optionsID) { ZoomOptions(controller: self, state: state) }
+            optionsDismissal?.cancel()
+            optionsDismissal = nil
             optionsPresented = true
+            // A quick reopen during retraction needs a fresh native scroll host too.
+            floating.present(Self.optionsID) { ZoomOptions(controller: self, state: state).id(UUID()) }
         }
     }
 
-    /// Also used by the bud's Escape/outside-tap binding. Leave the view installed while it retracts;
-    /// the closed bud releases its modal hit region, and detach removes the floating entry.
-    func dismissOptions() { optionsPresented = false }
+    /// Release focus/input now, let the bud retract (DESIGN.md §10.6), then dispose of its native
+    /// scroll host. Retaining that closed host indefinitely leaves a scroll/accessibility target
+    /// above the options button and reuses hidden content on the next opening.
+    func dismissOptions() {
+        guard optionsPresented else { return }
+        optionsPresented = false
+        optionsDismissal?.cancel()
+        optionsDismissal = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(3 * NibMotion.retract.response)) }
+            catch { return }
+            guard !Task.isCancelled, let self, !self.optionsPresented else { return }
+            self.session.floatingHost?.dismiss(Self.optionsID)
+        }
+    }
 
-    /// Once the pane or its page goes away there is no anchor to retract into. Remove the native
-    /// popover too: retaining its scroll host over the toolbar can swallow the next opening tap.
+    /// No anchor remains when the pane/page goes away; remove its presentation immediately.
     private func removeOptions() {
-        dismissOptions()
+        optionsDismissal?.cancel()
+        optionsDismissal = nil
+        optionsPresented = false
         session.floatingHost?.dismiss(Self.optionsID)
     }
 
@@ -723,12 +739,17 @@ private struct ZoomOptionsKeyboard: UIViewRepresentable {
         view.onDismiss = dismiss
         view.setPresented(isPresented)
     }
+    static func dismantleUIView(_ view: ZoomOptionsKeyView, coordinator: ()) {
+        view.setPresented(false)
+        view.onDismiss = nil
+    }
 }
 
-final class ZoomOptionsKeyView: UIView {
+final class ZoomOptionsKeyView: UIControl {
     var onDismiss: (() -> Void)?
     private var presented = false
     private weak var previous: UIResponder?
+    private weak var focusWindow: UIWindow?
 
     init() {
         super.init(frame: .zero)
@@ -740,25 +761,25 @@ final class ZoomOptionsKeyView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if presented { takeFocus() }
+        if window == nil { setPresented(false) }
+        else if presented { takeFocus() }
     }
 
     func setPresented(_ value: Bool) {
         presented = value
         if value {
             takeFocus()
-        } else if isFirstResponder {
-            let target = previous
+        } else {
+            ZoomKeyboardRouting.restoreFocus(previous, from: self, in: focusWindow)
             previous = nil
-            resignFirstResponder()
-            let targetWindow = (target as? UIView)?.window ?? (target as? UIViewController)?.viewIfLoaded?.window
-            if let window, targetWindow === window { target?.becomeFirstResponder() }
+            focusWindow = nil
         }
     }
 
     private func takeFocus() {
         guard let window, window.isKeyWindow, !isFirstResponder else { return }
         previous = Self.firstResponder(in: window)
+        focusWindow = window
         becomeFirstResponder()
     }
 
@@ -791,7 +812,13 @@ final class ZoomOptionsKeyView: UIView {
 struct ZoomKeyboardShortcuts: View {
     let app: NibApp
     @ObservedObject var session: EditorSession
-    @State private var anchor = UIView()
+    @State private var anchor: ZoomKeyboardView
+
+    init(app: NibApp, session: EditorSession) {
+        self.app = app
+        self.session = session
+        _anchor = State(initialValue: ZoomKeyboardView(app: app, session: session))
+    }
 
     var body: some View {
         ZStack {
@@ -802,22 +829,147 @@ struct ZoomKeyboardShortcuts: View {
         }
         .background(ZoomKeyboardAnchor(view: anchor))
         .frame(width: 0, height: 0)
-        .opacity(0)
+        .clipped()
         .accessibilityHidden(true)
     }
 
     private func run(_ id: String) {
-        guard let window = anchor.window, window.isKeyWindow,
-              let invocation = ZoomKeyboardRouting.invocation(id, app: app, session: session,
-                  isEditingText: ZoomKeyboardRouting.textHasFocus(in: window)) else { return }
-        app.perform(invocation.command, invocation.params, session: session)
+        anchor.run(id)
     }
 }
 
 private struct ZoomKeyboardAnchor: UIViewRepresentable {
-    let view: UIView
-    func makeUIView(context: Context) -> UIView { view }
-    func updateUIView(_ uiView: UIView, context: Context) {}
+    let view: ZoomKeyboardView
+    func makeUIView(context: Context) -> ZoomKeyboardView { view }
+    func updateUIView(_ uiView: ZoomKeyboardView, context: Context) { uiView.scheduleFocus() }
+    static func dismantleUIView(_ view: ZoomKeyboardView, coordinator: ()) { view.restorePreviousFocus() }
+}
+
+/// A real target below SwiftUI's keyboard bridge. Invisible shortcut buttons advertise commands
+/// on the hosting controller, but can consume the key without invoking the action in an embedded
+/// document host. Keep that discoverability bridge and route dispatch at the native responder.
+/// Unrelated keys continue through the previous canvas responder, preserving its input handling.
+@MainActor
+final class ZoomKeyboardView: UIView {
+    let app: NibApp
+    let session: EditorSession
+    private weak var previous: UIResponder?
+    private weak var focusWindow: UIWindow?
+    private var scheduled = false
+    private var subscriptions: [AnyCancellable] = []
+
+    init(app: NibApp, session: EditorSession) {
+        self.app = app
+        self.session = session
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        accessibilityElementsHidden = true
+        for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
+                     UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
+                     UIResponder.keyboardDidHideNotification, .nibChromeNeedsUpdate] {
+            NotificationCenter.default.publisher(for: name).receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.scheduleFocus() }.store(in: &subscriptions)
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override var canBecomeFirstResponder: Bool { true }
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+    override var next: UIResponder? {
+        if isFirstResponder, let previous, Self.window(of: previous) === window { return previous }
+        return super.next
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { restorePreviousFocus() }
+        else { scheduleFocus() }
+    }
+
+    func scheduleFocus() {
+        guard !scheduled else { return }
+        scheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scheduled = false
+            self.takeFocus()
+        }
+    }
+
+    func takeFocus() {
+        guard let window, window.isKeyWindow, !isFirstResponder, !liveIDs.isEmpty,
+              let canvas = ZoomStore.resolve(app).state(for: session).pane?.host?.canvasView,
+              canvas.window === window else { return }
+        var ancestor: UIView? = canvas
+        while let view = ancestor {
+            guard !view.isHidden, view.alpha > 0 else { return }
+            ancestor = view.superview
+        }
+        let responder = ZoomKeyboardRouting.firstResponder(in: window)
+        if let responder {
+            guard !(responder is UIControl), !(responder is ZoomOptionsKeyView) else { return }
+            let view = (responder as? UIView) ?? (responder as? UIViewController)?.viewIfLoaded
+            guard let view, view.isDescendant(of: canvas) || canvas.isDescendant(of: view)
+                || view is PKCanvasView else { return }
+        }
+        previous = responder
+        focusWindow = window
+        becomeFirstResponder()
+    }
+
+    func restorePreviousFocus() {
+        ZoomKeyboardRouting.restoreFocus(previous, from: self, in: focusWindow)
+        previous = nil
+        focusWindow = nil
+    }
+
+    private static func window(of responder: UIResponder) -> UIWindow? {
+        (responder as? UIView)?.window ?? (responder as? UIViewController)?.viewIfLoaded?.window
+    }
+
+    private func invocation(_ id: String) -> Invocation? {
+        guard let window, window.isKeyWindow, !Self.hasModal(window.rootViewController),
+              ZoomStore.resolve(app).state(for: session).pane?.optionsPresented != true
+        else { return nil }
+        return ZoomKeyboardRouting.invocation(id, app: app, session: session,
+                                               isEditingText: ZoomKeyboardRouting.textHasFocus(in: window))
+    }
+
+    private static func hasModal(_ controller: UIViewController?) -> Bool {
+        guard let controller else { return false }
+        return controller.presentedViewController != nil || controller.children.contains(where: hasModal)
+    }
+
+    private var liveIDs: [String] {
+        [FeatZoomWindowFeature.toggleActionID, FeatZoomWindowFeature.newLineActionID].filter { invocation($0) != nil }
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        liveIDs.compactMap { id in
+            guard let descriptor = app.content.keyCommands.get(id) else { return nil }
+            let toggle = id == FeatZoomWindowFeature.toggleActionID
+            let command = UIKeyCommand(title: descriptor.title, action: #selector(runKey(_:)),
+                input: toggle ? "z" : "\r", modifierFlags: toggle ? [.command, .alternate] : [.alternate], propertyList: id)
+            command.wantsPriorityOverSystemBehavior = true
+            return command
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(runKey(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        guard let command = sender as? UIKeyCommand else { return !liveIDs.isEmpty }
+        guard let id = command.propertyList as? String else { return false }
+        return invocation(id) != nil
+    }
+
+    @objc private func runKey(_ command: UIKeyCommand) {
+        if let id = command.propertyList as? String { run(id) }
+    }
+
+    func run(_ id: String) {
+        guard let invocation = invocation(id) else { return }
+        app.perform(invocation.command, invocation.params, session: session)
+    }
 }
 
 @MainActor
@@ -836,13 +988,39 @@ enum ZoomKeyboardRouting {
         return Invocation(command: descriptor.command, params: descriptor.resolvedParams(for: session), session: session)
     }
 
-    static func textHasFocus(in view: UIView) -> Bool {
-        if view.isFirstResponder {
-            if let text = view as? UITextView { return text.isEditable }
-            if let field = view as? UITextField { return field.isEnabled }
-            return view is UIKeyInput
+    /// UIKit can resign a removed view before its window callbacks. Remember the source window
+    /// and restore after removal too, while leaving a newly focused editor/control alone.
+    static func restoreFocus(_ target: UIResponder?, from responder: UIResponder, in window: UIWindow?) {
+        guard let window, window.isKeyWindow else { return }
+        let ownedFocus = responder.isFirstResponder
+        if ownedFocus { responder.resignFirstResponder() }
+        guard let target else { return }
+        func view(of responder: UIResponder) -> UIView? {
+            (responder as? UIView) ?? (responder as? UIViewController)?.viewIfLoaded
         }
-        return view.subviews.contains { textHasFocus(in: $0) }
+        guard let targetView = view(of: target), targetView.window === window else { return }
+        if !ownedFocus, let current = firstResponder(in: window), current !== window {
+            guard current !== target else { return }
+            // An ancestor can become the default responder when its child is removed.
+            guard !(current is UIControl), !(current is UITextInput),
+                  let currentView = view(of: current), targetView.isDescendant(of: currentView) else { return }
+        }
+        target.becomeFirstResponder()
+    }
+
+    static func firstResponder(in view: UIView) -> UIResponder? {
+        if view.isFirstResponder { return view }
+        if let controller = view.next as? UIViewController, controller.isFirstResponder { return controller }
+        return view.subviews.lazy.compactMap { firstResponder(in: $0) }.first
+    }
+
+    static func textHasFocus(in view: UIView) -> Bool {
+        guard let responder = firstResponder(in: view) else { return false }
+        if let text = responder as? UITextView { return text.isEditable }
+        if let field = responder as? UITextField { return field.isEnabled }
+        // Hosting views may implement UIKeyInput solely to receive hardware keys. They are not
+        // text editors; only UITextInput (including custom editors) suppresses canvas shortcuts.
+        return responder is UITextInput
     }
 }
 

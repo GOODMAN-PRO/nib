@@ -135,6 +135,42 @@ final class FeatExportUITests: XCTestCase {
         }
     }
 
+    func testBoardOptionsPresentBeforeFloatingAnchorAttaches() async throws {
+        let (h, presenter, probe) = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let page = NodeRef.page(Fixtures.whiteboardID, Fixtures.boardID).description
+        _ = try await h.run(CommandIDs.exportPresent, [
+            "docs": [.string(NodeRef.document(Fixtures.whiteboardID).description)], "pages": [.string(page)]
+        ])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        let before = try h.app.workspace.peekContent(Fixtures.whiteboardID)
+        let depths = h.undoDepths()
+        let parent = UIViewController()
+        parent.view.frame = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        let host = AttachingExportHost()
+        let popover = SystemExportPresenter().showPopover(selection: selection, draft: draft,
+            printing: false, instant: false, app: h.app, session: h.session, host: host, parent: parent)
+
+        XCTAssertTrue(host.isPresenting("exportui.dialog"), "Anchor attachment must not prevent opening options")
+        XCTAssertNil(popover.sourceRect)
+        XCTAssertEqual(popover.source, "chrome.anchor.share")
+        XCTAssertEqual(popover.draft.selectedPages, [page])
+        XCTAssertEqual(popover.draft.scope, .selected)
+        let bounds = CGRect(x: 256, y: 32, width: 768, height: 736)
+        XCTAssertTrue(bounds.contains(ExportPopover.fallbackAnchor(in: bounds)))
+
+        host.convertedRect = CGRect(x: 920, y: 40, width: 44, height: 44)
+        XCTAssertEqual(popover.updateSourceRect(), host.convertedRect)
+        XCTAssertEqual(host.anchorID, ExportPresentation.anchorID)
+        host.dismiss("exportui.dialog")
+        XCTAssertFalse(host.isPresenting("exportui.dialog"))
+        XCTAssertTrue(probe.calls.isEmpty)
+        XCTAssertEqual(try h.app.workspace.peekContent(Fixtures.whiteboardID), before)
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
     func testDialogSubmissionsPreserveScopesAndOptions() async throws {
         let (h, presenter, probe) = harness()
         _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
@@ -488,6 +524,24 @@ final class FeatExportUITests: XCTestCase {
         for image in images.values { XCTAssertEqual(image.size.width, 390) }
 
     }
+}
+
+@MainActor
+private final class AttachingExportHost: FloatingHosting {
+    var convertedRect: CGRect?
+    var anchorID: String?
+    private var contents: [String: AnyView] = [:]
+    func present(_ id: String, content: AnyView) { contents[id] = content }
+    func dismiss(_ id: String) { contents[id] = nil }
+    func isPresenting(_ id: String) -> Bool { contents[id] != nil }
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { convertedRect }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
+        guard convertedRect != nil else { return false }
+        anchorID = id
+        return true
+    }
+    func removeAnchor(_ id: String) { if anchorID == id { anchorID = nil } }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
 }
 
 @MainActor

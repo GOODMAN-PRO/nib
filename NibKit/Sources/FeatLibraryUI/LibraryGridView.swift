@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import NibContracts
 import NibDesign
 
@@ -237,6 +238,7 @@ struct LibraryCell: View {
     let list: Bool
     @State private var subtitle: String?
     @State private var coverFrame: CGRect = .zero
+    @State private var isPressed = false
     private var reflow: NibReflow<String> { row.isFolder ? model.folderReflow : model.reflow }
     init(row: LibraryRow, model: LibraryViewModel, list: Bool) {
         self.row = row; self.model = model; self.cache = model.coverCache; self.list = list
@@ -283,6 +285,19 @@ struct LibraryCell: View {
         .accessibilityAddTraits(.isButton)
         .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
         .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
+        // One touch-up owner: the hosting/context-menu bridge can consume a
+        // SwiftUI Button's tap even though the card remains AX-hittable.
+        // The native overlay receives the touch; retain the Button underneath
+        // for accessibility and keyboard activation, as with LibraryNewButton.
+        .overlay {
+            LibraryItemTapTarget(action: {
+                guard !LibraryCarrierVisibility.hides(row.ref, in: reflow) else { return }
+                activate()
+            }, pressed: { isPressed = $0 })
+            .accessibilityHidden(true)
+        }
+        .scaleEffect(isPressed ? 0.96 : 1)
+        .animation(NibMotion.tap.animation, value: isPressed)
         .modifier(LibraryItemReflow(row: row, model: model))
         .contextMenu {
             LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
@@ -321,6 +336,47 @@ struct LibraryCell: View {
         .task(id: row.ref + String(row.modified ?? 0) + ":" + String(cache.revisions[row.nodeID] ?? 0) + ":" + String(isLocked)) {
             subtitle = cache.subtitle(row, app: model.app)
         }
+    }
+}
+
+/// A real touch surface, unlike the transparent reflow geometry probe. Scrolls
+/// and context menus may cancel it; the hosting bridge may not steal touch-down.
+struct LibraryItemTapTarget: UIViewRepresentable {
+    var action: () -> Void
+    var pressed: (Bool) -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        let tap = LibraryItemTapRecognizer(target: nil, action: nil)
+        tap.action = action
+        tap.pressed = pressed
+        tap.addTarget(tap, action: #selector(LibraryItemTapRecognizer.activate))
+        view.addGestureRecognizer(tap)
+        return view
+    }
+    func updateUIView(_ view: UIView, context: Context) {
+        guard let tap = view.gestureRecognizers?.first as? LibraryItemTapRecognizer else { return }
+        tap.action = action
+        tap.pressed = pressed
+    }
+}
+
+final class LibraryItemTapRecognizer: UITapGestureRecognizer {
+    var action: () -> Void = {}
+    var pressed: (Bool) -> Void = { _ in }
+    @objc func activate() { action() }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        pressed(true)
+    }
+    override func reset() {
+        super.reset()
+        pressed(false)
+    }
+    override func canBePrevented(by other: UIGestureRecognizer) -> Bool {
+        if state == .possible, !(other is UITapGestureRecognizer),
+           !(other is UIPanGestureRecognizer), !(other is UILongPressGestureRecognizer) { return false }
+        return super.canBePrevented(by: other)
     }
 }
 

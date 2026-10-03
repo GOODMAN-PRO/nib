@@ -278,21 +278,8 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
         let session = ctx.activeSession
         let isCompact = parent.traitCollection.horizontalSizeClass == .compact
         if !isCompact, let host = session?.floatingHost ?? ctx.navigator?.floatingHost {
-            let anchorID = ExportPresentation.anchorID
-            // The document chrome owns Share's real bud anchor. Library exports use the registered fallback.
-            let source = session?.document != nil ? "chrome.anchor.share" : anchorID
-            let rect = ExportPresentation.anchorRect(in: parent)
-            guard let sourceRect = host.containerRect(rect, from: parent.view),
-                  host.setAnchor(anchorID, rect: rect, in: parent.view) else { throw NibError.unavailable("the export anchor") }
-            host.present("exportui.dialog", content: AnyView(ExportPopover(selection: selection, draft: draft,
-                printing: printing, app: app, session: session, host: host,
-                source: source, sourceRect: sourceRect, updateSourceRect: { [weak parent, weak host] in
-                    guard let parent, let host else { return nil }
-                    let rect = ExportPresentation.anchorRect(in: parent)
-                    guard let converted = host.containerRect(rect, from: parent.view),
-                          host.setAnchor(anchorID, rect: rect, in: parent.view) else { return nil }
-                    return converted
-                }, instant: instant)))
+            showPopover(selection: selection, draft: draft, printing: printing, instant: instant,
+                        app: app, session: session, host: host, parent: parent)
         } else {
             let controller = UIHostingController(rootView: ExportSheet(selection: selection, draft: draft, printing: printing,
                                                                         app: app, session: session))
@@ -301,6 +288,27 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
             controller.sheetPresentationController?.prefersGrabberVisible = true
             parent.present(controller, animated: !instant && !UIAccessibility.isReduceMotionEnabled)
         }
+    }
+    /// Anchor conversion is optional until the floating layer is attached to the window.
+    /// Present first; the popover refreshes the anchor on appearance and geometry changes.
+    @discardableResult
+    func showPopover(selection: ExportSelection, draft: ExportDraft, printing: Bool, instant: Bool,
+                     app: NibApp, session: EditorSession?, host: FloatingHosting,
+                     parent: UIViewController) -> ExportPopover {
+        let anchorID = ExportPresentation.anchorID
+        let updateSourceRect: @MainActor () -> CGRect? = { [weak parent, weak host] in
+            guard let parent, let host else { return nil }
+            let rect = ExportPresentation.anchorRect(in: parent)
+            guard let converted = host.containerRect(rect, from: parent.view),
+                  host.setAnchor(anchorID, rect: rect, in: parent.view) else { return nil }
+            return converted
+        }
+        let popover = ExportPopover(selection: selection, draft: draft, printing: printing,
+            app: app, session: session, host: host,
+            source: session?.document != nil ? "chrome.anchor.share" : anchorID,
+            sourceRect: updateSourceRect(), updateSourceRect: updateSourceRect, instant: instant)
+        host.present("exportui.dialog", content: AnyView(popover))
+        return popover
     }
     func showLocked(doc: DocumentID, retry: String, params: JSONValue, ctx: CommandContext) async throws {
         guard let app = ctx.app else { throw NibError.unavailable("the app") }

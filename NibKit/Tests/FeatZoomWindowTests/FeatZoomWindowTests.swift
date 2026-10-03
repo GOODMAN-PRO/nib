@@ -2,6 +2,7 @@ import XCTest
 import UIKit
 import SwiftUI
 import PencilKit
+import Combine
 import NibContracts
 import NibTesting
 @testable import FeatZoomWindow
@@ -321,6 +322,139 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertNil(ZoomKeyboardRouting.invocation(toggle, app: h.app, session: h.session), "the chrome follows the live registry")
     }
 
+    func testNativeZoomShortcutsDispatchFromResponderChainAndPreserveCanvasFocus() async throws {
+        final class CanvasFocus: UIView {
+            override var canBecomeFirstResponder: Bool { true }
+        }
+        let h = harness()
+        registerRuled(h, returnHeight: 24.7)
+        let (host, overlay) = try await openWindow(h)
+        try await h.run("zoom.toggle", ["on": false])
+        overlay.controller.stateChanged()
+        let root = UIViewController()
+        let chrome = UIHostingController(rootView: ZoomKeyboardShortcuts(app: h.app, session: h.session)
+            .allowsHitTesting(false))
+        root.addChild(chrome)
+        root.view.addSubview(chrome.view)
+        chrome.didMove(toParent: root)
+        let canvas = CanvasFocus()
+        host.canvasView.addSubview(canvas)
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        chrome.view.frame = root.view.bounds
+        chrome.view.layoutIfNeeded()
+        func keyboardView(in view: UIView) -> ZoomKeyboardView? {
+            (view as? ZoomKeyboardView) ?? view.subviews.lazy.compactMap { keyboardView(in: $0) }.first
+        }
+        let keyboard = try XCTUnwrap(keyboardView(in: chrome.view))
+        defer {
+            keyboard.restorePreviousFocus()
+            overlay.detach(from: host)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        XCTAssertTrue(canvas.becomeFirstResponder())
+        keyboard.takeFocus()
+        XCTAssertTrue(keyboard.isFirstResponder)
+        XCTAssertTrue(keyboard.next === canvas, "other canvas shortcuts keep their native responder chain")
+        let depth = h.undoDepth(Fixtures.docID)
+
+        func send(_ id: String) async throws {
+            let key = try XCTUnwrap(keyboard.keyCommands?.first { $0.propertyList as? String == id })
+            let action = try XCTUnwrap(key.action)
+            XCTAssertTrue(key.wantsPriorityOverSystemBehavior)
+            XCTAssertTrue(keyboard.canPerformAction(action, withSender: nil), "UIKit's target discovery has no sender")
+            let changed = expectation(description: id)
+            let subscription = state(h).objectWillChange.sink { changed.fulfill() }
+            // These package tests are hostless: UIApplication has no scene from which to
+            // route a nil-target action. Resolve the same chain from the window's responder.
+            let focused = try XCTUnwrap(ZoomKeyboardRouting.firstResponder(in: window))
+            XCTAssertTrue(focused === keyboard)
+            let target = try XCTUnwrap(focused.target(forAction: action, withSender: key) as? UIResponder)
+            XCTAssertTrue(target === keyboard, "dispatch must reach the native target below the hosting boundary")
+            _ = target.perform(action, with: key)
+            await fulfillment(of: [changed], timeout: 3)
+            subscription.cancel()
+        }
+
+        try await send(FeatZoomWindowFeature.toggleActionID)
+        XCTAssertTrue(state(h).isOn, "the shortcut opens a closed pane")
+        let before = state(h).rect
+        overlay.controller.newLine()
+        await overlay.controller.pending?.value
+        let button = state(h).rect
+        try await send(FeatZoomWindowFeature.newLineActionID)
+        XCTAssertEqual(state(h).rect.y - button.y, button.y - before.y, accuracy: 1e-9)
+        XCTAssertEqual(state(h).rect.y - button.y, 24.7, accuracy: 1e-9, "one key runs exactly one New Line")
+        XCTAssertEqual(state(h).rect.x, button.x)
+        try await send(FeatZoomWindowFeature.toggleActionID)
+        XCTAssertFalse(state(h).isOn)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        keyboard.removeFromSuperview()
+        XCTAssertTrue(canvas.isFirstResponder, "removing the chrome restores its canvas target")
+    }
+
+    func testNativeZoomShortcutsDoNotTakeTextOrOptionsFocus() async throws {
+        let h = harness()
+        let (host, overlay) = try await openWindow(h)
+        let root = UIViewController()
+        root.view.addSubview(host.canvasView)
+        let keyboard = ZoomKeyboardView(app: h.app, session: h.session)
+        root.view.addSubview(keyboard)
+        let field = UITextField(frame: CGRect(x: 0, y: 0, width: 100, height: 44))
+        // Hardware focus is under test; a hostless runner must not start the system's
+        // software keyboard/dictation UI (ARCHITECTURE §15.10).
+        field.inputView = UIView()
+        host.canvasView.addSubview(field)
+        let options = ZoomOptionsKeyView()
+        root.view.addSubview(options)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { overlay.detach(from: host); window.isHidden = true; window.rootViewController = nil }
+        XCTAssertTrue(field.becomeFirstResponder())
+        keyboard.takeFocus()
+        XCTAssertTrue(field.isFirstResponder)
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
+        options.setPresented(true)
+        keyboard.takeFocus()
+        XCTAssertTrue(options.isFirstResponder, "the open options own Escape")
+        options.removeFromSuperview()
+        XCTAssertTrue(field.isFirstResponder, "unmount restores focus before the old window is lost")
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
+
+        root.view.addSubview(options)
+        options.setPresented(true)
+        let otherField = UITextField(frame: CGRect(x: 0, y: 50, width: 100, height: 44))
+        otherField.inputView = UIView()
+        root.view.addSubview(otherField)
+        XCTAssertTrue(otherField.becomeFirstResponder())
+        options.removeFromSuperview()
+        XCTAssertTrue(otherField.isFirstResponder, "cleanup must not steal focus from a newly selected editor")
+    }
+
+    func testHardwareKeyInputWithoutATextEditorDoesNotSuppressZoom() {
+        final class HardwareKeys: UIView, UIKeyInput {
+            private let hardwareInput = UIView()
+            override var inputView: UIView? { hardwareInput }
+            override var canBecomeFirstResponder: Bool { true }
+            var hasText: Bool { false }
+            func insertText(_ text: String) {}
+            func deleteBackward() {}
+        }
+        let root = UIViewController()
+        let keys = HardwareKeys()
+        root.view.addSubview(keys)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        XCTAssertTrue(keys.becomeFirstResponder())
+        XCTAssertFalse(ZoomKeyboardRouting.textHasFocus(in: window), "UIKeyInput alone is not an editable text field")
+    }
+
     private final class OptionsHost: FloatingHosting {
         var views: [String: AnyView] = [:]
         func present(_ id: String, content: AnyView) { views[id] = content }
@@ -380,6 +514,9 @@ final class FeatZoomWindowTests: XCTestCase {
         // The same dismissal used by Escape and the outside-tap binding.
         c.dismissOptions()
         XCTAssertFalse(c.optionsPresented)
+        await c.optionsDismissal?.value
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID),
+                       "Escape/outside taps must release the native scroll host after retraction")
         XCTAssertTrue(c.isActive)
         c.newLine()
         await c.pending?.value
@@ -428,6 +565,53 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
     }
 
+    func testAutoAdvanceOptionsReleaseTheirHostAndReopenAfterWriting() async throws {
+        let h = harness()
+        let floating = OptionsHost()
+        h.session.floatingHost = floating
+        let (host, overlay) = try await openWindow(h)
+        defer { overlay.detach(from: host) }
+        let c = overlay.controller
+        for on in [false, true] {
+            c.toggleOptions()
+            XCTAssertTrue(c.optionsPresented)
+            XCTAssertTrue(floating.isPresenting(ZoomWindowController.optionsID))
+            c.chooseOption { c.setAutoAdvance(on) }
+            XCTAssertFalse(c.optionsPresented)
+            await c.optionsDismissal?.value
+            XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID),
+                           "selecting the toggle must dispose of the old native menu after retraction")
+            await c.pending?.value
+            XCTAssertEqual(h.app.settings.get(NibSettings.zoomAutoAdvance), on)
+            c.strokeFinished(stroke(120, 230))
+            await c.pending?.value
+        }
+        XCTAssertEqual(host.committed.count, 2)
+        c.toggleOptions()
+        XCTAssertTrue(c.optionsPresented)
+        XCTAssertTrue(floating.isPresenting(ZoomWindowController.optionsID))
+    }
+
+    func testReopeningDuringRetractionCancelsOldOptionsCleanup() async throws {
+        let h = harness()
+        let floating = OptionsHost()
+        h.session.floatingHost = floating
+        let (host, overlay) = try await openWindow(h)
+        defer { overlay.detach(from: host) }
+        let c = overlay.controller
+        c.toggleOptions()
+        c.dismissOptions()
+        let oldCleanup = c.optionsDismissal
+        c.toggleOptions()
+        await oldCleanup?.value
+        XCTAssertTrue(c.optionsPresented)
+        XCTAssertTrue(floating.isPresenting(ZoomWindowController.optionsID),
+                      "a cancelled retraction must never remove the newly opened options")
+        c.dismissOptions()
+        await c.optionsDismissal?.value
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
+    }
+
     func testOptionsPresetsDismissAndKeepReturnHeightOnItsPage() async throws {
         let h = harness()
         registerRuled(h, returnHeight: 24.7)
@@ -438,12 +622,16 @@ final class FeatZoomWindowTests: XCTestCase {
         c.toggleOptions()
         c.chooseOption { c.setReturnHeight(state(h).rect.height) }
         XCTAssertFalse(c.optionsPresented)
+        await c.optionsDismissal?.value
+        XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
         await c.pending?.value
         XCTAssertEqual(c.returnHeight, 50)
         for delta in [2.0, -2.0] {
             c.toggleOptions()
             c.chooseOption { c.adjustReturnHeight(by: delta) }
             XCTAssertFalse(c.optionsPresented)
+            await c.optionsDismissal?.value
+            XCTAssertFalse(floating.isPresenting(ZoomWindowController.optionsID))
             await c.pending?.value
             XCTAssertEqual(c.returnHeight, delta > 0 ? 52 : 50)
         }

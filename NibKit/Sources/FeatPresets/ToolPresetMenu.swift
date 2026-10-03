@@ -456,20 +456,32 @@ struct ToolPresetMenu: View {
     }
 
     private func swatchStrip(arranging: Bool) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(Array(presets.swatches.enumerated()), id: \.offset) { i, swatch in
-                        swatchSlot(i, swatch, arranging: arranging).id(i)
+        Group {
+            if CGFloat(presets.swatches.count) * NibMetrics.paletteSwatchPitch <= stripWidth(presets.swatches.count) {
+                // The usual three colours fit. A nested scroll view here delays delivery
+                // of the touch to UIButton's long-press recogniser for no scrolling benefit.
+                swatchCells(arranging: arranging)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        swatchCells(arranging: arranging)
                     }
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                    .onAppear { proxy.scrollTo(presets.selectedSwatch, anchor: .center) }
+                    // Keys 1-9/0, the AI or another window can select a slot scrolled out of view.
+                    .onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }
                 }
             }
-            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-            .onAppear { proxy.scrollTo(presets.selectedSwatch, anchor: .center) }
-            // Keys 1-9/0, the AI or another window can select a slot scrolled out of view.
-            .onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }
         }
         .frame(width: stripWidth(presets.swatches.count), height: NibMetrics.hitTarget)
+    }
+
+    private func swatchCells(arranging: Bool) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(presets.swatches.enumerated()), id: \.offset) { i, swatch in
+                swatchSlot(i, swatch, arranging: arranging).id(i)
+            }
+        }
     }
 
     @ViewBuilder
@@ -678,16 +690,41 @@ struct PresetSwatchControl: UIViewRepresentable {
 
 final class PresetSwatchNativeButton: UIButton {
     private var tap: (() -> Void)?
+    private var menuOwnsInteraction = false
 
     init() {
         super.init(frame: .zero)
         showsMenuAsPrimaryAction = false
         isPointerInteractionEnabled = true
-        addTarget(self, action: #selector(activate), for: .touchUpInside)
+        // UIButton can forward touchUpInside to its primary action even after a menu
+        // long press. Keep that release from toggling the editor behind the menu.
+        addAction(UIAction { [weak self] _ in self?.menuOwnsInteraction = true }, for: .menuActionTriggered)
+        addAction(UIAction { [weak self] _ in
+            guard let self, !self.menuOwnsInteraction else { return }
+            self.tap?()
+        }, for: .primaryActionTriggered)
         accessibilityIdentifier = "cmd.preset.select"
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        menuOwnsInteraction = false
+        return super.beginTracking(touch, with: event)
+    }
+
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willEndFor configuration: UIContextMenuConfiguration,
+                                         animator: UIContextMenuInteractionAnimating?) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        let finished: () -> Void = { [weak self] in self?.menuOwnsInteraction = false }
+        if let animator {
+            animator.addCompletion(finished)
+        } else {
+            // With no animation, the release can still be delivered in this event turn.
+            DispatchQueue.main.async(execute: finished)
+        }
+    }
 
     func configure(swatch: NibSwatch, isSelected: Bool, menu: UIMenu, action: @escaping () -> Void) {
         tap = action
@@ -697,8 +734,6 @@ final class PresetSwatchNativeButton: UIButton {
         accessibilityLabel = swatch.pattern?.name.map { "\(swatch.name), \($0)" } ?? swatch.name
         accessibilityTraits = isSelected ? [.button, .selected] : [.button]
     }
-
-    @objc private func activate() { tap?() }
 }
 
 @MainActor

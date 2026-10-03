@@ -394,11 +394,18 @@ final class FeatPresetsTests: XCTestCase {
         let slots = buttons(host.view)
         XCTAssertEqual(slots.count, model.presets.swatches.count)
         let selected = try XCTUnwrap(slots.first(where: \.isSelected))
+        var ancestor = selected.superview
+        while let view = ancestor {
+            XCTAssertFalse(view is UIScrollView, "colours that fit must not delay the long press in a nested scroll view")
+            ancestor = view.superview
+        }
         XCTAssertTrue(selected.isContextMenuInteractionEnabled, "UIKit must own the long press on the swatch itself")
         XCTAssertFalse(selected.showsMenuAsPrimaryAction, "a short tap keeps the existing select/edit behaviour")
         let interaction = try XCTUnwrap(selected.contextMenuInteraction)
-        XCTAssertNotNil(selected.contextMenuInteraction(interaction, configurationForMenuAtLocation:
+        let configuration = try XCTUnwrap(selected.contextMenuInteraction(interaction, configurationForMenuAtLocation:
             CGPoint(x: selected.bounds.midX, y: selected.bounds.midY)))
+        selected.sendActions(for: .menuActionTriggered)
+        selected.sendActions(for: .touchUpInside)
         XCTAssertNil(model.popover, "requesting the long-press menu must not run the tap action")
         XCTAssertEqual(selected.accessibilityLabel, PresetColour.name(model.presets.color))
         XCTAssertTrue(selected.accessibilityTraits.contains(.selected))
@@ -406,10 +413,16 @@ final class FeatPresetsTests: XCTestCase {
             .first { $0.title == "Change Colour" })
         selected.sendAction(change)
         XCTAssertEqual(model.popover, .colour(.slot(0)), "the menu edits the held slot")
+        selected.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil)
+        selected.sendActions(for: .touchUpInside)
+        XCTAssertEqual(model.popover, .colour(.slot(0)), "the menu's final release must not toggle the editor closed")
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
         model.close()
-        selected.sendActions(for: .touchUpInside)
+        selected.sendActions(for: .primaryActionTriggered)
         XCTAssertEqual(model.popover, .colour(.slot(0)), "a short tap still opens the selected slot")
-        selected.sendActions(for: .touchUpInside)
+        selected.sendActions(for: .primaryActionTriggered)
         XCTAssertNil(model.popover, "and another short tap closes it")
     }
 
@@ -860,6 +873,27 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertEqual(presets(h, "pen").color, custom)
     }
 
+    func testCustomPickerUsesNativeControllerAndFullSizePresentation() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.open(.colour(.slot(0)))
+        model.openPicker()
+        let picker = try XCTUnwrap(navigator.presented.last as? UIColorPickerViewController)
+        // ARCHITECTURE §15: this target runs without UIApplication. Verify the native
+        // controller and presentation contract here; InkUITests exercises its actual
+        // Grid/Spectrum/Sliders interface in the app, including valid and invalid HEX.
+        XCTAssertEqual(ObjectIdentifier(type(of: picker)), ObjectIdentifier(type(of: UIColorPickerViewController())),
+                       "retain the delegate without substituting a feature subclass for UIKit's picker")
+        XCTAssertEqual(picker.modalPresentationStyle, .formSheet)
+        let sheet = try XCTUnwrap(picker.sheetPresentationController)
+        XCTAssertEqual(sheet.detents.map(\.identifier), [.medium, .large])
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .large)
+        XCTAssertTrue(picker.presentationController?.delegate === picker.delegate)
+        XCTAssertEqual(navigator.presented.count, 1)
+    }
+
     func testPickerCloseAndSwipeCommitOnlyOnce() {
         let picker = UIColorPickerViewController()
         let presentation = UIPresentationController(presentedViewController: picker, presenting: nil)
@@ -878,6 +912,22 @@ final class FeatPresetsTests: XCTestCase {
         closed.colorPickerViewControllerDidFinish(picker)
         closed.presentationControllerDidDismiss(presentation)
         XCTAssertEqual(picks, [vermilion, vermilion], "Close followed by presentation dismissal also commits once")
+    }
+
+    func testNativePickerOwnsItsDelegateOnlyForItsLifetime() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let navigator = PresetTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        weak var delegate: SystemColourPicker?
+        try autoreleasepool {
+            SystemColourPicker.present(title: "Pen Colour", initial: .black, supportsAlpha: true,
+                                       commitsOnFinishOnly: false, app: h.app, session: h.session) { _ in }
+            let picker = try XCTUnwrap(navigator.presented.last as? UIColorPickerViewController)
+            delegate = try XCTUnwrap(picker.delegate as? SystemColourPicker)
+            navigator.presented.removeAll()
+            XCTAssertNotNil(delegate, "the native picker must retain its otherwise weak delegate")
+        }
+        XCTAssertNil(delegate, "releasing the picker must release its window-specific coordinator")
     }
 
     /// A slot commits every settled choice; a new slot commits once, when the picker closes; an unchanged colour never.

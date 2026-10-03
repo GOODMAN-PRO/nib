@@ -526,20 +526,28 @@ final class CanvasUITests: XCTestCase {
         _ = try ui.waitForState { abs($0.zoom - 1.25) < 0.001 }
         try tap("Zoom Out")
         _ = try ui.waitForState { abs($0.zoom - 1) < 0.001 }
+        // F044's limits disable the visible minimap buttons. The app also exposes
+        // zero-size keyboard-command elements with the same labels; those do not
+        // represent the controls whose enabled state this test is verifying.
+        let controls = try require("Board zoom")
+        let zoomIn = controls.buttons.matching(NSPredicate(format: "label == %@", "Zoom In")).firstMatch
+        let zoomOut = controls.buttons.matching(NSPredicate(format: "label == %@", "Zoom Out")).firstMatch
+        XCTAssertTrue(zoomIn.exists)
+        XCTAssertTrue(zoomOut.exists)
         for _ in 0..<12 {
-            if !element("Zoom In").isEnabled { break }
+            if !zoomIn.isEnabled { break }
             try tap("Zoom In")
             bounded(try ui.state(), board: true)
         }
         XCTAssertEqual(try ui.state().zoom, 4, accuracy: 0.001)
-        XCTAssertFalse(element("Zoom In").isEnabled)
+        XCTAssertFalse(zoomIn.isEnabled)
         for _ in 0..<16 {
-            if !element("Zoom Out").isEnabled { break }
+            if !zoomOut.isEnabled { break }
             try tap("Zoom Out")
             bounded(try ui.state(), board: true)
         }
         XCTAssertEqual(try ui.state().zoom, 0.05, accuracy: 0.001)
-        XCTAssertFalse(element("Zoom Out").isEnabled)
+        XCTAssertFalse(zoomOut.isEnabled)
         try tap("Fit All Content")
         let fit = try ui.waitForState { $0.zoom > 0.05 }
         bounded(fit, board: true)

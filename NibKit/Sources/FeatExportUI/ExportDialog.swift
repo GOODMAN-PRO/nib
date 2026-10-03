@@ -478,7 +478,7 @@ struct ExportPopover: View {
     let host: FloatingHosting
     let source: String
     /// The registered source rect, in the floating container's coordinate space.
-    let sourceRect: CGRect
+    let sourceRect: CGRect?
     let updateSourceRect: @MainActor () -> CGRect?
     let instant: Bool
     @State private var presented = true
@@ -492,7 +492,9 @@ struct ExportPopover: View {
                 .onTapGesture { close() }.accessibilityHidden(true)
             GeometryReader { geometry in
                 let bounds = geometry.frame(in: NibLiquid.space)
-                let anchor = currentSourceRect ?? sourceRect
+                // The floating layer may attach after the command runs. Keep the options
+                // visible while its UIKit reference view becomes available.
+                let anchor = currentSourceRect ?? sourceRect ?? ExportPopover.fallbackAnchor(in: bounds)
                 let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
                 // NibBudPopover's .below rule: retain the source gap and clamp only horizontally.
                 let inset = bounds.insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
@@ -508,12 +510,18 @@ struct ExportPopover: View {
                     .onGeometryChange(for: CGRect.self) { _ in bounds } action: { _ in
                         currentSourceRect = updateSourceRect()
                     }
+                    .onAppear { currentSourceRect = updateSourceRect() }
             }
         }
         .onChange(of: presented) { _, value in
             // Buds also close through Escape and VoiceOver, so release the outside-touch shield.
             if !value { close() }
         }
+    }
+    static func fallbackAnchor(in bounds: CGRect) -> CGRect {
+        CGRect(x: bounds.maxX - NibMetrics.chromeInset - NibMetrics.hitTarget,
+               y: bounds.minY + NibMetrics.barTopGap,
+               width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
     }
     private var title: String { printing ? String(localized: "Print") : String(localized: "Share & Export") }
     @ViewBuilder private var contents: some View {

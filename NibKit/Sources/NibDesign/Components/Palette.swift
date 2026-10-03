@@ -496,9 +496,13 @@ public struct NibToolPalette<Settings: View>: View {
                 if let tool = a.natives.first(where: { $0.id == selection }) ?? a.plugins.first(where: { $0.id == selection }),
                    tool.hasSettings, let along = map[tool.id] {
                     popover(for: tool, anchor: slotAt(along), placement: placement(d), bounds: bounds)
+                        // The options strip overlaps the top of a side-docked settings panel.
+                        // Keep the open modal above that strip and the retained closed menus.
+                        .zIndex(settingsOpen ? 1 : 0)
                 }
                 if a.hasMore, let along = map[Self.moreID] {
                     moreGrid(a.more, anchor: slotAt(along), placement: placement(d), bounds: bounds)
+                        .zIndex(moreOpen ? 1 : 0)
                 }
                 if let opts = resolvedOptions(selection), let along = map[selection] {
                     // Share the palette's safe horizontal region, including a reserved trailing panel.
@@ -516,6 +520,7 @@ public struct NibToolPalette<Settings: View>: View {
                                       title: pop.title, subtitle: pop.subtitle, width: popoverWidth(bounds),
                                       placement: placement(d)) { pop.content }
                             .offset(x: -origin.x, y: -origin.y)
+                            .zIndex(pop.isPresented.wrappedValue ? 1 : 0)
                     }
                 }
             }

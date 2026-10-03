@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import ImageIO
+import ObjectiveC
 import NibContracts
 import NibDesign
 
@@ -257,6 +258,7 @@ enum TapePatternCache {
 /// the chosen colour. A slot changes with every settled choice; a new slot is added once, when the picker closes.
 @MainActor
 final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
+    private static var coordinatorKey: UInt8 = 0
     private let commitsOnFinishOnly: Bool
     private let onPick: @MainActor (RGBA) -> Void
     private var latest: RGBA?
@@ -272,7 +274,9 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
 
     static func present(title: String, initial: RGBA, supportsAlpha: Bool, commitsOnFinishOnly: Bool, app: NibApp,
                         session: EditorSession, onPick: @escaping @MainActor (RGBA) -> Void) {
-        let picker = PresetColourPickerController()
+        // Keep UIKit's concrete picker and its native presentation/remote-view setup.
+        // Subclassing just to retain a delegate changes the controller UIKit presents.
+        let picker = UIColorPickerViewController()
         picker.title = title
         picker.supportsAlpha = supportsAlpha
         picker.selectedColor = PresetColour.uiColor(initial)
@@ -280,7 +284,7 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
         picker.delegate = coordinator
         // UIKit's delegate is weak. Its own controller, not a process-global slot, keeps
         // it alive so opening a picker in another window cannot detach this one.
-        picker.colourCoordinator = coordinator
+        objc_setAssociatedObject(picker, &coordinatorKey, coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         picker.modalPresentationStyle = .formSheet
         picker.presentationController?.delegate = coordinator
         if let sheet = picker.sheetPresentationController {
@@ -317,11 +321,6 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
         committed = c
         onPick(c)
     }
-}
-
-/// Owns the weak native delegates for exactly the lifetime of this window's picker.
-private final class PresetColourPickerController: UIColorPickerViewController {
-    var colourCoordinator: SystemColourPicker?
 }
 
 /// Presents system view controllers from the window the tool menu lives in (never another window's navigator: two

@@ -42,6 +42,9 @@ public struct NibPopoverPanel<Content: View>: View {
                 content
             }
             .padding(NibSpacing.l)
+            // Empty insets and gaps are part of the scrolling surface. Without a
+            // hit shape, a drag there can reach chrome or the outside-tap catcher.
+            .contentShape(Rectangle())
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
                 // A native viewport can round the same content to adjacent fractional
                 // heights. Feeding that noise into its own frame restarts layout forever.

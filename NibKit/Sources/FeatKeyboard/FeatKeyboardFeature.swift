@@ -209,14 +209,14 @@ final class LibraryCreationKeyboardResponder: UIView {
     }
 }
 
-/// SwiftUI's document chrome can consume hardware-key dispatch before it reaches the
-/// UIKit canvas responder. Install bindings in that hosting tree as well. Both routes
-/// use the registry's winner and resolve parameters only in the invoking scene.
+/// Keep native key dispatch inside the document's chrome hosting boundary. Invisible
+/// SwiftUI shortcut buttons can claim these chords without delivering their actions.
+/// Both native routes use the registry's winner and the invoking scene's live params.
 @MainActor
 enum CanvasChromeShortcuts {
     static let overlayID = "keyboard.canvasShortcuts"
     private static let catalogKeys = Set(GlobalShortcuts.catalog(app: nil, owner: FeatKeyboardFeature.id)
-        .filter { $0.docKinds == ShortcutContext.canvasKinds }
+        .filter { $0.docKinds == ShortcutContext.canvasKinds || $0.command == "ai.chat.open" }
         .map { ShortcutRules.normalized($0.shortcut) })
 
     static func register(_ app: NibApp, owner: String) {
@@ -274,28 +274,150 @@ enum CanvasChromeShortcuts {
     }
 }
 
-private struct CanvasChromeShortcutView: View {
+private struct CanvasChromeShortcutView: UIViewRepresentable {
     let context: ChromeContext
-    @State private var revision = 0
 
-    var body: some View {
-        let _ = revision
-        Group {
-            ForEach(CanvasChromeShortcuts.descriptors(in: context), id: \.id) { descriptor in
-                Button(descriptor.title) { CanvasChromeShortcuts.perform(descriptor.id, in: context) }
-                    .keyboardShortcut(CanvasChromeShortcuts.shortcut(descriptor.shortcut))
+    func makeUIView(context: Context) -> CanvasChromeKeyboardResponder {
+        CanvasChromeKeyboardResponder(context: self.context)
+    }
+
+    func updateUIView(_ view: CanvasChromeKeyboardResponder, context: Context) {
+        view.context = self.context
+        view.scheduleFocus()
+    }
+
+    static func dismantleUIView(_ view: CanvasChromeKeyboardResponder, coordinator: ()) {
+        view.context = nil
+        view.resignFirstResponder()
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: CanvasChromeKeyboardResponder,
+                     context: Context) -> CGSize? { .zero }
+}
+
+@MainActor
+final class CanvasChromeKeyboardResponder: UIView {
+    var context: ChromeContext?
+    private let observers = NotificationBag()
+    private var focusScheduled = false
+
+    init(context: ChromeContext) {
+        self.context = context
+        super.init(frame: .zero)
+        // Disabling interaction also discards hardware keys. Touches fall through
+        // via point(inside:with:), without disabling keyboard event delivery.
+        isUserInteractionEnabled = true
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+        for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
+                     UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
+                     UIResponder.keyboardDidHideNotification, .nibChromeNeedsUpdate, .nibRegistryDidChange] {
+            observers.add(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                KeyboardRuntime.onMain { self?.scheduleFocus() }
+            })
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override var canBecomeFirstResponder: Bool { true }
+    override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        scheduleFocus()
+    }
+
+    func scheduleFocus() {
+        guard context != nil, !focusScheduled else { return }
+        focusScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.focusScheduled = false
+            self.restoreFocus()
+        }
+    }
+
+    func restoreFocus() {
+        guard let context, let window, !isFirstResponder, !descriptors.isEmpty,
+              !context.session.isEditingText,
+              let root = context.navigator?.rootViewController?.viewIfLoaded else { return }
+        let current = CanvasKeyboardFocus.firstResponder(in: window)
+        // The canvas attachment already provides the same native keys. Do not compete
+        // with it; reclaim only non-text focus left in a sibling chrome/hosting view.
+        guard !(current is CanvasKeyboardResponder),
+              CanvasKeyboardFocus.mayReplace(current, canvas: root) else { return }
+        var ancestor: UIView? = self
+        while let view = ancestor {
+            guard !view.isHidden, view.alpha > 0 else { return }
+            ancestor = view.superview
+        }
+        becomeFirstResponder()
+    }
+
+    private var descriptors: [KeyCommandDescriptor] {
+        guard let context, let window, window.isKeyWindow,
+              context.navigator?.session === context.session,
+              context.navigator?.rootViewController?.viewIfLoaded?.window === window,
+              !CanvasKeyboardFocus.hasModal(window.rootViewController) else { return [] }
+        return CanvasChromeShortcuts.descriptors(in: context)
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        descriptors.map { descriptor in
+            let command = UIKeyCommand(title: descriptor.title, action: #selector(runChromeKey(_:)),
+                                       input: CanvasKeyboardResponder.input(descriptor.shortcut.key),
+                                       modifierFlags: CanvasKeyboardResponder.modifiers(descriptor.shortcut.modifiers),
+                                       propertyList: descriptor.id)
+            command.wantsPriorityOverSystemBehavior = true
+            return command.nibCommand(descriptor.command)
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(selectAll(_:)) { return selectAllDescriptor(sender) != nil }
+        guard action == #selector(runChromeKey(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        guard let key = sender as? UIKeyCommand else { return !descriptors.isEmpty }
+        return descriptors.contains { $0.id == key.propertyList as? String }
+    }
+
+    private func selectAllDescriptor(_ sender: Any?) -> KeyCommandDescriptor? {
+        guard let descriptor = descriptors.first(where: { $0.shortcut == KeyShortcut("a", .command) }) else { return nil }
+        if let key = sender as? UIKeyCommand {
+            if let id = key.propertyList as? String {
+                guard id == descriptor.id else { return nil }
+            } else {
+                guard key.input?.lowercased() == "a", key.modifierFlags == .command else { return nil }
             }
         }
-        .frame(width: 0, height: 0)
-        .clipped()
-        .accessibilityHidden(true)
-        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange,
-                                                        object: context.app.content.keyCommands)) { _ in revision += 1 }
-        .onReceive(NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate)) { _ in revision += 1 }
-        .onReceive(NotificationCenter.default.publisher(for: UITextField.textDidBeginEditingNotification)) { _ in revision += 1 }
-        .onReceive(NotificationCenter.default.publisher(for: UITextField.textDidEndEditingNotification)) { _ in revision += 1 }
-        .onReceive(NotificationCenter.default.publisher(for: UITextView.textDidBeginEditingNotification)) { _ in revision += 1 }
-        .onReceive(NotificationCenter.default.publisher(for: UITextView.textDidEndEditingNotification)) { _ in revision += 1 }
+        return descriptor
+    }
+
+    override func selectAll(_ sender: Any?) {
+        guard let context, let descriptor = selectAllDescriptor(sender) else { return }
+        CanvasChromeShortcuts.perform(descriptor.id, in: context)
+    }
+
+    @objc private func runChromeKey(_ key: UIKeyCommand) {
+        guard let context, let descriptor = descriptors.first(where: { $0.id == key.propertyList as? String }) else { return }
+        CanvasChromeShortcuts.perform(descriptor.id, in: context)
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key,
+                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard let context, let descriptor = descriptors.first(where: { $0.shortcut == shortcut }) else { return false }
+        CanvasChromeShortcuts.perform(descriptor.id, in: context)
+        return true
     }
 }
 

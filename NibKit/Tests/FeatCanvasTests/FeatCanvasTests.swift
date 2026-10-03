@@ -788,6 +788,70 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(h.session.zoom, initial * 1.5, accuracy: 0.001)
     }
 
+    func testWindowAttachedWetInkLeavesPinchToDocumentAcrossLayoutAndReopening() throws {
+        func canvases(_ view: UIView) -> [PKCanvasView] {
+            (view as? PKCanvasView).map { [$0] } ?? view.subviews.flatMap { canvases($0) }
+        }
+        for mode in [StylusMode.anyInput, .pencilOnly] {
+            let h = Harness(features: [FeatCanvasFeature.self, FeatCanvasInputFeature.self])
+            h.app.settings.set(NibSettings.stylusMode, mode)
+            let tool = NavigationInkTool()
+            h.app.ui.canvasTools.register(CanvasToolDescriptor(id: tool.id, title: "Ink", owner: "test", make: { tool }))
+            h.session.tool = tool.id
+            let vc = try makeCanvas(h, input: XCTUnwrap(CanvasInputHooks.install))
+            let window = UIWindow(frame: vc.view.frame)
+            window.rootViewController = vc
+            window.isHidden = false
+            vc.view.layoutIfNeeded()
+            defer { vc.closeCanvas(); window.isHidden = true }
+
+            for reopening in [false, true] {
+                if reopening {
+                    vc.closeCanvas()
+                    vc.viewWillAppear(false)
+                    vc.view.layoutIfNeeded()
+                }
+                for style in [InkStyle.defaultPen, .defaultHighlighter] {
+                    tool.style = style
+                    vc.host.syncActiveTool(force: true)
+                    vc.setZoom(1.5, anchor: nil, centreFit: false)
+                    vc.view.layoutIfNeeded()
+                    let pinch = try XCTUnwrap(vc.scrollView.pinchGestureRecognizer)
+                    XCTAssertTrue(pinch.isEnabled)
+                    XCTAssertTrue(vc.scrollView.panGestureRecognizer.isEnabled)
+                    let surfaces = canvases(vc.host.wetInkContainer)
+                    XCTAssertEqual(surfaces.count, 2)
+                    for ink in surfaces {
+                        XCTAssertNotNil(ink.window)
+                        ink.setNeedsLayout()
+                        ink.layoutIfNeeded()
+                        // Construction-only checks miss PencilKit restoring its own pinch on window entry/layout.
+                        XCTAssertFalse(try XCTUnwrap(ink.pinchGestureRecognizer).isEnabled,
+                                       "Window-attached wet ink must leave pinch zoom to the document")
+                        XCTAssertFalse(ink.panGestureRecognizer.isEnabled)
+                        XCTAssertTrue(ink.drawingGestureRecognizer.isEnabled)
+                        XCTAssertEqual(Double(ink.zoomScale), vc.zoom, accuracy: 0.001,
+                                       "Disabling navigation must preserve programmatic wet-ink scaling")
+                        XCTAssertTrue(pinch.delegate?.gestureRecognizer?(pinch,
+                            shouldRecognizeSimultaneouslyWith: ink.drawingGestureRecognizer) == true)
+                        for other in [ink.drawingGestureRecognizer, ink.panGestureRecognizer,
+                                      ink.pinchGestureRecognizer].compactMap({ $0 }) {
+                            XCTAssertFalse(pinch.delegate?.gestureRecognizer?(pinch, shouldRequireFailureOf: other) ?? false)
+                            XCTAssertFalse(other.delegate?.gestureRecognizer?(other, shouldBeRequiredToFailBy: pinch) ?? false)
+                        }
+                        if ink.isUserInteractionEnabled {
+                            let point = CGPoint(x: ink.bounds.midX, y: ink.bounds.midY)
+                            let hit = try XCTUnwrap(ink.hitTest(point, with: nil))
+                            let contact = CanvasNavigationTouch(hitView: hit, point: ink.convert(point, to: hit))
+                            XCTAssertTrue(pinch.delegate?.gestureRecognizer?(pinch, shouldReceive: contact) ?? true,
+                                          "The document pinch must receive fingers on wet ink")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testOptionArrowResponderCommandsPanThisBoardAndYieldWhileEditing() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
@@ -2013,6 +2077,22 @@ final class FeatCanvasTests: XCTestCase {
     }
 }
 
+private final class CanvasNavigationTouch: UITouch {
+    let hitView: UIView
+    let point: CGPoint
+    init(hitView: UIView, point: CGPoint) {
+        self.hitView = hitView
+        self.point = point
+        super.init()
+    }
+    override var view: UIView? { hitView }
+    override var window: UIWindow? { hitView.window }
+    override var type: UITouch.TouchType { .direct }
+    override var phase: UITouch.Phase { .began }
+    override var majorRadius: CGFloat { 8 }
+    override func location(in view: UIView?) -> CGPoint { hitView.convert(point, to: view) }
+}
+
 // MARK: - Test doubles
 
 @MainActor
@@ -2055,7 +2135,8 @@ private final class NavigationInkTool: CanvasTool {
     var inputMode: CanvasInputMode { .pencilKit }
     var finished = 0
     var commits = false
-    func inkStyle(_ host: CanvasHost) -> InkStyle? { .defaultPen }
+    var style = InkStyle.defaultPen
+    func inkStyle(_ host: CanvasHost) -> InkStyle? { style }
     func strokeFinished(_ stroke: Stroke, page: PageID, host: CanvasHost) {
         finished += 1
         if commits { host.commitStroke(stroke, page: page) }

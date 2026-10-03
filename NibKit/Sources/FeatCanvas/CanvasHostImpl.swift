@@ -171,8 +171,9 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
         }
         expecting[page, default: 0] += 1
         let invocation = Invocation(command: CommandIDs.inkAddStrokes, params: params, principal: .user, session: session)
-        Task { @MainActor [weak self] in
-            guard let self = self else { return }
+        // Once accepted, ink belongs to the document, even if navigation tears down
+        // the editor before this task starts. Keep the hand-off alive through commit.
+        Task { @MainActor [self] in
             let outcome: Result<ElementID?, NibError>
             do {
                 let r = try await self.app.bus.execute(invocation)

@@ -258,7 +258,9 @@ final class CanvasKeyboardResponder: UIView {
 
     init() {
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        // UIView drops key events when interaction is disabled, even while it is
+        // first responder. Exclude this view from touch hit testing instead.
+        isUserInteractionEnabled = true
         isAccessibilityElement = false
         accessibilityElementsHidden = true
     }
@@ -267,6 +269,7 @@ final class CanvasKeyboardResponder: UIView {
 
     override var canBecomeFirstResponder: Bool { true }
     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
 
     func attach(to host: CanvasHost) {
         self.host = host
@@ -407,6 +410,27 @@ final class CanvasKeyboardResponder: UIView {
         run(descriptor)
     }
 
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandled = presses
+        for press in presses {
+            guard let key = press.key,
+                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+            unhandled.remove(press)
+        }
+        if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    /// UIKit delivers only presses that did not invoke a UIKeyCommand here. Handle them
+    /// before forwarding through a SwiftUI host, which may consume them before the shell.
+    @discardableResult
+    func performUnhandledPress(_ shortcut: KeyShortcut) -> Bool {
+        guard window?.isKeyWindow == true, !CanvasKeyboardFocus.hasModal(window?.rootViewController),
+              let descriptor = KeyCommandRouting.unhandledPress(shortcut, descriptors: descriptors,
+                                                                 in: context) else { return false }
+        run(descriptor)
+        return true
+    }
+
     private func run(_ descriptor: KeyCommandDescriptor) {
         guard let host else { return }
         if window?.isKeyWindow == true,
@@ -417,7 +441,7 @@ final class CanvasKeyboardResponder: UIView {
         host.app.perform(descriptor.command, descriptor.resolvedParams(for: host.session), session: host.session)
     }
 
-    private static func input(_ key: String) -> String {
+    static func input(_ key: String) -> String {
         switch key {
         case "up": return UIKeyCommand.inputUpArrow
         case "down": return UIKeyCommand.inputDownArrow
@@ -432,13 +456,47 @@ final class CanvasKeyboardResponder: UIView {
         }
     }
 
-    private static func modifiers(_ flags: KeyModifiers) -> UIKeyModifierFlags {
+    static func modifiers(_ flags: KeyModifiers) -> UIKeyModifierFlags {
         var result: UIKeyModifierFlags = []
         if flags.contains(.command) { result.insert(.command) }
         if flags.contains(.option) { result.insert(.alternate) }
         if flags.contains(.shift) { result.insert(.shift) }
         if flags.contains(.control) { result.insert(.control) }
         return result
+    }
+}
+
+/// A forwarded key can carry its chord on the event rather than the individual key.
+/// Preserve both, and use HID codes for navigation keys whose characters are private Unicode.
+@MainActor
+enum CanvasKeyPress {
+    static func shortcut(_ key: UIKey, event: UIPressesEvent?) -> KeyShortcut {
+        shortcut(code: key.keyCode, characters: key.charactersIgnoringModifiers,
+                 keyFlags: key.modifierFlags, eventFlags: event?.modifierFlags ?? [])
+    }
+
+    static func shortcut(code: UIKeyboardHIDUsage, characters: String,
+                         keyFlags: UIKeyModifierFlags, eventFlags: UIKeyModifierFlags) -> KeyShortcut {
+        let input: String
+        switch code {
+        case .keyboardReturnOrEnter, .keypadEnter: input = "return"
+        case .keyboardEscape: input = "escape"
+        case .keyboardTab: input = "tab"
+        case .keyboardDeleteOrBackspace: input = "delete"
+        case .keyboardUpArrow: input = "up"
+        case .keyboardDownArrow: input = "down"
+        case .keyboardLeftArrow: input = "left"
+        case .keyboardRightArrow: input = "right"
+        case .keyboardSpacebar: input = "space"
+        default: input = characters.lowercased()
+        }
+        let flags = keyFlags.union(eventFlags)
+        var modifiers: KeyModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.alternate) { modifiers.insert(.option) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        if flags.contains(.control) { modifiers.insert(.control) }
+        return KeyShortcut(input, modifiers)
     }
 }
 
@@ -466,9 +524,10 @@ enum CanvasKeyboardFocus {
         if let view = responder as? UIView {
             return !(view is UIControl) && (view.isDescendant(of: canvas) || canvas.isDescendant(of: view))
         }
-        // Only controllers containing this canvas; unrelated panels keep their own keyboard handling.
+        // Apply the same subtree rule to hosting controllers as to their views.
+        // Controllers in unrelated panels keep their own keyboard handling.
         guard let view = (responder as? UIViewController)?.viewIfLoaded else { return false }
-        return canvas.isDescendant(of: view)
+        return view.isDescendant(of: canvas) || canvas.isDescendant(of: view)
     }
 
     static func hasModal(_ controller: UIViewController?) -> Bool {

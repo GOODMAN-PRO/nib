@@ -26,6 +26,70 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testCardNativeTapDispatchesOnceAfterReattachmentInGridAndList() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        let row = try XCTUnwrap(model.documentRows.first)
+        var opened: [String] = []
+        var sessions: [NibID] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.docOpen, title: "Open",
+            summary: "Record card activation", effect: .session, target: .app)) { params, context in
+                opened.append(try XCTUnwrap(params["doc"]?.stringValue))
+                sessions.append(try XCTUnwrap(context.session?.id))
+                return [:]
+        }
+        let host = UIHostingController(rootView: LibraryCell(row: row, model: model, list: false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        for list in [false, true, false] {
+            window.rootViewController = nil
+            host.rootView = LibraryCell(row: row, model: model, list: list)
+            window.rootViewController = host
+            host.view.frame = window.bounds
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(100))
+            let taps = descendants(host.view).flatMap { $0.gestureRecognizers ?? [] }
+                .compactMap { $0 as? LibraryItemTapRecognizer }
+            XCTAssertEqual(taps.count, 1, "Each card must have exactly one touch-up owner")
+            let tap = try XCTUnwrap(taps.first), target = try XCTUnwrap(tap.view)
+            let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: host.view)
+            XCTAssertTrue(host.view.hitTest(point, with: nil) === target)
+            XCTAssertFalse(tap.canBePrevented(by: UIGestureRecognizer()),
+                           "A touch-down hosting bridge must not consume the opening tap")
+            XCTAssertTrue(tap.canBePrevented(by: UIPanGestureRecognizer()), "Swiping must scroll without opening")
+            XCTAssertTrue(tap.canBePrevented(by: UILongPressGestureRecognizer()), "Holding must show the menu without opening")
+
+            let count = opened.count
+            // Invoke the actual registered target/action callback. Assigning a
+            // terminal recognizer state cannot synthesise a UIKit touch sequence.
+            tap.activate()
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(opened.count, count + 1)
+            XCTAssertEqual(opened.last, row.ref)
+            XCTAssertEqual(sessions.last, h.session.id)
+
+            model.selection.isSelecting = true
+            tap.activate()
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(opened.count, count + 1, "Selecting a card must not open it")
+            XCTAssertTrue(model.selection.refs.contains(row.ref))
+            model.selection = LibrarySelection()
+
+            model.reflow.layout = NibReflowLayout(columns: 3, cell: NibMetrics.coverSize)
+            model.reflow.begin(row.ref, order: model.documentRefs, at: .zero)
+            XCTAssertTrue(model.reflow.isCarried(row.ref))
+            tap.activate()
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(opened.count, count + 1, "Finishing a reorder must not also open the carried card")
+            model.reflow.cancel()
+            // This isolated cell has no floating carrier to finish its landing.
+            model.reflow.landed()
+            XCTAssertFalse(model.reflow.isCarried(row.ref))
+        }
+    }
+
     func testNewButtonTapPairSurvivesHostingBridgeAndReattachment() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         let host = UIHostingController(rootView: LibraryNewButton(model: model, compact: false))

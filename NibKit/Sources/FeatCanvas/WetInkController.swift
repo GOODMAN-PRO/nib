@@ -162,6 +162,18 @@ private final class InputInkCanvas: PKCanvasView {
     // stroke once; native drawing/retirement must not add a second step to the window.
     override var undoManager: UndoManager? { nil }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        pinchGestureRecognizer?.isEnabled = false
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // PencilKit can recreate/re-enable its scroll gestures when attached or
+        // laid out. This surface only captures ink; its parent owns navigation.
+        if pinchGestureRecognizer?.isEnabled == true { pinchGestureRecognizer?.isEnabled = false }
+    }
+
     var acceptsContact: ((CGPoint, UIEvent?) -> Bool)?
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard acceptsContact?(point, event) != false else { return nil }

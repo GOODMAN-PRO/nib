@@ -53,6 +53,17 @@ private final class TestControl: UIControl {}
 /// A feature's own text field subclass: it keeps its I-beam pointer.
 private final class TestField: UITextField {}
 
+/// Non-text focus left in a sibling chrome host after a toolbar/layout transition.
+private final class TestChromeFocusView: UIView {
+    override var canBecomeFirstResponder: Bool { true }
+}
+
+private struct TestChromeFocusContent: UIViewRepresentable {
+    let view: TestChromeFocusView
+    func makeUIView(context: Context) -> TestChromeFocusView { view }
+    func updateUIView(_ uiView: TestChromeFocusView, context: Context) {}
+}
+
 /// Stands in for the object menu feature's own right-click menu on the canvas.
 @MainActor
 private final class MenuDelegate: NSObject, UIContextMenuInteractionDelegate {
@@ -1078,7 +1089,11 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertTrue(h.app.ui.activeNavigator === root)
         XCTAssertTrue(h.app.services.sessions.active === h.session)
         XCTAssertEqual(attachment.keyboard.editingInteractionConfiguration, .none)
-        XCTAssertFalse(attachment.keyboard.isUserInteractionEnabled)
+        // F073 requires hardware keys to reach the canvas. UIView's disabled
+        // interaction state drops keys as well as touches; use hit testing instead.
+        XCTAssertTrue(attachment.keyboard.isUserInteractionEnabled)
+        attachment.keyboard.bounds.size = CGSize(width: 100, height: 100)
+        XCTAssertNil(attachment.keyboard.hitTest(CGPoint(x: 50, y: 50), with: nil))
         XCTAssertTrue(attachment.keyboard.accessibilityElementsHidden)
 
         let button = UIButton()
@@ -1150,6 +1165,203 @@ final class FeatKeyboardTests: XCTestCase {
                        [["page": .string(NodeRef.page(Fixtures.whiteboardID, Fixtures.boardID).description)]])
         XCTAssertTrue(ShortcutRules.conflicts(in: h.app.content.keyCommands.all).isEmpty)
         withExtendedLifetime(editor) {}
+    }
+
+    func testHostedCanvasChromeInstallsNativeTargetAndRoutesFrameworkSelectionAndNavigation() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let editor = FakeEditor(host)
+        h.session.editor = editor
+        let root = KeyboardWindowController(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: root, kind: .notebook)
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get(CanvasChromeShortcuts.overlayID))
+        let chrome = UIHostingController(rootView: overlay.makeView(context))
+        root.addChild(chrome)
+        root.view.addSubview(chrome.view)
+        chrome.view.frame = root.view.bounds
+        chrome.didMove(toParent: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        chrome.view.layoutIfNeeded()
+        func nativeResponder(in view: UIView) -> CanvasChromeKeyboardResponder? {
+            if let responder = view as? CanvasChromeKeyboardResponder { return responder }
+            return view.subviews.lazy.compactMap { nativeResponder(in: $0) }.first
+        }
+        let keyboard = try XCTUnwrap(nativeResponder(in: chrome.view),
+                                    "The real overlay must install a native responder, not hidden SwiftUI buttons")
+        keyboard.restoreFocus()
+        XCTAssertTrue(keyboard.isFirstResponder)
+        XCTAssertTrue(keyboard.isUserInteractionEnabled)
+        keyboard.bounds.size = CGSize(width: 100, height: 100)
+        XCTAssertNil(keyboard.hitTest(CGPoint(x: 50, y: 50), with: nil))
+        XCTAssertEqual(keyboard.editingInteractionConfiguration, .none)
+
+        var go = descriptor("pages.goToPage", "g", [.command, .option], scope: .document,
+                            kinds: [.notebook, .whiteboard], owner: "pages", command: "panel.open")
+        go.params = ["id": "pages.goToPage"]
+        h.app.content.keyCommands.register(go)
+        let recorder = stand(in: h, for: ["selection.selectAll", "item.delete", "view.zoom", "panel.open", "view.scrollBy"])
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+
+        func send(_ input: String, _ flags: UIKeyModifierFlags, command id: String) async throws {
+            h.app.services.sessions.activate(other)
+            let key = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == input && $0.modifierFlags == flags })
+            let action = try XCTUnwrap(key.action)
+            let focused = try XCTUnwrap(CanvasKeyboardFocus.firstResponder(in: window))
+            let target = try XCTUnwrap(focused.target(forAction: action, withSender: nil) as? UIResponder)
+            XCTAssertTrue(target === keyboard)
+            XCTAssertTrue(target.canPerformAction(action, withSender: key))
+            let ran = expectation(description: id)
+            recorder.onCall = { if $0 == id { ran.fulfill() } }
+            _ = target.perform(action, with: key)
+            await fulfillment(of: [ran], timeout: 3)
+            recorder.onCall = nil
+            XCTAssertTrue(h.app.services.sessions.active === h.session)
+            XCTAssertTrue(h.app.ui.activeNavigator === root)
+        }
+
+        try await send("0", [.command, .alternate], command: "view.zoom")
+        XCTAssertEqual(recorder.params("view.zoom").last, ["actual": true])
+        // Try Again and rotation can retain non-ladder zooms. Read them at key delivery.
+        for (zoom, target) in [(1.2767101196, 1.5), (1.6798817363, 2.0)] {
+            host.zoomScale = zoom
+            try await send("=", .command, command: "view.zoom")
+            XCTAssertEqual(recorder.params("view.zoom").last, ["scale": .number(target)])
+        }
+        try await send("g", [.command, .alternate], command: "panel.open")
+        XCTAssertEqual(recorder.params("panel.open").last, go.params)
+
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        keyboard.context?.kind = .whiteboard
+        try await send("a", .command, command: "selection.selectAll")
+        XCTAssertEqual(recorder.params("selection.selectAll").last,
+                       ["page": .string(NodeRef.page(Fixtures.whiteboardID, Fixtures.boardID).description)])
+        let items = (0..<19).map { NibID("framework-\($0)") }
+        h.session.selection = Selection(doc: Fixtures.whiteboardID, page: Fixtures.boardID, items: items)
+        try await send(UIKeyCommand.inputDelete, [], command: "item.delete")
+        XCTAssertEqual(Set(recorder.params("item.delete").last?["refs"]?.arrayValue?.compactMap(\.stringValue) ?? []),
+                       Set(items.map { NodeRef.item(Fixtures.whiteboardID, Fixtures.boardID, $0).description }))
+
+        for (name, input, dx, dy) in [("up", UIKeyCommand.inputUpArrow, 0.0, -0.9),
+                                      ("down", UIKeyCommand.inputDownArrow, 0.0, 0.9),
+                                      ("left", UIKeyCommand.inputLeftArrow, -0.9, 0.0),
+                                      ("right", UIKeyCommand.inputRightArrow, 0.9, 0.0)] {
+            var pan = descriptor("canvas.pan." + name, name, .option, scope: .canvas,
+                                 kinds: [.notebook, .whiteboard], owner: "canvas", command: "view.scrollBy")
+            pan.params = ["dx": .number(dx), "dy": .number(dy), "unit": "window"]
+            h.app.content.keyCommands.register(pan)
+            try await send(input, .alternate, command: "view.scrollBy")
+            XCTAssertEqual(recorder.params("view.scrollBy").last, pan.params)
+        }
+        withExtendedLifetime(editor) {}
+    }
+
+    func testNativeChromeRecoversSiblingFocusAndRejectsTextModalStaleAndInactiveRoutes() async throws {
+        let h = await started()
+        let root = KeyboardWindowController(session: h.session)
+        let keyboard = CanvasChromeKeyboardResponder(context: ChromeContext(app: h.app, session: h.session,
+                                                                            navigator: root, kind: .notebook))
+        root.view.addSubview(keyboard)
+        let siblingFocus = TestChromeFocusView()
+        let sibling = UIHostingController(rootView: TestChromeFocusContent(view: siblingFocus))
+        root.addChild(sibling)
+        root.view.addSubview(sibling.view)
+        sibling.view.frame = root.view.bounds
+        sibling.didMove(toParent: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        sibling.view.layoutIfNeeded()
+        keyboard.restoreFocus()
+        XCTAssertTrue(keyboard.isFirstResponder)
+        // The old canvas attachment's policy excludes siblings. Chrome's root-scoped
+        // recovery must admit them after a toolbar interaction or layout transition.
+        XCTAssertTrue(CanvasKeyboardFocus.mayReplace(sibling, canvas: root.view))
+        XCTAssertFalse(CanvasKeyboardFocus.mayReplace(sibling, canvas: keyboard))
+        XCTAssertTrue(siblingFocus.becomeFirstResponder())
+        XCTAssertFalse(keyboard.isFirstResponder)
+        keyboard.restoreFocus()
+        XCTAssertTrue(keyboard.isFirstResponder, "Recover non-text focus from the sibling hosting subtree")
+        let old = try XCTUnwrap(keyboard.keyCommands?.first { $0.input == "0" && $0.modifierFlags == [.command, .alternate] })
+        var replacement = try key(h, "actualSize")
+        replacement.id = "plugin.actualSize"
+        replacement.docKinds = [.notebook]
+        h.app.content.keyCommands.register(replacement)
+        XCTAssertFalse(keyboard.canPerformAction(try XCTUnwrap(old.action), withSender: old))
+
+        let selectAll = #selector(UIResponderStandardEditActions.selectAll(_:))
+        XCTAssertTrue(keyboard.canPerformAction(selectAll, withSender: nil))
+        let field = UITextField(frame: CGRect(x: 0, y: 0, width: 200, height: 44))
+        root.view.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        keyboard.restoreFocus()
+        XCTAssertTrue(field.isFirstResponder)
+        XCTAssertFalse(keyboard.canPerformAction(selectAll, withSender: nil))
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("delete")))
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("a", .command)))
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        root.modal = UIViewController()
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("0", [.option, .command])))
+        root.modal = nil
+        keyboard.scheduleFocus()
+        let recovered = expectation(description: "Focus returns after panel dismissal/layout")
+        DispatchQueue.main.async { recovered.fulfill() }
+        await fulfillment(of: [recovered], timeout: 3)
+        XCTAssertTrue(keyboard.isFirstResponder)
+        let otherWindow = UIWindow(frame: window.bounds)
+        otherWindow.rootViewController = UIViewController()
+        otherWindow.makeKeyAndVisible()
+        defer { otherWindow.isHidden = true }
+        XCTAssertTrue(keyboard.keyCommands?.isEmpty == true)
+        XCTAssertFalse(keyboard.performUnhandledPress(KeyShortcut("=", .command)))
+        keyboard.context = nil
+        XCTAssertFalse(keyboard.canPerformAction(selectAll, withSender: nil))
+    }
+
+    func testUnhandledCanvasPressPreservesEventChordAndDispatchesOnceBeforeHostingBoundary() async throws {
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboard0, characters: "0", keyFlags: [],
+                                               eventFlags: [.command, .alternate]), KeyShortcut("0", [.command, .option]))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardG, characters: "G", keyFlags: .alternate,
+                                               eventFlags: .command), KeyShortcut("g", [.command, .option]))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardDownArrow, characters: "", keyFlags: [],
+                                               eventFlags: .alternate), KeyShortcut("down", .option))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardDeleteOrBackspace, characters: "\u{8}",
+                                               keyFlags: [], eventFlags: []), KeyShortcut("delete"))
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let root = KeyboardWindowController(session: h.session)
+        root.view.addSubview(host.canvasView)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let chrome = CanvasChromeKeyboardResponder(context: ChromeContext(app: h.app, session: h.session,
+                                                                          navigator: root, kind: .notebook))
+        root.view.addSubview(chrome)
+        let recorder = stand(in: h, for: ["view.zoom"])
+        for send in [attachment.keyboard.performUnhandledPress, chrome.performUnhandledPress] {
+            let count = recorder.calls.count
+            let ran = expectation(description: "Unhandled press dispatched")
+            recorder.onCall = { _ in ran.fulfill() }
+            XCTAssertTrue(send(KeyShortcut("0", [.command, .option])))
+            await fulfillment(of: [ran], timeout: 3)
+            XCTAssertEqual(recorder.calls.count, count + 1)
+            XCTAssertEqual(recorder.params("view.zoom").last, ["actual": true])
+            XCTAssertFalse(send(KeyShortcut("0")), "Do not mistake the chord for a colour key")
+            root.modal = UIViewController()
+            XCTAssertFalse(send(KeyShortcut("0", [.command, .option])))
+            root.modal = nil
+        }
     }
 
     func testCanvasChromeYieldsToTextModalAndRegistryChanges() async throws {
