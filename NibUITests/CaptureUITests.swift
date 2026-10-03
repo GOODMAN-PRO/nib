@@ -37,6 +37,10 @@ final class CaptureUITests: XCTestCase {
                 orientation = direction
                 ui = NibUI()
                 do {
+                    // On iPadOS 26 rotating a floating scene does not resize its
+                    // window. Use the public Settings mode before launching the
+                    // full-screen tour; windowed coverage is captured separately.
+                    try NibUIMultitasking.setWindowed(false)
                     // NibUI.launchFixture owns its launch arguments, so compose the same
                     // explicit fixture launch here and use its probe/navigation helpers.
                     ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
