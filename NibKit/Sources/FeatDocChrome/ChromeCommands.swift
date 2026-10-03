@@ -272,7 +272,9 @@ final class ChromeStateStore {
     /// Another feature wrote `session.openPanels`: open what it added (where the settings put it, when a document of
     /// a kind that takes it is showing), close what it removed, then write back what really is open.
     func adopt(_ session: EditorSession) {
-        guard let app, let state = windows[session.id] else { return }
+        // The retained document navigator is dormant while the library owns this
+        // session. Its panels must not erase the library's sheet/tab inventory.
+        guard session.document != nil, let app, let state = windows[session.id] else { return }
         let wanted = session.openPanels
         let current = Set(state.openPanels)
         guard wanted != current else { return }

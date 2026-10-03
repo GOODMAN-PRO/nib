@@ -12,6 +12,35 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(FeatDocChromeFeature.id, "chrome")
     }
 
+    func testLiveStatusProviderReevaluatesWhenItsVisibilityChanges() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        var visible = true
+        var evaluations: [Bool] = []
+        var status = ToolbarItemDescriptor(id: "test.liveStatus", title: "Live status", icon: "circle",
+                                          group: .navLeading, order: 40, owner: "tests", hideable: false)
+        status.navSlot = .afterTitle
+        status.compactStatus = { _ in
+            evaluations.append(visible)
+            return visible ? AnyView(Text("Live status")) : nil
+        }
+        h.app.ui.toolbar.register(status)
+        let navigator = TestNavigator(session: h.session)
+        let container = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.docID,
+                                                        app: h.app, navigator: navigator)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = container
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        container.view.layoutIfNeeded()
+        try await waitUntil { evaluations.last == true }
+        visible = false
+        h.app.ui.setNeedsChromeUpdate()
+        try await waitUntil { evaluations.last == false }
+        visible = true
+        h.app.ui.setNeedsChromeUpdate()
+        try await waitUntil { evaluations.last == true }
+    }
+
     func testSingleLineDocumentTitlesKeepAFullHeightTarget() throws {
         let chrome = try makeWindow(Harness(features: [FeatDocChromeFeature.self]))
         for kind in [DocumentKind.whiteboard, .textDocument] {
@@ -944,6 +973,25 @@ final class FeatDocChromeTests: XCTestCase {
     }
 
     // MARK: Commands
+
+    func testRetainedDocumentChromeDoesNotEraseLibraryPanelState() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let store = try XCTUnwrap(h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self))
+        let state = store.state(for: h.session)
+        state.open("test.pages", at: .left)
+        h.session.document = nil
+        h.session.openPanels = [PanelIDs.templates]
+        store.adopt(h.session)
+        XCTAssertEqual(h.session.openPanels, [PanelIDs.templates], "The visible library sheet owns session state")
+        XCTAssertEqual(state.openPanels, ["test.pages"], "The document navigator remains saved for reopening")
+        h.session.openPanels = [PanelIDs.trash]
+        store.adopt(h.session)
+        XCTAssertEqual(h.session.openPanels, [PanelIDs.trash])
+        h.session.openPanels = []
+        store.adopt(h.session)
+        XCTAssertTrue(h.session.openPanels.isEmpty)
+        XCTAssertEqual(state.openPanels, ["test.pages"])
+    }
 
     func testPanelCommandsPlacePanelsWhereTheSettingsSay() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
