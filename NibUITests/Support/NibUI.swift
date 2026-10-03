@@ -205,31 +205,51 @@ final class NibUI {
             app.descendants(matching: .any).matching(identifier: identifier).allElementsBoundByIndex
                 .first { $0.isHittable && $0.isEnabled }
         }
-        func revealInMenu() -> XCUIElement? {
+        func menuHost(containing control: XCUIElement? = nil) -> XCUIElement? {
+            (app.scrollViews.allElementsBoundByIndex + app.collectionViews.allElementsBoundByIndex)
+                .filter { scroll in
+                    guard scroll.identifier != "nib.canvas", scroll.isHittable else { return false }
+                    let matches = scroll.descendants(matching: .any).matching(identifier: id)
+                    if let control { return matches.allElementsBoundByIndex.contains { $0.frame == control.frame } }
+                    return matches.count > 0
+                }
+                .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        }
+        func revealInMenu() -> XCUICoordinate? {
             for _ in 0..<16 {
-                if let control = candidate(id) { return control }
+                let control = candidate(id)
+                let scroll = menuHost(containing: control)
+                let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                    + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
+                let viewport = NibUITestScrollGeometry.viewport(
+                    scroll: scroll?.frame ?? app.frame, window: app.frame, obstructions: obstructions)
+                let origin = app.coordinate(withNormalizedOffset: .zero)
+                if let control, let viewport,
+                   let point = NibUITestScrollGeometry.tapPoint(control: control.frame, viewport: viewport) {
+                    return origin.withOffset(CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY))
+                }
                 // More contains full sections (including Add Page) in a bounded viewport.
                 // Scroll its real host; existence alone does not make an offscreen row actionable.
-                guard let scroll = app.scrollViews.allElementsBoundByIndex.first(where: {
-                    $0.identifier != "nib.canvas" && $0.isHittable &&
-                    $0.descendants(matching: .any).matching(identifier: id).count > 0
-                }), let viewport = NibUITestScrollGeometry.viewport(
-                    scroll: scroll.frame, window: app.frame, obstructions: []) else { return nil }
+                guard let scroll, let viewport else { return nil }
                 let target = scroll.descendants(matching: .any).matching(identifier: id).firstMatch
                 let drag = NibUITestScrollGeometry.drag(in: viewport, toward: target.frame.midY)
-                let origin = app.coordinate(withNormalizedOffset: .zero)
                 origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
                     .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                         CGVector(dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
                         withVelocity: .slow, thenHoldForDuration: 0.15)
             }
-            return candidate(id)
+            return nil
         }
-        if let control = revealInMenu() { control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); return }
+        if let control = revealInMenu() { control.tap(); return }
         for identifier in overflow {
             if let menu = candidate(identifier) {
                 menu.tap()
-                if let control = revealInMenu() { control.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap(); return }
+                // The bud enters the accessibility tree before its scroll host is actionable.
+                let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    candidate(id) != nil || menuHost() != nil
+                }, object: nil)
+                _ = XCTWaiter.wait(for: [ready], timeout: 5)
+                if let control = revealInMenu() { control.tap(); return }
                 if menu.isHittable { menu.tap() }
             }
         }
@@ -306,18 +326,29 @@ extension NibUI {
         let title = calendar.textFields["Title"]
         // iPadOS 26 exposes the toolbar action as add-plus-button / lowercase "add".
         // Prefer its stable identifier; localized display casing is not a command contract.
-        let add = calendar.buttons.matching(NSPredicate(
-            format: "identifier == 'add-plus-button' OR label ==[c] 'Add' OR label IN {'Add Event', 'New Event', 'Create Event', 'Create'}")).firstMatch
-        if add.waitForExistence(timeout: 3), add.isHittable {
-            add.tap()
+        func addButton() -> XCUIElement? {
+            let identified = calendar.buttons.matching(identifier: "add-plus-button").allElementsBoundByIndex
+            let labelled = calendar.buttons.matching(NSPredicate(
+                format: "label ==[c] 'Add' OR label IN {'Add Event', 'New Event', 'Create Event', 'Create'}"))
+                .allElementsBoundByIndex
+            return (identified + labelled).first { $0.isEnabled && $0.isHittable }
         }
-        if title.waitForExistence(timeout: 3) { return }
+        func editorIsReady() -> Bool { title.exists && title.isEnabled && title.isHittable }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            editorIsReady() || addButton() != nil
+        }, object: nil)
+        _ = XCTWaiter.wait(for: [ready], timeout: 15)
+        if editorIsReady() { return }
+        addButton()?.tap()
+        let opened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorIsReady() }, object: nil)
+        if XCTWaiter.wait(for: [opened], timeout: 10) == .completed { return }
 
         // Calendar's New Event keyboard command also reaches the native editor when
         // iPadOS omits the visible + symbol's accessibility label. Unlike a screen
         // coordinate this remains valid across orientation and toolbar layouts.
         calendar.typeKey("n", modifierFlags: [.command])
-        guard title.waitForExistence(timeout: 5), title.isHittable else {
+        let shortcutOpened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorIsReady() }, object: nil)
+        guard XCTWaiter.wait(for: [shortcutOpened], timeout: 10) == .completed else {
             throw NibUI.Failure.message("Calendar did not open its New Event editor through Add or Command-N\n"
                                         + calendar.debugDescription)
         }

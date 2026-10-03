@@ -2,6 +2,55 @@ import XCTest
 import NibContracts
 
 final class UITestScrollGeometryTests: XCTestCase {
+    func testOffscreenAddPageMustScrollBeforeItCanBeTapped() throws {
+        let viewport = try XCTUnwrap(NibUITestScrollGeometry.viewport(
+            scroll: CGRect(x: 1048, y: 104, width: 312, height: 520),
+            window: CGRect(x: 0, y: 0, width: 1376, height: 1032), obstructions: []))
+        var row = CGRect(x: 1064, y: 1332.5, width: 280, height: 44)
+        XCTAssertNil(NibUITestScrollGeometry.tapPoint(control: row, viewport: viewport),
+                     "An accessibility row outside the menu is not a tap destination")
+        // Model content moving with successive drags. A long menu must converge
+        // without scrolling the canvas or needing a hard-coded number of swipes.
+        for _ in 0..<16 {
+            if NibUITestScrollGeometry.tapPoint(control: row, viewport: viewport) != nil { break }
+            let drag = NibUITestScrollGeometry.drag(in: viewport, toward: row.midY)
+            XCTAssertTrue(viewport.contains(drag.start))
+            XCTAssertTrue(viewport.contains(drag.end))
+            row = row.offsetBy(dx: 0, dy: drag.end.y - drag.start.y)
+        }
+        let point = try XCTUnwrap(NibUITestScrollGeometry.tapPoint(control: row, viewport: viewport))
+        XCTAssertTrue(row.contains(point))
+        XCTAssertTrue(viewport.contains(point))
+    }
+
+    func testPartiallyClippedRowTapsVisibleContentInsteadOfItsHiddenCentre() throws {
+        let viewport = CGRect(x: 1056, y: 112, width: 296, height: 504)
+        for row in [CGRect(x: 1064, y: 602, width: 280, height: 44),
+                    CGRect(x: 1064, y: 80, width: 280, height: 44)] {
+            XCTAssertFalse(viewport.contains(CGPoint(x: row.midX, y: row.midY)))
+            let point = try XCTUnwrap(NibUITestScrollGeometry.tapPoint(control: row, viewport: viewport))
+            XCTAssertTrue(viewport.contains(point))
+            XCTAssertTrue(row.contains(point))
+        }
+        XCTAssertNil(NibUITestScrollGeometry.tapPoint(
+            control: CGRect(x: 1064, y: 614, width: 280, height: 44), viewport: viewport),
+            "A two-point sliver requires another scroll, not an unreliable edge tap")
+    }
+
+    func testKeyboardCoveredFieldCannotSupplyATapPoint() throws {
+        let keyboard = CGRect(x: 0, y: 589, width: 1376, height: 440)
+        let shortcuts = CGRect(x: 0, y: 534, width: 1376, height: 55)
+        let viewport = try XCTUnwrap(NibUITestScrollGeometry.viewport(
+            scroll: CGRect(x: 484.5, y: 102, width: 407, height: 878),
+            window: CGRect(x: 0, y: 0, width: 1376, height: 1032), obstructions: [keyboard, shortcuts]))
+        XCTAssertNil(NibUITestScrollGeometry.tapPoint(
+            control: CGRect(x: 510, y: 719, width: 340, height: 44), viewport: viewport))
+        let point = try XCTUnwrap(NibUITestScrollGeometry.tapPoint(
+            control: CGRect(x: 510, y: 508, width: 340, height: 44), viewport: viewport))
+        XCTAssertFalse(keyboard.contains(point))
+        XCTAssertFalse(shortcuts.contains(point))
+    }
+
     func testOverflowMenuDragRevealsAddPageWithoutTouchingCanvas() throws {
         // More / Current Template frames from the Create distribution regression.
         let menu = CGRect(x: 1048, y: 104, width: 312, height: 520)

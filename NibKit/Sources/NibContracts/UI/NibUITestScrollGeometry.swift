@@ -3,6 +3,14 @@ import Foundation
 /// Geometry for black-box form gestures. Native scroll frames can extend behind
 /// the software keyboard; accessibility's frame is not its unobscured viewport.
 public enum NibUITestScrollGeometry {
+    /// XCTest can report a partially clipped row as hittable although its centre
+    /// is outside the scroll viewport. Tap only the visible portion of that row.
+    public static func tapPoint(control: CGRect, viewport: CGRect) -> CGPoint? {
+        let visible = control.intersection(viewport)
+        guard !visible.isNull, visible.width >= 8, visible.height >= 8 else { return nil }
+        return CGPoint(x: visible.midX, y: visible.midY)
+    }
+
     public static func viewport(scroll: CGRect, window: CGRect, obstructions: [CGRect]) -> CGRect? {
         var visible = scroll.intersection(window)
         guard !visible.isNull, !visible.isEmpty else { return nil }
