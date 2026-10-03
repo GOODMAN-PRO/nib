@@ -176,7 +176,9 @@ The tests live in NibUITests/${cls}.swift (read them to see exactly what the use
       if (minutesUntil(A.shipBy) < 150 && !alive(`${TAG}-verify-${a.key}-${round}`)) { say(`verify ${a.key} r${round}: skipped — out of time; the final verify covers the critical classes`); st.remaining = failures; save(); break }
       const verifyPrompt = `Verify the ${a.key} fixes (round ${round}). Run ${UIRUN(target, 2)} (${target.includes('/test') ? `the ${cls} tests that failed before the fixes` : `the WHOLE ${cls} class — most of it has never run yet`}; identifiers are NibUITests/<Class>/<testMethod>). If the build fails, report the compile errors as a failure with the owning feature. For every failing test decide: test wrong per spec -> fix the test in NibUITests/${cls}.swift (and rerun once if budget allows); app wrong -> report it (do not change app code here). Never git add/commit/stash/checkout/reset. Answer status "green" (all those tests pass) or "red", file "NibUITests/${cls}.swift", tests/passed/failed, failures (test = "${cls}/<testMethod>", owner = feature id or "shared", problem, evidence), notes.`
       let v = await codex(`verify-${a.key}-${round}`, verifyPrompt, 'uiwrite', 'high', 2).catch((e) => ({ status: 'blocked', failures, notes: e.message }))
-      const executed = (v.passed || 0) + (v.failed || 0)
+      const infra = (f) => /runner|infrastructure|failed to (launch|initialize)|AX loaded|simulator .*(busy|launch)|no tests? (ran|executed)/i.test(`${f.test} ${f.problem} ${f.evidence}`)
+      const realFails = (v.failures || []).filter((f) => !infra(f))
+      const executed = (v.passed || 0) + realFails.length   // runner / simulator start-up failures are not test results
       if (!executed && minutesUntil(A.shipBy) > 150) {   // nothing executed (build broken by a concurrent edit, runner death): run the verify again
         say(`verify ${a.key} r${round}: no tests executed — running the verify again`)
         v = await codex(`verify-${a.key}-${round}b`, verifyPrompt, 'uiwrite', 'high', 2).catch((e) => ({ status: 'blocked', failures, notes: e.message }))
