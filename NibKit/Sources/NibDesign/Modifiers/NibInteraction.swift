@@ -121,3 +121,71 @@ extension KeyboardShortcut {
         return s
     }
 }
+
+/// Native touch ownership for controls embedded in the palette's glass/hosting
+/// hierarchy. Accessibility and keyboard activation stay on the SwiftUI button.
+struct NibActionTouchTarget: UIViewRepresentable {
+    let isEnabled: Bool
+    let action: () -> Void
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        let tap = NibActionTapRecognizer()
+        tap.action = action
+        tap.addTarget(tap, action: #selector(NibActionTapRecognizer.activate))
+        view.addGestureRecognizer(tap)
+        return view
+    }
+    func updateUIView(_ view: UIView, context: Context) {
+        guard let tap = view.gestureRecognizers?.first as? NibActionTapRecognizer else { return }
+        tap.action = action
+        tap.isEnabled = isEnabled
+    }
+}
+
+final class NibActionTapRecognizer: UITapGestureRecognizer {
+    var action: () -> Void = {}
+    private var start: CGPoint?
+    @objc func activate() { action() }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        start = touches.first?.location(in: view)
+        super.touchesBegan(touches, with: event)
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let start, let point = touches.first?.location(in: view),
+           hypot(point.x - start.x, point.y - start.y) >= DropletPhysics.pickupSlop {
+            state = .failed
+        } else { super.touchesMoved(touches, with: event) }
+    }
+    override func reset() { super.reset(); start = nil }
+    override func canBePrevented(by other: UIGestureRecognizer) -> Bool {
+        // Scrolls and deliberate holds win. The hosting touch-down bridge does not.
+        if other is UIPanGestureRecognizer || other is UILongPressGestureRecognizer {
+            return super.canBePrevented(by: other)
+        }
+        return false
+    }
+}
+
+public extension View {
+    /// Keep touch delivery on a native surface when a button lives inside a
+    /// retained glass popover; the original button retains accessibility/keys.
+    func nibNativeAction(_ action: @escaping () -> Void) -> some View {
+        modifier(NibNativeActionModifier(action: action))
+    }
+}
+
+private struct NibNativeActionModifier: ViewModifier {
+    let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+    func body(content: Content) -> some View {
+        // Give native input sole ownership of touch without putting a UIKit
+        // overlay over artwork (which obscures it in SwiftUI/glass snapshots).
+        // Accessibility and keyboard actions remain on the original control.
+        content.allowsHitTesting(false).background {
+            NibActionTouchTarget(isEnabled: isEnabled, action: action)
+                .accessibilityHidden(true)
+        }
+    }
+}

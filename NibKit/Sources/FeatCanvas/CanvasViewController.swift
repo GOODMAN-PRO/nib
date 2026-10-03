@@ -49,6 +49,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var fitZoom: Double = 1
     private(set) var zoomLimits: ClosedRange<Double> = ZoomRules.notebookRange
     private var isAtFit = true
+    private var pinchPanWasEnabled = true
+    private var pinchStartZoom: Double?
+    private var pinchAnchor: (page: PageID, point: Point, window: CGPoint)?
     /// A pan at fit width is a reading position, not a request to keep the page's top fitted.
     private var hasManualPan = false
     private(set) var didInitialLayout = false
@@ -127,6 +130,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         scrollView.frame = view.bounds
         scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         scrollView.delegate = self
+        scrollView.documentPinchGestureRecognizer.addTarget(self, action: #selector(pinched(_:)))
         scrollView.host = self
         scrollView.accessibilityIdentifier = "nib.canvas"
         view.addSubview(scrollView)
@@ -1096,7 +1100,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private var livePanCommands: [KeyCommandDescriptor] {
         guard !isClosed, session.editor === self, session.document == documentID else { return [] }
         func textHasFocus(_ view: UIView) -> Bool {
-            if view.isFirstResponder, view is UIKeyInput { return true }
+            if view.isFirstResponder, view is UITextInput { return true }
             return view.subviews.contains(where: textHasFocus)
         }
         let typing = session.isEditingText || viewIfLoaded?.window.map(textHasFocus) == true
@@ -1233,6 +1237,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        // setZoomScale may finish a UIKit transform inside our continuing pinch.
+        guard pinchStartZoom == nil else { return }
         isAtFit = abs(self.scrollView.zoom - fitZoom) <= fitZoom * 0.005
         endZoom()
         hudLingerTask?.cancel()
@@ -1286,9 +1292,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// (`comment.tapAt`); a link is followed (`link.follow`). A board lists the items near the window.
     private func accessibilityElements(for pageView: PageTileView) -> [Any] {
         guard let id = pageView.pageID, let record = shown[id] else { return [] }
-        let summary = UIAccessibilityElement(accessibilityContainer: pageView)
+        let summary = CanvasPageElement(accessibilityContainer: pageView)
         summary.accessibilityLabel = accessibilityName(record)
-        summary.accessibilityFrameInContainerSpace = record.size == nil ? visiblePageArea(id).cg : pageView.bounds
+        summary.localFrame = record.size == nil ? visiblePageArea(id).cg : pageView.bounds
         summary.accessibilityCustomActions = pageActions()
         var out: [Any] = [summary]
         guard let items = try? app.workspace.items(documentID, page: id) else { return out }
@@ -1369,6 +1375,49 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     // MARK: Input
+
+    @objc func pinched(_ gesture: UIPinchGestureRecognizer) {
+        // Read the centroid in the stationary viewport. The recognizer's location
+        // in UIScrollView follows its changing bounds during setZoomScale, so
+        // subtracting contentOffset there can feed the last correction back into
+        // the next sample and move the focal content.
+        let point = gesture.location(in: view)
+        updatePinch(state: gesture.state, scale: Double(gesture.scale),
+                    centroid: CGPoint(x: point.x - scrollView.frame.minX, y: point.y - scrollView.frame.minY))
+    }
+
+    /// Centroid is in viewport coordinates; retain one page point for the whole
+    /// gesture, including centroid translation and zoom clamping at either limit.
+    func updatePinch(state: UIGestureRecognizer.State, scale: Double, centroid: CGPoint) {
+        guard didInitialLayout, !isClosed else { return }
+        switch state {
+        case .began:
+            pinchStartZoom = zoom
+            pinchAnchor = anchor(atWindow: centroid)
+            // The centroid already supplies two-finger translation. A simultaneous
+            // scroll pan would apply that movement a second time, including the
+            // jump when one finger lifts before the other.
+            pinchPanWasEnabled = scrollView.panGestureRecognizer.isEnabled
+            scrollView.panGestureRecognizer.isEnabled = false
+            scrollViewWillBeginZooming(scrollView, with: scrollView.contentView)
+            fallthrough
+        case .changed:
+            guard let start = pinchStartZoom, scale.isFinite, scale > 0 else { return }
+            applyZoom(start * scale)
+            if var anchor = pinchAnchor {
+                anchor.window = centroid
+                keep(anchor)
+            }
+            scrollViewDidZoom(scrollView)
+        case .ended, .cancelled, .failed:
+            guard pinchStartZoom != nil else { return }
+            pinchStartZoom = nil
+            pinchAnchor = nil
+            scrollView.panGestureRecognizer.isEnabled = pinchPanWasEnabled
+            scrollViewDidEndZooming(scrollView, with: scrollView.contentView, atScale: scrollView.zoomScale)
+        default: break
+        }
+    }
 
     @objc private func doubleTapped(_ g: UITapGestureRecognizer) {
         guard g.state == .ended else { return }
@@ -1969,8 +2018,20 @@ final class PageErrorView: UIView {
 
 // MARK: - Item accessibility
 
-/// A VoiceOver element for something on a page, positioned in the page view's (page point) coordinates, so it follows
-/// scrolling and zoom. Activating it runs the same command a finger would.
+/// Page elements are cached, but their screen geometry is not. Chrome docking,
+/// scrolling and zooming all move the paper without changing its local bounds.
+final class CanvasPageElement: UIAccessibilityElement {
+    var localFrame: CGRect = .zero
+    override var accessibilityFrame: CGRect {
+        get {
+            guard let page = accessibilityContainer as? UIView, let window = page.window else { return .zero }
+            return window.convert(page.convert(localFrame, to: window), to: window.screen.coordinateSpace)
+        }
+        set { super.accessibilityFrame = newValue }
+    }
+}
+
+/// A VoiceOver element for a page item. Activating it runs the same command a finger would.
 final class CanvasItemElement: UIAccessibilityElement {
     var onActivate: (() -> Void)?
 

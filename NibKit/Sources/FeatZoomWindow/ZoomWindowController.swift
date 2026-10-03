@@ -651,6 +651,7 @@ struct ZoomPane: View {
     private var controls: some View {
         HStack(spacing: NibSpacing.s) {
             NibIconButton(.xmark, label: String(localized: "Close Zoom Window"), size: .round) { controller.close() }
+                .nibNativeAction { controller.close() }
             Text(zoomText)
                 .font(NibFont.hud)
                 .foregroundStyle(NibColor.label)
@@ -660,6 +661,7 @@ struct ZoomPane: View {
                 .accessibilityValue(zoomText)
             Spacer(minLength: 0)
             NibButton(String(localized: "New Line"), kind: .secondary, size: .compact) { controller.newLine() }
+                .nibNativeAction { controller.newLine() }
             options
         }
         .frame(height: NibMetrics.hitTarget)
@@ -862,7 +864,7 @@ final class ZoomKeyboardView: UIView {
         self.app = app
         self.session = session
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        isUserInteractionEnabled = true
         accessibilityElementsHidden = true
         for name in [UIWindow.didBecomeKeyNotification, UIScene.didActivateNotification,
                      UITextField.textDidEndEditingNotification, UITextView.textDidEndEditingNotification,
@@ -873,6 +875,7 @@ final class ZoomKeyboardView: UIView {
     }
 
     required init?(coder: NSCoder) { nil }
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
     override var canBecomeFirstResponder: Bool { true }
     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
     override var next: UIResponder? {
@@ -907,6 +910,12 @@ final class ZoomKeyboardView: UIView {
         }
         let responder = ZoomKeyboardRouting.firstResponder(in: window)
         if let responder {
+            // F073 already advertises the feature's keys together with zoom/pan
+            // and presets. Keep that complete native route rather than inserting
+            // a two-command responder through a noninteractive SwiftUI overlay.
+            if responder.keyCommands?.contains(where: {
+                $0.input == "z" && $0.modifierFlags == [.command, .alternate]
+            }) == true { return }
             guard !(responder is UIControl), !(responder is ZoomOptionsKeyView) else { return }
             let view = (responder as? UIView) ?? (responder as? UIViewController)?.viewIfLoaded
             guard let view, view.isDescendant(of: canvas) || canvas.isDescendant(of: view)
@@ -1065,6 +1074,8 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         canvas.isOpaque = false
         canvas.overrideUserInterfaceStyle = .light          // ink is never themed (DESIGN.md §3.4)
         canvas.isScrollEnabled = false
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.bounces = false
         canvas.bouncesZoom = false
         canvas.showsVerticalScrollIndicator = false
@@ -1172,6 +1183,9 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
             canvas.minimumZoomScale = mag
             canvas.maximumZoomScale = mag
         }
+        // Setting a zoom limit can lazily create/re-enable UIKit's pinch.
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.contentSize = CGSize(width: CGFloat(pageSize.width) * mag, height: CGFloat(pageSize.height) * mag)
         canvas.contentOffset = CGPoint(x: CGFloat(box.x) * mag, y: CGFloat(box.y) * mag)
     }

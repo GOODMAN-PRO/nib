@@ -127,6 +127,7 @@ struct ColourEditor: View {
                         }
                         if model.presets.swatches.count < ToolPresets.maxSwatches {
                             NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
+                                .nibNativeAction { model.addColour() }
                         }
                     }
                 }
@@ -142,6 +143,7 @@ struct ColourEditor: View {
             }
             HStack(spacing: NibSpacing.s) {
                 NibButton(String(localized: "Custom"), symbol: .customColour, size: .compact) { model.openPicker() }
+                    .nibNativeAction { model.openPicker() }
                     .accessibilityLabel(String(localized: "Custom Colour"))
                 if model.canPickFromPage {
                     NibButton(String(localized: "From Page"), symbol: .eyedropper, size: .compact) { model.pickFromPage() }
@@ -262,6 +264,7 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     private let commitsOnFinishOnly: Bool
     private let onPick: @MainActor (RGBA) -> Void
     private var latest: RGBA?
+    private var lastPickerSelection: RGBA?
     private var committed: RGBA?
     private var finished = false
 
@@ -298,16 +301,31 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
     func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor, continuously: Bool) {
         guard !finished else { return }
         latest = PresetColour.rgba(color)
+        lastPickerSelection = PresetColour.rgba(viewController.selectedColor)
         if !continuously && !commitsOnFinishOnly { commitLatest() }
     }
 
+    // UIKit's HEX field can use the original delegate callback, whereas grid
+    // and spectrum gestures use didSelect:continuously:. Both commit the slot.
+    func colorPickerViewControllerDidSelectColor(_ viewController: UIColorPickerViewController) {
+        colorPickerViewController(viewController, didSelect: viewController.selectedColor, continuously: false)
+    }
+
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
-        // UIKit dismisses its Close button presentation before this callback.
+        viewController.viewIfLoaded?.endEditing(true)
+        let finalSelection = PresetColour.rgba(viewController.selectedColor)
+        // HEX editing can settle after the last selection callback. A previous
+        // grid/slider callback must not mask a newer authoritative picker value.
+        if latest == nil || finalSelection != lastPickerSelection { latest = finalSelection }
         finish()
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        finish()
+        if let picker = presentationController.presentedViewController as? UIColorPickerViewController {
+            colorPickerViewControllerDidFinish(picker)
+        } else {
+            finish()
+        }
     }
 
     private func finish() {
@@ -329,7 +347,19 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate, U
 enum PresetPresenter {
     static func present(_ viewController: UIViewController, app: NibApp, session: EditorSession) {
         if let navigator = app.ui.activeNavigator, navigator.session === session {
-            navigator.presentModal(viewController)
+            // A colour command may arrive while UIKit retracts the swatch's
+            // context menu. Present only after that transition has released its
+            // controller; otherwise UIKit silently drops the picker presentation.
+            let root = navigator.rootViewController
+            var top = root
+            while let presented = top?.presentedViewController { top = presented }
+            if let transition = top?.transitionCoordinator ?? root?.transitionCoordinator {
+                transition.animate(alongsideTransition: nil) { _ in
+                    navigator.presentModal(viewController)
+                }
+            } else {
+                navigator.presentModal(viewController)
+            }
             return
         }
         var top = (session.editor as? UIViewController) ?? session.editor?.canvasHost?.canvasView.window?.rootViewController

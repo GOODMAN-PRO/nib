@@ -426,6 +426,24 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertNil(model.popover, "and another short tap closes it")
     }
 
+    func testColourMenuRemainsStableAcrossChromeRefreshUntilDismissed() async throws {
+        let button = PresetSwatchNativeButton()
+        let original = UIMenu(title: "Original", children: [UIAction(title: "Change Colour") { _ in }])
+        let refreshed = UIMenu(title: "Refreshed", children: [UIAction(title: "Change Colour") { _ in }])
+        let swatch = PresetColour.swatch(.black, id: "black", name: "Black")
+        button.configure(swatch: swatch, isSelected: true, menu: original, action: {})
+        let interaction = UIContextMenuInteraction(delegate: button)
+        let configuration = UIContextMenuConfiguration(identifier: nil, previewProvider: nil)
+        button.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: nil)
+        button.configure(swatch: swatch, isSelected: true, menu: refreshed, action: {})
+        XCTAssertEqual(button.menu?.title, "Original", "Refreshing chrome must not replace the menu being touched")
+        button.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        XCTAssertEqual(button.menu?.title, "Refreshed", "The next interaction uses the latest actions")
+    }
+
     func testNativeColourMenuEditsHeldSlotAndPreservesOtherActionsForEveryTool() async throws {
         let h = Harness(features: [FeatPresetsFeature.self])
         for tool in NibSettings.presetTools {
@@ -931,6 +949,38 @@ final class FeatPresetsTests: XCTestCase {
     }
 
     /// A slot commits every settled choice; a new slot commits once, when the picker closes; an unchanged colour never.
+    func testPickerCommitsNativeHexCallbackAndFinishWithoutSelectionCallback() {
+        let picker = UIColorPickerViewController()
+        let hex = RGBA(0xD0, 0x30, 0x80)
+        var picks: [RGBA] = []
+        let delegate = SystemColourPicker(initial: .black, commitsOnFinishOnly: false) { picks.append($0) }
+        picker.selectedColor = PresetColour.uiColor(hex)
+        delegate.colorPickerViewControllerDidSelectColor(picker)
+        delegate.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [hex])
+        let finishOnly = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        finishOnly.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [hex, hex])
+        let swipe = SystemColourPicker(initial: .black, commitsOnFinishOnly: true) { picks.append($0) }
+        swipe.presentationControllerDidDismiss(UIPresentationController(presentedViewController: picker, presenting: nil))
+        XCTAssertEqual(picks, [hex, hex, hex], "Interactive dismissal must also read the native final selection")
+    }
+
+    func testFinalHexSelectionSupersedesAnEarlierPickerCallback() {
+        let picker = UIColorPickerViewController()
+        picker.selectedColor = PresetColour.uiColor(.black)
+        var picks: [RGBA] = []
+        let delegate = SystemColourPicker(initial: .black, commitsOnFinishOnly: false) { picks.append($0) }
+        picker.selectedColor = PresetColour.uiColor(vermilion)
+        delegate.colorPickerViewController(picker, didSelect: picker.selectedColor, continuously: false)
+        let hex = RGBA(0xD0, 0x30, 0x80)
+        picker.selectedColor = PresetColour.uiColor(hex)
+        delegate.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [vermilion, hex])
+        delegate.colorPickerViewControllerDidFinish(picker)
+        XCTAssertEqual(picks, [vermilion, hex], "Dismissal cannot commit twice")
+    }
+
     func testSystemColourPickerCommitRules() {
         let vc = UIColorPickerViewController()
         let blue = UIColor(red: 0, green: 0, blue: 1, alpha: 1)

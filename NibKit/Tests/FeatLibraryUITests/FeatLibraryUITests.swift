@@ -26,6 +26,61 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testCardOpeningTapSurvivesHostingTapButYieldsToNavigationAndMenu() {
+        let opening = LibraryItemTapRecognizer()
+        XCTAssertFalse(opening.canBePrevented(by: UITapGestureRecognizer()))
+        XCTAssertFalse(opening.canBePrevented(by: UIGestureRecognizer()))
+        XCTAssertTrue(opening.canBePrevented(by: UIPanGestureRecognizer()))
+        XCTAssertTrue(opening.canBePrevented(by: UILongPressGestureRecognizer()))
+    }
+
+    func testCardTapRejectsAncestorHostingPanAndHoldButKeepsNativeScrollAndMenu() {
+        let host = UIView(), card = LibraryItemTouchView()
+        host.addSubview(card)
+        let opening = LibraryItemTapRecognizer()
+        card.addGestureRecognizer(opening)
+        for gesture in [UIPanGestureRecognizer(), UILongPressGestureRecognizer()] {
+            host.addGestureRecognizer(gesture)
+            XCTAssertFalse(opening.canBePrevented(by: gesture))
+        }
+        let scroll = UIScrollView()
+        scroll.addSubview(host)
+        XCTAssertTrue(opening.canBePrevented(by: scroll.panGestureRecognizer))
+        let menu = UILongPressGestureRecognizer()
+        card.addGestureRecognizer(menu)
+        XCTAssertTrue(opening.canBePrevented(by: menu))
+    }
+
+    func testCardTouchOwnerSurvivesPressFeedbackAndMenuDragAvailabilityChanges() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        let row = try XCTUnwrap(model.documentRows.first)
+        let host = UIHostingController(rootView: LibraryCell(row: row, model: model, list: false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        let card = try XCTUnwrap(descendants(host.view).compactMap { $0 as? LibraryItemTouchView }.first)
+        let tap = try XCTUnwrap(card.gestureRecognizers?.compactMap { $0 as? LibraryItemTapRecognizer }.first)
+        let frame = card.convert(card.bounds, to: window)
+        tap.pressed(true)
+        for menu in ["sort", "none", "app", "none"] {
+            model.setView(["menu": .string(menu)])
+            try await Task.sleep(for: .milliseconds(150))
+            host.view.layoutIfNeeded()
+            XCTAssertEqual(LibraryItemReflow.acceptsDrag(model), menu == "none")
+            let current = try XCTUnwrap(descendants(host.view).compactMap { $0 as? LibraryItemTouchView }.first)
+            XCTAssertTrue(current === card, "Changing drag availability must not replace a touched card")
+            XCTAssertTrue(tap.view === card)
+            XCTAssertTrue(card.window === window)
+            XCTAssertEqual(card.convert(card.bounds, to: window), frame, "Press feedback must not move the native touch target")
+        }
+        tap.pressed(false)
+    }
+
     func testCardNativeTapDispatchesOnceAfterReattachmentInGridAndList() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         await model.appear()
@@ -56,6 +111,11 @@ final class FeatLibraryUITests: XCTestCase {
             let tap = try XCTUnwrap(taps.first), target = try XCTUnwrap(tap.view)
             let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: host.view)
             XCTAssertTrue(host.view.hitTest(point, with: nil) === target)
+            XCTAssertTrue(target.isAccessibilityElement, "The tappable native card must own its accessibility identity")
+            XCTAssertEqual(target.accessibilityIdentifier, "cmd.doc.open")
+            XCTAssertEqual(target.accessibilityLabel, row.accessibilityLabel)
+            XCTAssertTrue(target.accessibilityTraits.contains(.button))
+            XCTAssertEqual(target.accessibilityCustomActions?.count, 2)
             XCTAssertFalse(tap.canBePrevented(by: UIGestureRecognizer()),
                            "A touch-down hosting bridge must not consume the opening tap")
             XCTAssertTrue(tap.canBePrevented(by: UIPanGestureRecognizer()), "Swiping must scroll without opening")

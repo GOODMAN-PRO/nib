@@ -268,44 +268,34 @@ struct LibraryCell: View {
                     .accessibilityHidden(true)
             }
         }
-        // Attach identity and actions to the actual Button, before the reflow and
-        // context-menu hosts. Otherwise accessibility exposes a second command
-        // button around the card instead of the control that receives its touch.
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(row.accessibilityLabel)
-        .accessibilityIdentifier(row.isFolder ? "cmd.library.setView" : "cmd.doc.open")
-        .accessibilityValue(accessibilityValue(subtitle: visibleSubtitle))
-        .accessibilityAction { activate() }
-        .accessibilityActions {
-            if model.collection == .documents {
-                Button("Move earlier") { step(-1) }
-                Button("Move later") { step(1) }
-            }
-        }
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
+        .accessibilityHidden(true)
         .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
-        // One touch-up owner: the hosting/context-menu bridge can consume a
-        // SwiftUI Button's tap even though the card remains AX-hittable.
-        // The native overlay receives the touch; retain the Button underneath
-        // for accessibility and keyboard activation, as with LibraryNewButton.
-        .overlay {
-            LibraryItemTapTarget(action: {
-                guard !LibraryCarrierVisibility.hides(row.ref, in: reflow) else { return }
-                activate()
-            }, pressed: { isPressed = $0 })
-            .accessibilityHidden(true)
-        }
+        .allowsHitTesting(false)
         .scaleEffect(isPressed ? 0.96 : 1)
         .animation(NibMotion.tap.animation, value: isPressed)
+        // One surface owns touch, context menus and accessibility activation.
+        // Exposing the covered SwiftUI button instead leaves automation and
+        // assistive input targeting a different view from the visible card.
+        .overlay {
+            LibraryItemTapTarget(label: row.accessibilityLabel,
+                identifier: row.isFolder ? "cmd.library.setView" : "cmd.doc.open",
+                value: accessibilityValue(subtitle: visibleSubtitle),
+                selected: model.selection.isSelecting && model.selection.refs.contains(row.ref),
+                earlier: model.collection == .documents ? { step(-1) } : nil,
+                later: model.collection == .documents ? { step(1) } : nil, action: {
+                guard !LibraryCarrierVisibility.hides(row.ref, in: reflow) else { return }
+                activate()
+            }, pressed: { isPressed = $0 }, menu: {
+                var entries = LibraryMenus.nativeItems(model, rows: [row])
+                if model.collection == .documents {
+                    entries += [UIAction(title: String(localized: "Move earlier")) { _ in step(-1) },
+                                UIAction(title: String(localized: "Move later")) { _ in step(1) }]
+                }
+                return UIMenu(children: entries)
+            }, preview: { UIHostingController(rootView: LibraryCard(row: row, model: model, subtitle: visibleSubtitle)) })
+        }
         .modifier(LibraryItemReflow(row: row, model: model))
-        .contextMenu {
-            LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
-            if model.collection == .documents {
-                Button("Move earlier") { step(-1) }
-                Button("Move later") { step(1) }
-            }
-        } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+
     }
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
@@ -342,11 +332,21 @@ struct LibraryCell: View {
 /// A real touch surface, unlike the transparent reflow geometry probe. Scrolls
 /// and context menus may cancel it; the hosting bridge may not steal touch-down.
 struct LibraryItemTapTarget: UIViewRepresentable {
+    var label: String
+    var identifier: String
+    var value: String
+    var selected: Bool
+    var earlier: (() -> Void)?
+    var later: (() -> Void)?
     var action: () -> Void
     var pressed: (Bool) -> Void
+    var menu: () -> UIMenu
+    var preview: () -> UIViewController
 
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+    func makeUIView(context: Context) -> LibraryItemTouchView {
+        let view = LibraryItemTouchView()
+        view.menu = menu
+        view.preview = preview
         let tap = LibraryItemTapRecognizer(target: nil, action: nil)
         tap.action = action
         tap.pressed = pressed
@@ -354,10 +354,43 @@ struct LibraryItemTapTarget: UIViewRepresentable {
         view.addGestureRecognizer(tap)
         return view
     }
-    func updateUIView(_ view: UIView, context: Context) {
-        guard let tap = view.gestureRecognizers?.first as? LibraryItemTapRecognizer else { return }
+    func updateUIView(_ view: LibraryItemTouchView, context: Context) {
+        view.menu = menu
+        view.preview = preview
+        view.isAccessibilityElement = true
+        view.accessibilityLabel = label
+        view.accessibilityIdentifier = identifier
+        view.accessibilityValue = value
+        view.accessibilityTraits = selected ? [.button, .selected] : [.button]
+        view.activate = action
+        view.accessibilityCustomActions = [
+            earlier.map { action in UIAccessibilityCustomAction(name: String(localized: "Move earlier")) { _ in action(); return true } },
+            later.map { action in UIAccessibilityCustomAction(name: String(localized: "Move later")) { _ in action(); return true } }
+        ].compactMap { $0 }
+        guard let tap = view.gestureRecognizers?.compactMap({ $0 as? LibraryItemTapRecognizer }).first else { return }
         tap.action = action
         tap.pressed = pressed
+    }
+}
+
+/// One native touch surface owns both opening and the context menu. A SwiftUI
+/// contextMenu wrapper above a separate tap overlay can consume the opening tap.
+final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
+    var menu: (() -> UIMenu)?
+    var preview: (() -> UIViewController)?
+    var activate: (() -> Void)?
+    override func accessibilityActivate() -> Bool { activate?(); return activate != nil }
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isOpaque = false
+        backgroundColor = .clear
+        addInteraction(UIContextMenuInteraction(delegate: self))
+    }
+    required init?(coder: NSCoder) { nil }
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
+                                   actionProvider: { [weak self] _ in self?.menu?() })
     }
 }
 
@@ -374,9 +407,20 @@ final class LibraryItemTapRecognizer: UITapGestureRecognizer {
         pressed(false)
     }
     override func canBePrevented(by other: UIGestureRecognizer) -> Bool {
-        if state == .possible, !(other is UITapGestureRecognizer),
-           !(other is UIPanGestureRecognizer), !(other is UILongPressGestureRecognizer) { return false }
-        return super.canBePrevented(by: other)
+        // Hosting bridges also use pan/hold recognizer subclasses. Only the
+        // scroll view's real pan and this card's native context-menu hold own
+        // competing user actions; an ancestor's bookkeeping cannot cancel a tap.
+        if let owner = other.view {
+            if let scroll = owner as? UIScrollView, other === scroll.panGestureRecognizer {
+                return super.canBePrevented(by: other)
+            }
+            if other is UILongPressGestureRecognizer, owner === view {
+                return super.canBePrevented(by: other)
+            }
+            return false
+        }
+        return (other is UIPanGestureRecognizer || other is UILongPressGestureRecognizer)
+            && super.canBePrevented(by: other)
     }
 }
 
@@ -388,11 +432,11 @@ struct LibraryItemReflow: ViewModifier {
             model.confirmation == nil && model.renaming == nil && model.floating.presentedIDs.isEmpty
     }
     func body(content: Content) -> some View {
-        if Self.acceptsDrag(model) {
-            content.nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
-                order: row.isFolder ? model.folderRefs : model.documentRefs,
-                onDrop: { model.drop($0, from: row.isFolder ? model.folderReflow : model.reflow) })
-        } else { content }
+        // Menus can close on touch-down. Never replace the card's native view
+        // when that changes drag availability: UIKit cancels its in-flight tap.
+        content.nibReflowDraggable(row.ref, in: row.isFolder ? model.folderReflow : model.reflow,
+            order: row.isFolder ? model.folderRefs : model.documentRefs, isEnabled: Self.acceptsDrag(model),
+            onDrop: { model.drop($0, from: row.isFolder ? model.folderReflow : model.reflow) })
     }
 }
 

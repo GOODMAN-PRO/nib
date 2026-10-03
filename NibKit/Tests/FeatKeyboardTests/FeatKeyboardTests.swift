@@ -126,6 +126,17 @@ final class FeatKeyboardTests: XCTestCase {
 
     // MARK: Acceptance: no shortcut is registered twice
 
+    func testHardwareOnlyInputDoesNotSuppressCanvasNavigation() {
+        final class HardwareInput: UIView, UIKeyInput {
+            var hasText: Bool { false }
+            func insertText(_ text: String) {}
+            func deleteBackward() {}
+        }
+        XCTAssertFalse(CanvasKeyboardFocus.isTextInput(HardwareInput()))
+        XCTAssertTrue(CanvasKeyboardFocus.isTextInput(UITextField()))
+        XCTAssertTrue(CanvasKeyboardFocus.isTextInput(UITextView()))
+    }
+
     func testNoShortcutIsRegisteredTwice() async throws {
         let catalog = GlobalShortcuts.catalog(app: nil, owner: FeatKeyboardFeature.id)
         XCTAssertTrue(ShortcutRules.conflicts(in: catalog).isEmpty, "\(ShortcutRules.conflicts(in: catalog))")
@@ -1029,6 +1040,59 @@ final class FeatKeyboardTests: XCTestCase {
         h.session.isEditingText = false
         attachment.detach(from: host)
         XCTAssertFalse(keyboard.canPerformAction(action, withSender: nil))
+    }
+
+    func testCanvasHardwareInputSessionAndShiftedPlusRetainNavigationChords() {
+        let responder = CanvasKeyboardResponder()
+        XCTAssertFalse((responder as UIResponder) is UIKeyInput, "Navigation must not establish a text-input session")
+        XCTAssertFalse(responder.hasText)
+        XCTAssertNotNil(responder.inputView)
+        XCTAssertEqual(responder.inputView?.bounds.height, 0)
+        XCTAssertFalse(CanvasKeyboardFocus.isTextInput(responder), "Hardware command input is not editable text")
+        responder.insertText("ignored")
+        responder.deleteBackward()
+        XCTAssertFalse(responder.hasText)
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardEqualSign, characters: "=", keyFlags: .command,
+                                               eventFlags: .shift), KeyShortcut("+", .command))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardDownArrow, characters: "", keyFlags: [],
+                                               eventFlags: [], heldKeys: [.keyboardLeftAlt]), KeyShortcut("down", .option))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardReturnOrEnter, characters: "\r", keyFlags: [],
+                                               eventFlags: [], heldKeys: [.keyboardRightAlt]), KeyShortcut("return", .option))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardZ, characters: "z", keyFlags: [], eventFlags: [],
+                                               heldKeys: [.keyboardLeftAlt, .keyboardLeftGUI]), KeyShortcut("z", [.command, .option]))
+        XCTAssertEqual(CanvasKeyPress.shortcut(code: .keyboardEqualSign, characters: "=", keyFlags: [],
+                                               eventFlags: []), KeyShortcut("="), "Never infer modifiers from the action a key could perform")
+    }
+
+    func testCanvasReclaimsSiblingHostingFocusForNavigationKeys() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let root = KeyboardWindowController(session: h.session)
+        root.view.addSubview(host.canvasView)
+        let sibling = TestChromeFocusView()
+        root.view.addSubview(sibling)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        XCTAssertTrue(sibling.becomeFirstResponder())
+        h.session.inking.begin()
+        attachment.keyboard.restoreFocus()
+        XCTAssertTrue(sibling.isFirstResponder, "Focus repair must not interrupt a live stroke")
+        h.session.inking.end()
+        attachment.keyboard.restoreFocus()
+        XCTAssertTrue(attachment.keyboard.isFirstResponder)
+        for (input, flags) in [("0", UIKeyModifierFlags([.command, .alternate])), ("=", .command)] {
+            XCTAssertTrue(attachment.keyboard.keyCommands?.contains { $0.input == input && $0.modifierFlags == flags } == true)
+        }
+        let field = UITextField()
+        root.view.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        attachment.keyboard.restoreFocus()
+        XCTAssertTrue(field.isFirstResponder)
     }
 
     func testCanvasFocusRecoveryAfterRemovalAndRotationPreservesTextFields() async throws {

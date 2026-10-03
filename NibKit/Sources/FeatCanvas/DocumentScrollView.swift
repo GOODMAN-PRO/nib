@@ -305,11 +305,16 @@ protocol DocumentScrollViewHost: AnyObject {
 }
 
 /// The canvas's scroll view (`CanvasHost.canvasView`). The pages live in one zoomed content view in layout space
-/// (page points), so UIKit's own pinch, bounce and deceleration drive zoom and scroll, and `zoomScale` is the
+/// (page points). A document-owned pinch and UIKit's bounce/deceleration drive zoom and scroll; `zoomScale` is the
 /// document zoom (view points per page point). Only the pages on screen (plus one either side) have views, taken
 /// from a small pool. Paper shadows live outside the zoomed view so their size never scales. Tiles are baked for
 /// the zoom level when a zoom ends; during a pinch the current tiles scale.
 final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
+    // A nested PKCanvasView participates in UIScrollView's private pinch ownership.
+    // This recognizer owns the document gesture; UIKit still applies zoom transforms.
+    let documentPinchGestureRecognizer = DocumentPinchGestureRecognizer()
+    private weak var configuredSystemPinch: UIPinchGestureRecognizer?
+
     /// Zoomed; holds the page views in layout space.
     let contentView = UIView()
     /// Above the pages, below attachments: the input half's wet ink canvases (F101). Scroll-content coordinates.
@@ -349,7 +354,23 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     /// The Pencil never scrolls or zooms the page: it writes. Fingers, trackpads and mice do.
     private func restrictGesturesToFingers() {
         panGestureRecognizer.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
-        pinchGestureRecognizer?.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
+        documentPinchGestureRecognizer.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
+        configureSystemPinch()
+    }
+
+    /// UIScrollView creates its pinch lazily when zoom limits first differ.
+    /// Bind it after creation as well as at init; otherwise both recognizers can
+    /// apply a zoom, and UIKit overwrites the document's focal compensation.
+    private func configureSystemPinch() {
+        guard let pinch = pinchGestureRecognizer, pinch !== configuredSystemPinch else { return }
+        pinch.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
+        pinch.require(toFail: documentPinchGestureRecognizer)
+        configuredSystemPinch = pinch
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
+        gestureRecognizer === pinchGestureRecognizer && other === documentPinchGestureRecognizer
     }
 
     /// UIKit uses the scroll view as its navigation recognizers' delegate. Keep that delegate and
@@ -359,14 +380,23 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     /// rejects palms/claimed contacts and its touch stream cancels the provisional stroke.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        let navigation = [panGestureRecognizer, pinchGestureRecognizer].compactMap { $0 }
+        if (gestureRecognizer === pinchGestureRecognizer && other === documentPinchGestureRecognizer)
+            || (gestureRecognizer === documentPinchGestureRecognizer && other === pinchGestureRecognizer) { return false }
+        let navigation = [panGestureRecognizer, pinchGestureRecognizer, documentPinchGestureRecognizer].compactMap { $0 }
         guard navigation.contains(where: { $0 === gestureRecognizer }) else { return false }
         if navigation.contains(where: { $0 === other }) { return true }
-        return other.view?.isDescendant(of: wetInkContainer) == true
+        if other.view?.isDescendant(of: wetInkContainer) == true { return true }
+        // The embedded editor sits below SwiftUI's hosting recognizers. Their
+        // touch-down bookkeeping must not fail navigation before a second finger
+        // arrives. Sibling/descendant attachment gestures retain exclusive input.
+        if let owner = other.view, owner !== self, isDescendant(of: owner) { return true }
+        return false
     }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        documentPinchGestureRecognizer.delegate = self
+        addGestureRecognizer(documentPinchGestureRecognizer)
         contentInsetAdjustmentBehavior = .never
         showsHorizontalScrollIndicator = true
         showsVerticalScrollIndicator = true
@@ -429,6 +459,7 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
 
     /// Recomputes the content size after a zoom and keeps the content centred when it is smaller than the window.
     func zoomDidChange() {
+        configureSystemPinch()
         let size = layout.size
         let z = Double(zoomScale)
         let target = CGSize(width: size.width * z, height: size.height * z)
@@ -610,6 +641,7 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        configureSystemPinch()
         let content = CGRect(origin: .zero, size: contentSize)
         if wetInkContainer.frame != content { wetInkContainer.frame = content }
         updateVisiblePages()
@@ -622,4 +654,11 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
         @unknown default: return false
         }
     }
+}
+
+/// Navigation coexists with wet ink and hosting bookkeeping. Claimed/palm
+/// contacts are excluded by CanvasNavigationGate before this can begin.
+final class DocumentPinchGestureRecognizer: UIPinchGestureRecognizer {
+    override func canBePrevented(by other: UIGestureRecognizer) -> Bool { false }
+    override func canPrevent(_ other: UIGestureRecognizer) -> Bool { false }
 }

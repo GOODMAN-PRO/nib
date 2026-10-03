@@ -536,9 +536,9 @@ public extension View {
     /// Makes a cell liftable: a 0.3 s press, then 6 pt of movement, lifts it; moving reflows its neighbours; lifting
     /// the finger calls `onDrop`. Also adds "Move earlier" and "Move later" accessibility actions (every drag has an
     /// action equivalent).
-    func nibReflowDraggable<ID: Hashable>(_ id: ID, in reflow: NibReflow<ID>, order: [ID],
+    func nibReflowDraggable<ID: Hashable>(_ id: ID, in reflow: NibReflow<ID>, order: [ID], isEnabled: Bool = true,
                                           onDrop: @escaping (NibReflowDrop<ID>) -> Void) -> some View {
-        modifier(NibReflowDragModifier(id: id, reflow: reflow, order: order, onDrop: onDrop))
+        modifier(NibReflowDragModifier(id: id, reflow: reflow, order: order, onDrop: onDrop, isEnabled: isEnabled))
     }
 }
 
@@ -574,15 +574,17 @@ struct NibReflowDragModifier<ID: Hashable>: ViewModifier {
     let reflow: NibReflow<ID>
     let order: [ID]
     let onDrop: (NibReflowDrop<ID>) -> Void
+    var isEnabled = true
 
     func body(content: Content) -> some View {
         content
-            .background(NibReflowTouchTarget(id: id, reflow: reflow, order: order, onDrop: onDrop))
+            .background(NibReflowTouchTarget(id: id, reflow: reflow, order: order, onDrop: onDrop, isEnabled: isEnabled))
             .accessibilityAction(named: Text(String(localized: "Move earlier", bundle: .module))) { step(-1) }
             .accessibilityAction(named: Text(String(localized: "Move later", bundle: .module))) { step(1) }
     }
 
     private func step(_ delta: Int) {
+        guard isEnabled else { return }
         reflow.step(id, by: delta, order: order, onDrop: onDrop)
     }
 }
@@ -594,6 +596,7 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
     let reflow: NibReflow<ID>
     let order: [ID]
     let onDrop: (NibReflowDrop<ID>) -> Void
+    var isEnabled = true
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeUIView(context: Context) -> Probe {
@@ -602,7 +605,10 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
         probe.changedWindow = { [weak coordinator = context.coordinator] probe in coordinator?.attach(probe) }
         return probe
     }
-    func updateUIView(_ view: Probe, context: Context) { context.coordinator.target = self }
+    func updateUIView(_ view: Probe, context: Context) {
+        context.coordinator.target = self
+        context.coordinator.gesture.isEnabled = isEnabled
+    }
     static func dismantleUIView(_ view: Probe, coordinator: Coordinator) { coordinator.detach() }
 
     final class Probe: UIView {
@@ -625,7 +631,7 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
         }
         func detach() { gesture.view?.removeGestureRecognizer(gesture) }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-            guard let probe, probe.window != nil, !probe.isHidden else { return false }
+            guard target.isEnabled, let probe, probe.window != nil, !probe.isHidden else { return false }
             // Window-level recognisers must not receive touches in a sheet or an
             // occluded/removed library. Geometry alone overlaps those surfaces.
             var ancestor: UIView? = probe

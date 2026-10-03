@@ -91,6 +91,8 @@ private struct PopoverScrollInteraction: UIViewRepresentable {
     final class Probe: UIView {
         var isPresented = true
         override func didMoveToWindow() { super.didMoveToWindow(); updateScrollView() }
+        override func layoutSubviews() { super.layoutSubviews(); updateScrollView() }
+        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { false }
         func updateScrollView() {
             var ancestor = superview
             while let view = ancestor {
@@ -407,6 +409,7 @@ public struct NibSheetHeader: View {
                 .buttonStyle(.plain)
                 .frame(minHeight: NibMetrics.hitTarget)
                 .keyboardShortcut(.cancelAction)
+                .nibNativeAction(onCancel)
             Text(title)
                 .font(NibFont.title3)
                 .foregroundStyle(NibColor.label)
@@ -417,6 +420,7 @@ public struct NibSheetHeader: View {
             if let primaryTitle {
                 NibButton(primaryTitle, kind: .primary, size: .compact, shortcut: .defaultAction, action: onPrimary)
                     .nibCommand(primaryCommand)
+                    .nibNativeAction(onPrimary)
                     .disabled(!isPrimaryEnabled)
             }
         }

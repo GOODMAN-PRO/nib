@@ -213,6 +213,7 @@ public struct NibToolButton: View {
         .accessibilityShowsLargeContentViewer {
             Label { Text(tool.label) } icon: { Image(nib: tool.symbol) }
         }
+        .nibNativeAction(action)
     }
 }
 
