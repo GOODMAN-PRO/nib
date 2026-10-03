@@ -15,7 +15,6 @@ final class CaptureUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         ui?.app.terminate()
-        XCUIDevice.shared.orientation = .portrait
     }
 
     private func variants(scenario: NibUI.FixtureScenario = .standard,
@@ -31,16 +30,13 @@ final class CaptureUITests: XCTestCase {
                     ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
                                               "-NibUITestAppearance", style,
                                               "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
-                    XCUIDevice.shared.orientation = .portrait
                     ui.app.launch()
-                    _ = try ui.waitForState { $0.screen == "library" }
-                    // Publish a populated accessibility layout, as NibUI.launchFixture does.
-                    XCUIDevice.shared.orientation = .landscapeLeft
-                    if direction == "portrait" { XCUIDevice.shared.orientation = .portrait }
-                    try wait("The scene must reach \(direction)") {
-                        let frame = self.ui.app.frame
-                        return direction == "portrait" ? frame.height > frame.width : frame.width > frame.height
-                    }
+                    _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
+                    ui.app.activate()
+                    // Rotate the foreground scene, then await its window geometry before
+                    // delivering another orientation. The application's union frame can
+                    // contain stale keyboard/system windows after a previous variant.
+                    try rotate(to: direction)
                     try body()
                 } catch {
                     let reason = "\(name) / \(style) / \(direction): \(error)"
@@ -52,6 +48,18 @@ final class CaptureUITests: XCTestCase {
                 }
                 ui.app.terminate()
             }
+        }
+    }
+
+    private func rotate(to direction: String) throws {
+        let target: UIDeviceOrientation = direction == "portrait" ? .portrait : .landscapeLeft
+        XCUIDevice.shared.orientation = target
+        try wait("The scene must reach \(direction)", timeout: 30) {
+            let window = self.ui.app.windows.firstMatch
+            guard window.exists else { return false }
+            let frame = window.frame
+            return frame.width > 0 && frame.height > 0 &&
+                (direction == "portrait" ? frame.height > frame.width : frame.width > frame.height)
         }
     }
 
