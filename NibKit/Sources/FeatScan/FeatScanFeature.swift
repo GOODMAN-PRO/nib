@@ -17,8 +17,7 @@ public enum FeatScanFeature: NibFeature {
         menus.register(MenuItemDescriptor(
             id: ScanMenus.newDocumentsID, title: String(localized: "Scan Document"), icon: NibSymbol.scan.name,
             location: .libraryNew, order: 700, owner: id, command: ScanDocuments.descriptor.id,
-            params: { ScanMenus.newNotebookParams($0) },
-            isVisible: { _ in ScanSupport.documentCamera }))
+            params: { ScanMenus.newNotebookParams($0) }))
         menus.register(MenuItemDescriptor(
             id: ScanMenus.newQRID, title: String(localized: "Scan QR Code"), icon: NibSymbol.qrCode.name,
             location: .libraryNew, order: 710, owner: id, command: ScanQR.descriptor.id,
