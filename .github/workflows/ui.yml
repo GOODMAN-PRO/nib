@@ -1,0 +1,290 @@
+name: UI tests
+run-name: UI ${{ inputs.label }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Space-separated NibUITests/Class[/method] identifiers; empty runs every class
+        type: string
+        required: false
+        default: ''
+      label:
+        description: Run label
+        type: string
+        required: false
+        default: ''
+      device:
+        description: Simulator device name prefix; the newest available match is booted (created if missing)
+        type: string
+        required: false
+        default: 'iPad Pro 13-inch'
+
+permissions:
+  contents: read
+
+env:
+  XCODE: /Applications/Xcode_26.6.app
+  HOMEBREW_NO_AUTO_UPDATE: 1
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Plan class shards
+        id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, pathlib, re
+          identifiers = os.environ['ONLY'].split()
+          if not identifiers:
+              identifiers = ['NibUITests/' + pathlib.Path(p).stem for p in sorted(glob.glob('NibUITests/*UITests.swift'))]
+          groups = {}
+          for identifier in identifiers:
+              if not re.fullmatch(r'NibUITests/[A-Za-z_][A-Za-z0-9_]*UITests(?:/[A-Za-z_][A-Za-z0-9_]*(?:\(\))?)?', identifier):
+                  raise SystemExit('Invalid UI test identifier: ' + identifier)
+              cls = identifier.split('/')[1]
+              if not pathlib.Path('NibUITests', cls + '.swift').is_file():
+                  raise SystemExit('Missing test class: ' + cls)
+              groups.setdefault(cls, set()).add(identifier)
+          if not groups:
+              raise SystemExit('No UI test classes found')
+          matrix = {'include': []}
+          for cls, selected in sorted(groups.items()):
+              if 'NibUITests/' + cls in selected:
+                  selected = {'NibUITests/' + cls}
+              matrix['include'].append({'class': cls, 'args': ['-only-testing:' + s for s in sorted(selected)]})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps(matrix, separators=(',', ':')) + '\n')
+          print(json.dumps(matrix, indent=2))
+          PY
+
+  ui:
+    needs: plan
+    runs-on: macos-26
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: UI / ${{ matrix.class }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Scripts/restore_mtimes.py reads the history
+
+      - name: Select Xcode 26.6
+        run: |
+          if [ ! -d "$XCODE" ]; then
+            echo "::error::$XCODE is not on this runner image any more; pick another Xcode 26.x in ios.yml (env.XCODE)"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Metal toolchain (NibDesign compiles Shaders/NibLiquid.metal; Xcode 26 ships it as a component)
+        run: xcrun metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Restore file times (keeps the restored DerivedData incremental)
+        run: |
+          python3 Scripts/restore_mtimes.py
+          defaults write com.apple.dt.XCBuild IgnoreFileSystemDeviceInodeChanges -bool YES
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-${{ hashFiles('NibKit/Package.swift') }}
+
+      - name: Restore DerivedData from main (read-only)
+        uses: actions/cache/restore@v4
+        with:
+          path: build/DerivedData
+          key: dd-x26.6-main-${{ hashFiles('NibKit/Package.swift', 'NibKit/Sources/**', 'NibKit/Tests/**') }}
+          restore-keys: dd-x26.6-main-
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate icons
+        run: swift Scripts/make_icons.swift
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Boot newest iOS 26 ${{ inputs.device || 'iPad Pro 13-inch' }}
+        id: sim
+        env:
+          DEVICE: ${{ inputs.device || 'iPad Pro 13-inch' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          def sim(*args):
+              return subprocess.check_output(['xcrun', 'simctl', *args], text=True)
+          runtimes = [r for r in json.loads(sim('list', 'runtimes', '-j'))['runtimes']
+                      if r.get('isAvailable') and r['identifier'].startswith('com.apple.CoreSimulator.SimRuntime.iOS-26-')]
+          if not runtimes:
+              raise SystemExit('No available iOS 26 runtime')
+          runtime = max(runtimes, key=lambda r: tuple(map(int, r['version'].split('.'))))
+          devices = json.loads(sim('list', 'devices', 'available', '-j'))['devices'].get(runtime['identifier'], [])
+          candidates = [d for d in devices if d['name'].startswith(os.environ['DEVICE'])]
+          if candidates:
+              device = sorted(candidates, key=lambda d: d['name'])[-1]
+              udid = device['udid']
+              booted = device['state'] == 'Booted'
+          else:
+              types = [d for d in json.loads(sim('list', 'devicetypes', '-j'))['devicetypes']
+                       if d['name'].startswith(os.environ['DEVICE'])]
+              if not types:
+                  raise SystemExit('No device type named ' + os.environ['DEVICE'])
+              device_type = sorted(types, key=lambda d: d['name'])[-1]
+              udid = sim('create', 'Nib UI ' + os.environ['DEVICE'], device_type['identifier'], runtime['identifier']).strip()
+              booted = False
+          if not booted:
+              sim('boot', udid)
+          subprocess.check_call(['xcrun', 'simctl', 'bootstatus', udid, '-b'])
+          print('Simulator:', udid, runtime['name'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('udid=' + udid + '\n')
+          PY
+
+      - name: Build and run UI tests
+        id: tests
+        continue-on-error: true
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+          ONLY_ARGS: ${{ toJSON(matrix.args) }}
+        run: |
+          python3 -u - <<'PY'
+          import json, os, subprocess, time
+          args = ['xcodebuild', 'test', '-project', 'Nib.xcodeproj', '-scheme', 'NibUITests',
+                  '-destination', 'id=' + os.environ['UDID'], '-derivedDataPath', 'build/DerivedData',
+                  '-clonedSourcePackagesDirPath', 'build/SourcePackages', '-skipPackagePluginValidation',
+                  '-parallel-testing-enabled', 'NO', *json.loads(os.environ['ONLY_ARGS']),
+                  '-resultBundlePath', 'ui.xcresult', 'CODE_SIGN_IDENTITY=-', 'CODE_SIGNING_REQUIRED=NO']
+          start = time.time()
+          test_start = None
+          with open('ui.log', 'w') as log:
+              process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+              for line in process.stdout:
+                  print(line, end='')
+                  log.write(line)
+                  if test_start is None and ('Testing started' in line or "Test Suite '" in line):
+                      test_start = time.time()
+              code = process.wait()
+          finish = time.time()
+          with open('timing.json', 'w') as output:
+              json.dump({'buildSeconds': (test_start or finish) - start,
+                         'testSeconds': finish - test_start if test_start else 0,
+                         'totalSeconds': finish - start}, output, indent=2)
+          with open('exit-code.txt', 'w') as output:
+              output.write(str(code))
+          raise SystemExit(code)
+          PY
+
+      - name: Summarize results
+        if: ${{ always() && steps.tests.outcome != 'skipped' }}
+        env:
+          TEST_CLASS: ${{ matrix.class }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          from urllib.parse import unquote, urlparse, parse_qs
+          cls = os.environ['TEST_CLASS']
+          errors = []
+          def result(command):
+              p = subprocess.run(['xcrun', 'xcresulttool', 'get', *command, '--path', 'ui.xcresult'], capture_output=True, text=True)
+              if p.returncode:
+                  errors.append(p.stderr.strip())
+                  return {}
+              return json.loads(p.stdout)
+          tests = result(['test-results', 'tests'])
+          summary = result(['test-results', 'summary'])
+          # The legacy issue records preserve file:line, which the new summary may omit.
+          legacy = subprocess.run(['xcrun', 'xcresulttool', 'get', 'object', '--legacy', '--format', 'json', '--path', 'ui.xcresult'],
+                                  capture_output=True, text=True)
+          issues = json.loads(legacy.stdout).get('issues', {}).get('testFailureSummaries', {}).get('_values', []) if legacy.returncode == 0 else []
+          def normalize(value):
+              value = re.sub(r'^-?\[([^ ]+) (.+)\]$', r'\1/\2', value)
+              value = value.removeprefix('NibUITests/').removeprefix('NibUITests.')
+              if value.startswith(cls + '.'):
+                  value = cls + '/' + value[len(cls) + 1:]
+              return value.replace('()', '')
+          locations = {}
+          for issue in issues:
+              key = normalize(issue.get('testCaseName', {}).get('_value', ''))
+              url = issue.get('documentLocationInCreatingWorkspace', {}).get('url', {}).get('_value', '')
+              parsed = urlparse(url)
+              line = parse_qs(parsed.fragment).get('StartingLineNumber', [''])[0]
+              location = unquote(parsed.path) + (':' + line if line else '')
+              if key and location:
+                  locations.setdefault(key, location)
+          messages = {}
+          for failure in summary.get('testFailures', []):
+              key = normalize(failure.get('testIdentifierString') or failure.get('testName', ''))
+              messages.setdefault(key, failure.get('failureText', 'Test failed'))
+          failures = {}
+          def walk(node):
+              if node.get('nodeType') == 'Test Case' and node.get('result') == 'Failed':
+                  key = normalize(node.get('nodeIdentifier', node['name']))
+                  if '/' not in key:
+                      key = cls + '/' + key
+                  def first_message(n):
+                      if n.get('nodeType') == 'Failure Message':
+                          return n.get('name') or n.get('details')
+                      return next((m for c in n.get('children', []) if (m := first_message(c))), None)
+                  failures.setdefault(key, messages.get(key) or first_message(node) or 'Test failed')
+              for child in node.get('children', []):
+                  walk(child)
+          for node in tests.get('testNodes', []):
+              walk(node)
+          for key, message in messages.items():
+              failures.setdefault(key, message)
+          report = {'class': cls, 'tests': summary.get('totalTestCount', 0), 'passed': summary.get('passedTests', 0),
+                    'failed': summary.get('failedTests', 0),
+                    'failures': [{'test': key, 'message': ' '.join(message.split()) + (', ' + locations[key] if key in locations else '')}
+                                 for key, message in failures.items()]}
+          pathlib.Path('summary.json').write_text(json.dumps(report, indent=2) + '\n')
+          code = int(pathlib.Path('exit-code.txt').read_text()) if pathlib.Path('exit-code.txt').exists() else -1
+          infra = bool(errors or not report['tests'] or (code != 0 and not report['failed']))
+          pathlib.Path('status.json').write_text(json.dumps({'infrastructureError': infra, 'xcodebuildExit': code, 'errors': errors}, indent=2))
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Zip result bundle
+        if: ${{ always() && steps.tests.outcome != 'skipped' }}
+        run: |
+          if [ -d ui.xcresult ]; then ditto -c -k --keepParent ui.xcresult ui.xcresult.zip; fi
+
+      - name: Upload UI results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-${{ matrix.class }}
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            summary.json
+            status.json
+            timing.json
+            ui.xcresult.zip
+            ui.log
+
+      - name: Fail if tests failed
+        if: ${{ always() && steps.tests.outcome != 'skipped' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          status = json.load(open('status.json'))
+          summary = json.load(open('summary.json'))
+          if status['infrastructureError']:
+              raise SystemExit('UI infrastructure/build error; see ui.log and status.json')
+          if summary['failed'] or status['xcodebuildExit']:
+              raise SystemExit('UI tests failed; see summary.json')
+          PY
