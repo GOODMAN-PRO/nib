@@ -624,6 +624,31 @@ final class FeatOutlineTests: XCTestCase {
 
     // MARK: Panel model
 
+    func testOutlineMenuKeepsItsSourceRowUntilDismissal() async throws {
+        let h = harness()
+        let model = OutlinePanelModel(app: h.app, session: h.session)
+        let controller = OutlineTableController(model: model)
+        let table = controller.tableView
+        table.frame = CGRect(x: 0, y: 0, width: 240, height: 600)
+        controller.update()
+        table.layoutIfNeeded()
+        let index = IndexPath(row: 0, section: 0)
+        let cell = try XCTUnwrap(table.cellForRow(at: index))
+        let configuration = try XCTUnwrap(controller.tableView(table, contextMenuConfigurationForRowAt: index, point: .zero))
+        controller.tableView(table, willDisplayContextMenu: configuration, animator: nil)
+        let originalTitle = cell.accessibilityLabel
+        try await h.run("outline.rename", ["entry": entryRef(Fixtures.outlineID), "title": "Updated while open"])
+        try await waitUntil { model.sections.flatMap(\.rows).contains { $0.title == "Updated while open" } }
+        controller.update()
+        XCTAssertTrue(table.cellForRow(at: index) === cell)
+        XCTAssertEqual(cell.accessibilityLabel, originalTitle)
+        controller.tableView(table, willEndContextMenuInteraction: configuration, animator: nil)
+        try await waitUntil {
+            table.layoutIfNeeded()
+            return table.cellForRow(at: index)?.accessibilityLabel == "Updated while open"
+        }
+    }
+
     func testHiddenOutlineActionRestoresBothSourcesWithoutChangingTheDocument() async throws {
         let h = harness()
         let pdf = FakePDFService()

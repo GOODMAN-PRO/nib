@@ -1015,6 +1015,14 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertFalse(SwipeSelection.mayBegin(velocity: CGPoint(x: 10, y: 100), heldDuration: 0.05, isDragging: false))
     }
 
+    func testStationarySelectionPanReleasesNativeDragBeforeMovement() {
+        let pan = PageSelectionPan()
+        XCTAssertEqual(pan.state, .possible)
+        pan.yieldStationaryHold()
+        XCTAssertEqual(pan.state, .failed, "A stationary hold must release UIKit's drag without waiting for movement")
+        pan.reset()
+    }
+
     func testThumbnailActivationAndTouchUseTheCollectionCell() async throws {
         let h = harness()
         let log = CallLog()

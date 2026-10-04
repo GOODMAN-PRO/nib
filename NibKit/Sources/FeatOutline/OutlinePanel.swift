@@ -696,6 +696,7 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
     private var showsThumbnails = false
     private var pendingDrop: OutlinePlacement?
     private var needsUpdate = false
+    private var presentingMenu = false
 
     init(model: OutlinePanelModel) {
         self.model = model
@@ -718,7 +719,7 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
     }
 
     func update() {
-        if tableView.hasActiveDrag || tableView.hasActiveDrop {
+        if tableView.hasActiveDrag || tableView.hasActiveDrop || presentingMenu {
             needsUpdate = true
             return
         }
@@ -841,6 +842,49 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
         return UIContextMenuConfiguration(identifier: row.id as NSString, previewProvider: nil) { [weak self] _ in
             self?.menu(for: entry)
         }
+    }
+
+    func tableView(_ tableView: UITableView, willDisplayContextMenu configuration: UIContextMenuConfiguration,
+                   animator: UIContextMenuInteractionAnimating?) {
+        presentingMenu = true
+    }
+
+    func tableView(_ tableView: UITableView, willEndContextMenuInteraction configuration: UIContextMenuConfiguration,
+                   animator: UIContextMenuInteractionAnimating?) {
+        let finished = { [weak self] in
+            self?.presentingMenu = false
+            self?.flushDeferredUpdate()
+        }
+        if let animator { animator.addCompletion(finished) } else { finished() }
+    }
+
+    func tableView(_ tableView: UITableView,
+                   previewForHighlightingContextMenuWithConfiguration configuration: UIContextMenuConfiguration) -> UITargetedPreview? {
+        menuPreview(configuration)
+    }
+
+    func tableView(_ tableView: UITableView,
+                   previewForDismissingContextMenuWithConfiguration configuration: UIContextMenuConfiguration) -> UITargetedPreview? {
+        menuPreview(configuration)
+    }
+
+    /// The table is transparent over the navigator's glass. Lift a bounded,
+    /// opaque snapshot of the row, rather than a live transparent cell whose
+    /// backdrop keeps participating in the system menu's lift animation.
+    func menuPreview(_ configuration: UIContextMenuConfiguration) -> UITargetedPreview? {
+        guard let id = configuration.identifier as? String,
+              let index = sections.enumerated().compactMap({ section, value in
+                  value.rows.firstIndex(where: { $0.id == id }).map { IndexPath(row: $0, section: section) }
+              }).first,
+              let cell = tableView.cellForRow(at: index),
+              let snapshot = cell.snapshotView(afterScreenUpdates: false) else { return nil }
+        let parameters = UIPreviewParameters()
+        parameters.backgroundColor = NibUIColor.backgroundSecondary
+        let path = UIBezierPath(roundedRect: cell.bounds, cornerRadius: NibRadius.sidebarRow)
+        parameters.visiblePath = path
+        parameters.shadowPath = path
+        return UITargetedPreview(view: snapshot, parameters: parameters,
+                                 target: UIPreviewTarget(container: tableView, center: cell.center))
     }
 
     /// Rename (asks for the title here), then every `MenuLocation.outlineEntry` item registered by features and

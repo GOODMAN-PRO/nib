@@ -90,6 +90,33 @@ struct ThumbnailLayoutMetrics: Equatable {
 
 // MARK: - Swipe to select (D-122)
 
+/// A stationary hold must release the pan's failure dependency *before* UIKit
+/// decides whether to lift a drag. Waiting for the first movement is too late:
+/// the collection view's drag recognizer has already lost that touch.
+final class PageSelectionPan: UIPanGestureRecognizer {
+    private var holdTimer: Timer?
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        holdTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.3, repeats: false) { [weak self] _ in
+            self?.yieldStationaryHold()
+        }
+        holdTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func yieldStationaryHold() {
+        if state == .possible { state = .failed }
+    }
+
+    override func reset() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        super.reset()
+    }
+}
+
 /// Select mode's swipe: starting on a thumbnail, sweeping across others selects them all (or deselects them all when
 /// the swipe started on a selected one), relative to the selection before the swipe, so sweeping back undoes.
 struct SwipeSelection {
@@ -325,7 +352,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var highlightedPages = Set<PageID>()
     private var deferredRefresh = false
     private var retryUpdate: Task<Void, Never>?
-    private let swipePan = UIPanGestureRecognizer()
+    private let swipePan = PageSelectionPan()
     private var swipeTouchBegan: TimeInterval = 0
     private var swipe: SwipeSelection?
     private var swipeLocation: CGPoint?
@@ -957,7 +984,10 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     // MARK: Swipe to select
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        if gestureRecognizer === swipePan { swipeTouchBegan = touch.timestamp }
+        if gestureRecognizer === swipePan {
+            swipeTouchBegan = touch.timestamp
+            return model.isSelecting
+        }
         return true
     }
 
