@@ -532,8 +532,10 @@ struct ShapeTapAt: NibCommand {
 /// moves with the shape; dropped outside, it is released. Pure planning; `ShapeContainerWatcher` applies it.
 enum ShapeContainers {
     static let containerKinds: Set<ShapeKind> = [.rectangle, .roundedRectangle, .ellipse, .triangle, .diamond, .polygon]
-    /// Commands that land items on a page without moving an existing record (drops from elsewhere).
-    static let dropCommands: Set<String> = [CommandIDs.itemMoveToPage, CommandIDs.clipboardPaste, CommandIDs.elementInsert]
+    /// Commands that land items on a page without moving an existing record. Drawing inside a
+    /// container has the same attachment semantics as dropping existing ink into it.
+    static let dropCommands: Set<String> = [CommandIDs.itemMoveToPage, CommandIDs.clipboardPaste,
+                                           CommandIDs.elementInsert, CommandIDs.inkAddStrokes]
     static let ignoredCommands: Set<String> = [CommandIDs.undo, CommandIDs.redo, CommandIDs.revertGroup]
 
     /// Items a user changeset moved (bounds changed) or dropped onto a page, per document and page.
