@@ -339,7 +339,8 @@ enum DropLoader {
 }
 
 /// A window-level drop target: files, folders and web links dragged from other apps onto the library or the page
-/// sidebar are imported (the dialog asks where). The canvas (F014) and the library's own drops claim theirs first,
+/// sidebar are imported. A library supplies the folder under the drop; elsewhere
+/// the dialog asks where. The canvas (F014) and the library's own drops claim theirs first,
 /// because UIKit offers a drop to the deepest view that accepts it.
 @MainActor
 final class ImportDropTarget: NSObject, UIDropInteractionDelegate {
@@ -373,13 +374,28 @@ final class ImportDropTarget: NSObject, UIDropInteractionDelegate {
     }
 
     func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
-        guard let app = app else { return }
+        guard let app, let window else { return }
         let providers = session.items.map { $0.itemProvider }
-        let navigator = window?.rootViewController as? SceneNavigator
-        Task { @MainActor in await ImportDropTarget.importDrop(providers, app: app, navigator: navigator) }
+        let navigator = window.rootViewController as? SceneNavigator
+        // Capture the destination before loading asynchronous providers. A person
+        // may navigate while Files prepares a large PDF or downloads it from iCloud.
+        let destination = Self.libraryDestination(in: navigator?.rootViewController,
+                                                  at: session.location(in: window))
+        Task { @MainActor in
+            await ImportDropTarget.importDrop(providers, app: app, navigator: navigator, destination: destination)
+        }
     }
 
-    static func importDrop(_ providers: [NSItemProvider], app: NibApp, navigator: SceneNavigator?) async {
+    static func libraryDestination(in controller: UIViewController?, at point: CGPoint) -> NodeRef? {
+        guard let controller, controller.presentedViewController == nil else { return nil }
+        if let library = controller as? LibraryImportDestinationProviding {
+            return library.libraryImportDestination(at: point)
+        }
+        return controller.children.lazy.compactMap { libraryDestination(in: $0, at: point) }.first
+    }
+
+    static func importDrop(_ providers: [NSItemProvider], app: NibApp, navigator: SceneNavigator?,
+                           destination: NodeRef? = nil) async {
         let dir = ImportLocations.scratch.appendingPathComponent("drop-" + UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -395,8 +411,22 @@ final class ImportDropTarget: NSObject, UIDropInteractionDelegate {
             return
         }
         do {
-            _ = try await app.bus.execute(Invocation(command: CommandIDs.importFiles, params: ["urls": .array(urls)],
-                                                     principal: .user, session: navigator?.session ?? app.services.sessions.active))
+            var params: JSONValue = ["urls": .array(urls)]
+            if let destination { params = params.merging(["folder": .string(destination.description)]) }
+            let session = navigator?.session ?? app.services.sessions.active
+            let result = try await app.bus.execute(Invocation(command: CommandIDs.importFiles, params: params,
+                                                              principal: .user, session: session))
+            // Explicit destinations do not show the import dialog that normally
+            // reveals its result. Keep the same single-document reveal for drops.
+            if destination != nil, let refs = result.value["refs"]?.arrayValue, refs.count == 1,
+               let ref = refs[0].stringValue, case .document? = NodeRef(ref) {
+                if let navigator {
+                    app.ui.activeNavigator = navigator
+                    app.services.sessions.activate(navigator.session)
+                }
+                _ = try await app.bus.execute(Invocation(command: CommandIDs.docOpen,
+                    params: ["doc": .string(ref)], principal: .user, session: session))
+            }
         } catch {
             ImportUI.report(NibError.wrap(error), navigator: navigator, app: app)
         }

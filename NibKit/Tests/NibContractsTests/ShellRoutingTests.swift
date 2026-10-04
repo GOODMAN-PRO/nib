@@ -6,6 +6,16 @@ import NibTesting
 /// and its ⌘Z / ⇧⌘Z fallback to the window's UndoManager (`UndoRoute`).
 @MainActor
 final class ShellRoutingTests: XCTestCase {
+    func testHardwareChordCombinesPhysicalKeyAndEventModifiersAndReleasesThem() {
+        var modifiers = HardwareKeyModifiers()
+        modifiers.began(.keyboardLeftControl)
+        modifiers.began(.keyboardRightGUI)
+        XCTAssertEqual(modifiers.combined(key: .shift, event: .alternate), [.control, .command, .shift, .alternate])
+        modifiers.ended(.keyboardLeftControl)
+        XCTAssertEqual(modifiers.combined(key: []), .command)
+        modifiers.reset()
+        XCTAssertTrue(modifiers.combined(key: []).isEmpty)
+    }
     func testModalOwnsFocusDuringPresentationEvenBeforeItsFieldIsReady() {
         for document in [false, true] {
             for focused in [false, true] {
@@ -32,6 +42,17 @@ final class ShellRoutingTests: XCTestCase {
     }
 
     private let library = KeyCommandContext(docKind: nil)
+    func testNativeCommandTableYieldsTextSelectionAndNavigationButKeepsGlobalChords() {
+        let descriptors = [
+            key("all", KeyShortcut("a", .command), scope: .library),
+            key("open", KeyShortcut("return"), scope: .library),
+            key("exit", KeyShortcut("escape"), scope: .library),
+            key("find", KeyShortcut("o", .command), scope: .global)
+        ]
+        XCTAssertEqual(KeyCommandRouting.nativeCommands(descriptors, in: library).map(\.id), descriptors.map(\.id))
+        let typing = KeyCommandContext(docKind: nil, isEditingText: true)
+        XCTAssertEqual(KeyCommandRouting.nativeCommands(descriptors, in: typing).map(\.id), ["find"])
+    }
     private let notebook = KeyCommandContext(docKind: .notebook)
     private let textDocument = KeyCommandContext(docKind: .textDocument)
     private let editingNotebookText = KeyCommandContext(docKind: .notebook, isEditingText: true)

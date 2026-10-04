@@ -7,11 +7,16 @@ import UIKit
 enum NibUIMultitasking {
     private static var configuredMode: String?
 
-    /// The runner's screen stays portrait on some XCTest versions. Orient its
-    /// physical bounds to the requested device orientation, never to the app
-    /// window (which could still be a narrow floating scene).
+    /// Read the system's accessibility display, not UIKit inside the test runner:
+    /// the runner can report a 768 x 1024 compatibility screen on a 13-inch iPad.
+    /// Orient the independent system bounds, never the app window being checked.
     static func assertFullScreen(_ app: XCUIApplication, timeout: TimeInterval = 30) throws {
-        let bounds = UIScreen.main.fixedCoordinateSpace.bounds
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let bounds = springboard.frame
+        guard bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0 else {
+            throw NibUI.Failure.message("SpringBoard must expose the physical display bounds: \(bounds)")
+        }
         let landscape = XCUIDevice.shared.orientation.isLandscape
         let short = min(bounds.width, bounds.height), long = max(bounds.width, bounds.height)
         let expected = CGRect(x: 0, y: 0, width: landscape ? long : short,

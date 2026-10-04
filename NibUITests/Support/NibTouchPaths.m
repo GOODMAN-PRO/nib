@@ -4,6 +4,8 @@
 
 // Dynamic lookup keeps SDK-private classes out of the app and gives a clear failure if XCTest changes its SPI.
 @interface NSObject (NibXCTestTouchSPI)
++ (id)sharedSession;
+- (BOOL)useLegacyEventCoordinateTransformationPath;
 - (instancetype)initForTouchAtPoint:(CGPoint)point offset:(NSTimeInterval)offset;
 - (instancetype)initWithName:(NSString *)name interfaceOrientation:(NSInteger)orientation;
 - (void)moveToPoint:(CGPoint)point atOffset:(NSTimeInterval)offset;
@@ -11,9 +13,26 @@
 - (void)addPointerEventPath:(id)path;
 - (id)eventSynthesizer;
 - (void)synthesizeEvent:(id)event completion:(void (^)(BOOL, NSError *))completion;
++ (id)deviceEventWithPage:(unsigned int)page usage:(unsigned int)usage duration:(double)duration;
+- (BOOL)performDeviceEvent:(id)event error:(NSError **)error;
 @end
 
 @implementation NibTouchPaths
++ (BOOL)pressKeyboardUsage:(unsigned int)usage error:(NSError **)error {
+    Class eventClass = NSClassFromString(@"XCDeviceEvent");
+    XCUIDevice *device = XCUIDevice.sharedDevice;
+    if (![eventClass respondsToSelector:@selector(deviceEventWithPage:usage:duration:)] ||
+        ![device respondsToSelector:@selector(performDeviceEvent:error:)]) {
+        if (error) *error = [NSError errorWithDomain:@"NibUITests" code:4
+            userInfo:@{NSLocalizedDescriptionKey: @"XCTest physical keyboard event synthesis is unavailable"}];
+        return NO;
+    }
+    // USB HID keyboard page, with both down and up supplied by XCTest. This
+    // follows the real hardware path; it never calls into the app or its commands.
+    id event = [eventClass deviceEventWithPage:0x07 usage:usage duration:0.05];
+    return [device performDeviceEvent:event error:error];
+}
+
 + (void)perform:(NSArray<NSArray<NSValue *> *> *)paths duration:(NSTimeInterval)duration
      completion:(void (^)(NSError *))completion {
     Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
@@ -33,9 +52,17 @@
         completion([NSError errorWithDomain:@"NibUITests" code:2 userInfo:@{NSLocalizedDescriptionKey: @"XCTest event synthesizer unavailable"}]);
         return;
     }
-    // Use XCTest screen points with the interface orientation corresponding to the device orientation.
-    NSInteger orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
-        device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    // Modern XCTest transforms screen points in the daemon. Supplying the
+    // interface rotation as well rotates them twice (a landscape centre becomes
+    // the portrait centre). Only the legacy event path needs that rotation.
+    NSInteger orientation = UIInterfaceOrientationPortrait;
+    Class sessionClass = NSClassFromString(@"XCTRunnerDaemonSession");
+    id session = [sessionClass respondsToSelector:@selector(sharedSession)] ? [sessionClass sharedSession] : nil;
+    if ([session respondsToSelector:@selector(useLegacyEventCoordinateTransformationPath)] &&
+        [session useLegacyEventCoordinateTransformationPath]) {
+        orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
+            device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    }
     id record = [[recordClass alloc] initWithName:@"Nib touch path" interfaceOrientation:orientation];
     NSTimeInterval settle = paths.count > 1 ? 0.1 : 0;
     NSUInteger finger = 0;
