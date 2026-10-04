@@ -9,6 +9,7 @@ final class CaptureUITests: XCTestCase {
     private var ui: NibUI!
     private var appearance = "light"
     private var orientation = "portrait"
+    private var windowed = false
     private let notebook = "Physics — Motion"
 
     override func setUpWithError() throws {
@@ -29,14 +30,20 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func variants(scenario: NibUI.FixtureScenario = .standard, onboarding: Bool = false, agent: Bool = false,
+                          emptyLibrary: Bool = false, windowed: Bool = false,
                           styles: [String] = ["light", "dark"],
                           _ body: () throws -> Void) {
         for style in styles {
             for direction in ["portrait", "landscape"] {
                 appearance = style
                 orientation = direction
+                self.windowed = windowed
                 ui = NibUI()
                 do {
+                    // On iPadOS 26 rotating a floating scene does not resize its
+                    // window. Use the public Settings mode before launching the
+                    // full-screen tour; windowed coverage is captured separately.
+                    try NibUIMultitasking.setWindowed(windowed)
                     // NibUI.launchFixture owns its launch arguments, so compose the same
                     // explicit fixture launch here and use its probe/navigation helpers.
                     ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
@@ -44,6 +51,7 @@ final class CaptureUITests: XCTestCase {
                                               "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
                     if onboarding { ui.app.launchArguments.append("-NibUITestOnboarding") }
                     if agent { ui.app.launchArguments.append("-NibUITestAgent") }
+                    if emptyLibrary { ui.app.launchArguments.append("-NibUITestEmptyLibrary") }
                     ui.app.launch()
                     if onboarding {
                         try wait("First-run fixture must finish preparing", timeout: 120) {
@@ -57,6 +65,7 @@ final class CaptureUITests: XCTestCase {
                     // delivering another orientation. The application's union frame can
                     // contain stale keyboard/system windows after a previous variant.
                     try rotate(to: direction)
+                    if !windowed { try NibUIMultitasking.assertFullScreen(ui.app) }
                     if !onboarding { try showDocuments() }
                     try body()
                 } catch {
@@ -77,6 +86,12 @@ final class CaptureUITests: XCTestCase {
         let reached: () -> Bool = {
             let window = self.ui.app.windows.firstMatch
             guard window.exists else { return false }
+            // A windowed scene is allowed its own aspect ratio. The variant
+            // describes device orientation, verified from the real screenshot.
+            if self.windowed {
+                let size = XCUIScreen.main.screenshot().image.size
+                return direction == "portrait" ? size.height > size.width : size.width > size.height
+            }
             let frame = window.frame
             return frame.width > 0 && frame.height > 0 &&
                 (direction == "portrait" ? frame.height > frame.width : frame.width > frame.height)
@@ -101,9 +116,12 @@ final class CaptureUITests: XCTestCase {
         }
     }
 
+    private func matchingPredicate(_ name: String) -> NSPredicate {
+        NSPredicate(format: "identifier == %@ OR label ==[c] %@ OR label BEGINSWITH[c] %@", name, name, name + ",")
+    }
+
     private func query(_ name: String) -> XCUIElementQuery {
-        ui.app.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == %@ OR label ==[c] %@ OR label BEGINSWITH[c] %@", name, name, name + ","))
+        ui.app.descendants(matching: .any).matching(matchingPredicate(name))
     }
 
     @discardableResult
@@ -121,11 +139,14 @@ final class CaptureUITests: XCTestCase {
 
     private func reachable(_ name: String, scroll: Bool = false) throws -> XCUIElement {
         let candidates = query(name)
+        let buttons = ui.app.buttons.matching(matchingPredicate(name))
+        let actionable: (XCUIElement) -> Bool = { self.hasVisibleFrame($0) && $0.isHittable && $0.isEnabled }
         for attempt in 0..<(scroll ? 10 : 2) {
-            let matches = candidates.allElementsBoundByIndex.filter { self.hasVisibleFrame($0) && $0.isHittable && $0.isEnabled }
-            if let target = matches.first(where: { $0.elementType == .button }) ?? matches.first {
-                return target
-            }
+            // Keep the same button-first choice, but stop once it is found.
+            // Asking every identically labelled ancestor for three AX properties
+            // costs minutes across the complete four-variant tour.
+            if let target = buttons.allElementsBoundByIndex.first(where: actionable) { return target }
+            if let target = candidates.allElementsBoundByIndex.first(where: actionable) { return target }
             if attempt == 0 {
                 let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
                     candidates.allElementsBoundByIndex.contains { self.hasVisibleFrame($0) && $0.isHittable && $0.isEnabled }
@@ -194,6 +215,9 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func showDocuments() throws {
+        // The regular-width library already opens on Documents. Re-selecting
+        // the same row adds a navigation transaction to every tour launch.
+        if query("New").allElementsBoundByIndex.contains(where: { $0.isHittable && $0.isEnabled }) { return }
         let row = ui.app.buttons.matching(identifier: "cmd.library.setView")
             .matching(NSPredicate(format: "label == 'Documents' OR label BEGINSWITH 'Documents,'")).firstMatch
         try wait("Library navigation must finish appearing", timeout: 30) {
@@ -226,20 +250,20 @@ final class CaptureUITests: XCTestCase {
         variants {
             if !self.query("App Menu").firstMatch.isHittable { try self.tap("Show Library") }
             _ = try self.require("App Menu")
-            try self.libraryCapture(6, "library-sidebar")
+            try self.libraryCapture(7, "library-sidebar")
             try self.showDocuments()
             _ = try self.require(self.notebook)
-            try self.libraryCapture(7, "library-grid")
+            try self.libraryCapture(8, "library-grid")
             try self.tap("Sort and View")
             _ = try self.require("List")
-            try self.libraryCapture(10, "library-sort-view-menu")
+            try self.libraryCapture(11, "library-sort-view-menu")
             try self.tap("List")
-            self.ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
+            self.ui.app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.07, dy: 0.10)).tap()
             _ = try self.require(self.notebook)
-            try self.libraryCapture(8, "library-list")
+            try self.libraryCapture(9, "library-list")
             try self.folder("Semester Notes")
             _ = try self.require("Lecture notes")
-            try self.libraryCapture(9, "open-folder")
+            try self.libraryCapture(10, "open-folder")
         }
     }
 
@@ -249,13 +273,13 @@ final class CaptureUITests: XCTestCase {
             let field = try self.searchField()
             self.focus(field); field.typeText("Physics")
             _ = try self.require(self.notebook)
-            try self.libraryCapture(12, "library-search")
-            self.focus(field); field.typeKey("a", modifierFlags: .command); field.typeText("No matching capture notebook")
+            try self.libraryCapture(13, "library-search")
+            self.focus(field); field.nibTypeKey("a", modifierFlags: .command); field.typeText("No matching capture notebook")
             try self.wait("Search must show no matching document") {
                 self.ui.app.staticTexts.matching(NSPredicate(
                     format: "label BEGINSWITH %@", "No results for “No matching capture notebook”")).firstMatch.exists
             }
-            try self.libraryCapture(13, "library-search-empty")
+            try self.libraryCapture(14, "library-search-empty")
         }
     }
 
@@ -263,10 +287,10 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.tap("New")
             _ = try self.require("Notebook")
-            try self.libraryCapture(23, "new-menu")
+            try self.libraryCapture(25, "new-menu")
             try self.tap("Notebook")
             _ = try self.require("New Notebook")
-            try self.capture(24, "new-notebook") { $0.screen == "library" && !$0.openPanels.isEmpty }
+            try self.capture(26, "new-notebook") { $0.screen == "library" && !$0.openPanels.isEmpty }
         }
     }
 
@@ -287,7 +311,7 @@ final class CaptureUITests: XCTestCase {
         case "top": destination = CGVector(dx: 0.5, dy: 0.12)
         default: destination = CGVector(dx: 0.5, dy: 0.94)
         }
-        start.press(forDuration: 0.15, thenDragTo: ui.app.coordinate(withNormalizedOffset: destination),
+        start.press(forDuration: 0.15, thenDragTo: ui.app.windows.firstMatch.coordinate(withNormalizedOffset: destination),
                     withVelocity: .slow, thenHoldForDuration: 0.3)
         _ = try ui.waitForState(timeout: 30) { $0.paletteDock?.edge == edge }
     }
@@ -303,7 +327,7 @@ final class CaptureUITests: XCTestCase {
     private func canvasPalette(styles: [String]) {
         variants(styles: styles) {
             try self.openNotebook()
-            for (number, edge) in UIDevice.current.userInterfaceIdiom == .pad ? [(30, "left"), (31, "top"), (32, "bottom")] : [(31, "top"), (32, "bottom")] {
+            for (number, edge) in UIDevice.current.userInterfaceIdiom == .pad ? [(32, "left"), (33, "top"), (34, "bottom")] : [(33, "top"), (34, "bottom")] {
                 try self.dock(edge)
                 try self.wait("Palette controls must be visible at the \(edge) dock") {
                     let frame = self.query("Tools").firstMatch.frame
@@ -318,7 +342,7 @@ final class CaptureUITests: XCTestCase {
             }
             try self.ui.selectTool("pen")
             _ = try self.require("menu.toolSettings")
-            try self.capture(33, "options-bar") { $0.screen == "document" && $0.tool == "pen" }
+            try self.capture(35, "options-bar") { $0.screen == "document" && $0.tool == "pen" }
         }
     }
 
@@ -334,12 +358,12 @@ final class CaptureUITests: XCTestCase {
         }
     }
 
-    func test05PenOptions() { toolOptions("pen", title: "Fountain Pen", number: 35) }
-    func test06HighlighterOptions() { toolOptions("highlighter", title: "Straight line", number: 37) }
-    func test07EraserOptions() { toolOptions("eraser", title: "Whole stroke", number: 38) }
-    func test08LassoOptions() { toolOptions("lasso", title: "Lasso type", number: 39) }
-    func test09ShapesOptions() { toolOptions("shape", title: "Rectangle", number: 40) }
-    func test10TextOptions() { toolOptions("text", title: "Save Style…", number: 41) }
+    func test05PenOptions() { toolOptions("pen", title: "Fountain Pen", number: 38) }
+    func test06HighlighterOptions() { toolOptions("highlighter", title: "Straight line", number: 40) }
+    func test07EraserOptions() { toolOptions("eraser", title: "Whole stroke", number: 41) }
+    func test08LassoOptions() { toolOptions("lasso", title: "Lasso type", number: 42) }
+    func test09ShapesOptions() { toolOptions("shape", title: "Rectangle", number: 43) }
+    func test10TextOptions() { toolOptions("text", title: "Save Style…", number: 44) }
 
     func test11LassoSelection() {
         variants {
@@ -354,7 +378,7 @@ final class CaptureUITests: XCTestCase {
                                     CGPoint(x: 0.36, y: 0.54)], duration: 0.7)
             _ = try self.ui.waitForState { $0.selectionCount > 0 }
             _ = try self.require("cmd.item.duplicate")
-            try self.capture(50, "lasso-object-menu") { $0.screen == "document" && $0.selectionCount > 0 }
+            try self.capture(53, "lasso-object-menu") { $0.screen == "document" && $0.selectionCount > 0 }
         }
     }
 
@@ -362,13 +386,13 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.ui.tapCommand("sidebar.toggle")
-            try self.capture(55, "page-sidebar") { $0.openPanels.contains("sidebar.pages") }
+            try self.capture(58, "page-sidebar") { $0.openPanels.contains("sidebar.pages") }
             try self.tap("Outline")
             _ = try self.require("No outline yet")
-            try self.capture(56, "outline") { $0.openPanels.contains("outline.tab") }
+            try self.capture(59, "outline") { $0.openPanels.contains("outline.tab") }
             try self.tap("Bookmarks")
             _ = try self.require("No bookmarks")
-            try self.documentCapture(57, "bookmarks-empty")
+            try self.documentCapture(60, "bookmarks-empty")
         }
     }
 
@@ -382,15 +406,15 @@ final class CaptureUITests: XCTestCase {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
                     format: "label BEGINSWITH 'Search result ' AND label CONTAINS ' of '")).firstMatch.exists
             }
-            try self.documentCapture(61, "document-search-matches")
-            self.focus(field); field.typeKey("a", modifierFlags: .command); field.typeText("zzzznomatch")
+            try self.documentCapture(64, "document-search-matches")
+            self.focus(field); field.nibTypeKey("a", modifierFlags: .command); field.typeText("zzzznomatch")
             try self.wait("Document search must clear its matches") {
                 self.ui.app.staticTexts.matching(NSPredicate(
                     format: "label BEGINSWITH %@", "No results for “zzzznomatch”")).firstMatch.exists
                     && !self.ui.app.descendants(matching: .any).matching(NSPredicate(
                         format: "label BEGINSWITH 'Search result ' AND label CONTAINS ' of '")).firstMatch.exists
             }
-            try self.documentCapture(62, "document-search-empty")
+            try self.documentCapture(65, "document-search-empty")
         }
     }
 
@@ -398,7 +422,7 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.tap("Assistant")
-            try self.capture(65, "ai-assistant") { $0.openPanels.contains("aichat.panel") }
+            try self.capture(71, "ai-assistant") { $0.openPanels.contains("aichat.panel") }
         }
     }
 
@@ -423,21 +447,21 @@ final class CaptureUITests: XCTestCase {
             try self.settings()
             try self.openSettingsPage("Plugins")
             _ = try self.require("Install from…")
-            try self.libraryCapture(123, "plugin-manager")
+            try self.libraryCapture(129, "plugin-manager")
         }
     }
 
     func test16Settings() {
         variants {
             try self.settings()
-            try self.libraryCapture(90, "settings-general")
+            try self.libraryCapture(96, "settings-general")
             try self.openSettingsPage("Document Editing")
             _ = try self.require("Open documents in tabs")
-            try self.libraryCapture(101, "settings-editing")
+            try self.libraryCapture(107, "settings-editing")
             try self.closeSettings()
             try self.settings()
             try self.openSettingsPage("Stylus & Palm Rejection")
-            try self.libraryCapture(109, "settings-stylus")
+            try self.libraryCapture(115, "settings-stylus")
         }
     }
 
@@ -448,23 +472,23 @@ final class CaptureUITests: XCTestCase {
             // The share menu contains the production export action; open the format sheet.
             try self.ui.tapCommand("export.present")
             _ = try self.require("Save to Files")
-            try self.documentCapture(67, "export-sheet")
+            try self.documentCapture(73, "export-sheet")
             if !self.query("Images").allElementsBoundByIndex.contains(where: { self.hasVisibleFrame($0) && $0.isHittable }) {
                 try self.tap("PDF")
             }
             try self.tap("Images")
             _ = try self.require("PNG")
-            try self.documentCapture(68, "export-images")
+            try self.documentCapture(74, "export-images")
             try self.tap("Print…", scroll: true)
             _ = try self.require("Print")
-            try self.documentCapture(69, "print-options")
+            try self.documentCapture(75, "print-options")
         }
     }
 
     func test18Whiteboard() {
         variants {
             try self.openDocument("Concept map")
-            try self.capture(79, "whiteboard") { $0.screen == "document" && $0.itemCountOnPage == 3 }
+            try self.capture(85, "whiteboard") { $0.screen == "document" && $0.itemCountOnPage == 3 }
         }
     }
 
@@ -476,7 +500,7 @@ final class CaptureUITests: XCTestCase {
                     format: "value CONTAINS %@ OR label CONTAINS %@", "Measure distance and time", "Measure distance and time"
                 )).firstMatch.exists
             }
-            try self.documentCapture(81, "text-document")
+            try self.documentCapture(87, "text-document")
         }
     }
 
@@ -484,13 +508,13 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openDocument("Motion flashcards")
             _ = try self.require("Practice")
-            try self.documentCapture(84, "study-set-editor")
+            try self.documentCapture(90, "study-set-editor")
             try self.tap("Practice")
             _ = try self.require("Question side")
-            try self.capture(85, "study-session-front") { $0.openPanels.contains("studysession.practice") }
+            try self.capture(91, "study-session-front") { $0.openPanels.contains("studysession.practice") }
             try self.tap("Question side")
             _ = try self.require("Answer side")
-            try self.documentCapture(86, "study-session-back")
+            try self.documentCapture(92, "study-session-back")
             for card in 0..<3 {
                 if card > 0 {
                     try self.tap("Question side")
@@ -499,7 +523,7 @@ final class CaptureUITests: XCTestCase {
                 try self.tap("Good")
             }
             _ = try self.require("Review complete")
-            try self.documentCapture(87, "study-session-summary")
+            try self.documentCapture(93, "study-session-summary")
         }
     }
 
@@ -510,11 +534,11 @@ final class CaptureUITests: XCTestCase {
             if self.query("Presenter Page").firstMatch.exists {
                 try self.tap("Presenter Page", scroll: true)
                 _ = try self.require("Stop Presenting")
-                try self.documentCapture(70, "presentation-mode")
+                try self.documentCapture(76, "presentation-mode")
             } else {
                 XCTAssertFalse(self.query("Full Page").firstMatch.exists)
                 XCTAssertFalse(self.query("Stop Presenting").firstMatch.exists)
-                try self.documentCapture(70, "presentation-disconnected-share-menu")
+                try self.documentCapture(76, "presentation-disconnected-share-menu")
             }
         }
     }
@@ -537,7 +561,7 @@ final class CaptureUITests: XCTestCase {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
                     format: "value == 'Tab 3 of 3' OR value == '3 open documents'")).firstMatch.exists
             }
-            try self.documentCapture(51, "three-document-tabs")
+            try self.documentCapture(54, "three-document-tabs")
         }
     }
 
@@ -545,7 +569,7 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.tap("New"); try self.tap("New Folder")
             _ = try self.ui.waitForState { $0.openPanels.contains("organize.folder.new") }
-            try self.libraryCapture(14, "new-folder")
+            try self.libraryCapture(15, "new-folder")
             let field = self.ui.app.textFields["Folder name"]
             guard field.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("Folder name field missing") }
             self.focus(field); field.typeText("Review Inbox")
@@ -555,7 +579,7 @@ final class CaptureUITests: XCTestCase {
             try self.wait("The new folder must contain no documents") {
                 self.ui.app.descendants(matching: .any).matching(identifier: "cmd.doc.open").count == 0
             }
-            try self.libraryCapture(15, "empty-folder")
+            try self.libraryCapture(16, "empty-folder")
         }
     }
 
@@ -563,7 +587,7 @@ final class CaptureUITests: XCTestCase {
         variants(scenario: .failedRender) {
             try self.openNotebook()
             _ = try self.require("Try Again")
-            try self.capture(72, "page-render-error") {
+            try self.capture(78, "page-render-error") {
                 $0.screen == "document" && $0.fixtureScenario == "failedRender" && $0.renderFailureCount == 1
             }
         }
@@ -578,7 +602,7 @@ final class CaptureUITests: XCTestCase {
         let back = ui.app.navigationBars.buttons["Settings"].firstMatch
         if back.isHittable { back.tap() }
         let field = try searchField()
-        self.focus(field); field.typeKey("a", modifierFlags: .command); field.typeText(title)
+        self.focus(field); field.nibTypeKey("a", modifierFlags: .command); field.typeText(title)
         try tap(title, scroll: true)
         try wait("Settings must open \(title)") {
             self.ui.app.navigationBars[title].exists
@@ -603,7 +627,7 @@ final class CaptureUITests: XCTestCase {
             _ = try self.require(self.notebook)
             document.press(forDuration: 1)
             _ = try self.require("Rename")
-            try self.libraryCapture(11, "library-document-context-menu")
+            try self.libraryCapture(12, "library-document-context-menu")
         }
     }
 
@@ -611,10 +635,10 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.tap("New"); try self.tap("Notebook")
             _ = try self.reachable("No cover", scroll: true)
-            try self.libraryCapture(25, "new-notebook-covers")
+            try self.libraryCapture(27, "new-notebook-covers")
             try self.tap("More Templates…", scroll: true)
             _ = try self.require("Choose Paper")
-            try self.libraryCapture(26, "paper-template-library")
+            try self.libraryCapture(28, "paper-template-library")
         }
     }
 
@@ -635,16 +659,16 @@ final class CaptureUITests: XCTestCase {
             try self.libraryCapture(number, stem)
         }
     }
-    func test27CreateWhiteboard() { creation("Whiteboard", heading: "New Whiteboard", number: 27, stem: "new-whiteboard") }
-    func test28CreateTextDocument() { creation("Text Document", heading: "New Text Document", number: 28, stem: "new-text-document") }
-    func test29CreateStudySet() { creation("Study Set", heading: "New Study Set", number: 29, stem: "new-study-set") }
+    func test27CreateWhiteboard() { creation("Whiteboard", heading: "New Whiteboard", number: 29, stem: "new-whiteboard") }
+    func test28CreateTextDocument() { creation("Text Document", heading: "New Text Document", number: 30, stem: "new-text-document") }
+    func test29CreateStudySet() { creation("Study Set", heading: "New Study Set", number: 31, stem: "new-study-set") }
 
     func test30StickyNote() {
         variants {
             try self.openNotebook(); try self.ui.selectTool("sticky")
             try self.tap("menu.toolSettings")
             _ = try self.require("Sign notes as")
-            try self.documentCapture(43, "sticky-note-options")
+            try self.documentCapture(46, "sticky-note-options")
             self.ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
             try self.wait("Sticky settings must close before inserting a note") {
                 !self.query("Sign notes as").firstMatch.exists
@@ -653,7 +677,7 @@ final class CaptureUITests: XCTestCase {
             let editor = self.ui.app.textViews["Sticky note"]
             guard editor.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("Sticky editor missing") }
             self.focus(editor); editor.typeText("Review Newton’s second law")
-            try self.documentCapture(44, "sticky-note-editor")
+            try self.documentCapture(47, "sticky-note-editor")
         }
     }
 
@@ -662,7 +686,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook(); try self.ui.selectTool("image")
             self.ui.coordinate(CGPoint(x: 0.5, y: 0.6)).tap()
             _ = try self.require("Files")
-            try self.documentCapture(45, "image-source-picker")
+            try self.documentCapture(48, "image-source-picker")
         }
     }
 
@@ -670,10 +694,10 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook(); try self.ui.tapCommand("ruler.set")
             let ruler = try self.require("Ruler")
-            try self.documentCapture(48, "ruler")
+            try self.documentCapture(51, "ruler")
             ruler.doubleTap()
             _ = try self.require("Set Angle…")
-            try self.documentCapture(49, "ruler-menu")
+            try self.documentCapture(52, "ruler-menu")
         }
     }
 
@@ -681,17 +705,17 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook(); try self.ui.tapCommand("zoom.toggle")
             _ = try self.require("Zoom Window writing area")
-            try self.documentCapture(52, "zoom-window")
+            try self.documentCapture(55, "zoom-window")
             try self.tap("Close Zoom Window")
             try self.tap("tool.lasso")
             _ = try self.ui.waitForState { $0.tool == "lasso" }
             let initial = try self.ui.state().zoom
             try self.ui.pinchZoom(scale: 1.5)
             let zoomed = try self.ui.waitForState { $0.zoom > initial + 0.05 }
-            try self.documentCapture(53, "canvas-zoomed-in")
+            try self.documentCapture(56, "canvas-zoomed-in")
             try self.ui.pinchZoom(scale: 0.4)
             _ = try self.ui.waitForState { $0.zoom < zoomed.zoom - 0.05 }
-            try self.documentCapture(54, "canvas-zoomed-out")
+            try self.documentCapture(57, "canvas-zoomed-out")
         }
     }
 
@@ -710,7 +734,7 @@ final class CaptureUITests: XCTestCase {
             guard page.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("First thumbnail missing") }
             page.press(forDuration: 1)
             _ = try self.require("Duplicate")
-            try self.documentCapture(58, "page-context-menu")
+            try self.documentCapture(61, "page-context-menu")
         }
     }
 
@@ -719,7 +743,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook(); try self.tap("menu.more")
             try self.tap("Go to Page…", scroll: true)
             _ = try self.require("Page number or title")
-            try self.documentCapture(59, "go-to-page")
+            try self.documentCapture(62, "go-to-page")
         }
     }
 
@@ -728,7 +752,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook(); try self.ui.selectTool("eraser")
             try self.tap("menu.toolSettings"); try self.tap("Clear Page", scroll: true)
             _ = try self.require("eraser.clearPage.confirmation")
-            try self.documentCapture(60, "clear-page-confirmation")
+            try self.documentCapture(63, "clear-page-confirmation")
         }
     }
 
@@ -741,51 +765,51 @@ final class CaptureUITests: XCTestCase {
             try self.wait("The real agent must display the fixture model answer", timeout: 60) {
                 self.ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Velocity is displacement per unit time'")).firstMatch.exists
             }
-            try self.capture(66, "ai-assistant-answer") { $0.openPanels.contains("aichat.panel") }
+            try self.capture(72, "ai-assistant-answer") { $0.openPanels.contains("aichat.panel") }
         }
     }
 
     func test38SettingsGeneralPages() {
-        settingsPages([(91,"Profile","profile"), (92,"Appearance","appearance"), (93,"Password Protection","password")])
+        settingsPages([(97,"Profile","profile"), (98,"Appearance","appearance"), (99,"Password Protection","password")])
     }
     func test38SettingsGeneralPagesPart2() {
-        settingsPages([(94,"Accessibility","accessibility"), (95,"Language","language"), (96,"Recording Settings","recording")])
+        settingsPages([(100,"Accessibility","accessibility"), (101,"Language","language"), (102,"Recording Settings","recording")])
     }
     func test38SettingsGeneralPagesPart3() {
-        settingsPages([(97,"Keyboard and Pointer","keyboard"), (98,"Calendar","calendar"), (99,"Collaboration","collaboration")])
+        settingsPages([(103,"Keyboard and Pointer","keyboard"), (104,"Calendar","calendar"), (105,"Collaboration","collaboration")])
     }
     func test38SettingsGeneralPagesPart4() {
-        settingsPages([(100,"Notifications","notifications")])
+        settingsPages([(106,"Notifications","notifications")])
     }
     func test39SettingsEditingPages() {
-        settingsPages([(102,"Tabs","tabs"), (103,"Toolbar","toolbar"), (104,"Undo and Redo","undo")])
+        settingsPages([(108,"Tabs","tabs"), (109,"Toolbar","toolbar"), (110,"Undo and Redo","undo")])
     }
     func test39SettingsEditingPagesPart2() {
-        settingsPages([(105,"Alignment and snapping","snapping"), (106,"Elements and GIFs","elements"), (107,"Layers","layers")])
+        settingsPages([(111,"Alignment and snapping","snapping"), (112,"Elements and GIFs","elements"), (113,"Layers","layers")])
     }
     func test40SettingsWritingPages() {
-        settingsPages([(108,"Apple Pencil","apple-pencil"), (110,"Smart Ink","smart-ink"), (111,"Handwriting Recognition","recognition")])
+        settingsPages([(114,"Apple Pencil","apple-pencil"), (116,"Smart Ink","smart-ink"), (117,"Handwriting Recognition","recognition")])
     }
     func test40SettingsWritingPagesPart2() {
-        settingsPages([(112,"Shape Recognition","shape-recognition"), (113,"Writing Aids","writing-aids")])
+        settingsPages([(118,"Shape Recognition","shape-recognition"), (119,"Writing Aids","writing-aids")])
     }
     func test41SettingsAIPages() {
-        settingsPages([(114,"AI","ai"), (115,"Use my Claude subscription","claude-subscription"), (116,"Use my ChatGPT subscription","chatgpt-subscription")])
+        settingsPages([(120,"AI","ai"), (121,"Use my Claude subscription","claude-subscription"), (122,"Use my ChatGPT subscription","chatgpt-subscription")])
     }
     func test41SettingsAIPagesPart2() {
-        settingsPages([(117,"Add provider","other-provider"), (118,"Meeting AI","meeting-ai")])
+        settingsPages([(123,"Add provider","other-provider"), (124,"Meeting AI","meeting-ai")])
     }
     func test42SettingsSyncPages() {
-        settingsPages([(119,"Backup","backup"), (120,"WebDAV","webdav"), (121,"Collaboration Relay","relay")])
+        settingsPages([(125,"Backup","backup"), (126,"WebDAV","webdav"), (127,"Collaboration Relay","relay")])
     }
     func test42SettingsSyncPagesPart2() {
-        settingsPages([(122,"Library Repair","repair"), (124,"Bridge","bridge")])
+        settingsPages([(128,"Library Repair","repair"), (130,"Bridge","bridge")])
     }
     func test43SettingsAboutPages() {
-        settingsPages([(125,"Troubleshooting","troubleshooting"), (126,"Developer","developer"), (127,"About Nib","about")])
+        settingsPages([(131,"Troubleshooting","troubleshooting"), (132,"Developer","developer"), (133,"About Nib","about")])
     }
     func test43SettingsAboutPagesPart2() {
-        settingsPages([(128,"Privacy & Data","privacy"), (129,"Goodnotes Parity","parity")])
+        settingsPages([(134,"Privacy & Data","privacy"), (135,"Goodnotes Parity","parity")])
     }
 
     func test44FirstRun() {
@@ -819,20 +843,20 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.tap("tool.more")
             _ = try self.require("tool.tape")
-            try self.documentCapture(34, "more-tools")
+            try self.documentCapture(37, "more-tools")
             try self.tap("tool.tape", scroll: true)
             _ = try self.ui.waitForState { $0.tool == "tape" }
             try self.tap("menu.toolSettings")
             _ = try self.require("Pattern")
-            try self.documentCapture(42, "tape-options")
+            try self.documentCapture(45, "tape-options")
             self.ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
             try self.ui.selectTool("pencil"); try self.tap("menu.toolSettings")
             _ = try self.require("Pencil")
-            try self.documentCapture(36, "pencil-options")
+            try self.documentCapture(39, "pencil-options")
             self.ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
             try self.ui.selectTool("laser"); try self.tap("menu.toolSettings")
             _ = try self.require("Laser mode")
-            try self.documentCapture(47, "laser-options")
+            try self.documentCapture(50, "laser-options")
         }
     }
 
@@ -841,14 +865,14 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook(); try self.ui.selectTool("elements")
             try self.tap("tool.elements")
             _ = try self.require("Search elements")
-            try self.documentCapture(46, "elements-library")
+            try self.documentCapture(49, "elements-library")
         }
     }
 
     func test47LibraryCollections() {
         variants {
-            for (number, title, stem) in [(16,"Favourites","favourites"), (17,"Shared","shared"),
-                    (18,"Recents","recents"), (19,"Study Sets","study-sets"), (20,"Gallery","gallery"), (21,"Trash","trash-empty"), (22,"Calendar","calendar")] {
+            for (number, title, stem) in [(17,"Favourites","favourites"), (18,"Shared","shared"),
+                    (19,"Recents","recents"), (20,"Study Sets","study-sets"), (21,"Gallery","gallery"), (22,"Trash","trash-empty"), (23,"Calendar","calendar")] {
                 let row = self.ui.app.buttons.matching(identifier: "cmd.library.setView")
                     .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
                 if !self.query("App Menu").firstMatch.isHittable { try self.tap("Show Library") }
@@ -874,11 +898,11 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook(); try self.tap("menu.title")
             _ = try self.require("Rename")
-            try self.documentCapture(63, "document-title-menu")
+            try self.documentCapture(66, "document-title-menu")
             self.ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
             try self.tap("menu.more")
             _ = try self.require("Go to Page…")
-            try self.documentCapture(64, "document-more-menu")
+            try self.documentCapture(67, "document-more-menu")
         }
     }
 
@@ -887,7 +911,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook(); try self.tap("menu.title")
             try self.tap("Collaborators", scroll: true)
             _ = try self.require("Share Live")
-            try self.documentCapture(71, "collaboration-share-live")
+            try self.documentCapture(77, "collaboration-share-live")
         }
     }
 
@@ -895,7 +919,7 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openDocument("Concept map")
             try self.tap("tool.more"); try self.tap("Templates", scroll: true)
-            try self.capture(80, "whiteboard-templates") { $0.openPanels.contains("whiteboard.templates") }
+            try self.capture(86, "whiteboard-templates") { $0.openPanels.contains("whiteboard.templates") }
         }
     }
 
@@ -904,7 +928,7 @@ final class CaptureUITests: XCTestCase {
             try self.openDocument("Motion flashcards"); try self.tap("Practice")
             try self.tap("Study options")
             _ = try self.require("Appearance and reminders")
-            try self.documentCapture(88, "study-options")
+            try self.documentCapture(94, "study-options")
         }
     }
 
@@ -912,7 +936,7 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openDocument("Motion flashcards"); try self.tap("Smart Learn")
             _ = try self.require("Question side")
-            try self.capture(89, "study-smart-learn") { $0.openPanels.contains("studysession.smartLearn") }
+            try self.capture(95, "study-smart-learn") { $0.openPanels.contains("studysession.smartLearn") }
         }
     }
 
@@ -922,12 +946,12 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook(); try self.ui.tapCommand("sidebar.toggle")
             try self.tap("Panel Options"); try self.tap("Audio")
             _ = try self.require("No recordings yet")
-            try self.capture(73, "audio-empty") { $0.openPanels.contains("audio") }
+            try self.capture(79, "audio-empty") { $0.openPanels.contains("audio") }
             try self.tap("menu.more"); try self.tap("Transcript", scroll: true)
             _ = try self.ui.waitForState { $0.openPanels.contains("transcription") }
             _ = try self.require("Transcript")
             _ = try self.require("No recordings yet")
-            try self.capture(78, "transcript-empty") { $0.openPanels.contains("transcription") }
+            try self.capture(84, "transcript-empty") { $0.openPanels.contains("transcription") }
         }
     }
 
@@ -942,7 +966,7 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook(); try self.ui.tapCommand("audio.record")
             if !self.query("Pause Recording").firstMatch.isHittable {
-                self.ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+                self.ui.app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
             }
             _ = try self.require("Pause Recording")
             let timer = self.ui.app.descendants(matching: .any)
@@ -951,10 +975,10 @@ final class CaptureUITests: XCTestCase {
             try self.wait("The real recording timer must advance", timeout: 15) {
                 timer.value as? String != initial
             }
-            try self.documentCapture(74, "audio-recording")
+            try self.documentCapture(80, "audio-recording")
             try self.tap("Pause Recording")
             _ = try self.require("Resume Recording")
-            try self.documentCapture(75, "audio-recording-paused")
+            try self.documentCapture(81, "audio-recording-paused")
             try self.tap("Stop Recording")
             try self.ui.tapCommand("sidebar.toggle"); try self.tap("Panel Options"); try self.tap("Audio")
             let clips = self.ui.app.buttons.matching(NSPredicate(
@@ -962,10 +986,10 @@ final class CaptureUITests: XCTestCase {
             try self.wait("The saved clip must appear in Audio") {
                 clips.allElementsBoundByIndex.contains { $0.isHittable }
             }
-            try self.capture(76, "audio-recordings") { $0.openPanels.contains("audio") }
+            try self.capture(82, "audio-recordings") { $0.openPanels.contains("audio") }
             try XCTUnwrap(clips.allElementsBoundByIndex.first { $0.isHittable }).tap()
             _ = try self.require("Playback position")
-            try self.documentCapture(77, "audio-playback")
+            try self.documentCapture(83, "audio-playback")
         }
     }
 
@@ -980,11 +1004,50 @@ final class CaptureUITests: XCTestCase {
             }
             self.focus(paragraph); paragraph.typeText(" /")
             _ = try self.require("Blocks")
-            try self.documentCapture(82, "text-document-slash-menu")
+            try self.documentCapture(88, "text-document-slash-menu")
             self.ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-            self.ui.app.typeKey("t", modifierFlags: .command)
+            self.ui.app.nibTypeKey("t", modifierFlags: .command)
             _ = try self.require("Turn Into")
-            try self.documentCapture(83, "text-document-turn-into")
+            try self.documentCapture(89, "text-document-turn-into")
+        }
+    }
+
+    func test56EmptyLibrary() {
+        variants(emptyLibrary: true) {
+            _ = try self.require("No notebooks yet")
+            _ = try self.reachable("New Notebook")
+            try self.libraryCapture(6, "library-empty")
+        }
+    }
+
+    func test57WindowedLibraryAndEditor() {
+        // iPhone has no Windowed Apps mode. Exercise its compact counterpart
+        // explicitly, with truthful names, rather than passing an empty test.
+        let windowed = UIDevice.current.userInterfaceIdiom == .pad
+        variants(windowed: windowed) {
+            _ = try self.reachable("New")
+            try self.libraryCapture(24, windowed ? "library-windowed" : "library-compact")
+            try self.openNotebook()
+            _ = try self.reachable("tool.pen")
+            _ = try self.reachable("menu.more")
+            try self.documentCapture(36, windowed ? "editor-windowed" : "editor-compact")
+        }
+    }
+
+    func test58CommandBar() {
+        variants {
+            try self.openNotebook()
+            try self.tap("menu.more"); try self.tap("Commands", scroll: true)
+            let field = try self.require("commandBar.search")
+            try self.documentCapture(68, "command-bar")
+            self.focus(field); field.typeText("zzzzunmatchedcommand")
+            _ = try self.require("No matching commands")
+            try self.documentCapture(69, "command-bar-empty")
+            self.focus(field); field.nibTypeKey("a", modifierFlags: .command); field.typeText("Add Page")
+            _ = try self.require("commandBar.run.page.add")
+            self.ui.app.typeKey(XCUIKeyboardKey.tab.rawValue, modifierFlags: [])
+            _ = try self.require("Run Command")
+            try self.documentCapture(70, "command-bar-arguments")
         }
     }
 

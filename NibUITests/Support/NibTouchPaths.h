@@ -4,5 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface NibTouchPaths : NSObject
 + (void)perform:(NSArray<NSArray<NSValue *> *> *)paths duration:(NSTimeInterval)duration
      completion:(void (^)(NSError * _Nullable))completion;
+/// A complete physical keyboard-page HID down/up, including Return, Escape and Delete.
++ (BOOL)pressKeyboardUsage:(unsigned int)usage error:(NSError * _Nullable * _Nullable)error;
 @end
 NS_ASSUME_NONNULL_END

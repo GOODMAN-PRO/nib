@@ -325,6 +325,9 @@ final class PagesUITests: XCTestCase {
         // notes inside Semester Notes, so navigate there in the destination.
         let folder = ui.app.buttons.matching(identifier: "cmd.library.setView")
             .matching(NSPredicate(format: "label == 'Semester Notes'")).firstMatch
+        // A new scene starts with the native Folders disclosure collapsed.
+        // F019 does not require every folder to be permanently expanded.
+        if !folder.exists { try tap("Folders") }
         try require(folder, "Open the destination notebook's folder").tap()
         let openTarget = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(format: "label BEGINSWITH 'Lecture notes'")).firstMatch
         try require(openTarget).tap()
@@ -459,7 +462,9 @@ final class PagesUITests: XCTestCase {
         try tab("Pages", id: "sidebar.pages"); try navigate(2); try addOutline("Second")
         try tap("Outline Options"); try tap("Sort by Page Number")
         try wait("Sort must follow current page order") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Second", "Third"] }
-        try require(label("Second")).swipeLeft(); try tap("Delete")
+        // DESIGN §14.4 uses native swipe deletion. A full swipe commits it;
+        // there is no second Delete button after the row has been removed.
+        try require(label("Second")).swipeLeft()
         try wait("Swipe Delete must remove only Second") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Third"] }
         try count(4)
     }
@@ -545,7 +550,7 @@ final class PagesUITests: XCTestCase {
         XCTAssertTrue(try itemKinds(try XCTUnwrap(added["id"] as? String)).isEmpty, "Template artwork must be flattened, not copied editable strokes")
         try pages(); try navigate(1)
         try ui.waitForState { $0.strokeCountOnPage == source.strokeCountOnPage }
-        try closeNavigator(); try manageTemplates(); try tap("Custom")
+        try closeNavigator(); try manageTemplates(); try category("Custom")
         try require(button("Motion master")).press(forDuration: 0.8); try tap("Delete Template"); try confirm("Delete Template")
         try wait("Delete custom template must remove only chosen catalogue entry") { (try? self.customTemplates().contains { $0["title"] as? String == "Motion master" }) == false }
         try category("Essentials"); try require(button("Blank"))

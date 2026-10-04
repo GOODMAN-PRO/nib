@@ -141,12 +141,7 @@ final class ChromeUITests: XCTestCase {
         }
     }
     private func chord(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags, on target: XCUIElement) {
-        let keys: [(XCUIElement.KeyModifierFlags, XCUIKeyboardKey)] = [(.command, .command), (.control, .control),
-                                                                    (.option, .option), (.shift, .shift)]
-        for (flag, key) in keys where modifiers.contains(flag) {
-            target.typeKey(key.rawValue, modifierFlags: [])
-        }
-        XCUIElement.perform(withKeyModifiers: modifiers) { target.typeKey(value, modifierFlags: modifiers) }
+        target.nibTypeKey(value, modifierFlags: modifiers)
     }
     private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = []) {
         // Exercise the specified physical chord. CI's one-shot typeKey can
@@ -414,9 +409,13 @@ final class ChromeUITests: XCTestCase {
         try settings("pen")
         try tap("tool.highlighter")
         _ = try ui.waitForState { $0.tool == "highlighter" }
-        XCTAssertFalse(query("Fountain Pen").firstMatch.exists, "Switching tools must dismiss the old settings popover")
+        // Fountain Pen remains the palette button's label (DESIGN §14.3).
+        // Its type-grid button belongs only to the settings popover.
+        let fountainChoice = ui.app.buttons.matching(NSPredicate(
+            format: "label == 'Fountain Pen' AND NOT identifier BEGINSWITH 'tool.'")).firstMatch
+        XCTAssertFalse(fountainChoice.exists, "Switching tools must dismiss the old settings popover")
         try tap("menu.toolSettings"); _ = try require("Straight line")
-        XCTAssertFalse(query("Fountain Pen").firstMatch.exists)
+        XCTAssertFalse(fountainChoice.exists)
     }
 
     func testSelectedToolTapOpensSettingsAndChangesPenType() throws {
@@ -424,7 +423,9 @@ final class ChromeUITests: XCTestCase {
         // F007 defines Pencil as a separate canvas tool, not a pen.style value.
         // Reopen the selected tool's settings after choosing it in the type grid.
         try tap("Pencil"); _ = try ui.waitForState { $0.tool == "pencil" }
-        outside(); try draw()
+        // Selecting a different tool dismisses the old settings. An extra
+        // outside tap here is real Pencil input, not a dismissal gesture.
+        try draw()
         try tap("tool.pencil"); XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@ AND NOT identifier BEGINSWITH %@", "Pencil", "tool.")).firstMatch.isSelected)
         outside(); try draw(y: 0.72)
     }
@@ -689,7 +690,15 @@ final class ChromeUITests: XCTestCase {
             !self.query("menu.toolSettings").firstMatch.exists
         }
         try ui.selectTool("highlighter"); _ = try reachable("menu.toolSettings")
-        try settings("highlighter"); try tap("Thickness 2"); outside(); try draw()
+        // DESIGN §14.3: the modal settings cover the options bar; use the
+        // highlighter popover's second thickness preset.
+        try settings("highlighter")
+        let presets = ui.app.buttons.matching(NSPredicate(format: "label ENDSWITH 'millimetres'"))
+            .allElementsBoundByIndex.filter { $0.isHittable }
+        XCTAssertEqual(presets.count, 3)
+        let second = try XCTUnwrap(presets.dropFirst().first)
+        second.tap(); XCTAssertTrue(second.isSelected)
+        outside(); try draw()
     }
     private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
     private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
@@ -1093,8 +1102,7 @@ final class ChromeUITests: XCTestCase {
     }
     private func timer(_ duration: String = "1:30", name: String = "Chrome countdown") throws {
         try timeKeeper(); try replace("Duration", duration); try replace("Timer name", name)
-        // End field editing before a global canvas shortcut can be interpreted as text.
-        key(XCUIKeyboardKey.escape.rawValue)
+        // Escape closes the panel. Starting via its button commits the form.
         try tap("Start Timer")
         let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
         if alert.waitForExistence(timeout: 2), alert.buttons["Don't Allow"].exists { alert.buttons["Don't Allow"].tap() }
@@ -1171,7 +1179,9 @@ final class ChromeUITests: XCTestCase {
         _ = try reachable("Delete Chrome study")
         try tap("cmd.panel.close"); try timeKeeper()
         try tap("Chrome study")
-        XCTAssertEqual(try require("Duration").value as? String, "2:30")
+        // The section heading also says Duration; inspect the editable value.
+        // TimerFormat.clock uses a zero-padded minutes display.
+        XCTAssertEqual(try reachable("Duration", editing: true).value as? String, "02:30")
         try tap("Delete Chrome study"); try tap("Delete Mode")
         try wait("Delete Mode must remove the saved preset") { !self.query("Delete Chrome study").firstMatch.exists }
         try tap("cmd.panel.close"); try timeKeeper()
@@ -1273,9 +1283,11 @@ final class ChromeUITests: XCTestCase {
     }
     func testPDFDefineOpensDictionaryForSelectedText() throws {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Define")
-        _ = try require("Done")
+        // F042 delegates Define to the system dictionary, whose iOS 26
+        // navigation bar exposes Close rather than a Done text button.
+        _ = try require("Close")
         XCTAssertTrue(ui.app.navigationBars.count > 0, "Define must present the system dictionary")
-        try tap("Done"); try sameContent(before)
+        try tap("Close"); try sameContent(before)
     }
     func testPDFSpeakStartsSpeechAndOffersStopSpeaking() throws {
         try importTextPDF(); let before = try ui.state(); try selectPDFText(); try pdfAction("Speak")
