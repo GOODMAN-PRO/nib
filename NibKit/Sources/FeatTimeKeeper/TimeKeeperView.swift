@@ -52,10 +52,13 @@ struct TimeKeeperPanel: View {
     /// Bumped by every read, so an older recognition that finishes late never overwrites a newer one.
     @State private var readGeneration = 0
     @State private var pendingDelete: TimerPreset?
+    private enum Field: Hashable { case duration, name, modeName }
+    @FocusState private var focusedField: Field?
 
     private var seconds: Int? { DurationParser.seconds(from: durationText) }
 
     var body: some View {
+        ScrollViewReader { scroll in
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.xl) {
                 if keeper.engine.isActive {
@@ -72,6 +75,16 @@ struct TimeKeeperPanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollBounceBehavior(.basedOnSize)
+        .scrollDismissesKeyboard(.interactively)
+        .onChange(of: focusedField) { _, field in
+            // A field near a clipped edge must remain editable as the keyboard
+            // reduces the floating panel's viewport.
+            if let field { scroll.scrollTo(field, anchor: .center) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidChangeFrameNotification)) { _ in
+            if let field = focusedField { scroll.scrollTo(field, anchor: .center) }
+        }
+        }
         .onAppear {
             keeper.panelOpen = true
             keeper.refreshStored()
@@ -117,13 +130,17 @@ struct TimeKeeperPanel: View {
         if kind == .timer {
             durationSection
             presetsSection
-            modesSection
             NibInspectorSection(String(localized: "Name")) {
                 NibField(text: $name, prompt: String(localized: "Optional, such as Essay plan"))
+                    .focused($focusedField, equals: .name)
                     .accessibilityLabel(String(localized: "Timer name"))
             }
+            .id(Field.name)
             NibButton(String(localized: "Start Timer"), symbol: .play, kind: .primary, expands: true) { startTimer() }
                 .disabled(seconds == nil)
+            // Starting a one-off timer should not require scrolling past an
+            // ever-growing list of saved modes. Those remain directly below.
+            modesSection
         } else {
             Text(String(localized: "Counts up from zero. Record laps while it runs."))
                 .font(NibFont.callout)
@@ -145,6 +162,8 @@ struct TimeKeeperPanel: View {
                 } else {
                     NibField(text: $durationText, prompt: String(localized: "25, 1:30 or 1h 15m"))
                         .keyboardType(.numbersAndPunctuation)
+                        .focused($focusedField, equals: .duration)
+                        .id(Field.duration)
                         .accessibilityLabel(String(localized: "Duration"))
                 }
                 NibIconButton(writing ? NibSymbol.keyboard : NibSymbol.pen,
@@ -278,6 +297,8 @@ struct TimeKeeperPanel: View {
             }
             HStack(spacing: NibSpacing.s) {
                 NibField(text: $modeName, prompt: String(localized: "Mode name"))
+                    .focused($focusedField, equals: .modeName)
+                    .id(Field.modeName)
                     .accessibilityLabel(String(localized: "New mode name"))
                 NibButton(String(localized: "Save Mode"), size: .compact) { saveMode() }
                     .disabled(seconds == nil || modeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -287,6 +308,7 @@ struct TimeKeeperPanel: View {
 
     private func startTimer() {
         guard let s = seconds else { return }
+        focusedField = nil
         var params: [String: JSONValue] = ["seconds": .number(Double(s))]
         let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !label.isEmpty { params["label"] = .string(label) }
