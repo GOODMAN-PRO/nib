@@ -62,7 +62,7 @@ final class CanvasUITests: XCTestCase {
         return target
     }
 
-    private func tap(_ label: String) throws {
+    private func tap(_ label: String, contextMenu: Bool = false) throws {
         let query = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@ OR identifier == %@", label, label))
         _ = try require(label)
         // Chrome groups are sections in one scrollable menu, not nested submenus.
@@ -79,7 +79,26 @@ final class CanvasUITests: XCTestCase {
         guard let target = query.allElementsBoundByIndex.first(where: { $0.isHittable && $0.isEnabled }) else {
             throw NibUI.Failure.message("Canvas control is not actionable: \(label)\n\(ui.app.debugDescription)")
         }
-        target.tap()
+        if contextMenu { try contextMenuTouch(target) }
+        else { target.tap() }
+    }
+
+    /// Native context menus can omit XCTest's animation-complete notification.
+    /// Send the same physical press/tap without its unrelated 60-second idle wait;
+    /// accessibility, command effects, scope and undo are still asserted normally.
+    private func contextMenuTouch(_ target: XCUIElement, duration: TimeInterval = 0.05) throws {
+        XCTAssertTrue(target.isHittable && target.isEnabled, "Context-menu target must be actionable")
+        let point = NSValue(cgPoint: target.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint)
+        let done = XCTestExpectation(description: "Context-menu touch completed")
+        var failure: Error?
+        NibTouchPaths.perform([[point, point]], duration: duration) { error in
+            failure = error
+            done.fulfill()
+        }
+        guard XCTWaiter.wait(for: [done], timeout: duration + 15) == .completed else {
+            throw NibUI.Failure.message("Context-menu touch timed out")
+        }
+        if let failure { throw failure }
     }
 
     private func eventually(_ message: String, timeout: TimeInterval = 10, _ predicate: @escaping () -> Bool) {
@@ -108,7 +127,28 @@ final class CanvasUITests: XCTestCase {
     private func key(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) {
         // Reacquire the current app after system/floating export windows from earlier tests.
         ui.app.activate()
-        ui.app.typeKey(key, modifierFlags: modifiers)
+        // Unmodified control strings can take XCTest's text-input route without
+        // delivering a UIKey to a canvas/popover responder. Exercise the actual
+        // physical Escape/Delete key, including its down and up events.
+        if modifiers.isEmpty,
+           let usage: UInt32 = [XCUIKeyboardKey.escape.rawValue: 0x29,
+                                XCUIKeyboardKey.delete.rawValue: 0x2A][key] {
+            do { try NibTouchPaths.pressKeyboardUsage(usage) }
+            catch { XCTFail("Physical keyboard event failed: \(error)") }
+            return
+        }
+        // Address this scene's canvas rather than the application's union of
+        // document and system windows. Preserve any focused text field within it.
+        // XCTest can retain modifier state across app relaunches, then omit
+        // the physical down event from the next chord. A modifier-only down/up
+        // synchronizes that state without invoking any app command.
+        let physicalModifiers: [(XCUIElement.KeyModifierFlags, XCUIKeyboardKey)] = [
+            (.command, .command), (.control, .control), (.option, .option), (.shift, .shift)
+        ]
+        for (flag, physicalKey) in physicalModifiers where modifiers.contains(flag) {
+            ui.canvas.typeKey(physicalKey.rawValue, modifierFlags: [])
+        }
+        ui.canvas.typeKey(key, modifierFlags: modifiers)
     }
 
     private func more(_ labels: String...) throws {
@@ -222,14 +262,16 @@ final class CanvasUITests: XCTestCase {
         let paper = try page().frame
         let focal = ui.coordinate(CGPoint(x: 0.5, y: 0.5)).screenPoint
         let anchor = CGPoint(x: (focal.x - paper.minX) / before.zoom, y: (focal.y - paper.minY) / before.zoom)
-        ui.canvas.pinch(withScale: 1.5, velocity: 1)
+        // XCTest's element pinch uses portrait bounds on a rotated simulator.
+        // Explicit finger paths keep the gesture centroid at the point asserted below.
+        try ui.pinchZoom(scale: 1.5, at: CGPoint(x: 0.5, y: 0.5))
         let zoomed = try ui.waitForState { $0.zoom > before.zoom + 0.1 }
         let zoomedPaper = try page().frame
         XCTAssertEqual(zoomedPaper.minX + anchor.x * zoomed.zoom, focal.x, accuracy: 45, "Pinch must retain focal content")
         XCTAssertEqual(zoomedPaper.minY + anchor.y * zoomed.zoom, focal.y, accuracy: 45, "Pinch must retain focal content")
         unchanged(before, zoomed)
-        for _ in 0..<3 { ui.canvas.pinch(withScale: 4, velocity: 1); bounded(try ui.state()) }
-        for _ in 0..<4 { ui.canvas.pinch(withScale: 0.2, velocity: -1); bounded(try ui.state()) }
+        for _ in 0..<3 { try ui.pinchZoom(scale: 4, at: CGPoint(x: 0.5, y: 0.5)); bounded(try ui.state()) }
+        for _ in 0..<4 { try ui.pinchZoom(scale: 0.2, velocity: -1, at: CGPoint(x: 0.5, y: 0.5)); bounded(try ui.state()) }
         unchanged(before, try ui.state(), page: false)
         try go(1)
         XCTAssertEqual(try ui.state().strokeCountOnPage, before.strokeCountOnPage)
@@ -996,14 +1038,14 @@ final class CanvasUITests: XCTestCase {
         try open(whiteboard)
         let original = try ui.state()
         try boards()
-        try boardRow(1, count: 1).press(forDuration: 1)
-        try tap("Duplicate")
+        try contextMenuTouch(boardRow(1, count: 1), duration: 1)
+        try tap("Duplicate", contextMenu: true)
         _ = try ui.waitForState { $0.pageCount == 2 }
         // Duplicate preserves a board's title, so identify its position rather than inventing a new name.
         try boardRow(2, count: 2).tap()
         XCTAssertEqual(try ui.state().itemCountOnPage, original.itemCountOnPage)
-        try boardRow(2, count: 2).press(forDuration: 1)
-        try tap("Move to Trash")
+        try contextMenuTouch(boardRow(2, count: 2), duration: 1)
+        try tap("Move to Trash", contextMenu: true)
         _ = try ui.waitForState { $0.pageCount == 1 }
         XCTAssertEqual(try ui.state().page, original.page)
         XCTAssertEqual(try ui.state().itemCountOnPage, original.itemCountOnPage)

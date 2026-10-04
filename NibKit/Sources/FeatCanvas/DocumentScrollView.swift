@@ -362,7 +362,11 @@ final class DocumentScrollView: UIScrollView, UIGestureRecognizerDelegate {
     /// Bind it after creation as well as at init; otherwise both recognizers can
     /// apply a zoom, and UIKit overwrites the document's focal compensation.
     private func configureSystemPinch() {
-        guard let pinch = pinchGestureRecognizer, pinch !== configuredSystemPinch else { return }
+        guard let pinch = pinchGestureRecognizer else { return }
+        // The document recognizer owns focal-point compensation. Keep UIKit's
+        // competing transform disabled after lazy creation or reconfiguration.
+        pinch.isEnabled = false
+        guard pinch !== configuredSystemPinch else { return }
         pinch.allowedTouchTypes = DocumentScrollView.fingerTouchTypes
         pinch.require(toFail: documentPinchGestureRecognizer)
         configuredSystemPinch = pinch
