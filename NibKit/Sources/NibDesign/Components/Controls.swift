@@ -249,6 +249,7 @@ public struct NibWidthPresetButton: View {
         .nibTooltip(label)
         .accessibilityLabel(label)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .nibNativeAction(action)
     }
 }
 
@@ -269,14 +270,18 @@ public struct NibSegmentedControl<Value: Hashable>: View {
     @Environment(\.dynamicTypeSize) private var typeSize
 
     public var body: some View {
-        if typeSize.isAccessibilitySize {
-            verticalOptions
-        } else {
-            ViewThatFits(in: .horizontal) {
-                horizontalOptions.fixedSize(horizontal: true, vertical: true)
+        Group {
+            if typeSize.isAccessibilitySize {
                 verticalOptions
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    horizontalOptions.fixedSize(horizontal: true, vertical: true)
+                    verticalOptions
+                }
             }
         }
+        // A caller's group label must not replace every segment's own title.
+        .accessibilityElement(children: .contain)
     }
 
     private var horizontalOptions: some View {
@@ -332,7 +337,11 @@ public struct NibSegmentedControl<Value: Hashable>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
+        .accessibilityLabel(title(option))
         .accessibilityAddTraits(selected ? .isSelected : [])
+        .nibNativeAction {
+            withAnimation(NibMotion.tap.animation) { selection = option }
+        }
     }
 }
 
@@ -562,5 +571,38 @@ extension View {
     /// Grows the hit area vertically by `amount` on each side without changing layout (padding in, padding out).
     func hitPadding(_ amount: CGFloat) -> some View {
         padding(.vertical, amount).contentShape(Rectangle()).padding(.vertical, -amount)
+    }
+}
+
+/// Native control tracking keeps inspector taps independent of the surrounding
+/// scroll view's gesture recognizers. SwiftUI retains the visual and AX button.
+struct NibInspectorTouchTarget: UIViewRepresentable {
+    var enabled: Bool
+    let action: () -> Void
+    func makeUIView(context: Context) -> UIButton {
+        let button = UIButton(type: .custom)
+        button.isOpaque = false
+        button.backgroundColor = .clear
+        button.accessibilityIdentifier = "nib.inspector.touch"
+        button.isAccessibilityElement = false
+        return button
+    }
+    func updateUIView(_ button: UIButton, context: Context) {
+        button.isEnabled = enabled
+        button.removeAction(identifiedBy: UIAction.Identifier("activate"), for: .touchUpInside)
+        button.addAction(UIAction(identifier: UIAction.Identifier("activate")) { _ in action() }, for: .touchUpInside)
+    }
+}
+
+struct NibInspectorAction: ViewModifier {
+    @Environment(\.isEnabled) var enabled
+    let action: () -> Void
+    func body(content: Content) -> some View {
+        content.overlay { NibInspectorTouchTarget(enabled: enabled, action: action).accessibilityHidden(true) }
+    }
+}
+extension View {
+    func nibInspectorAction(_ action: @escaping () -> Void) -> some View {
+        modifier(NibInspectorAction(action: action))
     }
 }

@@ -502,7 +502,6 @@ struct HighlighterSettingsView: View {
     @State private var straightLine: Bool
     @State private var stabilization: Double
     @State private var drawAndHold: Bool
-    @State private var pickingColour = false
 
     init(app: NibApp, session: EditorSession) {
         self.app = app
@@ -518,7 +517,7 @@ struct HighlighterSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             NibInspectorSection(String(localized: "Colour"),
-                                action: NibAction(String(localized: "Custom…")) { pickingColour = true }) {
+                                action: NibAction(String(localized: "Custom…")) { presentColourPicker() }) {
                 HStack(spacing: 0) {
                     ForEach(NibHighlighter.allCases, id: \.self) { h in
                         NibPenSwatch(NibSwatch(highlighter: h),
@@ -551,11 +550,21 @@ struct HighlighterSettingsView: View {
         .onChange(of: drawAndHold) { _, on in commit(HighlighterSettings.drawAndHold, on) }
         .task(id: stabilization) { await commitStabilization() }
         .task(id: widthMM) { await commitWidth() }
-        .sheet(isPresented: $pickingColour) {
-            SystemColourPicker(initial: presets.color.uiColor, onPick: { picked in
-                edit(.setColour(index: presets.selectedSwatch, color: RGBA(picked).asHighlighter))
-            }, onDone: { pickingColour = false })
-            .presentationDetents([.medium, .large])
+    }
+
+    private func presentColourPicker() {
+        let picker = SystemColourPicker(initial: presets.color.uiColor, onPick: { picked in
+            edit(.setColour(index: presets.selectedSwatch, color: RGBA(picked).asHighlighter))
+        }, onDone: {}).makePicker()
+        // Present the concrete system controller. Embedding it in a SwiftUI sheet
+        // hides UIKit's dismissal control on iPadOS and leaves the picker trapped.
+        if let navigator = app.ui.activeNavigator, navigator.session === session {
+            navigator.presentModal(picker)
+        } else {
+            var presenter = (session.editor as? UIViewController)
+                ?? session.editor?.canvasHost?.canvasView.window?.rootViewController
+            while let presented = presenter?.presentedViewController { presenter = presented }
+            presenter?.present(picker, animated: true)
         }
     }
 
@@ -619,29 +628,32 @@ struct HighlighterSettingsView: View {
 }
 
 /// The system colour picker (grid, spectrum, sliders, hex, eyedropper) for a custom highlighter colour.
-struct SystemColourPicker: UIViewControllerRepresentable {
+@MainActor
+struct SystemColourPicker {
+    private static var coordinatorKey: UInt8 = 0
     let initial: UIColor
     let onPick: (UIColor) -> Void
     let onDone: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    func makeUIViewController(context: Context) -> UIColorPickerViewController {
+    func makePicker() -> UIColorPickerViewController {
         let picker = UIColorPickerViewController()
         picker.selectedColor = initial
         picker.supportsAlpha = false                           // highlighters keep the preset translucency
-        picker.delegate = context.coordinator
+        let coordinator = makeCoordinator()
+        picker.delegate = coordinator
+        picker.modalPresentationStyle = .formSheet
+        picker.presentationController?.delegate = coordinator
+        objc_setAssociatedObject(picker, &Self.coordinatorKey, coordinator, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         return picker
     }
 
-    func updateUIViewController(_ picker: UIColorPickerViewController, context: Context) {
-        context.coordinator.parent = self
-    }
-
     @MainActor
-    final class Coordinator: NSObject, UIColorPickerViewControllerDelegate {
+    final class Coordinator: NSObject, UIColorPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
         var parent: SystemColourPicker
         private var last: UIColor?
+        private var finished = false
 
         init(_ parent: SystemColourPicker) {
             self.parent = parent
@@ -653,9 +665,21 @@ struct SystemColourPicker: UIViewControllerRepresentable {
             pick(color)
         }
 
-        func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+        func colorPickerViewControllerDidSelectColor(_ viewController: UIColorPickerViewController) {
             pick(viewController.selectedColor)
+        }
+
+        func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+            guard !finished else { return }
+            viewController.viewIfLoaded?.endEditing(true)
+            pick(viewController.selectedColor)
+            finished = true
             parent.onDone()
+        }
+
+        func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+            guard let picker = presentationController.presentedViewController as? UIColorPickerViewController else { return }
+            colorPickerViewControllerDidFinish(picker)
         }
 
         private func pick(_ color: UIColor) {
