@@ -184,6 +184,9 @@ public struct NibPaperTile<Content: View>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
+        // A scroll beginning on a paper preview must never commit a selection
+        // when the finger lifts over another tile in the moving grid.
+        .nibNativeAction(action)
         .accessibilityLabel(name)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
