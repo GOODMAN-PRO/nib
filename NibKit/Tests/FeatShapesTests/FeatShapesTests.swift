@@ -8,6 +8,20 @@ import NibTesting
 
 @MainActor
 final class FeatShapesTests: XCTestCase {
+    func testChangingBoxKindPreservesFractionalFrameExactly() {
+        let frame = Frame(x: 220.09694736842104, y: 428.2775789473684,
+                          w: 150.77815789473684, h: 80.676105263157865)
+        let original = ShapeItem(shape: .rectangle, frame: frame)
+        for kind: ShapeKind in [.ellipse, .diamond, .triangle, .roundedRectangle, .rectangle] {
+            XCTAssertEqual(ShapeGeometry.setKind(original, to: kind).frame, frame)
+        }
+    }
+
+    func testNewOrdinaryShapesStartWithSharpCorners() {
+        let h = Harness(features: [FeatShapesFeature.self])
+        XCTAssertEqual(h.app.settings.get(ShapeSettings.cornerRadius), 0)
+    }
+
     private let shapeRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"
     private let page1Ref = "page:FIXTUREDOC01/FIXTUREPG001"
     private let page2Ref = "page:FIXTUREDOC01/FIXTUREPG002"

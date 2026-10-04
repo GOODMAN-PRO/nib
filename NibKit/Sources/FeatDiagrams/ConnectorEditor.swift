@@ -599,6 +599,8 @@ final class ConnectorEditor: CanvasAttachment {
     private func element(_ key: String, at p: CGPoint) -> OverlayElement {
         let e = elements[key] ?? OverlayElement(accessibilityContainer: kit.view)
         elements[key] = e
+        e.isAccessibilityElement = true
+        e.accessibilityTraits = .button
         let d = NibMetrics.hitTarget
         e.accessibilityFrameInContainerSpace = CGRect(x: p.x - d / 2, y: p.y - d / 2, width: d, height: d)
         return e

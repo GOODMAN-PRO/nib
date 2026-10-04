@@ -215,6 +215,7 @@ struct ProviderEditorView: View {
                         ForEach(ProviderPreset.allCases.filter { $0 != .claudeSubscription && $0 != .chatGPTSubscription }) { Text($0.title).tag($0) }
                     }
                     .frame(minHeight: NibMetrics.hitTarget)
+                    .accessibilityIdentifier("Preset")
                     .onChange(of: preset) { _, value in draft.apply(value); models = [] }
                 }
             }

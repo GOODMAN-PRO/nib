@@ -207,6 +207,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         case none, knob, text
     }
     private(set) var text: TextSession?
+    private var keyboardAvoidance: NibTextKeyboardAvoidance?
     /// The last knob commit and the last text commit (tests await them).
     private(set) var pendingCommit: Task<Void, Never>?
     private(set) var pendingFlush: Task<Void, Never>?
@@ -596,6 +597,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         tv.accessibilityLabel = String(localized: "Text in shape")
         tv.delegate = self
         tv.onEscape = { [weak self] in self?.endTextEditing(commit: true) }
+        tv.inputAccessoryView = NibTextKeyboardAvoidance.finishAccessory { [weak tv] in tv?.onEscape?() }
 
         let session = TextSession(doc: doc, page: page, id: id, textView: tv, scale: scale, darkPaper: dark,
                                   committed: ShapeTextStyle.richText(attributed, shape: shape, scale: scale))
@@ -611,6 +613,9 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         host.session.editingTextRange = ShapeTextStyle.plainRange(tv.selectedRange, in: attributed)
         hideKnobs()
         layoutText(session, host: host)
+        if let scroll = host.canvasView as? UIScrollView {
+            keyboardAvoidance = NibTextKeyboardAvoidance(textView: tv, scrollView: scroll)
+        }
         tv.becomeFirstResponder()
         return true
     }
@@ -619,6 +624,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     func endTextEditing(commit: Bool) {
         guard let t = text else { return }
         text = nil
+        keyboardAvoidance?.stop()
+        keyboardAvoidance = nil
         t.debounce?.cancel()
         let flushed = commit ? flush(t) : nil
         t.textView.delegate = nil
@@ -722,6 +729,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     }
 
     func textViewDidChangeSelection(_ textView: UITextView) {
+        keyboardAvoidance?.revealCaret()
         guard let t = text, textView === t.textView, let session = host?.session,
               session.editingTextRef == Self.ref(t) else { return }
         let current = textView.attributedText ?? NSAttributedString()

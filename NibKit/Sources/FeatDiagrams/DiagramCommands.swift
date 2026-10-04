@@ -384,6 +384,12 @@ struct DiagramAddConnected: NibCommand {
             try tx.put(shape, doc: doc, page: page)
             try tx.put(connector, doc: doc, page: page)
         }
+        // Menu, keyboard and canvas-dot creation all continue from the new node.
+        // Keep programmatic creation in another document from stealing focus.
+        if let session = ctx.activeSession, session.selection.doc == doc,
+           session.selection.page == page, session.selection.items == [source.id] {
+            session.selection = Selection(doc: doc, page: page, items: [shape.id], bounds: shape.bounds)
+        }
         return Output(ref: NodeRef.item(doc, page, shape.id).description,
                       connector: NodeRef.item(doc, page, connector.id).description)
     }

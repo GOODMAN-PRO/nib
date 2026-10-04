@@ -67,6 +67,9 @@ enum ShapeGeometry {
 
     /// A frame with both sides usable by a box kind (a line's zero-height frame grows around its centre).
     static func nonDegenerate(_ f: Frame) -> Frame {
+        // Preserve an already usable frame exactly. Recentring it needlessly introduces
+        // floating-point drift every time the user changes the shape type.
+        guard f.w < 2 || f.h < 2 else { return f }
         var g = f
         if g.w < 2 { g.w = max(24, g.h * 0.6) }
         if g.h < 2 { g.h = max(24, g.w * 0.6) }

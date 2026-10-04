@@ -425,10 +425,9 @@ struct CommentThreadView: View {
             reply = ""
             focusComposerForDraft()
         }
-        .confirmationDialog(String(localized: "Delete Thread?"),
+        .alert(String(localized: "Delete Thread?"),
                             isPresented: Binding(get: { lastMessagePendingDelete != nil },
-                                                 set: { if !$0 { lastMessagePendingDelete = nil } }),
-                            titleVisibility: .visible) {
+                                                 set: { if !$0 { lastMessagePendingDelete = nil } })) {
             Button(String(localized: "Delete Thread"), role: .destructive) {
                 if let id = lastMessagePendingDelete { model.delete(id) }
                 lastMessagePendingDelete = nil
@@ -528,7 +527,9 @@ struct CommentThreadView: View {
                 .font(NibFont.caption1Emphasis)
                 .foregroundStyle(NibColor.labelSecondary)
             if isEditing {
-                NibField(text: $editText, prompt: String(localized: "Message"), lines: 1...8)
+                NibField(text: $editText, prompt: String(localized: "Message"), lines: 1...8,
+                         accessibilityName: String(localized: "Message"))
+                    .accessibilityLabel(String(localized: "Message"))
                     .onKeyPress(.return, phases: .down) { press in
                         guard press.modifiers.contains(.command) else { return .ignored }
                         saveEdit(message.id)

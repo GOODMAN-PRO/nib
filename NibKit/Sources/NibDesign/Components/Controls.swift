@@ -339,7 +339,7 @@ public struct NibSegmentedControl<Value: Hashable>: View {
         .buttonStyle(NibPressStyle(shape: shape))
         .accessibilityLabel(title(option))
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .nibNativeAction {
+        .nibInspectorAction {
             withAnimation(NibMotion.tap.animation) { selection = option }
         }
     }

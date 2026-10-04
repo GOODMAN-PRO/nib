@@ -206,6 +206,16 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertThrowsError(try ws.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: connectorID))
     }
 
+    func testAddConnectedFromTheSelectedShapeSelectsItsNewNodeForEveryEntryPoint() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        let result = try await h.run("diagram.addConnected", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "side": "bottom", "id": "NEXTNODE"])
+        XCTAssertEqual(result["ref"]?.stringValue, "item:FIXTUREDOC01/FIXTUREPG001/NEXTNODE")
+        XCTAssertEqual(h.session.selection.items, ["NEXTNODE"])
+        XCTAssertNotNil(h.session.selection.bounds)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
     func testAddConnectedSaysWhenASideHasNoRoom() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         // The sticky note is 140 pt tall and 120 pt from the top of the page: no room for its copy above it.
@@ -562,6 +572,9 @@ final class FeatDiagramsTests: XCTestCase {
         editor.attach(to: host)
         h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
         editor.canvasDidChange(host)
+        let handleElements = host.canvasView.subviews.flatMap { ($0.accessibilityElements as? [UIAccessibilityElement]) ?? [] }
+        let endHandle = try XCTUnwrap(handleElements.first { $0.accessibilityLabel == "Connector end" })
+        XCTAssertTrue(endHandle.accessibilityTraits.contains(.button))
         XCTAssertTrue(editor.hitTest(CGPoint(x: 260, y: 245), host: host), "the start handle")
         XCTAssertFalse(editor.hitTest(CGPoint(x: 100, y: 600), host: host))
         editor.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(400, 190)), host: host)

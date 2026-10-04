@@ -1016,6 +1016,8 @@ final class FeatElementsTests: XCTestCase {
         model.promptText = "not a URL"
         await model.submit(.gifLink)
         await fulfillment(of: [errorShown], timeout: 1)
+        XCTAssertTrue(model.failure?.contains("address") == true,
+                      "The popover must retain the link error after its native prompt closes")
         model.pick(.gif)
         await model.picked(.failure(CocoaError(.userCancelled)))
         XCTAssertEqual(insertions.count, 1, "Invalid links and cancelling Files must not insert anything")
@@ -1081,6 +1083,37 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(out["gifs"]?.arrayValue?.count, 1)
         XCTAssertEqual(out["attribution"], "Powered by GIPHY")
         XCTAssertEqual(transport.requests.last?.url?.path, "/v1/gifs/search")
+    }
+
+    func testKeychainFailureRetainsDraftAndRetryThenRemovalUseConfirmedStoreState() {
+        var stored: String?
+        var writable = false
+        let model = GiphyKeySettingsModel(load: { stored }, save: { value in
+            guard writable else { return false }
+            stored = value
+            return true
+        })
+        model.draft = "  my-subscription-key  "
+        model.saveDraft()
+        XCTAssertFalse(model.hasKey)
+        XCTAssertEqual(model.draft, "  my-subscription-key  ")
+        XCTAssertNotNil(model.failure)
+        writable = true
+        model.saveDraft()
+        XCTAssertTrue(model.hasKey)
+        XCTAssertEqual(stored, "my-subscription-key")
+        XCTAssertEqual(model.draft, "")
+        XCTAssertNil(model.failure)
+        writable = false
+        model.remove()
+        XCTAssertTrue(model.hasKey)
+        XCTAssertNotNil(model.failure)
+        XCTAssertEqual(stored, "my-subscription-key")
+        writable = true
+        model.remove()
+        XCTAssertFalse(model.hasKey)
+        XCTAssertNil(stored)
+        XCTAssertNil(model.failure)
     }
 
     func testGiphyKeyLivesInTheKeychain() {
