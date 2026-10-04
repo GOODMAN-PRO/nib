@@ -572,7 +572,6 @@ final class ImportDialogSession {
 /// bookmark for "Save changes to source". Several files and folders can be picked.
 @MainActor
 final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
-    private static var active: DocumentPicker?
     private var continuation: CheckedContinuation<[URL], Never>?
 
     static func pick(types: [UTType], navigator: SceneNavigator) async -> [URL] {
@@ -582,15 +581,39 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         picker.shouldShowFileExtensions = true
         let delegate = DocumentPicker()
         picker.delegate = delegate
-        active = delegate
+        // Each window retains its own delegate until the selection resolves.
+        // A process-global slot lets a second picker release the first one's delegate.
+        defer { withExtendedLifetime(delegate) {} }
+        var presentationCheck: Task<Void, Never>?
         let urls = await withCheckedContinuation { (continuation: CheckedContinuation<[URL], Never>) in
             delegate.continuation = continuation
             navigator.presentModal(picker)
-            if picker.presentingViewController == nil { delegate.finish([]) }
+            // UIKit may attach a presented controller on the next main turn.
+            // Do not report cancellation while its presentation is still starting.
+            presentationCheck = Task { @MainActor [weak delegate, weak picker, weak root = navigator.rootViewController] in
+                guard let picker else { delegate?.finish([]); return }
+                let attached = await waitForPresentation(of: picker, in: root)
+                if !Task.isCancelled && !attached { delegate?.finish([]) }
+            }
         }
-        active = nil
+        presentationCheck?.cancel()
         await ImportUI.waitUntilPresentable(navigator)             // the picker finishes dismissing first
         return urls
+    }
+
+    static func waitForPresentation(of controller: UIViewController, in root: UIViewController?, attempts: Int = 30) async -> Bool {
+        guard let root else { return false }
+        for _ in 0..<attempts {
+            guard !Task.isCancelled else { return false }
+            if controller.presentingViewController != nil || controller.viewIfLoaded?.window != nil { return true }
+            var presented: UIViewController? = root
+            while let current = presented {
+                if current === controller { return true }
+                presented = current.presentedViewController
+            }
+            do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return false }
+        }
+        return false
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {

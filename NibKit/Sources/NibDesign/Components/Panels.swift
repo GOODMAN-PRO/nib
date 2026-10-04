@@ -345,7 +345,7 @@ public struct NibInspectorSection<Content: View>: View {
                     }
                     .buttonStyle(.plain)
                     .nibCommand(action.command)
-                    .nibNativeAction(action.handler)
+                    .nibInspectorAction(action.handler)
                 }
             }
             content
@@ -766,7 +766,7 @@ private struct PopoverKeyboardOcclusionReader: UIViewRepresentable {
         @objc private func hideKeyboard(_ notification: Notification) { screenFrame = nil; report() }
         private func report() {
             guard let window else { return }
-            let next = screenFrame.map { convert(window.convert($0, from: window.screen.coordinateSpace), from: window) }
+            let next = screenFrame.map { convert(NibKeyboardGeometry.frame($0, in: window), from: window) }
             guard reported != next else { return }
             reported = next
             DispatchQueue.main.async { [weak self] in self?.changed?(next) }
