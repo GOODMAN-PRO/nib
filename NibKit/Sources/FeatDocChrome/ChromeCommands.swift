@@ -272,7 +272,9 @@ final class ChromeStateStore {
     /// Another feature wrote `session.openPanels`: open what it added (where the settings put it, when a document of
     /// a kind that takes it is showing), close what it removed, then write back what really is open.
     func adopt(_ session: EditorSession) {
-        guard let app, let state = windows[session.id] else { return }
+        // The retained document navigator is dormant while the library owns this
+        // session. Its panels must not erase the library's sheet/tab inventory.
+        guard session.document != nil, let app, let state = windows[session.id] else { return }
         let wanted = session.openPanels
         let current = Set(state.openPanels)
         guard wanted != current else { return }
@@ -296,6 +298,9 @@ enum PanelResolver {
     /// Sidebar tabs dock on the sidebar side and floating panels float, unless the user moved that panel (D-136).
     /// Sheets and full-screen panels are modal; library tabs never open in a document.
     static func spot(of panel: PanelDescriptor, override: String?, sidebarOnRight: Bool) -> PanelSpot? {
+        // Commands is the transient top-centred catalogue (§14.16), never a
+        // persistent sidebar. Compact windows still adapt it to a system sheet.
+        if panel.id == "chrome.commands" { return .floating }
         switch panel.placement {
         case .sidebarTab, .floating:
             if let raw = override, let chosen = PanelSpot(rawValue: raw), PanelSpot.overrides.contains(chosen) {
@@ -564,6 +569,22 @@ struct SidebarToggle: NibCommand {
         let (state, kind) = try ChromeCommandSupport.window(ctx, store)
         let settings = ctx.services.settings
         let panels = app.ui.panels.all
+        let preferred = PanelResolver.preferredSide(settings)
+        // A navigator moved to Floating remains the navigator when reopened.
+        // Filtering it out of sidebar tabs must not silently choose Outline instead.
+        if mode == nil, state.tabs.isEmpty,
+           let remembered = [preferred, preferred.other].compactMap({ state.lastTabs[$0] }).first(where: { id in
+               guard let panel = app.ui.panels.get(id), panel.placement == .sidebarTab,
+                     PanelResolver.accepts(panel, kind: kind) else { return false }
+               return PanelResolver.spot(of: panel, settings: settings) == .floating
+           }) {
+            if state.spot(of: remembered) != nil {
+                state.close(remembered)
+                return Output(visible: false, mode: state.mode.rawValue, panel: nil)
+            }
+            state.open(remembered, at: .floating)
+            return Output(visible: true, mode: state.mode.rawValue, panel: remembered)
+        }
         let side = try state.toggleSidebar(mode: mode, preferred: PanelResolver.preferredSide(settings)) { side in
             PanelResolver.tabs(panels, side: side, kind: kind, settings: settings).map { $0.id }
         }

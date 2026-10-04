@@ -118,8 +118,11 @@ enum TemplateChange {
             var background = try await store.background(group: group, entry: entry, doc: nil, assets: assets)
             guard let temporary = background.asset else { throw NibError.unavailable("Template asset") }
             let stored = try await model.run(CommandIDs.assetPut, ["doc": .string(docRef), "url": .string(temporary.name), "ext": .string(temporary.ext)])
-            // asset.put's catalogue result is an AssetRef (a JSON string).
-            background.asset = try stored.decode(AssetRef.self)
+            // asset.put returns its receipt {asset, doc, bytes}, not a bare AssetRef.
+            guard let name = stored["asset"]?.stringValue, !name.isEmpty else {
+                throw NibError.invalid("The stored template asset is missing.")
+            }
+            background.asset = AssetRef(name)
             calls.append(["command": .string(CommandIDs.pageSetBackground), "params": ["pages": .array(targets.map(JSONValue.string)), "background": try JSONValue.from(background)]])
         } else {
             guard let definition = model.app.content.templates.get(choice.id) else { throw NibError.notFound("Template \(choice.id)") }
