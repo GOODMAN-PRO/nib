@@ -1020,7 +1020,7 @@ struct NewNotebookSheet: View {
     @State private var windowSize: CGSize?
     @Environment(\.dynamicTypeSize) private var typeSize
     @FocusState private var titleFocused: Bool
-    @FocusState private var focusedDimension: CustomDimension?
+    @State private var focusedDimension: CustomDimension?
 
     init(app: NibApp, folder: FolderID?, kind: NewDocumentKind, session: EditorSession?, navigator: SceneNavigator?,
          onDone: @escaping () -> Void) {
@@ -1361,18 +1361,18 @@ struct NewNotebookSheet: View {
     }
 
     private func millimetreField(_ label: String, field: CustomDimension, value: Binding<Double>) -> some View {
-        TextField(label, value: value, format: .number.precision(.fractionLength(0...1)))
-            .focused($focusedDimension, equals: field)
-            .keyboardType(.decimalPad)
-            .font(NibFont.body)
-            .multilineTextAlignment(.trailing)
+        NotebookDimensionField(label: String(localized: "\(label) in millimetres"),
+                               value: Binding(get: { value.wrappedValue }, set: {
+                                   value.wrappedValue = $0
+                                   model.applyCustomSize()
+                               }),
+                               isFocused: Binding(get: { focusedDimension == field }, set: { focused in
+                                   if focused { focusedDimension = field }
+                                   else if focusedDimension == field { focusedDimension = nil }
+                               }))
             .padding(.horizontal, NibSpacing.m)
-            .frame(minWidth: NibMetrics.hitTarget * 2, minHeight: NibMetrics.hitTarget)
-            .fixedSize(horizontal: true, vertical: false)
+            .frame(width: NibMetrics.hitTarget * 2, height: max(NibMetrics.hitTarget, NibUIFont.body.lineHeight))
             .background(NibColor.backgroundTertiary, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
-            .onSubmit { model.applyCustomSize() }
-            .onChange(of: value.wrappedValue) { _, _ in model.applyCustomSize() }
-            .accessibilityLabel(String(localized: "\(label) in millimetres"))
     }
 
     // MARK: Whiteboard
