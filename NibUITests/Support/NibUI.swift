@@ -78,7 +78,13 @@ final class NibUI {
         field.typeKey("a", modifierFlags: .command)
         field.typeText(title)
         if usesInlineEditor {
-            field.typeText("\n")
+            // A newline is text input in iPadOS 26's inline editor; commit via
+            // the keyboard's actual Done action, just as a Files user does.
+            let done = app.keyboards.buttons["Done"]
+            guard done.waitForExistence(timeout: 5), done.isHittable else {
+                throw Failure.message("Files keyboard must offer Done for its new-folder name")
+            }
+            done.tap()
         } else {
             let create = app.alerts.buttons["Create"]
             guard create.isHittable && create.isEnabled else { throw Failure.message("Files Create must be available") }
@@ -90,7 +96,30 @@ final class NibUI {
         }
     }
 
+    /// XCTest's synthetic keyboard persists across app relaunches. Establish a
+    /// complete modifier down/up cycle in the new scene before testing chords;
+    /// otherwise iPadOS can deliver e.g. Control-Command-N as unmodified N.
+    /// Modifier-only presses invoke no Nib command and leave the assertions intact.
+    func synchronizeHardwareKeyboard() {
+        for key in [XCUIKeyboardKey.command, .control, .option, .shift] {
+            app.typeKey(key.rawValue, modifierFlags: [])
+        }
+    }
+
+    enum HardwareKey: UInt32 { case returnKey = 0x28, escape = 0x29 }
+
+    /// Unmodified control-key strings take a text-input path on iPadOS 26 and
+    /// can produce no UIKey event in a non-text responder. Test the specified
+    /// physical key instead, through XCTest's device HID interface.
+    func pressHardwareKey(_ key: HardwareKey) throws {
+        guard app.state == .runningForeground else {
+            throw Failure.message("The keyboard's target app must be foreground")
+        }
+        try NibTouchPaths.pressKeyboardUsage(key.rawValue)
+    }
+
     func launchFixture(scenario: FixtureScenario = .standard) throws {
+        try NibUIMultitasking.setWindowed(false)
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
         app.launch()
@@ -115,7 +144,13 @@ final class NibUI {
         guard XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
             throw Failure.message("Nib's launched scene did not reach landscape")
         }
+        try NibUIMultitasking.assertFullScreen(app)
         _ = try waitForState { $0.screen == "library" }
+        // The library heading has no action and is outside the editable/search
+        // controls. Touch the launched scene before sending hardware input.
+        let heading = app.staticTexts["Library"].firstMatch
+        if heading.isHittable { heading.tap() }
+        synchronizeHardwareKeyboard()
     }
 
     func state() throws -> QAState {
