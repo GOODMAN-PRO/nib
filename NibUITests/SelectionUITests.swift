@@ -502,10 +502,26 @@ final class SelectionUITests: XCTestCase {
         try clear()
     }
 
+    /// Waits for the real Copy export and decodes selected records for identity/attachment assertions.
+    private func copiedItems() throws -> [[String: Any]] {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ui.copyFragment()) as? [String: Any])
+        return try XCTUnwrap(object["items"] as? [[String: Any]])
+    }
+
     func testMovingContainerMovesAttachedInkInSameUndoStep() throws {
         try shape("Rectangle", from: CGPoint(x: 0.38, y: 0.52), to: CGPoint(x: 0.59, y: 0.73))
-        try draw([CGPoint(x: 0.42, y: 0.58), CGPoint(x: 0.47, y: 0.65), CGPoint(x: 0.53, y: 0.59)])
-        try lassoSettings(); try toggle("Shapes", to: false); outside(); try loop(count: 1)
+        ui.coordinate(CGPoint(x: 0.38, y: 0.60)).tap()
+        try ui.waitForState { $0.selectionCount == 1 }
+        let parentID = try XCTUnwrap(copiedItems().first { $0["kind"] as? String == "shape" }?["id"] as? String)
+        try clear()
+        // Ink creation is not a container drop. Draw outside, then perform the real drop-to-attach gesture.
+        try draw([CGPoint(x: 0.42, y: 0.79), CGPoint(x: 0.47, y: 0.86), CGPoint(x: 0.53, y: 0.80)])
+        try lassoSettings(); try toggle("Shapes", to: false); outside()
+        try loop(CGRect(x: 0.40, y: 0.77, width: 0.16, height: 0.11), count: 1)
+        drag(centre(try bounds()), ui.coordinate(CGPoint(x: 0.48, y: 0.63)).screenPoint)
+        let attached = try copiedItems()
+        XCTAssertEqual(attached.first { $0["kind"] as? String == "stroke" }?["attachedTo"] as? String, parentID,
+                       "Real drop must attach the stroke before testing linked movement")
         let child = try bounds()
         try clear(); try lassoSettings(); try toggle("Shapes", to: true); outside()
         ui.coordinate(CGPoint(x: 0.38, y: 0.60)).tap()

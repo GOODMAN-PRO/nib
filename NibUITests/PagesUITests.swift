@@ -62,7 +62,8 @@ final class PagesUITests: XCTestCase {
         XCTAssertGreaterThan(navigator.frame.width, ui.app.windows.firstMatch.frame.width * 0.7)
         try navigate(3)
         XCTAssertEqual(try ui.state().page, original[2])
-        try tap("Panel Options"); try tap("Show as Sidebar")
+        // Choosing a thumbnail in Window mode returns to Sidebar (PagesPanel.open).
+        try wait("Page navigation must return to Sidebar") { self.label("Sidebar").exists && !self.label("Document navigation").exists }
         XCTAssertLessThan(try require(label("Sidebar")).frame.width, ui.app.windows.firstMatch.frame.width * 0.5)
         XCTAssertEqual(try ids(), original)
     }
@@ -919,7 +920,7 @@ final class PagesUITests: XCTestCase {
     }
     private func assetFile(_ page: [String: Any], in id: String? = nil) throws -> URL {
         let name = try XCTUnwrap(background(page)["asset"] as? String, "Page must retain its background asset reference")
-        let file = try package(id).appendingPathComponent(name)
+        let file = try package(id).appendingPathComponent("assets").appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: file.path) else { throw NibUI.Failure.message("Missing referenced asset: \(name)") }
         return file
     }

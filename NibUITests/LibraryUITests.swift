@@ -892,8 +892,10 @@ final class LibraryUITests: XCTestCase {
         // rather than an alert. This changes setup only; the real drop is still required.
         try ui.nameNewFilesFolder(fixtureFolder)
         let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", fixtureFolder)).firstMatch
-        try visible(directory, "Files must create the external fixture folder")
-        directory.tap()
+        let entered = app.buttons[fixtureFolder + ", Actions Menu"].firstMatch
+        try eventually("Files must list or enter the newly created directory") { directory.exists || entered.exists }
+        if !entered.exists { directory.tap() }
+        try visible(entered, "Save destination must be the named external fixture directory")
         try tap("Save")
         try eventually("Save to Files must finish or report an export error", timeout: 20) {
             !self.app.buttons["Save"].exists || self.app.alerts.firstMatch.exists

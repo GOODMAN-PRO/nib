@@ -550,16 +550,22 @@ final class InsertUITests: XCTestCase {
         try menu("Style"); try tap("Ellipse"); try tap("Dashed", scroll: true); outside()
         let after = try item("shape")
         XCTAssertEqual(after["shape"] as? String, "ellipse")
-        XCTAssertEqual(json(after["frame"]), json(before["frame"]))
+        let oldFrame = try XCTUnwrap(before["frame"] as? JSON), newFrame = try XCTUnwrap(after["frame"] as? JSON)
+        // Serialization can round at the last binary digit. 1e-6 page points is far below a display pixel.
+        for component in ["x", "y", "w", "h"] {
+            XCTAssertEqual(try XCTUnwrap(newFrame[component] as? Double), try XCTUnwrap(oldFrame[component] as? Double), accuracy: 0.000001)
+        }
         XCTAssertEqual((after["style"] as? JSON)?["pattern"] as? String, "dashed")
         try ui.tapCommand("edit.undo")
         XCTAssertNotEqual((try item("shape")["style"] as? JSON)?["pattern"] as? String, "dashed")
     }
     func testShapeCornerRoundingAndArrowheadsPersist() throws {
-        try shape(); try menu("Style"); try tap("Rounded", scroll: true); outside()
+        try shape()
+        let originalRadius = try XCTUnwrap((item("shape")["style"] as? JSON)?["cornerRadius"] as? Double)
+        try menu("Style"); try tap("Rounded", scroll: true); outside()
         XCTAssertGreaterThan((try item("shape")["style"] as? JSON)?["cornerRadius"] as? Double ?? 0, 0)
         try ui.tapCommand("edit.undo")
-        XCTAssertEqual((try item("shape")["style"] as? JSON)?["cornerRadius"] as? Double, 0)
+        XCTAssertEqual((try item("shape")["style"] as? JSON)?["cornerRadius"] as? Double, originalRadius)
         try ui.tapCommand("item.delete"); try counts(4)
         try shape("Line"); let original = try item("shape")
         try menu("Style"); try toggle("At start", to: true); try toggle("At end", to: true); outside()
