@@ -346,8 +346,9 @@ struct DockLanding: Equatable {
     var centre: CGPoint
     var since: CFTimeInterval = CACurrentMediaTime()
 
-    func check(body: CGPoint, settling: Bool, now: CFTimeInterval) -> Outcome {
+    func check(body: CGPoint, settling: Bool, now: CFTimeInterval, deferred: Bool = false) -> Outcome {
         if now - since > DropletDockModel.arrivalTimeout { return .expired }
+        if deferred { return .waiting }
         return DropletDockModel.hasArrived(centre: body, at: centre) || !settling ? .arrived : .waiting
     }
 }
@@ -393,6 +394,65 @@ enum DockTransition: Equatable {
         case .spreading: return turns ? .wait : .slide
         case .idle: return reduced ? .crossFade : (turns ? .reform : .slide)
         }
+    }
+}
+
+/// The dockable's layout and latest deferred request. The dock carries its axis; the field alone decides when a
+/// gather spreads and finishes. Keeping this state outside SwiftUI also lets fixed-step tests exercise replay.
+struct DockableTransition {
+    var laidOut: NibPaletteDock?
+    var landing: DockLanding?
+    private(set) var reforming: NibPaletteDock?
+    private(set) var waiting: NibPaletteDock?
+    private var replaying = false
+
+    init(laidOut: NibPaletteDock? = nil) { self.laidOut = laidOut }
+
+    var defersLanding: Bool { waiting != nil || replaying }
+
+    mutating func request(_ next: NibPaletteDock, model: DropletDockModel, phase: DropletField.ReshapePhase,
+                          reduced: Bool, canReshape: Bool) -> DockTransition {
+        let plan = DockTransition.plan(from: laidOut ?? next, to: next, reforming: reforming,
+                                       phase: phase, reduced: reduced)
+        if waiting != nil || plan == .wait || plan == .retarget {
+            // Retarget the existing landing, never re-arm it or extend its timeout. Ordinary single flips keep
+            // their release's exact resting frame (including fusion with neighbours).
+            let target = model.frame(for: next)
+            landing?.centre = CGPoint(x: target.midX, y: target.midY)
+        }
+        if waiting != nil { replaying = plan == .reform || plan == .retarget || plan == .crossFade }
+        // Even a request for the current layout must pass the planner: it can reverse an unfinished gather.
+        waiting = plan == .wait ? next : nil
+        switch plan {
+        case .reform, .retarget:
+            guard canReshape else {
+                reforming = nil
+                laidOut = next
+                replaying = false
+                return .slide
+            }
+            reforming = next
+        case .slide:
+            laidOut = next
+        case .stay, .wait, .crossFade:
+            break
+        }
+        return plan
+    }
+
+    /// Switch axes only while the content is dark. At idle the owner replays the latest request with fresh geometry.
+    mutating func reshaped(_ phase: DropletField.ReshapePhase) -> NibPaletteDock? {
+        if phase == .spreading, let reforming {
+            laidOut = reforming
+            self.reforming = nil
+            replaying = false
+        }
+        return phase == .idle ? waiting : nil
+    }
+
+    mutating func crossFaded(to next: NibPaletteDock) {
+        laidOut = next
+        replaying = false
     }
 }
 
@@ -454,13 +514,14 @@ struct DockArrivalWatcher: View {
     let node: DropletNode?
     let field: DropletField?
     @Binding var landing: DockLanding?
+    var deferred = false
 
     var body: some View {
         Color.clear
             .onChange(of: node?.presentation) { _, p in
                 guard let target = landing, let p, !p.isLifted, let field, let box = field.visualFrame(id) else { return }
                 switch target.check(body: CGPoint(x: box.midX, y: box.midY), settling: p.isSettling,
-                                    now: CACurrentMediaTime()) {
+                                    now: CACurrentMediaTime(), deferred: deferred) {
                 case .waiting:
                     break
                 case .arrived:
@@ -535,12 +596,9 @@ struct DropletDockableModifier: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.nibLiquidMode) private var mode
     /// The dock the content is laid out for. It lags `current` through a re-form (the axis switches at the midpoint).
-    @State private var laidOut: NibPaletteDock?
-    /// The dock a running re-form spreads into.
-    @State private var pending: NibPaletteDock?
+    @State private var transition = DockableTransition()
     @State private var dragging = false
     @State private var releaseVelocity: CGVector = .zero
-    @State private var landing: DockLanding?
     @State private var opacity: Double = 1
     @GestureState private var live = false
 
@@ -554,7 +612,7 @@ struct DropletDockableModifier: ViewModifier {
                     .offsetBy(dx: origin.x, dy: origin.y),
                 length: length, thickness: thickness, docks: docks, compact: compact)
             let wanted = model.validated(current)
-            let dock = laidOut ?? wanted
+            let dock = transition.laidOut ?? wanted
             let frame = model.frame(for: dock)
             let driver = field.map { DropletDockDriver(id: id, field: $0) }
             ZStack(alignment: .topLeading) {
@@ -572,8 +630,12 @@ struct DropletDockableModifier: ViewModifier {
                     .position(x: frame.midX - origin.x, y: frame.midY - origin.y)
             }
             .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
-            .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
-            .onAppear { if laidOut == nil { laidOut = wanted } }
+            .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $transition.landing,
+                                           deferred: transition.defersLanding))
+            .background(ReshapeWatcher(node: field?.node(id)) { phase in
+                if let next = transition.reshaped(phase) { adopt(model.validated(next), model: model) }
+            })
+            .onAppear { if transition.laidOut == nil { transition.laidOut = wanted } }
             .onChange(of: wanted) { _, next in adopt(next, model: model) }
             .onChange(of: live) { _, isLive in
                 // A cancelled drag (no onEnded) still lets go: the droplet flows home with no velocity.
@@ -583,17 +645,11 @@ struct DropletDockableModifier: ViewModifier {
                     dragging = false
                     let box = field?.visualFrame(id) ?? frame
                     let r = driver.release(at: CGPoint(x: box.midX, y: box.midY), velocity: .zero,
-                                           from: laidOut ?? wanted, model: model)
-                    landing = DockLanding(centre: CGPoint(x: r.frame.midX, y: r.frame.midY))
+                                           from: transition.laidOut ?? wanted, model: model)
+                    transition.landing = DockLanding(centre: CGPoint(x: r.frame.midX, y: r.frame.midY))
                 }
             }
         }
-        .background(ReshapeWatcher(node: field?.node(id)) { phase in
-            if phase == .spreading, let pending {
-                laidOut = pending
-                self.pending = nil
-            }
-        })
     }
 
     private func dragGesture(driver: DropletDockDriver?, model: DropletDockModel) -> some Gesture {
@@ -603,7 +659,7 @@ struct DropletDockableModifier: ViewModifier {
                 guard let driver else { return }
                 if !dragging {
                     dragging = true
-                    landing = nil
+                    transition.landing = nil
                     driver.begin(at: value.startLocation)
                 }
                 driver.move(to: value.location, model: model)
@@ -611,12 +667,12 @@ struct DropletDockableModifier: ViewModifier {
             .onEnded { value in
                 guard let driver, dragging else { return }
                 dragging = false
-                let from = laidOut ?? model.validated(current)
+                let from = transition.laidOut ?? model.validated(current)
                 let r = driver.release(at: value.location,
                                        velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
                                        from: from, model: model)
                 releaseVelocity = r.velocity
-                landing = DockLanding(centre: CGPoint(x: r.frame.midX, y: r.frame.midY))
+                transition.landing = DockLanding(centre: CGPoint(x: r.frame.midX, y: r.frame.midY))
                 if r.dock != from { onDock(r.dock) }
             }
     }
@@ -625,25 +681,37 @@ struct DropletDockableModifier: ViewModifier {
     /// position animates from where the body is (FLIP, `snap`, from the release velocity). Other axis: re-form (§10.10).
     /// Reduce Motion or Liquid Off: fade out, move, fade in.
     private func adopt(_ next: NibPaletteDock, model: DropletDockModel) {
-        let shown = laidOut ?? next
-        let velocity = releaseVelocity
-        releaseVelocity = .zero
-        guard next != shown else { return }
-        if reduceMotion || mode == .off {
-            withAnimation(NibMotion.exit) { opacity = 0 }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                laidOut = next
-                pending = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
-                    withAnimation(NibMotion.enter) { opacity = 1 }
-                }
-            }
-        } else if next.isVertical != shown.isVertical, let field {
+        let phase = field?.node(id).presentation.reshape ?? .idle
+        let wasWaiting = transition.waiting != nil
+        let plan = transition.request(next, model: model, phase: phase, reduced: reduceMotion || mode == .off,
+                                      canReshape: field?.visualFrame(id) != nil)
+        switch plan {
+        case .stay:
+            releaseVelocity = .zero
+            return
+        case .wait:
+            return
+        case .slide:
+            break // The new layout flows from the current body with FLIP and `snap`.
+        case .reform, .retarget:
             let target = model.frame(for: next)
-            pending = next
-            field.beginReshape(id, towards: CGPoint(x: target.midX, y: target.midY), velocity: velocity)
-        } else {
-            laidOut = next
+            if (wasWaiting || plan == .retarget), transition.landing != nil {
+                field?.setMeniscus(id, towards: target)
+            }
+            field?.beginReshape(id, towards: CGPoint(x: target.midX, y: target.midY), velocity: releaseVelocity)
+        case .crossFade:
+            crossFade(to: next)
+        }
+        releaseVelocity = .zero
+    }
+
+    private func crossFade(to next: NibPaletteDock) {
+        withAnimation(NibMotion.exit) { opacity = 0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            transition.crossFaded(to: next)
+            DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                withAnimation(NibMotion.enter) { opacity = 1 }
+            }
         }
     }
 }

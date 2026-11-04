@@ -342,4 +342,132 @@ final class DropletDockTests: XCTestCase {
         XCTAssertTrue(own.claims(released, now: 10 + DropletDockModel.arrivalTimeout))
         XCTAssertFalse(own.claims(released, now: 12))                 // a binding that took longer moves from rest
     }
+
+    @MainActor
+    func testDockableReplaysAReversalBeforeTheSpreadingMidpointAndSettlesOnce() {
+        // 8, 100 and 150 ms: all before the gather reaches its spreading midpoint (about 190 ms).
+        for frame in [1, 12, 18] { runDockableFlip(reversingAt: frame) }
+    }
+
+    @MainActor
+    func testDockableSingleFlipStillSpreadsAtItsRequestedDockAndSettlesOnce() {
+        runDockableFlip(reversingAt: nil)
+    }
+
+    /// Drive the production request/replay state and the actual field, replacing only SwiftUI's phase watcher and
+    /// layout measurement with synchronous callbacks. No wall-clock sleeps or reconstructed reshape timing.
+    @MainActor
+    private func runDockableFlip(reversingAt reversalFrame: Int?) {
+        let field = DropletField()
+        defer { field.setActive(false) }
+        let id = "dockable.regression"
+        var state = DockableTransition(laidOut: left)
+        let finalDock = reversalFrame == nil ? bottom : left
+        let target = iPad.frame(for: bottom)
+        field.setRest(id, iPad.frame(for: left), style: .palette)
+        _ = field.tick(1.0 / 120, now: 0)
+        // One pickup/release. Replaying a dock must never start another drag or re-arm this landing.
+        let start = iPad.frame(for: left)
+        field.beginDrag(id, at: CGPoint(x: start.midX, y: start.midY))
+        _ = field.endDrag(id, velocity: .zero)
+        state.landing = DockLanding(centre: CGPoint(x: target.midX, y: target.midY), since: 0)
+
+        func request(_ dock: NibPaletteDock) -> DockTransition {
+            let plan = state.request(dock, model: iPad, phase: field.node(id).presentation.reshape,
+                                     reduced: false, canReshape: field.visualFrame(id) != nil)
+            if plan == .reform || plan == .retarget {
+                let frame = iPad.frame(for: dock)
+                field.beginReshape(id, towards: CGPoint(x: frame.midX, y: frame.midY), velocity: .zero)
+            }
+            return plan
+        }
+
+        XCTAssertEqual(request(bottom), .reform)
+        var phase = DropletField.ReshapePhase.idle
+        var layouts = [left]
+        var plips = 0
+        var settles = 0
+        var wasSettled = false
+        for frame in 1...480 {
+            let now = Double(frame) / 120
+            let busy = field.tick(1.0 / 120, now: now)
+            let presentation = field.node(id).presentation
+            if frame == reversalFrame {
+                XCTAssertEqual(presentation.reshape, .gathering)
+                XCTAssertEqual(state.laidOut, left)
+                XCTAssertEqual(request(left), .wait)
+                XCTAssertEqual(state.waiting, left)
+                XCTAssertEqual(state.landing?.since, 0)
+            }
+            if presentation.reshape != phase {
+                phase = presentation.reshape
+                if let next = state.reshaped(phase) {
+                    XCTAssertEqual(next, finalDock)
+                    XCTAssertEqual(request(next), .reform)
+                }
+            }
+            if let dock = state.laidOut, layouts.last != dock {
+                XCTAssertEqual(phase, .spreading, "The content's axis changes only at the dark midpoint")
+                XCTAssertEqual(presentation.contentOpacity, 0, accuracy: 1e-9)
+                layouts.append(dock)
+                field.setRest(id, iPad.frame(for: dock), style: .palette)
+            }
+            XCTAssertFalse(presentation.isLifted, "A replay must not pick the droplet up again")
+            if let landing = state.landing, let box = field.visualFrame(id) {
+                switch landing.check(body: CGPoint(x: box.midX, y: box.midY), settling: presentation.isSettling,
+                                     now: now, deferred: state.defersLanding) {
+                case .arrived:
+                    XCTAssertEqual(state.laidOut, finalDock, "No plip at the superseded dock")
+                    plips += 1
+                    state.landing = nil
+                case .expired:
+                    XCTFail("The release must reach its final dock before its landing expires")
+                    state.landing = nil
+                case .waiting:
+                    break
+                }
+            }
+            let settled = !busy && phase == .idle && !state.defersLanding
+            if settled && !wasSettled { settles += 1 }
+            wasSettled = settled
+        }
+        XCTAssertEqual(layouts, reversalFrame == nil ? [left, bottom] : [left, bottom, left])
+        XCTAssertEqual(state.laidOut, finalDock)
+        XCTAssertNil(state.waiting)
+        XCTAssertNil(state.reforming)
+        XCTAssertNil(state.landing)
+        XCTAssertEqual(phase, .idle)
+        XCTAssertTrue(wasSettled)
+        XCTAssertEqual(settles, 1)
+        XCTAssertEqual(plips, 1)
+        XCTAssertEqual(field.visualFrame(id), iPad.frame(for: finalDock))
+    }
+
+    func testDockableKeepsOnlyTheLatestRequestIncludingItsAxisAndAlongPosition() {
+        var state = DockableTransition(laidOut: left)
+        XCTAssertEqual(state.request(bottom, model: iPad, phase: .idle, reduced: false, canReshape: true), .reform)
+        // A request can precede the field's first publication, just as it can arrive during a gather.
+        XCTAssertEqual(state.request(left, model: iPad, phase: .idle, reduced: false, canReshape: true), .wait)
+        let latest = NibPaletteDock(edge: .trailing, along: 0.8)
+        XCTAssertEqual(state.request(latest, model: iPad, phase: .gathering, reduced: false, canReshape: true), .wait)
+        XCTAssertNil(state.reshaped(.spreading))
+        XCTAssertEqual(state.laidOut, bottom)
+        XCTAssertEqual(state.reshaped(.idle), latest)
+        XCTAssertEqual(state.request(latest, model: iPad, phase: .idle, reduced: false, canReshape: true), .reform)
+        XCTAssertNil(state.reshaped(.spreading))
+        XCTAssertEqual(state.laidOut, latest)
+        XCTAssertNil(state.reshaped(.idle))
+        XCTAssertNil(state.landing, "Commands do not arm touch haptics")
+    }
+
+    func testDockableReturningToTheActiveTargetCancelsTheDeferredReversal() {
+        var state = DockableTransition(laidOut: left)
+        XCTAssertEqual(state.request(bottom, model: iPad, phase: .idle, reduced: false, canReshape: true), .reform)
+        XCTAssertEqual(state.request(left, model: iPad, phase: .gathering, reduced: false, canReshape: true), .wait)
+        XCTAssertEqual(state.request(bottom, model: iPad, phase: .gathering, reduced: false, canReshape: true), .stay)
+        XCTAssertNil(state.waiting)
+        XCTAssertNil(state.reshaped(.spreading))
+        XCTAssertEqual(state.laidOut, bottom)
+        XCTAssertNil(state.reshaped(.idle))
+    }
 }
