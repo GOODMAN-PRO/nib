@@ -52,7 +52,7 @@ final class SelectionUITests: XCTestCase {
     /// Waits for a typed action or placeholder in the active presentation; re-resolves after every menu transition.
     private func control(_ name: String, type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
         let types: [XCUIElement.ElementType] = type == .any
-            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider, .image, .staticText, .cell] : [type]
+            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider, .image, .staticText, .cell, .other] : [type]
         func scope() -> XCUIElement {
             ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
                 : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch
@@ -908,6 +908,7 @@ final class SelectionUITests: XCTestCase {
             (sourceRecognition.value as? String ?? "").uppercased().filter { $0.isLetter } == "HI"
         }
         try tap("Cancel")
+        try loop(count: 4)
         try menu("Restyle Handwriting", "Neaten Handwriting")
         try clear()
         try wait("Neaten must produce visibly restyled handwriting", timeout: 30) { ((try? self.pixels().changed(from: source)) ?? 0) > 40 }
@@ -950,20 +951,39 @@ final class SelectionUITests: XCTestCase {
     }
     func testSelectAllIncludesOnlyActiveLayer() throws {
         try enableLayers()
-        // The QA probe does not expose activeLayer; the selected layer is observable only in the Layers panel.
-        // These canvas-only chords remain indirectly verified by the strict per-layer selection counts below.
-        try key("2", [.command, .option]) { try self.draw(); try self.clear(); try self.selectAll(1) }
-        try key("1", [.command, .option]) { try self.clear(); try self.selectAll(4) }
+        try activateLayer(2)
+        try draw(); try clear(); try selectAll(1)
+        try activateLayer(1)
+        try clear(); try selectAll(4)
     }
     func testMoveObjectsToLayerChangesActiveLayerSelectionAndUndo() throws {
         try enableLayers(); try selectedInk(); let before = try ui.state()
         try menu("Move to Layer", "Layer 2")
         try clear(); try selectAll(4)
-        try key("2", [.command, .option]) { try self.clear(); try self.selectAll(1) }
+        try activateLayer(2)
+        try clear(); try selectAll(1)
         try countsEqual(before)
         try ui.tapCommand("edit.undo")
         try clear(); try selectAll(0)
-        try key("1", [.command, .option]) { try self.clear(); try self.selectAll(5) }
+        try activateLayer(1)
+        try clear(); try selectAll(5)
+    }
+
+    /// Waits for the layer shortcut's selected row before closing the panel and doing any canvas operations.
+    private func activateLayer(_ number: Int) throws {
+        try key("l", [.command, .option]) {
+            _ = try self.ui.waitForState(timeout: 8) { $0.openPanels.contains("layers") }
+        }
+        let panel = ui.app.scrollViews.containing(.button, identifier: "Layer 1").firstMatch
+        let row = panel.buttons.matching(NSPredicate(format: "label == %@", "Layer \(number)")).firstMatch
+        try wait("Layers panel must expose the target row") { row.exists && row.isHittable }
+        try key(String(number), [.command, .option]) {
+            try self.wait("Layer \(number) shortcut must mark its row active") {
+                row.exists && row.isSelected && (row.value as? String)?.hasPrefix("Active,") == true
+            }
+        }
+        try tap("cmd.panel.close")
+        _ = try ui.waitForState(timeout: 8) { !$0.openPanels.contains("layers") }
     }
 
     // MARK: selection.snap — both exposed options, alignment also controls equal-spacing guides.

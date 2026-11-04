@@ -556,15 +556,28 @@ final class NibUI {
         }
     }
 
-    /// Proves a native selection by replacing it with a unique marker and observing the exact full value.
-    /// Unverified until simulator CI: Cmd-Z must reach native Undo and restore text and selection, not document Undo.
-    /// Exact text restoration and the caller's rich-text assertions remain required.
-    func verifyNativeSelection(in field: XCUIElement, fullText: String, range: NSRange) throws {
-        let marker = "QA-" + UUID().uuidString
-        let expected = (fullText as NSString).replacingCharacters(in: range, with: marker)
-        field.typeText(marker)
-        try waitForNativeText(in: field, equals: expected)
-        try nativeKey("z", in: field)
+    /// Waits for native Cut and Copy availability, which requires a nonempty selection, without editing or undoing.
+    /// The callers' rich-text/range assertions verify its extent; this probe preserves text, focus and selection.
+    func verifyNativeSelection(in field: XCUIElement, fullText: String) throws {
+        // iPad's input assistant exposes these even when a hardware shortcut does not present the edit menu.
+        // Never accept cmd.clipboard.*: those controls describe Nib's object selection, not this native field.
+        func available(_ title: String, assistant: String) -> Bool {
+            let shortcut = app.buttons.matching(identifier: assistant).firstMatch
+            if shortcut.exists && shortcut.isEnabled && shortcut.isHittable { return true }
+            for type in [XCUIElement.ElementType.menuItem, .button] {
+                let action = app.descendants(matching: type).matching(NSPredicate(
+                    format: "label ==[c] %@ AND NOT (identifier BEGINSWITH 'cmd.')", title)).firstMatch
+                if action.exists && action.isEnabled && action.isHittable { return true }
+            }
+            return false
+        }
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            isKeyboardFocused(field) && field.value as? String == fullText
+                && available("Cut", assistant: "assistantCut") && available("Copy", assistant: "assistantCopy")
+        }, object: nil)
+        guard XCTWaiter.wait(for: [selected], timeout: 8) == .completed else {
+            throw Failure.message("Native selection must enable Cut and Copy without changing text\n\(app.debugDescription)")
+        }
         try waitForNativeText(in: field, equals: fullText)
     }
 

@@ -744,7 +744,8 @@ final class LibraryUITests: XCTestCase {
             $0.buttons.matching(self.matching("Notebook")).count > 0
         }, "New must open its creation menu")
         // The fixture launches the real camera gate (ScanSupport.documentCamera); it does not fake support.
-        // QAState currently has no capability field, so use the same device API as that gate.
+        // QAState currently has no capability field. This assumes launchFixture's non-hostless launch
+        // (NibUITests/README.md); the runner's API alone would not model the app's hostless-test gate.
         let supportsDocumentCamera = VNDocumentCameraViewController.isSupported
         XCTContext.runActivity(named: "New menu document-camera capability") { activity in
             let attachment = XCTAttachment(string: "VNDocumentCameraViewController.isSupported=\(supportsDocumentCamera); fixture is not hostless")

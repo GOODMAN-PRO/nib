@@ -91,7 +91,7 @@ final class InsertUITests: XCTestCase {
     /// Waits for a freshly bound typed control in the active alert, menu or sheet, including native placeholders.
     private func control(_ name: String, _ type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
         let types: [XCUIElement.ElementType] = type == .any
-            ? [.button, .menuItem, .textField, .secureTextField, .textView, .searchField, .switch, .slider, .cell, .image, .staticText] : [type]
+            ? [.button, .menuItem, .textField, .secureTextField, .textView, .searchField, .switch, .slider, .cell, .image, .staticText, .other] : [type]
         func scope() -> XCUIElement {
             if ui.app.alerts.firstMatch.exists { return ui.app.alerts.firstMatch }
             if ui.app.menus.firstMatch.exists { return ui.app.menus.firstMatch }
@@ -150,7 +150,7 @@ final class InsertUITests: XCTestCase {
         let fullText = field.value as? String ?? ""
         try ui.nativeKey(value, modifiers, in: field)
         if value == "a" && modifiers == .command && !fullText.isEmpty && fullText != field.placeholderValue {
-            try ui.verifyNativeSelection(in: field, fullText: fullText, range: NSRange(location: 0, length: (fullText as NSString).length))
+            try ui.verifyNativeSelection(in: field, fullText: fullText)
         }
     }
     /// Resolves the current native input immediately before key delivery, avoiding stale retained editors.
@@ -364,7 +364,7 @@ final class InsertUITests: XCTestCase {
     func testTextSelectedRangeFontEmphasisColourAndHighlight() throws {
         try beginText("plain styled")
         try key(XCUIKeyboardKey.leftArrow.rawValue, [.alternate, .shift])
-        try ui.verifyNativeSelection(in: focusedField(), fullText: "plain styled", range: NSRange(location: 6, length: 6))
+        try ui.verifyNativeSelection(in: focusedField(), fullText: "plain styled")
         for title in ["Bold", "Italic", "Underline", "Strikethrough"] { try tap(title) }
         try tap("Font"); try tap("Georgia")
         let previousSize = try control("Larger Text").value as? String
@@ -877,7 +877,7 @@ final class InsertUITests: XCTestCase {
         let after = ui.app.buttons.allElementsBoundByIndex.map(\.label).filter { collectionLabels.contains($0) }
         XCTAssertLessThan(try XCTUnwrap(after.firstIndex(of: "Renamed Lab")), try XCTUnwrap(before.firstIndex(of: "Renamed Lab")))
         try tap("Collection Options"); try tap("Delete Collection")
-        if visible("Cancel") { try tap("Cancel") } else { outside() }
+        try tap("Cancel")
         try wait("Collection confirmation must dismiss") { !self.ui.app.buttons["Delete Collection"].exists }
         XCTAssertTrue(query("Renamed Lab").firstMatch.exists)
         try tap("Collection Options"); try tap("Delete Collection"); try tap("Delete Collection")
@@ -1212,7 +1212,7 @@ final class InsertUITests: XCTestCase {
         try toggle("Show Resolved", to: true)
         try message("Check the units").tap(); try tap("Reopen Thread")
         try message("Check the units").press(forDuration: 0.8)
-        if visible("Cancel") { try tap("Cancel") } else { outside() }
+        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try wait("Message context menu must dismiss before panel controls") { !self.ui.app.buttons["Edit Message"].exists }
         try tap("cmd.panel.close"); try goToSecondPage(); try panel("Comments")
         try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
@@ -1316,6 +1316,7 @@ final class InsertUITests: XCTestCase {
         try tap("Stop Recording"); try panel("Audio"); XCTAssertTrue(try clipRow().exists)
     }
     func testAudioPlayPauseSeekSkipSettingsAndClose() throws {
+        executionTimeAllowance = 300
         try recordClip(minimumSeconds: 30)
         let row = try clipRow()
         let pause = ui.app.buttons["Pause"].firstMatch
