@@ -717,9 +717,11 @@ final class LibraryUITests: XCTestCase {
         try context(physics); try tap("Duplicate")
         let copy = physics + " copy"
         try visible(item(copy), "Combine needs a second notebook")
+        ui.recordDiagnostics("Combine before drag", facts: "source=\(item(copy).frame); target=\(item(physics).frame); selected=\(item(copy).isSelected)")
         item(copy).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)),
                    withVelocity: .slow, thenHoldForDuration: 0.7)
+        ui.recordDiagnostics("Combine drag completed", facts: "confirmation=\(button("Combine").exists); target=\(item(physics).frame); source=\(item(copy).frame). Arming is not exposed by the current probe; inspect the retained target highlight and confirmation.")
         try tap("Combine")
         try eventually("Combined source must leave library") { !self.item(copy).exists }
         try ui.openDocument(physics)
@@ -780,7 +782,11 @@ final class LibraryUITests: XCTestCase {
     func testCommandFFocusesLibrarySearch() throws { try ui.chord("f", .command) { try self.searchFocused() } }
     func testCommandOFocusesLibrarySearch() throws { try ui.chord("o", .command) { try self.searchFocused() } }
     private func appMenu(_ title: String, expected: String) throws {
-        try tap("App Menu")
+        let menuButton = app.buttons.matching(identifier: "cmd.library.setView").matching(matching("App Menu")).firstMatch
+        ui.recordDiagnostics("App menu before opening", facts: "identified button exists=\(menuButton.exists); requested destination=\(title)")
+        try visible(menuButton, "App Menu must have its command-bearing button")
+        menuButton.tap()
+        ui.recordDiagnostics("App menu after opening", facts: "requested destination=\(title); menus=\(app.menus.count)")
         // Trash also exists in the sidebar; command identity disambiguates the app-menu entry.
         let entry = app.buttons.matching(identifier: "cmd.settings.open").matching(matching(title)).firstMatch
         try visible(entry, "App Menu must offer \(title)")

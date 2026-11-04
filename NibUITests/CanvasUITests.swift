@@ -685,6 +685,7 @@ final class CanvasUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(converted.itemCountOnPage, before.itemCountOnPage, "Conversion must preserve page assets and content")
         XCTAssertEqual(converted.strokeCountOnPage, before.strokeCountOnPage)
         try tap("Fit All Content")
+        ui.recordDiagnostics("Converted notebook canvas exposure", facts: "Expected preserved text: Motion and forces; inspect label/value and text geometry independently of conversion counts")
         _ = try content("Motion and forces")
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.pageCount == 4 }

@@ -896,13 +896,24 @@ final class SelectionUITests: XCTestCase {
                      [CGPoint(x: 0.41, y: 0.62), CGPoint(x: 0.47, y: 0.62)],
                      [CGPoint(x: 0.55, y: 0.57), CGPoint(x: 0.558, y: 0.70)]] { try draw(path) }
         try clear(); let source = try pixels(), before = try ui.state()
-        try loop(count: 4); try menu("Restyle Handwriting", "Neaten Handwriting")
+        try loop(count: 4)
+        let sourceItems = try copiedItems()
+        try menu("Convert", "Text")
+        let sourceRecognition = try control("Recognised text")
+        ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)")
+        try wait("Source HI must be recognised before testing preservation", timeout: 30) {
+            (sourceRecognition.value as? String ?? "").uppercased().filter { $0.isLetter } == "HI"
+        }
+        try tap("Cancel")
+        try menu("Restyle Handwriting", "Neaten Handwriting")
         try clear()
         try wait("Neaten must produce visibly restyled handwriting", timeout: 30) { ((try? self.pixels().changed(from: source)) ?? 0) > 40 }
         let restyled = try ui.state()
         try loop(count: restyled.strokeCountOnPage - 1)
+        let restyledItems = try copiedItems()
         try menu("Convert", "Text")
         let recognised = try control("Recognised text")
+        ui.recordDiagnostics("Neaten result recognition and stroke geometry", facts: "recognition=\(String(describing: recognised.value)); records=\(restyledItems)")
         try wait("Restyled HI must retain its recognised meaning", timeout: 30) {
             let text = (recognised.value as? String ?? "").uppercased().filter { $0.isLetter }
             return text == "HI"

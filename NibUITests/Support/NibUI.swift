@@ -738,6 +738,17 @@ final class NibUI {
         }
     }
 
+    /// Captures the current screen, probe and AX tree at a named transition; no command or document mutation is injected.
+    func recordDiagnostics(_ name: String, facts: String = "") {
+        XCTContext.runActivity(named: name) { activity in
+            let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screen.name = name + "-screen"; screen.lifetime = .keepAlways; activity.add(screen)
+            let tree = XCTAttachment(string: "uptime=\(ProcessInfo.processInfo.systemUptime)\n\(facts)\n"
+                + "probe=\(probe.value ?? "missing")\n\(app.debugDescription)")
+            tree.name = name + "-state-and-tree"; tree.lifetime = .keepAlways; activity.add(tree)
+        }
+    }
+
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using
     /// XCTest's event synthesizer (test runner only); no commands or app-side gesture injection are used.
     func drawStroke(_ path: [CGPoint], duration: TimeInterval = 0.35) throws {

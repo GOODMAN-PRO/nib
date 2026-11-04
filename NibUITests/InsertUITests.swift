@@ -934,9 +934,14 @@ final class InsertUITests: XCTestCase {
     }
     func testGIFLocalInvalidLinkReportsErrorAndFilesCancelInsertsNothing() throws {
         try elements(); try tap("GIFs"); try tap("Add GIF from a Link")
-        try replace(try control("https://", .textField), with: "not a URL"); try tap("Add GIF")
+        try replace(try control("https://", .textField), with: "not a URL")
+        ui.recordDiagnostics("Invalid GIF before submit", facts: "Expected route: ElementsPopover.submit(.gifLink) -> report(element.insertGIF, invalid URL) -> nibCommandFailed -> ShellViewController.toastIfActive")
+        try tap("Add GIF")
         let errors = ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'URL' OR label CONTAINS[c] 'address' OR label CONTAINS[c] 'invalid'"))
-        XCTAssertTrue(errors.firstMatch.waitForExistence(timeout: 10), "Invalid GIF link must give an actionable error")
+        // Observe the transient error before collecting the more expensive screen/tree attachments.
+        let errorAppeared = errors.firstMatch.waitForExistence(timeout: 10)
+        ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test")
+        XCTAssertTrue(errorAppeared, "Invalid GIF link must give an actionable error")
         if visible("Cancel") { try tap("Cancel") }
         try tap("Add GIF from Files"); try tap("Cancel"); try counts(4)
     }
@@ -962,7 +967,9 @@ final class InsertUITests: XCTestCase {
         try ui.selectTool("sticky"); try tap("tool.sticky")
         // DESIGN.md keeps the native keyboard: taps at the canvas's lower coordinates
         // hit its keys until input is submitted, rather than dismissing the popover.
-        try replace(try control("Author name on new notes", .textField, scroll: true), with: "UI Author\n")
+        let author = try control("Author name on new notes", .textField, scroll: true)
+        try replace(author, with: "UI Author")
+        author.typeText("\n")
         try wait("Submitting the author name must dismiss the keyboard") { !self.ui.app.keyboards.firstMatch.isHittable }
         outside(); ui.coordinate(point).tap()
         let editor = try control("Sticky note", .textView)
@@ -1007,8 +1014,15 @@ final class InsertUITests: XCTestCase {
         try counts(before.itemCountOnPage + 1, strokes: before.strokeCountOnPage + 1)
     }
     func testTapeDrawHideRevealDoesNotAddUndoAndRemoveAllRestores() throws {
+        defer {
+            ui.recordDiagnostics("Tape final command and undo state", facts: "Expected edit sequence: pen stroke, tape stroke, reveal, hide, undo tape, redo tape, removeAll, undo removeAll; reveal/hide are non-undoable")
+            // Read the user-visible history after the scenario, including when its strict count check throws.
+            do { try panel("History"); ui.recordDiagnostics("Tape actual history groups") }
+            catch { ui.recordDiagnostics("Tape history unavailable", facts: String(describing: error)) }
+        }
         try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: 2)
         try drawTape(); try counts(6, strokes: 3)
+        ui.recordDiagnostics("Tape committed before visibility toggles", facts: "pen + tape insertion completed")
         let masked = try canvasPixels()
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
         try wait("Reveal tape must visibly expose underlying pen ink") {
@@ -1021,7 +1035,10 @@ final class InsertUITests: XCTestCase {
             return self.changedPixels(masked, current) < 20
         }
         try counts(6, strokes: 3)
-        try ui.tapCommand("edit.undo"); try counts(5, strokes: 2)
+        ui.recordDiagnostics("Tape immediately before undo", facts: "reveal and hide completed; undo must remove tape insertion")
+        try ui.timedAction("Tape edit.undo") { try self.ui.tapCommand("edit.undo") }
+        ui.recordDiagnostics("Tape immediately after undo")
+        try counts(5, strokes: 2)
         try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
         try tap("tool.tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
         try counts(6, strokes: 3)
@@ -1134,7 +1151,10 @@ final class InsertUITests: XCTestCase {
     }
     func testCommentAddOpenBadgeReplyAndCopyText() throws {
         try comment(); try tap("cmd.panel.close")
+        try wait("Comment panel must finish closing before badge hit-testing") { !self.ui.app.buttons["cmd.panel.close"].exists }
+        ui.recordDiagnostics("Comment badge before reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)")
         ui.coordinate(point).tap()
+        ui.recordDiagnostics("Comment badge after reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)")
         XCTAssertTrue(try message("Check the units").exists)
         let reply = try control("Reply"); try ui.focusField(reply); reply.typeText("Use metres per second"); try tap("Send")
         let posted = try message("Use metres per second")
