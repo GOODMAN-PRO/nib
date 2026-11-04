@@ -61,6 +61,10 @@ final class InkUITests: XCTestCase {
                 let visible = ui.app.descendants(matching: kind).matching(predicate).firstMatch
                 if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
             }
+            if type == .any {
+                let visible = ui.app.descendants(matching: .any).matching(predicate).firstMatch
+                if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
+            }
             return nil
         }
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in candidate() != nil }, object: nil)
@@ -292,8 +296,8 @@ final class InkUITests: XCTestCase {
         let height: Int
         let bytes: [UInt8]
         @MainActor init(_ screenshot: XCUIScreenshot, screenSize: CGSize, rect: CGRect) throws {
-            // Device capture avoids XCUIApplication's incorrectly cropped landscape image on this SDK.
-            // UIImage.draw applies the capture's orientation before we address screen-coordinate pixels.
+            // raster() supplies a full-device capture and oriented screen dimensions in points.
+            // UIImage.draw applies its orientation before cropping; app captures crop landscape incorrectly on this SDK.
             let source = screenshot.image
             let format = UIGraphicsImageRendererFormat()
             format.scale = source.scale
@@ -335,11 +339,23 @@ final class InkUITests: XCTestCase {
         }
     }
 
-    /// Captures the app in app-local coordinates so floating-window origins never rescale a full-screen image.
+    /// Waits for fullscreen at the screen origin before cropping a device capture in screen-point coordinates.
     private func raster(_ region: CGRect? = nil) throws -> Raster {
+        try ui.establishFullScreen()
+        let window = ui.app.windows.firstMatch.frame
+        guard window.origin == .zero else {
+            throw NibUI.Failure.message("Raster requires a full-screen window at (0,0): \(window)")
+        }
+        let screenshot = XCUIScreen.main.screenshot()
+        let dimensions = UIScreen.main.bounds.size
+        let long = max(dimensions.width, dimensions.height), short = min(dimensions.width, dimensions.height)
+        let screenSize = screenshot.image.size.width > screenshot.image.size.height
+            ? CGSize(width: long, height: short) : CGSize(width: short, height: long)
         let r = region ?? inkRegion, f = ui.canvas.frame
-        return try Raster(ui.app.screenshot(), screenSize: ui.app.frame.size, rect: CGRect(x: f.minX - ui.app.frame.minX + r.minX * f.width, y: f.minY - ui.app.frame.minY + r.minY * f.height,
-                                                           width: r.width * f.width, height: r.height * f.height))
+        return try Raster(screenshot, screenSize: screenSize,
+                          rect: CGRect(x: f.minX - window.minX + r.minX * f.width,
+                                       y: f.minY - window.minY + r.minY * f.height,
+                                       width: r.width * f.width, height: r.height * f.height))
     }
 
     private func visibleInk(after before: Raster, region: CGRect? = nil) throws -> Raster {

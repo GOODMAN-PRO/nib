@@ -64,7 +64,11 @@ final class ChromeUITests: XCTestCase {
     private func reachable(_ name: String) throws -> XCUIElement {
         let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
         let buttons = ui.app.buttons.matching(predicate)
-        let target = { buttons.firstMatch.exists ? buttons.firstMatch : self.query(name).firstMatch }
+        let target = {
+            buttons.allElementsBoundByIndex.first {
+                $0.isHittable && $0.isEnabled && !$0.identifier.hasPrefix("tool.")
+            } ?? (buttons.firstMatch.exists ? buttons.firstMatch : self.query(name).firstMatch)
+        }
         ui.revealFormElement(target: target)
         try wait("Chrome control is not actionable: \(name)", timeout: 8) {
             let found = target()

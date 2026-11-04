@@ -222,9 +222,9 @@ final class CreateUITests: XCTestCase {
         try notebook("Custom dimensions")
         try tap("No cover")
         try chooseSize("Custom")
-        try replace(ui.app.textFields["Width in millimetres"], with: "100")
+        try replace(ui.app.textFields["Width in millimetres"], with: "100", matching: numericValueMatches)
         try dismissKeyboard()
-        try replace(ui.app.textFields["Height in millimetres"], with: "150")
+        try replace(ui.app.textFields["Height in millimetres"], with: "150", matching: numericValueMatches)
         try dismissKeyboard()
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
@@ -233,9 +233,9 @@ final class CreateUITests: XCTestCase {
         executionTimeAllowance = 300 // Diagnostic only; quiescence remains enabled.
         try notebook("Invalid dimensions")
         try chooseSize("Custom")
-        try replace(ui.app.textFields["Width in millimetres"], with: "0")
+        try replace(ui.app.textFields["Width in millimetres"], with: "0", matching: numericValueMatches)
         try dismissKeyboard()
-        try replace(ui.app.textFields["Height in millimetres"], with: "0")
+        try replace(ui.app.textFields["Height in millimetres"], with: "0", matching: numericValueMatches)
         try dismissKeyboard()
         let create = ui.app.buttons["cmd.doc.create"]
         if create.isEnabled { create.tap() }
@@ -300,7 +300,7 @@ final class CreateUITests: XCTestCase {
         let hex = ui.app.descendants(matching: .any).matching(NSPredicate(
             format: "(elementType == %d OR elementType == %d) AND (label CONTAINS[c] 'hex' OR placeholderValue CONTAINS[c] 'hex')",
             XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue)).firstMatch
-        try replace(hex, with: "#CEDFED")
+        try replace(hex, with: "#CEDFED", matching: hexValueMatches)
         try dismissKeyboard()
         try tap("Choose Template")
         try scrollTo(ui.app.textFields["Title"], name: "Title")
@@ -670,10 +670,13 @@ final class CreateUITests: XCTestCase {
             String(try XCTUnwrap(components.day)), formatter.string(from: chosen))).firstMatch
         try require(day, "Native start-date picker must expose the chosen day")
         day.tap()
-        // Escape is delivered to the native picker, not an app-relative outside point that can close the planner.
+        // Try picker delivery, then the app responder while the popover is still open; never dismiss the parent.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
             traceCreation("planner-before-picker-dismissal")
             picker.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+            if ui.app.buttons["DatePicker.NextMonth"].exists {
+                ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+            }
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
@@ -840,15 +843,29 @@ final class CreateUITests: XCTestCase {
         element.tap()
     }
 
-    /// Waits for the edited field value before any keyboard dismissal, exposing focus/selection failures directly.
-    private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil) throws {
+    /// Compares numeric values without waiting; replace() waits for equivalent decimal formatting, not a different value.
+    private func numericValueMatches(_ actual: String, _ expected: String) -> Bool {
+        guard let value = Double(actual), let wanted = Double(expected), value.isFinite, wanted.isFinite else { return false }
+        return value == wanted
+    }
+
+    /// Compares hex spelling without waiting; replace() still requires every digit before the picker is dismissed.
+    private func hexValueMatches(_ actual: String, _ expected: String) -> Bool {
+        actual.replacingOccurrences(of: "#", with: "").uppercased()
+            == expected.replacingOccurrences(of: "#", with: "").uppercased()
+    }
+
+    /// Waits for the edited value before dismissal; only explicitly formatted fields opt out of exact string comparison.
+    private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil,
+                         matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
         field.tap()
         field.typeKey("a", modifierFlags: [.command])
         field.typeText(text)
         try wait("Field must contain the replacement before dismissal: \(text)") {
-            (field.value as? String) == text
+            guard let actual = field.value as? String else { return false }
+            return matcher?(actual, text) ?? (actual == text)
         }
     }
 

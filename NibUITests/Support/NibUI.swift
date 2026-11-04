@@ -197,8 +197,8 @@ final class NibUI {
         }
     }
 
-    /// Waits for the visible palette separator grip, then checks that dragging it leaves the window fixed.
-    /// The aggregate Tools frame can include stale/offscreen layout; actual adjacent buttons locate the grip.
+    /// Waits for visible palette anchors, then uses an unobstructed adjacent gap or a verified container edge.
+    /// Records the frames for CI and checks that the gesture leaves the app window fixed.
     func dragPalette(to destination: CGPoint) throws {
         let more = app.buttons.matching(identifier: "tool.more").firstMatch
         let colour = app.buttons.matching(identifier: "cmd.preset.select")
@@ -212,11 +212,68 @@ final class NibUI {
         let before = app.windows.firstMatch.frame
         let a = more.frame, b = colour.frame
         let vertical = abs(a.midY - b.midY) > abs(a.midX - b.midX)
-        let grip = vertical ? CGPoint(x: a.midX, y: (a.maxY + b.minY) / 2)
-                            : CGPoint(x: (a.maxX + b.minX) / 2, y: a.midY)
         let gap = vertical ? b.minY - a.maxY : b.minX - a.maxX
-        guard gap > 2, before.insetBy(dx: 8, dy: 8).contains(grip) else {
-            throw Failure.message("No visible palette separator grip: More \(a), colour \(b), window \(before)")
+        let crossMin = vertical ? max(a.minX, b.minX) : max(a.minY, b.minY)
+        let crossMax = vertical ? min(a.maxX, b.maxX) : min(a.maxY, b.maxY)
+        let separator = vertical
+            ? CGRect(x: crossMin, y: a.maxY, width: max(0, crossMax - crossMin), height: max(0, gap))
+            : CGRect(x: a.maxX, y: crossMin, width: max(0, gap), height: max(0, crossMax - crossMin))
+        let midpoint = CGPoint(x: separator.midX, y: separator.midY)
+        // Structural containers and captions are not hit targets. Include native and custom leaf controls.
+        let containers: [XCUIElement.ElementType] = [.application, .window, .other, .scrollView,
+            .table, .collectionView, .toolbar, .navigationBar, .tabBar, .staticText]
+        let controls = try app.descendants(matching: .any).allElementsBoundByIndex.compactMap { element
+            -> (identifier: String, label: String, frame: CGRect)? in
+            // One snapshot supplies type/children/identity/frame rather than separate AX round trips for each attribute.
+            let snapshot = try element.snapshot()
+            guard !containers.contains(snapshot.elementType)
+                || (snapshot.elementType == .other && snapshot.children.isEmpty) else { return nil }
+            guard element.isHittable else { return nil }
+            return (snapshot.identifier, snapshot.label, snapshot.frame)
+        }
+        let others = controls.filter {
+            !($0.identifier == "tool.more" && $0.frame == a)
+                && !($0.identifier == "cmd.preset.select" && $0.label == "Colour 1" && $0.frame == b)
+        }
+        let visible = before.insetBy(dx: 8, dy: 8)
+        let adjacent = gap > 2 && crossMax - crossMin > 2 && visible.contains(separator)
+            && !others.contains { $0.frame.intersects(separator) || $0.frame.contains(midpoint) }
+        var chosen: CGPoint? = adjacent ? midpoint : nil
+        var paletteFrame: CGRect?
+        if !adjacent {
+            // Bind Tools to both live anchors; a stale aggregate frame alone is not evidence of a safe edge.
+            let palette = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Tools'"))
+                .allElementsBoundByIndex.filter {
+                    $0.frame.contains(a) && $0.frame.contains(b)
+                        && $0.buttons.matching(identifier: "tool.more").count > 0
+                        && $0.buttons.matching(identifier: "cmd.preset.select")
+                            .matching(NSPredicate(format: "label == 'Colour 1'")).count > 0
+                }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+            if let palette {
+                let frame = palette.frame
+                paletteFrame = frame
+                // End-padding is on the long axis; stay inside the rounded body and clear of all live controls.
+                let edges = vertical
+                    ? [CGPoint(x: frame.midX, y: frame.minY + 2), CGPoint(x: frame.midX, y: frame.maxY - 2)]
+                    : [CGPoint(x: frame.minX + 2, y: frame.midY), CGPoint(x: frame.maxX - 2, y: frame.midY)]
+                let thickness = vertical ? frame.width : frame.height
+                let anchorThickness = vertical ? max(a.width, b.width) : max(a.height, b.height)
+                if visible.contains(frame), thickness <= anchorThickness + 8 {
+                    chosen = edges.first { point in
+                        frame.contains(point) && !controls.contains { $0.frame.insetBy(dx: -1, dy: -1).contains(point) }
+                    }
+                }
+            }
+        }
+        XCTContext.runActivity(named: "Palette drag anchor geometry") { activity in
+            let frames = controls.map { "\($0.identifier) | \($0.label): \($0.frame)" }.joined(separator: "\n")
+            let attachment = XCTAttachment(string: "More \(a), Colour 1 \(b), window \(before)\n"
+                + "gap \(gap), separator \(separator), adjacent \(adjacent), palette \(String(describing: paletteFrame))\n"
+                + "chosen \(String(describing: chosen)), destination \(destination)\n\(frames)")
+            attachment.name = "palette-drag-frames"; attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+        guard let grip = chosen else {
+            throw Failure.message("No unobstructed palette separator or container edge: More \(a), colour \(b), window \(before)")
         }
         let origin = app.coordinate(withNormalizedOffset: .zero)
         origin.withOffset(CGVector(dx: grip.x - app.frame.minX, dy: grip.y - app.frame.minY))

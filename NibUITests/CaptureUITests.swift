@@ -2,8 +2,14 @@ import XCTest
 import UIKit
 
 /// Real-app review captures. Reachability is the only assertion: no pixel, colour,
-/// spacing or typography expectations. Each group starts with a disposable fixture
-/// in every appearance/orientation, and a failed variant does not hide later ones.
+/// spacing or typography expectations. Each test launches one disposable fixture for
+/// one group/appearance/orientation: 24 groups x 4 variants = 96 independent tests.
+/// UITestFixture pins appearance at launch (including new windows); FeatAppearance
+/// follows the system and has no live light/dark command, so variants require relaunches.
+/// At the observed ~57 seconds per variant, captures take ~91 minutes; the observed
+/// 9-16 minute cold build brings the estimate to ~100-107 minutes of the 150-minute job.
+/// Each test gets the lane's 300-second maximum for startup/captures/teardown headroom;
+/// this is a per-test ceiling, not a guarantee that the whole job fits if variants slow down.
 @MainActor
 final class CaptureUITests: XCTestCase {
     private var ui: NibUI!
@@ -11,7 +17,10 @@ final class CaptureUITests: XCTestCase {
     private var orientation = "portrait"
     private let notebook = "Physics — Motion"
 
-    override func setUpWithError() throws { continueAfterFailure = true }
+    override func setUpWithError() throws {
+        continueAfterFailure = true
+        executionTimeAllowance = 300
+    }
 
     override func tearDownWithError() throws {
         defer { ui?.app.terminate() }
