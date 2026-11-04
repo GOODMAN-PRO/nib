@@ -67,21 +67,11 @@ final class CanvasUITests: XCTestCase {
         try ui.timedAction("Canvas tap \(label)") { try self.performTap(label) }
     }
     private func performTap(_ label: String) throws {
-        let query = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@ OR identifier == %@", label, label))
-        _ = try require(label)
-        // Chrome groups are sections in one scrollable menu, not nested submenus.
-        // Bring an offscreen row into view through the actual enclosing scroll view.
-        for _ in 0..<10 {
-            if query.allElementsBoundByIndex.contains(where: { $0.isHittable && $0.isEnabled }) { break }
-            guard let scroller = ui.app.scrollViews.allElementsBoundByIndex.first(where: {
-                $0.identifier != "nib.canvas" && $0.descendants(matching: .any)
-                    .matching(NSPredicate(format: "label == %@ OR identifier == %@", label, label)).count > 0
-            }) else { break }
-            if query.firstMatch.frame.midY < scroller.frame.minY { scroller.swipeDown() }
-            else { scroller.swipeUp() }
-        }
-        guard let target = query.allElementsBoundByIndex.first(where: { $0.isHittable && $0.isEnabled }) else {
-            throw NibUI.Failure.message("Canvas control is not actionable: \(label)\n\(ui.app.debugDescription)")
+        // Zoom options also names a retained ScrollView; only its actual button can toggle the popover.
+        let type: XCUIElement.ElementType = label == "Zoom Window options" ? .button : .any
+        let target = try ui.requireControl(label, type: type, scroll: true, timeout: 8)
+        guard target.isEnabled else {
+            throw NibUI.Failure.message("Canvas control is disabled: \(label)")
         }
         target.tap()
     }
@@ -240,6 +230,15 @@ final class CanvasUITests: XCTestCase {
         try ui.pinchZoom(scale: 1.5, at: CGPoint(x: 0.5, y: 0.5))
         let zoomed = try ui.waitForState { $0.zoom > before.zoom + 0.1 }
         let zoomedPaper = try page().frame
+        let projected = CGPoint(x: zoomedPaper.minX + anchor.x * zoomed.zoom,
+                                y: zoomedPaper.minY + anchor.y * zoomed.zoom)
+        // Include the arithmetic in ui.log as well as the attachment: downloaded lanes may omit text attachments.
+        let geometry = "paper=\(paper) -> \(zoomedPaper), zoom=\(before.zoom) -> \(zoomed.zoom), "
+            + "pageAnchor=\(anchor), focal=\(focal), projected=\(projected), "
+            + "offset=\(before.contentOffset) -> \(zoomed.contentOffset)"
+        XCTContext.runActivity(named: "Pinch focal oracle: \(geometry)") { _ in
+            ui.recordGeometry("Pinch after zoom", touches: [focal, projected], selection: zoomedPaper)
+        }
         XCTAssertEqual(zoomedPaper.minX + anchor.x * zoomed.zoom, focal.x, accuracy: 45, "Pinch must retain focal content")
         XCTAssertEqual(zoomedPaper.minY + anchor.y * zoomed.zoom, focal.y, accuracy: 45, "Pinch must retain focal content")
         unchanged(before, zoomed)
