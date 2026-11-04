@@ -9,7 +9,7 @@ Usage: python3 tools/qa/ui-results.py <run-id> [--out DIR] [--repo GOODMAN-PRO/n
   DIR/<run-id>/ (default <repo parent>/Nib-ci-logs/ui-ci), prints one line per class and one `FAIL <Class>/<test>:
   <message>` line per failing test, maps each class to the feature owners of its QA area (tools/qa/matrix.json), and
   writes DIR/<run-id>/results.json. Exit 0 = every class passed, 1 = test failures, 2 = infrastructure error or the run
-  has not completed.
+  has not completed (--partial reports the completed classes of a run that is still going).
 """
 import argparse
 import glob
@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--repo", default="GOODMAN-PRO/nib")
     ap.add_argument("--out", default=str(ROOT.parent / "Nib-ci-logs" / "ui-ci"))
     ap.add_argument("--no-download", action="store_true", help="reuse what is already in the output folder")
+    ap.add_argument("--partial", action="store_true", help="report the classes that have completed while the run is still going")
     a = ap.parse_args()
     out = pathlib.Path(a.out) / a.run
     out.mkdir(parents=True, exist_ok=True)
@@ -41,8 +42,10 @@ def main():
     if run["status"] != "completed":
         for job in run["jobs"]:
             print(f"  {job['name']}: {job['status']} {job.get('conclusion') or ''}")
-        print("run not completed yet", file=sys.stderr)
-        return 2
+        if not a.partial:
+            print("run not completed yet", file=sys.stderr)
+            return 2
+        run["jobs"] = [j for j in run["jobs"] if j["status"] == "completed"]
     if not a.no_download:
         for stale in glob.glob(str(out / "ui-*")):
             pass  # keep earlier downloads of other classes; gh overwrites files in place
