@@ -107,6 +107,8 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
+        if form == nil, hasVisibleFrame(initial), initial.isHittable,
+           app.windows.firstMatch.frame.contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
         if let form, hasVisibleFrame(initial, in: form.frame) && initial.isHittable,
            form.frame.contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
         let containers = (app.collectionViews.allElementsBoundByIndex + app.tables.allElementsBoundByIndex
@@ -322,7 +324,10 @@ final class NibUI {
         let midpoint = CGPoint(x: separator.midX, y: separator.midY)
         // The canvas and decorative leaf Other/Image nodes cover this gap in AX but are not palette controls.
         // Bind the actual Tools container to both anchors, and traverse one immutable subtree snapshot.
-        let palette = app.otherElements.matching(NSPredicate(format: "label == 'Tools'")).firstMatch
+        let toolsLabel = NSPredicate(format: "label == 'Tools'")
+        let typedPalette = app.otherElements.matching(toolsLabel).firstMatch
+        let palette = typedPalette.exists ? typedPalette
+            : app.descendants(matching: .any).matching(toolsLabel).firstMatch
         guard palette.exists else { throw Failure.message("Palette Tools container missing") }
         let snapshot = try palette.snapshot()
         let paletteFrame = snapshot.frame
@@ -453,13 +458,49 @@ final class NibUI {
         }
         if nonTextFocus() { return focused }
         if app.state != .runningForeground { app.activate() }
-        // A desk tap reaches the real document responder chain. Unlike tapping arbitrary header whitespace,
-        // it lets the canvas restore native key focus. Stay outside paper and away from the side palette.
-        if canvas.exists {
+
+        func tapInertHeader(in surface: XCUIElement, modal: Bool) throws {
+            // One snapshot avoids per-control AX round trips. Conservatively exclude every control frame,
+            // including all button frames, so no hittable library button can become the focus target.
+            let snapshot = try surface.snapshot()
+            let interactive: [XCUIElement.ElementType] = [.button, .cell, .link, .switch, .slider,
+                .segmentedControl, .textField, .textView, .searchField, .secureTextField, .picker, .pickerWheel]
+            func occupiedFrames(_ node: XCUIElementSnapshot) -> [CGRect] {
+                let own = interactive.contains(node.elementType) ? [node.frame] : []
+                return own + node.children.flatMap { occupiedFrames($0) }
+            }
+            let occupied = occupiedFrames(snapshot)
+            let visible = snapshot.frame.intersection(app.windows.firstMatch.frame)
+            guard !visible.isNull, !visible.isInfinite, visible.width > 16, visible.height > 16 else {
+                throw Failure.message("No visible surface for keyboard focus tap")
+            }
+            let offsets: [CGFloat] = modal ? [24, 40, 56] : [70, 56, 40]
+            let fractions: [CGFloat] = [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8]
+            let points = offsets.flatMap { offset in
+                fractions.map { fraction in
+                    CGPoint(x: visible.minX + visible.width * fraction, y: visible.minY + offset)
+                }
+            }
+            guard let point = points.first(where: { point in
+                visible.insetBy(dx: 8, dy: 8).contains(point)
+                    && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+            }) else { throw Failure.message("No inert header focus target inside the presented surface") }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+        }
+
+        // A tap behind a modal can hit its dimming view and dismiss it. Keep focus preparation inside
+        // the foremost presented surface; if it has no inert header point, fail without tapping the desk.
+        let surface = [app.alerts.firstMatch, app.descendants(matching: .popover).firstMatch,
+                       app.sheets.firstMatch].first { hasVisibleFrame($0) }
+        if let surface {
+            try tapInertHeader(in: surface, modal: true)
+        } else if canvas.exists {
+            // Reach the real document responder chain outside paper and away from the side palette.
             coordinate(CGPoint(x: 0.18, y: 0.85)).tap()
         } else {
             // The shell's library tap recognizer schedules reclaimKeyFocusIfNeeded after a real window tap.
-            app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)).tap()
+            try tapInertHeader(in: app.windows.firstMatch, modal: false)
         }
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in nonTextFocus() }, object: nil)
         guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed else {
@@ -599,7 +640,17 @@ final class NibUI {
 
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
     func isKeyboardFocused(_ field: XCUIElement) -> Bool {
-        field.exists && NSPredicate(format: "hasKeyboardFocus == true").evaluate(with: field)
+        guard field.exists else { return false }
+        let identifier = field.identifier, label = field.label
+        if !identifier.isEmpty || !label.isEmpty {
+            let identity = !identifier.isEmpty ? NSPredicate(format: "identifier == %@", identifier)
+                : NSPredicate(format: "label == %@", label)
+            // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
+            let focused = app.descendants(matching: .any).matching(identity)
+                .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+            if focused.exists, focused.elementType == field.elementType, focused.frame == field.frame { return true }
+        }
+        return field.debugDescription.contains("Keyboard Focused")
     }
 
     /// Waits for the native keyboard's own dismissal before a global action; never taps document content.
