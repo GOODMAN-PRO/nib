@@ -90,38 +90,17 @@ final class InsertUITests: XCTestCase {
     }
     /// Waits for a freshly bound typed control in the active alert, menu or sheet, including native placeholders.
     private func control(_ name: String, _ type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
-        let types: [XCUIElement.ElementType] = type == .any
-            ? [.button, .menuItem, .textField, .secureTextField, .textView, .searchField, .switch, .slider, .cell, .image, .staticText, .other] : [type]
-        func scope() -> XCUIElement {
-            if ui.app.alerts.firstMatch.exists { return ui.app.alerts.firstMatch }
-            if ui.app.menus.firstMatch.exists { return ui.app.menus.firstMatch }
-            if ui.app.sheets.firstMatch.exists { return ui.app.sheets.firstMatch }
-            return ui.app
+        if [.textField, .secureTextField, .textView, .searchField].contains(type) {
+            // Focus is valid even when the software keyboard makes the editor non-hittable.
+            let field = try ui.textEditor(name)
+            guard field.elementType == type else { throw NibUI.Failure.message("Unexpected editor type: \(name)") }
+            return field
         }
-        func target(_ kind: XCUIElement.ElementType) -> XCUIElement {
-            scope().descendants(matching: kind).matching(NSPredicate(
-                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-        }
-        if scroll {
-            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
-        }
-        func candidate() -> XCUIElement? {
-            for kind in types {
-                let element = target(kind)
-                guard element.exists && element.isEnabled else { continue }
-                let input = [.textField, .secureTextField, .textView, .searchField].contains(kind)
-                if input && ui.isKeyboardFocused(element) { return element }
-                if element.isHittable { return element }
-            }
-            return nil
-        }
-        if candidate() == nil {
-            // Scroll a real inspector/form, never tap an occluded control through the keyboard.
-            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
-        }
-        try wait("Missing actionable insert control: \(name)") { candidate() != nil }
-        return try XCTUnwrap(candidate())
+        let target = try ui.requireControl(name, type: type, scroll: scroll, timeout: 8)
+        guard target.isEnabled else { throw NibUI.Failure.message("Insert control is disabled: \(name)") }
+        return target
     }
+
     /// Preserves an already-focused input; all other controls must expose a genuine visible hit target.
     private func tap(_ name: String, scroll: Bool = false) throws {
         try ui.timedAction("Insert tap \(name)") { try self.performTap(name, scroll: scroll) }
@@ -845,6 +824,7 @@ final class InsertUITests: XCTestCase {
         try replace(search, with: "unmatchablezzzz")
         XCTAssertTrue(ui.app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'No results for'")).firstMatch.waitForExistence(timeout: 8))
         try replace(search, with: "Heart")
+        try ui.dismissKeyboard()
         try tap("Heart"); try counts(5)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
         XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
@@ -1140,7 +1120,7 @@ final class InsertUITests: XCTestCase {
 
     private func comment(_ text: String = "Check the units") throws {
         try pageMenu(); try tap("Add Comment")
-        let input = try control("Add a comment")
+        let input = try ui.textEditor("Add a comment")
         try ui.focusField(input); input.typeText(text); try tap("Send")
         try counts(5)
         XCTAssertTrue(ui.app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch.waitForExistence(timeout: 8))
@@ -1168,7 +1148,7 @@ final class InsertUITests: XCTestCase {
     }
     func testObjectCommentAnchorsSelectedShapeAndCopiesDeepLink() throws {
         try shape(); try menu("Add Comment")
-        let input = try control("Add a comment")
+        let input = try ui.textEditor("Add a comment")
         try ui.focusField(input); input.typeText("Shape annotation"); try tap("Send"); try counts(6)
         // Thread-level More is beside Resolve; exclude the document and palette menus.
         let resolve = try control("Resolve Thread")
