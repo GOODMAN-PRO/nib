@@ -124,6 +124,42 @@ final class NibUI {
         }
     }
 
+    /// Waits for the actual microphone prompt (or an already-authorized Recording HUD), then for system alerts to disappear.
+    /// Startup/teardown callers drain outstanding known authorization prompts without accepting unrelated dialogs.
+    func handleAuthorizationAlerts(waitForMicrophone: Bool = false) throws {
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let permission = NSPredicate(format: "label CONTAINS[c] 'microphone' OR label CONTAINS[c] 'calendar' OR label CONTAINS[c] 'photos'")
+        /// Reads the currently visible authorization without waiting; the outer expectation handles asynchronous presentation.
+        func alert(microphoneOnly: Bool = false) -> XCUIElement? {
+            let filter = microphoneOnly ? NSPredicate(format: "label CONTAINS[c] 'microphone'") : permission
+            let title = system.alerts.matching(filter).firstMatch
+            if title.exists { return title }
+            let content = system.alerts.containing(filter).firstMatch
+            return content.exists ? content : nil
+        }
+        if waitForMicrophone {
+            let recording = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Recording' AND value != nil")).firstMatch
+            let requested = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                alert(microphoneOnly: true) != nil || recording.exists
+            }, object: nil)
+            guard XCTWaiter.wait(for: [requested], timeout: 15) == .completed else {
+                throw Failure.message("Quick Record produced neither microphone authorization nor Recording HUD\n\(system.debugDescription)")
+            }
+        }
+        for _ in 0..<3 {
+            guard let prompt = alert() else { return }
+            let allow = prompt.buttons.matching(NSPredicate(
+                format: "label IN {'Allow', 'OK', 'Allow Full Access', 'Allow Access to All Photos'}")).firstMatch
+            guard allow.isHittable else { throw Failure.message("Authorization has no observed affirmative action\n\(system.debugDescription)") }
+            allow.tap()
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !prompt.exists }, object: nil)
+            guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+                throw Failure.message("Authorization alert must disappear before continuing\n\(system.debugDescription)")
+            }
+        }
+        guard alert() == nil else { throw Failure.message("Outstanding authorization survived cleanup") }
+    }
+
     /// Waits for the main window to cover the physical display before any orientation assertion.
     /// Fixture data resets do not reset iPadOS window placement left by an earlier gesture.
     func establishFullScreen() throws {
@@ -200,7 +236,9 @@ final class NibUI {
         // Cold package creation and service startup share the machine with builds.
         // Keep the readiness assertion, but do not give launch the short deadline
         // used for an already-running command.
+        try handleAuthorizationAlerts()
         _ = try waitForState(timeout: 120) { $0.screen == "library" }
+        try handleAuthorizationAlerts()
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
         try establishFullScreen()

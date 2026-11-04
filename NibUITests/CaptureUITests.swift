@@ -14,7 +14,8 @@ final class CaptureUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = true }
 
     override func tearDownWithError() throws {
-        ui?.app.terminate()
+        defer { ui?.app.terminate() }
+        try ui?.handleAuthorizationAlerts()
         XCUIDevice.shared.orientation = .portrait
     }
 
@@ -27,7 +28,9 @@ final class CaptureUITests: XCTestCase {
                                       "-NibUITestAppearance", appearance,
                                       "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
             ui.app.launch()
+            try ui.handleAuthorizationAlerts()
             _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
+            try ui.handleAuthorizationAlerts()
             try ui.establishFullScreen()
             XCUIDevice.shared.orientation = orientation == "portrait" ? .portrait : .landscapeLeft
             try wait("The scene must reach \(orientation)") {

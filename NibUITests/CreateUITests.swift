@@ -38,7 +38,8 @@ final class CreateUITests: XCTestCase {
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
-            ui.app.terminate()
+            defer { ui.app.terminate() }
+            try ui.handleAuthorizationAlerts()
         }
     }
 
@@ -591,13 +592,8 @@ final class CreateUITests: XCTestCase {
     // MARK: Audio and calendar
 
     func testQuickRecordCreatesTextDocumentAndAdvancingHUD() throws {
-        let monitor = addUIInterruptionMonitor(withDescription: "Microphone access") { alert in
-            for title in ["Allow", "OK"] where alert.buttons[title].exists { alert.buttons[title].tap(); return true }
-            return false
-        }
-        defer { removeUIInterruptionMonitor(monitor) }
         try newMenu("Quick Record")
-        ui.app.tap()
+        try ui.handleAuthorizationAlerts(waitForMicrophone: true)
         let state = try ui.waitForState { $0.document != nil }
         let id = try XCTUnwrap(state.document)
         try assertDocument(id, kind: "textDocument", pages: 0)

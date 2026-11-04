@@ -30,7 +30,8 @@ final class InkUITests: XCTestCase {
                 let tree = XCTAttachment(string: ui.app.debugDescription)
                 tree.name = "\(name)-accessibility"; tree.lifetime = .keepAlways; add(tree)
             }
-            ui.app.terminate()
+            defer { ui.app.terminate() }
+            try ui.handleAuthorizationAlerts()
         }
         ui = nil
     }

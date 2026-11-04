@@ -31,7 +31,8 @@ final class ChromeUITests: XCTestCase {
             state.name = "Chrome-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
-            ui.app.terminate()
+            defer { ui.app.terminate() }
+            try ui.handleAuthorizationAlerts()
         }
         if let imports { try FileManager.default.removeItem(at: imports) }
         XCUIDevice.shared.orientation = .landscapeLeft
