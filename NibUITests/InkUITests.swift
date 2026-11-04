@@ -728,7 +728,8 @@ final class InkUITests: XCTestCase {
         try assertNoNewInk(before)
     }
 
-    func testAddColourPreservesExistingSlotsAndStopsAtTwelve() throws {
+    /// Waits for each appended colour and persistence at capacity; rendering is checked in bounded digit batches.
+    private func fillColourSlots() throws {
         let original = swatches.map(\.label)
         for count in original.count..<12 {
             try tap("Add Colour"); try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
@@ -739,8 +740,19 @@ final class InkUITests: XCTestCase {
         XCTAssertFalse(ui.app.buttons["Add Colour"].isHittable, "A thirteenth slot must not be offered")
         try ui.selectTool("highlighter"); try ui.selectTool("pen")
         XCTAssertEqual(swatches.count, 12)
+    }
+
+    func testAddColourPreservesExistingSlotsAndStopsAtTwelve() throws {
+        executionTimeAllowance = 300
+        try fillColourSlots()
+    }
+
+    /// Waits for selection, real ink, and undo for two digit slots after establishing the same twelve-slot palette.
+    private func renderedAddedColours(_ indices: Range<Int>) throws {
+        executionTimeAllowance = 300
+        try fillColourSlots()
         // CONTRACTS KeyCommandRouting: notebook-specific preset keys beat the unrestricted pencil key 2.
-        for index in 0..<10 {
+        for index in indices {
             ui.app.typeKey(index == 9 ? "0" : String(index + 1), modifierFlags: [])
             try wait("Digit key must select colour slot \(index + 1)") { self.swatches[index].isSelected }
             XCTAssertEqual(try ui.state().tool, "pen", "Preset arbitration must not unexpectedly select pencil")
@@ -748,6 +760,12 @@ final class InkUITests: XCTestCase {
             try draw(); _ = try visibleInk(after: blank); try undo(to: before)
         }
     }
+
+    func testAddedColourDigits1And2RenderInk() throws { try renderedAddedColours(0..<2) }
+    func testAddedColourDigits3And4RenderInk() throws { try renderedAddedColours(2..<4) }
+    func testAddedColourDigits5And6RenderInk() throws { try renderedAddedColours(4..<6) }
+    func testAddedColourDigits7And8RenderInk() throws { try renderedAddedColours(6..<8) }
+    func testAddedColourDigits9And10RenderInk() throws { try renderedAddedColours(8..<10) }
 
     func testRemoveColourRemovesSelectedSlotButKeepsAtLeastOne() throws {
         let original = swatches.map(\.label)

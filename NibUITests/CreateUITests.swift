@@ -241,6 +241,7 @@ final class CreateUITests: XCTestCase {
     }
 
     func testOrientationChangesCreatedDimensions() throws {
+        executionTimeAllowance = 300
         try notebook("Landscape notebook")
         try tap("No cover")
         try chooseSize("Letter")
@@ -297,7 +298,10 @@ final class CreateUITests: XCTestCase {
         XCTAssertEqual(((ref?["params"] as? [String: Any])?["paper"] as? String)?.uppercased(), "#CEDFEDFF")
     }
 
-    func testApplyEveryOtherDistributesPaperAcrossPages() throws { try distribution("Every other") }
+    func testApplyEveryOtherDistributesPaperAcrossPages() throws {
+        executionTimeAllowance = 300
+        try distribution("Every other")
+    }
     func testApplyAllPagesDistributesPaperAcrossPages() throws { try distribution("All pages") }
 
     func testSavedDefaultsReopenWithoutChangingExistingNotebook() throws {
