@@ -234,7 +234,8 @@ final class PresetMenuModel {
         run([PresetActions.call("preset.removeSwatch", tool, ["index": .number(Double(i))])])
     }
 
-    func move(_ from: Int, _ to: Int) {
+    @discardableResult
+    func move(_ from: Int, _ to: Int) -> Task<Bool, Never>? {
         run([PresetActions.call("preset.moveSwatch", tool, ["from": .number(Double(from)), "to": .number(Double(to))])])
     }
 
@@ -380,7 +381,6 @@ struct ToolPresetMenu: View {
     let model: PresetMenuModel
 
     @State private var confirmReset = false
-    @State private var dragged: Int?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     private var presets: ToolPresets { model.presets }
@@ -395,7 +395,6 @@ struct ToolPresetMenu: View {
             }
         }
         .onAppear { model.reload() }
-        .onChange(of: model.arranging) { _, _ in dragged = nil }
         .confirmationDialog(String(localized: "Restore the default colours and thicknesses?"),
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button(String(localized: "Restore Defaults"), role: .destructive) { model.reset() }
@@ -495,20 +494,13 @@ struct ToolPresetMenu: View {
         let registry = model.app?.content.tapePatterns
         if arranging {
             SwatchSlot(tool: tool, swatch: swatch, name: removable ? String(localized: "Remove \(name)") : name,
-                       isSelected: false, registry: registry) {
+                       isSelected: false, registry: registry, reorderModel: model, reorderIndex: i) {
                 if removable { model.remove(i) }
             }
             .accessibilityIdentifier("cmd.preset.removeSwatch")
             .overlay(alignment: .topTrailing) {
                 if removable { RemoveBadge() }
             }
-            .onDrag {
-                dragged = i
-                return NSItemProvider(object: SwatchDropDelegate.payload(i) as NSString)
-            }
-            .onDrop(of: [UTType.plainText], delegate: SwatchDropDelegate(index: i, dragged: $dragged) { from, to in
-                model.move(from, to)
-            })
             .accessibilityAction(named: Text(String(localized: "Move Left"))) {
                 if i > 0 { model.move(i, i - 1) }
             }
@@ -650,6 +642,8 @@ struct SwatchSlot: View {
     let isSelected: Bool
     let registry: Registry<TapePatternDescriptor>?
     var menu: UIMenu? = nil
+    var reorderModel: PresetMenuModel? = nil
+    var reorderIndex: Int = 0
     let action: () -> Void
     @State private var pattern: NibSwatchPattern?
 
@@ -660,7 +654,10 @@ struct SwatchSlot: View {
         let colour = PresetColour.display(swatch.color, tool: tool)
         let display = PresetColour.swatch(colour, id: swatch.color.hex, name: name, pattern: pattern)
         Group {
-            if let menu {
+            if let reorderModel {
+                PresetReorderControl(swatch: display, model: reorderModel, index: reorderIndex, action: action)
+                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            } else if let menu {
                 PresetSwatchControl(swatch: display, isSelected: isSelected, menu: menu, action: action)
                     .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
             } else {
@@ -784,27 +781,95 @@ struct RemoveBadge: View {
     }
 }
 
-/// Drop a dragged slot on another to move it there (one `preset.moveSwatch`). The drag carries `payload(from)`, so a
-/// cancelled drag's stale index never moves anything when outside text is dropped later.
-struct SwatchDropDelegate: DropDelegate {
+/// One local drag owns its source snapshot. A cancelled, repeated, cross-window or stale
+/// drop cannot reorder another slot after settings change.
+@MainActor
+final class SwatchDrag {
+    private weak var source: PresetMenuModel?
+    private let swatches: [PresetSwatch]
+    private let from: Int
+    private var committed = false
+
+    init(model: PresetMenuModel, index: Int) {
+        source = model; swatches = model.presets.swatches; from = index
+    }
+
+    func accepts(_ model: PresetMenuModel, at index: Int) -> Bool {
+        !committed && source === model && model.arranging && model.presets.swatches == swatches
+            && swatches.indices.contains(from) && swatches.indices.contains(index) && from != index
+    }
+
+    @discardableResult
+    func commit(_ model: PresetMenuModel, at index: Int) -> Task<Bool, Never>? {
+        guard accepts(model, at: index) else { return nil }
+        committed = true
+        return model.move(from, index)
+    }
+}
+
+struct PresetReorderControl: UIViewRepresentable {
+    let swatch: NibSwatch
+    let model: PresetMenuModel
     let index: Int
-    @Binding var dragged: Int?
-    let onMove: (Int, Int) -> Void
+    let action: () -> Void
 
-    static func payload(_ index: Int) -> String { "app.nib.presets.swatch:\(index)" }
+    func makeUIView(context: Context) -> PresetReorderButton { PresetReorderButton() }
+    func updateUIView(_ button: PresetReorderButton, context: Context) {
+        button.model = model; button.index = index; button.tap = action
+        button.setImage(.nibSwatch(swatch, size: .palette, isSelected: false), for: .normal)
+        button.accessibilityLabel = swatch.name
+    }
+}
 
-    func validateDrop(info: DropInfo) -> Bool { dragged != nil }
+/// UIKit owns both the button and its drag interactions; no SwiftUI press recogniser
+/// can consume the long press before a separate hosting-view drag starts.
+final class PresetReorderButton: UIButton, UIDragInteractionDelegate, UIDropInteractionDelegate {
+    weak var model: PresetMenuModel?
+    var index = 0
+    var tap: (() -> Void)?
+    private var dragging = false
 
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    init() {
+        super.init(frame: .zero)
+        accessibilityIdentifier = "cmd.preset.removeSwatch"
+        addAction(UIAction { [weak self] _ in
+            guard let self, !self.dragging else { return }
+            self.tap?()
+        }, for: .primaryActionTriggered)
+        let drag = UIDragInteraction(delegate: self)
+        drag.isEnabled = true
+        addInteraction(drag)
+        addInteraction(UIDropInteraction(delegate: self))
+    }
+    required init?(coder: NSCoder) { nil }
 
-    func performDrop(info: DropInfo) -> Bool {
-        guard let from = dragged, let provider = info.itemProviders(for: [UTType.plainText]).first else { return false }
-        dragged = nil
-        let to = index, onMove = onMove, expected = Self.payload(from)
-        _ = provider.loadObject(ofClass: NSString.self) { object, _ in
-            guard let text = object as? NSString, text as String == expected, from != to else { return }
-            DispatchQueue.main.async { onMove(from, to) }
-        }
-        return true
+    func dragInteraction(_ interaction: UIDragInteraction, itemsForBeginning session: UIDragSession) -> [UIDragItem] {
+        guard let model, model.arranging, model.presets.swatches.indices.contains(index) else { return [] }
+        dragging = true
+        let item = UIDragItem(itemProvider: NSItemProvider(object: "app.nib.presets.swatch" as NSString))
+        item.localObject = SwatchDrag(model: model, index: index)
+        return [item]
+    }
+
+    func dragInteraction(_ interaction: UIDragInteraction, sessionDidEnd session: UIDragSession) {
+        // Keep the drag's terminating release from also removing the source swatch.
+        DispatchQueue.main.async { [weak self] in self?.dragging = false }
+    }
+
+    private func move(in session: UIDropSession) -> SwatchDrag? {
+        guard session.localDragSession != nil, session.items.count == 1,
+              let move = session.items.first?.localObject as? SwatchDrag,
+              let model, move.accepts(model, at: index) else { return nil }
+        return move
+    }
+    func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+        move(in: session) != nil
+    }
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+        UIDropProposal(operation: move(in: session) == nil ? .cancel : .move)
+    }
+    func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+        guard let move = move(in: session), let model else { return }
+        move.commit(model, at: index)
     }
 }

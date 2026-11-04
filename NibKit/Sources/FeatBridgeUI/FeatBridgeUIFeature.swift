@@ -290,9 +290,7 @@ struct BridgeSnapshot: Decodable, Equatable {
 enum BridgeToken {
     /// nil when missing: never issued, or lost after re-signing with another team ("credentials missing").
     static func read() -> String? {
-        guard let t = Keychain.getString(service: BridgeNames.tokenService, account: BridgeNames.tokenAccount),
-              !t.isEmpty else { return nil }
-        return t
+        BridgeTokenStorage.shared.read()
     }
 
     /// "nib_••••••••wXyZ": enough to tell two tokens apart, never enough to use one.

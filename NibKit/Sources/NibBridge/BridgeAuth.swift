@@ -7,9 +7,7 @@ import NibContracts
 enum BridgeSecrets {
     /// nil when missing (never issued, or lost after re-signing with another team: "credentials missing — re-enter").
     static func token() -> String? {
-        guard let t = Keychain.getString(service: BridgeNames.tokenService, account: BridgeNames.tokenAccount),
-              !t.isEmpty else { return nil }
-        return t
+        BridgeTokenStorage.shared.read()
     }
 }
 

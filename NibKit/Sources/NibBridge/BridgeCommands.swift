@@ -82,9 +82,8 @@ struct BridgeSetEnabled: NibCommand {
         let controller = try BridgeController.resolve(ctx.services)
         var issued = false
         if p.rotateToken == true || (p.enabled && BridgeSecrets.token() == nil) {
-            guard Keychain.setString(BridgeAuth.generateToken(), service: BridgeNames.tokenService,
-                                     account: BridgeNames.tokenAccount) else {
-                throw NibError(.unavailable, "the Keychain did not store the bridge token",
+            guard BridgeTokenStorage.shared.write(BridgeAuth.generateToken()) else {
+                throw NibError(.unavailable, String(localized: "Couldn't securely store the bridge token. Try again."),
                                hint: "try again; the bridge stays off without a token")
             }
             issued = true

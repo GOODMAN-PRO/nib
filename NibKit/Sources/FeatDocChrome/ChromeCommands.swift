@@ -564,6 +564,22 @@ struct SidebarToggle: NibCommand {
         let (state, kind) = try ChromeCommandSupport.window(ctx, store)
         let settings = ctx.services.settings
         let panels = app.ui.panels.all
+        // A navigator remains the sidebar button's destination when the user floats it.
+        // Filtering by its resolved side first loses that identity and opens the next tab.
+        let preferred = PanelResolver.preferredSide(settings)
+        if state.tabs.isEmpty,
+           let remembered = ([preferred, preferred.other].compactMap { state.lastTabs[$0] }
+                + panels.filter { $0.placement == .sidebarTab }.map(\.id)).first(where: { id in
+                    guard let panel = app.ui.panels.get(id), panel.placement == .sidebarTab,
+                          PanelResolver.accepts(panel, kind: kind) else { return false }
+                    return true
+                }),
+           PanelResolver.target(remembered, panels: app.ui.panels, kind: kind, settings: settings) == .floating {
+            let visible = state.spot(of: remembered) == nil
+            if visible { state.open(remembered, at: .floating) }
+            else { state.close(remembered) }
+            return Output(visible: visible, mode: state.mode.rawValue, panel: visible ? remembered : nil)
+        }
         let side = try state.toggleSidebar(mode: mode, preferred: PanelResolver.preferredSide(settings)) { side in
             PanelResolver.tabs(panels, side: side, kind: kind, settings: settings).map { $0.id }
         }

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -573,36 +574,45 @@ final class ImportDialogSession {
 @MainActor
 final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     private static var active: DocumentPicker?
-    private var continuation: CheckedContinuation<[URL], Never>?
+    private var continuation: CheckedContinuation<[URL], Error>?
 
-    static func pick(types: [UTType], navigator: SceneNavigator) async -> [URL] {
+    static func pick(types: [UTType], navigator: SceneNavigator) async throws -> [URL] {
         await ImportUI.waitUntilPresentable(navigator)
+        guard navigator.rootViewController?.viewIfLoaded?.window != nil else {
+            throw NibError(.unavailable,
+                String(localized: "Couldn't open the Files picker. Choose Import Files again."))
+        }
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
         picker.allowsMultipleSelection = true
         picker.shouldShowFileExtensions = true
         let delegate = DocumentPicker()
         picker.delegate = delegate
         active = delegate
-        let urls = await withCheckedContinuation { (continuation: CheckedContinuation<[URL], Never>) in
+        defer { if active === delegate { active = nil } }
+        let urls = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[URL], Error>) in
             delegate.continuation = continuation
             navigator.presentModal(picker)
-            if picker.presentingViewController == nil { delegate.finish([]) }
+            if picker.presentingViewController == nil {
+                delegate.finish(.failure(NibError(.unavailable,
+                    String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+            }
         }
-        active = nil
         await ImportUI.waitUntilPresentable(navigator)             // the picker finishes dismissing first
         return urls
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        finish(urls)
+        importLog.info("Files picker delivered \(urls.count) URLs")
+        finish(.success(urls))
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        finish([])
+        importLog.info("Files picker cancelled")
+        finish(.success([]))
     }
 
-    private func finish(_ urls: [URL]) {
-        continuation?.resume(returning: urls)
+    private func finish(_ result: Result<[URL], Error>) {
+        continuation?.resume(with: result)
         continuation = nil
     }
 }
