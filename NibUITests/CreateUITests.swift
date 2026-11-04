@@ -34,7 +34,8 @@ final class CreateUITests: XCTestCase {
             shot.name = "Create-\(name)-screen"
             shot.lifetime = .keepAlways
             add(shot)
-            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(ui.app.debugDescription)")
+            let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
@@ -766,13 +767,14 @@ final class CreateUITests: XCTestCase {
     }
 
     private func require(_ element: XCUIElement, _ message: String, file: StaticString = #filePath, line: UInt = #line) throws {
-        guard element.waitForExistence(timeout: 10) else {
+        guard element.exists || element.waitForExistence(timeout: 10) else {
             XCTFail(message, file: file, line: line)
             throw NibUI.Failure.message(message)
         }
     }
 
     private func wait(_ message: String, timeout: TimeInterval = 15, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             XCTFail(message)

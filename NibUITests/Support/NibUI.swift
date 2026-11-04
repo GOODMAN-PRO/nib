@@ -54,34 +54,39 @@ final class NibUI {
     /// Offscreen matches remain available to revealFormElement so it can find the actual containing form.
     func findControl(_ name: String, type: XCUIElement.ElementType = .any,
                      actionable: Bool = true, in scope: XCUIElement? = nil) -> XCUIElement? {
-        let types: [XCUIElement.ElementType] = type == .any
-            ? [.textField, .textView, .searchField, .switch, .button, .slider, .cell,
-               .segmentedControl, .staticText, .other, .any] : [type]
+        let priority: [XCUIElement.ElementType] = [.textField, .textView, .searchField, .secureTextField,
+            .switch, .button, .slider, .cell, .segmentedControl, .staticText, .other]
         let predicate = NSPredicate(format:
             "(identifier == %@ OR label == %@ OR placeholderValue == %@) AND (NOT identifier BEGINSWITH 'tool.' OR identifier == %@)",
             name, name, name, name)
-        let roots: [XCUIElement]
-        if let scope { roots = [scope] }
-        else {
-            // UIKit colour editors and native sheets take precedence over retained custom popover trees.
-            roots = [app.otherElements["UIColorPicker"].firstMatch, app.sheets.firstMatch,
-                     app.descendants(matching: .popover).firstMatch].filter { $0.exists } + [app]
+        let command = ["cmd.", "tool.", "menu.", "sheet."].contains { name.hasPrefix($0) }
+        let kind: XCUIElement.ElementType = type == .any && command ? .button : type
+        // One exact query replaces eleven missing-type queries per root. Query only the supplied
+        // scope (or app); hittability rejects retained modal copies, without repeated root discovery.
+        let matches = (scope ?? app).descendants(matching: kind).matching(predicate)
+        let first = matches.firstMatch
+        guard first.exists else { return nil }
+        if kind != .any {
+            if !actionable, matches.count == 1 { return first }
+            if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
         }
-        for root in roots {
-            for kind in types {
-                let matches = root.descendants(matching: kind).matching(predicate)
-                let first = matches.firstMatch
-                guard first.exists else { continue }
-                if !actionable { return first }
-                if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
-                // Duplicate command labels occur in retained/hidden menus. Never enumerate the whole tree.
-                for index in 1..<max(1, min(matches.count, 8)) {
-                    let element = matches.element(boundBy: index)
-                    if hasVisibleFrame(element), !element.isEnabled || element.isHittable { return element }
-                }
-            }
+        var candidates: [(XCUIElement, XCUIElementSnapshot)] = []
+        for index in 0..<min(matches.count, 16) {
+            let element = matches.element(boundBy: index)
+            guard element.exists, let snapshot = try? element.snapshot() else { continue }
+            candidates.append((element, snapshot))
         }
-        return nil
+        candidates.sort {
+            (priority.firstIndex(of: $0.1.elementType) ?? priority.count)
+                < (priority.firstIndex(of: $1.1.elementType) ?? priority.count)
+        }
+        let viewport = app.windows.firstMatch.frame
+        for (element, snapshot) in candidates {
+            let visible = snapshot.frame.intersection(viewport)
+            guard !visible.isNull, visible.width > 1, visible.height > 1 else { continue }
+            if !snapshot.isEnabled || (element.exists && element.isHittable) { return element }
+        }
+        return actionable ? nil : candidates.first?.0
     }
 
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
@@ -118,7 +123,7 @@ final class NibUI {
         // Rebuild queries on every iteration: library grids and native forms replace their containers on scroll.
         func liveList() -> XCUIElement? {
             if let form, form.exists, hasVisibleFrame(form), form.isHittable { return form }
-            var candidates: [(XCUIElement, CGRect, Bool)] = []
+            var candidates: [(XCUIElement, CGRect, Bool, String)] = []
             for kind in [XCUIElement.ElementType.collectionView, .table, .scrollView] {
                 let query = app.descendants(matching: kind)
                 for index in 0..<min(query.count, 24) {
@@ -131,12 +136,18 @@ final class NibUI {
                         list.descendants(matching: node.elementType).matching(NSPredicate(
                             format: "identifier == %@ AND label == %@", node.identifier, node.label)).firstMatch.exists
                     } ?? false
-                    candidates.append((list, frame, contains))
+                    candidates.append((list, frame, contains, list.label))
                 }
             }
-            let containing = candidates.filter { $0.2 }
-            // A retained scaled popover must not win just because it has the smallest area.
-            return (containing.isEmpty ? candidates : containing).max {
+            // Prefer the full-size copy of the SAME named popover, then the tightest containing
+            // viewport. Time Keeper has a taller inner ScrollView clipped by its outer panel.
+            let live = candidates.filter { candidate in
+                candidate.3.isEmpty || !candidates.contains {
+                    $0.3 == candidate.3 && $0.1.width * $0.1.height > candidate.1.width * candidate.1.height
+                }
+            }
+            let containing = live.filter { $0.2 }
+            return (containing.isEmpty ? live : containing).min {
                 $0.1.width * $0.1.height < $1.1.width * $1.1.height
             }?.0
         }
@@ -423,7 +434,6 @@ final class NibUI {
         try handleAuthorizationAlerts()
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
-        try establishFullScreen(allowFixtureRelaunch: true)
         // Re-request orientation only if the device or this scene still disagrees; SpringBoard's orientation
         // alone does not prove that the launched scene has rotated.
         if XCUIDevice.shared.orientation != .landscapeLeft || app.windows.firstMatch.frame.width <= app.windows.firstMatch.frame.height {
@@ -469,7 +479,7 @@ final class NibUI {
         try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
-            // Type into the verified responder, not a caption or an arbitrary unfocused application.
+            // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
             try hardwareKey(key, modifiers)
             do { try postcondition() }
             catch {
@@ -701,7 +711,7 @@ final class NibUI {
             // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
             let focused = app.descendants(matching: .any).matching(identity)
                 .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            if focused.exists, focused.elementType == field.elementType, focused.frame == field.frame { return true }
+            return focused.exists && focused.elementType == field.elementType && focused.frame == field.frame
         }
         // debugDescription includes the whole application tree after the Attributes line.
         // A different focused field (Duration) must not qualify this field (Timer name).
@@ -925,62 +935,26 @@ final class NibUI {
             guard let control = findControl(identifier, type: .button), control.isEnabled else { return nil }
             return control
         }
-        func menuHost(containing control: XCUIElement? = nil) -> XCUIElement? {
-            (app.scrollViews.allElementsBoundByIndex + app.collectionViews.allElementsBoundByIndex)
-                .filter { scroll in
-                    guard scroll.identifier != "nib.canvas", scroll.isHittable else { return false }
-                    let matches = scroll.buttons.matching(identifier: id)
-                    if let control { return matches.allElementsBoundByIndex.contains { $0.frame == control.frame } }
-                    return matches.count > 0
-                }
-                .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        // XCTest taps the hittable activation point; do not scan every retained scroll host
+        // for a control already available on screen (Add Page previously cost 40-50s per tap).
+        if let control = candidate(id) { control.tap(); return }
+        let target = app.buttons.matching(identifier: id).firstMatch
+        if target.exists {
+            revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
+            if let control = candidate(id) { control.tap(); return }
         }
-        func revealInMenu() -> XCUICoordinate? {
-            var visited = Set<String>()
-            for _ in 0..<16 {
-                let control = candidate(id)
-                let scroll = menuHost(containing: control)
-                let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
-                    + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
-                let viewport = NibUITestScrollGeometry.viewport(
-                    scroll: scroll?.frame ?? app.frame, window: app.frame, obstructions: obstructions)
-                let origin = app.coordinate(withNormalizedOffset: .zero)
-                if let control, let viewport,
-                   let point = NibUITestScrollGeometry.tapPoint(control: control.frame, viewport: viewport) {
-                    return origin.withOffset(CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY))
-                }
-                // More contains full sections (including Add Page) in a bounded viewport.
-                // Scroll its real host; existence alone does not make an offscreen row actionable.
-                guard let scroll, let viewport else { return nil }
-                guard let snapshot = try? scroll.snapshot() else { return nil }
-                let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
-                guard visited.insert(signature).inserted else { return nil }
-                let target = scroll.buttons.matching(identifier: id).firstMatch
-                let drag = NibUITestScrollGeometry.drag(in: viewport, toward: target.frame.midY)
-                origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
-                    .press(forDuration: 0.01, thenDragTo: origin.withOffset(
-                        CGVector(dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
-                        withVelocity: .slow, thenHoldForDuration: 0.15)
-            }
-            return nil
-        }
-        // Common palette/history controls cannot be clipped by an overflow form; avoid discovering every scroll host.
-        if id.hasPrefix("tool.") || ["cmd.edit.undo", "cmd.edit.redo", "cmd.window.showLibrary"].contains(id),
-           let control = candidate(id) {
-            control.tap(); return
-        }
-        if let control = revealInMenu() { control.tap(); return }
         for identifier in overflow {
-            if let menu = candidate(identifier) {
-                menu.tap()
-                // The bud enters the accessibility tree before its scroll host is actionable.
-                let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-                    candidate(id) != nil || menuHost() != nil
-                }, object: nil)
-                if candidate(id) == nil && menuHost() == nil { _ = XCTWaiter.wait(for: [ready], timeout: 5) }
-                if let control = revealInMenu() { control.tap(); return }
-                if menu.isHittable { menu.tap() }
+            guard let menu = candidate(identifier) else { continue }
+            menu.tap()
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                app.buttons.matching(identifier: id).firstMatch.exists
+            }, object: nil)
+            if !app.buttons.matching(identifier: id).firstMatch.exists {
+                _ = XCTWaiter.wait(for: [ready], timeout: 3)
             }
+            revealFormElement { self.app.buttons.matching(identifier: id).firstMatch }
+            if let control = candidate(id) { control.tap(); return }
+            if menu.exists && menu.isHittable { menu.tap() }
         }
         throw Failure.message("No enabled control \(id)\n\(app.debugDescription)")
     }

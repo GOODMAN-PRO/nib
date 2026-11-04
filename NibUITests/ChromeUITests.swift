@@ -27,7 +27,8 @@ final class ChromeUITests: XCTestCase {
             shot.name = "Chrome-\(name)-screen"
             shot.lifetime = .keepAlways
             add(shot)
-            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(ui.app.debugDescription)")
+            let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Chrome-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
@@ -35,7 +36,7 @@ final class ChromeUITests: XCTestCase {
             try ui.handleAuthorizationAlerts()
         }
         if let imports { try FileManager.default.removeItem(at: imports) }
-        XCUIDevice.shared.orientation = .landscapeLeft
+        if XCUIDevice.shared.orientation != .landscapeLeft { XCUIDevice.shared.orientation = .landscapeLeft }
     }
 
     private func query(_ name: String) -> XCUIElementQuery {

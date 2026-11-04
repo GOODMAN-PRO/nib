@@ -26,7 +26,7 @@ final class InkUITests: XCTestCase {
             shot.name = "\(name)-screen"; shot.lifetime = .keepAlways; add(shot)
             let state = XCTAttachment(string: String(describing: ui.probe.value))
             state.name = "\(name)-nib.qa.state"; state.lifetime = .keepAlways; add(state)
-            if testRun?.hasSucceeded == false {
+            if (testRun?.totalFailureCount ?? 0) > 0 {
                 let tree = XCTAttachment(string: ui.app.debugDescription)
                 tree.name = "\(name)-accessibility"; tree.lifetime = .keepAlways; add(tree)
             }

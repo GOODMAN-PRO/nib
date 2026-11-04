@@ -24,7 +24,7 @@ final class LibraryUITests: XCTestCase {
             screenshot.name = name + "-library-screen"
             screenshot.lifetime = .keepAlways
             add(screenshot)
-            let tree = XCTAttachment(string: ui.app.debugDescription)
+            let tree = XCTAttachment(string: (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : "Successful test; see final screen and state")
             tree.name = name + "-accessibility-tree"
             tree.lifetime = .keepAlways
             add(tree)
@@ -51,7 +51,7 @@ final class LibraryUITests: XCTestCase {
 
     private func visible(_ element: XCUIElement, _ message: String, timeout: TimeInterval = 12,
                          file: StaticString = #filePath, line: UInt = #line) throws {
-        guard element.waitForExistence(timeout: timeout) else {
+        guard element.exists || element.waitForExistence(timeout: timeout) else {
             XCTFail(message, file: file, line: line)
             throw NibUI.Failure.message(message)
         }
@@ -60,6 +60,7 @@ final class LibraryUITests: XCTestCase {
     private func eventually(_ message: String, timeout: TimeInterval = 12,
                             file: StaticString = #filePath, line: UInt = #line,
                             _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             XCTFail(message, file: file, line: line)

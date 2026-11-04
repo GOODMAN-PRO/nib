@@ -38,7 +38,8 @@ final class PagesUITests: XCTestCase {
         if let ui {
             let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             shot.name = "Pages-\(name)-screen"; shot.lifetime = .keepAlways; add(shot)
-            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(ui.app.debugDescription)")
+            let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Pages-\(name)-state-and-accessibility"; state.lifetime = .keepAlways; add(state)
             ui.app.terminate()
         }
@@ -560,10 +561,11 @@ final class PagesUITests: XCTestCase {
         return matches.first { $0.isHittable } ?? matches.first { $0.frame.width > 0 && $0.frame.height > 0 } ?? query.firstMatch
     }
     @discardableResult private func require(_ element: XCUIElement, _ message: String = "Required page control missing") throws -> XCUIElement {
-        guard element.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("\(message): \(element)\n\(ui.app.debugDescription)") }
+        guard element.exists || element.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("\(message): \(element)\n\(ui.app.debugDescription)") }
         return element
     }
     private func wait(_ message: String, timeout: TimeInterval = 20, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let exp = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [exp], timeout: timeout) == .completed else { throw NibUI.Failure.message("\(message)\n\(ui.probe.value ?? "no probe")") }
     }
