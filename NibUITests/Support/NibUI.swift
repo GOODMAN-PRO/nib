@@ -343,17 +343,46 @@ final class NibUI {
     /// Waits for visible palette anchors, then uses an unobstructed adjacent gap or a verified container edge.
     /// Records the frames for CI and checks that the gesture leaves the app window fixed.
     func dragPalette(to destination: CGPoint) throws {
-        let more = app.buttons.matching(identifier: "tool.more").firstMatch
-        let colour = app.buttons.matching(identifier: "cmd.preset.select")
-            .matching(NSPredicate(format: "label == 'Colour 1'")).firstMatch
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            more.isHittable && colour.isHittable
-        }, object: nil)
-        guard (more.isHittable && colour.isHittable) || XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
-            throw Failure.message("Palette separator grip needs visible More tools and Colour 1")
-        }
         let before = app.windows.firstMatch.frame
-        let a = more.frame, b = colour.frame
+        // Never ask AX for these buttons' activation points: hidden dock-transition copies can raise.
+        // Both anchors and obstruction checks come from the SAME visible Tools subtree snapshot.
+        func targets(_ node: XCUIElementSnapshot) -> [(identifier: String, label: String, frame: CGRect)] {
+            let actionable: [XCUIElement.ElementType] = [.button, .switch, .slider, .textField, .cell]
+            if actionable.contains(node.elementType)
+                || (node.children.isEmpty && (node.identifier.hasPrefix("cmd.") || node.identifier.hasPrefix("tool."))) {
+                return [(node.identifier, node.label, node.frame)]
+            }
+            return node.children.flatMap { targets($0) }
+        }
+        var paletteFrame = CGRect.zero
+        var a = CGRect.zero, b = CGRect.zero
+        var controls: [(identifier: String, label: String, frame: CGRect)] = []
+        func resolveAnchors() -> Bool {
+            let palettes = app.otherElements.matching(NSPredicate(format: "label == 'Tools'"))
+            for palette in palettes.allElementsBoundByIndex.prefix(8) {
+                guard palette.exists, let snapshot = try? palette.snapshot() else { continue }
+                let frame = snapshot.frame
+                guard !frame.isNull, !frame.isInfinite, frame.width > 1, frame.height > 1,
+                      before.contains(frame) else { continue }
+                let candidates = targets(snapshot)
+                func visible(_ rect: CGRect) -> Bool {
+                    !rect.isNull && !rect.isInfinite && rect.width > 1 && rect.height > 1
+                        && frame.contains(rect) && before.contains(rect)
+                }
+                guard let more = candidates.first(where: { $0.identifier == "tool.more" && visible($0.frame) }),
+                      let colour = candidates.first(where: {
+                          $0.identifier == "cmd.preset.select" && $0.label == "Colour 1" && visible($0.frame)
+                      }) else { continue }
+                paletteFrame = frame; a = more.frame; b = colour.frame; controls = candidates
+                return true
+            }
+            return false
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in resolveAnchors() }, object: nil)
+        guard resolveAnchors() || XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            recordDiagnostics("Palette anchors unavailable", facts: "window=\(before); require More tools and Colour 1 in one visible Tools container")
+            throw Failure.message("Palette separator grip needs visible More tools and Colour 1 in Tools")
+        }
         let vertical = abs(a.midY - b.midY) > abs(a.midX - b.midX)
         let leading = vertical ? min(a.maxY, b.maxY) : min(a.maxX, b.maxX)
         let trailing = vertical ? max(a.minY, b.minY) : max(a.minX, b.minX)
@@ -365,26 +394,6 @@ final class NibUI {
             : CGRect(x: leading, y: crossMin, width: max(0, gap), height: max(0, crossMax - crossMin))
         let midpoint = CGPoint(x: separator.midX, y: separator.midY)
         // The canvas and decorative leaf Other/Image nodes cover this gap in AX but are not palette controls.
-        // Bind the actual Tools container to both anchors, and traverse one immutable subtree snapshot.
-        let toolsLabel = NSPredicate(format: "label == 'Tools'")
-        let typedPalette = app.otherElements.matching(toolsLabel).firstMatch
-        let palette = typedPalette.exists ? typedPalette
-            : app.descendants(matching: .any).matching(toolsLabel).firstMatch
-        guard palette.exists else { throw Failure.message("Palette Tools container missing") }
-        let snapshot = try palette.snapshot()
-        let paletteFrame = snapshot.frame
-        guard paletteFrame.contains(a), paletteFrame.contains(b) else {
-            throw Failure.message("Palette container does not contain both live anchors")
-        }
-        func targets(_ node: XCUIElementSnapshot) -> [(identifier: String, label: String, frame: CGRect)] {
-            let actionable: [XCUIElement.ElementType] = [.button, .switch, .slider, .textField, .cell]
-            if actionable.contains(node.elementType)
-                || (node.children.isEmpty && (node.identifier.hasPrefix("cmd.") || node.identifier.hasPrefix("tool."))) {
-                return [(node.identifier, node.label, node.frame)]
-            }
-            return node.children.flatMap { targets($0) }
-        }
-        let controls = targets(snapshot)
         let visible = before.insetBy(dx: 8, dy: 8)
         func clear(_ point: CGPoint) -> Bool {
             visible.contains(point) && paletteFrame.contains(point)

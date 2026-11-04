@@ -34,13 +34,18 @@ final class CanvasUITests: XCTestCase {
         state.name = "Canvas-\(name)-qa-state"
         state.lifetime = .keepAlways
         add(state)
+        if (testRun?.totalFailureCount ?? 0) > 0 {
+            let hierarchy = XCTAttachment(string: ui.app.debugDescription)
+            hierarchy.name = "Canvas-\(name)-failure-tree"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+        }
         ui.app.terminate()
-        XCUIDevice.shared.orientation = .landscapeLeft
     }
 
     private func open(_ title: String? = nil) throws {
         try ui.openDocument(title ?? notebook)
-        XCTAssertTrue(ui.canvas.waitForExistence(timeout: 15), "Document must expose nib.canvas")
+        XCTAssertTrue(ui.canvas.exists || ui.canvas.waitForExistence(timeout: 15), "Document must expose nib.canvas")
     }
 
     private func element(_ label: String) -> XCUIElement {
@@ -49,14 +54,14 @@ final class CanvasUITests: XCTestCase {
 
     private func content(_ text: String) throws -> XCUIElement {
         let target = ui.app.descendants(matching: .any).matching(NSPredicate(format: "value == %@", text)).firstMatch
-        XCTAssertTrue(target.waitForExistence(timeout: 10), "Canvas must expose content: \(text)")
+        XCTAssertTrue(target.exists || target.waitForExistence(timeout: 10), "Canvas must expose content: \(text)")
         return target
     }
 
     @discardableResult
     private func require(_ label: String, timeout: TimeInterval = 8) throws -> XCUIElement {
         let target = element(label)
-        guard target.waitForExistence(timeout: timeout) else {
+        guard target.exists || target.waitForExistence(timeout: timeout) else {
             throw NibUI.Failure.message("Missing canvas control: \(label)\n\(ui.app.debugDescription)")
         }
         return target
@@ -67,26 +72,17 @@ final class CanvasUITests: XCTestCase {
         try ui.timedAction("Canvas tap \(label)") { try self.performTap(label) }
     }
     private func performTap(_ label: String) throws {
-        let query = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@ OR identifier == %@", label, label))
-        _ = try require(label)
-        // Chrome groups are sections in one scrollable menu, not nested submenus.
-        // Bring an offscreen row into view through the actual enclosing scroll view.
-        for _ in 0..<10 {
-            if query.allElementsBoundByIndex.contains(where: { $0.isHittable && $0.isEnabled }) { break }
-            guard let scroller = ui.app.scrollViews.allElementsBoundByIndex.first(where: {
-                $0.identifier != "nib.canvas" && $0.descendants(matching: .any)
-                    .matching(NSPredicate(format: "label == %@ OR identifier == %@", label, label)).count > 0
-            }) else { break }
-            if query.firstMatch.frame.midY < scroller.frame.minY { scroller.swipeDown() }
-            else { scroller.swipeUp() }
-        }
-        guard let target = query.allElementsBoundByIndex.first(where: { $0.isHittable && $0.isEnabled }) else {
-            throw NibUI.Failure.message("Canvas control is not actionable: \(label)\n\(ui.app.debugDescription)")
+        // Zoom options also names a retained ScrollView; only its actual button can toggle the popover.
+        let type: XCUIElement.ElementType = label == "Zoom Window options" ? .button : .any
+        let target = try ui.requireControl(label, type: type, scroll: true, timeout: 8)
+        guard target.isEnabled else {
+            throw NibUI.Failure.message("Canvas control is disabled: \(label)")
         }
         target.tap()
     }
 
     private func eventually(_ message: String, timeout: TimeInterval = 10, _ predicate: @escaping () -> Bool) {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed, message)
     }
@@ -150,8 +146,12 @@ final class CanvasUITests: XCTestCase {
     /// The paper accessibility element, excluding the identically labelled 40-point HUD.
     private func page(_ number: Int = 1, count: Int = 4) throws -> XCUIElement {
         let query = ui.app.otherElements.matching(NSPredicate(format: "label == %@", "Page \(number) of \(count)"))
-        eventually("Page \(number) must be laid out") { query.allElementsBoundByIndex.contains { $0.frame.height > 100 } }
-        return try XCTUnwrap(query.allElementsBoundByIndex.first { $0.frame.height > 100 })
+        var found: XCUIElement?
+        eventually("Page \(number) must be laid out") {
+            found = query.allElementsBoundByIndex.first { $0.exists && $0.frame.height > 100 }
+            return found != nil
+        }
+        return try XCTUnwrap(found)
     }
 
     private func setDirection(_ direction: String) throws {
@@ -180,7 +180,7 @@ final class CanvasUITests: XCTestCase {
 
     private func boardRow(_ number: Int, count: Int) throws -> XCUIElement {
         let row = ui.app.buttons.matching(NSPredicate(format: "value == %@", "Board \(number) of \(count)")).firstMatch
-        XCTAssertTrue(row.waitForExistence(timeout: 8), "Boards navigator must expose board \(number) of \(count)")
+        XCTAssertTrue(row.exists || row.waitForExistence(timeout: 8), "Boards navigator must expose board \(number) of \(count)")
         return row
     }
 
@@ -240,6 +240,15 @@ final class CanvasUITests: XCTestCase {
         try ui.pinchZoom(scale: 1.5, at: CGPoint(x: 0.5, y: 0.5))
         let zoomed = try ui.waitForState { $0.zoom > before.zoom + 0.1 }
         let zoomedPaper = try page().frame
+        let projected = CGPoint(x: zoomedPaper.minX + anchor.x * zoomed.zoom,
+                                y: zoomedPaper.minY + anchor.y * zoomed.zoom)
+        // Include the arithmetic in ui.log as well as the attachment: downloaded lanes may omit text attachments.
+        let geometry = "paper=\(paper) -> \(zoomedPaper), zoom=\(before.zoom) -> \(zoomed.zoom), "
+            + "pageAnchor=\(anchor), focal=\(focal), projected=\(projected), "
+            + "offset=\(before.contentOffset) -> \(zoomed.contentOffset)"
+        XCTContext.runActivity(named: "Pinch focal oracle: \(geometry)") { _ in
+            ui.recordGeometry("Pinch after zoom", touches: [focal, projected], selection: zoomedPaper)
+        }
         XCTAssertEqual(zoomedPaper.minX + anchor.x * zoomed.zoom, focal.x, accuracy: 45, "Pinch must retain focal content")
         XCTAssertEqual(zoomedPaper.minY + anchor.y * zoomed.zoom, focal.y, accuracy: 45, "Pinch must retain focal content")
         unchanged(before, zoomed)
@@ -640,11 +649,7 @@ final class CanvasUITests: XCTestCase {
         let before = try ui.state()
         try boards()
         try tap("Templates")
-        let target = element(title)
-        for _ in 0..<5 {
-            if target.exists && target.isHittable { break }
-            ui.app.scrollViews.allElementsBoundByIndex.last?.swipeUp()
-        }
+        // performTap reveals the requested row in its live container, including virtualized templates.
         try tap(title)
         let inserted = try ui.waitForState { $0.itemCountOnPage > before.itemCountOnPage && $0.undoAvailable }
         try ui.tapCommand("edit.undo")
@@ -797,7 +802,9 @@ final class CanvasUITests: XCTestCase {
         XCTAssertTrue(heightLabel.waitForExistence(timeout: 5))
         let words = heightLabel.label.split(separator: " ")
         let templateHeight = try XCTUnwrap(words.compactMap { Double($0) }.first)
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try key(XCUIKeyboardKey.escape.rawValue, []) {
+            self.eventually("Escape must dismiss the return-height options") { !heightLabel.exists }
+        }
         let paper2 = try page(2).frame
         let secondBox = try require("Zoom box").frame
         let scale2 = try ui.state().zoom

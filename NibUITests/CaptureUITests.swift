@@ -23,9 +23,7 @@ final class CaptureUITests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        defer { ui?.app.terminate() }
-        try ui?.handleAuthorizationAlerts()
-        XCUIDevice.shared.orientation = .portrait
+        ui?.app.terminate()
     }
 
     /// Waits for one explicit appearance/orientation fixture, keeping each capture scenario within its own allowance.
@@ -40,8 +38,10 @@ final class CaptureUITests: XCTestCase {
             try ui.handleAuthorizationAlerts()
             _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
             try ui.handleAuthorizationAlerts()
-            try ui.establishFullScreen()
-            XCUIDevice.shared.orientation = orientation == "portrait" ? .portrait : .landscapeLeft
+            let requested: UIDeviceOrientation = orientation == "portrait" ? .portrait : .landscapeLeft
+            let frame = ui.app.windows.firstMatch.frame
+            let sceneAgrees = orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
+            if XCUIDevice.shared.orientation != requested || !sceneAgrees { XCUIDevice.shared.orientation = requested }
             try wait("The scene must reach \(orientation)") {
                 let frame = self.ui.app.windows.firstMatch.frame
                 return self.orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
@@ -54,7 +54,6 @@ final class CaptureUITests: XCTestCase {
             attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: "diagnostic-\(name)")
             XCTFail(reason)
         }
-        ui.app.terminate()
     }
 
     private func attach(_ attachment: XCTAttachment, name: String) {
@@ -65,6 +64,7 @@ final class CaptureUITests: XCTestCase {
 
     private func wait(_ message: String, timeout: TimeInterval = 12,
                       _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             throw NibUI.Failure.message(message)
@@ -79,30 +79,18 @@ final class CaptureUITests: XCTestCase {
     @discardableResult
     private func require(_ name: String) throws -> XCUIElement {
         let element = query(name).firstMatch
-        guard element.waitForExistence(timeout: 12) else {
+        guard element.exists || element.waitForExistence(timeout: 12) else {
             throw NibUI.Failure.message("State cannot be reached: missing \(name)")
         }
         return element
     }
 
     private func tap(_ name: String, scroll: Bool = false) throws {
-        let candidates = query(name)
-        for attempt in 0..<(scroll ? 10 : 2) {
-            let matches = candidates.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let target = matches.first(where: { $0.elementType == .button }) ?? matches.first {
-                target.tap()
-                return
-            }
-            if attempt == 0 { _ = candidates.firstMatch.waitForExistence(timeout: 5) }
-            if scroll {
-                let panels = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex
-                let scroller = panels.first { $0.identifier != "nib.canvas" && $0.isHittable &&
-                    $0.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).count > 0
-                } ?? panels.last { $0.identifier != "nib.canvas" && $0.isHittable }
-                scroller?.swipeUp()
-            }
+        let target = try ui.requireControl(name, scroll: scroll, timeout: 5)
+        guard target.isEnabled else {
+            throw NibUI.Failure.message("State cannot be reached: disabled \(name)")
         }
-        throw NibUI.Failure.message("State cannot be reached: no actionable \(name)")
+        target.tap()
     }
 
     private func capture(_ number: Int, _ screen: String, state: @escaping (QAState) -> Bool) throws {
@@ -201,6 +189,13 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             for (number, edge) in [(7, "left"), (8, "top"), (9, "bottom")] {
                 try self.dock(edge)
+                try self.wait("The \(edge) palette must expose its tools, not only the options strip", timeout: 8) {
+                    let more = self.ui.app.buttons.matching(identifier: "tool.more")
+                    let colours = self.ui.app.buttons.matching(identifier: "cmd.preset.select")
+                        .matching(NSPredicate(format: "label == 'Colour 1'"))
+                    return more.allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) }
+                        && colours.allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) }
+                }
                 try self.capture(number, "canvas-palette-" + edge) {
                     $0.screen == "document" && $0.paletteDock?.edge == edge
                 }
@@ -216,9 +211,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.ui.selectTool(id)
             try self.tap("menu.toolSettings")
-            guard self.ui.app.staticTexts[title].firstMatch.waitForExistence(timeout: 12) else {
-                throw NibUI.Failure.message("\(title) options did not open")
-            }
+            _ = try self.ui.requireControl(title, type: .staticText, timeout: 12)
             try self.capture(number, id == "shape" ? "shapes-options" : id + "-options") {
                 $0.screen == "document" && $0.tool == id
             }
@@ -226,7 +219,7 @@ final class CaptureUITests: XCTestCase {
     }
 
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
-    private func capture05PenOptions() { toolOptions("pen", title: "Pen", number: 11) }
+    private func capture05PenOptions() { toolOptions("pen", title: "Fountain Pen", number: 11) }
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
     private func capture06HighlighterOptions() { toolOptions("highlighter", title: "Highlighter", number: 12) }
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
@@ -273,8 +266,8 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.ui.tapCommand("search.open")
-            let field = try self.searchField()
-            field.tap(); field.typeText("Motion")
+            let field = try self.ui.textEditor("Find in this document")
+            field.typeText("Motion")
             try self.wait("Document search must contain matches", timeout: 30) {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
                     format: "label BEGINSWITH 'Search result ' AND label CONTAINS ' of '")).firstMatch.exists
@@ -293,8 +286,15 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func settings() throws {
-        ui.app.typeKey(",", modifierFlags: .command)
-        _ = try require("Settings")
+        try ui.chord(",", .command) {
+            // The library also exposes Settings. Prove that the settings surface actually presented.
+            try self.wait("Settings must present its navigation and Done control") {
+                let sections = self.ui.app.otherElements["Settings sections"]
+                let compactSearch = self.ui.app.textFields["Search settings"]
+                return (self.ui.hasVisibleFrame(sections) || self.ui.hasVisibleFrame(compactSearch))
+                    && self.ui.findControl("sheet.dismiss", type: .button) != nil
+            }
+        }
         _ = try ui.waitForState { $0.screen == "library" }
     }
 
