@@ -1,4 +1,5 @@
 import XCTest
+import VisionKit
 
 /// Black-box coverage for the library inventory. Each launch uses the real isolated library;
 /// mutations are exclusively taps, keyboard input and touch gestures, never command injection.
@@ -66,7 +67,11 @@ final class LibraryUITests: XCTestCase {
         }
     }
 
+    /// Records action boundaries even when XCTest stalls waiting for a native menu to idle.
     private func tap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
+    }
+    private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
         let candidates = app.buttons.matching(matching(label))
         if !candidates.firstMatch.isHittable { revealFormElement(candidates.firstMatch) }
         try visible(candidates.firstMatch, "Missing action: \(label)", file: file, line: line)
@@ -117,7 +122,7 @@ final class LibraryUITests: XCTestCase {
     private func context(_ title: String, folder: Bool = false) throws {
         let tile = item(title, folder: folder)
         try visible(tile, "Context-menu target missing: \(title)")
-        tile.press(forDuration: 1)
+        ui.timedAction("Library context menu \(title)") { tile.press(forDuration: 1) }
         try visible(button("Rename"), "Long press must open the item context menu")
     }
 
@@ -170,15 +175,9 @@ final class LibraryUITests: XCTestCase {
         ui.revealFormElement(element)
     }
 
+    /// Verifies exact field replacement before submitting a native form.
     private func replace(_ field: XCUIElement, with text: String) throws {
-        revealFormElement(field)
-        try visible(field, "Editable text field missing")
-        field.tap()
-        let value = field.value as? String ?? ""
-        if !value.isEmpty && value != field.placeholderValue {
-            field.typeKey("a", modifierFlags: .command)
-        }
-        field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        try ui.replaceNativeText(in: field, with: text)
     }
 
     private func createFolder(_ title: String) throws {
@@ -314,13 +313,13 @@ final class LibraryUITests: XCTestCase {
         try visible(app.staticTexts["1 item · Name, Z to A"], "Child sort must be remembered independently")
     }
     func testSortModifiedNewest() throws {
-        try checkSort("Date modified", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
+        try checkSort("Modified, newest first", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
     }
     func testSortModifiedOldest() throws {
         try checkSort("Modified, oldest first", expected: [physics, "Concept map", "Lab report", "Motion flashcards"])
     }
     func testSortCreatedNewest() throws {
-        try checkSort("Date created", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
+        try checkSort("Created, newest first", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
     }
     func testSortCreatedOldest() throws {
         try checkSort("Created, oldest first", expected: [physics, "Concept map", "Lab report", "Motion flashcards"])
@@ -361,7 +360,11 @@ final class LibraryUITests: XCTestCase {
         XCTAssertTrue(button("Duplicate").isEnabled)
         item(physics).tap()
         XCTAssertFalse(item(physics).isSelected)
-        app.typeKey("a", modifierFlags: .command)
+        try ui.chord("a", .command) {
+            try self.eventually("Command-A selects every library item") {
+                self.rootDocuments.allSatisfy { self.item($0).isSelected } && self.item(self.folder, folder: true).isSelected
+            }
+        }
         try eventually("Command-A must select all visible documents and the folder") {
             self.rootDocuments.allSatisfy { self.item($0).isSelected } && self.item(self.folder, folder: true).isSelected
         }
@@ -398,13 +401,12 @@ final class LibraryUITests: XCTestCase {
         try backFromDocument()
         try tap("Select Items")
         item(physics).tap()
-        app.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
-        _ = try ui.waitForState(timeout: 12) { $0.screen == "document" && $0.document == id }
+        try ui.chord(XCUIKeyboardKey.return.rawValue, []) { try self.ui.waitForState { $0.screen == "document" && $0.document == id } }
     }
     func testReturnOpensSelectedFolder() throws {
         try tap("Select Items")
         item(folder, folder: true).tap()
-        app.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.return.rawValue, []) { try self.visible(self.item("Lecture notes"), "Return opens selected folder") }
         try visible(item("Lecture notes"), "Return must open the selected folder")
         try library()
     }
@@ -617,7 +619,7 @@ final class LibraryUITests: XCTestCase {
     }
     func testNewFolderKeyboardShortcutUsesCurrentParent() throws {
         try openFolder(folder)
-        app.typeKey("n", modifierFlags: [.control, .command])
+        try ui.chord("n", [.control, .command]) { try self.ui.waitForState { $0.openPanels.contains("organize.folder.new") } }
         _ = try ui.waitForState { $0.openPanels.contains("organize.folder.new") }
         try replace(app.textFields["Folder name"], with: "Keyboard child")
         try tap("Create Folder")
@@ -696,16 +698,20 @@ final class LibraryUITests: XCTestCase {
         try visible(app.staticTexts["5 items · Manual"], "Reorder must choose Manual sort")
         try openFolder(folder); try tap("Back to Documents")
         XCTAssertEqual(documentOrder(), expected, "Drag order must persist")
-        app.typeKey("z", modifierFlags: .command)
+        try ui.chord("z", .command) { try self.eventually("Undo restores sibling order") { self.documentOrder() == before } }
         try eventually("Undo must restore the complete previous sibling order") { self.documentOrder() == before }
     }
     func testDragDocumentIntoFolderAndToastUndo() throws {
+        // Resolve a lazy toast-only query before the six-second lifetime begins.
+        let toast = "Moved to " + folder
+        let undo = app.otherElements.containing(NSPredicate(format: "label == %@ OR identifier == %@", toast, toast))
+            .buttons["Undo"].firstMatch
         item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(folder, folder: true).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                    withVelocity: .slow, thenHoldForDuration: 0.6)
-        try eventually("Folder drop must move document out of root") { !self.item(self.physics).exists }
-        try tap("Undo")
-        try visible(item(physics), "Toast Undo must restore original parent")
+        try eventually("Completed folder move must expose its Undo toast", timeout: 5) { undo.exists && !self.item(self.physics).exists }
+        undo.tap()
+        try eventually("Toast Undo command must restore the document to its original root parent") { self.item(self.physics).exists }
         try openFolder(folder)
         XCTAssertFalse(item(physics).exists, "Undo must remove document from drop destination")
     }
@@ -713,9 +719,11 @@ final class LibraryUITests: XCTestCase {
         try context(physics); try tap("Duplicate")
         let copy = physics + " copy"
         try visible(item(copy), "Combine needs a second notebook")
+        ui.recordDiagnostics("Combine before drag", facts: "source=\(item(copy).frame); target=\(item(physics).frame); selected=\(item(copy).isSelected)")
         item(copy).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)),
                    withVelocity: .slow, thenHoldForDuration: 0.7)
+        ui.recordDiagnostics("Combine drag completed", facts: "confirmation=\(button("Combine").exists); target=\(item(physics).frame); source=\(item(copy).frame). Arming is not exposed by the current probe; inspect the retained target highlight and confirmation.")
         try tap("Combine")
         try eventually("Combined source must leave library") { !self.item(copy).exists }
         try ui.openDocument(physics)
@@ -735,7 +743,17 @@ final class LibraryUITests: XCTestCase {
         let menu = try XCTUnwrap(app.scrollViews.allElementsBoundByIndex.first {
             $0.buttons.matching(self.matching("Notebook")).count > 0
         }, "New must open its creation menu")
-        for label in ["Notebook", "QuickNote", "Whiteboard", "Text Document", "Study Set", "Import Files", "Scan Document"] {
+        // The fixture launches the real camera gate (ScanSupport.documentCamera); it does not fake support.
+        // QAState currently has no capability field. This assumes launchFixture's non-hostless launch
+        // (NibUITests/README.md); the runner's API alone would not model the app's hostless-test gate.
+        let supportsDocumentCamera = VNDocumentCameraViewController.isSupported
+        XCTContext.runActivity(named: "New menu document-camera capability") { activity in
+            let attachment = XCTAttachment(string: "VNDocumentCameraViewController.isSupported=\(supportsDocumentCamera); fixture is not hostless")
+            attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+        var entries = ["Notebook", "QuickNote", "Whiteboard", "Text Document", "Study Set", "Import Files"]
+        if supportsDocumentCamera { entries.append("Scan Document") }
+        for label in entries {
             let entry = menu.buttons.matching(matching(label)).firstMatch
             for _ in 0..<8 where !entry.isHittable { menu.swipeUp() }
             try visible(entry, "New menu must offer \(label)")
@@ -764,10 +782,14 @@ final class LibraryUITests: XCTestCase {
         try library()
     }
     func testSearchButtonFocusesLibrarySearch() throws { try ui.tapCommand("search.open"); try searchFocused() }
-    func testCommandFFocusesLibrarySearch() throws { app.typeKey("f", modifierFlags: .command); try searchFocused() }
-    func testCommandOFocusesLibrarySearch() throws { app.typeKey("o", modifierFlags: .command); try searchFocused() }
+    func testCommandFFocusesLibrarySearch() throws { try ui.chord("f", .command) { try self.searchFocused() } }
+    func testCommandOFocusesLibrarySearch() throws { try ui.chord("o", .command) { try self.searchFocused() } }
     private func appMenu(_ title: String, expected: String) throws {
-        try tap("App Menu")
+        let menuButton = app.buttons.matching(identifier: "cmd.library.setView").matching(matching("App Menu")).firstMatch
+        ui.recordDiagnostics("App menu before opening", facts: "identified button exists=\(menuButton.exists); requested destination=\(title)")
+        try visible(menuButton, "App Menu must have its command-bearing button")
+        menuButton.tap()
+        ui.recordDiagnostics("App menu after opening", facts: "requested destination=\(title); menus=\(app.menus.count)")
         // Trash also exists in the sidebar; command identity disambiguates the app-menu entry.
         let entry = app.buttons.matching(identifier: "cmd.settings.open").matching(matching(title)).firstMatch
         try visible(entry, "App Menu must offer \(title)")
@@ -895,8 +917,10 @@ final class LibraryUITests: XCTestCase {
         // rather than an alert. This changes setup only; the real drop is still required.
         try ui.nameNewFilesFolder(fixtureFolder)
         let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", fixtureFolder)).firstMatch
-        try visible(directory, "Files must create the external fixture folder")
-        directory.tap()
+        let entered = app.buttons[fixtureFolder + ", Actions Menu"].firstMatch
+        try eventually("Files must list or enter the newly created directory") { directory.exists || entered.exists }
+        if !entered.exists { directory.tap() }
+        try visible(entered, "Save destination must be the named external fixture directory")
         try tap("Save")
         try eventually("Save to Files must finish or report an export error", timeout: 20) {
             !self.app.buttons["Save"].exists || self.app.alerts.firstMatch.exists

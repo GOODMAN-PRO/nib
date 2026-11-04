@@ -62,7 +62,8 @@ final class PagesUITests: XCTestCase {
         XCTAssertGreaterThan(navigator.frame.width, ui.app.windows.firstMatch.frame.width * 0.7)
         try navigate(3)
         XCTAssertEqual(try ui.state().page, original[2])
-        try tap("Panel Options"); try tap("Show as Sidebar")
+        // Choosing a thumbnail in Window mode returns to Sidebar (PagesPanel.open).
+        try wait("Page navigation must return to Sidebar") { self.label("Sidebar").exists && !self.label("Document navigation").exists }
         XCTAssertLessThan(try require(label("Sidebar")).frame.width, ui.app.windows.firstMatch.frame.width * 0.5)
         XCTAssertEqual(try ids(), original)
     }
@@ -89,7 +90,9 @@ final class PagesUITests: XCTestCase {
         try wait("Select All must check every thumbnail") { self.ui.app.staticTexts["4 Selected"].exists || (1...4).allSatisfy { self.thumb($0).isSelected } }
         try tap("Deselect All")
         XCTAssertFalse(thumb(2).isSelected)
-        ui.app.typeKey("a", modifierFlags: .command)
+        try ui.chord("a", .command) {
+            try self.wait("Command-A must check all four thumbnails") { (1...4).allSatisfy { self.thumb($0).isSelected } }
+        }
         try selectionAction("Bookmark")
         try wait("Cmd-A batch action must include all four pages") { (try? self.live().allSatisfy { $0["bookmarked"] as? Bool == true }) == true }
     }
@@ -173,7 +176,7 @@ final class PagesUITests: XCTestCase {
         ui.coordinate(CGPoint(x: 0.38, y: 0.85)).tap()
         let before = try ids()
         try more("Image")
-        let photo = ui.app.images.matching(NSPredicate(format: "label BEGINSWITH 'Photo' OR label BEGINSWITH 'Image'")).firstMatch
+        let photo = try ui.photoAsset()
         try require(photo, "Add Page > Image must present selectable Photos assets")
         photo.tap()
         let add = button("Add")
@@ -596,8 +599,9 @@ final class PagesUITests: XCTestCase {
         if !state.openPanels.contains(where: navigatorIDs.contains) {
             // Other page tests use the real navigator shortcut so a HUD regression does not mask them.
             // The sidebar button and HUD have their own direct-tap acceptance tests above.
-            ui.app.typeKey("s", modifierFlags: [.control, .command])
-            try ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
+            try ui.chord("s", [.control, .command]) {
+                try self.ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
+            }
         }
         if !(try ui.state().openPanels.contains("sidebar.pages")) { try tab("Pages", id: "sidebar.pages") }
         try ui.waitForState { $0.openPanels.contains("sidebar.pages") }
@@ -612,8 +616,9 @@ final class PagesUITests: XCTestCase {
     }
     private func closeNavigator() throws {
         if try ui.state().openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) {
-            ui.app.typeKey("s", modifierFlags: [.control, .command])
-            try ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
+            try ui.chord("s", [.control, .command]) {
+                try self.ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
+            }
         }
     }
     private func thumb(_ number: Int) -> XCUIElement {
@@ -655,7 +660,7 @@ final class PagesUITests: XCTestCase {
         try wait("Live persisted page count must equal \(count)") { (try? self.live().count) == count }
     }
     private func replace(_ field: XCUIElement, _ text: String) throws {
-        try require(field).tap(); field.typeKey("a", modifierFlags: .command); field.typeText(text)
+        try ui.replaceNativeText(in: require(field), with: text)
         if !ui.app.alerts.firstMatch.exists, ui.app.keyboards.firstMatch.exists {
             let hide = ui.app.keyboards.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
             if hide.exists { hide.tap() } else { ui.app.keyboards.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.94)).tap() }
@@ -686,7 +691,9 @@ final class PagesUITests: XCTestCase {
         let before = try ids(), kinds = try itemKinds(try ids()[0]), content = try contentSignature(try ids()[0])
         try pages(); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let revision = try ui.state().clipboardChangeCount ?? 0
-        if keyboard { ui.app.typeKey("c", modifierFlags: .command) } else { try selectionAction("Copy") }
+        if keyboard {
+            try ui.chord("c", .command) { try self.ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision } }
+        } else { try selectionAction("Copy") }
         try ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision }
         XCTAssertEqual(try ids(), before)
         XCTAssertEqual(try itemKinds(before[0]), kinds)
@@ -710,7 +717,7 @@ final class PagesUITests: XCTestCase {
         try tap(action)
     }
     private func openTrash() throws {
-        try closeNavigator(); try ui.tapCommand("window.showLibrary"); try tap("Trash")
+        try closeNavigator(); try ui.tapCommand("window.showLibrary"); try tap("Trash", prefix: true)
         try require(label("Page 1", exact: false))
     }
     private func label(_ text: String, exact: Bool) -> XCUIElement {
@@ -792,8 +799,9 @@ final class PagesUITests: XCTestCase {
         try wait("Undo must restore all page backgrounds") { (try? self.live().map { self.canonical(self.background($0)) }) == before.map { self.canonical(self.background($0)) } }
     }
     private func manageTemplates() throws {
-        ui.app.typeKey("t", modifierFlags: [.command, .option, .shift])
-        try ui.waitForState { $0.openPanels.contains("templateui.manage") }
+        try ui.chord("t", [.command, .option, .shift]) {
+            try self.ui.waitForState { $0.openPanels.contains("templateui.manage") }
+        }
         try require(button("Import Template"))
     }
     private func importTemplate(kind: String, file: String) throws {
@@ -912,7 +920,7 @@ final class PagesUITests: XCTestCase {
     }
     private func assetFile(_ page: [String: Any], in id: String? = nil) throws -> URL {
         let name = try XCTUnwrap(background(page)["asset"] as? String, "Page must retain its background asset reference")
-        let file = try package(id).appendingPathComponent(name)
+        let file = try package(id).appendingPathComponent("assets").appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: file.path) else { throw NibUI.Failure.message("Missing referenced asset: \(name)") }
         return file
     }

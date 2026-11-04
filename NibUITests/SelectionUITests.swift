@@ -49,41 +49,51 @@ final class SelectionUITests: XCTestCase {
         }
     }
 
+    /// Waits for a typed action or placeholder in the active presentation; re-resolves after every menu transition.
     private func control(_ name: String, type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
-        let q = query(name, type: type)
-        for attempt in 0..<(scroll ? 10 : 2) {
-            let matches = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let found = matches.first(where: { [.button, .switch, .textField, .textView].contains($0.elementType) }) ?? matches.first {
-                // SwiftUI menus expose both the row and its label. An index in the mixed-type
-                // query can resolve differently when XCTest performs the action. Keep the
-                // intended labelled control (icons such as "scribble" are shared by rows).
-                let exact = ui.app.descendants(matching: found.elementType).matching(NSPredicate(
-                    format: "identifier == %@ AND label == %@", found.identifier, found.label))
-                if exact.count == 1 { return exact.firstMatch }
-                return found
-            }
-            if attempt == 0 { _ = q.firstMatch.waitForExistence(timeout: 3) }
-            let panels = ui.app.scrollViews.allElementsBoundByIndex
-                + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
-            if scroll, let panel = panels.first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.width > 200 && $0.frame.height > 150
-            }) {
-                panel.coordinate(withNormalizedOffset: CGVector(dx: 0.025, dy: 0.8)).press(forDuration: 0.01,
-                    thenDragTo: panel.coordinate(withNormalizedOffset: CGVector(dx: 0.025, dy: 0.2)))
-            }
+        let types: [XCUIElement.ElementType] = type == .any
+            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider, .image, .staticText, .cell, .other] : [type]
+        func scope() -> XCUIElement {
+            ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
+                : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch
+                : ui.app.sheets.firstMatch.exists ? ui.app.sheets.firstMatch : ui.app
         }
-        throw NibUI.Failure.message("Missing actionable selection control: \(name)\n\(ui.app.debugDescription)")
+        func target(_ kind: XCUIElement.ElementType) -> XCUIElement {
+            scope().descendants(matching: kind).matching(NSPredicate(
+                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+        }
+        func candidate() -> XCUIElement? {
+            for kind in types {
+                // Bind the requested identity before hittability; never retain a mixed ordinal.
+                let bound = target(kind)
+                guard bound.exists else { continue }
+                if bound.isEnabled && bound.isHittable { return bound }
+            }
+            return nil
+        }
+        if scroll {
+            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
+        }
+        try wait("Missing actionable selection control: \(name)") { candidate() != nil }
+        return try XCTUnwrap(candidate(), "Selection control changed during discovery: \(name)")
     }
 
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) {
-        ui.app.typeKey(value, modifierFlags: modifiers)
+    /// Waits for the specified global action after NibUI establishes non-text focus.
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command,
+                     verifying result: () throws -> Void) throws {
+        try ui.chord(value, modifiers, verifying: result)
+    }
+    /// Waits for Settings' real Editing entry, proving the shortcut opened its presentation.
+    private func settings() throws {
+        try key(",") { _ = try self.control("Editing") }
     }
     private func outside() { ui.coordinate(CGPoint(x: 0.95, y: 0.85)).tap() }
 
     private func toggle(_ name: String, to enabled: Bool) throws {
         let target = try control(name, type: .switch, scroll: true)
-        if (target.value as? String == "1") != enabled { target.tap() }
+        let nativeSwitch = target.descendants(matching: .switch).firstMatch
+        if (target.value as? String == "1") != enabled { (nativeSwitch.exists ? nativeSwitch : target).tap() }
         try wait("\(name) must retain its setting") { (target.value as? String == "1") == enabled }
     }
 
@@ -137,8 +147,7 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
     }
     private func selectAll(_ count: Int) throws {
-        key("a")
-        _ = try ui.waitForState(timeout: 8) { $0.selectionCount == count }
+        try key("a") { try self.ui.waitForState(timeout: 8) { $0.selectionCount == count } }
     }
 
     /// The capsule More shares its label with unrelated chrome. Find the one next to Copy.
@@ -227,6 +236,7 @@ final class SelectionUITests: XCTestCase {
         try loop(count: 1)
         try countsEqual(before)
         let b = try bounds()
+        ui.recordGeometry("Lasso content versus selection accessibility frame", touches: stroke.map { ui.coordinate($0).screenPoint }, selection: b)
         XCTAssertTrue(b.contains(ui.coordinate(stroke[2]).screenPoint), "Lasso must select the enclosed stroke")
         XCTAssertFalse(b.contains(ui.coordinate(CGPoint(x: 0.5, y: 0.85)).screenPoint), "Unrelated stroke must remain outside selection")
     }
@@ -241,7 +251,7 @@ final class SelectionUITests: XCTestCase {
     }
 
     func testVShortcutSelectsLassoAndCanEncloseInk() throws {
-        try draw(); key("v", [])
+        try draw(); try key("v", []) { try self.ui.waitForState { $0.tool == "lasso" } }
         _ = try ui.waitForState(timeout: 8) { $0.tool == "lasso" }
         try loop(count: 1)
     }
@@ -267,7 +277,7 @@ final class SelectionUITests: XCTestCase {
     }
 
     func testEscapeDeselectsAndRemovesHandles() throws {
-        try selectedInk(); key(XCUIKeyboardKey.escape.rawValue, [])
+        try selectedInk(); try key(XCUIKeyboardKey.escape.rawValue, []) { try self.ui.waitForState { $0.selectionCount == 0 } }
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         XCTAssertFalse(query("cmd.clipboard.copy").allElementsBoundByIndex.contains { $0.isHittable })
         XCTAssertFalse(query("Selection").allElementsBoundByIndex.contains {
@@ -322,7 +332,7 @@ final class SelectionUITests: XCTestCase {
             try tap("Remove line 2", scroll: true)
         }
         XCTAssertFalse(query("Remove line 2").firstMatch.exists)
-        let field = try control("LaTeX line 1"); field.tap(); key("a"); field.typeText("x=2")
+        let field = try control("LaTeX line 1"); try ui.replaceNativeText(in: field, with: "x=2")
         try wait("Valid LaTeX must enable Apply") { self.query("Apply", type: .button).firstMatch.isEnabled }
         try tap("Apply"); try tap("Done")
         try filter("Maths", excluded: 1)
@@ -468,7 +478,12 @@ final class SelectionUITests: XCTestCase {
                                   (XCUIKeyboardKey.upArrow.rawValue, 0.0, -1.0)] {
             for large in [false, true] {
                 let b = try bounds(), z = try ui.state().zoom, step = large ? 10.0 : 1.0
-                key(keyName, large ? .shift : [])
+                try key(keyName, large ? .shift : []) {
+                    try self.wait("Nudge must reach its requested displacement") {
+                        guard let a = try? self.bounds() else { return false }
+                        return abs(a.minX - b.minX - dx * step * z) < z * 0.25 && abs(a.minY - b.minY - dy * step * z) < z * 0.25
+                    }
+                }
                 try wait("Arrow nudge must move by \(step) page points") {
                     guard let a = try? self.bounds() else { return false }
                     return abs(a.minX - b.minX - dx * step * z) < z * 0.25 && abs(a.minY - b.minY - dy * step * z) < z * 0.25
@@ -491,10 +506,26 @@ final class SelectionUITests: XCTestCase {
         try clear()
     }
 
+    /// Waits for the real Copy export and decodes selected records for identity/attachment assertions.
+    private func copiedItems() throws -> [[String: Any]] {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ui.copyFragment()) as? [String: Any])
+        return try XCTUnwrap(object["items"] as? [[String: Any]])
+    }
+
     func testMovingContainerMovesAttachedInkInSameUndoStep() throws {
         try shape("Rectangle", from: CGPoint(x: 0.38, y: 0.52), to: CGPoint(x: 0.59, y: 0.73))
-        try draw([CGPoint(x: 0.42, y: 0.58), CGPoint(x: 0.47, y: 0.65), CGPoint(x: 0.53, y: 0.59)])
-        try lassoSettings(); try toggle("Shapes", to: false); outside(); try loop(count: 1)
+        ui.coordinate(CGPoint(x: 0.38, y: 0.60)).tap()
+        try ui.waitForState { $0.selectionCount == 1 }
+        let parentID = try XCTUnwrap(copiedItems().first { $0["kind"] as? String == "shape" }?["id"] as? String)
+        try clear()
+        // Ink creation is not a container drop. Draw outside, then perform the real drop-to-attach gesture.
+        try draw([CGPoint(x: 0.42, y: 0.79), CGPoint(x: 0.47, y: 0.86), CGPoint(x: 0.53, y: 0.80)])
+        try lassoSettings(); try toggle("Shapes", to: false); outside()
+        try loop(CGRect(x: 0.40, y: 0.77, width: 0.16, height: 0.11), count: 1)
+        drag(centre(try bounds()), ui.coordinate(CGPoint(x: 0.48, y: 0.63)).screenPoint)
+        let attached = try copiedItems()
+        XCTAssertEqual(attached.first { $0["kind"] as? String == "stroke" }?["attachedTo"] as? String, parentID,
+                       "Real drop must attach the stroke before testing linked movement")
         let child = try bounds()
         try clear(); try lassoSettings(); try toggle("Shapes", to: true); outside()
         ui.coordinate(CGPoint(x: 0.38, y: 0.60)).tap()
@@ -555,7 +586,7 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage }
     }
     func testCommandDDuplicatesSelectedInk() throws {
-        try selectedInk(); let before = try ui.state(); key("d")
+        try selectedInk(); let before = try ui.state(); try key("d") { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try undoCounts(before)
     }
@@ -578,7 +609,7 @@ final class SelectionUITests: XCTestCase {
         try undoCounts(before)
     }
     func testCommandCCopyAndCommandVPaste() throws {
-        try selectedInk(); let before = try ui.state(); key("c"); try countsEqual(before); key("v")
+        try selectedInk(); let before = try ui.state(); try key("c") { try self.ui.waitForState { ($0.clipboardChangeCount ?? 0) > (before.clipboardChangeCount ?? 0) } }; try countsEqual(before); try key("v") { try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try undoCounts(before)
     }
@@ -593,9 +624,9 @@ final class SelectionUITests: XCTestCase {
         try undoCounts(before)
     }
     func testCommandXCutIsUndoableAndPasteable() throws {
-        try selectedInk(); let before = try ui.state(); key("x")
+        try selectedInk(); let before = try ui.state(); try key("x") { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage - 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage - 1 }
-        try undoCounts(before); key("v")
+        try undoCounts(before); try key("v") { try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
     }
 
@@ -607,9 +638,7 @@ final class SelectionUITests: XCTestCase {
         }
         let before = try ui.state()
         try pageMenu(at: point); try tap("Paste")
-        let allow = ui.app.buttons["Allow Paste"]
-        if allow.waitForExistence(timeout: 1) { allow.tap() }
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.selectionCount == 1 }
+        try ui.waitForPaste { self.ui.matchesState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.selectionCount == 1 } }
         XCTAssertEqual(try ui.state().strokeCountOnPage, before.strokeCountOnPage)
     }
     func testPasteExternalPNGIncreasesItemCountAndUndoRemovesAssetUse() throws {
@@ -623,12 +652,10 @@ final class SelectionUITests: XCTestCase {
     func testPasteRichTextRetainsContentAndMatchStyleUsesDestinationStyle() throws {
         try richText(); let before = try ui.state()
         try pageMenu(at: CGPoint(x: 0.45, y: 0.56)); try tap("Paste")
-        let allow = ui.app.buttons["Allow Paste"]
-        if allow.waitForExistence(timeout: 1) { allow.tap() }
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 }
+        try ui.waitForPaste { self.ui.matchesState { $0.itemCountOnPage == before.itemCountOnPage + 1 } }
         let richBounds = try bounds()
         try clear(); try pageMenu(at: CGPoint(x: 0.45, y: 0.78)); try tap("Paste and Match Style")
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 2 }
+        try ui.waitForPaste { self.ui.matchesState { $0.itemCountOnPage == before.itemCountOnPage + 2 } }
         XCTAssertLessThan(try bounds().height, richBounds.height, "Match Style must replace the external 36-point style with the destination text defaults")
         XCTAssertEqual(ui.app.descendants(matching: .any).matching(NSPredicate(format: "value == 'Selection rich text'")).count, 2)
         try ui.tapCommand("edit.undo"); try undoCounts(before)
@@ -644,7 +671,7 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage - 1 }
     }
     func testDeleteKeyRemovesSelectionAndUndoRestores() throws {
-        try selectedInk(); let before = try ui.state(); key(XCUIKeyboardKey.delete.rawValue, [])
+        try selectedInk(); let before = try ui.state(); try key(XCUIKeyboardKey.delete.rawValue, []) { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage - 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 }
         try undoCounts(before)
     }
@@ -740,21 +767,15 @@ final class SelectionUITests: XCTestCase {
 
     // MARK: selection.screenshot — export a real PNG, retaining the document and history.
 
-    private func copyScreenshotAndCheck(_ before: QAState) throws {
-        // Copy in UIActivityViewController transfers the generated PNG to the system clipboard.
-        // F013 exports through the share sheet. The selection's own Copy button remains
-        // visible behind that sheet and copies a fragment instead of the screenshot.
+    /// Waits for a real exported PNG, validates visible ink, and returns its pixel dimensions for region assertions.
+    @discardableResult
+    private func copyScreenshotAndCheck(_ before: QAState) throws -> CGSize {
         let activities = ui.app.otherElements["ActivityListView"].firstMatch
         XCTAssertTrue(activities.waitForExistence(timeout: 15), "Take Screenshot must present the system share sheet")
-        let copy = activities.descendants(matching: .any).matching(NSPredicate(format: "label == 'Copy'")).firstMatch
-        try wait("The screenshot share sheet must offer Copy") { copy.exists && copy.isHittable && copy.isEnabled }
-        copy.tap()
-        try wait("Take Screenshot must export a decodable PNG", timeout: 15) {
-            guard let data = UIPasteboard.general.data(forPasteboardType: UTType.png.identifier),
-                  let image = UIImage(data: data) else { return false }
-            return image.size.width > 10 && image.size.height > 10
-        }
-        let exported = try XCTUnwrap(UIPasteboard.general.image?.cgImage)
+        let data = try ui.saveSharedPNG()
+        let exported = try XCTUnwrap(UIImage(data: data)?.cgImage)
+        XCTAssertGreaterThan(exported.width, 10)
+        XCTAssertGreaterThan(exported.height, 10)
         var rgba = [UInt8](repeating: 0, count: exported.width * exported.height * 4)
         try rgba.withUnsafeMutableBytes { data in
             let context = try XCTUnwrap(CGContext(data: data.baseAddress, width: exported.width, height: exported.height,
@@ -770,23 +791,21 @@ final class SelectionUITests: XCTestCase {
         XCTAssertGreaterThan(visibleInk, 25, "Exported PNG must contain the chosen ink, not an empty region")
         try countsEqual(before)
         XCTAssertEqual(try ui.state().undoAvailable, before.undoAvailable, "Screenshot is a read-only action")
+        return CGSize(width: CGFloat(exported.width), height: CGFloat(exported.height))
     }
     func testSelectionScreenshotExportsPNGWithoutEditingDocument() throws {
         try selectedInk(); let before = try ui.state()
-        UIPasteboard.general.items = []
         try menu("Take Screenshot")
         try copyScreenshotAndCheck(before)
     }
     func testPageRegionScreenshotExportsChosenRegion() throws {
         try draw(); try clear(); let before = try ui.state()
-        UIPasteboard.general.items = []
         try pageMenu(); try tap("Take Screenshot")
         _ = try ui.waitForState(timeout: 8) { $0.tool == "objectmenu.screenshotTool" }
         try ui.drawStroke([CGPoint(x: 0.38, y: 0.52), CGPoint(x: 0.63, y: 0.76)])
-        try copyScreenshotAndCheck(before)
-        let image = try XCTUnwrap(UIPasteboard.general.image)
+        let imageSize = try copyScreenshotAndCheck(before)
         let expectedRatio = (0.25 * ui.canvas.frame.width) / (0.24 * ui.canvas.frame.height)
-        XCTAssertEqual(image.size.width / image.size.height, expectedRatio, accuracy: 0.05,
+        XCTAssertEqual(imageSize.width / imageSize.height, expectedRatio, accuracy: 0.05,
                        "PNG dimensions must follow the selected region")
     }
 
@@ -800,6 +819,12 @@ final class SelectionUITests: XCTestCase {
         }
         try loop(count: 3)
     }
+    /// Waits for a custom handwriting summary's geometry without treating that read-only Other element as a button.
+    private func handwritingGeometry(_ label: String) throws -> XCUIElement {
+        let element = ui.app.otherElements.matching(NSPredicate(format: "label == %@", label)).firstMatch
+        try wait("Handwriting summary must expose its current bounds") { element.exists && !element.frame.isEmpty }
+        return element
+    }
     private func editWords() throws {
         try words(); try menu("Smart Ink", "Edit Handwriting")
         _ = try ui.waitForState(timeout: 8) { $0.tool == "smartink.edit" }
@@ -809,7 +834,7 @@ final class SelectionUITests: XCTestCase {
         try editWords()
         ui.coordinate(CGPoint(x: 0.43, y: 0.595)).doubleTap()
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
-        let word = try control("Selected word")
+        let word = try handwritingGeometry("Selected word")
         XCTAssertLessThan(word.frame.maxX, ui.coordinate(CGPoint(x: 0.52, y: 0.595)).screenPoint.x)
         let before = try ui.state()
         try tap("Delete Word")
@@ -818,8 +843,8 @@ final class SelectionUITests: XCTestCase {
     }
     func testHandwritingReflowNarrowWidthPreservesStrokeCountAndWordShapes() throws {
         try editWords(); let before = try ui.state()
-        let block = try control("Handwriting being edited"), original = block.frame
-        let right = try control("Right edge")
+        let block = try handwritingGeometry("Handwriting being edited"), original = block.frame
+        let right = try control("Right edge", type: .other)
         drag(centre(right.frame), CGPoint(x: original.minX + original.width * 0.48, y: right.frame.midY))
         try wait("Narrowing the handwriting column must add lines") { block.frame.height > original.height + 10 }
         try countsEqual(before)
@@ -874,13 +899,25 @@ final class SelectionUITests: XCTestCase {
                      [CGPoint(x: 0.41, y: 0.62), CGPoint(x: 0.47, y: 0.62)],
                      [CGPoint(x: 0.55, y: 0.57), CGPoint(x: 0.558, y: 0.70)]] { try draw(path) }
         try clear(); let source = try pixels(), before = try ui.state()
-        try loop(count: 4); try menu("Restyle Handwriting", "Neaten Handwriting")
+        try loop(count: 4)
+        let sourceItems = try copiedItems()
+        try menu("Convert", "Text")
+        let sourceRecognition = try control("Recognised text")
+        ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)")
+        try wait("Source HI must be recognised before testing preservation", timeout: 30) {
+            (sourceRecognition.value as? String ?? "").uppercased().filter { $0.isLetter } == "HI"
+        }
+        try tap("Cancel")
+        try loop(count: 4)
+        try menu("Restyle Handwriting", "Neaten Handwriting")
         try clear()
         try wait("Neaten must produce visibly restyled handwriting", timeout: 30) { ((try? self.pixels().changed(from: source)) ?? 0) > 40 }
         let restyled = try ui.state()
         try loop(count: restyled.strokeCountOnPage - 1)
+        let restyledItems = try copiedItems()
         try menu("Convert", "Text")
         let recognised = try control("Recognised text")
+        ui.recordDiagnostics("Neaten result recognition and stroke geometry", facts: "recognition=\(String(describing: recognised.value)); records=\(restyledItems)")
         try wait("Restyled HI must retain its recognised meaning", timeout: 30) {
             let text = (recognised.value as? String ?? "").uppercased().filter { $0.isLetter }
             return text == "HI"
@@ -906,7 +943,7 @@ final class SelectionUITests: XCTestCase {
     // MARK: selection.selectAll / layer.moveItems
 
     private func enableLayers() throws {
-        key(",")
+        try settings()
         // DESIGN §14.8: iPad Settings shows sections, then their pages.
         try tap("Editing")
         try tap("Layers", scroll: true); try toggle("Layers", to: true)
@@ -914,25 +951,45 @@ final class SelectionUITests: XCTestCase {
     }
     func testSelectAllIncludesOnlyActiveLayer() throws {
         try enableLayers()
-        key("2", [.command, .option]); try draw()
-        try clear(); try selectAll(1)
-        key("1", [.command, .option]); try clear(); try selectAll(4)
+        try activateLayer(2)
+        try draw(); try clear(); try selectAll(1)
+        try activateLayer(1)
+        try clear(); try selectAll(4)
     }
     func testMoveObjectsToLayerChangesActiveLayerSelectionAndUndo() throws {
         try enableLayers(); try selectedInk(); let before = try ui.state()
         try menu("Move to Layer", "Layer 2")
         try clear(); try selectAll(4)
-        key("2", [.command, .option]); try clear(); try selectAll(1)
+        try activateLayer(2)
+        try clear(); try selectAll(1)
         try countsEqual(before)
         try ui.tapCommand("edit.undo")
         try clear(); try selectAll(0)
-        key("1", [.command, .option]); try clear(); try selectAll(5)
+        try activateLayer(1)
+        try clear(); try selectAll(5)
+    }
+
+    /// Waits for the layer shortcut's selected row before closing the panel and doing any canvas operations.
+    private func activateLayer(_ number: Int) throws {
+        try key("l", [.command, .option]) {
+            _ = try self.ui.waitForState(timeout: 8) { $0.openPanels.contains("layers") }
+        }
+        let panel = ui.app.scrollViews.containing(.button, identifier: "Layer 1").firstMatch
+        let row = panel.buttons.matching(NSPredicate(format: "label == %@", "Layer \(number)")).firstMatch
+        try wait("Layers panel must expose the target row") { row.exists && row.isHittable }
+        try key(String(number), [.command, .option]) {
+            try self.wait("Layer \(number) shortcut must mark its row active") {
+                row.exists && row.isSelected && (row.value as? String)?.hasPrefix("Active,") == true
+            }
+        }
+        try tap("cmd.panel.close")
+        _ = try ui.waitForState(timeout: 8) { !$0.openPanels.contains("layers") }
     }
 
     // MARK: selection.snap — both exposed options, alignment also controls equal-spacing guides.
 
     private func snapping(align: Bool, grid: Bool) throws {
-        key(","); try tap("Editing"); try tap("Alignment and snapping", scroll: true)
+        try settings(); try tap("Editing"); try tap("Alignment and snapping", scroll: true)
         try toggle("Alignment guides", to: align); try toggle("Snap to grid", to: grid)
         try ui.dismissSheets()
     }
@@ -983,7 +1040,7 @@ final class SelectionUITests: XCTestCase {
     // MARK: item.moveToPage — a real cross-page drag; source and destination checked through page navigation.
 
     private func goToPage(_ number: Int, original: String? = nil) throws {
-        key("g", [.command, .option])
+        try key("g", [.command, .option]) { _ = try self.control("Page number or title", type: .textField) }
         let field = try control("Page number or title"); field.tap(); field.typeText(String(number)); try tap("Go")
         _ = try ui.waitForState(timeout: 10) { !$0.openPanels.contains("pages.goToPage") && (original == nil || $0.page == original) }
     }
@@ -1078,16 +1135,17 @@ final class SelectionUITests: XCTestCase {
         let provider = try SelectionProviderFixture(page: page)
         defer { provider.stop() }
         try wait("The local Assistant provider fixture must start") { provider.port != nil }
-        key(","); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
+        try settings(); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
         try tap("Preset"); try tap("Custom OpenAI-compatible")
         for (label, value) in [("Name", "Selection fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
                                ("Chat model", "selection-fixture")] {
             let field = try control(label, type: .textField, scroll: true)
-            field.tap(); key("a"); field.typeText(value)
+            try ui.replaceNativeText(in: field, with: value)
         }
         // Save through the editor's real keyboard shortcut; no settings or commands are injected.
-        key("s")
+        try ui.dismissNativeKeyboard()
+        try key("s") { try self.wait("Provider save must complete") { self.query("Provider saved.").firstMatch.exists } }
         XCTAssertTrue(query("Provider saved.").firstMatch.waitForExistence(timeout: 10))
         try ui.dismissSheets()
         try menu("Ask AI")

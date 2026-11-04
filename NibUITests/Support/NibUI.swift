@@ -108,9 +108,7 @@ final class NibUI {
         }
         let usesInlineEditor = inline.isHittable
         let field = usesInlineEditor ? inline : alertField
-        field.tap()
-        field.typeKey("a", modifierFlags: .command)
-        field.typeText(title)
+        try replaceNativeText(in: field, with: title)
         if usesInlineEditor {
             field.typeText("\n")
         } else {
@@ -336,13 +334,15 @@ final class NibUI {
         let window = app.windows.firstMatch
         let title = app.buttons.matching(identifier: "menu.title").firstMatch
         // Use an empty part of the header row, never a canvas stroke, tool, or navigation action.
-        let y = title.exists ? title.frame.midY : window.frame.minY + 70
+        let sheet = app.sheets.firstMatch
+        let focusFrame = sheet.exists ? sheet.frame : window.frame
+        let y = sheet.exists ? focusFrame.minY + 24 : title.exists ? title.frame.midY : window.frame.minY + 70
         let occupied = app.buttons.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
             + app.textFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
             + app.searchFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
             + app.textViews.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
         let points = [CGFloat(0.5), 0.45, 0.55, 0.4, 0.6].map {
-            CGPoint(x: window.frame.minX + window.frame.width * $0, y: y)
+            CGPoint(x: focusFrame.minX + focusFrame.width * $0, y: y)
         }
         guard let focus = points.first(where: { point in
             window.frame.contains(point) && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
@@ -375,6 +375,210 @@ final class NibUI {
     func state() throws -> QAState {
         if let state = try readState() { return state }
         return try waitForState(timeout: 10) { _ in true }
+    }
+
+    /// Waits for this paste's result or the exact native Allow Paste prompt, then for dismissal and completion.
+    /// Only the requesting app and SpringBoard are searched; unrelated authorization dialogs are never accepted.
+    func waitForPaste(timeout: TimeInterval = 15, result: @escaping () -> Bool) throws {
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        func allowButton() -> XCUIElement? {
+            for source in [app, system] {
+                let button = source.buttons["Allow Paste"].firstMatch
+                if button.exists && button.isHittable { return button }
+            }
+            return nil
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            allowButton() != nil || result()
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed else {
+            throw Failure.message("Paste produced neither its expected result nor Allow Paste")
+        }
+        if let allow = allowButton() {
+            allow.tap()
+            let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in allowButton() == nil }, object: nil)
+            guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else {
+                throw Failure.message("Allow Paste must dismiss before observing pasted content")
+            }
+        }
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in result() }, object: nil)
+        guard XCTWaiter.wait(for: [completed], timeout: timeout) == .completed else {
+            throw Failure.message("Authorized paste did not produce the expected content\n\(app.debugDescription)")
+        }
+    }
+
+    /// Waits for a real asset cell in the native Photos grid, excluding the document's background image.
+    func photoAsset() throws -> XCUIElement {
+        let photos = NSPredicate(format: "label BEGINSWITH[c] 'Photo' OR label BEGINSWITH[c] 'Image'")
+        let cells = app.collectionViews.cells
+        let labelled = cells.matching(photos).firstMatch
+        let containing = cells.containing(photos).firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (labelled.exists && labelled.isHittable) || (containing.exists && containing.isHittable)
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
+            throw Failure.message("Photos must expose a selectable asset cell\n\(app.debugDescription)")
+        }
+        return labelled.exists && labelled.isHittable ? labelled : containing
+    }
+
+    /// Exports the current share sheet to a uniquely named Files directory and waits for the real PNG bytes on disk.
+    /// The runner only reads the export; it never reads a background UIPasteboard or generates an expected image.
+    func saveSharedPNG() throws -> Data {
+        var finished = false
+        defer {
+            if !finished { recordDiagnostics("Save to Files PNG export failed") }
+        }
+        let action = app.buttons["Save to Files"].firstMatch
+        revealFormElement(action)
+        guard action.waitForExistence(timeout: 10), action.isHittable else {
+            throw Failure.message("PNG share sheet must offer Save to Files")
+        }
+        action.tap()
+        let local = app.cells["DOC.sidebar.item.On My iPad"].firstMatch
+        guard local.waitForExistence(timeout: 10), local.isHittable else { throw Failure.message("Files local provider missing") }
+        local.tap()
+        let nib = app.cells["Nib, Container"].firstMatch
+        if nib.waitForExistence(timeout: 3) && nib.isHittable { nib.tap() }
+        else {
+            guard app.buttons["Nib, Actions Menu"].exists else { throw Failure.message("Export must target Nib Documents") }
+        }
+        let folder = "QA Screenshot " + UUID().uuidString
+        let newFolder = app.buttons["New Folder"].firstMatch
+        if !newFolder.isHittable { app.buttons["More"].firstMatch.tap() }
+        guard newFolder.waitForExistence(timeout: 5), newFolder.isHittable else { throw Failure.message("Files New Folder missing") }
+        newFolder.tap()
+        try nameNewFilesFolder(folder)
+        let entered = app.buttons[folder + ", Actions Menu"].firstMatch
+        let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", folder)).firstMatch
+        let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in entered.exists || directory.exists }, object: nil)
+        guard XCTWaiter.wait(for: [created], timeout: 8) == .completed else { throw Failure.message("Files did not create PNG destination") }
+        if !entered.exists { directory.tap() }
+        guard entered.waitForExistence(timeout: 8) else { throw Failure.message("Files must enter the unique PNG destination") }
+        let save = app.buttons["Save"].firstMatch
+        guard save.isEnabled && save.isHittable else { throw Failure.message("Files Save unavailable") }
+        save.tap()
+        // Unverified until simulator CI: Files labels and runner access to sibling app containers.
+        // The native picker saves into the app container. The unique directory prevents stale exports matching.
+        let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()
+        let destinations = try FileManager.default.contentsOfDirectory(at: containers, includingPropertiesForKeys: nil)
+            .map { $0.appendingPathComponent("Documents").appendingPathComponent(folder) }
+        var bytes: Data?
+        let exported = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            for destination in destinations {
+                let files = (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)) ?? []
+                for file in files where file.pathExtension.lowercased() == "png" {
+                    if let data = try? Data(contentsOf: file), UIImage(data: data) != nil { bytes = data; return true }
+                }
+            }
+            return false
+        }, object: nil)
+        guard XCTWaiter.wait(for: [exported], timeout: 15) == .completed, let bytes else {
+            throw Failure.message("Save to Files must produce a decodable PNG in the unique destination")
+        }
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !entered.exists }, object: nil)
+        guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else { throw Failure.message("Files must finish exporting") }
+        finished = true
+        return bytes
+    }
+
+    /// Drags the visible custom track, then waits for the caller's playback-position oracle; native slider endpoints are absent.
+    func dragSlider(_ slider: XCUIElement, to fraction: CGFloat, verifying result: () throws -> Void) throws {
+        guard slider.exists && slider.isHittable && slider.frame.width > 28 else {
+            throw Failure.message("Custom slider needs a visible track: \(slider)")
+        }
+        // NibSlider reserves 14 points at each end for its bead; map the fraction onto the actual track.
+        let targetX = (14 + min(1, max(0, fraction)) * (slider.frame.width - 28)) / slider.frame.width
+        slider.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.01, thenDragTo: slider.coordinate(withNormalizedOffset:
+                CGVector(dx: targetX, dy: 0.5)), withVelocity: .slow, thenHoldForDuration: 0)
+        try result()
+    }
+
+    /// Samples the live probe once, without nesting a state wait inside another expectation.
+    func matchesState(_ predicate: (QAState) -> Bool) -> Bool {
+        guard let current = try? readState() else { return false }
+        return predicate(current)
+    }
+
+    /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
+    func isKeyboardFocused(_ field: XCUIElement) -> Bool {
+        field.exists && field.debugDescription.contains("Keyboard Focused")
+    }
+
+    /// Waits for the native keyboard's own dismissal before a global action; never taps document content.
+    func dismissNativeKeyboard() throws {
+        guard app.keyboards.firstMatch.exists else { return }
+        let hide = app.keyboards.buttons.matching(NSPredicate(format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).firstMatch
+        guard hide.exists && hide.isHittable else { throw Failure.message("No native keyboard dismissal control") }
+        hide.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in !app.keyboards.firstMatch.exists }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 5) == .completed else { throw Failure.message("Keyboard did not dismiss") }
+    }
+
+    /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
+    func focusField(_ field: XCUIElement) throws {
+        if isKeyboardFocused(field) { return }
+        revealFormElement(field)
+        guard field.exists && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
+        field.tap()
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
+        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
+            throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
+        }
+    }
+
+    /// Delivers modifiers while preserving native focus; callers verify the relevant text or formatting result.
+    func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
+        try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
+            try focusField(field)
+            XCUIElement.perform(withKeyModifiers: modifiers) { field.typeKey(key, modifierFlags: modifiers) }
+        }
+    }
+
+    /// Waits for exact replacement, including empty fields, so a lost Select All cannot silently append text.
+    func replaceNativeText(in field: XCUIElement, with text: String) throws {
+        try nativeKey("a", in: field)
+        timedAction("Native replacement delivery (\(text.count) characters)") {
+            field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        }
+        try waitForNativeText(in: field, equals: text)
+    }
+
+    /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
+    func waitForNativeText(in field: XCUIElement, equals text: String) throws {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            guard let value = field.value as? String else { return false }
+            return value == text || (text.isEmpty && value == field.placeholderValue)
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            throw Failure.message("Native replacement mismatch: expected \(text.debugDescription), got \(String(describing: field.value))")
+        }
+    }
+
+    /// Waits for native Cut and Copy availability, which requires a nonempty selection, without editing or undoing.
+    /// The callers' rich-text/range assertions verify its extent; this probe preserves text, focus and selection.
+    func verifyNativeSelection(in field: XCUIElement, fullText: String) throws {
+        // iPad's input assistant exposes these even when a hardware shortcut does not present the edit menu.
+        // Never accept cmd.clipboard.*: those controls describe Nib's object selection, not this native field.
+        func available(_ title: String, assistant: String) -> Bool {
+            let shortcut = app.buttons.matching(identifier: assistant).firstMatch
+            if shortcut.exists && shortcut.isEnabled && shortcut.isHittable { return true }
+            for type in [XCUIElement.ElementType.menuItem, .button] {
+                let action = app.descendants(matching: type).matching(NSPredicate(
+                    format: "label ==[c] %@ AND NOT (identifier BEGINSWITH 'cmd.')", title)).firstMatch
+                if action.exists && action.isEnabled && action.isHittable { return true }
+            }
+            return false
+        }
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            isKeyboardFocused(field) && field.value as? String == fullText
+                && available("Cut", assistant: "assistantCut") && available("Copy", assistant: "assistantCopy")
+        }, object: nil)
+        guard XCTWaiter.wait(for: [selected], timeout: 8) == .completed else {
+            throw Failure.message("Native selection must enable Cut and Copy without changing text\n\(app.debugDescription)")
+        }
+        try waitForNativeText(in: field, equals: fullText)
     }
 
     private func readState() throws -> QAState? {
@@ -527,6 +731,43 @@ final class NibUI {
         canvas.coordinate(withNormalizedOffset: CGVector(dx: point.x, dy: point.y))
     }
 
+    /// Captures screen-point geometry at the action boundary so CI can distinguish gesture delivery from AX projection.
+    func recordGeometry(_ name: String, touches: [CGPoint], selection: CGRect? = nil) {
+        XCTContext.runActivity(named: name) { activity in
+            let attachment = XCTAttachment(string: "All frames and touches are screen points.\n"
+                + "app=\(app.frame) window=\(app.windows.firstMatch.frame) canvas=\(canvas.frame)\n"
+                + "touches=\(touches) selection=\(String(describing: selection))\n\(probe.value ?? "missing")")
+            attachment.name = name; attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+    }
+
+    /// Records monotonic timestamps before and after one UI action, including any XCTest idle wait in that action.
+    /// The first attachment is emitted before touching AX so an idle stall still leaves a precise last-started action.
+    @discardableResult
+    func timedAction<T>(_ name: String, action: () throws -> T) rethrows -> T {
+        try XCTContext.runActivity(named: name) { activity in
+            let started = ProcessInfo.processInfo.systemUptime
+            let start = XCTAttachment(string: "start uptime=\(started) wall=\(Date())")
+            start.name = "action-start"; start.lifetime = .keepAlways; activity.add(start)
+            defer {
+                let end = XCTAttachment(string: "end uptime=\(ProcessInfo.processInfo.systemUptime) elapsed=\(ProcessInfo.processInfo.systemUptime - started)")
+                end.name = "action-end"; end.lifetime = .keepAlways; activity.add(end)
+            }
+            return try action()
+        }
+    }
+
+    /// Captures the current screen, probe and AX tree at a named transition; no command or document mutation is injected.
+    func recordDiagnostics(_ name: String, facts: String = "") {
+        XCTContext.runActivity(named: name) { activity in
+            let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screen.name = name + "-screen"; screen.lifetime = .keepAlways; activity.add(screen)
+            let tree = XCTAttachment(string: "uptime=\(ProcessInfo.processInfo.systemUptime)\n\(facts)\n"
+                + "probe=\(probe.value ?? "missing")\n\(app.debugDescription)")
+            tree.name = name + "-state-and-tree"; tree.lifetime = .keepAlways; activity.add(tree)
+        }
+    }
+
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using
     /// XCTest's event synthesizer (test runner only); no commands or app-side gesture injection are used.
     func drawStroke(_ path: [CGPoint], duration: TimeInterval = 0.35) throws {
@@ -550,6 +791,8 @@ final class NibUI {
             [CGPoint(x: centre.x + direction * radius, y: centre.y),
              CGPoint(x: centre.x + direction * radius * scale, y: centre.y)]
         }
+        recordGeometry("Pinch focal point and contact paths", touches: [coordinate(centre).screenPoint]
+            + paths.flatMap { $0.map { coordinate($0).screenPoint } })
         try synthesize(paths, duration: duration)
     }
     func doubleTap(at point: CGPoint = CGPoint(x: 0.5, y: 0.5)) { coordinate(point).doubleTap() }
