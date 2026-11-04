@@ -8,6 +8,12 @@ public enum FeatPenFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         InkCommands.register(app)
+        app.ui.inspectors.register(InspectorDescriptor(
+            id: "pen.strokeStyle", title: String(localized: "Ink"), icon: NibSymbol.pen.name,
+            itemKinds: [.stroke], order: 100, owner: id) { context in
+                AnyView(StrokeStyleInspector(context: context)
+                    .id(context.items.map { NodeRef.item(context.doc, context.page, $0.id).description }))
+            })
         PenSettings.declare(app.settings)
         app.content.strokeProcessors.register(StrokeProcessorEntry(id: PenStabilizer.id, order: PenStabilizer.order,
             owner: id, processor: PenStabilizer(settings: app.settings)))
@@ -45,6 +51,87 @@ public enum FeatPenFeature: NibFeature {
 
     public static func stop(_ app: NibApp) {
         app.services.set(nil, for: "pen.toolObservation")
+    }
+}
+
+/// Edits existing ink, never the active tool's presets. One inspector interaction session is one undo group.
+@MainActor
+final class StrokeInspectorModel: ObservableObject {
+    let context: InspectorContext
+    let ids: [ElementID]
+    private let group = NibID.make().raw
+    @Published private(set) var style: InkStyle
+    private(set) var pending: Task<Void, Never>?
+    private var observation: EventSubscription?
+
+    init(context: InspectorContext) {
+        self.context = context
+        ids = context.items.filter { $0.stroke != nil && !$0.locked }.map(\.id)
+        style = context.items.compactMap(\.stroke).first?.style ?? .defaultPen
+        observation = context.app.events.subscribe { [weak self] event in
+            guard event.type == NibEventType.committed else { return }
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    deinit { observation?.cancel() }
+
+    private func refresh() {
+        guard let id = ids.first,
+              let stroke = try? context.app.workspace.item(context.doc, page: context.page, id: id).stroke else { return }
+        style = stroke.style
+    }
+
+    func change(_ patch: JSONValue) {
+        guard !ids.isEmpty, !context.session.readOnly else { return }
+        let previous = pending
+        pending = Task { @MainActor [self] in
+            await previous?.value
+            let refs = ids.map { JSONValue.string(NodeRef.item(context.doc, context.page, $0).description) }
+            do {
+                _ = try await context.app.bus.execute(Invocation(command: CommandIDs.inkSetStyle,
+                    params: ["refs": .array(refs), "style": patch], session: context.session, group: group))
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: context.app,
+                    userInfo: ["command": CommandIDs.inkSetStyle, "error": NibError.wrap(error)])
+            }
+            refresh()
+        }
+    }
+
+    var width: Binding<Double> {
+        Binding(get: { self.style.width * 25.4 / 72 },
+                set: { self.change(["width": .number($0 * 72 / 25.4)]) })
+    }
+    var swatch: Binding<String?> {
+        Binding(get: { NibInk.allCases.first { RGBA($0.uiColor) == self.style.color }?.rawValue },
+                set: { name in
+                    if let name, let ink = NibInk(rawValue: name) {
+                        self.change(["color": .string(RGBA(ink.uiColor).hex)])
+                    }
+                })
+    }
+    var pattern: Binding<StrokePattern> {
+        Binding(get: { self.style.pattern }, set: { self.change(["pattern": .string($0.rawValue)]) })
+    }
+}
+
+struct StrokeStyleInspector: View {
+    @StateObject private var model: StrokeInspectorModel
+    init(context: InspectorContext) {
+        _model = StateObject(wrappedValue: StrokeInspectorModel(context: context))
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.l) {
+            NibStrokeWidthSlider(width: model.width, range: 0.1...3)
+            NibInspectorSection(String(localized: "Colour")) {
+                NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: model.swatch)
+            }
+            NibInspectorSection(String(localized: "Stroke pattern")) {
+                NibSegmentedControl(selection: model.pattern, options: StrokePattern.allCases, title: { $0.title })
+            }
+        }
+        .disabled(model.ids.isEmpty || model.context.session.readOnly)
     }
 }
 
