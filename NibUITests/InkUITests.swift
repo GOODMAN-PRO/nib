@@ -1213,7 +1213,7 @@ final class InkUITests: XCTestCase {
     // The tests below verify settings and direct-touch behavior, never claim those hardware events.
 
     func testPencilPaletteKeyboardChoiceAppliesAndDismissesWithoutMarks() throws {
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         let palette = try control("Pencil palette")
         let eraser = palette.buttons["tool.eraser"]
         XCTAssertTrue(eraser.exists); eraser.tap()
@@ -1223,7 +1223,7 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         let desired = try XCTUnwrap(swatches.last?.label)
         let paletteColourFallback = "Colour \(swatches.count)"
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         let colours = try control("Pencil palette")
         let thickness = colours.buttons.matching(NSPredicate(format: "label ENDSWITH 'millimetres'")).allElementsBoundByIndex
         let thickest = try XCTUnwrap(thickness.last, "Pencil palette must offer the current tool's thickness attributes")
@@ -1235,14 +1235,14 @@ final class InkUITests: XCTestCase {
         XCTAssertEqual(swatches.first(where: \.isSelected)?.label, desired)
         XCTAssertTrue(try control("Thickness 3", type: .button).isSelected)
         try assertNoNewInk(before); try draw()
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         _ = try control("Pencil palette")
         ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try wait("Escape dismisses the Pencil palette") { !self.ui.app.otherElements["Pencil palette"].exists }
     }
 
     func testSettingsKeyboardShortcutOpensInkPreferences() throws {
-        ui.app.typeKey(",", modifierFlags: .command)
+        try ui.chord(",", .command) { _ = try self.control("Stylus") }
         _ = try control("Stylus")
     }
 

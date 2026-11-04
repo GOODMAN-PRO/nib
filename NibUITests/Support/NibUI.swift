@@ -189,6 +189,54 @@ final class NibUI {
         _ = try waitForState { $0.screen == "library" }
     }
 
+    /// Activates this scene, waits for non-text focus without editing/navigating, and verifies the chord's action.
+    /// The activity records requested modifiers beside the shell's existing Key routing / Library key diagnostic logs.
+    func chord(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
+               verifying postcondition: () throws -> Void) throws {
+        app.activate()
+        let before = try state()
+        guard !app.keyboards.firstMatch.exists else {
+            throw Failure.message("Dismiss text editing explicitly before delivering a global chord")
+        }
+        let window = app.windows.firstMatch
+        let title = app.buttons.matching(identifier: "menu.title").firstMatch
+        // Use an empty part of the header row, never a canvas stroke, tool, or navigation action.
+        let y = title.exists ? title.frame.midY : window.frame.minY + 70
+        let occupied = app.buttons.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+            + app.textFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+            + app.searchFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+            + app.textViews.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+        let points = [CGFloat(0.5), 0.45, 0.55, 0.4, 0.6].map {
+            CGPoint(x: window.frame.minX + window.frame.width * $0, y: y)
+        }
+        guard let focus = points.first(where: { point in
+            window.frame.contains(point) && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+        }) else { throw Failure.message("No inert header focus target for keyboard chord") }
+        app.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: focus.x - app.frame.minX, dy: focus.y - app.frame.minY)).tap()
+        let focused = try state()
+        guard focused.document == before.document, focused.page == before.page,
+              focused.strokeCountOnPage == before.strokeCountOnPage,
+              focused.itemCountOnPage == before.itemCountOnPage, focused.selectionCount == before.selectionCount,
+              focused.undoAvailable == before.undoAvailable, focused.redoAvailable == before.redoAvailable,
+              focused.zoom == before.zoom, focused.contentOffset.x == before.contentOffset.x,
+              focused.contentOffset.y == before.contentOffset.y, focused.openPanels == before.openPanels,
+              !app.keyboards.firstMatch.exists else {
+            throw Failure.message("Keyboard focus preparation changed document content or navigation")
+        }
+        try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
+            let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) window=\(window.frame)\n\(probe.value ?? "missing")")
+            request.lifetime = .keepAlways; activity.add(request)
+            defer {
+                let result = XCTAttachment(string: "\(probe.value ?? "missing")\n\(app.debugDescription)")
+                result.name = "chord-result"; result.lifetime = .keepAlways; activity.add(result)
+            }
+            // Holding modifiers across the event avoids an unmodified fallback key between down/up events.
+            XCUIElement.perform(withKeyModifiers: modifiers) { [self] in app.typeKey(key, modifierFlags: modifiers) }
+            try postcondition()
+        }
+    }
+
     func state() throws -> QAState {
         if let state = try readState() { return state }
         return try waitForState(timeout: 10) { _ in true }

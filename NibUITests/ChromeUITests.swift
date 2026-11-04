@@ -251,7 +251,7 @@ final class ChromeUITests: XCTestCase {
         try tap("Assistant"); try panel("aichat.panel")
         // DESIGN §14.9 transfers the droplet into the header, which has its own Close.
         try tap("Close Assistant"); try panel("aichat.panel", shown: false)
-        key("j", .command); try panel("aichat.panel")
+        try ui.chord("j", .command) { try self.panel("aichat.panel") }
         escape(); try panel("aichat.panel", shown: false)
         try sameContent(before); key("p"); try draw()
     }
@@ -523,17 +523,21 @@ final class ChromeUITests: XCTestCase {
     func testDockKeyboardUndoRedoRestoresEdgeAndAlongWithDocumentPriority() throws {
         try open(); let before = try ui.state(); XCTAssertFalse(before.undoAvailable)
         try dock("right"); let moved = try ui.state()
-        key("z", .command)
-        _ = try ui.waitForState { $0.paletteDock?.edge == before.paletteDock?.edge }
+        try ui.chord("z", .command) {
+            _ = try self.ui.waitForState { $0.paletteDock?.edge == before.paletteDock?.edge }
+        }
         XCTAssertEqual(try XCTUnwrap(ui.state().paletteDock?.along), try XCTUnwrap(before.paletteDock?.along), accuracy: 0.02)
-        key("z", [.command, .shift])
-        _ = try ui.waitForState { $0.paletteDock?.edge == moved.paletteDock?.edge }
+        try ui.chord("z", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.paletteDock?.edge == moved.paletteDock?.edge }
+        }
         try ui.selectTool("pen"); try draw(); try dock("top")
-        key("z", .command)
-        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage }
+        try ui.chord("z", .command) {
+            _ = try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage }
+        }
         XCTAssertEqual(try ui.state().paletteDock?.edge, "top", "Document ink must undo before the window's newer docking step")
-        key("z", [.command, .shift])
-        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
+        try ui.chord("z", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
+        }
     }
 
     // toolbar.setVisible/setLayout/reset/saveLayout/applyLayout/deleteLayout
@@ -701,10 +705,11 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState { $0.document == first.document }
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         XCTAssertEqual(try ui.state().document, second.document)
-        key("w", .command); _ = try ui.waitForState { $0.document == first.document }
+        try ui.chord("w", .command) { _ = try self.ui.waitForState { $0.document == first.document } }
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
-        key("w", [.command, .option])
-        _ = try ui.waitForState { $0.screen == "library" && $0.document == nil }
+        try ui.chord("w", [.command, .option]) {
+            _ = try self.ui.waitForState { $0.screen == "library" && $0.document == nil }
+        }
         try open(); XCTAssertEqual(try ui.state().document, first.document)
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         XCTAssertEqual(try ui.state().document, second.document)
@@ -797,11 +802,16 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(try require("Layer 2").isSelected)
         let baseline = try require("Layer 2").value as? String
         try tap("cmd.panel.close"); try ui.selectTool("pen"); try draw()
-        key("l", [.command, .option]); try panel("layers")
+        try ui.chord("l", [.command, .option]) { try self.panel("layers") }
         XCTAssertNotEqual(try require("Layer 2").value as? String, baseline, "New stroke must belong to chosen layer")
         XCTAssertTrue((query("Layer 2").firstMatch.value as? String ?? "").contains("1 item"))
-        try tap("cmd.panel.close"); key("3", [.command, .option]); try draw(y: 0.73)
-        key("l", [.command, .option]); XCTAssertTrue(try require("Layer 3").isSelected)
+        try tap("cmd.panel.close"); try ui.chord("3", [.command, .option]) {
+            try self.more("Layers")
+            try self.wait("Layer 3 shortcut must select Layer 3") { self.query("Layer 3").firstMatch.isSelected }
+            try self.tap("cmd.panel.close")
+        }
+        try draw(y: 0.73)
+        try ui.chord("l", [.command, .option]) { try self.panel("layers") }; XCTAssertTrue(try require("Layer 3").isSelected)
         XCTAssertTrue((query("Layer 3").firstMatch.value as? String ?? "").contains("1 item"))
     }
     func testActiveLayerLimitsLassoSelectionToChosenLayer() throws {

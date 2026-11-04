@@ -45,7 +45,9 @@ final class CreateUITests: XCTestCase {
     // MARK: Entry, title, kind and cancellation
 
     func testNotebookKeyboardShortcutOpensDraftAndEscapeCancels() throws {
-        ui.app.typeKey("n", modifierFlags: [.command, .alternate])
+        try ui.chord("n", [.command, .alternate]) {
+            try self.require(self.ui.app.textFields["Title"], "Creation chord must open Title")
+        }
         try require(ui.app.textFields["Title"], "create.newNotebook: Option-Command-N must open the creation sheet")
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
@@ -400,7 +402,9 @@ final class CreateUITests: XCTestCase {
     }
 
     func testWhiteboardKeyboardShortcutOpensOptionsWithoutCreating() throws {
-        ui.app.typeKey("w", modifierFlags: [.command, .shift])
+        try ui.chord("w", [.command, .shift]) {
+            try self.require(self.ui.app.textFields["Whiteboard name"], "Creation chord must open Whiteboard name")
+        }
         try require(ui.app.textFields["Whiteboard name"], "whiteboard.create: Shift-Command-W must open board options")
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
@@ -412,7 +416,9 @@ final class CreateUITests: XCTestCase {
     }
 
     func testTextDocumentKeyboardShortcutCreatesEditableFirstBlock() throws {
-        ui.app.typeKey("t", modifierFlags: [.command, .shift])
+        try ui.chord("t", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.document != nil }
+        }
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "textDocument", pages: 0)
         let block = ui.app.textViews.firstMatch
@@ -481,7 +487,9 @@ final class CreateUITests: XCTestCase {
     }
 
     func testQuickNoteKeyboardShortcutCreatesUntitledDefaultPaper() throws {
-        ui.app.typeKey("n", modifierFlags: [.command, .shift])
+        try ui.chord("n", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.document != nil }
+        }
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "notebook", pages: 1)
         XCTAssertEqual(try livePages(id).map(template), ["builtin.ruled"])
