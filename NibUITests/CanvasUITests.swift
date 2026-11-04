@@ -797,7 +797,9 @@ final class CanvasUITests: XCTestCase {
         XCTAssertTrue(heightLabel.waitForExistence(timeout: 5))
         let words = heightLabel.label.split(separator: " ")
         let templateHeight = try XCTUnwrap(words.compactMap { Double($0) }.first)
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try key(XCUIKeyboardKey.escape.rawValue, []) {
+            self.eventually("Escape must dismiss the return-height options") { !heightLabel.exists }
+        }
         let paper2 = try page(2).frame
         let secondBox = try require("Zoom box").frame
         let scale2 = try ui.state().zoom
