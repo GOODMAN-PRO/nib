@@ -321,14 +321,17 @@ struct ClearPageConfirmation: UIViewControllerRepresentable {
 /// The three size presets of the options bar (T-093), as NibDesign's width preset dots (the same dots as the popover's
 /// size slider); the popover's slider covers everything in between.
 struct EraserSizePresets: View {
+    static func slotID(_ index: Int) -> String { "size.eraser.\(index)" }
+
     @ObservedObject var model: EraserOptions
 
     var body: some View {
         ForEach(Array(EraserSettings.presets.enumerated()), id: \.offset) { index, preset in
             NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected: abs(model.size - preset) < 0.5,
-                                 label: EraserSizeFormat.presetName(index, preset)) {
+                                 label: EraserSizeFormat.presetName(index, preset), slotID: Self.slotID(index)) {
                 model.selectSize(preset)
             }
+            .accessibilityIdentifier("cmd.settings.set")
         }
     }
 }

@@ -216,21 +216,36 @@ public struct NibStrokeWidthSlider: View {
     }
 }
 
-/// v2: one thickness preset (DESIGN.md §13.3): a `label` dot in a 44 × 40 cell (44 pt hit target), the selected one
+/// v2: one thickness preset (DESIGN.md §13.3): a `label` dot in a 44 × 40 cell and hit target, the selected one
 /// on `fill3` (radius 12). The dots of a row are `NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt. Every place that
 /// offers a thickness (a tool's popover, the Pencil palette, the options bar) uses it, so a width looks the same.
 public struct NibWidthPresetButton: View {
     let diameter: CGFloat
     let isSelected: Bool
     let label: String
+    let slotID: String?
+    let value: String?
     let action: () -> Void
     @Environment(\.isEnabled) private var isEnabled
 
     public init(diameter: CGFloat, isSelected: Bool, label: String, action: @escaping () -> Void) {
+        self.init(diameter: diameter, isSelected: isSelected, label: label, slotID: nil, action: action)
+    }
+
+    public init(diameter: CGFloat, isSelected: Bool, label: String,
+                slotID: String?, value: String? = nil, action: @escaping () -> Void) {
         self.diameter = diameter
         self.isSelected = isSelected
         self.label = label
+        self.slotID = slotID
+        self.value = value
         self.action = action
+    }
+
+    /// A stable parameter identity alongside the caller's unchanged cmd.<command> identifier.
+    /// Keep the human-readable width/pattern after it, even when those settings change.
+    var accessibilitySlotValue: String {
+        [slotID, value].compactMap { $0 }.joined(separator: "; ")
     }
 
     public var body: some View {
@@ -239,16 +254,20 @@ public struct NibWidthPresetButton: View {
             Circle()
                 .fill(NibChromeColor(NibColor.label))
                 .frame(width: diameter, height: diameter)
-                .frame(width: NibMetrics.hitTarget, height: 40)
+                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hudHeight)
                 .background(NibChromeColor(isSelected ? NibColor.fill3 : Color.clear), in: shape)
                 .opacity(isEnabled ? 1 : NibOpacity.disabled)
-                .frame(minHeight: NibMetrics.hitTarget)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(NibPressStyle(shape: shape))
+        .buttonStyle(NibPressStyle(shape: shape, rectangularHitTarget: true))
         .nibTooltip(label)
         .accessibilityLabel(label)
+        .accessibilityValue(accessibilitySlotValue)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        // Each cell owns a native surface with exactly its layout bounds. SwiftUI's
+        // shared glass-host hit routing must not redirect a tap to a neighbouring dot.
+        .frame(width: NibMetrics.hitTarget, height: NibMetrics.hudHeight)
+        .nibNativeAction(action)
     }
 }
 

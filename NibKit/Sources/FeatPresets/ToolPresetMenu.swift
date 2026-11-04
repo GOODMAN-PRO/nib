@@ -125,6 +125,8 @@ final class PresetMenuModel {
     /// palette holds never goes stale.
     static func anchorID(_ tool: String) -> String { "presets.\(tool).popoverSource" }
 
+    static func widthSlotID(_ tool: String, _ index: Int) -> String { "width.\(tool).\(index)" }
+
     var range: ClosedRange<Double> { PresetRules.widthRange(tool) }
 
     /// The thickness the slider shows, rounded to 0.01 pt.
@@ -413,11 +415,12 @@ struct ToolPresetMenu: View {
             ForEach(0..<PresetRules.widthSlots, id: \.self) { i in
                 let selected = i == presets.selectedWidth
                 NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(i), isSelected: selected,
-                                     label: String(localized: "Thickness \(i + 1)")) {
+                                     label: String(localized: "Thickness \(i + 1)"),
+                                     slotID: PresetMenuModel.widthSlotID(tool, i),
+                                     value: PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i])) {
                     model.tapWidth(i)
                 }
                 .accessibilityIdentifier("cmd.preset.select")
-                .accessibilityValue(PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]))
                 .accessibilityHint(selected ? String(localized: "Double-tap to adjust.") : "")
                 .presetPopoverSource(tool, model.shown == .width(i))
             }
@@ -541,6 +544,7 @@ extension View {
         background {
             if isSource {
                 Color.clear.nibBudAnchor(PresetMenuModel.anchorID(tool))
+                    .allowsHitTesting(false)
             }
         }
     }

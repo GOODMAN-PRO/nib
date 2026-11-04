@@ -43,7 +43,7 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
                 XCTAssertTrue(String(reflecting: type(of: bar.body)).contains("ScrollView"))
                 let target = NibWidthPresetButton(diameter: 8, isSelected: false, label: "Width") {}
                 XCTAssertEqual(NibSnapshot.fittingSize(target, width: available, variant: variant),
-                               CGSize(width: 44, height: 44))
+                               CGSize(width: NibMetrics.hitTarget, height: NibMetrics.hudHeight))
                 for placement in [NibBudPlacement.above, .below] {
                     for anchorX in [CGFloat(16), phoneWidth / 2, phoneWidth - 60] {
                         let bounds = CGRect(x: 0, y: 0, width: phoneWidth, height: 852)
@@ -89,7 +89,7 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
         }
     }
 
-    func testWidthPresetsAreRoundDotsWith44PointTargetsAnd40PointSelectedCells() throws {
+    func testWidthPresetsAreRoundDotsWith44By40PointCells() throws {
         for variant in [NibSnapshot.Variant.light, .dark, .largeText] {
             for (index, diameter) in [CGFloat(5), 8, 12].enumerated() {
                 let off = NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected: false,
@@ -97,7 +97,8 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
                 let on = NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected: true,
                                               label: "Thickness") {}
                 let size = CGSize(width: 44, height: 44)
-                XCTAssertEqual(NibSnapshot.fittingSize(off, width: 44, variant: variant), size)
+                XCTAssertEqual(NibSnapshot.fittingSize(off, width: 44, variant: variant),
+                               CGSize(width: NibMetrics.hitTarget, height: NibMetrics.hudHeight))
                 let dot = try XCTUnwrap(NibSnapshot.image(off, size: size, variant: variant))
                 var minX = 44.0, minY = 44.0, maxX = 0.0, maxY = 0.0
                 for y in stride(from: 0.0, to: 44, by: 0.5) {
@@ -114,7 +115,7 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
                 let fill = try XCTUnwrap(NibSnapshot.pixel(selected, at: CGPoint(x: 22, y: 4)))
                 let outside = try XCTUnwrap(NibSnapshot.pixel(selected, at: CGPoint(x: 22, y: 1)))
                 XCTAssertGreaterThan(fill.a, 0, "Selected fill3 is visible beyond the dot")
-                XCTAssertEqual(outside.a, 0, "The 40 pt visual cell sits inside its 44 pt hit area")
+                XCTAssertEqual(outside.a, 0, "The 40 pt cell remains centred in the 44 pt options bar")
             }
         }
     }
