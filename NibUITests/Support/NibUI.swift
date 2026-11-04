@@ -844,11 +844,46 @@ final class NibUI {
             }
             return false
         }
-        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+        func hasSelection() -> Bool {
             isKeyboardFocused(field) && field.value as? String == fullText
                 && available("Cut", assistant: "assistantCut") && available("Copy", assistant: "assistantCopy")
-        }, object: nil)
-        guard XCTWaiter.wait(for: [selected], timeout: 8) == .completed else {
+        }
+        if !hasSelection() {
+            // Command-A can be routed outside a presented editor. Select through UIKit's edit
+            // menu instead; never delete/reinsert text to manufacture a selection or test it.
+            try focusField(field)
+            func selectAll() -> XCUIElement? {
+                for kind in [XCUIElement.ElementType.menuItem, .button] {
+                    let action = app.descendants(matching: kind).matching(NSPredicate(
+                        format: "label ==[c] 'Select All' AND NOT (identifier BEGINSWITH 'cmd.')")).firstMatch
+                    if hasVisibleFrame(action), action.isEnabled, action.isHittable { return action }
+                }
+                return nil
+            }
+            func waitForSelectAll() -> XCUIElement? {
+                if let action = selectAll() { return action }
+                var action: XCUIElement?
+                let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    action = selectAll(); return action != nil
+                }, object: nil)
+                _ = XCTWaiter.wait(for: [ready], timeout: 2)
+                return action
+            }
+            field.doubleTap()
+            var action = waitForSelectAll()
+            if action == nil {
+                // Collapse the word selection before requesting the caret's Select All menu.
+                field.tap()
+                field.press(forDuration: 0.8)
+                action = waitForSelectAll()
+            }
+            guard let action else {
+                throw Failure.message("Native edit menu must offer Select All after lost Command-A\n\(app.debugDescription)")
+            }
+            action.tap()
+        }
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in hasSelection() }, object: nil)
+        guard hasSelection() || XCTWaiter.wait(for: [selected], timeout: 8) == .completed else {
             throw Failure.message("Native selection must enable Cut and Copy without changing text\n\(app.debugDescription)")
         }
         try waitForNativeText(in: field, equals: fullText)
