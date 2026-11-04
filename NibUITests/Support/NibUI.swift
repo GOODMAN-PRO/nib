@@ -701,16 +701,19 @@ final class NibUI {
     }
 
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
-    func isKeyboardFocused(_ field: XCUIElement) -> Bool {
+    func isKeyboardFocused(_ field: XCUIElement, allowingAttributeFallback: Bool = false) -> Bool {
         guard field.exists else { return false }
         let identifier = field.identifier, label = field.label
         if !identifier.isEmpty || !label.isEmpty {
             let identity = !identifier.isEmpty ? NSPredicate(format: "identifier == %@", identifier)
                 : NSPredicate(format: "label == %@", label)
             // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
-            let focused = app.descendants(matching: .any).matching(identity)
+            let focused = app.descendants(matching: field.elementType).matching(identity)
                 .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            return focused.exists && focused.elementType == field.elementType && focused.frame == field.frame
+            if focused.exists && focused.frame == field.frame { return true }
+            // GIPHY and LaTeX expose focus in Attributes but not the predicate on this OS.
+            // Only explicit native-editor callers opt in; ordinary discovery stays cheap.
+            if !allowingAttributeFallback { return false }
         }
         // debugDescription includes the whole application tree after the Attributes line.
         // A different focused field (Duration) must not qualify this field (Timer name).
@@ -769,10 +772,15 @@ final class NibUI {
     func focusField(_ field: XCUIElement) throws {
         if isKeyboardFocused(field) { return }
         revealFormElement(field)
-        guard hasVisibleFrame(field) && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
+        guard hasVisibleFrame(field) && field.isHittable else {
+            // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
+            if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
+            throw Failure.message("Native field cannot receive focus: \(field)")
+        }
         field.tap()
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
-        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
+        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
+                || isKeyboardFocused(field, allowingAttributeFallback: true) else {
             throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
         }
     }
@@ -844,11 +852,46 @@ final class NibUI {
             }
             return false
         }
-        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            isKeyboardFocused(field) && field.value as? String == fullText
+        func hasSelection() -> Bool {
+            isKeyboardFocused(field, allowingAttributeFallback: true) && field.value as? String == fullText
                 && available("Cut", assistant: "assistantCut") && available("Copy", assistant: "assistantCopy")
-        }, object: nil)
-        guard XCTWaiter.wait(for: [selected], timeout: 8) == .completed else {
+        }
+        if !hasSelection() {
+            // Command-A can be routed outside a presented editor. Select through UIKit's edit
+            // menu instead; never delete/reinsert text to manufacture a selection or test it.
+            try focusField(field)
+            func selectAll() -> XCUIElement? {
+                for kind in [XCUIElement.ElementType.menuItem, .button] {
+                    let action = app.descendants(matching: kind).matching(NSPredicate(
+                        format: "label ==[c] 'Select All' AND NOT (identifier BEGINSWITH 'cmd.')")).firstMatch
+                    if hasVisibleFrame(action), action.isEnabled, action.isHittable { return action }
+                }
+                return nil
+            }
+            func waitForSelectAll() -> XCUIElement? {
+                if let action = selectAll() { return action }
+                var action: XCUIElement?
+                let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    action = selectAll(); return action != nil
+                }, object: nil)
+                _ = XCTWaiter.wait(for: [ready], timeout: 2)
+                return action
+            }
+            field.doubleTap()
+            var action = waitForSelectAll()
+            if action == nil {
+                // Collapse the word selection before requesting the caret's Select All menu.
+                field.tap()
+                field.press(forDuration: 0.8)
+                action = waitForSelectAll()
+            }
+            guard let action else {
+                throw Failure.message("Native edit menu must offer Select All after lost Command-A\n\(app.debugDescription)")
+            }
+            action.tap()
+        }
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in hasSelection() }, object: nil)
+        guard hasSelection() || XCTWaiter.wait(for: [selected], timeout: 8) == .completed else {
             throw Failure.message("Native selection must enable Cut and Copy without changing text\n\(app.debugDescription)")
         }
         try waitForNativeText(in: field, equals: fullText)
@@ -1004,13 +1047,14 @@ final class NibUI {
         }
     }
 
-    /// Captures the current screen, probe and AX tree at a named transition; no command or document mutation is injected.
-    func recordDiagnostics(_ name: String, facts: String = "") {
+    /// Captures screen/probe/facts; routine checkpoints can omit the expensive full AX tree.
+    func recordDiagnostics(_ name: String, facts: String = "", includeHierarchy: Bool = true) {
         XCTContext.runActivity(named: name) { activity in
             let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             screen.name = name + "-screen"; screen.lifetime = .keepAlways; activity.add(screen)
+            let hierarchy = includeHierarchy ? "\n" + app.debugDescription : ""
             let tree = XCTAttachment(string: "uptime=\(ProcessInfo.processInfo.systemUptime)\n\(facts)\n"
-                + "probe=\(probe.value ?? "missing")\n\(app.debugDescription)")
+                + "probe=\(probe.value ?? "missing")\(hierarchy)")
             tree.name = name + "-state-and-tree"; tree.lifetime = .keepAlways; activity.add(tree)
         }
     }
