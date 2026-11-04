@@ -108,9 +108,7 @@ final class NibUI {
         }
         let usesInlineEditor = inline.isHittable
         let field = usesInlineEditor ? inline : alertField
-        field.tap()
-        field.typeKey("a", modifierFlags: .command)
-        field.typeText(title)
+        try replaceNativeText(in: field, with: title)
         if usesInlineEditor {
             field.typeText("\n")
         } else {
@@ -412,6 +410,58 @@ final class NibUI {
     func matchesState(_ predicate: (QAState) -> Bool) -> Bool {
         guard let current = try? readState() else { return false }
         return predicate(current)
+    }
+
+    /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
+    func isKeyboardFocused(_ field: XCUIElement) -> Bool {
+        field.exists && field.debugDescription.contains("Keyboard Focused")
+    }
+
+    /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
+    func focusField(_ field: XCUIElement) throws {
+        if isKeyboardFocused(field) { return }
+        revealFormElement(field)
+        guard field.exists && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
+        field.tap()
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
+        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
+            throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
+        }
+    }
+
+    /// Delivers modifiers while preserving native focus; callers verify the relevant text or formatting result.
+    func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
+        try focusField(field)
+        XCUIElement.perform(withKeyModifiers: modifiers) { field.typeKey(key, modifierFlags: modifiers) }
+    }
+
+    /// Waits for exact replacement, including empty fields, so a lost Select All cannot silently append text.
+    func replaceNativeText(in field: XCUIElement, with text: String) throws {
+        try nativeKey("a", in: field)
+        field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        try waitForNativeText(in: field, equals: text)
+    }
+
+    /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
+    func waitForNativeText(in field: XCUIElement, equals text: String) throws {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            guard let value = field.value as? String else { return false }
+            return value == text || (text.isEmpty && value == field.placeholderValue)
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            throw Failure.message("Native replacement mismatch: expected \(text.debugDescription), got \(String(describing: field.value))")
+        }
+    }
+
+    /// Proves a native selection by replacing it with a unique marker and observing the exact full value.
+    /// Native Undo restores the original text and selected range before formatting; rich-text assertions still verify the result.
+    func verifyNativeSelection(in field: XCUIElement, fullText: String, range: NSRange) throws {
+        let marker = "QA-" + UUID().uuidString
+        let expected = (fullText as NSString).replacingCharacters(in: range, with: marker)
+        field.typeText(marker)
+        try waitForNativeText(in: field, equals: expected)
+        try nativeKey("z", in: field)
+        try waitForNativeText(in: field, equals: fullText)
     }
 
     private func readState() throws -> QAState? {

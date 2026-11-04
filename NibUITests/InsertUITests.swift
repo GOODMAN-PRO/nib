@@ -115,29 +115,48 @@ final class InsertUITests: XCTestCase {
     }
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
     private func visible(_ name: String) -> Bool { query(name).allElementsBoundByIndex.contains { $0.isHittable } }
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) { ui.app.typeKey(value, modifierFlags: modifiers) }
+    /// Preserves focus for native editing only; global commands use NibUI.chord at their call sites.
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) throws {
+        let field = try focusedField()
+        let fullText = field.value as? String ?? ""
+        try ui.nativeKey(value, modifiers, in: field)
+        if value == "a" && modifiers == .command && !fullText.isEmpty && fullText != field.placeholderValue {
+            try ui.verifyNativeSelection(in: field, fullText: fullText, range: NSRange(location: 0, length: (fullText as NSString).length))
+        }
+    }
+    /// Resolves the current native input immediately before key delivery, avoiding stale retained editors.
+    private func focusedField() throws -> XCUIElement {
+        for type in [XCUIElement.ElementType.textView, .textField, .searchField, .secureTextField] {
+            let query = ui.app.descendants(matching: type)
+            for field in query.allElementsBoundByIndex where ui.isKeyboardFocused(field) {
+                return query.matching(NSPredicate(format: "identifier == %@ AND label == %@", field.identifier, field.label)).firstMatch
+            }
+        }
+        throw NibUI.Failure.message("No keyboard-focused native input")
+    }
     private func outside() { ui.coordinate(CGPoint(x: 0.93, y: 0.83)).tap() }
     private func finish() throws {
         if visible("Finish Editing") { try tap("Finish Editing") }
         else if visible("Done typing") { try tap("Done typing") }
-        else { key(XCUIKeyboardKey.escape.rawValue, []); outside() }
+        else { try key(XCUIKeyboardKey.escape.rawValue, []); outside() }
         try wait("Text input must finish") { !self.ui.app.textViews.allElementsBoundByIndex.contains { $0.isHittable } }
     }
-    private func replace(_ field: XCUIElement, with text: String) {
-        field.tap(); key("a"); field.typeText(text)
+    private func replace(_ field: XCUIElement, with text: String) throws {
+        try ui.replaceNativeText(in: field, with: text)
     }
     private func pasteText(into field: XCUIElement) throws -> String {
         // Observe Copy through the user's Paste action. Reading UIPasteboard.string
         // in the background runner can block indefinitely on cross-app authorization.
-        field.tap(); key("v")
-        try wait("Paste must insert the copied text") {
+        let before = field.value as? String
+        try ui.nativeKey("v", in: field)
+        try ui.waitForPaste {
             guard let text = field.value as? String else { return false }
-            return !text.isEmpty && text != field.placeholderValue
+            return !text.isEmpty && text != field.placeholderValue && text != before
         }
         return try XCTUnwrap(field.value as? String)
     }
-    private func clearText(_ field: XCUIElement) {
-        field.tap(); key("a"); key(XCUIKeyboardKey.delete.rawValue, [])
+    private func clearText(_ field: XCUIElement) throws {
+        try ui.replaceNativeText(in: field, with: "")
     }
     private func toggle(_ name: String, to value: Bool) throws {
         let element = try control(name, .switch, scroll: true)
@@ -161,8 +180,8 @@ final class InsertUITests: XCTestCase {
     private func documentMenu(_ name: String) throws { try tap("menu.more"); try tap(name) }
     private func goToSecondPage() throws {
         let original = try ui.state().page
-        key("g", [.command, .option])
-        replace(try control("Page number or title"), with: "2"); try tap("Go")
+        try key("g", [.command, .option])
+        try replace(try control("Page number or title"), with: "2"); try tap("Go")
         _ = try ui.waitForState(timeout: 10) { $0.page != original && !$0.openPanels.contains("pages.goToPage") }
     }
     private func panel(_ name: String) throws {
@@ -192,7 +211,7 @@ final class InsertUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
     }
     private func all() throws {
-        try ui.selectTool("lasso"); key("a")
+        try ui.selectTool("lasso"); try key("a")
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == $0.itemCountOnPage }
     }
     private func fragment() throws -> JSON {
@@ -294,7 +313,7 @@ final class InsertUITests: XCTestCase {
         try beginText("Velocity = distance / time"); try finish(); try counts(5, strokes: 1)
         try undo(4, redo: 5)
         try selectAt(); ui.doubleTap(at: point)
-        replace(try control("Text box", .textView), with: "Acceleration = change in velocity")
+        try replace(try control("Text box", .textView), with: "Acceleration = change in velocity")
         try finish()
         XCTAssertEqual(try plain(snapshot("text")), "Acceleration = change in velocity")
         try ui.tapCommand("edit.undo")
@@ -302,7 +321,8 @@ final class InsertUITests: XCTestCase {
     }
     func testTextSelectedRangeFontEmphasisColourAndHighlight() throws {
         try beginText("plain styled")
-        key(XCUIKeyboardKey.leftArrow.rawValue, [.alternate, .shift])
+        try key(XCUIKeyboardKey.leftArrow.rawValue, [.alternate, .shift])
+        try ui.verifyNativeSelection(in: focusedField(), fullText: "plain styled", range: NSRange(location: 6, length: 6))
         for title in ["Bold", "Italic", "Underline", "Strikethrough"] { try tap(title) }
         try tap("Font"); try tap("Georgia")
         let previousSize = try control("Larger Text").value as? String
@@ -327,7 +347,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertNotNil(styled["highlight"]); XCTAssertNotNil(styled["color"])
     }
     func testParagraphAlignmentListsIndentAndSpacing() throws {
-        try beginText("first\nsecond"); key("a")
+        try beginText("first\nsecond"); try key("a")
         try tap("Alignment"); try tap("Centre")
         try tap("Line Spacing"); try tap("1.5")
         for kind in ["Bullets", "Numbered (1.)", "Checklist", "Numbered (1))"] {
@@ -347,9 +367,9 @@ final class InsertUITests: XCTestCase {
     func testAutomaticListsContinueNestOutdentAndExit() throws {
         // F026 consumes the typed list marker when it creates the bullet paragraph.
         try beginText("- first\n", visibleText: "first")
-        key(XCUIKeyboardKey.tab.rawValue, [])
+        try key(XCUIKeyboardKey.tab.rawValue, [])
         try control("Text box", .textView).typeText("nested\n")
-        key(XCUIKeyboardKey.tab.rawValue, .shift)
+        try key(XCUIKeyboardKey.tab.rawValue, .shift)
         try control("Text box", .textView).typeText("last\n\nplain")
         try finish()
         let ps = try paragraphs(snapshot("text"))
@@ -373,7 +393,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((style["borderWidth"] as? Double) ?? 0, 0)
         let originalHeight = try XCTUnwrap((box["frame"] as? JSON)?["h"] as? Double)
         try selectAt(); ui.doubleTap(at: point)
-        replace(try control("Text box", .textView), with: (1...10).map { "Line \($0)" }.joined(separator: "\n"))
+        try replace(try control("Text box", .textView), with: (1...10).map { "Line \($0)" }.joined(separator: "\n"))
         try finish()
         XCTAssertEqual(try XCTUnwrap((snapshot("text")["frame"] as? JSON)?["h"] as? Double), originalHeight, accuracy: 0.1,
                        "Fixed-height text must clip rather than silently resize its frame")
@@ -383,8 +403,8 @@ final class InsertUITests: XCTestCase {
                              "Auto-size must grow the frame to fit retained text")
     }
     func testNamedStyleAndDefaultAffectNewText() throws {
-        try beginText("First"); key("a"); try tap("Larger Text"); try tap("More Formatting")
-        try tap("Save Style…"); replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
+        try beginText("First"); try key("a"); try tap("Larger Text"); try tap("More Formatting")
+        try tap("Save Style…"); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
         try tap("Lab Caption"); try tap("Set as Default for New Text"); outside(); try finish()
         let first = try snapshot("text")
         outside(); try ui.selectTool("text"); ui.coordinate(CGPoint(x: 0.58, y: 0.82)).tap()
@@ -406,7 +426,7 @@ final class InsertUITests: XCTestCase {
         try beginText("Preset")
         var sizes = Set<String>()
         for title in ["Title", "Heading", "Body", "Caption"] {
-            key("a"); try tap("Text Style"); try tap(title)
+            try key("a"); try tap("Text Style"); try tap(title)
             sizes.insert(try control("Larger Text").value as? String ?? "missing")
         }
         XCTAssertEqual(sizes.count, 4, "Each preset must apply distinct typography")
@@ -437,7 +457,10 @@ final class InsertUITests: XCTestCase {
         let data = try rich.data(from: NSRange(location: 0, length: rich.length),
                                  documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd])
         UIPasteboard.general.setData(data, forPasteboardType: UTType.flatRTFD.identifier)
-        key("v"); try finish(); try counts(5, strokes: 1)
+        let editor = try focusedField()
+        try ui.nativeKey("v", in: editor)
+        try ui.waitForPaste { (editor.value as? String)?.contains("\u{FFFC}") == true }
+        try finish(); try counts(5, strokes: 1)
         let box = try snapshot("text")
         XCTAssertTrue(json(try paragraphs(box)).contains("attachment"), "Native inline sticker must persist as an attachment")
         XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty, "Copy must carry the retained sticker bytes")
@@ -466,7 +489,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((frame["x"] as? Double) ?? 0, 0)
         XCTAssertGreaterThan((frame["y"] as? Double) ?? 0, 0)
         XCTAssertLessThan((frame["w"] as? Double) ?? 595, 595)
-        outside(); key("t", [.command, .alternate])
+        outside(); try key("t", [.command, .alternate])
         let reopened = try control("Page text", .textView)
         XCTAssertTrue((reopened.value as? String)?.contains("Full page report") == true)
         try tap("Text Style"); try tap("Caption"); try finish(); try counts(5)
@@ -618,14 +641,14 @@ final class InsertUITests: XCTestCase {
         let state = try ui.state()
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
-        key(","); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
+        try key(","); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
         try tap("Preset"); try tap("Custom OpenAI-compatible")
         for (label, value) in [("Name", "Insert fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
                                ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")] {
-            replace(try control(label, .textField, scroll: true), with: value)
+            try replace(try control(label, .textField, scroll: true), with: value)
         }
-        key("s"); XCTAssertTrue(query("Provider saved.").firstMatch.waitForExistence(timeout: 10))
+        try key("s"); XCTAssertTrue(query("Provider saved.").firstMatch.waitForExistence(timeout: 10))
         try ui.dismissSheets()
     }
     func testNativeDiagramActionCreatesEditableNodesAndGroupedUndo() throws {
@@ -757,7 +780,7 @@ final class InsertUITests: XCTestCase {
         let field = alert.textFields.matching(NSPredicate(
             format: "identifier == %@ OR label == %@", fieldName, fieldName)).firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 3))
-        field.tap(); field.typeKey("a", modifierFlags: .command); field.typeText(text)
+        try ui.replaceNativeText(in: field, with: text)
         let button = alert.buttons[action]
         XCTAssertTrue(button.waitForExistence(timeout: 3))
         button.tap()
@@ -769,9 +792,9 @@ final class InsertUITests: XCTestCase {
     func testElementsSearchMatchingEmptyAndInsertThumbnail() throws {
         try elements()
         let search = try control("Search elements", .textField)
-        replace(search, with: "unmatchablezzzz")
+        try replace(search, with: "unmatchablezzzz")
         XCTAssertTrue(ui.app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'No results for'")).firstMatch.waitForExistence(timeout: 8))
-        replace(search, with: "Heart")
+        try replace(search, with: "Heart")
         try tap("Heart"); try counts(5)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
         XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
@@ -831,7 +854,7 @@ final class InsertUITests: XCTestCase {
         provider = try InsertProviderFixture(page: "", media: gifData())
         try wait("GIF HTTP fixture must start") { self.provider?.port != nil }
         try elements(); try tap("GIFs"); try tap("Add GIF from a Link")
-        replace(try control("https://", .textField), with: "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/test.gif")
+        try replace(try control("https://", .textField), with: "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/test.gif")
         try tap("Add GIF"); try counts(5)
         try all(); XCTAssertEqual(try item("image")["animated"] as? Bool, true)
         XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
@@ -854,7 +877,7 @@ final class InsertUITests: XCTestCase {
     }
     func testGIFLocalInvalidLinkReportsErrorAndFilesCancelInsertsNothing() throws {
         try elements(); try tap("GIFs"); try tap("Add GIF from a Link")
-        replace(try control("https://", .textField), with: "not a URL"); try tap("Add GIF")
+        try replace(try control("https://", .textField), with: "not a URL"); try tap("Add GIF")
         let errors = ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'URL' OR label CONTAINS[c] 'address' OR label CONTAINS[c] 'invalid'"))
         XCTAssertTrue(errors.firstMatch.waitForExistence(timeout: 10), "Invalid GIF link must give an actionable error")
         if visible("Cancel") { try tap("Cancel") }
@@ -872,7 +895,7 @@ final class InsertUITests: XCTestCase {
         search.tap(); search.typeText("physics\n")
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
-        outside(); key(","); try tap("Elements and GIFs", scroll: true); try tap("Remove Key")
+        outside(); try key(","); try tap("Elements and GIFs", scroll: true); try tap("Remove Key")
         XCTAssertTrue(query("Paste your GIPHY API key").firstMatch.waitForExistence(timeout: 8))
     }
 
@@ -882,7 +905,7 @@ final class InsertUITests: XCTestCase {
         try ui.selectTool("sticky"); try tap("tool.sticky")
         // DESIGN.md keeps the native keyboard: taps at the canvas's lower coordinates
         // hit its keys until input is submitted, rather than dismissing the popover.
-        replace(try control("Author name on new notes", .textField, scroll: true), with: "UI Author\n")
+        try replace(try control("Author name on new notes", .textField, scroll: true), with: "UI Author\n")
         try wait("Submitting the author name must dismiss the keyboard") { !self.ui.app.keyboards.firstMatch.isHittable }
         outside(); ui.coordinate(point).tap()
         let editor = try control("Sticky note", .textView)
@@ -1003,9 +1026,9 @@ final class InsertUITests: XCTestCase {
 
     // MARK: link.set/remove/autodetect/follow/back, clipboard.copyText
 
-    private func linkText() throws { try beginText("Visit lab"); key("a"); key("k") }
+    private func linkText() throws { try beginText("Visit lab"); try key("a"); try key("k") }
     func testURLLinkSaveRemoveKeepsText() throws {
-        try linkText(); replace(try control("Website address", .textField), with: "https://example.com/lab")
+        try linkText(); try replace(try control("Website address", .textField), with: "https://example.com/lab")
         try tap("Add Link"); try finish()
         let linked = try snapshot("text")
         XCTAssertTrue(json(linked).contains("https://example.com/lab"))
@@ -1032,9 +1055,9 @@ final class InsertUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page && $0.document == original.document }
     }
     func testCopyTextUsesActualSelectedText() throws {
-        try beginText("Copied rich text"); key("a"); key("c")
+        try beginText("Copied rich text"); try key("a"); try key("c")
         let editor = try control("Text box", .textView)
-        clearText(editor)
+        try clearText(editor)
         XCTAssertEqual(try pasteText(into: editor), "Copied rich text", "Copy and Paste must retain the actual selected text")
         try finish(); try counts(5, strokes: 1)
     }
@@ -1063,7 +1086,7 @@ final class InsertUITests: XCTestCase {
         posted.press(forDuration: 0.8); try tap("Copy Text")
         let composer = try control("Reply")
         XCTAssertEqual(try pasteText(into: composer), "Use metres per second", "Comment Copy Text returns the chosen reply")
-        clearText(composer)
+        try clearText(composer)
         try counts(5)
     }
     func testObjectCommentAnchorsSelectedShapeAndCopiesDeepLink() throws {
@@ -1081,15 +1104,15 @@ final class InsertUITests: XCTestCase {
         let link = try pasteText(into: composer)
         XCTAssertTrue(link.hasPrefix("nib:") && link.contains(state.document ?? "missing"),
                       "Copied comment link must identify the current document and comment")
-        clearText(composer)
+        try clearText(composer)
         XCTAssertTrue(try message("Shape annotation").exists)
     }
     func testCommentEditCancelSaveAndDeleteFinalMessageRemovesAnchor() throws {
         try comment(); try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
-        replace(try control("Message"), with: "Cancelled edit"); try tap("Cancel")
+        try replace(try control("Message"), with: "Cancelled edit"); try tap("Cancel")
         XCTAssertTrue(try message("Check the units").exists)
         try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
-        replace(try control("Message"), with: "Confirmed edit"); try tap("Save")
+        try replace(try control("Message"), with: "Confirmed edit"); try tap("Save")
         try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Cancel")
         XCTAssertTrue(try message("Confirmed edit").exists)
         try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Delete Thread")
@@ -1237,7 +1260,7 @@ final class InsertUITests: XCTestCase {
     }
     func testAudioRenameExportDeleteCancelAndConfirm() throws {
         try recordClip(); try clipRow().press(forDuration: 0.8); try tap("Rename")
-        replace(try control("Name", .textField), with: "Motion lecture"); try tap("Rename")
+        try replace(try control("Name", .textField), with: "Motion lecture"); try tap("Rename")
         let row = try control("Motion lecture")
         let duration = row.value as? String
         row.press(forDuration: 0.8); try tap("Share Audio File")
@@ -1294,7 +1317,7 @@ final class InsertUITests: XCTestCase {
 
     private func transcript() throws {
         try configureProvider()
-        key(","); try tap("Recording Settings", scroll: true); try toggle("Cloud transcription", to: true)
+        try key(","); try tap("Recording Settings", scroll: true); try toggle("Cloud transcription", to: true)
         try ui.dismissSheets()
         try recordClip(); try documentMenu("Transcript")
         _ = try ui.waitForState(timeout: 8) { $0.openPanels.contains("transcription") }
@@ -1304,7 +1327,7 @@ final class InsertUITests: XCTestCase {
         let search = try control("Search transcript", .textField)
         search.tap(); search.typeText("nonmatching phrase")
         XCTAssertTrue(query("No matching lines").firstMatch.waitForExistence(timeout: 8))
-        replace(search, with: ""); key(XCUIKeyboardKey.delete.rawValue, [])
+        try replace(search, with: ""); try key(XCUIKeyboardKey.delete.rawValue, [])
         try tap("Regenerate Transcript", scroll: true)
         if visible("Replace Transcript") { try tap("Replace Transcript") }
         try wait("Regeneration must finish with transcript or useful error", timeout: 30) {
@@ -1324,16 +1347,16 @@ final class InsertUITests: XCTestCase {
         timestamp.tap(); XCTAssertTrue(query("Playback position").firstMatch.waitForExistence(timeout: 8))
         _ = try ui.waitForState(timeout: 8) { $0.page == recordedPage }
         timestamp.press(forDuration: 0.8); try tap("Edit")
-        replace(try control("Transcript text"), with: "Cancelled correction"); try tap("Cancel")
+        try replace(try control("Transcript text"), with: "Cancelled correction"); try tap("Cancel")
         XCTAssertFalse(query("Cancelled correction").firstMatch.exists)
         timestamp.press(forDuration: 0.8); try tap("Edit")
-        replace(try control("Transcript text"), with: "Corrected motion lecture"); try tap("Save")
+        try replace(try control("Transcript text"), with: "Corrected motion lecture"); try tap("Save")
         let line = try control("Corrected motion lecture")
         XCTAssertTrue(query("Measure distance and time.").firstMatch.exists, "Correcting one segment must retain the other segment")
         line.press(forDuration: 0.8); try tap("Copy")
         let search = try control("Search transcript", .textField)
         XCTAssertEqual(try pasteText(into: search), "Corrected motion lecture", "Transcript Copy preserves corrected text")
-        clearText(search)
+        try clearText(search)
         let count = try ui.state().itemCountOnPage
         line.press(forDuration: 0.8); try tap("Insert on Page"); try counts(count + 1)
         XCTAssertTrue(query("Corrected motion lecture").firstMatch.exists, "Inserting text must retain source transcript")

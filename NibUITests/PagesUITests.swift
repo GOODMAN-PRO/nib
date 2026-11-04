@@ -655,7 +655,7 @@ final class PagesUITests: XCTestCase {
         try wait("Live persisted page count must equal \(count)") { (try? self.live().count) == count }
     }
     private func replace(_ field: XCUIElement, _ text: String) throws {
-        try require(field).tap(); field.typeKey("a", modifierFlags: .command); field.typeText(text)
+        try ui.replaceNativeText(in: require(field), with: text)
         if !ui.app.alerts.firstMatch.exists, ui.app.keyboards.firstMatch.exists {
             let hide = ui.app.keyboards.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
             if hide.exists { hide.tap() } else { ui.app.keyboards.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.94)).tap() }

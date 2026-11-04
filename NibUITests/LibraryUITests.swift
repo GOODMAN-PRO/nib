@@ -170,15 +170,9 @@ final class LibraryUITests: XCTestCase {
         ui.revealFormElement(element)
     }
 
+    /// Verifies exact field replacement before submitting a native form.
     private func replace(_ field: XCUIElement, with text: String) throws {
-        revealFormElement(field)
-        try visible(field, "Editable text field missing")
-        field.tap()
-        let value = field.value as? String ?? ""
-        if !value.isEmpty && value != field.placeholderValue {
-            field.typeKey("a", modifierFlags: .command)
-        }
-        field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        try ui.replaceNativeText(in: field, with: text)
     }
 
     private func createFolder(_ title: String) throws {
