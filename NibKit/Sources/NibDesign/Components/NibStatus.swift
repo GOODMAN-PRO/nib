@@ -312,7 +312,7 @@ public struct NibDropletButton: View {
         self.title = title
         self.detail = detail
         self.symbol = symbol
-        self.label = detail.map { String(localized: "\(title), \($0)", bundle: .module) } ?? title
+        self.label = detail.map { String(localized: "status.label.titleDetail", defaultValue: "\(title), \($0)", bundle: .module) } ?? title
         self.kind = kind
         self.shortcut = shortcut
         self.action = action

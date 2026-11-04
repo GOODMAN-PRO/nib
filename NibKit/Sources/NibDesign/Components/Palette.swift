@@ -107,7 +107,7 @@ public struct NibPenSwatch: View {
 
     private var accessibilityName: String {
         guard let patternName = pattern?.name else { return swatch.name }
-        return String(localized: "\(swatch.name), \(patternName)", bundle: .module)
+        return String(localized: "palette.swatch.namePattern", defaultValue: "\(swatch.name), \(patternName)", bundle: .module)
     }
 
     public var body: some View {
@@ -206,7 +206,7 @@ public struct NibToolButton: View {
         .nibShortcut(tool.registeredShortcut)
         .nibShortcutHint(tool.hintOnlyShortcut)
         .nibTooltip(tool.label)
-        .accessibilityLabel(tool.isPlugin ? String(localized: "\(tool.label), plugin", bundle: .module) : tool.label)
+        .accessibilityLabel(tool.isPlugin ? String(localized: "palette.tool.pluginLabel", defaultValue: "\(tool.label), plugin", bundle: .module) : tool.label)
         .accessibilityIdentifier(tool.accessibilityID)
         .accessibilityValue(tool.value ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])

@@ -292,7 +292,7 @@ struct GalleryTokens: View {
     }
 
     @ViewBuilder private var typeAndGlyphs: some View {
-        GallerySection(String(localized: "Type", bundle: .module)) {
+        GallerySection(String(localized: "gallery.section.type", defaultValue: "Type", bundle: .module)) {
             ForEach(Self.fonts.indices, id: \.self) { i in
                 let name = Self.fonts[i].0, font = Self.fonts[i].1
                 HStack(alignment: .firstTextBaseline) {
