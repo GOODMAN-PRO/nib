@@ -9405,9 +9405,9 @@ extension NibUIFont {   // every §4.1 role for UIKit except math; all scale wit
 
 Resolves F037, F039, F046, F047 (UIKit roles built with `NibUIFont.font(…)` by hand) and F102/F103 (text-document body and headings). Replaces `NibUIFont.font(.body, design: .serif)` and the serif `title1/2/3` headings in FeatTextDoc (F047), `font(.footnote, weight: .bold, design: .rounded)` for comment pins (F037), `font(.caption2, weight: .medium)` in FeatRuler (F039), `font(.body/.footnote, weight: .semibold)` in FeatOutline (F046).
 
-**`NibSpacing.swift`** (DESIGN.md §5, §5.1, §5.2, §6):
-
 `NibPrint` supplies paper tokens for print renderers and PDF export: `margin: CGFloat = 54` pt on every side, `typeScale: CGFloat = 0.7` relative to screen roles at Large Dynamic Type, and `footerHeight: CGFloat = 32` pt for page numbers. F103's `TextDocPrintMetrics` reads these shared values (contracts-v2.5).
+
+**`NibSpacing.swift`** (DESIGN.md §5, §5.1, §5.2, §6):
 
 ```swift
 extension NibRadius { static let ruler: CGFloat /* 6 */; static let pageWash: CGFloat /* 4 */ }
