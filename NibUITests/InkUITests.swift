@@ -335,9 +335,10 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    /// Captures the app in app-local coordinates so floating-window origins never rescale a full-screen image.
     private func raster(_ region: CGRect? = nil) throws -> Raster {
         let r = region ?? inkRegion, f = ui.canvas.frame
-        return try Raster(XCUIScreen.main.screenshot(), screenSize: ui.app.frame.size, rect: CGRect(x: f.minX + r.minX * f.width, y: f.minY + r.minY * f.height,
+        return try Raster(ui.app.screenshot(), screenSize: ui.app.frame.size, rect: CGRect(x: f.minX - ui.app.frame.minX + r.minX * f.width, y: f.minY - ui.app.frame.minY + r.minY * f.height,
                                                            width: r.width * f.width, height: r.height * f.height))
     }
 
@@ -460,10 +461,14 @@ final class InkUITests: XCTestCase {
             for value: CGFloat in [0.01, 0.99] {
                 try settings(tool); _ = try slider("Stabilisation", to: value); closePopover()
                 let before = try ui.state(), blank = try raster()
+                let endpoints = [zigzag.first!, zigzag.last!].map {
+                    CGRect(x: $0.x - 0.01, y: $0.y - 0.01, width: 0.02, height: 0.02)
+                }
+                let emptyEndpoints = try endpoints.map { try raster($0) }
                 try draw(zigzag); images.append(try visibleInk(after: blank))
-                for p in [zigzag.first!, zigzag.last!] {
-                    let endpoint = CGRect(x: p.x - 0.01, y: p.y - 0.01, width: 0.02, height: 0.02)
-                    XCTAssertGreaterThan(try raster(endpoint).darkPixels, 0, "Stabilisation must retain both endpoints")
+                for (endpoint, empty) in zip(endpoints, emptyEndpoints) {
+                    XCTAssertGreaterThan(try raster(endpoint).changed(from: empty), 0,
+                                         "Stabilisation must retain ink at each endpoint, including pale graphite")
                 }
                 try undo(to: before)
             }
