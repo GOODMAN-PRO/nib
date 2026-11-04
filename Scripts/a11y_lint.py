@@ -108,6 +108,12 @@ def icon_only(toks):
         else:
             outside_images.append(toks[i])
             i += 1
+    # A lowercase identifier that starts a view expression (`row`, `row.padding()`) is a property or parameter view,
+    # which may well carry text: the label is not known to be icon-only.
+    for k, t in enumerate(outside_images):
+        if t.kind == "id" and t.text[:1].islower() and (k == 0 or (outside_images[k - 1].kind == "punct"
+                                                                    and outside_images[k - 1].text in "{};")):
+            return False
     return bool(calls & ICON_VIEWS) and calls <= (ICON_VIEWS | LAYOUT_VIEWS) \
         and not any(t.kind == "str" for t in outside_images)
 
@@ -354,6 +360,8 @@ PROBE_FIXTURES = [
     ('ShareLink(item: url) { Image(nib: .more) }', 1),
     ('Toggle(isOn: $enabled) { Image(nib: .more) }', 1),
     ('Button { } label: { Image(systemName: "plus") }', 1),
+    ('Button(action: toggle) { row.contentShape(Rectangle()) }', 0),
+    ('Button { } label: { Circle().fill(color) }', 1),
     ('Button { } label: { Image("asset") }.accessibilityHidden(false)', 1),
     ('Button { } label: { Image("asset").accessibilityHidden(false) }', 1),
     ('Button { } label: { Image("asset") }.accessibilityHidden(true)', 0),
