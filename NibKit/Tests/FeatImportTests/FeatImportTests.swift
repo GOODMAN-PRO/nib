@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import UniformTypeIdentifiers
 import NibContracts
 import NibTesting
 @testable import FeatImport
@@ -766,6 +767,12 @@ final class FeatImportTests: XCTestCase {
         await expectError(.unavailable) { _ = try await h.run("import.pick", [:]) }
         await expectError(.invalidParams, path: "$.target") {
             _ = try await h.run("import.pick", ["target": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"])
+        }
+    }
+
+    func testPickerPresentationFailureIsNotUserCancellation() async {
+        await expectError(.unavailable) {
+            _ = try await DocumentPicker.pick(types: [.pdf], navigator: StubNavigator())
         }
     }
 

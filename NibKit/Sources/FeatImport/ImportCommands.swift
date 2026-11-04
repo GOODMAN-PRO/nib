@@ -687,6 +687,7 @@ enum ImportEngine {
             do {
                 staged.append(try await staging.stage(s, index: i, ctx: ctx))
             } catch {
+                importLog.error("Import staging failed: \(String(describing: error), privacy: .public)")
                 failures.append(failure(s.original, error))
             }
         }
@@ -743,6 +744,7 @@ enum ImportEngine {
                     }
                 }
             } catch {
+                importLog.error("Importer failed: \(String(describing: error), privacy: .public)")
                 for f in files { failures.append(failure(f.source.original, error)) }
             }
             done += files.count
@@ -890,19 +892,28 @@ enum ImportEngine {
     /// Shows what arrived (`ImportReveal.plan`).
     private static func revealResult(_ result: ImportResult, created: [DocumentID], topFolders: [FolderID],
                                      destination: ImportDestination, ctx: CommandContext) async {
-        switch ImportReveal.plan(pages: result.pages ?? [], created: created, topFolders: topFolders,
-                                 destination: destination, openDocument: ctx.activeSession?.document) {
-        case .goToPage(let page)?:
-            _ = try? await ctx.execute(CommandIDs.viewGoToPage, ["page": .string(page)])
-        case .open(let doc, let page)?:
-            var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
-            if let page = page { params["page"] = .string(page) }
-            _ = try? await ctx.execute(CommandIDs.docOpen, .object(params))
-        case .showFolder(let folder)?:
-            let ref = folder.map { NodeRef.folder($0).description } ?? NodeRef.library.description
-            _ = try? await ctx.execute(CommandIDs.windowShowLibrary, ["folder": .string(ref)])
-        case nil:
-            break
+        do {
+            switch ImportReveal.plan(pages: result.pages ?? [], created: created, topFolders: topFolders,
+                                     destination: destination, openDocument: ctx.activeSession?.document) {
+            case .goToPage(let page)?:
+                _ = try await ctx.execute(CommandIDs.viewGoToPage, ["page": .string(page)])
+            case .open(let doc, let page)?:
+                var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
+                if let page = page { params["page"] = .string(page) }
+                _ = try await ctx.execute(CommandIDs.docOpen, .object(params))
+            case .showFolder(let folder)?:
+                let ref = folder.map { NodeRef.folder($0).description } ?? NodeRef.library.description
+                _ = try await ctx.execute(CommandIDs.windowShowLibrary, ["folder": .string(ref)])
+            case nil:
+                break
+            }
+        } catch {
+            importLog.error("Import reveal failed: \(String(describing: error), privacy: .public)")
+            // The document already exists. Do not report the whole import as failed or
+            // encourage a duplicate retry; tell the person where to find the result.
+            ImportUI.report(NibError(.unavailable,
+                String(localized: "Files were imported, but couldn't be opened. Open them from the library.")),
+                navigator: ctx.navigator, app: ctx.app)
         }
     }
 
@@ -1021,10 +1032,11 @@ struct ImportPick: NibCommand {
         }
         // Pages go into a notebook, so a notebook target offers only formats that become pages.
         let types = ImportUI.pickerTypes(ctx.content, pagesOnly: preset?.doc != nil)
-        let picked = await DocumentPicker.pick(types: types, navigator: nav)
+        let picked = try await DocumentPicker.pick(types: types, navigator: nav)
         guard !picked.isEmpty else { return .cancelledResult }
         // Picked files stay readable while the import runs (the engine opens them again from their paths).
         let access = picked.map { ($0, $0.startAccessingSecurityScopedResource()) }
+        importLog.info("Import picked files: \(picked.count), security scopes granted: \(access.filter { $0.1 }.count)")
         defer { for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() } }
         var sources = picked.map { ImportSource(original: $0.absoluteString) }
         var destination = preset
