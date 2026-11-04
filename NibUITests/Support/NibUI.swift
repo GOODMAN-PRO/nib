@@ -377,6 +377,43 @@ final class NibUI {
         return try waitForState(timeout: 10) { _ in true }
     }
 
+    /// Waits for this paste's result or the exact native Allow Paste prompt, then for dismissal and completion.
+    /// Only the requesting app and SpringBoard are searched; unrelated authorization dialogs are never accepted.
+    func waitForPaste(timeout: TimeInterval = 15, result: @escaping () -> Bool) throws {
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        func allowButton() -> XCUIElement? {
+            for source in [app, system] {
+                let prompt = source.alerts.containing(.button, identifier: "Allow Paste").firstMatch
+                let button = prompt.buttons["Allow Paste"].firstMatch
+                if button.exists { return button }
+            }
+            return nil
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            allowButton() != nil || result()
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed else {
+            throw Failure.message("Paste produced neither its expected result nor Allow Paste")
+        }
+        if let allow = allowButton() {
+            allow.tap()
+            let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in allowButton() == nil }, object: nil)
+            guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else {
+                throw Failure.message("Allow Paste must dismiss before observing pasted content")
+            }
+        }
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in result() }, object: nil)
+        guard XCTWaiter.wait(for: [completed], timeout: timeout) == .completed else {
+            throw Failure.message("Authorized paste did not produce the expected content\n\(app.debugDescription)")
+        }
+    }
+
+    /// Samples the live probe once, without nesting a state wait inside another expectation.
+    func matchesState(_ predicate: (QAState) -> Bool) -> Bool {
+        guard let current = try? readState() else { return false }
+        return predicate(current)
+    }
+
     private func readState() throws -> QAState? {
         guard probe.exists,
               let state = try NibUITestSnapshot.decode(probe.value, as: QAState.self) else { return nil }

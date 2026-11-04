@@ -607,9 +607,7 @@ final class SelectionUITests: XCTestCase {
         }
         let before = try ui.state()
         try pageMenu(at: point); try tap("Paste")
-        let allow = ui.app.buttons["Allow Paste"]
-        if allow.waitForExistence(timeout: 1) { allow.tap() }
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.selectionCount == 1 }
+        try ui.waitForPaste { self.ui.matchesState { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.selectionCount == 1 } }
         XCTAssertEqual(try ui.state().strokeCountOnPage, before.strokeCountOnPage)
     }
     func testPasteExternalPNGIncreasesItemCountAndUndoRemovesAssetUse() throws {
@@ -623,12 +621,10 @@ final class SelectionUITests: XCTestCase {
     func testPasteRichTextRetainsContentAndMatchStyleUsesDestinationStyle() throws {
         try richText(); let before = try ui.state()
         try pageMenu(at: CGPoint(x: 0.45, y: 0.56)); try tap("Paste")
-        let allow = ui.app.buttons["Allow Paste"]
-        if allow.waitForExistence(timeout: 1) { allow.tap() }
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 }
+        try ui.waitForPaste { self.ui.matchesState { $0.itemCountOnPage == before.itemCountOnPage + 1 } }
         let richBounds = try bounds()
         try clear(); try pageMenu(at: CGPoint(x: 0.45, y: 0.78)); try tap("Paste and Match Style")
-        _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 2 }
+        try ui.waitForPaste { self.ui.matchesState { $0.itemCountOnPage == before.itemCountOnPage + 2 } }
         XCTAssertLessThan(try bounds().height, richBounds.height, "Match Style must replace the external 36-point style with the destination text defaults")
         XCTAssertEqual(ui.app.descendants(matching: .any).matching(NSPredicate(format: "value == 'Selection rich text'")).count, 2)
         try ui.tapCommand("edit.undo"); try undoCounts(before)
