@@ -49,27 +49,30 @@ final class SelectionUITests: XCTestCase {
         }
     }
 
-    /// Waits for a typed action in the active presentation; re-resolves after every menu transition.
+    /// Waits for a typed action or placeholder in the active presentation; re-resolves after every menu transition.
     private func control(_ name: String, type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
         let types: [XCUIElement.ElementType] = type == .any
-            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider] : [type]
+            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider, .image, .staticText, .cell] : [type]
+        func scope() -> XCUIElement {
+            ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
+                : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch
+                : ui.app.sheets.firstMatch.exists ? ui.app.sheets.firstMatch : ui.app
+        }
+        func target(_ kind: XCUIElement.ElementType) -> XCUIElement {
+            scope().descendants(matching: kind).matching(NSPredicate(
+                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+        }
         func candidate() -> XCUIElement? {
-            let scope = ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
-                : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch : ui.app
             for kind in types {
-                let query = scope.descendants(matching: kind).matching(NSPredicate(
-                    format: "identifier == %@ OR label == %@", name, name))
-                let first = query.firstMatch
-                guard first.exists else { continue }
-                // Bind identity before hittability; never probe an Other wrapper or retain a mixed ordinal.
-                let bound = scope.descendants(matching: kind).matching(NSPredicate(
-                    format: "identifier == %@ AND label == %@", first.identifier, first.label)).firstMatch
+                // Bind the requested identity before hittability; never retain a mixed ordinal.
+                let bound = target(kind)
+                guard bound.exists else { continue }
                 if bound.isEnabled && bound.isHittable { return bound }
             }
             return nil
         }
         if scroll {
-            ui.revealFormElement { self.query(name, type: types[0]).firstMatch }
+            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
         }
         try wait("Missing actionable selection control: \(name)") { candidate() != nil }
         return try XCTUnwrap(candidate(), "Selection control changed during discovery: \(name)")
@@ -947,6 +950,8 @@ final class SelectionUITests: XCTestCase {
     }
     func testSelectAllIncludesOnlyActiveLayer() throws {
         try enableLayers()
+        // The QA probe does not expose activeLayer; the selected layer is observable only in the Layers panel.
+        // These canvas-only chords remain indirectly verified by the strict per-layer selection counts below.
         try key("2", [.command, .option]) { try self.draw(); try self.clear(); try self.selectAll(1) }
         try key("1", [.command, .option]) { try self.clear(); try self.selectAll(4) }
     }

@@ -703,7 +703,9 @@ final class LibraryUITests: XCTestCase {
     }
     func testDragDocumentIntoFolderAndToastUndo() throws {
         // Resolve a lazy toast-only query before the six-second lifetime begins.
-        let undo = app.otherElements.containing(.staticText, identifier: "Moved to " + folder).buttons["Undo"].firstMatch
+        let toast = "Moved to " + folder
+        let undo = app.otherElements.containing(NSPredicate(format: "label == %@ OR identifier == %@", toast, toast))
+            .buttons["Undo"].firstMatch
         item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(folder, folder: true).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                    withVelocity: .slow, thenHoldForDuration: 0.6)

@@ -383,9 +383,8 @@ final class NibUI {
         let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         func allowButton() -> XCUIElement? {
             for source in [app, system] {
-                let prompt = source.alerts.containing(.button, identifier: "Allow Paste").firstMatch
-                let button = prompt.buttons["Allow Paste"].firstMatch
-                if button.exists { return button }
+                let button = source.buttons["Allow Paste"].firstMatch
+                if button.exists && button.isHittable { return button }
             }
             return nil
         }
@@ -426,6 +425,10 @@ final class NibUI {
     /// Exports the current share sheet to a uniquely named Files directory and waits for the real PNG bytes on disk.
     /// The runner only reads the export; it never reads a background UIPasteboard or generates an expected image.
     func saveSharedPNG() throws -> Data {
+        var finished = false
+        defer {
+            if !finished { recordDiagnostics("Save to Files PNG export failed") }
+        }
         let action = app.buttons["Save to Files"].firstMatch
         revealFormElement(action)
         guard action.waitForExistence(timeout: 10), action.isHittable else {
@@ -455,6 +458,7 @@ final class NibUI {
         let save = app.buttons["Save"].firstMatch
         guard save.isEnabled && save.isHittable else { throw Failure.message("Files Save unavailable") }
         save.tap()
+        // Unverified until simulator CI: Files labels and runner access to sibling app containers.
         // The native picker saves into the app container. The unique directory prevents stale exports matching.
         let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()
         let destinations = try FileManager.default.contentsOfDirectory(at: containers, includingPropertiesForKeys: nil)
@@ -474,6 +478,7 @@ final class NibUI {
         }
         let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !entered.exists }, object: nil)
         guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else { throw Failure.message("Files must finish exporting") }
+        finished = true
         return bytes
     }
 
@@ -552,7 +557,8 @@ final class NibUI {
     }
 
     /// Proves a native selection by replacing it with a unique marker and observing the exact full value.
-    /// Native Undo restores the original text and selected range before formatting; rich-text assertions still verify the result.
+    /// Unverified until simulator CI: Cmd-Z must reach native Undo and restore text and selection, not document Undo.
+    /// Exact text restoration and the caller's rich-text assertions remain required.
     func verifyNativeSelection(in field: XCUIElement, fullText: String, range: NSRange) throws {
         let marker = "QA-" + UUID().uuidString
         let expected = (fullText as NSString).replacingCharacters(in: range, with: marker)
