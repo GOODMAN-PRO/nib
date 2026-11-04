@@ -770,9 +770,13 @@ final class NibUI {
 
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
-        if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
+        if isKeyboardFocused(field) { return }
         revealFormElement(field)
-        guard hasVisibleFrame(field) && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
+        guard hasVisibleFrame(field) && field.isHittable else {
+            // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
+            if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
+            throw Failure.message("Native field cannot receive focus: \(field)")
+        }
         field.tap()
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
         guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
