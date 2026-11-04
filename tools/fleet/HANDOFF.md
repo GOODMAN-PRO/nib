@@ -1,6 +1,27 @@
-# Nib: handoff to the Mac
+# Nib: handoff (any machine)
 
-## 0. Read first: cloud session results (26–30 Sept 2026)
+## 0. Read first: where Nib stands (4 Nov 2026, Windows session)
+
+**Shipped.** Nib 1.0.1 (tag `nib-1.0.1`, main `9c41914`, 4 Oct 2026): all 111 features merged, main CI green (package tests + unsigned IPA). The QA campaign (`tools/fleet/qa-campaign.mjs`, run by Codex on the Mac) wrote 10 XCUITest classes (`NibUITests/`, 508 tests) and fixed hundreds of bugs, but ended with the UI lane red for 8 of the 10 classes; the 60 `qa-ci/*` branches are its disposable CI snapshots.
+
+**This session** ran on Windows (no Swift toolchain; GitHub Actions is the only compiler) with Codex CLI (`gpt-6-astra`, the user's own `~/.codex/config.toml`) doing the Swift work and Claude reviewing. Work lands on `integration` first, then fast-forwards to `main`. Done on `integration`:
+- `tools/fleet/codex-job.sh` + `tools/fleet/schemas/`: cross-platform Codex job runner (the Mac's `nib-codex.sh` and its per-machine schema folder are superseded). `tools/qa/ui-results.py`: parses one `ui.yml` run into PASS/FAIL per class with owners and a `FAIL Class/test: message` list (the Mac-only `ui-ci.sh` tail, for any platform).
+- `ios.yml` runs `Scripts/a11y_lint.py` and `Scripts/extract_strings.py --check --sources` (warnings only; closes the F095 request, issue #1). The a11y lint no longer flags a lowercase view reference as an icon-only label; the repo lint is at 0 warnings.
+- contracts-v2.5: `PrintRendererDescriptor` + `ContentRegistries.printRenderers`, `NibPrint` tokens, F103 registers its text-document renderer and F067's `print.present` routes to it (both `docs/contract-requests` resolved and removed). Implemented by Codex, independently reviewed.
+- `docs/SHIPPING_POLISH.md` copy table applied (sentence case, translations carried over); the applied width-presets patch file removed.
+- String catalog refreshed from the sources (1475 new keys, 27 stale) and translated into the 14 locales by Claude agents (per-locale QA + redo), then `--module-catalogs` for NibDesign (issue #2). PENDING-I18N
+- Codex audit of every follow-up in `tools/fleet/cloud/ledger.md` and `followups-local.md` against the code: all done except three, fixed on `work/*` branches and merged: assistant full-screen through F017's panel host (F085), `.dropletDockable` replays a dock requested during an in-flight reshape (NibDesign), folder tiles wrap long names (NibDesign). PENDING-BATCH-C
+- UI lane baseline on main (`gh workflow run ui.yml --ref main`, run 41817269947) -> `tools/qa/ui-results.py` -> per-class Codex fix jobs (`tools/fleet/ui-fix.workflow.js`) -> review -> merge -> re-run the affected classes. PENDING-UI
+
+**How to continue (any machine):**
+1. `git fetch origin && git checkout integration` (or merge `origin/main` into it). Worktrees: `git worktree add ../Nib-wt/<name> -b work/<name> integration`.
+2. Codex job: write a prompt file (style of the prompts in `G:\Projects\Nib-prompts`: role, task, follow-through policy, verification loop, output contract), then `bash tools/fleet/codex-job.sh run <name> <worktree> <prompt> <schema: result|review|audit> [effort]`, and `wait <name>` while it prints RUNNING. The Workflow scripts in `tools/fleet/*.workflow.js` wrap this with Claude forwarder + reviewer agents (Sonnet).
+3. CI: `gh workflow run ios.yml --repo GOODMAN-PRO/nib --ref integration` (package tests + IPA) and `gh workflow run ui.yml --repo GOODMAN-PRO/nib --ref integration -f only="NibUITests/<Class> ..." -f label=<name>` (UI lane; `only` empty = all 10 classes), then `python tools/qa/ui-results.py <run-id>`. Runs are cold when the DerivedData cache has expired (7 days unused): 30-45 min per job.
+4. Ship: `git checkout main && git merge --ff-only integration && git push origin main` (main's push runs the full CI and saves the cache); tag `nib-1.0.x`; the unsigned IPA is the `Nib-unsigned-ipa` artifact of main's run.
+
+**Left for the user to decide:** delete the 60 `qa-ci/*` and 10 merged `v2/*` remote branches; remove the 111 stale `../Nib-wt/F###` worktrees (646 MB, all merged); the study-set window keeps FeatKeyboard's global Command-P (F067's key covers notebooks, whiteboards and text documents).
+
+## 0a. Earlier: cloud session results (26-30 Sept 2026)
 
 A cloud session continued the build after this handoff was written, then stopped on the weekly usage limit. This section supersedes the state in §3; the rest of the file still applies.
 
