@@ -108,14 +108,27 @@ final class InsertUITests: XCTestCase {
         func candidate() -> XCUIElement? {
             for kind in types {
                 let element = target(kind)
-                if element.exists && element.isEnabled && element.isHittable { return element }
+                guard element.exists && element.isEnabled else { continue }
+                let input = [.textField, .secureTextField, .textView, .searchField].contains(kind)
+                if input && ui.isKeyboardFocused(element) { return element }
+                if element.isHittable { return element }
             }
             return nil
+        }
+        if candidate() == nil {
+            // Scroll a real inspector/form, never tap an occluded control through the keyboard.
+            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
         }
         try wait("Missing actionable insert control: \(name)") { candidate() != nil }
         return try XCTUnwrap(candidate())
     }
-    private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
+    /// Preserves an already-focused input; all other controls must expose a genuine visible hit target.
+    private func tap(_ name: String, scroll: Bool = false) throws {
+        let target = try control(name, scroll: scroll)
+        if [.textField, .secureTextField, .textView, .searchField].contains(target.elementType) {
+            try ui.focusField(target)
+        } else { target.tap() }
+    }
     /// Samples typed controls in the active presentation without retaining mixed-type ordinals during transitions.
     private func visible(_ name: String) -> Bool {
         let scope = ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
@@ -672,7 +685,7 @@ final class InsertUITests: XCTestCase {
         let before = try ui.state().itemCountOnPage
         try menu("Ask AI"); try tap("Edit")
         let composer = try control("Question or instruction")
-        composer.tap(); composer.typeText("Insert an editable flow diagram with Motion and Force, one connecting edge, classic style.")
+        try ui.focusField(composer); composer.typeText("Insert an editable flow diagram with Motion and Force, one connecting edge, classic style.")
         try tap("Send to assistant")
         try counts(before + 3)
         try ui.dismissSheets(); try all(); let content = try items()
@@ -905,12 +918,12 @@ final class InsertUITests: XCTestCase {
         try elements(); try tap("GIFs"); try tap("Open Settings")
         if visible("Remove Key") { try tap("Remove Key") }
         let field = try control("Paste your GIPHY API key", .secureTextField)
-        field.tap(); field.typeText("nib-ui-invalid-test-key")
+        try ui.focusField(field); field.typeText("nib-ui-invalid-test-key")
         try tap("Save Key")
         XCTAssertTrue(query("Remove Key").firstMatch.waitForExistence(timeout: 8))
         try ui.dismissSheets(); try elements(); try tap("GIFs")
         let search = try control("Search GIPHY", .textField)
-        search.tap(); search.typeText("physics\n")
+        try ui.focusField(search); search.typeText("physics\n")
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
         outside(); try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("Elements and GIFs", scroll: true); try tap("Remove Key")
@@ -1085,7 +1098,7 @@ final class InsertUITests: XCTestCase {
     private func comment(_ text: String = "Check the units") throws {
         try pageMenu(); try tap("Add Comment")
         let input = try control("Add a comment")
-        input.tap(); input.typeText(text); try tap("Send")
+        try ui.focusField(input); input.typeText(text); try tap("Send")
         try counts(5)
         XCTAssertTrue(ui.app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch.waitForExistence(timeout: 8))
     }
@@ -1097,7 +1110,7 @@ final class InsertUITests: XCTestCase {
         try comment(); try tap("cmd.panel.close")
         ui.coordinate(point).tap()
         XCTAssertTrue(try message("Check the units").exists)
-        let reply = try control("Reply"); reply.tap(); reply.typeText("Use metres per second"); try tap("Send")
+        let reply = try control("Reply"); try ui.focusField(reply); reply.typeText("Use metres per second"); try tap("Send")
         let posted = try message("Use metres per second")
         XCTAssertTrue(posted.label.contains("Anonymous"), "Reply retains the current author")
         XCTAssertTrue(posted.label.contains(":"), "Reply displays its timestamp")
@@ -1110,7 +1123,7 @@ final class InsertUITests: XCTestCase {
     func testObjectCommentAnchorsSelectedShapeAndCopiesDeepLink() throws {
         try shape(); try menu("Add Comment")
         let input = try control("Add a comment")
-        input.tap(); input.typeText("Shape annotation"); try tap("Send"); try counts(6)
+        try ui.focusField(input); input.typeText("Shape annotation"); try tap("Send"); try counts(6)
         // Thread-level More is beside Resolve; exclude the document and palette menus.
         let resolve = try control("Resolve Thread")
         let more = query("More", .button).allElementsBoundByIndex.first {
@@ -1358,7 +1371,7 @@ final class InsertUITests: XCTestCase {
     func testTranscriptSearchFollowAndRegenerationPreserveRecording() throws {
         try transcript(); try toggle("Follow playback", to: true)
         let search = try control("Search transcript", .textField)
-        search.tap(); search.typeText("nonmatching phrase")
+        try ui.focusField(search); search.typeText("nonmatching phrase")
         XCTAssertTrue(query("No matching lines").firstMatch.waitForExistence(timeout: 8))
         try replace(search, with: ""); try key(XCUIKeyboardKey.delete.rawValue, [])
         try tap("Regenerate Transcript", scroll: true)
