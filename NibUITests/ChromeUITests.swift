@@ -59,25 +59,17 @@ final class ChromeUITests: XCTestCase {
         }
     }
 
-    /// Scroll the containing sheet/popover, never the document, to reach offscreen controls.
+    /// Waits for an actionable control in its containing form with bidirectional, progress-bounded scrolling.
     private func reachable(_ name: String) throws -> XCUIElement {
-        let q = query(name)
-        if !q.firstMatch.exists { ui.revealFormElement(q.firstMatch) }
-        _ = try require(name)
-        for _ in 0..<12 {
-            let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let button = candidates.first(where: { $0.elementType == .button && !$0.identifier.hasPrefix("tool.") }) { return button }
-            if let target = candidates.first { return target }
-            let containers = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
-            guard let scroller = containers.first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.descendants(matching: .any)
-                    .matching(NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).count > 0
-            }) else { break }
-            let dy: CGFloat = q.firstMatch.frame.midY < scroller.frame.minY ? 0.65 : -0.65
-            let start = scroller.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: dy > 0 ? 0.2 : 0.8))
-            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy * scroller.frame.height)))
+        let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
+        let buttons = ui.app.buttons.matching(predicate)
+        let target = { buttons.firstMatch.exists ? buttons.firstMatch : self.query(name).firstMatch }
+        ui.revealFormElement(target: target)
+        try wait("Chrome control is not actionable: \(name)", timeout: 8) {
+            let found = target()
+            return found.exists && found.isHittable && found.isEnabled
         }
-        throw NibUI.Failure.message("Chrome control is not actionable: \(name)\n\(ui.app.debugDescription)")
+        return target()
     }
 
     private func tap(_ name: String) throws { try reachable(name).tap() }

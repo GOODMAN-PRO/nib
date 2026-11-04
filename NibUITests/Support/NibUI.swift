@@ -40,26 +40,59 @@ final class NibUI {
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards }
 
-    func revealFormElement(_ element: XCUIElement) {
-        if !element.exists { _ = app.collectionViews.firstMatch.waitForExistence(timeout: 2) }
-        for _ in 0..<24 {
-            guard let list = app.collectionViews.allElementsBoundByIndex.last, list.isHittable else { return }
-            // Include the shortcuts bar: it is above the Keyboard accessibility frame.
-            let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
-                + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
-            guard let viewport = NibUITestScrollGeometry.viewport(
-                scroll: list.frame, window: app.frame, obstructions: obstructions) else { return }
-            if element.exists && element.isHittable {
-                let belongsToList = list.descendants(matching: element.elementType)
-                    .matching(NSPredicate(format: "label == %@", element.label)).count > 0
-                if !belongsToList || viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
+    /// Waits for a target in its actual form, searching both directions until the visible rows stop changing.
+    /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
+    func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
+
+    /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
+    func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
+        let initial = target()
+        if initial.exists && initial.isHittable,
+           (form?.frame ?? app.windows.firstMatch.frame).contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
+        let containers = (app.collectionViews.allElementsBoundByIndex + app.tables.allElementsBoundByIndex
+            + app.scrollViews.allElementsBoundByIndex).filter {
+                $0.identifier != "nib.canvas" && $0.frame.height > 100 && $0.frame.width > 200
+                    && app.windows.firstMatch.frame.intersects($0.frame)
+                    && ($0.isHittable || [.collectionView, .table].contains($0.elementType))
             }
-            let drag = NibUITestScrollGeometry.drag(in: viewport, toward: element.exists ? element.frame.midY : nil)
-            let origin = app.coordinate(withNormalizedOffset: .zero)
-            let start = origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
-            let end = origin.withOffset(CGVector(dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY))
-            start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
+        let containing = containers.filter { list in
+            initial.exists && list.descendants(matching: initial.elementType).matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", initial.identifier, initial.label)).count > 0
         }
+        guard let list = form ?? containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+            ?? containers.max(by: { $0.frame.minX < $1.frame.minX }) else { return }
+        for down in [false, true] {
+            var previous: String?
+            for _ in 0..<8 {
+                let element = target()
+                let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                    + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
+                guard let viewport = NibUITestScrollGeometry.viewport(
+                    scroll: list.frame, window: app.windows.firstMatch.frame, obstructions: obstructions) else { return }
+                if element.exists && element.isHittable && viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
+                // One snapshot supplies the visible range; querying every row attribute separately can itself time out.
+                guard let snapshot = try? list.snapshot() else { return }
+                let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
+                if signature == previous { break }
+                previous = signature
+                let origin = app.coordinate(withNormalizedOffset: .zero)
+                let x = viewport.minX + viewport.width * 0.5
+                let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
+                let endY = viewport.minY + viewport.height * (down ? 0.75 : 0.25)
+                origin.withOffset(CGVector(dx: x - app.frame.minX, dy: startY - app.frame.minY))
+                    .press(forDuration: 0.01, thenDragTo: origin.withOffset(
+                        CGVector(dx: x - app.frame.minX, dy: endY - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
+            }
+        }
+    }
+
+    /// Reads one immutable snapshot without waiting so progress checks cannot retain stale virtualized element indices.
+    private func formVisibleRange(_ snapshot: XCUIElementSnapshot, viewport: CGRect) -> [String] {
+        let frame = snapshot.frame
+        let own = [.button, .staticText].contains(snapshot.elementType)
+            && viewport.contains(CGPoint(x: frame.midX, y: frame.midY))
+            ? ["\(snapshot.identifier)|\(snapshot.label)|\(Int(frame.minY))"] : []
+        return own + snapshot.children.flatMap { formVisibleRange($0, viewport: viewport) }
     }
 
     /// Complete Files' New Folder action using the editor supplied by the OS.

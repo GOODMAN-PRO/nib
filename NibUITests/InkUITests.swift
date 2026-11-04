@@ -47,36 +47,67 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    /// Waits on typed identifier/label queries, re-resolving firstMatch rather than snapshot indices during menu transitions.
     private func control(_ label: String, type: XCUIElement.ElementType = .any,
                          scroll: Bool = false) throws -> XCUIElement {
-        let predicate = NSPredicate(format: "identifier == %@ OR label == %@", label, label)
-        let query = ui.app.descendants(matching: type).matching(predicate)
-        for attempt in 0..<(scroll ? 12 : 2) {
-            let matches = query.allElementsBoundByIndex.filter {
-                ($0.isHittable || !$0.isEnabled) && (label.hasPrefix("tool.") || !$0.identifier.hasPrefix("tool."))
+        let types: [XCUIElement.ElementType] = type == .any
+            ? [.button, .switch, .slider, .textField, .segmentedControl, .staticText, .other] : [type]
+        let predicate = NSPredicate(format: "(identifier == %@ OR label == %@) AND (identifier BEGINSWITH %@ OR NOT identifier BEGINSWITH 'tool.')",
+                                    label, label, label.hasPrefix("tool.") ? "tool." : "cmd.")
+        /// Resolves a fresh typed query without waiting; hittability is evaluated locally, not as an unsupported AX query attribute.
+        func candidate() -> XCUIElement? {
+            for kind in types {
+                let visible = ui.app.descendants(matching: kind).matching(predicate).firstMatch
+                if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
             }
-            let interactive = matches.filter { [.button, .switch, .slider, .textField, .segmentedControl].contains($0.elementType) }
-            // A settings choice can share its title with the tool behind the popover (Pencil, Highlighter,
-            // Fountain Pen). Choose the actual option/filter, not the underlying palette selector.
-            if let found = interactive.first(where: { !$0.identifier.hasPrefix("tool.") })
-                ?? interactive.first ?? matches.first {
-                // Native menus can remove their same-labelled wrapper after the first snapshot.
-                // Rebind a unique typed element so an Any-query index does not become stale before tapping.
-                let stable = ui.app.descendants(matching: found.elementType).matching(
-                    NSPredicate(format: "identifier == %@ AND label == %@", found.identifier, found.label))
-                return stable.count == 1 ? stable.firstMatch : found
+            return nil
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in candidate() != nil }, object: nil)
+        _ = XCTWaiter.wait(for: [ready], timeout: 3)
+        if let found = candidate() { return found }
+        if scroll {
+            ui.revealFormElement {
+                candidate() ?? self.ui.app.descendants(matching: type).matching(predicate).firstMatch
             }
-            if attempt == 0 { _ = query.firstMatch.waitForExistence(timeout: 3) }
-            if scroll {
-                let panels = scrollPanels
-                // Prefer the target's own scroller. Settings has a navigation list alongside its detail list.
-                let containing = panels.filter { $0.descendants(matching: type).matching(predicate).count > 0 }
-                guard let panel = containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
-                    ?? panels.max(by: { $0.frame.minX < $1.frame.minX }) else { break }
-                scrollPanel(panel, down: false)
-            }
+            if let found = candidate() { return found }
         }
         throw NibUI.Failure.message("Missing hittable control: \(label)\n\(ui.app.debugDescription)")
+    }
+
+    /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
+    private func squeezePaletteBinding() throws -> XCUIElement {
+        let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
+        ui.revealFormElement(heading)
+        try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
+        let detail = try XCTUnwrap(scrollPanels.filter {
+            $0.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).count > 0
+        }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+        let section = detail.otherElements.containing(.staticText, identifier: heading.label)
+            .matching(NSPredicate(format: "label != 'Double-tap'")).allElementsBoundByIndex
+            .filter {
+                let rows = $0.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
+                return rows.count == 1 && rows.firstMatch.frame.minY > heading.frame.maxY
+            }
+            .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        if let section {
+            let row = section.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).firstMatch
+            ui.revealFormElement(in: detail) { row }
+            if row.isHittable { return row }
+        }
+        // Native grouped lists can flatten Section containers. Bind by the visible header/footer range instead.
+        let footer = detail.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Squeeze Apple Pencil Pro'")).firstMatch
+        let choices = detail.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
+        /// Reacquires the row between current section boundaries; the enclosing form search waits for visibility.
+        func scopedRow() -> XCUIElement {
+            guard heading.exists else { return choices.matching(NSPredicate(value: false)).firstMatch }
+            return choices.allElementsBoundByIndex.first {
+                $0.frame.minY > heading.frame.maxY && (!footer.exists || $0.frame.maxY < footer.frame.minY)
+            } ?? choices.matching(NSPredicate(value: false)).firstMatch
+        }
+        ui.revealFormElement(in: detail, target: scopedRow)
+        let row = scopedRow()
+        guard row.exists && row.isHittable else { throw NibUI.Failure.message("Squeeze must offer its own palette binding") }
+        return row
     }
 
     private func tap(_ label: String, scroll: Bool = false) throws {
@@ -1305,14 +1336,7 @@ final class InkUITests: XCTestCase {
         let first = choices.firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 5)); first.tap()
         XCTAssertTrue(first.isSelected, "Double-tap binding must persist its choice")
-        // Both gesture sections offer the same choices. Select the second section's palette binding.
-        let squeeze = ui.app.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).element(boundBy: 1)
-        for _ in 0..<12 {
-            if squeeze.exists && squeeze.isHittable { break }
-            let detail = try XCTUnwrap(scrollPanels.max(by: { $0.frame.minX < $1.frame.minX }))
-            scrollPanel(detail, down: false)
-        }
-        XCTAssertTrue(squeeze.exists && squeeze.isHittable, "Squeeze must offer its own palette binding")
+        let squeeze = try squeezePaletteBinding()
         squeeze.tap()
         XCTAssertTrue(squeeze.isSelected, "Squeeze binding must persist its choice")
         try closePreferences()
