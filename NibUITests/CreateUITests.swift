@@ -54,7 +54,7 @@ final class CreateUITests: XCTestCase {
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Title"], with: "Escape cancelled draft")
         try dismissKeyboard()
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.hardwareKey(XCUIKeyboardKey.escape.rawValue)
         try wait("create.cancel: Escape must dismiss the creation sheet") { !self.ui.app.textFields["Title"].exists }
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
@@ -673,9 +673,9 @@ final class CreateUITests: XCTestCase {
         // Try picker delivery, then the app responder while the popover is still open; never dismiss the parent.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
             traceCreation("planner-before-picker-dismissal")
-            picker.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+            try ui.hardwareKey(XCUIKeyboardKey.escape.rawValue)
             if ui.app.buttons["DatePicker.NextMonth"].exists {
-                ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+                try ui.hardwareKey(XCUIKeyboardKey.escape.rawValue)
             }
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
@@ -869,15 +869,8 @@ final class CreateUITests: XCTestCase {
         }
     }
 
-    /// Waits for the observed native Hide keyboard button and then disappearance; never taps an assumed corner.
     private func dismissKeyboard(in application: XCUIApplication? = nil) throws {
-        let keyboard = (application ?? ui.app).keyboards.firstMatch
-        guard keyboard.exists else { return }
-        let hide = keyboard.buttons.matching(NSPredicate(
-            format: "label ==[c] 'Hide keyboard' OR label ==[c] 'Dismiss keyboard'")).firstMatch
-        try wait("Native keyboard must expose its dismissal control") { hide.exists && hide.isHittable }
-        hide.tap()
-        try wait("Keyboard must disappear after Hide keyboard") { !keyboard.exists }
+        try ui.dismissNativeKeyboard(in: application)
     }
 
     private func newMenu(_ choice: String) throws {

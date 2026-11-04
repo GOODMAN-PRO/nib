@@ -1,9 +1,16 @@
 #import "NibTouchPaths.h"
 #import <XCTest/XCTest.h>
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 
 // Dynamic lookup keeps SDK-private classes out of the app and gives a clear failure if XCTest changes its SPI.
 @interface NSObject (NibXCTestTouchSPI)
+- (instancetype)initForTextInput;
+- (void)typeKey:(NSString *)key modifiers:(NSUInteger)flags atOffset:(NSTimeInterval)offset;
+- (void)pressKey:(NSString *)key modifiers:(NSUInteger)flags atOffset:(NSTimeInterval)offset;
+- (void)releaseKey:(NSString *)key modifiers:(NSUInteger)flags atOffset:(NSTimeInterval)offset;
+- (void)setModifiers:(NSUInteger)flags mergeWithCurrentModifierFlags:(BOOL)merge atOffset:(NSTimeInterval)offset;
+- (void)typeText:(NSString *)text atOffset:(NSTimeInterval)offset typingSpeed:(NSUInteger)speed shouldRedact:(BOOL)redact;
 - (instancetype)initForTouchAtPoint:(CGPoint)point offset:(NSTimeInterval)offset;
 - (instancetype)initWithName:(NSString *)name interfaceOrientation:(NSInteger)orientation;
 - (void)moveToPoint:(CGPoint)point atOffset:(NSTimeInterval)offset;
@@ -14,6 +21,58 @@
 @end
 
 @implementation NibTouchPaths
++ (void)typeKey:(NSString *)key modifiers:(NSUInteger)flags completion:(void (^)(NSError *))completion {
+    Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
+    Class pathClass = NSClassFromString(@"XCPointerEventPath");
+    XCUIDevice *device = XCUIDevice.sharedDevice;
+    NSMutableArray<NSString *> *selectors = [NSMutableArray array];
+    for (Class cls = pathClass; cls; cls = class_getSuperclass(cls)) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            [selectors addObject:NSStringFromSelector(method_getName(methods[i]))];
+        }
+        free(methods);
+    }
+    void (^unavailable)(void) = ^{
+        completion([NSError errorWithDomain:@"NibUITests" code:5 userInfo:@{NSLocalizedDescriptionKey:
+            [NSString stringWithFormat:@"Hardware key synthesis unavailable. XCPointerEventPath instance selectors: %@",
+             [[selectors sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "]]}]);
+    };
+    if (!recordClass || !pathClass || ![device respondsToSelector:@selector(eventSynthesizer)] ||
+        ![recordClass instancesRespondToSelector:@selector(initWithName:interfaceOrientation:)] ||
+        ![recordClass instancesRespondToSelector:@selector(addPointerEventPath:)] ||
+        ![pathClass instancesRespondToSelector:@selector(initForTextInput)]) { unavailable(); return; }
+    id synthesizer = [device eventSynthesizer];
+    if (![synthesizer respondsToSelector:@selector(synthesizeEvent:completion:)]) { unavailable(); return; }
+    id path = [[pathClass alloc] initForTextInput];
+    NSString *route;
+    if ([pathClass instancesRespondToSelector:@selector(typeKey:modifiers:atOffset:)]) {
+        route = @"typeKey:modifiers:atOffset:";
+        [path typeKey:key modifiers:flags atOffset:0];
+    } else if ([pathClass instancesRespondToSelector:@selector(pressKey:modifiers:atOffset:)] &&
+               [pathClass instancesRespondToSelector:@selector(releaseKey:modifiers:atOffset:)]) {
+        route = @"pressKey/releaseKey:modifiers:atOffset:";
+        [path pressKey:key modifiers:flags atOffset:0];
+        [path releaseKey:key modifiers:flags atOffset:0.05];
+    } else if ([pathClass instancesRespondToSelector:@selector(setModifiers:mergeWithCurrentModifierFlags:atOffset:)] &&
+               [pathClass instancesRespondToSelector:@selector(typeText:atOffset:typingSpeed:shouldRedact:)]) {
+        route = @"setModifiers/typeText/resetModifiers";
+        [path setModifiers:flags mergeWithCurrentModifierFlags:NO atOffset:0];
+        [path typeText:key atOffset:0.01 typingSpeed:60 shouldRedact:NO];
+        [path setModifiers:0 mergeWithCurrentModifierFlags:NO atOffset:0.1 + key.length / 60.0];
+    } else { unavailable(); return; }
+    NSLog(@"[Nib hardware key] route=%@ key=%@ modifiers=%lu", route, key, (unsigned long)flags);
+    NSInteger orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
+        device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    id record = [[recordClass alloc] initWithName:[@"Nib hardware key: " stringByAppendingString:route] interfaceOrientation:orientation];
+    [record addPointerEventPath:path];
+    [synthesizer synthesizeEvent:record completion:^(BOOL success, NSError *error) {
+        completion(error ?: (success ? nil : [NSError errorWithDomain:@"NibUITests" code:6
+            userInfo:@{NSLocalizedDescriptionKey: @"Hardware key synthesis failed"}]));
+    }];
+}
+
 + (void)tapAtPoints:(NSArray<NSValue *> *)points count:(NSUInteger)count
          completion:(void (^)(NSError *))completion {
     Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");

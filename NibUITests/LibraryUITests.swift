@@ -375,7 +375,7 @@ final class LibraryUITests: XCTestCase {
         XCTAssertFalse(button("Finish Selecting").exists)
         try tap("Select Items")
         item(physics).tap()
-        app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         XCTAssertFalse(item(physics).isSelected, "Escape must clear selection")
         XCTAssertFalse(button("Finish Selecting").exists)
     }
@@ -389,7 +389,7 @@ final class LibraryUITests: XCTestCase {
         }
         try tap("Select Items")
         item(physics).tap()
-        app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         try eventually("Escape must exit selection and clear the checked cover") {
             !self.item(self.physics).isSelected && !self.button("Finish Selecting").exists
         }

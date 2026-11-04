@@ -4,6 +4,8 @@ import UIKit
 struct QAState: Decodable {
     struct Offset: Decodable { let x: Double; let y: Double }
     struct Dock: Decodable { let edge: String; let along: Double }
+    let keyResponder: String?
+    let keyResponderIsText: Bool?
     let screen: String
     let document: String?
     let page: String?
@@ -420,8 +422,8 @@ final class NibUI {
     func chord(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
                verifying postcondition: () throws -> Void) throws {
         let before = try state()
-        guard !app.keyboards.firstMatch.exists else {
-            throw Failure.message("Dismiss text editing explicitly before delivering a global chord")
+        guard before.keyResponderIsText != true else {
+            throw Failure.message("Dismiss text editing before global chord; responder=\(before.keyResponder ?? "unknown")")
         }
         let window = app.windows.firstMatch
         let recipient = try globalKeyboardRecipient()
@@ -436,10 +438,10 @@ final class NibUI {
             throw Failure.message("Keyboard focus preparation changed document content or navigation")
         }
         try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
-            let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) window=\(window.frame)\n\(probe.value ?? "missing")")
+            let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Type into the verified responder, not a caption or an arbitrary unfocused application.
-            recipient.typeKey(key, modifierFlags: modifiers)
+            try hardwareKey(key, modifiers)
             do { try postcondition() }
             catch {
                 recordDiagnostics("Chord postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
@@ -448,16 +450,14 @@ final class NibUI {
         }
     }
 
-    /// AX exposes keyboard focus separately from hittability. A hidden software keyboard is not proof of focus.
-    /// ShellViewController keeps library keys; CanvasKeyboardResponder keeps document keys and forwards shell keys.
-    private func globalKeyboardRecipient() throws -> XCUIElement {
-        let focused = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-        func nonTextFocus() -> Bool {
-            guard focused.exists else { return false }
-            return ![XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField].contains(focused.elementType)
+    /// Global responders deliberately have no AX keyboard focus. The fixture probe observes UIKit's responder.
+    private func globalKeyboardRecipient() throws -> String {
+        let current = try state()
+        guard current.keyResponderIsText != true else {
+            throw Failure.message("Global chord rejected text responder: \(current.keyResponder ?? "unknown")")
         }
-        if nonTextFocus() { return focused }
         if app.state != .runningForeground { app.activate() }
+        if let responder = current.keyResponder, current.keyResponderIsText == false { return responder }
 
         func tapInertHeader(in surface: XCUIElement, modal: Bool) throws {
             // One snapshot avoids per-control AX round trips. Conservatively exclude every control frame,
@@ -502,11 +502,30 @@ final class NibUI {
             // The shell's library tap recognizer schedules reclaimKeyFocusIfNeeded after a real window tap.
             try tapInertHeader(in: app.windows.firstMatch, modal: false)
         }
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in nonTextFocus() }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed else {
-            throw Failure.message("No non-text keyboard responder after scene focus tap\n\(app.debugDescription)")
+        let focused = try waitForState(timeout: 5) {
+            $0.keyResponderIsText == true || ($0.keyResponder != nil && $0.keyResponderIsText == false)
         }
-        return focused
+        guard focused.keyResponderIsText == false, let responder = focused.keyResponder else {
+            throw Failure.message("Focus tap reached text responder: \(focused.keyResponder ?? "unknown")")
+        }
+        return responder
+    }
+
+    /// Runner-only hardware delivery, also usable for native popover dismissal without inventing AX focus.
+    func hardwareKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = []) throws {
+        try XCTContext.runActivity(named: "Hardware key \(key), modifiers \(modifiers.rawValue)") { activity in
+            let route = XCTAttachment(string: "route=NibTouchPaths key=\(key) modifiers=\(modifiers.rawValue); SPI route is in runner log")
+            route.lifetime = .keepAlways; activity.add(route)
+            let done = XCTestExpectation(description: "Hardware key delivered")
+            var failure: Error?
+            NibTouchPaths.typeKey(key, modifiers: modifiers.rawValue) { error in
+                failure = error; done.fulfill()
+            }
+            guard XCTWaiter.wait(for: [done], timeout: 10) == .completed else {
+                throw Failure.message("Hardware key synthesis timed out")
+            }
+            if let failure { throw failure }
+        }
     }
 
     func state() throws -> QAState {
@@ -650,17 +669,21 @@ final class NibUI {
                 .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
             if focused.exists, focused.elementType == field.elementType, focused.frame == field.frame { return true }
         }
-        return field.debugDescription.contains("Keyboard Focused")
+        // debugDescription includes the whole application tree after the Attributes line.
+        // A different focused field (Duration) must not qualify this field (Timer name).
+        return field.debugDescription.components(separatedBy: "\n").first?.contains("Keyboard Focused") == true
     }
 
-    /// Waits for the native keyboard's own dismissal before a global action; never taps document content.
-    func dismissNativeKeyboard() throws {
-        guard app.keyboards.firstMatch.exists else { return }
-        let hide = app.keyboards.buttons.matching(NSPredicate(format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).firstMatch
-        guard hide.exists && hide.isHittable else { throw Failure.message("No native keyboard dismissal control") }
-        hide.tap()
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in !app.keyboards.firstMatch.exists }, object: nil)
-        guard XCTWaiter.wait(for: [gone], timeout: 5) == .completed else { throw Failure.message("Keyboard did not dismiss") }
+    /// Hide-key AX frames are invalid on the floating number pad. Command-Return is UIKit's
+    /// keyboard-dismissal chord; unlike Return it does not submit the creation form.
+    func dismissNativeKeyboard(in application: XCUIApplication? = nil) throws {
+        let source = application ?? app
+        guard source.keyboards.firstMatch.exists else { return }
+        try hardwareKey(XCUIKeyboardKey.return.rawValue, .command)
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
+        guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
+            throw Failure.message("Keyboard did not dismiss after hardware Command-Return")
+        }
     }
 
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.

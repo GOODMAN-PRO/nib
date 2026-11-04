@@ -428,8 +428,8 @@ final class PagesUITests: XCTestCase {
         try require(label("D")).press(forDuration: 0.8); try tap("Move")
         let tooDeep = button("Nest in Previous Entry")
         XCTAssertFalse(tooDeep.exists && tooDeep.isEnabled, "Outline must not offer a fourth nesting level")
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         try outlineMenu("C", "Move Out a Level", move: true)
         try wait("Outdent must move C back under A") { (try? self.entry("C")["parent"] as? String) == (try? self.entry("A")["id"] as? String) }
         let parent = try XCTUnwrap(entry("A")["id"] as? String)

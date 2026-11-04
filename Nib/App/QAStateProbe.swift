@@ -46,6 +46,8 @@ final class QAStateProbe: UIView {
                 return page.rev.device != app.clock.device && page.rev.effective() > max(baseline.effective(), own.effective())
             }.map { JSONValue.string($0.id.raw) }
             let state: JSONValue = [
+                "keyResponder": ShellFocus.firstResponder().map { .string(NSStringFromClass(type(of: $0))) } ?? .null,
+                "keyResponderIsText": .bool(ShellFocus.isEditingText(in: shell.view.window)),
                 "screen": .string(UITestFixture.failure != nil ? "fixtureError" : !UITestFixture.isReady ? "loading" : doc == nil ? "library" : "document"),
                 "document": doc.map { .string($0.raw) } ?? .null,
                 "page": doc == nil ? .null : session.page.map { .string($0.raw) } ?? .null,
