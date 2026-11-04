@@ -30,21 +30,26 @@ final class NativeActionSnapshotTests: XCTestCase {
             (view.gestureRecognizers ?? []).compactMap { $0 as? NibActionTapRecognizer }
                 + view.subviews.flatMap(taps)
         }
-        func settle() async throws {
-            host.view.layoutIfNeeded()
-            try await Task.sleep(for: .milliseconds(80))
+        /// Waits (bounded, 50 x 20 ms) until the host has `expected` native targets: the probe reports
+        /// didMoveToWindow asynchronously and SwiftUI re-renders on its own schedule.
+        func settle(until expected: Int) async throws {
+            for _ in 0..<50 {
+                host.view.layoutIfNeeded()
+                if taps(host.view).count == expected { return }
+                try await Task.sleep(for: .milliseconds(20))
+            }
             host.view.layoutIfNeeded()
         }
 
         // Measuring an offscreen host must not install an input surface.
         host.loadViewIfNeeded()
-        try await settle()
+        try await settle(until: 0)
         XCTAssertTrue(taps(host.view).isEmpty)
 
         for attached in [true, false, true] {
             window.rootViewController = attached ? host : nil
             window.isHidden = !attached
-            try await settle()
+            try await settle(until: attached ? 1 : 0)
             let actions = taps(host.view)
             XCTAssertEqual(actions.count, attached ? 1 : 0)
             if attached {
