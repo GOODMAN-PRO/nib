@@ -14,6 +14,41 @@
 @end
 
 @implementation NibTouchPaths
++ (void)tapAtPoints:(NSArray<NSValue *> *)points count:(NSUInteger)count
+         completion:(void (^)(NSError *))completion {
+    Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
+    Class pathClass = NSClassFromString(@"XCPointerEventPath");
+    XCUIDevice *device = XCUIDevice.sharedDevice;
+    if (!recordClass || !pathClass || points.count < 2 || count == 0 ||
+        ![device respondsToSelector:@selector(eventSynthesizer)] ||
+        ![recordClass instancesRespondToSelector:@selector(initWithName:interfaceOrientation:)] ||
+        ![pathClass instancesRespondToSelector:@selector(initForTouchAtPoint:offset:)] ||
+        ![pathClass instancesRespondToSelector:@selector(liftUpAtOffset:)] ||
+        ![recordClass instancesRespondToSelector:@selector(addPointerEventPath:)]) {
+        completion([NSError errorWithDomain:@"NibUITests" code:4 userInfo:@{NSLocalizedDescriptionKey: @"Stationary multi-tap synthesis unavailable"}]);
+        return;
+    }
+    id synthesizer = [device eventSynthesizer];
+    if (![synthesizer respondsToSelector:@selector(synthesizeEvent:completion:)]) {
+        completion([NSError errorWithDomain:@"NibUITests" code:2 userInfo:@{NSLocalizedDescriptionKey: @"XCTest event synthesizer unavailable"}]);
+        return;
+    }
+    NSInteger orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
+        device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    id record = [[recordClass alloc] initWithName:@"Nib stationary multi-tap" interfaceOrientation:orientation];
+    for (NSUInteger tap = 0; tap < count; tap++) {
+        NSTimeInterval down = tap * 0.16;
+        for (NSValue *point in points) {
+            id path = [[pathClass alloc] initForTouchAtPoint:point.CGPointValue offset:down];
+            [path liftUpAtOffset:down + 0.06];
+            [record addPointerEventPath:path];
+        }
+    }
+    [synthesizer synthesizeEvent:record completion:^(BOOL success, NSError *error) {
+        completion(error ?: (success ? nil : [NSError errorWithDomain:@"NibUITests" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Multi-tap synthesis failed"}]));
+    }];
+}
+
 + (void)perform:(NSArray<NSArray<NSValue *> *> *)paths duration:(NSTimeInterval)duration
      completion:(void (^)(NSError *))completion {
     Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");

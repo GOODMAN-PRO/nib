@@ -46,14 +46,17 @@ final class ChromeUITests: XCTestCase {
 
     @discardableResult
     private func require(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
+        // Preserve existence-only callers, but prefer native controls to their identically labelled captions.
+        if let found = ui.findControl(name, actionable: false) { return found }
         let target = query(name).firstMatch
-        guard target.waitForExistence(timeout: timeout) else {
+        guard target.exists || target.waitForExistence(timeout: timeout) else {
             throw NibUI.Failure.message("Missing chrome control: \(name)\n\(ui.app.debugDescription)")
         }
-        return target
+        return ui.findControl(name, actionable: false) ?? target
     }
 
     private func wait(_ message: String, timeout: TimeInterval = 12, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             throw NibUI.Failure.message("\(message)\nState: \(ui.probe.value ?? "missing")\n\(ui.app.debugDescription)")
@@ -62,19 +65,9 @@ final class ChromeUITests: XCTestCase {
 
     /// Waits for an actionable control in its containing form with bidirectional, progress-bounded scrolling.
     private func reachable(_ name: String) throws -> XCUIElement {
-        let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
-        let buttons = ui.app.buttons.matching(predicate)
-        let target = {
-            buttons.allElementsBoundByIndex.first {
-                $0.isHittable && $0.isEnabled && !$0.identifier.hasPrefix("tool.")
-            } ?? (buttons.firstMatch.exists ? buttons.firstMatch : self.query(name).firstMatch)
-        }
-        ui.revealFormElement(target: target)
-        try wait("Chrome control is not actionable: \(name)", timeout: 8) {
-            let found = target()
-            return found.exists && found.isHittable && found.isEnabled
-        }
-        return target()
+        let found = try ui.requireControl(name, scroll: true, timeout: 8)
+        guard found.isEnabled else { throw NibUI.Failure.message("Chrome control is not enabled: \(name)") }
+        return found
     }
 
     private func tap(_ name: String) throws { try reachable(name).tap() }
@@ -116,11 +109,11 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 12) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && $0.undoAvailable }
     }
     private func replace(_ name: String, _ text: String) throws {
-        let target = try reachable(name)
-        target.tap()
-        key("a", .command)
-        target.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        // Duration has a separate StaticText caption; only the native editor can accept key synthesis.
+        let target = try ui.textEditor(name)
+        try ui.replaceNativeText(in: target, with: text)
     }
+
     private func toggle(_ name: String, to on: Bool) throws {
         let target = ui.app.switches.matching(NSPredicate(format: "label == %@", name)).firstMatch
         _ = try reachable(name)
@@ -210,9 +203,13 @@ final class ChromeUITests: XCTestCase {
     func testShareExportOpensCorrectSheetAndCancelIsInert() throws {
         try open(); let before = try ui.state()
         try menu("share", "Export all…")
-        _ = try ui.waitForState { !$0.openPanels.isEmpty }
-        _ = try require("PDF")
-        try ui.dismissSheets(); try sameContent(before)
+        // ExportPresentation presents exportui.dialog directly, outside the registered panel state.
+        _ = try reachable("Share & Export")
+        _ = try reachable("PDF")
+        XCTAssertTrue(try reachable("All").isSelected, "Export all must select every page")
+        try ui.dismissSheets()
+        try wait("Export options must close") { self.ui.findControl("Share & Export") == nil }
+        try sameContent(before)
     }
 
     func testMenusOutsideDismissWithoutInkOrHistoryChanges() throws {
@@ -325,7 +322,12 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.drawShape")
         _ = try ui.waitForState { $0.tool == "drawShape" }
-        try draw()
+        // Draw Shape recognises this straight path as a vector shape (F030), not an additional ink stroke.
+        try ui.drawStroke([CGPoint(x: 0.4, y: 0.65), CGPoint(x: 0.6, y: 0.68)])
+        _ = try ui.waitForState {
+            $0.itemCountOnPage == before.itemCountOnPage + 1
+                && $0.strokeCountOnPage == before.strokeCountOnPage && $0.undoAvailable
+        }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage && $0.strokeCountOnPage == before.strokeCountOnPage }
     }

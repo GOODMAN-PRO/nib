@@ -4,5 +4,8 @@ NS_ASSUME_NONNULL_BEGIN
 @interface NibTouchPaths : NSObject
 + (void)perform:(NSArray<NSArray<NSValue *> *> *)paths duration:(NSTimeInterval)duration
      completion:(void (^)(NSError * _Nullable))completion;
+/// Explicit stationary fingers; XCTest's element multi-tap distributes fingers along the window edges.
++ (void)tapAtPoints:(NSArray<NSValue *> *)points count:(NSUInteger)count
+         completion:(void (^)(NSError * _Nullable))completion NS_SWIFT_NAME(tap(at:count:completion:));
 @end
 NS_ASSUME_NONNULL_END
