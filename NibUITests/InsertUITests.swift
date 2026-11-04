@@ -1276,7 +1276,7 @@ final class InsertUITests: XCTestCase {
         } else { outside() }
         try wait("The real microphone permission prompt must be denied") { denied }
         try panel("Audio")
-        XCTAssertTrue(query("Microphone access is off for Nib. Turn it on in Settings to record.").firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(ui.app.staticTexts["Microphone access is off for Nib. Turn it on in Settings to record."].waitForExistence(timeout: 10))
         XCTAssertTrue(query("No recordings yet").firstMatch.exists)
         XCTAssertFalse(query("Pause Recording").firstMatch.exists)
         try tap("Open Settings")
