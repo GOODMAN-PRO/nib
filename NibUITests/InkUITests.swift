@@ -603,11 +603,18 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    /// Waits for the native spectrum surface's observed label so colour taps reach the picker.
+    private func colourSpectrum() throws -> XCUIElement {
+        let spectrum = ui.app.otherElements.matching(NSPredicate(format: "label ==[c] 'Color Spectrum'")).firstMatch
+        try wait("Native Color Spectrum must be visible") { spectrum.exists && spectrum.isHittable }
+        return spectrum
+    }
+
     func testHighlighterCustomColourPersistsAndDrawsTranslucentInk() throws {
         try settings("highlighter"); try tap("Custom…")
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
-        let spectrum = try control("Color spectrum")
+        let spectrum = try colourSpectrum()
         spectrum.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.35)).tap()
         try closeColourPicker()
         closePopover()

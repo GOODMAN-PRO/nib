@@ -749,12 +749,13 @@ final class CreateUITests: XCTestCase {
         element.tap()
     }
 
-    private func scrollTo(_ element: XCUIElement, name: String = "creation control") throws {
+    private func scrollTo(_ element: XCUIElement, name: String = "creation control", in application: XCUIApplication? = nil) throws {
+        let app = application ?? ui.app
         for _ in 0..<12 {
             let exists = element.exists
             if exists && element.elementType != .textField && element.isHittable { return }
             let target = exists ? element.frame : nil
-            let candidates = (ui.app.collectionViews.allElementsBoundByIndex + ui.app.scrollViews.allElementsBoundByIndex)
+            let candidates = (app.collectionViews.allElementsBoundByIndex + app.scrollViews.allElementsBoundByIndex)
                 .filter { $0.isHittable && $0.frame.height > 40 }
             // Scroll the target's own container, not an unrelated card editor or paper grid.
             let containers = exists ? candidates.filter { scroll in
@@ -771,9 +772,9 @@ final class CreateUITests: XCTestCase {
             }
             // DESIGN uses the native keyboard. Its covered area cannot receive form gestures,
             // even when accessibility reports a scroll frame extending underneath it.
-            let keyboards = ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
+            let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
             guard let visible = NibUITestScrollGeometry.viewport(
-                scroll: scroll.frame, window: ui.app.frame, obstructions: keyboards) else { break }
+                scroll: scroll.frame, window: app.frame, obstructions: keyboards) else { break }
             if exists && element.isHittable, let target {
                 var required = target
                 if name == "Title" {
@@ -783,10 +784,10 @@ final class CreateUITests: XCTestCase {
             }
             let targetY = name == "Title" ? target.map { $0.midY - 68 } : target?.midY
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
-            let origin = ui.app.coordinate(withNormalizedOffset: .zero)
-            origin.withOffset(CGVector(dx: drag.start.x - ui.app.frame.minX, dy: drag.start.y - ui.app.frame.minY))
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
-                    dx: drag.end.x - ui.app.frame.minX, dy: drag.end.y - ui.app.frame.minY)),
+                    dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
                     withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
         }
         try require(element, "Missing required creation control: \(name)")
@@ -799,17 +800,17 @@ final class CreateUITests: XCTestCase {
         element.tap()
     }
 
-    private func replace(_ field: XCUIElement, with text: String) throws {
+    private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil) throws {
         try require(field, "Missing editable field: \(field)")
-        try scrollTo(field, name: field.label)
+        try scrollTo(field, name: field.label, in: application)
         field.tap()
         field.typeKey("a", modifierFlags: [.command])
         field.typeText(text)
-        dismissKeyboard()
+        dismissKeyboard(in: application)
     }
 
-    private func dismissKeyboard() {
-        let keyboard = ui.app.keyboards.firstMatch
+    private func dismissKeyboard(in application: XCUIApplication? = nil) {
+        let keyboard = (application ?? ui.app).keyboards.firstMatch
         guard keyboard.exists else { return }
         let hide = keyboard.buttons.matching(NSPredicate(
             format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
@@ -962,8 +963,12 @@ final class CreateUITests: XCTestCase {
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
         try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
-        try replace(title, with: eventTitle)
-        calendar.buttons["Add"].tap()
+        try replace(title, with: eventTitle, in: calendar)
+        let save = calendar.buttons["add-button"]
+        try require(save, "Calendar must expose its observed add-button (Done)")
+        XCTAssertTrue(save.isEnabled)
+        save.tap()
+        try wait("Calendar must save the event and close its editor") { !title.exists }
         ui.app.activate()
         try tap("Calendar")
         let connect = button("Connect Calendars")
