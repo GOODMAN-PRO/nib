@@ -19,7 +19,14 @@ struct SidebarPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             // §14.4: tabs lead every navigator, including panels that embed their own header.
-            if selected.id != PanelIDs.assistant { tabStrip }
+            if selected.id != PanelIDs.assistant {
+                HStack(spacing: 0) {
+                    tabStrip.frame(maxWidth: .infinity)
+                    // Keep host controls in the navigation strip when the feature
+                    // supplies its own header, without adding a second header row.
+                    if !chrome.drawsHeader(selected) { placementMenu }
+                }
+            }
             Rectangle()
                 .fill(NibColor.separatorSoft)
                 .frame(height: NibStroke.hairline)
@@ -37,10 +44,13 @@ struct SidebarPanelView: View {
     private var header: some View {
         NibPanelHeader(title: selected.title, symbol: NibSymbol(systemName: selected.icon) ?? .puzzle,
                        onClose: { chrome.closePanel(selected.id) }) {
-            PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
-                               mode: showsModeToggle ? mode : nil,
-                               additionalPanels: SidebarNavigation.additional(tabs))
+            placementMenu
         }
+    }
+
+    private var placementMenu: some View {
+        PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
+                           mode: showsModeToggle ? mode : nil, additionalPanels: tabs)
     }
 
     /// Pages, Outline and Bookmarks remain labelled; secondary panels live in the header's single menu.

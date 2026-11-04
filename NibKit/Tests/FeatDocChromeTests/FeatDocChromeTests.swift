@@ -898,6 +898,24 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertTrue(state.tabs.isEmpty, "the side that shows hides")
     }
 
+    func testSidebarToggleReopensRememberedFloatingNavigator() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        h.app.ui.panels.register(panel("test.pages", .sidebarTab))
+        h.app.ui.panels.register(panel("test.outline", .sidebarTab))
+        let state = try chromeState(h)
+        try await h.run("panel.open", ["id": "test.pages"])
+        try await h.run("settings.set", ["name": .string(ChromeSettings.placementName("test.pages")), "value": "floating"])
+        state.reconcile { PanelResolver.target($0, panels: h.app.ui.panels, kind: .notebook, settings: h.app.settings) }
+        try await h.run("panel.close", ["id": "test.pages"])
+        let reopened = try await h.run("sidebar.toggle")
+        XCTAssertEqual(reopened["panel"], "test.pages")
+        XCTAssertEqual(state.floating, ["test.pages"])
+        XCTAssertTrue(state.tabs.isEmpty)
+        XCTAssertEqual(h.app.settings.json(ChromeSettings.placementName("test.pages")), "floating")
+        try await h.run("sidebar.toggle")
+        XCTAssertTrue(state.openPanels.isEmpty)
+    }
+
     func testAContainerClosesPanelsItsDocumentKindDoesNotTake() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         h.app.ui.panels.register(panel("test.pages", .sidebarTab, kinds: [.notebook]))
