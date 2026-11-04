@@ -1043,13 +1043,14 @@ final class NibUI {
         }
     }
 
-    /// Captures the current screen, probe and AX tree at a named transition; no command or document mutation is injected.
-    func recordDiagnostics(_ name: String, facts: String = "") {
+    /// Captures screen/probe/facts; routine checkpoints can omit the expensive full AX tree.
+    func recordDiagnostics(_ name: String, facts: String = "", includeHierarchy: Bool = true) {
         XCTContext.runActivity(named: name) { activity in
             let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             screen.name = name + "-screen"; screen.lifetime = .keepAlways; activity.add(screen)
+            let hierarchy = includeHierarchy ? "\n" + app.debugDescription : ""
             let tree = XCTAttachment(string: "uptime=\(ProcessInfo.processInfo.systemUptime)\n\(facts)\n"
-                + "probe=\(probe.value ?? "missing")\n\(app.debugDescription)")
+                + "probe=\(probe.value ?? "missing")\(hierarchy)")
             tree.name = name + "-state-and-tree"; tree.lifetime = .keepAlways; activity.add(tree)
         }
     }

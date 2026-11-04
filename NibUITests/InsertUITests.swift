@@ -31,19 +31,18 @@ final class InsertUITests: XCTestCase {
             return false
         }
         try ui.launchFixture()
-        try allowSystemPermissionIfPresented(timeout: 2)
-        // XCTest invokes interruption monitors only on a subsequent interaction. A tap in the
-        // library's blank footer also dismisses a late permission sheet left by a terminated test.
-        ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.95)).tap()
+        // The retained interruption monitor handles late prompts on the document-opening action.
         try ui.openDocument("Physics — Motion")
         _ = try ui.waitForState { $0.itemCountOnPage == 4 && $0.strokeCountOnPage == 1 }
     }
 
     override func tearDownWithError() throws {
         guard let ui else { return }
-        let attachments = [XCTAttachment(screenshot: XCUIScreen.main.screenshot()),
-                           XCTAttachment(string: String(describing: ui.probe.value)),
-                           XCTAttachment(string: ui.app.debugDescription)]
+        var attachments = [XCTAttachment(screenshot: XCUIScreen.main.screenshot()),
+                           XCTAttachment(string: String(describing: ui.probe.value))]
+        if (testRun?.totalFailureCount ?? 0) > 0 {
+            attachments.append(XCTAttachment(string: ui.app.debugDescription))
+        }
         for (index, attachment) in attachments.enumerated() {
             attachment.name = "Insert-\(name)-\(["screen", "nib.qa.state", "accessibility"][index])"
             attachment.lifetime = .keepAlways
@@ -86,6 +85,7 @@ final class InsertUITests: XCTestCase {
         ui.app.descendants(matching: type).matching(NSPredicate(format: "identifier == %@ OR label == %@", name, name))
     }
     private func wait(_ message: String, timeout: TimeInterval = 8, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             throw NibUI.Failure.message(message + "\nprobe: " + String(describing: ui.probe.value))
@@ -96,7 +96,7 @@ final class InsertUITests: XCTestCase {
         if [.textField, .secureTextField, .textView, .searchField].contains(type) {
             // Focus is valid even when the software keyboard makes the editor non-hittable.
             let field = try ui.textEditor(name)
-            guard field.elementType == type else { throw NibUI.Failure.message("Unexpected editor type: \(name)") }
+            guard field.elementType == type, field.isEnabled else { throw NibUI.Failure.message("Unexpected or disabled editor: \(name)") }
             return field
         }
         let target = try ui.requireControl(name, type: type, scroll: scroll, timeout: 8)
@@ -116,16 +116,10 @@ final class InsertUITests: XCTestCase {
     }
     /// Samples typed controls in the active presentation without retaining mixed-type ordinals during transitions.
     private func visible(_ name: String) -> Bool {
-        let scope = ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
-            : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch
-            : ui.app.sheets.firstMatch.exists ? ui.app.sheets.firstMatch : ui.app
-        for type in [XCUIElement.ElementType.button, .menuItem, .textField, .textView, .searchField, .staticText, .cell, .image] {
-            let target = scope.descendants(matching: type).matching(NSPredicate(
-                format: "identifier == %@ OR label == %@", name, name)).firstMatch
-            if target.exists && target.isHittable { return true }
-        }
-        return false
+        guard let target = ui.findControl(name) else { return false }
+        return target.exists && target.isHittable
     }
+
     /// Preserves focus for native editing only; global commands use NibUI.chord at their call sites.
     private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) throws {
         let field = try focusedField()
@@ -827,7 +821,7 @@ final class InsertUITests: XCTestCase {
         try replace(search, with: "unmatchablezzzz")
         XCTAssertTrue(ui.app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'No results for'")).firstMatch.waitForExistence(timeout: 8))
         try replace(search, with: "Heart")
-        try ui.dismissKeyboard()
+        try ui.dismissNativeKeyboard()
         try tap("Heart"); try counts(5)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
         XCTAssertFalse(try XCTUnwrap(fragment()["assets"] as? JSON).isEmpty)
@@ -918,12 +912,12 @@ final class InsertUITests: XCTestCase {
     func testGIFLocalInvalidLinkReportsErrorAndFilesCancelInsertsNothing() throws {
         try elements(); try tap("GIFs"); try tap("Add GIF from a Link")
         try replace(try control("https://", .textField), with: "not a URL")
-        ui.recordDiagnostics("Invalid GIF before submit", facts: "Expected route: ElementsPopover.submit(.gifLink) -> report(element.insertGIF, invalid URL) -> nibCommandFailed -> ShellViewController.toastIfActive")
+        ui.recordDiagnostics("Invalid GIF before submit", facts: "Expected route: ElementsPopover.submit(.gifLink) -> report(imageInsert, invalid web address) -> nibCommandFailed -> ShellViewController.toastIfActive", includeHierarchy: false)
         try tap("Add GIF")
         let errors = ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'URL' OR label CONTAINS[c] 'address' OR label CONTAINS[c] 'invalid'"))
         // Observe the transient error before collecting the more expensive screen/tree attachments.
         let errorAppeared = errors.firstMatch.waitForExistence(timeout: 10)
-        ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test")
+        ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test", includeHierarchy: false)
         XCTAssertTrue(errorAppeared, "Invalid GIF link must give an actionable error")
         if visible("Cancel") { try tap("Cancel") }
         try tap("Add GIF from Files"); try tap("Cancel"); try counts(4)
@@ -997,15 +991,18 @@ final class InsertUITests: XCTestCase {
         try counts(before.itemCountOnPage + 1, strokes: before.strokeCountOnPage + 1)
     }
     func testTapeDrawHideRevealDoesNotAddUndoAndRemoveAllRestores() throws {
+        var completed = false
         defer {
-            ui.recordDiagnostics("Tape final command and undo state", facts: "Expected edit sequence: pen stroke, tape stroke, reveal, hide, undo tape, redo tape, removeAll, undo removeAll; reveal/hide are non-undoable")
-            // Read the user-visible history after the scenario, including when its strict count check throws.
-            do { try panel("History"); ui.recordDiagnostics("Tape actual history groups") }
-            catch { ui.recordDiagnostics("Tape history unavailable", facts: String(describing: error)) }
+            if !completed {
+                ui.recordDiagnostics("Tape final command and undo state", facts: "Expected edit sequence: pen stroke, tape stroke, reveal, hide, undo tape, redo tape, removeAll, undo removeAll; reveal/hide are non-undoable")
+                // Read the user-visible history after the scenario, including when its strict count check throws.
+                do { try panel("History"); ui.recordDiagnostics("Tape actual history groups") }
+                catch { ui.recordDiagnostics("Tape history unavailable", facts: String(describing: error)) }
+            }
         }
         try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: 2)
         try drawTape(); try counts(6, strokes: 3)
-        ui.recordDiagnostics("Tape committed before visibility toggles", facts: "pen + tape insertion completed")
+        ui.recordDiagnostics("Tape committed before visibility toggles", facts: "pen + tape insertion completed", includeHierarchy: false)
         let masked = try canvasPixels()
         ui.coordinate(CGPoint(x: 0.53, y: 0.70)).tap()
         try wait("Reveal tape must visibly expose underlying pen ink") {
@@ -1018,9 +1015,9 @@ final class InsertUITests: XCTestCase {
             return self.changedPixels(masked, current) < 20
         }
         try counts(6, strokes: 3)
-        ui.recordDiagnostics("Tape immediately before undo", facts: "reveal and hide completed; undo must remove tape insertion")
+        ui.recordDiagnostics("Tape immediately before undo", facts: "reveal and hide completed; undo must remove tape insertion", includeHierarchy: false)
         try ui.timedAction("Tape edit.undo") { try self.ui.tapCommand("edit.undo") }
-        ui.recordDiagnostics("Tape immediately after undo")
+        ui.recordDiagnostics("Tape immediately after undo", includeHierarchy: false)
         try counts(5, strokes: 2)
         try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
         try tap("tool.tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
@@ -1028,6 +1025,7 @@ final class InsertUITests: XCTestCase {
         try tap("Remove All Tape", scroll: true); try tap("Remove All Tape")
         outside(); try counts(5, strokes: 2)
         try ui.tapCommand("edit.undo"); try counts(6, strokes: 3)
+        completed = true
     }
     func testTapePatternWidthStraightnessOrientationAndClearHistory() throws {
         try ui.selectTool("tape"); try tap("tool.tape")
@@ -1135,9 +1133,9 @@ final class InsertUITests: XCTestCase {
     func testCommentAddOpenBadgeReplyAndCopyText() throws {
         try comment(); try tap("cmd.panel.close")
         try wait("Comment panel must finish closing before badge hit-testing") { !self.ui.app.buttons["cmd.panel.close"].exists }
-        ui.recordDiagnostics("Comment badge before reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)")
+        ui.recordDiagnostics("Comment badge before reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)", includeHierarchy: false)
         ui.coordinate(point).tap()
-        ui.recordDiagnostics("Comment badge after reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)")
+        ui.recordDiagnostics("Comment badge after reopen", facts: "tap screen point=\(ui.coordinate(point).screenPoint)", includeHierarchy: false)
         XCTAssertTrue(try message("Check the units").exists)
         let reply = try control("Reply"); try ui.focusField(reply); reply.typeText("Use metres per second"); try tap("Send")
         let posted = try message("Use metres per second")
@@ -1259,8 +1257,7 @@ final class InsertUITests: XCTestCase {
     }
     func testAudioMicrophoneDenialShowsRecoveryAndCreatesNoClip() throws {
         resetMicrophonePermission = true
-        ui.app.resetAuthorizationStatus(for: .microphone)
-        try ui.launchFixture(); try ui.openDocument("Physics — Motion")
+        // Setup already reset permission and opened a fresh fixture.
         var denied = false
         let denialMonitor = addUIInterruptionMonitor(withDescription: "Deny this recording's microphone request") { alert in
             guard let button = alert.buttons.allElementsBoundByIndex.first(where: {

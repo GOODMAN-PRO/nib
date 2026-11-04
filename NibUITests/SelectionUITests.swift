@@ -24,9 +24,12 @@ final class SelectionUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         guard let ui else { return }
-        for attachment in [XCTAttachment(screenshot: XCUIScreen.main.screenshot()),
-                           XCTAttachment(string: String(describing: ui.probe.value)),
-                           XCTAttachment(string: ui.app.debugDescription)] .enumerated() {
+        var attachments = [XCTAttachment(screenshot: XCUIScreen.main.screenshot()),
+                           XCTAttachment(string: String(describing: ui.probe.value))]
+        if (testRun?.totalFailureCount ?? 0) > 0 {
+            attachments.append(XCTAttachment(string: ui.app.debugDescription))
+        }
+        for attachment in attachments.enumerated() {
             attachment.element.name = "Selection-\(name)-\(["screen", "nib.qa.state", "accessibility"][attachment.offset])"
             attachment.element.lifetime = .keepAlways
             add(attachment.element)
@@ -42,6 +45,7 @@ final class SelectionUITests: XCTestCase {
     private func wait(_ message: String, timeout: TimeInterval = 10,
                       file: StaticString = #filePath, line: UInt = #line,
                       _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             XCTFail(message, file: file, line: line)
@@ -889,7 +893,7 @@ final class SelectionUITests: XCTestCase {
         let sourceItems = try copiedItems()
         try menu("Convert", "Text")
         let sourceRecognition = try control("Recognised text")
-        ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)")
+        ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)", includeHierarchy: false)
         try wait("Source HI must be recognised before testing preservation", timeout: 30) {
             (sourceRecognition.value as? String ?? "").uppercased().filter { $0.isLetter } == "HI"
         }
@@ -903,7 +907,7 @@ final class SelectionUITests: XCTestCase {
         let restyledItems = try copiedItems()
         try menu("Convert", "Text")
         let recognised = try control("Recognised text")
-        ui.recordDiagnostics("Neaten result recognition and stroke geometry", facts: "recognition=\(String(describing: recognised.value)); records=\(restyledItems)")
+        ui.recordDiagnostics("Neaten result recognition and stroke geometry", facts: "recognition=\(String(describing: recognised.value)); records=\(restyledItems)", includeHierarchy: false)
         try wait("Restyled HI must retain its recognised meaning", timeout: 30) {
             let text = (recognised.value as? String ?? "").uppercased().filter { $0.isLetter }
             return text == "HI"
