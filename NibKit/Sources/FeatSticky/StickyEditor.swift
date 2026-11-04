@@ -362,6 +362,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     }
 
     private weak var host: CanvasHost?
+    private let keyboard = NibKeyboardAvoidance()
     private var editing: Editing?
     private var observers: Set<AnyCancellable> = []
     /// The pending autosave, restarted by every keystroke.
@@ -373,6 +374,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     private init(host: CanvasHost) {
         self.host = host
         super.init()
+        keyboard.onChange = { [weak self] in self?.revealEditingNote() }
     }
 
     /// The note being edited.
@@ -453,7 +455,14 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
 
     /// Scrolls the note into view above the keyboard (without animation under Reduce Motion).
     private func reveal(_ note: StickyItem, page: PageID, host: CanvasHost) {
-        host.session.editor?.reveal(page: page, rect: note.frame.bounds, animated: !UIAccessibility.isReduceMotionEnabled)
+        host.session.editor?.reveal(page: page, rect: note.frame.bounds, animated: false)
+        revealEditingNote()
+    }
+
+    private func revealEditingNote() {
+        guard let e = editing, let host, let scroll = host.canvasView as? UIScrollView else { return }
+        position(e.view, zoom: e.zoom, page: e.page, host: host)
+        keyboard.reveal(e.view.bounds, in: e.view, scrolling: scroll)
     }
 
     private func open(doc: DocumentID, page: PageID, id: ElementID, note: StickyItem, placed: Bool, host: CanvasHost) {
@@ -498,6 +507,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             autosave = nil
         }
         editing = nil
+        keyboard.reset()
         observers.removeAll()
         e.view.textView.delegate = nil
         e.view.textView.onDone = nil
@@ -588,6 +598,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
 
     func textViewDidChangeSelection(_ textView: UITextView) {
         publishRange(textView)
+        revealEditingNote()
     }
 
     func textViewDidEndEditing(_ textView: UITextView) {

@@ -836,6 +836,7 @@ final class TextPopoverState: ObservableObject {
     }
     /// Available content height above the keyboard; the editor uses this budget to select its presentation.
     @Published var contentHeight: CGFloat = NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight
+    @Published var viewport: CGRect?
     var onClose: (() -> Void)?
 }
 
@@ -851,6 +852,15 @@ struct TextFormatPopover: View {
     static let minimumHeight: CGFloat = NibMetrics.popoverMaxHeight / 2
 
     var body: some View {
+        Group {
+            if let viewport = state.viewport {
+                panel.frame(width: viewport.width, height: viewport.height)
+                    .position(x: viewport.midX, y: viewport.midY)
+            } else { panel }
+        }
+    }
+
+    private var panel: some View {
         NibBudPopover(id: TextPopoverIDs.popover, source: TextPopoverIDs.source, isPresented: $state.isPresented,
                       title: state.panel.title, placement: .above) {
             // NibBudPopover owns the vertical scroll view. Nesting a fixed-height scroll view

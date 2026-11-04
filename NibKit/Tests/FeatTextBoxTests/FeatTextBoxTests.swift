@@ -3,6 +3,7 @@ import UIKit
 import SwiftUI
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatTextBox
 
 /// Refs `link.autodetect` (F029's) was called with, from a test double.
@@ -37,6 +38,39 @@ private final class FakeFloatingHost: FloatingHosting {
 
 @MainActor
 final class FeatTextBoxTests: XCTestCase {
+    func testKeyboardViewportFitsEditorAndInspectorAboveDockedKeyboard() {
+        let window = CGRect(x: 0, y: 24, width: 1376, height: 1008)
+        let keyboard = CGRect(x: 0, y: 589, width: 1376, height: 440)
+        let visible = NibKeyboardAvoidance.viewport(window, keyboard: keyboard)
+        XCTAssertEqual(visible, CGRect(x: 0, y: 24, width: 1376, height: 565))
+        // Recorded shape editor, sticky editor, and formatting inspector bounds from the UI lane.
+        for proposed in [CGRect(x: 641, y: 679, width: 176, height: 86),
+                         CGRect(x: 546, y: 584, width: 174, height: 155),
+                         CGRect(x: 740, y: 570, width: 312, height: 520)] {
+            let fitted = NibKeyboardAvoidance.fitting(proposed, in: visible)
+            XCTAssertTrue(visible.contains(fitted))
+            XCTAssertLessThan(fitted.maxY, keyboard.minY)
+            XCTAssertEqual(fitted.size, proposed.size)
+        }
+    }
+
+    func testKeyboardResizeHideAndFloatingKeyboardUseWindowIntersection() {
+        let window = CGRect(x: 40, y: 24, width: 700, height: 600)
+        let floating = CGRect(x: 400, y: 350, width: 300, height: 240)
+        let visible = NibKeyboardAvoidance.viewport(window, keyboard: floating)
+        let proposed = CGRect(x: 500, y: 480, width: 312, height: 520)
+        let fitted = NibKeyboardAvoidance.fitting(proposed, in: visible)
+        XCTAssertTrue(visible.contains(fitted))
+        XCTAssertLessThan(fitted.height, proposed.height, "Oversized inspectors need a bounded scroll viewport")
+        XCTAssertEqual(NibKeyboardAvoidance.viewport(window, keyboard: nil), window)
+        XCTAssertEqual(NibKeyboardAvoidance.viewport(window, keyboard: CGRect(x: 0, y: 800, width: 1000, height: 300)), window)
+        let otherWindow = CGRect(x: 0, y: 0, width: 300, height: 600)
+        XCTAssertEqual(NibKeyboardAvoidance.viewport(otherWindow, keyboard: floating), otherWindow)
+        let raised = NibKeyboardAvoidance.viewport(window, keyboard: floating.offsetBy(dx: 0, dy: -100))
+        XCTAssertEqual(raised.height, visible.height - 100)
+        XCTAssertTrue(raised.contains(NibKeyboardAvoidance.fitting(proposed, in: raised)))
+    }
+
     private let textRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
 
     private func box(_ h: Harness, _ id: ElementID = Fixtures.textID, page: PageID = Fixtures.page1) throws -> TextBoxItem {

@@ -9,6 +9,27 @@ This file is the exact Swift source of the `NibDesign` module, the only place in
 
 Contents
 
+Keyboard geometry (UI QA follow-up): `Components/NibKeyboardAvoidance.swift` adds the public,
+main-actor `NibKeyboardAvoidance` helper. It observes keyboard frame changes, converts screen frames
+through the editor's own window, computes an unobscured viewport, and reveals canvas editors with
+an owned, reversible bottom inset. `viewport(_:keyboard:)` and `fitting(_:in:margin:)` are pure geometry
+functions. Text boxes, shape labels and sticky editors use it; the text floating inspector constrains
+its entire `NibBudPopover` to that viewport, so its scrolling controls cannot flip below the keyboard.
+Keyboard-driven scrolling is immediate. Reset the helper on editing end and clear callbacks on detach.
+
+F035 limitation: Elements content is laid out inside the palette-owned settings panel. Its position is
+computed in `Components/Palette.swift` by `popover(for:anchor:placement:bounds:)` using full container
+bounds. Correcting that requires the palette owner to use the unobscured window viewport for both its
+panel height and centre. An offset or inset on `ElementsPopover` alone would move content inside the
+existing droplet clip and would not fix its touch region. That existing shared component is outside this
+QA job's additive-helper exception; F035 remains for the palette owner.
+
+Device/CI verification still required: repeat the seven Insert keyboard cases with the software keyboard;
+check the shape label and sticky editor remain hittable, scroll to Save Style and box colours, select Body,
+then hide/show and change keyboard height while the inspector is open. Repeat in a compact window and
+with a floating keyboard. Verify scroll insets return to their original values after editing. Pure viewport
+and editor/inspector-fit tests live in `FeatTextBoxTests`; they do not establish native window hit testing.
+
 1. [Integration changes this module needs](#1-integration-changes-this-module-needs)
 2. [How a feature uses it](#2-how-a-feature-uses-it)
 3. [Source](#3-source), one block per file
