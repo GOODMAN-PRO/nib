@@ -25,8 +25,9 @@ for attempt in $(seq 1 "$RETRIES"); do
   while [ "$(gh run view "$run" --repo "$REPO" --json status --jq .status)" != "completed" ]; do sleep 30; done
   conclusion=$(gh run view "$run" --repo "$REPO" --json conclusion --jq .conclusion)
   if [ "$conclusion" = "success" ]; then echo "RUN $run success"; exit 0; fi
-  # Unacquired: every job (ignoring the planning job and skipped jobs) is cancelled without having run a single step.
-  unacquired=$(gh api "repos/$REPO/actions/runs/$run/jobs" --jq '[.jobs[] | select(.name != "plan" and .conclusion != "skipped")] | if length == 0 then false else all(.conclusion == "cancelled" and ((.steps // []) | map(select(.status == "completed" and .conclusion != "skipped")) | length == 0)) end')
+  # Unacquired: ignoring the planning job and skipped jobs, every job either succeeded or was cancelled without having run a
+  # single step, and at least one was cancelled (GitHub sometimes acquires a runner for one job of a run and not another).
+  unacquired=$(gh api "repos/$REPO/actions/runs/$run/jobs" --jq '[.jobs[] | select(.name != "plan" and .conclusion != "skipped")] | if length == 0 then false else (any(.conclusion == "cancelled") and all(.conclusion == "success" or (.conclusion == "cancelled" and ((.steps // []) | map(select(.status == "completed" and .conclusion != "skipped")) | length == 0)))) end')
   if [ "$unacquired" = "true" ]; then
     echo "attempt $attempt: run $run never acquired a runner (macOS capacity); retrying in $SLEEP s"
     sleep "$SLEEP"; continue
