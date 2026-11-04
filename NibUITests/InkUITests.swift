@@ -726,18 +726,38 @@ final class InkUITests: XCTestCase {
         XCTAssertEqual(swatches[0].label, "Vermilion")
     }
 
+    /// Records native field and preset output at the action boundary without waiting; no command-bus result is fabricated.
+    private func traceSwatch(_ stage: String, field: XCUIElement? = nil) {
+        let attachment = XCTAttachment(string: "\(stage) field=\(String(describing: field?.value)) swatches=\(swatches.map(\.label))\n\(ui.probe.value ?? "missing")\n\(ui.app.debugDescription)")
+        attachment.name = stage; attachment.lifetime = .keepAlways; add(attachment)
+    }
+
     func testCustomColourValidHexUpdatesSlotAndInvalidHexIsRejected() throws {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
         try tap("Sliders")
         let hex = try hexField()
-        hex.tap(); ui.app.typeKey("a", modifierFlags: .command); hex.typeText("D03080")
+        let selection = try ui.state().selectionCount
+        hex.tap()
+        try wait("HEX field must be editable with its keyboard before Select All") { hex.isHittable && self.ui.app.keyboards.firstMatch.exists }
+        hex.typeKey("a", modifierFlags: .command); hex.typeText("D03080")
+        try wait("HEX field must contain D03080 before closing") {
+            (hex.value as? String)?.replacingOccurrences(of: "#", with: "").uppercased() == "D03080"
+        }
+        XCTAssertEqual(try ui.state().selectionCount, selection, "HEX Select All must not select document contents")
+        traceSwatch("preset.setSwatch-valid-before-close", field: hex)
+        defer { traceSwatch("preset.setSwatch-final") }
         try closeColourPicker()
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
         try swatchMenu("Change Colour"); try tap("Custom Colour"); try tap("Sliders")
         let invalid = try hexField()
-        invalid.tap(); ui.app.typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
+        invalid.tap()
+        try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
+        invalid.typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
+        XCTAssertNotNil(invalid.value as? String, "Native HEX editor must still expose its value")
+        XCTAssertEqual(try ui.state().selectionCount, selection, "Invalid HEX edit must not select document contents")
+        traceSwatch("preset.setSwatch-invalid-before-close", field: invalid)
         try closeColourPicker(); closePopover()
         XCTAssertEqual(swatches[0].label, valid, "Invalid HEX must not overwrite a valid colour")
         let blank = try raster(); try draw(); _ = try visibleInk(after: blank)

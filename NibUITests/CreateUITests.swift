@@ -557,7 +557,27 @@ final class CreateUITests: XCTestCase {
         try drawAndUndoRedo()
         try exitQuickNote()
         try tap("Combine to a Document…")
-        try tap("Physics — Motion", prefix: true)
+        let targetID = try XCTUnwrap(target.document)
+        let beforePages = try livePages(targetID).compactMap { $0["id"] as? String }
+        traceCreation("doc.merge-request source=\(source) into=\(targetID)")
+        defer { traceCreation("doc.merge-final source=\(source) into=\(targetID)") }
+        // The chooser row is not the cmd.doc.open library card behind the sheet.
+        let destinationName = NSPredicate(format: "label BEGINSWITH %@ AND identifier != 'cmd.doc.open'", "Physics — Motion")
+        let chooser = try XCTUnwrap((ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex)
+            .filter { $0.isHittable && $0.buttons.matching(destinationName).count > 0 }
+            .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height },
+            "Combine must expose its own target list")
+        let destination = chooser.buttons.matching(destinationName).firstMatch
+        try require(destination, "Combine chooser must offer the intended target")
+        destination.tap()
+        try wait("doc.merge must persist the appended page before reopening its target", timeout: 30) {
+            guard let pages = self.persistedHead(targetID)?["pages"] as? [[String: Any]] else { return false }
+            return pages.filter { ($0["deleted"] as? Bool) != true }.count == beforePages.count + 1
+        }
+        traceCreation("doc.merge-persisted source=\(source) into=\(targetID)")
+        XCTAssertEqual(Array(try livePages(targetID).compactMap { $0["id"] as? String }.prefix(beforePages.count)), beforePages,
+                       "doc.merge must preserve all original target page identities")
+        try wait("Combine chooser must finish before reopening") { !destination.exists }
         try ui.openDocument("Physics — Motion")
         let merged = try ui.waitForState { $0.pageCount == target.pageCount + 1 }
         XCTAssertEqual(merged.document, target.document)
@@ -650,15 +670,16 @@ final class CreateUITests: XCTestCase {
             String(try XCTUnwrap(components.day)), formatter.string(from: chosen))).firstMatch
         try require(day, "Native start-date picker must expose the chosen day")
         day.tap()
-        // The native compact date picker can overlap the header while XCTest still reports
-        // Create as hittable. Dismiss that system popover before invoking the create action;
-        // tapping the covered header instead can open the picker's month/year controls.
+        // Escape is delivered to the native picker, not an app-relative outside point that can close the planner.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
-            ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).tap()
+            traceCreation("planner-before-picker-dismissal")
+            picker.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
+            traceCreation("planner-after-picker-dismissal")
         }
+        try require(button("Create Planner"), "Picker dismissal must preserve the parent planner")
         try tap("Create Planner")
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "notebook", pages: 7)
@@ -1027,6 +1048,37 @@ final class CreateUITests: XCTestCase {
         let row = try XCTUnwrap(containers.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height },
                                "calendar: missing \(action) action for \(eventTitle)")
         row.buttons[action].firstMatch.tap()
+    }
+
+    /// Reads a fresh persisted head without XCTest assertions so a pending write can be polled safely.
+    private func persistedHead(_ id: String) -> [String: Any]? {
+        for url in packages() {
+            for file in (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+                where file.lastPathComponent.hasPrefix("doc.") && file.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: file),
+                      let head = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      (head["meta"] as? [String: Any])?["id"] as? String == id else { continue }
+                return head
+            }
+        }
+        return nil
+    }
+
+    /// Captures current picker/merge evidence without waiting or mutating; persisted IDs distinguish wrong targets from stale UI.
+    private func traceCreation(_ stage: String) {
+        var heads: [[String: Any]] = []
+        for url in packages() {
+            for file in (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+                where file.lastPathComponent.hasPrefix("doc.") && file.pathExtension == "json" {
+                if let data = try? Data(contentsOf: file), let head = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    heads.append(["package": url.path, "head": head])
+                }
+            }
+        }
+        let json = (try? JSONSerialization.data(withJSONObject: heads, options: [.prettyPrinted, .sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "unreadable persisted heads"
+        let attachment = XCTAttachment(string: "\(stage)\n\(json)\n\(ui.probe.value ?? "missing")\n\(ui.app.debugDescription)")
+        attachment.name = stage; attachment.lifetime = .keepAlways; add(attachment)
     }
 
     // MARK: Read-only persisted results (simulator fixture only)

@@ -597,7 +597,14 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize()
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
-        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen"))
+        let pen = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Fountain Pen'")).firstMatch
+        XCTAssertTrue(pen.exists && pen.isHittable, "Pen reorder handle must define the insertion row")
+        let insertion = pen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .withOffset(CGVector(dx: 0, dy: -pen.frame.height / 2 - 2))
+        let trace = XCTAttachment(string: "toolbar.setLayout via onMove: Highlighter \(handle.frame), Pen \(pen.frame), insertion \(insertion.screenPoint)\n\(ui.app.debugDescription)")
+        trace.name = "reorder-insertion-target"; trace.lifetime = .keepAlways; add(trace)
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: insertion, withVelocity: .slow, thenHoldForDuration: 0.2)
         try wait("Reordering must move Highlighter above Pen") {
             self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }
