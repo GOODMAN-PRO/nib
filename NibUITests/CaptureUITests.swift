@@ -23,9 +23,7 @@ final class CaptureUITests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        defer { ui?.app.terminate() }
-        try ui?.handleAuthorizationAlerts()
-        XCUIDevice.shared.orientation = .portrait
+        ui?.app.terminate()
     }
 
     /// Waits for one explicit appearance/orientation fixture, keeping each capture scenario within its own allowance.
@@ -40,8 +38,10 @@ final class CaptureUITests: XCTestCase {
             try ui.handleAuthorizationAlerts()
             _ = try ui.waitForState(timeout: 120) { $0.screen == "library" }
             try ui.handleAuthorizationAlerts()
-            try ui.establishFullScreen()
-            XCUIDevice.shared.orientation = orientation == "portrait" ? .portrait : .landscapeLeft
+            let requested: UIDeviceOrientation = orientation == "portrait" ? .portrait : .landscapeLeft
+            let frame = ui.app.windows.firstMatch.frame
+            let sceneAgrees = orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
+            if XCUIDevice.shared.orientation != requested || !sceneAgrees { XCUIDevice.shared.orientation = requested }
             try wait("The scene must reach \(orientation)") {
                 let frame = self.ui.app.windows.firstMatch.frame
                 return self.orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
@@ -54,7 +54,6 @@ final class CaptureUITests: XCTestCase {
             attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: "diagnostic-\(name)")
             XCTFail(reason)
         }
-        ui.app.terminate()
     }
 
     private func attach(_ attachment: XCTAttachment, name: String) {
@@ -65,6 +64,7 @@ final class CaptureUITests: XCTestCase {
 
     private func wait(_ message: String, timeout: TimeInterval = 12,
                       _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             throw NibUI.Failure.message(message)
@@ -79,7 +79,7 @@ final class CaptureUITests: XCTestCase {
     @discardableResult
     private func require(_ name: String) throws -> XCUIElement {
         let element = query(name).firstMatch
-        guard element.waitForExistence(timeout: 12) else {
+        guard element.exists || element.waitForExistence(timeout: 12) else {
             throw NibUI.Failure.message("State cannot be reached: missing \(name)")
         }
         return element
@@ -267,7 +267,6 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.ui.tapCommand("search.open")
             let field = try self.ui.textEditor("Find in this document")
-            try self.ui.focusField(field)
             field.typeText("Motion")
             try self.wait("Document search must contain matches", timeout: 30) {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(

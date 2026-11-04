@@ -34,13 +34,18 @@ final class CanvasUITests: XCTestCase {
         state.name = "Canvas-\(name)-qa-state"
         state.lifetime = .keepAlways
         add(state)
+        if (testRun?.totalFailureCount ?? 0) > 0 {
+            let hierarchy = XCTAttachment(string: ui.app.debugDescription)
+            hierarchy.name = "Canvas-\(name)-failure-tree"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+        }
         ui.app.terminate()
-        XCUIDevice.shared.orientation = .landscapeLeft
     }
 
     private func open(_ title: String? = nil) throws {
         try ui.openDocument(title ?? notebook)
-        XCTAssertTrue(ui.canvas.waitForExistence(timeout: 15), "Document must expose nib.canvas")
+        XCTAssertTrue(ui.canvas.exists || ui.canvas.waitForExistence(timeout: 15), "Document must expose nib.canvas")
     }
 
     private func element(_ label: String) -> XCUIElement {
@@ -49,14 +54,14 @@ final class CanvasUITests: XCTestCase {
 
     private func content(_ text: String) throws -> XCUIElement {
         let target = ui.app.descendants(matching: .any).matching(NSPredicate(format: "value == %@", text)).firstMatch
-        XCTAssertTrue(target.waitForExistence(timeout: 10), "Canvas must expose content: \(text)")
+        XCTAssertTrue(target.exists || target.waitForExistence(timeout: 10), "Canvas must expose content: \(text)")
         return target
     }
 
     @discardableResult
     private func require(_ label: String, timeout: TimeInterval = 8) throws -> XCUIElement {
         let target = element(label)
-        guard target.waitForExistence(timeout: timeout) else {
+        guard target.exists || target.waitForExistence(timeout: timeout) else {
             throw NibUI.Failure.message("Missing canvas control: \(label)\n\(ui.app.debugDescription)")
         }
         return target
@@ -77,6 +82,7 @@ final class CanvasUITests: XCTestCase {
     }
 
     private func eventually(_ message: String, timeout: TimeInterval = 10, _ predicate: @escaping () -> Bool) {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed, message)
     }
@@ -140,8 +146,12 @@ final class CanvasUITests: XCTestCase {
     /// The paper accessibility element, excluding the identically labelled 40-point HUD.
     private func page(_ number: Int = 1, count: Int = 4) throws -> XCUIElement {
         let query = ui.app.otherElements.matching(NSPredicate(format: "label == %@", "Page \(number) of \(count)"))
-        eventually("Page \(number) must be laid out") { query.allElementsBoundByIndex.contains { $0.frame.height > 100 } }
-        return try XCTUnwrap(query.allElementsBoundByIndex.first { $0.frame.height > 100 })
+        var found: XCUIElement?
+        eventually("Page \(number) must be laid out") {
+            found = query.allElementsBoundByIndex.first { $0.exists && $0.frame.height > 100 }
+            return found != nil
+        }
+        return try XCTUnwrap(found)
     }
 
     private func setDirection(_ direction: String) throws {
@@ -170,7 +180,7 @@ final class CanvasUITests: XCTestCase {
 
     private func boardRow(_ number: Int, count: Int) throws -> XCUIElement {
         let row = ui.app.buttons.matching(NSPredicate(format: "value == %@", "Board \(number) of \(count)")).firstMatch
-        XCTAssertTrue(row.waitForExistence(timeout: 8), "Boards navigator must expose board \(number) of \(count)")
+        XCTAssertTrue(row.exists || row.waitForExistence(timeout: 8), "Boards navigator must expose board \(number) of \(count)")
         return row
     }
 
@@ -639,11 +649,7 @@ final class CanvasUITests: XCTestCase {
         let before = try ui.state()
         try boards()
         try tap("Templates")
-        let target = element(title)
-        for _ in 0..<5 {
-            if target.exists && target.isHittable { break }
-            ui.app.scrollViews.allElementsBoundByIndex.last?.swipeUp()
-        }
+        // performTap reveals the requested row in its live container, including virtualized templates.
         try tap(title)
         let inserted = try ui.waitForState { $0.itemCountOnPage > before.itemCountOnPage && $0.undoAvailable }
         try ui.tapCommand("edit.undo")
