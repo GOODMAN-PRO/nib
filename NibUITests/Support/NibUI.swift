@@ -725,14 +725,19 @@ final class NibUI {
         let viewport = source.windows.firstMatch.frame
         let hide = source.keyboards.buttons.matching(NSPredicate(
             format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
-                hasVisibleFrame($0, in: viewport) && $0.isHittable
+                hasVisibleFrame($0, in: viewport)
             }
         let route = hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button"
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
-            if let hide { hide.tap() }
-            else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
+            if let hide {
+                // Floating keypad keys can report an invalid activation point: isHittable and tap() then record
+                // "Failed to determine hittability". Tap the visible frame's centre by coordinate instead.
+                let centre = CGPoint(x: hide.frame.midX, y: hide.frame.midY)
+                source.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: centre.x - source.frame.minX, dy: centre.y - source.frame.minY)).tap()
+            } else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
         }
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
