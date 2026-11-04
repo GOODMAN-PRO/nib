@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import BackgroundTasks
+import UIKit
 
 /// Anything registered by a feature or plugin. `owner` = feature id or plugin id (used to unregister).
 public protocol Registrable {
@@ -512,6 +513,27 @@ public struct StrokeProcessorEntry: Registrable {
     }
 }
 
+// MARK: - Printing
+
+/// contracts-v2.5: a document kind's paper-aware renderer, used by `print.present` without a feature import.
+public struct PrintRendererDescriptor: Registrable {
+    public var id: String
+    public var docKinds: Set<DocumentKind>
+    public var owner: String
+    public var order: Int
+    /// Builds a renderer for the print system's paper and page ranges, using the window's latest edits if available.
+    public var makeRenderer: @MainActor (DocumentID, EditorSession?) throws -> UIPrintPageRenderer
+
+    public init(id: String, docKinds: Set<DocumentKind>, owner: String, order: Int = 0,
+                makeRenderer: @escaping @MainActor (DocumentID, EditorSession?) throws -> UIPrintPageRenderer) {
+        self.id = id
+        self.docKinds = docKinds
+        self.owner = owner
+        self.order = order
+        self.makeRenderer = makeRenderer
+    }
+}
+
 // MARK: - Keyboard
 
 public struct KeyModifiers: OptionSet, Hashable, Codable {
@@ -942,6 +964,7 @@ public final class ContentRegistries {
     public let drawers = Registry<ItemDrawerEntry>()
     public let importers = Registry<ImporterDescriptor>()
     public let exporters = Registry<ExporterDescriptor>()
+    public let printRenderers = Registry<PrintRendererDescriptor>()
     public let aiActions = Registry<AIActionDescriptor>()
     public let strokeProcessors = Registry<StrokeProcessorEntry>()
     public let keyCommands = Registry<KeyCommandDescriptor>()
@@ -957,6 +980,11 @@ public final class ContentRegistries {
     public let textLayouts = Registry<TextLayoutDescriptor>()
 
     public init() {}
+
+    /// contracts-v2.5: the renderer for `kind` with the lowest order (then id); nil uses PDF export.
+    public func printRenderer(for kind: DocumentKind) -> PrintRendererDescriptor? {
+        printRenderers.all.first { $0.docKinds.contains(kind) }
+    }
 
     /// contracts-v2: where `item`'s text lays out: the registered `TextLayoutDescriptor` for its draw key or kind, else
     /// for text boxes the frame inset by `TextBoxStyle.padding` (top-aligned, `style.defaults`); nil for items

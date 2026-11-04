@@ -8,6 +8,32 @@ import NibTesting
 /// (docs/CONTRACTS.md › contracts-v2 changelog).
 @MainActor
 final class ContractsV2Tests: XCTestCase {
+    func testPrintRendererLookupUsesKindThenLowestOrderAndID() throws {
+        let content = ContentRegistries()
+        let renderer = UIPrintPageRenderer()
+        let session = EditorSession()
+        content.printRenderers.register(PrintRendererDescriptor(
+            id: "text.fallback", docKinds: [.textDocument], owner: "test", order: 100) { _, _ in UIPrintPageRenderer() })
+        content.printRenderers.register(PrintRendererDescriptor(
+            id: "text.preferred", docKinds: [.textDocument], owner: "test", order: 10) { doc, window in
+                XCTAssertEqual(doc, Fixtures.textDocID)
+                XCTAssertTrue(window === session)
+                return renderer
+            })
+        let descriptor = try XCTUnwrap(content.printRenderer(for: .textDocument))
+        XCTAssertEqual(descriptor.id, "text.preferred")
+        XCTAssertEqual(descriptor.owner, "test")
+        XCTAssertTrue(try descriptor.makeRenderer(Fixtures.textDocID, session) === renderer)
+        XCTAssertNil(content.printRenderer(for: .notebook))
+        XCTAssertNil(content.printRenderer(for: .studySet))
+        content.printRenderers.register(PrintRendererDescriptor(
+            id: "a.tie", docKinds: [.textDocument, .whiteboard], owner: "test", order: 10) { _, _ in renderer })
+        XCTAssertEqual(content.printRenderer(for: .textDocument)?.id, "a.tie")
+        XCTAssertEqual(content.printRenderer(for: .whiteboard)?.id, "a.tie")
+        content.printRenderers.unregister(owner: "test")
+        XCTAssertNil(content.printRenderer(for: .textDocument))
+    }
+
     private let doc = Fixtures.docID
     private let page1 = Fixtures.page1
     private let mathRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"

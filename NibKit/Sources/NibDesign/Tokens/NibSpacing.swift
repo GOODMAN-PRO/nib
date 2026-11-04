@@ -15,6 +15,16 @@ public enum NibSpacing {
     public static let x6: CGFloat = 64
 }
 
+/// Shared paper geometry for printing and PDF export (DESIGN.md §15.6).
+public enum NibPrint {
+    /// Page margin on every side (pt).
+    public static let margin: CGFloat = 54
+    /// Type on paper, relative to the Large Dynamic Type size of the screen roles.
+    public static let typeScale: CGFloat = 0.7
+    /// The band that holds page numbers at the foot of a page (pt).
+    public static let footerHeight: CGFloat = 32
+}
+
 /// Continuous-corner radii (DESIGN.md §6). A shape inside a shape uses `concentric(outer, inset:)`.
 public enum NibRadius {
     public static let popover: CGFloat = 26

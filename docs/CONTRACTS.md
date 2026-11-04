@@ -20,6 +20,8 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 
 ## contracts-v2 changelog
 
+**contracts-v2.5 - print renderers (additive)**. `PrintRendererDescriptor` registers a document kind's `@MainActor` throwing renderer factory, with a public initializer, `id`, `docKinds`, `owner` and `order`. `ContentRegistries.printRenderers` and `printRenderer(for:)` select the lowest order, then id; an unregistered kind returns nil and keeps PDF export. F103 registers `textdoc.print` for text documents, reads the shared `NibPrint` margin (54 pt), type scale (0.7) and footer height (32 pt), and removes its editor-only Command-P hook. F067's `print.present` presents the registered renderer with the document title as the job name, leaving paper and page ranges to AirPrint; dry runs build no renderer and lock and user-presence checks remain in force. Its Command-P descriptor names the window's document and covers notebooks, whiteboards and text documents (study sets currently export CSV only). Registry, token and feature tests cover selection, routing, PDF fallback and guards; `NameLookupCanaryTests` includes the new public type. Resolves and removes `docs/contract-requests/F103-print.md` and `docs/contract-requests/F103-print-metrics.md`.
+
 **contracts-v2.4 — UI automation** (additive). `NibUITestMode.isEnabled: Bool` reads the explicit `-NibUITestFixture` launch argument once. `NibUITestMode.rootURL: URL?` is nil in normal launches and a unique temporary directory in fixture launches. It does not set `NibApp.isHostlessTest` or install fake services. NibLibrary uses that root for its real library and catalogue; the app shell isolates preferences, seeds via commands, and delays the library screen until ready. `UIMenuElement.nibCommand(_ command: String) -> Self` assigns `cmd.<command>` without changing the title, state or handler. Native and SwiftUI descriptor renderers follow this same identifier policy; tool selectors use `tool.<toolID>`. The additive NibDesign `NibAction(command:)`, `NibSheetHeader(primaryCommand:)` and `View.nibCommand(_:)` carry that identity through shared components. `NibTool.accessibilityID` defaults to `tool.<id>` and accepts command identity for palette accessories. `UITestInfrastructureTests` covers opt-in isolation and native menu identity; `NameLookupCanaryTests` includes the new public type.
 
 The fixture-only transparent `nib.qa.state` element computes compact JSON on accessibility reads: `{screen, document, page, pageCount, tool, zoom, contentOffset, itemCountOnPage, strokeCountOnPage, selectionCount, undoAvailable, redoAvailable, openPanels, paletteDock}`. Document/page are nullable raw IDs, contentOffset is `{x,y}` in scroll-view points, zoom is the actual canvas `UIScrollView.zoomScale`, openPanels contains registered session panel IDs, and paletteDock is `{edge,along}` or null without a canvas. An additive `fixtureError` string reports seed failures. There is no production polling or probe. The UI test target is independent of the existing CI schemes. Helper API and simulator invocation: [NibUITests/README.md](../NibUITests/README.md).
@@ -9268,6 +9270,7 @@ public enum AppGroup {
 import Foundation
 import CoreGraphics
 import BackgroundTasks
+import UIKit
 
 /// Anything registered by a feature or plugin. `owner` = feature id or plugin id (used to unregister).
 public protocol Registrable {
@@ -9779,6 +9782,27 @@ public struct StrokeProcessorEntry: Registrable {
     }
 }
 
+// MARK: - Printing
+
+/// contracts-v2.5: a document kind's paper-aware renderer, used by `print.present` without a feature import.
+public struct PrintRendererDescriptor: Registrable {
+    public var id: String
+    public var docKinds: Set<DocumentKind>
+    public var owner: String
+    public var order: Int
+    /// Builds a renderer for the print system's paper and page ranges, using the window's latest edits if available.
+    public var makeRenderer: @MainActor (DocumentID, EditorSession?) throws -> UIPrintPageRenderer
+
+    public init(id: String, docKinds: Set<DocumentKind>, owner: String, order: Int = 0,
+                makeRenderer: @escaping @MainActor (DocumentID, EditorSession?) throws -> UIPrintPageRenderer) {
+        self.id = id
+        self.docKinds = docKinds
+        self.owner = owner
+        self.order = order
+        self.makeRenderer = makeRenderer
+    }
+}
+
 // MARK: - Keyboard
 
 public struct KeyModifiers: OptionSet, Hashable, Codable {
@@ -9896,6 +9920,16 @@ public extension KeyCommandDescriptor {
 /// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
 /// hands UIKit one command per shortcut, so two features mapping the same keys never race).
 public enum KeyCommandRouting {
+    /// Fallback for a hardware press UIKit delivered without invoking its
+    /// UIKeyCommand (for example through an embedded SwiftUI hosting tree).
+    /// Use the same winner and text-input priority rules as the command table.
+    public static func unhandledPress(_ shortcut: KeyShortcut, descriptors: [KeyCommandDescriptor],
+                                      in context: KeyCommandContext) -> KeyCommandDescriptor? {
+        active(descriptors, in: context).first {
+            $0.shortcut == shortcut && overridesSystemKeys($0, in: context)
+        }
+    }
+
     /// True when `a` wins over `b` for the same shortcut, most specific first: the command limited to fewer document
     /// kinds (`docKinds`; nil, empty and every kind all count as every kind, so they tie); then the narrower scope
     /// (`.canvas`, then `.document` or `.library`, then `.global`); then the lower `order`; then the id.
@@ -9923,9 +9957,11 @@ public enum KeyCommandRouting {
     /// True when the key command should take priority over what the system does with the same keys (the shell sets
     /// `UIKeyCommand.wantsPriorityOverSystemBehavior`): always, except for a key without ⌘, ⌥ or ⌃ (a letter, an
     /// arrow, Space, Return, Tab, Delete or Escape, with or without ⇧) while text has the keyboard, where typing,
-    /// cursor movement and the text view's own Escape win.
+    /// cursor movement and the text view's own Escape win. Command-A also belongs to an active text input;
+    /// selecting library items must not steal Select All from a rename or colour field.
     public static func overridesSystemKeys(_ d: KeyCommandDescriptor, in context: KeyCommandContext) -> Bool {
-        !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+        if context.isEditingText, d.shortcut == KeyShortcut("a", [.command]) { return false }
+        return !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
     }
 
     /// How many document kinds a command is live in: its `docKinds`, or every kind when they are nil or empty.
@@ -10197,6 +10233,7 @@ public final class ContentRegistries {
     public let drawers = Registry<ItemDrawerEntry>()
     public let importers = Registry<ImporterDescriptor>()
     public let exporters = Registry<ExporterDescriptor>()
+    public let printRenderers = Registry<PrintRendererDescriptor>()
     public let aiActions = Registry<AIActionDescriptor>()
     public let strokeProcessors = Registry<StrokeProcessorEntry>()
     public let keyCommands = Registry<KeyCommandDescriptor>()
@@ -10212,6 +10249,11 @@ public final class ContentRegistries {
     public let textLayouts = Registry<TextLayoutDescriptor>()
 
     public init() {}
+
+    /// contracts-v2.5: the renderer for `kind` with the lowest order (then id); nil uses PDF export.
+    public func printRenderer(for kind: DocumentKind) -> PrintRendererDescriptor? {
+        printRenderers.all.first { $0.docKinds.contains(kind) }
+    }
 
     /// contracts-v2: where `item`'s text lays out: the registered `TextLayoutDescriptor` for its draw key or kind, else
     /// for text boxes the frame inset by `TextBoxStyle.padding` (top-aligned, `style.defaults`); nil for items
@@ -13909,18 +13951,18 @@ enum NameLookupCanary {
         NibSettings.self, SecretStore.self, SystemKeychainStore.self, Keychain.self, DeviceIdentity.self,
         AppGroup.self, Registrable.self, Registry<TemplateDefinition>.self, TemplateParam.self, TemplateRender.self,
         TemplateDefinition.self, DrawContext.self, ItemDrawer.self, ItemDrawerEntry.self, ImportTarget.self,
-        ImporterDescriptor.self, ExportRequest.self, ExporterDescriptor.self, AIActionDescriptor.self, StrokeProcessor.self,
+        ImporterDescriptor.self, ExportRequest.self, ExporterDescriptor.self, PrintRendererDescriptor.self, AIActionDescriptor.self, StrokeProcessor.self,
         StrokeProcessorEntry.self, KeyModifiers.self, KeyShortcut.self, KeyScope.self, KeyCommandDescriptor.self,
         BackgroundTaskKind.self, BackgroundTaskDescriptor.self, CanvasGesture.self, TapHandlerDescriptor.self, BoardTemplateDescriptor.self,
         TapePatternDescriptor.self, ElementEntry.self, ElementCollectionDescriptor.self, BlockKindDescriptor.self, CustomItemTypeDescriptor.self,
         PencilActionDescriptor.self, ContentRegistries.self, PKBridge.self, RichTextBridge.self, CanvasInputMode.self,
         CanvasSample.self, CanvasHost.self, CanvasTool.self, CanvasAttachment.self, CanvasAttachmentDescriptor.self,
-        PencilEventHandler.self, DocumentEditing.self, ToolbarGroup.self, ToolbarItemDescriptor.self, MenuLocation.self,
+        PencilEventHandler.self, DocumentEditing.self, ToolbarGroup.self, ToolbarNavSlot.self, ToolbarItemDescriptor.self, MenuLocation.self,
         MenuContext.self, MenuItemDescriptor.self, PanelPlacement.self, PanelContext.self, PanelDescriptor.self,
         SettingsSection.self, SettingsPageDescriptor.self, InspectorContext.self, InspectorDescriptor.self, ToolMenuDescriptor.self,
         BlockViewContext.self, BlockViewDescriptor.self, PluginPanelFactory.self, CanvasToolDescriptor.self, DocumentEditorDescriptor.self,
         OpenMode.self, SceneNavigator.self, SceneHooks.self, ScreenRegistry.self, UIRegistries.self,
-        NibFeature.self, NibApp.self, SafeMode.self, InkOutline.self, FakeCanvasHost.self,
+        NibFeature.self, NibApp.self, SafeMode.self, NibUITestMode.self, InkOutline.self, FakeCanvasHost.self,
         InMemoryCollabTransport.self,
         // contracts-v2
         NibEventPayload.self, SyncStatusPayload.self, IndexProgressPayload.self, LaserMovedPayload.self,
@@ -13987,6 +14029,32 @@ import NibTesting
 /// (docs/CONTRACTS.md › contracts-v2 changelog).
 @MainActor
 final class ContractsV2Tests: XCTestCase {
+    func testPrintRendererLookupUsesKindThenLowestOrderAndID() throws {
+        let content = ContentRegistries()
+        let renderer = UIPrintPageRenderer()
+        let session = EditorSession()
+        content.printRenderers.register(PrintRendererDescriptor(
+            id: "text.fallback", docKinds: [.textDocument], owner: "test", order: 100) { _, _ in UIPrintPageRenderer() })
+        content.printRenderers.register(PrintRendererDescriptor(
+            id: "text.preferred", docKinds: [.textDocument], owner: "test", order: 10) { doc, window in
+                XCTAssertEqual(doc, Fixtures.textDocID)
+                XCTAssertTrue(window === session)
+                return renderer
+            })
+        let descriptor = try XCTUnwrap(content.printRenderer(for: .textDocument))
+        XCTAssertEqual(descriptor.id, "text.preferred")
+        XCTAssertEqual(descriptor.owner, "test")
+        XCTAssertTrue(try descriptor.makeRenderer(Fixtures.textDocID, session) === renderer)
+        XCTAssertNil(content.printRenderer(for: .notebook))
+        XCTAssertNil(content.printRenderer(for: .studySet))
+        content.printRenderers.register(PrintRendererDescriptor(
+            id: "a.tie", docKinds: [.textDocument, .whiteboard], owner: "test", order: 10) { _, _ in renderer })
+        XCTAssertEqual(content.printRenderer(for: .textDocument)?.id, "a.tie")
+        XCTAssertEqual(content.printRenderer(for: .whiteboard)?.id, "a.tie")
+        content.printRenderers.unregister(owner: "test")
+        XCTAssertNil(content.printRenderer(for: .textDocument))
+    }
+
     private let doc = Fixtures.docID
     private let page1 = Fixtures.page1
     private let mathRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"

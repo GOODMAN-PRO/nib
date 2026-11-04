@@ -12,17 +12,15 @@ import NibDesign
 
 // MARK: - Metrics
 
-/// Paper geometry, not UI: NibDesign has no print tokens (DESIGN §15.6). These three are requested as tokens in
-/// docs/contract-requests/F103-print-metrics.md (a print margin, a print type scale, the page-number band) and stay
-/// here until NibDesign has them.
+/// Paper geometry shared with other exporters through NibDesign's `NibPrint` tokens (DESIGN §15.6).
 enum TextDocPrintMetrics {
     /// Printed type uses the reading column's roles at the Large Dynamic Type size, scaled to print size (body 17 pt
     /// becomes 11.9 pt, the size of printed prose).
-    static let typeScale: CGFloat = 0.7
+    static let typeScale: CGFloat = NibPrint.typeScale
     /// Page margins: three quarters of an inch on every side.
-    static let margin: CGFloat = 54
+    static let margin: CGFloat = NibPrint.margin
     /// The page number's band at the foot of each page.
-    static let footerHeight: CGFloat = NibSpacing.x3
+    static let footerHeight: CGFloat = NibPrint.footerHeight
 
     /// Where text goes on a page: the printable area, at least a margin from the paper's edges, above the page
     /// number's band. An unset paper (asked before the print system chose one) falls back to `fallback`.
@@ -964,21 +962,10 @@ enum TextDocPrintImages {
 
 // MARK: - Printing
 
-/// ⌘P in a text document: the system print sheet with this document laid out for the paper the user picks. The key
-/// is a `TextDocHooks` key (live while a block has the caret) until F067's print.present routes text documents here
-/// (docs/contract-requests/F103-print.md); `present(doc:app:session:)` and `renderer(doc:app:session:)` need no editor.
+/// Text documents laid out for the print system's paper. F067's `print.present` reaches `renderer` through the
+/// registered descriptor and owns the window's Command-P key. Both `present` and `renderer` need no editor.
 @MainActor
 enum TextDocPrinter {
-    static let keyID = TextDocExtrasHookIDs.prefix + "print"
-
-    static func install() {
-        TextDocHooks.addKeyCommandSet(TextDocExtrasHookIDs.prefix + "print.keys", order: 200) { _ in
-            [TextDocKeyCommand(id: keyID, title: String(localized: "Print"), input: "p", modifiers: .command) { editor in
-                present(from: editor)
-            }]
-        }
-    }
-
     static func present(from editor: TextDocViewController) {
         present(doc: editor.documentID, app: editor.app, session: editor.session)
     }

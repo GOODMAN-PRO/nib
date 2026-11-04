@@ -6,6 +6,12 @@ import UIKit
 /// The v2 additions (DESIGN_SYSTEM.md, "NibDesign v2 additions"): tokens that must resolve, the rules components
 /// compute, and every public initialiser called once, so an ambiguous overload fails here and not in a feature.
 final class NibDesignV2Tests: XCTestCase {
+    func testPrintTokensUsePaperPointsAndFixedTypeScale() {
+        XCTAssertEqual(NibPrint.margin, 54)
+        XCTAssertEqual(NibPrint.typeScale, 0.7, accuracy: 1e-9)
+        XCTAssertEqual(NibPrint.footerHeight, 32)
+    }
+
     // MARK: Symbols
 
     func testEveryTokenIsAnAllowedSymbolOnThisOS() {
