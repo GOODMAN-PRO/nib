@@ -49,30 +49,30 @@ final class SelectionUITests: XCTestCase {
         }
     }
 
+    /// Waits for a typed action in the active presentation; re-resolves after every menu transition.
     private func control(_ name: String, type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
-        let q = query(name, type: type)
-        for attempt in 0..<(scroll ? 10 : 2) {
-            let matches = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let found = matches.first(where: { [.button, .switch, .textField, .textView].contains($0.elementType) }) ?? matches.first {
-                // SwiftUI menus expose both the row and its label. An index in the mixed-type
-                // query can resolve differently when XCTest performs the action. Keep the
-                // intended labelled control (icons such as "scribble" are shared by rows).
-                let exact = ui.app.descendants(matching: found.elementType).matching(NSPredicate(
-                    format: "identifier == %@ AND label == %@", found.identifier, found.label))
-                if exact.count == 1 { return exact.firstMatch }
-                return found
+        let types: [XCUIElement.ElementType] = type == .any
+            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider] : [type]
+        func candidate() -> XCUIElement? {
+            let scope = ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
+                : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch : ui.app
+            for kind in types {
+                let query = scope.descendants(matching: kind).matching(NSPredicate(
+                    format: "identifier == %@ OR label == %@", name, name))
+                let first = query.firstMatch
+                guard first.exists else { continue }
+                // Bind identity before hittability; never probe an Other wrapper or retain a mixed ordinal.
+                let bound = scope.descendants(matching: kind).matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", first.identifier, first.label)).firstMatch
+                if bound.isEnabled && bound.isHittable { return bound }
             }
-            if attempt == 0 { _ = q.firstMatch.waitForExistence(timeout: 3) }
-            let panels = ui.app.scrollViews.allElementsBoundByIndex
-                + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
-            if scroll, let panel = panels.first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.width > 200 && $0.frame.height > 150
-            }) {
-                panel.coordinate(withNormalizedOffset: CGVector(dx: 0.025, dy: 0.8)).press(forDuration: 0.01,
-                    thenDragTo: panel.coordinate(withNormalizedOffset: CGVector(dx: 0.025, dy: 0.2)))
-            }
+            return nil
         }
-        throw NibUI.Failure.message("Missing actionable selection control: \(name)\n\(ui.app.debugDescription)")
+        if scroll {
+            ui.revealFormElement { self.query(name, type: types[0]).firstMatch }
+        }
+        try wait("Missing actionable selection control: \(name)") { candidate() != nil }
+        return try XCTUnwrap(candidate(), "Selection control changed during discovery: \(name)")
     }
 
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
@@ -796,6 +796,12 @@ final class SelectionUITests: XCTestCase {
         }
         try loop(count: 3)
     }
+    /// Waits for a custom handwriting summary's geometry without treating that read-only Other element as a button.
+    private func handwritingGeometry(_ label: String) throws -> XCUIElement {
+        let element = ui.app.otherElements.matching(NSPredicate(format: "label == %@", label)).firstMatch
+        try wait("Handwriting summary must expose its current bounds") { element.exists && !element.frame.isEmpty }
+        return element
+    }
     private func editWords() throws {
         try words(); try menu("Smart Ink", "Edit Handwriting")
         _ = try ui.waitForState(timeout: 8) { $0.tool == "smartink.edit" }
@@ -805,7 +811,7 @@ final class SelectionUITests: XCTestCase {
         try editWords()
         ui.coordinate(CGPoint(x: 0.43, y: 0.595)).doubleTap()
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
-        let word = try control("Selected word")
+        let word = try handwritingGeometry("Selected word")
         XCTAssertLessThan(word.frame.maxX, ui.coordinate(CGPoint(x: 0.52, y: 0.595)).screenPoint.x)
         let before = try ui.state()
         try tap("Delete Word")
@@ -814,8 +820,8 @@ final class SelectionUITests: XCTestCase {
     }
     func testHandwritingReflowNarrowWidthPreservesStrokeCountAndWordShapes() throws {
         try editWords(); let before = try ui.state()
-        let block = try control("Handwriting being edited"), original = block.frame
-        let right = try control("Right edge")
+        let block = try handwritingGeometry("Handwriting being edited"), original = block.frame
+        let right = try control("Right edge", type: .other)
         drag(centre(right.frame), CGPoint(x: original.minX + original.width * 0.48, y: right.frame.midY))
         try wait("Narrowing the handwriting column must add lines") { block.frame.height > original.height + 10 }
         try countsEqual(before)
