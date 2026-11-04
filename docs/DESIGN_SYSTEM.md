@@ -4017,6 +4017,8 @@ struct WaterCluster: Identifiable, Equatable {
 
 ### 3.17a `NibKit/Sources/NibDesign/Liquid/DropletDock.swift`
 
+If `.dropletDockable` receives an incompatible dock request during a re-form, it retains the latest dock (including its axis and position along the edge) and replays it when the current reshape finishes, even when the request reverses the axis before the spreading midpoint. Replay uses the existing dock springs without another lift; a release retains its single arrival plip for the final dock, while command and accessibility moves remain silent.
+
 The palette's water dock (DESIGN.md §10.1–10.3, §10.10, §10.11), public so any droplet that docks like the palette can use it. `DropletDockModel` is the pure dock logic (region, frames, the projected release, the nearest dock with the top's +40 pt bias, the 200 / 160 pt capture radius, the meniscus law) and is unit-tested (§3.28a). `.dropletDockable(_:length:thickness:docks:current:style:reservedTrailing:onDock:)` makes a full-size child of the container a dockable droplet; its content reads `@Environment(\.nibDockEdge)` for its axis. `NibDock.commandValue` / `init?(commandValue:)` are the `toolbar.dock` names (left, right, top, bottom). Internally `DockMeniscus` is the neck to the dock that `DropletField` draws, `DropletDockDriver` is the hold-and-release path `NibToolPalette` shares, and `DockLanding` arms the one plip.
 
 ```swift
