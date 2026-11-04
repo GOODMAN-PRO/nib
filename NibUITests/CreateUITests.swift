@@ -52,6 +52,7 @@ final class CreateUITests: XCTestCase {
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Title"], with: "Escape cancelled draft")
+        try dismissKeyboard()
         ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try wait("create.cancel: Escape must dismiss the creation sheet") { !self.ui.app.textFields["Title"].exists }
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
@@ -76,6 +77,7 @@ final class CreateUITests: XCTestCase {
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Title"], with: "Cancelled draft")
+        try dismissKeyboard()
         try tap("Cancel")
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
         try wait("create.cancel must dismiss the draft") { !self.ui.app.textFields["Title"].exists }
@@ -128,7 +130,9 @@ final class CreateUITests: XCTestCase {
         try require(cardFace("Term"), "create.type: Study set must open the front input")
         try require(cardFace("Definition"), "create.type: Study set must open the back input")
         try replace(cardFace("Term"), with: "Typed front")
+        try dismissKeyboard()
         try replace(cardFace("Definition"), with: "Typed back")
+        try dismissKeyboard()
         XCTAssertEqual(cardFace("Term").value as? String, "Typed front")
         XCTAssertEqual(cardFace("Definition").value as? String, "Typed back")
     }
@@ -148,6 +152,7 @@ final class CreateUITests: XCTestCase {
             (titleField.value as? String) == "Suggested creation title"
         }
         try replace(titleField, with: "Temporary override")
+        try dismissKeyboard()
         try tap("Use “Suggested creation title”")
         XCTAssertEqual(titleField.value as? String, "Suggested creation title")
         try tap("Save as “Suggested creation title”")
@@ -217,15 +222,20 @@ final class CreateUITests: XCTestCase {
         try tap("No cover")
         try chooseSize("Custom")
         try replace(ui.app.textFields["Width in millimetres"], with: "100")
+        try dismissKeyboard()
         try replace(ui.app.textFields["Height in millimetres"], with: "150")
+        try dismissKeyboard()
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
     func testInvalidCustomSizePreventsCreation() throws {
+        executionTimeAllowance = 300 // Diagnostic only; quiescence remains enabled.
         try notebook("Invalid dimensions")
         try chooseSize("Custom")
         try replace(ui.app.textFields["Width in millimetres"], with: "0")
+        try dismissKeyboard()
         try replace(ui.app.textFields["Height in millimetres"], with: "0")
+        try dismissKeyboard()
         let create = ui.app.buttons["cmd.doc.create"]
         if create.isEnabled { create.tap() }
         let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -290,6 +300,7 @@ final class CreateUITests: XCTestCase {
             format: "(elementType == %d OR elementType == %d) AND (label CONTAINS[c] 'hex' OR placeholderValue CONTAINS[c] 'hex')",
             XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue)).firstMatch
         try replace(hex, with: "#CEDFED")
+        try dismissKeyboard()
         try tap("Choose Template")
         try scrollTo(ui.app.textFields["Title"], name: "Title")
         try assertPreviewColour(0xCEDFED)
@@ -302,7 +313,10 @@ final class CreateUITests: XCTestCase {
         executionTimeAllowance = 300
         try distribution("Every other")
     }
-    func testApplyAllPagesDistributesPaperAcrossPages() throws { try distribution("All pages") }
+    func testApplyAllPagesDistributesPaperAcrossPages() throws {
+        executionTimeAllowance = 300 // Diagnostic headroom for the observed animation-idle stall.
+        try distribution("All pages")
+    }
 
     func testSavedDefaultsReopenWithoutChangingExistingNotebook() throws {
         try ui.openDocument("Physics — Motion")
@@ -368,6 +382,7 @@ final class CreateUITests: XCTestCase {
     func testWhiteboardOptionsReachNewBoard() throws {
         try newMenu("Whiteboard")
         try replace(ui.app.textFields["Whiteboard name"], with: "Board options")
+        try dismissKeyboard()
         try scrollTap("Grid")
         try scrollTap("Ivory")
         try scrollTap("Handwriting language", prefix: true)
@@ -413,6 +428,7 @@ final class CreateUITests: XCTestCase {
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Whiteboard name"], with: "Keyboard board")
+        try dismissKeyboard()
         try tap("Create")
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "whiteboard", pages: 1)
@@ -441,7 +457,9 @@ final class CreateUITests: XCTestCase {
         try require(cardFace("Term"),
                     "create.studySet must open the card editor with front/back inputs")
         try replace(cardFace("Term"), with: "Question from UI")
+        try dismissKeyboard()
         try replace(cardFace("Definition"), with: "Answer from UI")
+        try dismissKeyboard()
         try ui.tapCommand("window.showLibrary")
         try wait("create.studySet must persist both faces") {
             guard let data = try? self.head(id), let cards = data["cards"] as? [[String: Any]], let card = cards.first else { return false }
@@ -507,6 +525,7 @@ final class CreateUITests: XCTestCase {
         try drawAndUndoRedo()
         try exitQuickNote()
         try replace(ui.app.textFields["Title"], with: "Saved QuickNote")
+        try dismissKeyboard()
         try tap("Save as “Saved QuickNote”")
         try ui.openDocument("Saved QuickNote")
         XCTAssertEqual(try ui.state().document, id)
@@ -804,26 +823,27 @@ final class CreateUITests: XCTestCase {
         element.tap()
     }
 
+    /// Waits for the edited field value before any keyboard dismissal, exposing focus/selection failures directly.
     private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
         field.tap()
         field.typeKey("a", modifierFlags: [.command])
         field.typeText(text)
-        dismissKeyboard(in: application)
+        try wait("Field must contain the replacement before dismissal: \(text)") {
+            (field.value as? String) == text
+        }
     }
 
-    private func dismissKeyboard(in application: XCUIApplication? = nil) {
+    /// Waits for the observed native Hide keyboard button and then disappearance; never taps an assumed corner.
+    private func dismissKeyboard(in application: XCUIApplication? = nil) throws {
         let keyboard = (application ?? ui.app).keyboards.firstMatch
         guard keyboard.exists else { return }
         let hide = keyboard.buttons.matching(NSPredicate(
-            format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
-        if hide.exists && hide.isHittable {
-            hide.tap()
-        } else {
-            // iPad's system keyboard has a dismissal key at its lower-right corner.
-            keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.94)).tap()
-        }
+            format: "label ==[c] 'Hide keyboard' OR label ==[c] 'Dismiss keyboard'")).firstMatch
+        try wait("Native keyboard must expose its dismissal control") { hide.exists && hide.isHittable }
+        hide.tap()
+        try wait("Keyboard must disappear after Hide keyboard") { !keyboard.exists }
     }
 
     private func newMenu(_ choice: String) throws {
@@ -841,6 +861,7 @@ final class CreateUITests: XCTestCase {
     private func notebook(_ title: String) throws {
         try newMenu("Notebook")
         try replace(ui.app.textFields["Title"], with: title)
+        try dismissKeyboard()
         // Resign focus without Return, which is the Create action on this field.
         try tap("Notebook")
     }
@@ -968,6 +989,7 @@ final class CreateUITests: XCTestCase {
         try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
         try replace(title, with: eventTitle, in: calendar)
+        try dismissKeyboard(in: calendar)
         let save = calendar.buttons["add-button"]
         try require(save, "Calendar must expose its observed add-button (Done)")
         XCTAssertTrue(save.isEnabled)
