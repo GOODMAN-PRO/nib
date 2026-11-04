@@ -34,7 +34,7 @@ struct QAState: Decodable {
 @MainActor
 final class NibUI {
     let app = XCUIApplication()
-    var probe: XCUIElement { app.descendants(matching: .any)["nib.qa.state"].firstMatch }
+    var probe: XCUIElement { app.otherElements["nib.qa.state"].firstMatch }
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
@@ -45,7 +45,7 @@ final class NibUI {
         guard element.exists else { return false }
         let frame = element.frame
         let visible = frame.intersection(viewport ?? app.windows.firstMatch.frame)
-        return !frame.isNull && !frame.isInfinite && visible.width > 1 && visible.height > 1
+        return !frame.isNull && !frame.isInfinite && !visible.isNull && visible.width > 1 && visible.height > 1
     }
 
     /// Exact, bounded matches only. Native editors precede their identically labelled captions.
@@ -71,11 +71,11 @@ final class NibUI {
                 let first = matches.firstMatch
                 guard first.exists else { continue }
                 if !actionable { return first }
-                if hasVisibleFrame(first), first.isHittable { return first }
+                if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
                 // Duplicate command labels occur in retained/hidden menus. Never enumerate the whole tree.
                 for index in 1..<max(1, min(matches.count, 8)) {
                     let element = matches.element(boundBy: index)
-                    if hasVisibleFrame(element), element.isHittable { return element }
+                    if hasVisibleFrame(element), !element.isEnabled || element.isHittable { return element }
                 }
             }
         }
@@ -107,22 +107,25 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
-        if hasVisibleFrame(initial) && initial.isHittable,
-           (form?.frame ?? app.windows.firstMatch.frame).contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
+        if let form, hasVisibleFrame(initial, in: form.frame) && initial.isHittable,
+           form.frame.contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
         let containers = (app.collectionViews.allElementsBoundByIndex + app.tables.allElementsBoundByIndex
             + app.scrollViews.allElementsBoundByIndex).filter {
                 $0.identifier != "nib.canvas" && $0.frame.height > 100 && $0.frame.width > 200
                     && app.windows.firstMatch.frame.intersects($0.frame)
                     && ($0.isHittable || [.collectionView, .table].contains($0.elementType))
             }
+        let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
         let containing = containers.filter { list in
-            initial.exists && list.descendants(matching: initial.elementType).matching(NSPredicate(
-                format: "identifier == %@ AND label == %@", initial.identifier, initial.label)).count > 0
+            guard let initialSnapshot else { return false }
+            return list.descendants(matching: initialSnapshot.elementType).matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", initialSnapshot.identifier, initialSnapshot.label)).firstMatch.exists
         }
         guard let list = form ?? containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
             ?? containers.max(by: { $0.frame.minX < $1.frame.minX }) else { return }
-        for down in [false, true] {
-            var previous: String?
+        let firstDown = initial.exists && initial.frame.midY < list.frame.midY
+        for down in [firstDown, !firstDown] {
+            var visited = Set<String>()
             for _ in 0..<8 {
                 let element = target()
                 let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
@@ -133,13 +136,12 @@ final class NibUI {
                 // One snapshot supplies the visible range; querying every row attribute separately can itself time out.
                 guard let snapshot = try? list.snapshot() else { return }
                 let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
-                if signature == previous { break }
-                previous = signature
+                if !visited.insert(signature).inserted { break }
                 let origin = app.coordinate(withNormalizedOffset: .zero)
                 // Custom pen forms put sliders across the centre. Their 16-point content inset is scrollable;
                 // native grouped lists instead need a row touch, away from the trailing switch.
                 let x = [.collectionView, .table].contains(list.elementType)
-                    ? viewport.midX : viewport.minX + min(8, viewport.width * 0.025)
+                    ? viewport.midX : viewport.minX + 1
                 let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
                 let endY = viewport.minY + viewport.height * (down ? 0.75 : 0.25)
                 origin.withOffset(CGVector(dx: x - app.frame.minX, dy: startY - app.frame.minY))
@@ -225,10 +227,19 @@ final class NibUI {
     /// than from the runner's UIScreen (which reports the runner's compatibility size on large iPads). A screenshot
     /// image carries the device scale when XCTest sets it; otherwise its size is in pixels and the runner's scale,
     /// which is the device's, converts it.
+    private static var displayRects: [Int: CGRect] = [:]
+
     static func displayRect() -> CGRect {
+        let orientation = XCUIDevice.shared.orientation
+        if let cached = displayRects[orientation.rawValue] { return cached }
         let image = XCUIScreen.main.screenshot().image
         let scale = image.scale > 1 ? CGFloat(1) : UIScreen.main.scale
-        return CGRect(origin: .zero, size: CGSize(width: image.size.width / scale, height: image.size.height / scale))
+        let rect = CGRect(origin: .zero, size: CGSize(width: image.size.width / scale, height: image.size.height / scale))
+        // Never poison the cache with an image captured during an orientation transition or face-up/unknown state.
+        if (orientation.isLandscape && rect.width > rect.height) || (orientation.isPortrait && rect.height > rect.width) {
+            displayRects[orientation.rawValue] = rect
+        }
+        return rect
     }
 
     /// Waits for the main window to cover the physical display before any orientation assertion.
@@ -294,7 +305,7 @@ final class NibUI {
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             more.isHittable && colour.isHittable
         }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+        guard (more.isHittable && colour.isHittable) || XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
             throw Failure.message("Palette separator grip needs visible More tools and Colour 1")
         }
         let before = app.windows.firstMatch.frame
@@ -377,9 +388,11 @@ final class NibUI {
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
         try establishFullScreen(allowFixtureRelaunch: true)
-        // Device orientation may already say landscape after tearDown rotated
-        // SpringBoard. Deliver the request to this scene too.
-        XCUIDevice.shared.orientation = .landscapeLeft
+        // Re-request orientation only if the device or this scene still disagrees; SpringBoard's orientation
+        // alone does not prove that the launched scene has rotated.
+        if XCUIDevice.shared.orientation != .landscapeLeft || app.windows.firstMatch.frame.width <= app.windows.firstMatch.frame.height {
+            XCUIDevice.shared.orientation = .landscapeLeft
+        }
         let landscape = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
             // The application's union frame includes transient system windows.
             // Validate the main app window using one fresh snapshot per poll.
@@ -388,7 +401,9 @@ final class NibUI {
             let frame = window.frame
             return frame.width > frame.height && frame.height > 0
         }, object: nil)
-        guard XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
+        let frame = app.windows.firstMatch.frame
+        guard (frame.width > frame.height && frame.height > 0)
+            || XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
             throw Failure.message("Nib's launched scene did not reach landscape")
         }
         try establishFullScreen(allowFixtureRelaunch: true)
@@ -419,7 +434,7 @@ final class NibUI {
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Type into the verified responder, not a caption or an arbitrary unfocused application.
-            XCUIElement.perform(withKeyModifiers: modifiers) { recipient.typeKey(key, modifierFlags: modifiers) }
+            recipient.typeKey(key, modifierFlags: modifiers)
             do { try postcondition() }
             catch {
                 recordDiagnostics("Chord postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
@@ -598,19 +613,21 @@ final class NibUI {
     }
 
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
-    func textField(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
+    func textEditor(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
         var field: XCUIElement?
         func locate() -> Bool {
-            field = findControl(name, type: .textField, actionable: false)
-            return field != nil
+            for type in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
+                if let found = findControl(name, type: type, actionable: false) { field = found; return true }
+            }
+            return false
         }
         if !locate() {
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in locate() }, object: nil)
             guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed else {
-                throw Failure.message("Missing native text field: \(name)")
+                throw Failure.message("Missing native text editor: \(name)")
             }
         }
-        guard let field else { throw Failure.message("Missing native text field: \(name)") }
+        guard let field else { throw Failure.message("Missing native text editor: \(name)") }
         try focusField(field)
         return field
     }
@@ -631,7 +648,7 @@ final class NibUI {
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
         try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
             try focusField(field)
-            XCUIElement.perform(withKeyModifiers: modifiers) { field.typeKey(key, modifierFlags: modifiers) }
+            field.typeKey(key, modifierFlags: modifiers)
         }
     }
 
@@ -646,10 +663,12 @@ final class NibUI {
 
     /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
     func waitForNativeText(in field: XCUIElement, equals text: String) throws {
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+        func matches() -> Bool {
             guard let value = field.value as? String else { return false }
             return value == text || (text.isEmpty && value == field.placeholderValue)
-        }, object: nil)
+        }
+        if matches() { return }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in matches() }, object: nil)
         guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
             throw Failure.message("Native replacement mismatch: expected \(text.debugDescription), got \(String(describing: field.value))")
         }
@@ -689,6 +708,7 @@ final class NibUI {
 
     @discardableResult
     func waitForState(timeout: TimeInterval = 30, _ matches: @escaping (QAState) -> Bool) throws -> QAState {
+        if let current = try readState(), matches(current) { return current }
         var latest: QAState?
         var error: Error?
         let predicate = NSPredicate { [self] _, _ in
@@ -713,11 +733,11 @@ final class NibUI {
         _ = try waitForState { $0.screen == "library" }
         let document = app.buttons.matching(identifier: "cmd.doc.open")
             .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", title, title + ",")).firstMatch
-        guard document.waitForExistence(timeout: 15) else { throw Failure.message("Document missing: \(title); state: \(String(describing: probe.value))\n\(app.debugDescription)") }
+        guard document.exists || document.waitForExistence(timeout: 15) else { throw Failure.message("Document missing: \(title); state: \(String(describing: probe.value))\n\(app.debugDescription)") }
         // The card's decorative accessibility group can also have a button trait.
         // Only the command-bearing outer button owns document navigation.
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true AND enabled == true"), object: document)
-        guard XCTWaiter.wait(for: [ready], timeout: 15) == .completed else { throw Failure.message("Document is not hittable: \(title)") }
+        guard (document.isHittable && document.isEnabled) || XCTWaiter.wait(for: [ready], timeout: 15) == .completed else { throw Failure.message("Document is not hittable: \(title)") }
         // Hittable means that some of the card is visible, not that its centre
         // lies in the library's scroll viewport. A clipped card must receive the
         // same visible tap a person can make, never a tap on chrome below it.
@@ -772,20 +792,21 @@ final class NibUI {
 
     private func tapControl(_ id: String, overflow: [String]) throws {
         func candidate(_ identifier: String) -> XCUIElement? {
-            app.descendants(matching: .any).matching(identifier: identifier).allElementsBoundByIndex
-                .first { $0.isHittable && $0.isEnabled }
+            guard let control = findControl(identifier, type: .button), control.isEnabled else { return nil }
+            return control
         }
         func menuHost(containing control: XCUIElement? = nil) -> XCUIElement? {
             (app.scrollViews.allElementsBoundByIndex + app.collectionViews.allElementsBoundByIndex)
                 .filter { scroll in
                     guard scroll.identifier != "nib.canvas", scroll.isHittable else { return false }
-                    let matches = scroll.descendants(matching: .any).matching(identifier: id)
+                    let matches = scroll.buttons.matching(identifier: id)
                     if let control { return matches.allElementsBoundByIndex.contains { $0.frame == control.frame } }
                     return matches.count > 0
                 }
                 .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
         }
         func revealInMenu() -> XCUICoordinate? {
+            var visited = Set<String>()
             for _ in 0..<16 {
                 let control = candidate(id)
                 let scroll = menuHost(containing: control)
@@ -801,7 +822,10 @@ final class NibUI {
                 // More contains full sections (including Add Page) in a bounded viewport.
                 // Scroll its real host; existence alone does not make an offscreen row actionable.
                 guard let scroll, let viewport else { return nil }
-                let target = scroll.descendants(matching: .any).matching(identifier: id).firstMatch
+                guard let snapshot = try? scroll.snapshot() else { return nil }
+                let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
+                guard visited.insert(signature).inserted else { return nil }
+                let target = scroll.buttons.matching(identifier: id).firstMatch
                 let drag = NibUITestScrollGeometry.drag(in: viewport, toward: target.frame.midY)
                 origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
                     .press(forDuration: 0.01, thenDragTo: origin.withOffset(
@@ -809,6 +833,11 @@ final class NibUI {
                         withVelocity: .slow, thenHoldForDuration: 0.15)
             }
             return nil
+        }
+        // Common palette/history controls cannot be clipped by an overflow form; avoid discovering every scroll host.
+        if id.hasPrefix("tool.") || ["cmd.edit.undo", "cmd.edit.redo", "cmd.window.showLibrary"].contains(id),
+           let control = candidate(id) {
+            control.tap(); return
         }
         if let control = revealInMenu() { control.tap(); return }
         for identifier in overflow {
@@ -818,7 +847,7 @@ final class NibUI {
                 let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
                     candidate(id) != nil || menuHost() != nil
                 }, object: nil)
-                _ = XCTWaiter.wait(for: [ready], timeout: 5)
+                if candidate(id) == nil && menuHost() == nil { _ = XCTWaiter.wait(for: [ready], timeout: 5) }
                 if let control = revealInMenu() { control.tap(); return }
                 if menu.isHittable { menu.tap() }
             }
@@ -939,9 +968,11 @@ final class NibUI {
 
     func dismissSheets() throws {
         for _ in 0..<8 {
-            if let close = ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close"].compactMap({ id in
-                findControl(id, type: .button)
-            }).first { close.tap(); continue }
+            var close: XCUIElement?
+            for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close"] {
+                if let found = findControl(id, type: .button), found.isEnabled { close = found; break }
+            }
+            if let close { close.tap(); continue }
             if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
                 sheet.swipeDown(); continue
             }

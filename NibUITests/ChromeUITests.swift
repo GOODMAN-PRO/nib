@@ -46,14 +46,17 @@ final class ChromeUITests: XCTestCase {
 
     @discardableResult
     private func require(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
+        // Preserve existence-only callers, but prefer native controls to their identically labelled captions.
+        if let found = ui.findControl(name, actionable: false) { return found }
         let target = query(name).firstMatch
-        guard target.waitForExistence(timeout: timeout) else {
+        guard target.exists || target.waitForExistence(timeout: timeout) else {
             throw NibUI.Failure.message("Missing chrome control: \(name)\n\(ui.app.debugDescription)")
         }
-        return target
+        return ui.findControl(name, actionable: false) ?? target
     }
 
     private func wait(_ message: String, timeout: TimeInterval = 12, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             throw NibUI.Failure.message("\(message)\nState: \(ui.probe.value ?? "missing")\n\(ui.app.debugDescription)")
@@ -62,7 +65,9 @@ final class ChromeUITests: XCTestCase {
 
     /// Waits for an actionable control in its containing form with bidirectional, progress-bounded scrolling.
     private func reachable(_ name: String) throws -> XCUIElement {
-        try ui.requireControl(name, scroll: true, timeout: 8)
+        let found = try ui.requireControl(name, scroll: true, timeout: 8)
+        guard found.isEnabled else { throw NibUI.Failure.message("Chrome control is not enabled: \(name)") }
+        return found
     }
 
     private func tap(_ name: String) throws { try reachable(name).tap() }
@@ -105,7 +110,7 @@ final class ChromeUITests: XCTestCase {
     }
     private func replace(_ name: String, _ text: String) throws {
         // Duration has a separate StaticText caption; only the native editor can accept key synthesis.
-        let target = try ui.textField(name)
+        let target = try ui.textEditor(name)
         try ui.replaceNativeText(in: target, with: text)
     }
 

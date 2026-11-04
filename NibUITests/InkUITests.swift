@@ -41,6 +41,7 @@ final class InkUITests: XCTestCase {
     private func wait(_ description: String, timeout: TimeInterval = 8,
                       file: StaticString = #filePath, line: UInt = #line,
                       _ condition: @escaping () -> Bool) throws {
+        if condition() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             XCTFail(description, file: file, line: line)
