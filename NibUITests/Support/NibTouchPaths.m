@@ -26,7 +26,7 @@
     Class pathClass = NSClassFromString(@"XCPointerEventPath");
     XCUIDevice *device = XCUIDevice.sharedDevice;
     NSMutableArray<NSString *> *selectors = [NSMutableArray array];
-    for (Class cls = pathClass; cls; cls = class_getSuperclass(cls)) {
+    for (Class cls = pathClass; cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
         unsigned int count = 0;
         Method *methods = class_copyMethodList(cls, &count);
         for (unsigned int i = 0; i < count; i++) {

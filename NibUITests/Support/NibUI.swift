@@ -496,7 +496,6 @@ final class NibUI {
             throw Failure.message("Global chord rejected text responder: \(current.keyResponder ?? "unknown")")
         }
         if app.state != .runningForeground { app.activate() }
-        if let responder = current.keyResponder, current.keyResponderIsText == false { return responder }
 
         func tapInertHeader(in surface: XCUIElement, modal: Bool) throws {
             // One snapshot avoids per-control AX round trips. Conservatively exclude every control frame,
@@ -718,15 +717,26 @@ final class NibUI {
         return field.debugDescription.components(separatedBy: "\n").first?.contains("Keyboard Focused") == true
     }
 
-    /// Hide-key AX frames are invalid on the floating number pad. Command-Return is UIKit's
-    /// keyboard-dismissal chord; unlike Return it does not submit the creation form.
+    /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
+    /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
     func dismissNativeKeyboard(in application: XCUIApplication? = nil) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
-        try hardwareKey(XCUIKeyboardKey.return.rawValue, .command)
+        let viewport = source.windows.firstMatch.frame
+        let hide = source.keyboards.buttons.matching(NSPredicate(
+            format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
+                hasVisibleFrame($0, in: viewport) && $0.isHittable
+            }
+        let route = hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button"
+        try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
+            let attachment = XCTAttachment(string: "route=\(route)")
+            attachment.lifetime = .keepAlways; activity.add(attachment)
+            if let hide { hide.tap() }
+            else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
+        }
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
-            throw Failure.message("Keyboard did not dismiss after hardware Command-Return")
+            throw Failure.message("Keyboard did not dismiss after \(route)")
         }
     }
 
