@@ -3,6 +3,7 @@ import UIKit
 import SwiftUI
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatTextBox
 
 /// Refs `link.autodetect` (F029's) was called with, from a test double.
@@ -22,8 +23,12 @@ private final class FakeFloatingHost: FloatingHosting {
     var presented: [String] = []
     var anchors: [String: CGRect] = [:]
     var offset: CGFloat = 900
+    private(set) var presentationCount = 0
 
-    func present(_ id: String, content: AnyView) { if !presented.contains(id) { presented.append(id) } }
+    func present(_ id: String, content: AnyView) {
+        presentationCount += 1
+        if !presented.contains(id) { presented.append(id) }
+    }
     func dismiss(_ id: String) { presented.removeAll { $0 == id } }
     func isPresenting(_ id: String) -> Bool { presented.contains(id) }
     func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
@@ -37,6 +42,39 @@ private final class FakeFloatingHost: FloatingHosting {
 
 @MainActor
 final class FeatTextBoxTests: XCTestCase {
+    func testKeyboardViewportFitsEditorAndInspectorAboveDockedKeyboard() {
+        let window = CGRect(x: 0, y: 24, width: 1376, height: 1008)
+        let keyboard = CGRect(x: 0, y: 589, width: 1376, height: 440)
+        let visible = NibKeyboardAvoidance.viewport(window, keyboard: keyboard)
+        XCTAssertEqual(visible, CGRect(x: 0, y: 24, width: 1376, height: 565))
+        // Recorded shape editor, sticky editor, and formatting inspector bounds from the UI lane.
+        for proposed in [CGRect(x: 641, y: 679, width: 176, height: 86),
+                         CGRect(x: 546, y: 584, width: 174, height: 155),
+                         CGRect(x: 740, y: 570, width: 312, height: 520)] {
+            let fitted = NibKeyboardAvoidance.fitting(proposed, in: visible)
+            XCTAssertTrue(visible.contains(fitted))
+            XCTAssertLessThan(fitted.maxY, keyboard.minY)
+            XCTAssertEqual(fitted.size, proposed.size)
+        }
+    }
+
+    func testKeyboardResizeHideAndFloatingKeyboardUseWindowIntersection() {
+        let window = CGRect(x: 40, y: 24, width: 700, height: 600)
+        let floating = CGRect(x: 400, y: 350, width: 300, height: 240)
+        let visible = NibKeyboardAvoidance.viewport(window, keyboard: floating)
+        let proposed = CGRect(x: 500, y: 480, width: 312, height: 520)
+        let fitted = NibKeyboardAvoidance.fitting(proposed, in: visible)
+        XCTAssertTrue(visible.contains(fitted))
+        XCTAssertLessThan(fitted.height, proposed.height, "Oversized inspectors need a bounded scroll viewport")
+        XCTAssertEqual(NibKeyboardAvoidance.viewport(window, keyboard: nil), window)
+        XCTAssertEqual(NibKeyboardAvoidance.viewport(window, keyboard: CGRect(x: 0, y: 800, width: 1000, height: 300)), window)
+        let otherWindow = CGRect(x: 0, y: 0, width: 300, height: 600)
+        XCTAssertEqual(NibKeyboardAvoidance.viewport(otherWindow, keyboard: floating), otherWindow)
+        let raised = NibKeyboardAvoidance.viewport(window, keyboard: floating.offsetBy(dx: 0, dy: -100))
+        XCTAssertEqual(raised.height, visible.height - 100)
+        XCTAssertTrue(raised.contains(NibKeyboardAvoidance.fitting(proposed, in: raised)))
+    }
+
     private let textRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
 
     private func box(_ h: Harness, _ id: ElementID = Fixtures.textID, page: PageID = Fixtures.page1) throws -> TextBoxItem {
@@ -754,6 +792,21 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertEqual(floating.anchors[TextPopoverIDs.source], more.bounds)
         XCTAssertTrue(st.popover.isPresented)
         XCTAssertGreaterThanOrEqual(st.popover.contentHeight, TextFormatPopover.minimumHeight)
+        // Both notifications occur for a single keyboard transition. Update the retained inspector,
+        // including when its own field caused the transition, without presenting a new SwiftUI root.
+        floating.offset = 300
+        let frameInfo = [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: CGRect(x: 0, y: 300, width: 1024, height: 400))]
+        for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardDidChangeFrameNotification] {
+            NotificationCenter.default.post(name: name, object: nil, userInfo: frameInfo)
+        }
+        XCTAssertEqual(floating.presentationCount, 1)
+        XCTAssertTrue(st.popover.isPresented)
+        XCTAssertEqual(st.popover.contentHeight,
+                       300 - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight)
+        floating.offset = 900
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        XCTAssertEqual(floating.presentationCount, 1)
+        XCTAssertEqual(st.popover.contentHeight, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight)
         st.popover.isPresented = false   // a tap outside
         editor.presentInspector(from: more)
         XCTAssertEqual(floating.presented, [TextPopoverIDs.popover], "the popover is presented once per editing session")

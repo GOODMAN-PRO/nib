@@ -34,6 +34,27 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertTrue(opening.canBePrevented(by: UILongPressGestureRecognizer()))
     }
 
+    func testEmptyImportActionTargetsRootAndCurrentFolder() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var targets: [JSONValue] = []
+        for folder in [nil, Fixtures.folderID] as [FolderID?] {
+            let dispatched = expectation(description: "Import action reaches the command bus")
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.importPick, title: "Import",
+                summary: "Record the picker destination", effect: .library, target: .library)) { params, context in
+                    XCTAssertEqual(context.session?.id, h.session.id)
+                    targets.append(try XCTUnwrap(params["target"]))
+                    dispatched.fulfill()
+                    return [:]
+            }
+            model.folder = folder
+            let action = LibraryGridView(model: model).emptyImportAction
+            XCTAssertEqual(action.command, CommandIDs.importPick)
+            action.handler()
+            await fulfillment(of: [dispatched], timeout: 2)
+        }
+        XCTAssertEqual(targets, ["lib", .string(NodeRef.folder(Fixtures.folderID).description)])
+    }
+
     func testCardTapRejectsAncestorHostingPanAndHoldButKeepsNativeScrollAndMenu() {
         let host = UIView(), card = LibraryItemTouchView()
         host.addSubview(card)

@@ -183,6 +183,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     }
 
     private weak var host: CanvasHost?
+    private let keyboard = NibKeyboardAvoidance()
     private var sessionID: NibID?
     private let container = CALayer()
     private let guides = CAShapeLayer()
@@ -215,6 +216,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     func attach(to host: CanvasHost) {
         self.host = host
+        keyboard.onChange = { [weak self] in self?.revealText() }
         sessionID = host.session.id
         Self.live[host.session.id] = WeakOverlay(self)
         container.zPosition = Self.zPosition
@@ -244,6 +246,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         for view in knobViews { view.removeFromSuperview() }
         knobViews = []
         if let id = sessionID, Self.live[id]?.overlay === self { Self.live[id] = nil }
+        keyboard.onChange = nil
+        keyboard.reset()
         self.host = nil
     }
 
@@ -612,6 +616,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         hideKnobs()
         layoutText(session, host: host)
         tv.becomeFirstResponder()
+        revealText()
         return true
     }
 
@@ -619,6 +624,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     func endTextEditing(commit: Bool) {
         guard let t = text else { return }
         text = nil
+        keyboard.reset()
         t.debounce?.cancel()
         let flushed = commit ? flush(t) : nil
         t.textView.delegate = nil
@@ -687,6 +693,18 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         CATransaction.commit()
     }
 
+    private func revealText() {
+        guard let t = text, let host else { return }
+        layoutText(t, host: host)
+        guard let scroll = host.canvasView as? UIScrollView else {
+            if let item = try? host.app.workspace.item(t.doc, page: t.page, id: t.id), let shape = item.shape {
+                host.session.editor?.reveal(page: t.page, rect: shape.frame.bounds, animated: false)
+            }
+            return
+        }
+        keyboard.reveal(t.textView.bounds, in: t.textView, scrolling: scroll)
+    }
+
     /// The shape without its text, drawn by the shape drawer itself, shown while the item is hidden for editing.
     private func renderBackdrop(_ t: TextSession, shape: ShapeItem, host: CanvasHost) {
         let bounds = ShapeGeometry.paintBounds(shape)
@@ -713,6 +731,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     func textViewDidChange(_ textView: UITextView) {
         guard let t = text, textView === t.textView, let host else { return }
         layoutText(t, host: host)
+        revealText()
         t.debounce?.cancel()
         t.debounce = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -726,6 +745,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
               session.editingTextRef == Self.ref(t) else { return }
         let current = textView.attributedText ?? NSAttributedString()
         session.editingTextRange = ShapeTextStyle.plainRange(textView.selectedRange, in: current)
+        revealText()
     }
 
     func textViewDidEndEditing(_ textView: UITextView) {

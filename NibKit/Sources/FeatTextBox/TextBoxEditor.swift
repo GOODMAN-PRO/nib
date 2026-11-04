@@ -100,8 +100,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private var ownGroups = Set<String>()
     private var commitSubscription: EventSubscription?
     private var hiddenIDs: [PageID: Set<ElementID>] = [:]
-    private var keyboardFrame: CGRect?
-    private var keyboardInset: CGFloat = 0
+    private let keyboard = NibKeyboardAvoidance()
+    private weak var inspectorSource: UIView?
     private var isRendering = false
     private var adjustingSelection = false
     private var needsNormalize = false
@@ -136,10 +136,15 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         self.host = host
         commitSubscription = app.bus.observeCommits { [weak self] cs in self?.handle(cs) }
         let center = NotificationCenter.default
-        center.addObserver(self, selector: #selector(keyboardWillChange(_:)),
-                           name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
-        center.addObserver(self, selector: #selector(keyboardWillHide(_:)),
-                           name: UIResponder.keyboardWillHideNotification, object: nil)
+        keyboard.onChange = { [weak self] in
+            guard let self else { return }
+            self.ensureCaretVisible()
+            if let st = self.state, st.popover.isPresented, let source = self.inspectorSource,
+               let host = self.host, let floating = self.floating,
+               let anchor = self.floatingAnchor(source, floating: floating, canvas: host.canvasView) {
+                self.updateFloatingGeometry(st, anchor: anchor, floating: floating, canvas: host.canvasView)
+            }
+        }
         center.addObserver(self, selector: #selector(willResignActive(_:)),
                            name: UIApplication.willResignActiveNotification, object: nil)
     }
@@ -149,6 +154,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         commitSubscription?.cancel()
         commitSubscription = nil
         NotificationCenter.default.removeObserver(self)
+        keyboard.onChange = nil
     }
 
     func canvasDidChange(_ host: CanvasHost) {
@@ -806,45 +812,22 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     // MARK: Keyboard avoidance
 
-    @objc private func keyboardWillChange(_ note: Notification) {
-        keyboardFrame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
-        ensureCaretVisible()
-    }
-
-    @objc private func keyboardWillHide(_ note: Notification) {
-        keyboardFrame = nil
-        removeKeyboardInset()
-    }
-
     @objc private func willResignActive(_ note: Notification) {
         commitNow()
     }
 
     /// Scrolls the canvas (instantly: typing never animates) so the caret stays above the keyboard.
     private func ensureCaretVisible() {
-        guard let st = state, let host = host, let keyboard = keyboardFrame, let window = host.canvasView.window,
+        guard let st = state, let host,
               let caretPosition = st.textView.selectedTextRange?.end else { return }
-        let caret = st.textView.convert(st.textView.caretRect(for: caretPosition), to: window)
-        let covered = window.convert(keyboard, from: window.screen.coordinateSpace)
-        let overlap = caret.maxY + NibSpacing.l - covered.minY
-        guard overlap > 0, covered.height > 0 else { return }
         guard let scroll = host.canvasView as? UIScrollView else {
-            host.session.editor?.reveal(page: st.page, rect: st.box.frame.rect, animated: false)
+            host.session.editor?.reveal(page: st.page, rect: st.box.frame.bounds, animated: false)
             return
         }
-        if keyboardInset < covered.height {
-            scroll.contentInset.bottom += covered.height - keyboardInset
-            keyboardInset = covered.height
-        }
-        scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: scroll.contentOffset.y + overlap), animated: false)
+        keyboard.reveal(st.textView.caretRect(for: caretPosition), in: st.textView, scrolling: scroll)
     }
 
-    private func removeKeyboardInset() {
-        if keyboardInset > 0, let scroll = host?.canvasView as? UIScrollView {
-            scroll.contentInset.bottom = max(0, scroll.contentInset.bottom - keyboardInset)
-        }
-        keyboardInset = 0
-    }
+    private func removeKeyboardInset() { keyboard.reset() }
 
     // MARK: Popovers
 
@@ -869,6 +852,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     /// headless runs), or without room above the keyboard for it, a system popover shows it instead.
     func presentInspector(from source: UIView, panel: TextFormatPanel = .inspector) {
         guard let st = state else { return }
+        inspectorSource = source
         st.popover.panel = panel
         if presentFloatingInspector(st, from: source) { return }
         guard let presenter = topPresenter() else { return }
@@ -900,14 +884,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private func presentFloatingInspector(_ st: EditState, from source: UIView) -> Bool {
         guard let host = host, let floating = host.session.floatingHost,
               let anchor = floatingAnchor(source, floating: floating, canvas: host.canvasView) else { return false }
-        // The popover rests above the button, so it needs the room between the button and the top of the window.
-        let room = anchor.minY - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight
-        let height = min(room, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight)
-        guard height >= TextFormatPopover.minimumHeight else {
+        updateFloatingGeometry(st, anchor: anchor, floating: floating, canvas: host.canvasView)
+        guard st.popover.isPresented || st.popover.contentHeight >= TextFormatPopover.minimumHeight else {
             floating.removeAnchor(TextPopoverIDs.source)
             return false
         }
-        st.popover.contentHeight = height
         st.popover.onClose = { [weak self, weak st] in
             // Back to typing (the popover's own fields may have had the keyboard).
             guard let self = self, let st = st, self.state === st, !st.textView.isFirstResponder else { return }
@@ -919,6 +900,19 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         self.floating = floating
         st.popover.isPresented = true
         return true
+    }
+
+    /// Update the retained view's geometry only; keyboard notifications must not replace its focus or scroll state.
+    private func updateFloatingGeometry(_ st: EditState, anchor: CGRect, floating: FloatingHosting, canvas: UIView) {
+        let viewport = canvas.window.flatMap { window in
+            floating.containerRect(keyboard.viewport(in: window), from: window)
+        }
+        if st.popover.viewport != viewport { st.popover.viewport = viewport }
+        let top = viewport?.minY ?? 0
+        let bottom = min(anchor.minY, viewport?.maxY ?? anchor.minY)
+        let room = bottom - top - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight
+        let height = max(0, min(room, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight))
+        if st.popover.contentHeight != height { st.popover.contentHeight = height }
     }
 
     /// The button's rect as the popover's bud source, and where that is in the container. The keyboard bar lives in the
@@ -937,6 +931,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     private func dismissFloatingInspector(_ st: EditState) {
         st.popover.onClose = nil
+        inspectorSource = nil
         st.popover.isPresented = false
         guard let floating = floating else { return }
         floating.dismiss(TextPopoverIDs.popover)
