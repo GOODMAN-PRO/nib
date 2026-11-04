@@ -130,10 +130,11 @@ public struct NibClothCover: View {
     }
 }
 
-/// A folder tile (78 tall, radius 14) on backgroundSecondary. Its width comes from the grid on the 24 pt gutter; the
-/// full name is one line with tail truncation. While a notebook is dragged it grows a water film; when the notebook
-/// fuses with it the film tints with the accent wash.
+/// A folder tile (78 minimum height, radius 14) on backgroundSecondary, with grid-driven width and names that wrap
+/// to two lines (three at accessibility sizes) before tail truncation. While a notebook is dragged it grows a water
+/// film; when the notebook fuses with it the film tints with the accent wash.
 public struct NibFolderTile: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let name: String
     let count: String
     let color: Color
@@ -165,16 +166,20 @@ public struct NibFolderTile: View {
                 Text(name)
                     .font(NibFont.button)
                     .foregroundStyle(NibColor.label)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                     .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(Text(verbatim: name))
                 Text(count)
                     .font(NibFont.footnote)
                     .foregroundStyle(NibColor.labelSecondary)
                     .lineLimit(1)
             }
+            .layoutPriority(1)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
+        .padding(.vertical, NibSpacing.m)
         .frame(minWidth: NibMetrics.folderTileMinWidth, maxWidth: .infinity, minHeight: NibMetrics.folderTileHeight)
         .background(NibColor.backgroundSecondary, in: shape)
         .overlay {

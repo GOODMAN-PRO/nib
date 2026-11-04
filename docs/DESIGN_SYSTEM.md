@@ -7735,8 +7735,9 @@ public struct NibClothCover: View {
     }
 }
 
-/// A folder tile (78 tall, radius 14) on backgroundSecondary. Its width comes from the grid on the 24 pt gutter; the
-/// full name is one line with tail truncation. While a notebook is dragged it grows a water film; when the notebook
+/// NibFolderTile keeps its grid-driven width and 78 pt minimum height, prioritises names over decoration and grows
+/// to fit two lines (three at accessibility sizes) before tail truncation, preserving the full name for VoiceOver.
+/// While a notebook is dragged it grows a water film; when the notebook
 /// fuses with it the film tints with the accent wash.
 public struct NibFolderTile: View {
     let name: String

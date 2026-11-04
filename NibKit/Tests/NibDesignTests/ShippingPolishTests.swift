@@ -115,6 +115,34 @@ final class ShippingPolishTests: XCTestCase {
         }
     }
 
+    func testFolderNamesWrapAndGrowWithinTheirGridColumns() {
+        for variant in [NibSnapshot.Variant.light, .dark, .largeText] {
+            let allowedLines = variant == .largeText ? 3 : 2
+            for width in [NibMetrics.folderTileMinWidth, NibMetrics.folderTileMinWidth + NibMetrics.libraryGutter * 2] {
+                func size(_ name: String) -> CGSize {
+                    NibSnapshot.fittingSize(NibFolderTile(name: name, count: "9", color: NibColor.accent),
+                                            width: width, variant: variant)
+                }
+                let short = size("A")
+                let long = size("Semester notes and assignments for computer science")
+                // Explicit line breaks provide a measured reference, independent of word wrapping or font metrics.
+                let full = size(Array(repeating: "A", count: allowedLines).joined(separator: "\n"))
+                let overflow = size(Array(repeating: "A", count: allowedLines + 1).joined(separator: "\n"))
+                XCTAssertEqual(short.width, width, accuracy: 1)
+                XCTAssertEqual(long.width, width, accuracy: 1, "Names must not widen the grid column")
+                XCTAssertGreaterThanOrEqual(short.height, NibMetrics.folderTileHeight)
+                XCTAssertGreaterThan(long.height, short.height, "Long names must wrap beyond one line and grow the tile")
+                XCTAssertEqual(long.height, full.height, accuracy: 1, "The long name uses every allowed line")
+                XCTAssertEqual(overflow.height, full.height, accuracy: 1, "Further lines truncate instead of growing indefinitely")
+                if variant == .largeText {
+                    XCTAssertGreaterThan(long.height, size("A\nA").height, "Accessibility names use a third line")
+                } else {
+                    XCTAssertEqual(short.height, NibMetrics.folderTileHeight, accuracy: 1)
+                }
+            }
+        }
+    }
+
     func testSegmentsReflowWhenLabelsCannotFit() {
         let control = NibSegmentedControl(selection: .constant(0), options: [0, 1, 2]) {
             ["Always ask", "Ask for destructive changes", "Allow all changes"][$0]
