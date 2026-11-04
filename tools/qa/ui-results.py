@@ -20,6 +20,11 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+try:  # from a worktree, keep the logs next to the main clone (../Nib-ci-logs of the main checkout)
+    _common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, check=True).stdout.strip()
+    MAIN = pathlib.Path(_common).parent
+except (OSError, subprocess.CalledProcessError):
+    MAIN = ROOT
 
 
 def gh(*args):
@@ -30,7 +35,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run")
     ap.add_argument("--repo", default="GOODMAN-PRO/nib")
-    ap.add_argument("--out", default=str(ROOT.parent / "Nib-ci-logs" / "ui-ci"))
+    ap.add_argument("--out", default=str(MAIN.parent / "Nib-ci-logs" / "ui-ci"))
     ap.add_argument("--no-download", action="store_true", help="reuse what is already in the output folder")
     ap.add_argument("--partial", action="store_true", help="report the classes that have completed while the run is still going")
     a = ap.parse_args()
