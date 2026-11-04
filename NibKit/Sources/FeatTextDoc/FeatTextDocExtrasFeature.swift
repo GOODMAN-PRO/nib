@@ -14,13 +14,10 @@ import NibDesign
 /// `docKinds` and `sessionParams`) that the editor also serves while a block is edited.
 ///
 /// Printing: text documents print through `TextDocPageRenderer` (the "textdoc.pdf" exporter's layout, paginated for
-/// the paper the user picks). Until F067's print.present can route a text document to it, ⌘P in the editor
-/// (`TextDocPrinter`, a `TextDocHooks` key, live while a block has the caret) is the way in; there is no touch path
-/// yet. `TextDocPrinter.present(doc:app:session:)` needs no editor (the blocks come from `app.workspace`), and
-/// `TextDocPrinter.renderer(doc:app:session:)` makes the renderer for a print controller someone else configures.
-/// F067's print.present {doc} for a `.textDocument` must print with that renderer (and own ⌘P as a
-/// `KeyCommandDescriptor` with `docKinds` and `sessionParams` naming the document), which needs a contracts-level way
-/// to reach it from another module: docs/contract-requests/F103-print.md.
+/// the paper the user picks). The registered `PrintRendererDescriptor` lets F067's `print.present` use it from
+/// menus, the command bar and the window's ⌘P key, even without an editor or a block with the caret.
+/// `TextDocPrinter.renderer(doc:app:session:)` reads the workspace and the window editor's newer typing;
+/// `TextDocPrinter.present(doc:app:session:)` remains available for direct presentation.
 public enum FeatTextDocExtrasFeature: NibFeature {
     public static let id = "textdocextras"
 
@@ -31,13 +28,17 @@ public enum FeatTextDocExtrasFeature: NibFeature {
         app.commands.register(BlockCommentResolve.self)
 
         app.content.exporters.register(TextDocExporter.descriptor(owner: id))
+        app.content.printRenderers.register(PrintRendererDescriptor(
+            id: "textdoc.print", docKinds: [.textDocument], owner: id) { [weak app] doc, session in
+                guard let app else { throw NibError.unavailable(String(localized: "the app")) }
+                return try TextDocPrinter.renderer(doc: doc, app: app, session: session)
+            })
         app.ui.panels.register(TextDocOutlinePanel.descriptor(owner: id))
         app.ui.panels.register(TextDocCommentsPanel.descriptor(owner: id))
         app.content.keyCommands.register(BlockCommentsEditor.keyDescriptor(owner: id))
 
         BlockCommentsEditor.install()
         AutoLinkEditor.install()
-        TextDocPrinter.install()
     }
 
     /// Keeps comments on their words while a block's text changes, whoever changes it (typing, the assistant,

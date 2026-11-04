@@ -55,9 +55,15 @@ public enum FeatExportUIFeature: NibFeature {
         app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".exportKey", title: String(localized: "Share & Export"),
             shortcut: KeyShortcut("e", [.command, .shift]), command: CommandIDs.exportPresent,
             params: ["instant": true], scope: .document, owner: id))
-        app.content.keyCommands.register(KeyCommandDescriptor(id: id + ".printKey", title: String(localized: "Print"),
+        var printKey = KeyCommandDescriptor(id: id + ".printKey", title: String(localized: "Print"),
             shortcut: KeyShortcut("p", .command), command: CommandIDs.printPresent,
-            params: ["instant": true], scope: .document, owner: id))
+            params: ["instant": true], scope: .document, owner: id)
+        // Study sets currently export CSV only; the other kinds have PDF exporters or a paper-aware renderer.
+        printKey.docKinds = [.notebook, .whiteboard, .textDocument]
+        printKey.sessionParams = { session in
+            session.document.map { ["doc": .string(NodeRef.document($0).description)] } ?? [:]
+        }
+        app.content.keyCommands.register(printKey)
     }
 }
 

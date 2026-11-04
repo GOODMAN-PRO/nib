@@ -567,7 +567,8 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertFalse(titles(editor.blockMenu(for: try block(h, "FIXTUREBLK03")).children).contains("Comment on Block"))
 
         let keys = editor.keyCommands ?? []
-        XCTAssertTrue(keys.contains { $0.title == "Print" && $0.input == "p" && $0.modifierFlags == .command })
+        XCTAssertFalse(keys.contains { $0.input == "p" && $0.modifierFlags == .command },
+                       "F067 owns Command-P; the text editor must not install a second print key")
         XCTAssertFalse(keys.contains { $0.input == "m" }, "⇧⌘M needs a block with the caret")
         let comment = TextDocHooks.keyCommandSets.first { $0.id == TextDocExtrasHookIDs.prefix + "comments.keys" }
         XCTAssertNotNil(comment)
@@ -1160,6 +1161,20 @@ final class BlockCommentTests: XCTestCase {
     }
 
     // MARK: Printing
+
+    func testRegisteredPrintRendererUsesTextDocumentsAndRejectsNotebooks() throws {
+        let h = harness()
+        let descriptor = try XCTUnwrap(h.app.content.printRenderer(for: .textDocument))
+        XCTAssertEqual(descriptor.id, "textdoc.print")
+        XCTAssertEqual(descriptor.owner, FeatTextDocExtrasFeature.id)
+        XCTAssertEqual(descriptor.docKinds, [.textDocument])
+        XCTAssertNil(h.app.content.printRenderer(for: .notebook))
+        XCTAssertTrue(try descriptor.makeRenderer(doc, nil) is TextDocPageRenderer)
+        XCTAssertThrowsError(try descriptor.makeRenderer(Fixtures.docID, h.session)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unsupported)
+        }
+        XCTAssertFalse(TextDocHooks.keyCommandSets.contains { $0.id == TextDocExtrasHookIDs.prefix + "print.keys" })
+    }
 
     /// The print system's paper, stood in (the renderer asks for it when it paginates).
     private final class StubPaperRenderer: TextDocPageRenderer {

@@ -233,6 +233,7 @@ protocol ExportPresenting: AnyObject {
     func showLocked(doc: DocumentID, retry: String, params: JSONValue, ctx: CommandContext) async throws
     func deliver(_ urls: [URL], destination: String, ctx: CommandContext) async throws -> Bool
     func printPDF(_ url: URL, title: String, ctx: CommandContext) async throws -> Bool
+    func printRenderer(_ renderer: UIPrintPageRenderer, title: String, ctx: CommandContext) async throws -> Bool
 }
 
 @MainActor
@@ -379,5 +380,8 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
     }
     func printPDF(_ url: URL, title: String, ctx: CommandContext) async throws -> Bool {
         try await PrintController.present(url: url, title: title, ctx: ctx)
+    }
+    func printRenderer(_ renderer: UIPrintPageRenderer, title: String, ctx: CommandContext) async throws -> Bool {
+        try await PrintController.present(renderer: renderer, title: title, ctx: ctx)
     }
 }

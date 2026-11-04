@@ -309,6 +309,94 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertTrue(presenter.destinations.isEmpty)
     }
 
+    func testPrintUsesRegisteredRendererWithoutAnExporterAndDryRunDoesNotBuildIt() async throws {
+        let (h, presenter, probe) = harness()
+        // A renderer must not depend on an exporter, including for validation in a dry run.
+        h.app.content.exporters.unregister(owner: "test")
+        let renderer = UIPrintPageRenderer()
+        var calls = 0
+        h.app.content.printRenderers.register(PrintRendererDescriptor(
+            id: "test.print", docKinds: [.textDocument], owner: "test") { doc, session in
+                XCTAssertEqual(doc, Fixtures.textDocID)
+                XCTAssertTrue(session === h.session)
+                calls += 1
+                return renderer
+            })
+        let params: JSONValue = ["doc": "doc:FIXTUREDOC02"]
+        let dry = try await h.app.bus.execute(Invocation(command: CommandIDs.printPresent,
+            params: params, session: h.session, dryRun: true)).value
+        XCTAssertEqual(dry["wouldPresent"], true)
+        XCTAssertEqual(calls, 0)
+        XCTAssertNil(presenter.renderer)
+        let result = try await h.run(CommandIDs.printPresent, params)
+        XCTAssertEqual(result["completed"], true)
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(presenter.renderer === renderer)
+        XCTAssertEqual(presenter.printTitle, h.library.node(Fixtures.textDocID)?.title)
+        XCTAssertNil(presenter.draft, "Renderer jobs go straight to the system print sheet")
+        XCTAssertEqual(presenter.printCount, 0)
+        XCTAssertTrue(probe.calls.isEmpty)
+        XCTAssertTrue(h.app.commands.descriptor(CommandIDs.printPresent)!.userPresence)
+    }
+
+    func testRegisteredRendererKeepsLockChecksAndHostlessPresentationGuard() async throws {
+        let (h, presenter, _) = harness()
+        var calls = 0
+        h.app.content.printRenderers.register(PrintRendererDescriptor(
+            id: "test.print", docKinds: [.textDocument], owner: "test") { _, _ in
+                calls += 1
+                return UIPrintPageRenderer()
+            })
+        h.app.services.lock = FakeLockService(locked: [Fixtures.textDocID])
+        let locked = try await h.run(CommandIDs.printPresent, ["doc": "doc:FIXTUREDOC02"])
+        XCTAssertEqual(locked["locked"], true)
+        XCTAssertEqual(presenter.lockedScreens, 1)
+        for dryRun in [false, true] {
+            do {
+                _ = try await h.app.bus.execute(Invocation(command: CommandIDs.printPresent,
+                    params: ["doc": "doc:FIXTUREDOC02", "ready": true], session: h.session, dryRun: dryRun))
+                XCTFail("Locked renderer job was accepted")
+            } catch let error as NibError { XCTAssertEqual(error.code, .locked) }
+        }
+        XCTAssertEqual(calls, 0)
+        XCTAssertNil(presenter.renderer)
+        h.app.services.lock = nil
+        h.app.services.set(SystemExportPresenter(), for: ExportPresentation.serviceKey)
+        XCTAssertTrue(NibApp.isHostlessTest)
+        do {
+            _ = try await h.run(CommandIDs.printPresent, ["doc": "doc:FIXTUREDOC02"])
+            XCTFail("Hostless printing must not access the AirPrint singleton")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+    }
+
+    func testPrintWithoutRendererStillResolvesPDFAndExportsIt() async throws {
+        let (h, presenter, probe) = harness()
+        XCTAssertNil(h.app.content.printRenderer(for: .textDocument))
+        _ = try await h.run(CommandIDs.printPresent, ["doc": "doc:FIXTUREDOC02"])
+        XCTAssertEqual(presenter.draft?.format, "pdf", "The kind-specific textdoc.pdf exporter resolves as PDF")
+        _ = try await h.run(CommandIDs.printPresent, ["doc": "doc:FIXTUREDOC02", "ready": true])
+        XCTAssertEqual(probe.calls.last?["format"], "pdf")
+        XCTAssertEqual(presenter.printCount, 1)
+        XCTAssertNil(presenter.renderer)
+    }
+
+    func testPrintKeyNamesTheWindowDocumentWithoutTextFocus() throws {
+        let (h, _, _) = harness()
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("exportui.printKey"))
+        XCTAssertEqual(key.docKinds, [.notebook, .whiteboard, .textDocument])
+        XCTAssertEqual(key.command, CommandIDs.printPresent)
+        XCTAssertEqual(key.shortcut, KeyShortcut("p", .command))
+        for kind in [DocumentKind.notebook, .whiteboard, .textDocument] {
+            XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: kind, isEditingText: false)))
+        }
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .studySet)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: nil)))
+        h.session.document = Fixtures.textDocID
+        XCTAssertEqual(key.resolvedParams(for: h.session), ["doc": "doc:FIXTUREDOC02", "instant": true])
+        h.session.document = Fixtures.docID
+        XCTAssertEqual(key.resolvedParams(for: h.session)["doc"], "doc:FIXTUREDOC01")
+    }
+
     func testPrintRangeExclusionsAndSelectedPagesUseOriginalNumbers() async throws {
         let (h, presenter, probe) = harness()
         _ = try await h.run("print.present", ["doc": "doc:FIXTUREDOC01", "ready": true,
@@ -559,6 +647,8 @@ private final class RecordingExportPresenter: ExportPresenting {
     var destinations: [String] = []
     var filesExistedDuringDelivery = false
     var printCount = 0
+    var renderer: UIPrintPageRenderer?
+    var printTitle: String?
     var lockedScreens = 0
     var onDelivery: (([URL]) async throws -> Bool)?
     func showLocked(doc: DocumentID, retry: String, params: JSONValue, ctx: CommandContext) async throws { lockedScreens += 1 }
@@ -575,6 +665,11 @@ private final class RecordingExportPresenter: ExportPresenting {
     func printPDF(_ url: URL, title: String, ctx: CommandContext) async throws -> Bool {
         XCTAssertNotNil(PDFDocument(url: url))
         printCount += 1
+        return true
+    }
+    func printRenderer(_ renderer: UIPrintPageRenderer, title: String, ctx: CommandContext) async throws -> Bool {
+        self.renderer = renderer
+        printTitle = title
         return true
     }
 }

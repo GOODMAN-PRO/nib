@@ -71,7 +71,7 @@ enum NameLookupCanary {
         NibSettings.self, SecretStore.self, SystemKeychainStore.self, Keychain.self, DeviceIdentity.self,
         AppGroup.self, Registrable.self, Registry<TemplateDefinition>.self, TemplateParam.self, TemplateRender.self,
         TemplateDefinition.self, DrawContext.self, ItemDrawer.self, ItemDrawerEntry.self, ImportTarget.self,
-        ImporterDescriptor.self, ExportRequest.self, ExporterDescriptor.self, AIActionDescriptor.self, StrokeProcessor.self,
+        ImporterDescriptor.self, ExportRequest.self, ExporterDescriptor.self, PrintRendererDescriptor.self, AIActionDescriptor.self, StrokeProcessor.self,
         StrokeProcessorEntry.self, KeyModifiers.self, KeyShortcut.self, KeyScope.self, KeyCommandDescriptor.self,
         BackgroundTaskKind.self, BackgroundTaskDescriptor.self, CanvasGesture.self, TapHandlerDescriptor.self, BoardTemplateDescriptor.self,
         TapePatternDescriptor.self, ElementEntry.self, ElementCollectionDescriptor.self, BlockKindDescriptor.self, CustomItemTypeDescriptor.self,

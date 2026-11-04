@@ -16,7 +16,7 @@ struct PresentPrint: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "print.present", title: String(localized: "Print"),
-        summary: "Open AirPrint page options; ready=true prints selected pages after applying 1-based ranges and exclusions, preserving mixed page proportions.",
+        summary: "Open AirPrint with a registered renderer (paper and page ranges chosen in the print sheet), or PDF page options; ready=true prints selected PDF pages after applying 1-based ranges and exclusions.",
         params: .obj(["doc": .ref, "pages": .arr(.ref), "range": .str("1-based ranges, e.g. 1-3, 5, 8-"),
                       "exclude": .str("1-based pages to omit"), "options": .anything("PDF export options"),
                       "ready": .bool("submit the print draft"), "instant": .bool("keyboard presentation")]),
@@ -29,6 +29,19 @@ struct PresentPrint: NibCommand {
             try await ExportPresentation.presenter(ctx).showLocked(doc: doc, retry: Self.descriptor.id,
                                                                   params: JSONValue.from(p), ctx: ctx)
             return ["presented": true, "locked": true]
+        }
+        // Renderer pagination belongs to AirPrint, so it needs neither an exporter nor a stored-page filter.
+        // Check the lock before even inspecting content, just as ExportSelection does for the PDF route.
+        try ExportSelection.requireUnlocked(doc, ctx)
+        let kind = try ctx.workspace.peekContent(doc).meta.kind
+        if let descriptor = ctx.content.printRenderer(for: kind) {
+            if ctx.dryRun { return ["wouldPresent": true] }
+            let presenter = try ExportPresentation.presenter(ctx)
+            let renderer = try descriptor.makeRenderer(doc, ctx.activeSession)
+            let title = ctx.services.library?.node(doc)?.title ?? String(localized: "Untitled")
+            try ExportSelection.requireUnlocked(doc, ctx)
+            let completed = try await presenter.printRenderer(renderer, title: title, ctx: ctx)
+            return ["completed": .bool(completed)]
         }
         let selection = try await ExportSelection.load(docs: [NodeRef.document(doc).description], pages: p.pages, ctx: ctx)
         guard let pdf = selection.formats.first(where: { $0.fileExtension.lowercased() == "pdf" }) else {
@@ -169,6 +182,26 @@ final class PrintController: NSObject, UIPrintInteractionControllerDelegate {
         printer.printPageRenderer = renderer
         printer.delegate = delegate
         defer { printer.delegate = nil; printer.printPageRenderer = nil }
+        return try await present(printer, from: parent, retaining: delegate)
+    }
+
+    /// No paper delegate or orientation override: the document renderer adapts to the user's paper choice.
+    static func present(renderer: UIPrintPageRenderer, title: String, ctx: CommandContext) async throws -> Bool {
+        let parent = try ExportPresentation.topController(ctx)
+        guard UIPrintInteractionController.isPrintingAvailable else { throw NibError.unavailable("AirPrint") }
+        let printer = UIPrintInteractionController.shared
+        let info = UIPrintInfo(dictionary: nil)
+        info.jobName = title
+        info.outputType = .general
+        printer.printInfo = info
+        printer.delegate = nil
+        printer.printPageRenderer = renderer
+        defer { printer.printPageRenderer = nil }
+        return try await present(printer, from: parent, retaining: nil)
+    }
+
+    private static func present(_ printer: UIPrintInteractionController, from parent: UIViewController,
+                                retaining delegate: PrintController?) async throws -> Bool {
         return try await withCheckedThrowingContinuation { continuation in
             var resumed = false
             let handler: UIPrintInteractionController.CompletionHandler = { _, completed, error in

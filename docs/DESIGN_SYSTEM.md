@@ -724,6 +724,16 @@ public enum NibSpacing {
     public static let x6: CGFloat = 64
 }
 
+/// Shared paper geometry for printing and PDF export (DESIGN.md §15.6).
+public enum NibPrint {
+    /// Page margin on every side (pt).
+    public static let margin: CGFloat = 54
+    /// Type on paper, relative to the Large Dynamic Type size of the screen roles.
+    public static let typeScale: CGFloat = 0.7
+    /// The band that holds page numbers at the foot of a page (pt).
+    public static let footerHeight: CGFloat = 32
+}
+
 /// Continuous-corner radii (DESIGN.md §6). A shape inside a shape uses `concentric(outer, inset:)`.
 public enum NibRadius {
     public static let popover: CGFloat = 26
@@ -9396,6 +9406,8 @@ extension NibUIFont {   // every §4.1 role for UIKit except math; all scale wit
 Resolves F037, F039, F046, F047 (UIKit roles built with `NibUIFont.font(…)` by hand) and F102/F103 (text-document body and headings). Replaces `NibUIFont.font(.body, design: .serif)` and the serif `title1/2/3` headings in FeatTextDoc (F047), `font(.footnote, weight: .bold, design: .rounded)` for comment pins (F037), `font(.caption2, weight: .medium)` in FeatRuler (F039), `font(.body/.footnote, weight: .semibold)` in FeatOutline (F046).
 
 **`NibSpacing.swift`** (DESIGN.md §5, §5.1, §5.2, §6):
+
+`NibPrint` supplies paper tokens for print renderers and PDF export: `margin: CGFloat = 54` pt on every side, `typeScale: CGFloat = 0.7` relative to screen roles at Large Dynamic Type, and `footerHeight: CGFloat = 32` pt for page numbers. F103's `TextDocPrintMetrics` reads these shared values (contracts-v2.5).
 
 ```swift
 extension NibRadius { static let ruler: CGFloat /* 6 */; static let pageWash: CGFloat /* 4 */ }
