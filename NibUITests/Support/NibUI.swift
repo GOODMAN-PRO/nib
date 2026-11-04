@@ -701,16 +701,19 @@ final class NibUI {
     }
 
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
-    func isKeyboardFocused(_ field: XCUIElement) -> Bool {
+    func isKeyboardFocused(_ field: XCUIElement, allowingAttributeFallback: Bool = false) -> Bool {
         guard field.exists else { return false }
         let identifier = field.identifier, label = field.label
         if !identifier.isEmpty || !label.isEmpty {
             let identity = !identifier.isEmpty ? NSPredicate(format: "identifier == %@", identifier)
                 : NSPredicate(format: "label == %@", label)
             // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
-            let focused = app.descendants(matching: .any).matching(identity)
+            let focused = app.descendants(matching: field.elementType).matching(identity)
                 .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            return focused.exists && focused.elementType == field.elementType && focused.frame == field.frame
+            if focused.exists && focused.frame == field.frame { return true }
+            // GIPHY and LaTeX expose focus in Attributes but not the predicate on this OS.
+            // Only explicit native-editor callers opt in; ordinary discovery stays cheap.
+            if !allowingAttributeFallback { return false }
         }
         // debugDescription includes the whole application tree after the Attributes line.
         // A different focused field (Duration) must not qualify this field (Timer name).
@@ -767,12 +770,13 @@ final class NibUI {
 
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
-        if isKeyboardFocused(field) { return }
+        if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
         revealFormElement(field)
         guard hasVisibleFrame(field) && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
         field.tap()
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
-        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
+        guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
+                || isKeyboardFocused(field, allowingAttributeFallback: true) else {
             throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
         }
     }
@@ -845,7 +849,7 @@ final class NibUI {
             return false
         }
         func hasSelection() -> Bool {
-            isKeyboardFocused(field) && field.value as? String == fullText
+            isKeyboardFocused(field, allowingAttributeFallback: true) && field.value as? String == fullText
                 && available("Cut", assistant: "assistantCut") && available("Copy", assistant: "assistantCopy")
         }
         if !hasSelection() {

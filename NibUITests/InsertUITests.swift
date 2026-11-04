@@ -139,7 +139,7 @@ final class InsertUITests: XCTestCase {
     private func focusedField() throws -> XCUIElement {
         for type in [XCUIElement.ElementType.textView, .textField, .searchField, .secureTextField] {
             let query = ui.app.descendants(matching: type)
-            for field in query.allElementsBoundByIndex where ui.isKeyboardFocused(field) {
+            for field in query.allElementsBoundByIndex.prefix(16) where ui.isKeyboardFocused(field, allowingAttributeFallback: true) {
                 return query.matching(NSPredicate(format: "identifier == %@ AND label == %@", field.identifier, field.label)).firstMatch
             }
         }

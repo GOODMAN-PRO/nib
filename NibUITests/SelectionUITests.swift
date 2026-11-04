@@ -51,31 +51,9 @@ final class SelectionUITests: XCTestCase {
 
     /// Waits for a typed action or placeholder in the active presentation; re-resolves after every menu transition.
     private func control(_ name: String, type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
-        let types: [XCUIElement.ElementType] = type == .any
-            ? [.button, .menuItem, .textField, .textView, .searchField, .switch, .slider, .image, .staticText, .cell, .other] : [type]
-        func scope() -> XCUIElement {
-            ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
-                : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch
-                : ui.app.sheets.firstMatch.exists ? ui.app.sheets.firstMatch : ui.app
-        }
-        func target(_ kind: XCUIElement.ElementType) -> XCUIElement {
-            scope().descendants(matching: kind).matching(NSPredicate(
-                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
-        }
-        func candidate() -> XCUIElement? {
-            for kind in types {
-                // Bind the requested identity before hittability; never retain a mixed ordinal.
-                let bound = target(kind)
-                guard bound.exists else { continue }
-                if bound.isEnabled && bound.isHittable { return bound }
-            }
-            return nil
-        }
-        if scroll {
-            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
-        }
-        try wait("Missing actionable selection control: \(name)") { candidate() != nil }
-        return try XCTUnwrap(candidate(), "Selection control changed during discovery: \(name)")
+        let target = try ui.requireControl(name, type: type, scroll: scroll, timeout: 10)
+        guard target.isEnabled else { throw NibUI.Failure.message("Selection control is disabled: \(name)") }
+        return target
     }
 
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
@@ -495,10 +473,10 @@ final class SelectionUITests: XCTestCase {
 
     private func shape(_ kind: String, from: CGPoint, to: CGPoint) throws {
         try ui.selectTool("shape")
-        if !query(kind, type: .button).allElementsBoundByIndex.contains(where: { $0.isHittable && !$0.identifier.hasPrefix("tool.") }) {
+        if ui.findControl(kind, type: .button) == nil {
             try tap("tool.shape")
         }
-        try tap(kind); outside()
+        try tap(kind, scroll: true); outside()
         let before = try ui.state()
         try ui.drawStroke([from, to])
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 }
@@ -693,7 +671,14 @@ final class SelectionUITests: XCTestCase {
         try loop(count: 1); let before = try ui.state(), geometry = try bounds()
         try menu("Style")
         let slider = try control("Thickness", type: .slider)
-        slider.adjust(toNormalizedSliderPosition: 0.85); outside()
+        let oldThickness = try XCTUnwrap(slider.value as? String, "Thickness must expose its value")
+        try ui.dragSlider(slider, to: 0.85) {
+            try self.wait("Dragging Thickness must change its accessible value") {
+                guard let value = slider.value as? String else { return false }
+                return !value.isEmpty && value != oldThickness
+            }
+        }
+        outside()
         try countsEqual(before)
         XCTAssertTrue(try ui.state().undoAvailable)
         try clear()
@@ -833,8 +818,9 @@ final class SelectionUITests: XCTestCase {
     func testEditHandwritingDoubleTapSelectsOneWordWithoutUnrelatedWords() throws {
         try editWords()
         ui.coordinate(CGPoint(x: 0.43, y: 0.595)).doubleTap()
-        _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
+        // Smart Ink owns selectedWord separately from the canvas item selection probe.
         let word = try handwritingGeometry("Selected word")
+        XCTAssertEqual(ui.app.otherElements.matching(NSPredicate(format: "label == 'Selected word'")).count, 1)
         XCTAssertLessThan(word.frame.maxX, ui.coordinate(CGPoint(x: 0.52, y: 0.595)).screenPoint.x)
         let before = try ui.state()
         try tap("Delete Word")
