@@ -357,10 +357,7 @@ final class InkUITests: XCTestCase {
             throw NibUI.Failure.message("Raster requires a full-screen window at (0,0): \(window)")
         }
         let screenshot = XCUIScreen.main.screenshot()
-        let dimensions = UIScreen.main.bounds.size
-        let long = max(dimensions.width, dimensions.height), short = min(dimensions.width, dimensions.height)
-        let screenSize = screenshot.image.size.width > screenshot.image.size.height
-            ? CGSize(width: long, height: short) : CGSize(width: short, height: long)
+        let screenSize = NibUI.displayRect().size   // the device, not the runner's compatibility UIScreen
         let r = region ?? inkRegion, f = ui.canvas.frame
         return try Raster(screenshot, screenSize: screenSize,
                           rect: CGRect(x: f.minX - window.minX + r.minX * f.width,
