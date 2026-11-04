@@ -1,0 +1,9 @@
+# QA support 5
+
+Evidence: work/ui-round-5, base 3179563; run G:/Projects/Nib-ci-logs/ui-ci/41891170141 (219378a), results.json, digest.json, both class ui.log files and shots; comparison baseline 41817269947. Read QA-support-4 first and QA-support-3/README. Comparison rerun with PYTHONIOENCODING=utf-8 after the Windows console rejected Unicode. Insert 27/70 -> 21/70, Selection 23/68 -> 33/68; these results predate round 4. No Swift/Objective-C compiler or simulator here. All changes below are **unverified** until macos-26 CI. No app files edited.
+
+## K - keyboard routes
+
+Audited every chord/key call site: Insert global Settings, Save, Go to Page, page typing and Select All have destination/content postconditions; Selection's key wrapper requires a verifying closure (tool, selection, clipboard counter, counts, geometry, panel or saved-provider result). The 10 Insert and 23 Selection non-text responder failures are already addressed by round 4 hardware synthesis; no SPI or focus-preparation redesign here.
+
+Two Insert app-level Escape stragglers: CommentResolveFilter now uses chord with its existing menu-disappearance postcondition. finish() sends Escape to the focused native editor, preserving the existing editor-disappearance assertion; StickyEditor.swift defines that native Escape command. This also targets ShapeAttachedLabelDoubleTap and StickyCollapseExpand's finish failures. Native formatting/Command-A still use nativeKey. Selection's only direct typeKey is Safari Command-A immediately after tapping its address field: native editing, not a Nib global shortcut. ExternalDragToSafari remains unchanged and failing without real multitasking controls. Next CI must prove command effects, not merely successful event synthesis.

@@ -167,7 +167,7 @@ final class InsertUITests: XCTestCase {
     private func finish() throws {
         if visible("Finish Editing") { try tap("Finish Editing") }
         else if visible("Done typing") { try tap("Done typing") }
-        else { ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: []); outside() }
+        else { try ui.nativeKey(XCUIKeyboardKey.escape.rawValue, [], in: focusedField()) }
         try wait("Text input must finish") { !self.ui.app.textViews.allElementsBoundByIndex.contains { $0.isHittable } }
     }
     private func replace(_ field: XCUIElement, with text: String) throws {
@@ -1212,8 +1212,9 @@ final class InsertUITests: XCTestCase {
         try toggle("Show Resolved", to: true)
         try message("Check the units").tap(); try tap("Reopen Thread")
         try message("Check the units").press(forDuration: 0.8)
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-        try wait("Message context menu must dismiss before panel controls") { !self.ui.app.buttons["Edit Message"].exists }
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) {
+            try self.wait("Message context menu must dismiss before panel controls") { !self.ui.app.buttons["Edit Message"].exists }
+        }
         try tap("cmd.panel.close"); try goToSecondPage(); try panel("Comments")
         try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page }
