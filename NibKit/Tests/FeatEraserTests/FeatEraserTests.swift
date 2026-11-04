@@ -800,6 +800,22 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertEqual(bar.size, 6)
     }
 
+    func testSizeSlotIdentitiesAndSelectionMapToTheExactPreset() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let model = EraserOptions(app: h.app)
+        let ids = EraserSettings.presets.indices.map { EraserSizePresets.slotID($0) }
+        XCTAssertEqual(ids, ["size.eraser.0", "size.eraser.1", "size.eraser.2"])
+        XCTAssertEqual(Set(ids).count, EraserSettings.presets.count)
+        for index in [0, 1, 2, 1, 0] {
+            let size = EraserSettings.presets[index]
+            model.selectSize(size)
+            XCTAssertEqual(model.size, size)
+            await model.pendingSettingsWrite?.value
+            XCTAssertEqual(EraserSettings.size(h.app.settings), size)
+            XCTAssertEqual(EraserSettings.presets.firstIndex(of: model.size), index)
+        }
+    }
+
     func testFinishedSizeChoiceFlushesSliderAndCannotBeOverwrittenByItsDebounce() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
         let model = EraserOptions(app: h.app)

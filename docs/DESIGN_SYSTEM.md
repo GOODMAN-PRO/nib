@@ -9462,6 +9462,7 @@ extension NibPenSwatch {
 }
 extension NibPenSwatch.Size { var diameter: CGFloat }
 struct NibWidthPresetButton: View { init(diameter: CGFloat, isSelected: Bool, label: String, action: @escaping () -> Void) }
+// An additive initializer with slotID: String? and value: String? = nil encodes the supplied fields in accessibilityValue (joined by "; "), preserving the caller's cmd identifier and bounding native touch ownership to the 44 × 40 cell.
 extension NibMetrics { static let widthPresetDots: [CGFloat]; static func widthPresetDot(_ index: Int) -> CGFloat }
 extension View { func nibTooltip(_ text: String) -> some View }   // Components/Buttons.swift
 // NibIconButton, NibToolButton, NibDropletButton, NibOptionTile, NibWidthPresetButton read `isEnabled` and dim to 40 %

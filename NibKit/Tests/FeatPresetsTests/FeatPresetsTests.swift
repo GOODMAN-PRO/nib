@@ -711,6 +711,34 @@ final class FeatPresetsTests: XCTestCase {
         }
     }
 
+    func testWidthSlotIdentitiesAndTapsPreserveTheExactSelectedIndex() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        var identities = Set<String>()
+        for tool in NibSettings.presetTools {
+            let model = PresetMenuModel(app: h.app, session: h.session, tool: tool)
+            for index in 0..<PresetRules.widthSlots {
+                let identity = PresetMenuModel.widthSlotID(tool, index)
+                XCTAssertEqual(identity, "width.\(tool).\(index)")
+                XCTAssertTrue(identities.insert(identity).inserted, "Slots and tools have distinct identities")
+            }
+            // Both directions, including the failing transition back from Large to Medium.
+            for index in [0, 1, 2, 1, 0] {
+                model.tapWidth(index)
+                let deadline = Date().addingTimeInterval(3)
+                while model.presets.selectedWidth != index && Date() < deadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertEqual(model.presets.selectedWidth, index, tool)
+                XCTAssertEqual(presets(h, tool).selectedWidth, index, "The command must persist the tapped index")
+                XCTAssertNil(model.popover, "Selecting a different width must not open its editor")
+                model.tapWidth(index)
+                XCTAssertEqual(model.popover, .width(index), "Retapping edits that exact slot")
+                model.tapWidth(index)
+                XCTAssertNil(model.popover, "Retapping the edited slot closes it")
+            }
+        }
+    }
+
     /// Exercise the actual options row, so replacing its shared width buttons with stroke samples regresses here.
     func testOptionsWidthsUseDistinctDotsAndRoundedSelectedCellsForEveryTool() throws {
         let h = Harness(features: [FeatPresetsFeature.self])

@@ -211,10 +211,20 @@ final class InkUITests: XCTestCase {
             .filter { !$0.label.hasPrefix("Thickness ") }
     }
 
+    private func widthButton(_ slot: Int) throws -> XCUIElement {
+        let tool = try ui.state().tool
+        let prefix = "width.\(tool).\(slot - 1); "
+        let query = ui.app.buttons.matching(NSPredicate(
+            format: "identifier == %@ AND value BEGINSWITH %@", "cmd.preset.select", prefix))
+        let button = query.firstMatch
+        try wait("Missing thickness slot \(slot) for \(tool)") { button.exists && button.isHittable }
+        XCTAssertEqual(query.count, 1, "A tool's width slot must have one accessibility identity")
+        XCTAssertEqual(button.label, "Thickness \(slot)")
+        return button
+    }
+
     private func width(_ slot: Int, edit: Bool = false) throws {
-        let button = try control("Thickness \(slot)", type: .button)
-        // Tap the visible cell centre, as Support/NibUI does for command controls. XCTest's
-        // inferred hit point can land on the adjacent slot in this tightly packed options bar.
+        let button = try widthButton(slot)
         if !button.isSelected { button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
         try wait("Thickness \(slot) must be selected") { button.isSelected }
         if edit { button.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
@@ -597,7 +607,7 @@ final class InkUITests: XCTestCase {
             let before = try ui.state(), blank = try raster()
             try draw(); _ = try visibleInk(after: blank)
             let expected = String(format: "%.2f", points * 25.4 / 72)
-            let value = String(describing: try control("Thickness \(index + 1)", type: .button).value)
+            let value = String(describing: try widthButton(index + 1).value)
             XCTAssertTrue(value.contains(expected), "DESIGN §14.3 requires \(points) pt (\(expected) mm), got \(value)")
             try undo(to: before)
         }
@@ -659,12 +669,12 @@ final class InkUITests: XCTestCase {
             try tap(pattern)
             XCTAssertTrue(try control(pattern, type: .button).isSelected)
             closePopover()
-            let value = String(describing: try control("Thickness 2", type: .button).value)
+            let value = String(describing: try widthButton(2).value)
             if pattern != "Solid" { XCTAssertTrue(value.contains(pattern), "Slot must retain \(pattern)") }
             let before = try ui.state(), blank = try raster()
             try draw(); images.append(try visibleInk(after: blank)); try undo(to: before)
             try ui.selectTool("highlighter"); try ui.selectTool("pen")
-            XCTAssertEqual(String(describing: try control("Thickness 2", type: .button).value), value)
+            XCTAssertEqual(String(describing: try widthButton(2).value), value)
         }
         XCTAssertGreaterThan(images[0].changed(from: images[1]), 20, "Dashed must differ from solid")
         XCTAssertGreaterThan(images[1].changed(from: images[2]), 20, "Dotted must differ from dashed")
@@ -774,11 +784,11 @@ final class InkUITests: XCTestCase {
 
     func testRestoreDefaultsCancelPreservesAndConfirmResetsOnlySelectedTool() throws {
         let defaults = swatches.map(\.label)
-        let defaultWidth = String(describing: try control("Thickness 2", type: .button).value)
+        let defaultWidth = String(describing: try widthButton(2).value)
         try width(2, edit: true)
         _ = try slider("Thickness", to: 0.8)
         try tap("Dashed"); closePopover()
-        let customWidth = String(describing: try control("Thickness 2", type: .button).value)
+        let customWidth = String(describing: try widthButton(2).value)
         XCTAssertNotEqual(customWidth, defaultWidth)
         try swatchMenu("Change Colour"); try chooseColour("Vermilion"); closePopover()
         let custom = swatches.map(\.label)
@@ -788,11 +798,11 @@ final class InkUITests: XCTestCase {
         try ui.selectTool("pen")
         try swatchMenu("Restore Default Presets"); cancelConfirmation()
         XCTAssertEqual(swatches.map(\.label), custom)
-        XCTAssertEqual(String(describing: try control("Thickness 2", type: .button).value), customWidth,
+        XCTAssertEqual(String(describing: try widthButton(2).value), customWidth,
                        "Cancel must preserve customised width and pattern as well as colours")
         try swatchMenu("Restore Default Presets"); try tap("cmd.preset.reset")
         try wait("Confirmed reset must restore pen defaults") { self.swatches.map(\.label) == defaults }
-        XCTAssertEqual(String(describing: try control("Thickness 2", type: .button).value), defaultWidth,
+        XCTAssertEqual(String(describing: try widthButton(2).value), defaultWidth,
                        "Restore Defaults must restore width and Solid pattern")
         let blank = try raster(); try draw(); _ = try visibleInk(after: blank)
         try ui.selectTool("highlighter")
@@ -849,9 +859,15 @@ final class InkUITests: XCTestCase {
         let before = try ui.state(), full = try raster()
         try eraser("Precision")
         var removed: [Int] = []
-        for label in ["Small eraser, 6 points", "Medium eraser, 14 points", "Large eraser, 28 points"] {
-            try tap(label)
-            XCTAssertTrue(try control(label, type: .button).isSelected)
+        for (index, label) in ["Small eraser, 6 points", "Medium eraser, 14 points", "Large eraser, 28 points"].enumerated() {
+            let query = ui.app.buttons.matching(NSPredicate(
+                format: "identifier == %@ AND value == %@", "cmd.settings.set", "size.eraser.\(index)"))
+            let button = query.firstMatch
+            try wait("Missing eraser size slot \(index)") { button.exists && button.isHittable }
+            XCTAssertEqual(query.count, 1, "An eraser size slot must have one accessibility identity")
+            XCTAssertEqual(button.label, label)
+            button.tap()
+            XCTAssertTrue(button.isSelected)
             try ui.drawStroke([CGPoint(x: 0.5, y: 0.58), CGPoint(x: 0.5, y: 0.66)])
             _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
             removed.append(try raster().changed(from: full)); try undo(to: before)
