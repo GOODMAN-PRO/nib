@@ -670,17 +670,15 @@ final class CreateUITests: XCTestCase {
             String(try XCTUnwrap(components.day)), formatter.string(from: chosen))).firstMatch
         try require(day, "Native start-date picker must expose the chosen day")
         day.tap()
-        // Try picker delivery, then the app responder while the popover is still open; never dismiss the parent.
+        // The calendar is anchored above Starts. Its caption is an inert point inside the parent sheet.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
-            traceCreation("planner-before-picker-dismissal")
-            try ui.hardwareKey(XCUIKeyboardKey.escape.rawValue)
-            if ui.app.buttons["DatePicker.NextMonth"].exists {
-                try ui.hardwareKey(XCUIKeyboardKey.escape.rawValue)
-            }
+            let caption = ui.app.staticTexts["Starts"].firstMatch
+            try require(caption, "Start-date caption must remain visible outside the calendar")
+            XCTAssertTrue(caption.isHittable)
+            caption.tap()
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
-            traceCreation("planner-after-picker-dismissal")
         }
         try require(button("Create Planner"), "Picker dismissal must preserve the parent planner")
         try tap("Create Planner")
@@ -962,8 +960,12 @@ final class CreateUITests: XCTestCase {
         try scrollTap("Grid")
         try scrollTap("Graph Paper")
         let id = try create()
-        for _ in 0..<3 { try ui.tapCommand("page.add") }
-        try ui.waitForState { $0.pageCount == 4 }
+        for expected in 2...4 {
+            try ui.tapCommand("page.add")
+            try ui.waitForState { $0.pageCount == expected }
+        }
+        // The state probe sees the in-memory commit before its package write finishes.
+        try wait("All four pages must reach the persisted package") { (try? self.livePages(id).count) == 4 }
         let papers = try livePages(id).map(template)
         XCTAssertEqual(papers.count, 4)
         if choice == "All pages" { XCTAssertEqual(papers, Array(repeating: "builtin.graph", count: 4)) }

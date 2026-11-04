@@ -592,19 +592,24 @@ final class NibUI {
         }
     }
 
-    /// Waits for a real asset cell in the native Photos grid, excluding the document's background image.
+    /// Photos on iOS 26 exposes assets as Images under photos_sectioned_layout, not collection cells.
     func photoAsset() throws -> XCUIElement {
-        let photos = NSPredicate(format: "label BEGINSWITH[c] 'Photo' OR label BEGINSWITH[c] 'Image'")
-        let cells = app.collectionViews.cells
-        let labelled = cells.matching(photos).firstMatch
-        let containing = cells.containing(photos).firstMatch
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            (labelled.exists && labelled.isHittable) || (containing.exists && containing.isHittable)
-        }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
-            throw Failure.message("Photos must expose a selectable asset cell\n\(app.debugDescription)")
+        let assets = app.otherElements["photos_sectioned_layout"].images.matching(
+            NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH 'Photo,'"))
+        let legacy = app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Photo,'"))
+        func candidate() -> XCUIElement? {
+            for query in [assets, legacy] {
+                let first = query.firstMatch
+                if hasVisibleFrame(first), first.isHittable { return first }
+            }
+            return nil
         }
-        return labelled.exists && labelled.isHittable ? labelled : containing
+        if let asset = candidate() { return asset }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in candidate() != nil }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed, let asset = candidate() else {
+            throw Failure.message("Photos must expose a selectable asset in its grid\n\(app.debugDescription)")
+        }
+        return asset
     }
 
     /// Exports the current share sheet to a uniquely named Files directory and waits for the real PNG bytes on disk.
@@ -1094,7 +1099,7 @@ final class NibUI {
     func dismissSheets() throws {
         for _ in 0..<8 {
             var close: XCUIElement?
-            for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close"] {
+            for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
                 if let found = findControl(id, type: .button), found.isEnabled { close = found; break }
             }
             if let close { close.tap(); continue }

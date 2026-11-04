@@ -437,14 +437,16 @@ final class ChromeUITests: XCTestCase {
     func testMoreImageOpensSourcePickerAndCancelDoesNotInsert() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.image"); ui.coordinate(CGPoint(x: 0.5, y: 0.65)).tap(); try tap("Files")
-        _ = try require("Browse"); try tap("Cancel"); try sameContent(before)
+        let provider = ui.app.cells["DOC.sidebar.item.On My iPad"].firstMatch
+        XCTAssertTrue(provider.exists || provider.waitForExistence(timeout: 8), "Files picker must expose its local provider")
+        try tap("Cancel"); try sameContent(before)
     }
 
     func testMoreElementsOpensRegisteredPanel() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.elements")
         _ = try ui.waitForState { $0.tool == "elements" }
-        try tap("tool.elements"); try replace("Search elements", "Heart"); try tap("Heart")
+        try tap("tool.elements"); try replace("Search elements", "Heart"); try ui.dismissNativeKeyboard(); try tap("Heart")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
@@ -612,12 +614,14 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
         let pen = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Fountain Pen'")).firstMatch
         XCTAssertTrue(pen.exists && pen.isHittable, "Pen reorder handle must define the insertion row")
+        let row = ui.app.collectionViews.cells.containing(.button, identifier: pen.label).firstMatch
+        XCTAssertTrue(row.exists, "Reorder destination must be the Pen row")
         let insertion = pen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .withOffset(CGVector(dx: 0, dy: -pen.frame.height / 2 - 2))
+            .withOffset(CGVector(dx: 0, dy: row.frame.minY + 4 - pen.frame.midY))
         let trace = XCTAttachment(string: "toolbar.setLayout via onMove: Highlighter \(handle.frame), Pen \(pen.frame), insertion \(insertion.screenPoint)\n\(ui.app.debugDescription)")
         trace.name = "reorder-insertion-target"; trace.lifetime = .keepAlways; add(trace)
         handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.5, thenDragTo: insertion, withVelocity: .slow, thenHoldForDuration: 0.2)
+            .press(forDuration: 0.05, thenDragTo: insertion, withVelocity: XCUIGestureVelocity(rawValue: 100), thenHoldForDuration: 0.5)
         try wait("Reordering must move Highlighter above Pen") {
             self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }
@@ -1029,7 +1033,11 @@ final class ChromeUITests: XCTestCase {
         _ = try reachable("Start Timer")
     }
     func testStopwatchAdvancesPauseRetainsElapsedAndLapsDoNotReset() throws {
-        try open(); try timeKeeper(); try tap("Stopwatch"); try tap("Start Stopwatch")
+        try open(); try timeKeeper(); let modes = ui.app.buttons.matching(NSPredicate(format: "label == 'Timer or stopwatch'"))
+        XCTAssertEqual(modes.count, 2, "Native segmented picker must expose Timer and Stopwatch")
+        let stopwatch = modes.element(boundBy: 1)
+        XCTAssertTrue(stopwatch.isHittable)
+        stopwatch.tap(); try tap("Start Stopwatch")
         try wait("Stopwatch must expose elapsed clock") { self.clockValue.exists }
         let start = clockValue.label
         try wait("Stopwatch elapsed time must advance") { self.clockValue.label != start }
@@ -1043,7 +1051,7 @@ final class ChromeUITests: XCTestCase {
         try tap("Resume"); try wait("Stopwatch must resume from elapsed time") { self.clockValue.label != paused }
         XCTAssertEqual(laps.count, 2)
         try tap("Stop and Save")
-        _ = try reachable("Stopwatch")
+        try wait("Stopwatch mode must remain available after saving") { modes.count == 2 && modes.element(boundBy: 1).isHittable }
     }
     func testTimerSaveAndDeleteModesPersistAcrossPanelReopen() throws {
         try open(); try timeKeeper(); try replace("Duration", "2:30")
