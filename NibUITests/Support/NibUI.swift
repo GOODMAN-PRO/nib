@@ -597,11 +597,29 @@ final class NibUI {
         guard XCTWaiter.wait(for: [gone], timeout: 5) == .completed else { throw Failure.message("Keyboard did not dismiss") }
     }
 
+    /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
+    func textField(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
+        var field: XCUIElement?
+        func locate() -> Bool {
+            field = findControl(name, type: .textField, actionable: false)
+            return field != nil
+        }
+        if !locate() {
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in locate() }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed else {
+                throw Failure.message("Missing native text field: \(name)")
+            }
+        }
+        guard let field else { throw Failure.message("Missing native text field: \(name)") }
+        try focusField(field)
+        return field
+    }
+
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
         if isKeyboardFocused(field) { return }
         revealFormElement(field)
-        guard field.exists && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
+        guard hasVisibleFrame(field) && field.isHittable else { throw Failure.message("Native field cannot receive focus: \(field)") }
         field.tap()
         let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
         guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed else {
@@ -922,9 +940,9 @@ final class NibUI {
     func dismissSheets() throws {
         for _ in 0..<8 {
             if let close = ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close"].compactMap({ id in
-                app.buttons.matching(identifier: id).allElementsBoundByIndex.first { $0.isHittable }
+                findControl(id, type: .button)
             }).first { close.tap(); continue }
-            if let sheet = app.sheets.allElementsBoundByIndex.first {
+            if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
                 sheet.swipeDown(); continue
             }
             return

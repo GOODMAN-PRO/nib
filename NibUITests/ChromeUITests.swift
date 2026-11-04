@@ -105,7 +105,7 @@ final class ChromeUITests: XCTestCase {
     }
     private func replace(_ name: String, _ text: String) throws {
         // Duration has a separate StaticText caption; only the native editor can accept key synthesis.
-        let target = try ui.requireControl(name, type: .textField, scroll: true, timeout: 8)
+        let target = try ui.textField(name)
         try ui.replaceNativeText(in: target, with: text)
     }
 
@@ -198,9 +198,13 @@ final class ChromeUITests: XCTestCase {
     func testShareExportOpensCorrectSheetAndCancelIsInert() throws {
         try open(); let before = try ui.state()
         try menu("share", "Export all…")
-        _ = try ui.waitForState { !$0.openPanels.isEmpty }
-        _ = try require("PDF")
-        try ui.dismissSheets(); try sameContent(before)
+        // ExportPresentation presents exportui.dialog directly, outside the registered panel state.
+        _ = try reachable("Share & Export")
+        _ = try reachable("PDF")
+        XCTAssertTrue(try reachable("All").isSelected, "Export all must select every page")
+        try ui.dismissSheets()
+        try wait("Export options must close") { self.ui.findControl("Share & Export") == nil }
+        try sameContent(before)
     }
 
     func testMenusOutsideDismissWithoutInkOrHistoryChanges() throws {
@@ -313,7 +317,12 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.drawShape")
         _ = try ui.waitForState { $0.tool == "drawShape" }
-        try draw()
+        // Draw Shape recognises this straight path as a vector shape (F030), not an additional ink stroke.
+        try ui.drawStroke([CGPoint(x: 0.4, y: 0.65), CGPoint(x: 0.6, y: 0.68)])
+        _ = try ui.waitForState {
+            $0.itemCountOnPage == before.itemCountOnPage + 1
+                && $0.strokeCountOnPage == before.strokeCountOnPage && $0.undoAvailable
+        }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage && $0.strokeCountOnPage == before.strokeCountOnPage }
     }
