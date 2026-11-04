@@ -86,23 +86,11 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func tap(_ name: String, scroll: Bool = false) throws {
-        let candidates = query(name)
-        for attempt in 0..<(scroll ? 10 : 2) {
-            let matches = candidates.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let target = matches.first(where: { $0.elementType == .button }) ?? matches.first {
-                target.tap()
-                return
-            }
-            if attempt == 0 { _ = candidates.firstMatch.waitForExistence(timeout: 5) }
-            if scroll {
-                let panels = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex
-                let scroller = panels.first { $0.identifier != "nib.canvas" && $0.isHittable &&
-                    $0.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).count > 0
-                } ?? panels.last { $0.identifier != "nib.canvas" && $0.isHittable }
-                scroller?.swipeUp()
-            }
+        let target = try ui.requireControl(name, scroll: scroll, timeout: 5)
+        guard target.isEnabled else {
+            throw NibUI.Failure.message("State cannot be reached: disabled \(name)")
         }
-        throw NibUI.Failure.message("State cannot be reached: no actionable \(name)")
+        target.tap()
     }
 
     private func capture(_ number: Int, _ screen: String, state: @escaping (QAState) -> Bool) throws {
@@ -293,8 +281,15 @@ final class CaptureUITests: XCTestCase {
     }
 
     private func settings() throws {
-        ui.app.typeKey(",", modifierFlags: .command)
-        _ = try require("Settings")
+        try ui.chord(",", .command) {
+            // The library also exposes Settings. Prove that the settings surface actually presented.
+            try self.wait("Settings must present its navigation and Done control") {
+                let sections = self.ui.app.otherElements["Settings sections"]
+                let compactSearch = self.ui.app.textFields["Search settings"]
+                return (self.ui.hasVisibleFrame(sections) || self.ui.hasVisibleFrame(compactSearch))
+                    && self.ui.findControl("sheet.dismiss", type: .button) != nil
+            }
+        }
         _ = try ui.waitForState { $0.screen == "library" }
     }
 
