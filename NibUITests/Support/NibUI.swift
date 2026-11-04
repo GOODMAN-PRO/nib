@@ -40,6 +40,66 @@ final class NibUI {
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards }
 
+    /// Reject hidden SwiftUI menu copies before asking AX for an activation point (zero frames can raise).
+    func hasVisibleFrame(_ element: XCUIElement, in viewport: CGRect? = nil) -> Bool {
+        guard element.exists else { return false }
+        let frame = element.frame
+        let visible = frame.intersection(viewport ?? app.windows.firstMatch.frame)
+        return !frame.isNull && !frame.isInfinite && visible.width > 1 && visible.height > 1
+    }
+
+    /// Exact, bounded matches only. Native editors precede their identically labelled captions.
+    /// Offscreen matches remain available to revealFormElement so it can find the actual containing form.
+    func findControl(_ name: String, type: XCUIElement.ElementType = .any,
+                     actionable: Bool = true, in scope: XCUIElement? = nil) -> XCUIElement? {
+        let types: [XCUIElement.ElementType] = type == .any
+            ? [.textField, .textView, .searchField, .switch, .button, .slider, .cell,
+               .segmentedControl, .staticText, .other, .any] : [type]
+        let predicate = NSPredicate(format:
+            "(identifier == %@ OR label == %@ OR placeholderValue == %@) AND (NOT identifier BEGINSWITH 'tool.' OR identifier == %@)",
+            name, name, name, name)
+        let roots: [XCUIElement]
+        if let scope { roots = [scope] }
+        else {
+            // UIKit colour editors and native sheets take precedence over retained custom popover trees.
+            roots = [app.otherElements["UIColorPicker"].firstMatch, app.sheets.firstMatch,
+                     app.descendants(matching: .popover).firstMatch].filter { $0.exists } + [app]
+        }
+        for root in roots {
+            for kind in types {
+                let matches = root.descendants(matching: kind).matching(predicate)
+                let first = matches.firstMatch
+                guard first.exists else { continue }
+                if !actionable { return first }
+                if hasVisibleFrame(first), first.isHittable { return first }
+                // Duplicate command labels occur in retained/hidden menus. Never enumerate the whole tree.
+                for index in 1..<max(1, min(matches.count, 8)) {
+                    let element = matches.element(boundBy: index)
+                    if hasVisibleFrame(element), element.isHittable { return element }
+                }
+            }
+        }
+        return nil
+    }
+
+    func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
+                        scroll: Bool = false, timeout: TimeInterval = 3) throws -> XCUIElement {
+        if let found = findControl(name, type: type) { return found }
+        if scroll, let target = findControl(name, type: type, actionable: false) {
+            revealFormElement(target)
+            if let found = findControl(name, type: type) { return found }
+        }
+        var found: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            found = findControl(name, type: type)
+            return found != nil
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: timeout) == .completed, let found else {
+            throw Failure.message("Missing hittable control: \(name)\n\(app.debugDescription)")
+        }
+        return found
+    }
+
     /// Waits for a target in its actual form, searching both directions until the visible rows stop changing.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
@@ -47,7 +107,7 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
-        if initial.exists && initial.isHittable,
+        if hasVisibleFrame(initial) && initial.isHittable,
            (form?.frame ?? app.windows.firstMatch.frame).contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
         let containers = (app.collectionViews.allElementsBoundByIndex + app.tables.allElementsBoundByIndex
             + app.scrollViews.allElementsBoundByIndex).filter {
@@ -69,14 +129,17 @@ final class NibUI {
                     + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
                 guard let viewport = NibUITestScrollGeometry.viewport(
                     scroll: list.frame, window: app.windows.firstMatch.frame, obstructions: obstructions) else { return }
-                if element.exists && element.isHittable && viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
+                if hasVisibleFrame(element, in: viewport) && element.isHittable && viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
                 // One snapshot supplies the visible range; querying every row attribute separately can itself time out.
                 guard let snapshot = try? list.snapshot() else { return }
                 let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
                 if signature == previous { break }
                 previous = signature
                 let origin = app.coordinate(withNormalizedOffset: .zero)
-                let x = viewport.minX + viewport.width * 0.5
+                // Custom pen forms put sliders across the centre. Their 16-point content inset is scrollable;
+                // native grouped lists instead need a row touch, away from the trailing switch.
+                let x = [.collectionView, .table].contains(list.elementType)
+                    ? viewport.midX : viewport.minX + min(8, viewport.width * 0.025)
                 let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
                 let endY = viewport.minY + viewport.height * (down ? 0.75 : 0.25)
                 origin.withOffset(CGVector(dx: x - app.frame.minX, dy: startY - app.frame.minY))

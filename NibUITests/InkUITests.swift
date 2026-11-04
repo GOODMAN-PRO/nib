@@ -51,32 +51,7 @@ final class InkUITests: XCTestCase {
     /// Waits on typed identifier/label queries, re-resolving firstMatch rather than snapshot indices during menu transitions.
     private func control(_ label: String, type: XCUIElement.ElementType = .any,
                          scroll: Bool = false) throws -> XCUIElement {
-        let types: [XCUIElement.ElementType] = type == .any
-            ? [.button, .switch, .slider, .textField, .segmentedControl, .staticText, .other] : [type]
-        let predicate = NSPredicate(format: "(identifier == %@ OR label == %@) AND (identifier BEGINSWITH %@ OR NOT identifier BEGINSWITH 'tool.')",
-                                    label, label, label.hasPrefix("tool.") ? "tool." : "cmd.")
-        /// Resolves a fresh typed query without waiting; hittability is evaluated locally, not as an unsupported AX query attribute.
-        func candidate() -> XCUIElement? {
-            for kind in types {
-                let visible = ui.app.descendants(matching: kind).matching(predicate).firstMatch
-                if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
-            }
-            if type == .any {
-                let visible = ui.app.descendants(matching: .any).matching(predicate).firstMatch
-                if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
-            }
-            return nil
-        }
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in candidate() != nil }, object: nil)
-        _ = XCTWaiter.wait(for: [ready], timeout: 3)
-        if let found = candidate() { return found }
-        if scroll {
-            ui.revealFormElement {
-                candidate() ?? self.ui.app.descendants(matching: type).matching(predicate).firstMatch
-            }
-            if let found = candidate() { return found }
-        }
-        throw NibUI.Failure.message("Missing hittable control: \(label)\n\(ui.app.debugDescription)")
+        try ui.requireControl(label, type: type, scroll: scroll)
     }
 
     /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
@@ -134,9 +109,7 @@ final class InkUITests: XCTestCase {
         default: topLabel = "Fountain Pen"
         }
         for _ in 0..<8 {
-            let visible = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", topLabel))
-                .allElementsBoundByIndex.contains { $0.isHittable && !$0.identifier.hasPrefix("tool.") && [XCUIElement.ElementType.button, .switch].contains($0.elementType) }
-            if visible { return }
+            if ui.findControl(topLabel) != nil { return }
             guard let panel = ui.app.scrollViews.allElementsBoundByIndex.first(where: {
                 $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.width > 200 && $0.frame.width < 600 && $0.frame.height > 180
             }) else { break }
@@ -279,24 +252,44 @@ final class InkUITests: XCTestCase {
         option.tap()
     }
 
+    private var colourPicker: XCUIElement { ui.app.otherElements["UIColorPicker"].firstMatch }
+
     private func closeColourPicker() throws {
-        // UIKit labels the colour picker's dismissal Close on current iPadOS, Done on older releases.
-        if let close = ui.app.buttons.matching(identifier: "Close").allElementsBoundByIndex.last(where: { $0.isHittable }) {
-            close.tap()
-        } else {
-            try tap("Done")
+        let picker = colourPicker
+        guard picker.exists else { throw NibUI.Failure.message("Native colour picker is not presented") }
+        // This simulator exposes lowercase close; SwiftUI's colour popover can hide that button entirely.
+        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'")).firstMatch
+        if ui.hasVisibleFrame(close) && close.isHittable { close.tap() }
+        else {
+            // Dismiss the observed popover from outside its content, never by tapping a similarly named app control.
+            let content = picker.scrollViews.firstMatch
+            let point = ui.coordinate(CGPoint(x: 0.95, y: 0.85))
+            guard content.exists && !content.frame.contains(point.screenPoint) else {
+                throw NibUI.Failure.message("No outside dismissal point for native colour picker")
+            }
+            point.tap()
         }
+        try wait("Native colour picker must dismiss") { !picker.exists }
     }
 
     private func hexField() throws -> XCUIElement {
-        let labelled = ui.app.textFields.matching(NSPredicate(format: "label CONTAINS[c] 'hex' OR identifier CONTAINS[c] 'hex'")).firstMatch
-        if labelled.exists && labelled.isHittable { return labelled }
-        // iPadOS 26 gives the HEX caption an accessibility label, but leaves its adjacent field unlabelled.
-        let caption = try control("sRGB Hex Color\u{00a0}#", type: .button)
-        if let field = ui.app.textFields.allElementsBoundByIndex.first(where: {
-            $0.isHittable && abs($0.frame.midY - caption.frame.midY) < 28 && $0.frame.minX >= caption.frame.maxX - 4
-        }) {
-            return field
+        let picker = colourPicker
+        guard picker.waitForExistence(timeout: 3) else { throw NibUI.Failure.message("Native colour picker missing") }
+        let labelled = picker.textFields.matching(NSPredicate(
+            format: "label CONTAINS[c] 'hex' OR identifier CONTAINS[c] 'hex' OR placeholderValue CONTAINS[c] 'hex'")).firstMatch
+        if ui.hasVisibleFrame(labelled) && labelled.isHittable { return labelled }
+        // The caption is an AX button with a nonbreaking space, sometimes duplicated. It is a geometry anchor,
+        // not the editor: requiring it to be hittable rejects the visible unlabelled field beside it.
+        let caption = picker.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'Hex Color'")).firstMatch
+        guard ui.hasVisibleFrame(caption) else { throw NibUI.Failure.message("Native HEX caption missing") }
+        let anchor = caption.frame
+        let fields = picker.textFields
+        for index in 0..<min(fields.count, 8) {
+            let field = fields.element(boundBy: index)
+            if ui.hasVisibleFrame(field), field.isHittable,
+               abs(field.frame.midY - anchor.midY) < 28 && field.frame.minX >= anchor.maxX - 4 {
+                return field
+            }
         }
         throw NibUI.Failure.message("System colour picker must expose an editable HEX field beside its caption\n\(ui.app.debugDescription)")
     }

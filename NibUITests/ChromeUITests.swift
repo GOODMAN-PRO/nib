@@ -62,19 +62,7 @@ final class ChromeUITests: XCTestCase {
 
     /// Waits for an actionable control in its containing form with bidirectional, progress-bounded scrolling.
     private func reachable(_ name: String) throws -> XCUIElement {
-        let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
-        let buttons = ui.app.buttons.matching(predicate)
-        let target = {
-            buttons.allElementsBoundByIndex.first {
-                $0.isHittable && $0.isEnabled && !$0.identifier.hasPrefix("tool.")
-            } ?? (buttons.firstMatch.exists ? buttons.firstMatch : self.query(name).firstMatch)
-        }
-        ui.revealFormElement(target: target)
-        try wait("Chrome control is not actionable: \(name)", timeout: 8) {
-            let found = target()
-            return found.exists && found.isHittable && found.isEnabled
-        }
-        return target()
+        try ui.requireControl(name, scroll: true, timeout: 8)
     }
 
     private func tap(_ name: String) throws { try reachable(name).tap() }
