@@ -751,15 +751,37 @@ final class NibUI {
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
         try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
             try focusField(field)
+            XCTContext.runActivity(named: "Native field key route") { activity in
+                let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(probe.value ?? "missing")")
+                attachment.lifetime = .keepAlways; activity.add(attachment)
+            }
             field.typeKey(key, modifierFlags: modifiers)
         }
     }
 
-    /// Waits for exact replacement, including empty fields, so a lost Select All cannot silently append text.
-    func replaceNativeText(in field: XCUIElement, with text: String) throws {
+    /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
+    func clearNativeText(in field: XCUIElement) throws {
         try nativeKey("a", in: field)
-        timedAction("Native replacement delivery (\(text.count) characters)") {
-            field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
+        if value.isEmpty || value == field.placeholderValue { return }
+        // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
+        field.typeText(XCUIKeyboardKey.delete.rawValue)
+        guard let remaining = field.value as? String else { throw Failure.message("Native editor lost its value after deletion") }
+        if !remaining.isEmpty && remaining != field.placeholderValue {
+            // Collapse any selection to its right edge and move beyond every remaining character.
+            // Plain arrow events do not depend on Command-A or the app's command routing.
+            guard remaining.count <= 4096 else { throw Failure.message("Native clear exceeds bounded editor length") }
+            field.typeText(String(repeating: XCUIKeyboardKey.rightArrow.rawValue, count: remaining.count + 1))
+            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: remaining.count))
+        }
+        try waitForNativeText(in: field, equals: "")
+    }
+
+    /// Waits for exact replacement, including empty fields, after proving the old content is gone.
+    func replaceNativeText(in field: XCUIElement, with text: String) throws {
+        try clearNativeText(in: field)
+        if !text.isEmpty {
+            timedAction("Native replacement delivery (\(text.count) characters)") { field.typeText(text) }
         }
         try waitForNativeText(in: field, equals: text)
     }

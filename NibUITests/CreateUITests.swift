@@ -861,8 +861,8 @@ final class CreateUITests: XCTestCase {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
         field.tap()
-        field.typeKey("a", modifierFlags: [.command])
-        field.typeText(text)
+        try ui.clearNativeText(in: field)
+        if !text.isEmpty { field.typeText(text) }
         try wait("Field must contain the replacement before dismissal: \(text)") {
             guard let actual = field.value as? String else { return false }
             return matcher?(actual, text) ?? (actual == text)
