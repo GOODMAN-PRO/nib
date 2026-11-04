@@ -189,6 +189,13 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             for (number, edge) in [(7, "left"), (8, "top"), (9, "bottom")] {
                 try self.dock(edge)
+                try self.wait("The \(edge) palette must expose its tools, not only the options strip", timeout: 8) {
+                    let more = self.ui.app.buttons.matching(identifier: "tool.more")
+                    let colours = self.ui.app.buttons.matching(identifier: "cmd.preset.select")
+                        .matching(NSPredicate(format: "label == 'Colour 1'"))
+                    return more.allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) }
+                        && colours.allElementsBoundByIndex.contains { self.ui.hasVisibleFrame($0) }
+                }
                 try self.capture(number, "canvas-palette-" + edge) {
                     $0.screen == "document" && $0.paletteDock?.edge == edge
                 }
