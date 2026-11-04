@@ -204,9 +204,7 @@ final class CaptureUITests: XCTestCase {
             try self.openNotebook()
             try self.ui.selectTool(id)
             try self.tap("menu.toolSettings")
-            guard self.ui.app.staticTexts[title].firstMatch.waitForExistence(timeout: 12) else {
-                throw NibUI.Failure.message("\(title) options did not open")
-            }
+            _ = try self.ui.requireControl(title, type: .staticText, timeout: 12)
             try self.capture(number, id == "shape" ? "shapes-options" : id + "-options") {
                 $0.screen == "document" && $0.tool == id
             }
@@ -214,7 +212,7 @@ final class CaptureUITests: XCTestCase {
     }
 
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
-    private func capture05PenOptions() { toolOptions("pen", title: "Pen", number: 11) }
+    private func capture05PenOptions() { toolOptions("pen", title: "Fountain Pen", number: 11) }
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
     private func capture06HighlighterOptions() { toolOptions("highlighter", title: "Highlighter", number: 12) }
     /// Waits for the named capture surface and attaches it after the state predicate succeeds.
@@ -261,8 +259,9 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.ui.tapCommand("search.open")
-            let field = try self.searchField()
-            field.tap(); field.typeText("Motion")
+            let field = try self.ui.textEditor("Find in this document")
+            try self.ui.focusField(field)
+            field.typeText("Motion")
             try self.wait("Document search must contain matches", timeout: 30) {
                 self.ui.app.descendants(matching: .any).matching(NSPredicate(
                     format: "label BEGINSWITH 'Search result ' AND label CONTAINS ' of '")).firstMatch.exists
