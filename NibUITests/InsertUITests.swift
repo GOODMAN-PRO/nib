@@ -124,6 +124,9 @@ final class InsertUITests: XCTestCase {
     }
     /// Preserves an already-focused input; all other controls must expose a genuine visible hit target.
     private func tap(_ name: String, scroll: Bool = false) throws {
+        try ui.timedAction("Insert tap \(name)") { try self.performTap(name, scroll: scroll) }
+    }
+    private func performTap(_ name: String, scroll: Bool = false) throws {
         let target = try control(name, scroll: scroll)
         if [.textField, .secureTextField, .textView, .searchField].contains(target.elementType) {
             try ui.focusField(target)
@@ -890,9 +893,9 @@ final class InsertUITests: XCTestCase {
         try collectionPrompt("Lab Node", fieldName: "Element name", action: "Rename")
         try tap("Lab Node"); try counts(6)
         try elements(); try tap("My Objects", scroll: true)
-        try control("Lab Node").press(forDuration: 0.8); try tap("Delete"); try tap("Cancel")
+        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Cancel")
         XCTAssertTrue(query("Lab Node").firstMatch.exists)
-        try control("Lab Node").press(forDuration: 0.8); try tap("Delete"); try tap("Delete Element")
+        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Delete Element")
         try wait("Only confirmed element is removed") { !self.query("Lab Node").firstMatch.exists }
         try counts(6)
     }
@@ -1283,6 +1286,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(try clipRow().exists)
     }
     func testAudioCrossDocumentAndBackgroundShowReturnsOwner() throws {
+        executionTimeAllowance = 300
         let owner = try ui.state().document
         try startRecording(); try ui.tapCommand("window.showLibrary"); try ui.openDocument("Concept map")
         XCUIDevice.shared.press(.home); ui.app.activate()

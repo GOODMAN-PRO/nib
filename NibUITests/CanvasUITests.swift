@@ -62,7 +62,11 @@ final class CanvasUITests: XCTestCase {
         return target
     }
 
+    /// Records discovery and menu activation separately from later state waits.
     private func tap(_ label: String) throws {
+        try ui.timedAction("Canvas tap \(label)") { try self.performTap(label) }
+    }
+    private func performTap(_ label: String) throws {
         let query = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@ OR identifier == %@", label, label))
         _ = try require(label)
         // Chrome groups are sections in one scrollable menu, not nested submenus.
@@ -486,6 +490,7 @@ final class CanvasUITests: XCTestCase {
     }
 
     func testRotateAllPagesChangesEveryPageAndUndoesTogether() throws {
+        executionTimeAllowance = 300
         try open()
         try more("Rotate All Pages")
         for number in 1...4 {
@@ -607,6 +612,7 @@ final class CanvasUITests: XCTestCase {
 
     // board.rename; F044
     func testBoardRenamePersistsAfterReopeningDocument() throws {
+        executionTimeAllowance = 300
         try open(whiteboard)
         try boards()
         let row = try boardRow(1, count: 1)
@@ -766,6 +772,7 @@ final class CanvasUITests: XCTestCase {
 
     // zoom.setReturnHeight + zoom.returnPresets; F038
     func testReturnHeightPresetsIncreaseDecreaseAndPageSpecificPersistence() throws {
+        executionTimeAllowance = 300
         try zoomWindow()
         try option("Match Zoom Box")
         let before = try boxRect()
@@ -1006,13 +1013,13 @@ final class CanvasUITests: XCTestCase {
         try open(whiteboard)
         let original = try ui.state()
         try boards()
-        try boardRow(1, count: 1).press(forDuration: 1)
+        try ui.timedAction("Board 1 context menu") { try self.boardRow(1, count: 1).press(forDuration: 1) }
         try tap("Duplicate")
         _ = try ui.waitForState { $0.pageCount == 2 }
         // Duplicate preserves a board's title, so identify its position rather than inventing a new name.
         try boardRow(2, count: 2).tap()
         XCTAssertEqual(try ui.state().itemCountOnPage, original.itemCountOnPage)
-        try boardRow(2, count: 2).press(forDuration: 1)
+        try ui.timedAction("Board 2 context menu") { try self.boardRow(2, count: 2).press(forDuration: 1) }
         try tap("Move to Trash")
         _ = try ui.waitForState { $0.pageCount == 1 }
         XCTAssertEqual(try ui.state().page, original.page)

@@ -66,7 +66,11 @@ final class LibraryUITests: XCTestCase {
         }
     }
 
+    /// Records action boundaries even when XCTest stalls waiting for a native menu to idle.
     private func tap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
+    }
+    private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
         let candidates = app.buttons.matching(matching(label))
         if !candidates.firstMatch.isHittable { revealFormElement(candidates.firstMatch) }
         try visible(candidates.firstMatch, "Missing action: \(label)", file: file, line: line)
@@ -117,7 +121,7 @@ final class LibraryUITests: XCTestCase {
     private func context(_ title: String, folder: Bool = false) throws {
         let tile = item(title, folder: folder)
         try visible(tile, "Context-menu target missing: \(title)")
-        tile.press(forDuration: 1)
+        ui.timedAction("Library context menu \(title)") { tile.press(forDuration: 1) }
         try visible(button("Rename"), "Long press must open the item context menu")
     }
 

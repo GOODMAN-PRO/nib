@@ -471,14 +471,18 @@ final class NibUI {
 
     /// Delivers modifiers while preserving native focus; callers verify the relevant text or formatting result.
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
-        try focusField(field)
-        XCUIElement.perform(withKeyModifiers: modifiers) { field.typeKey(key, modifierFlags: modifiers) }
+        try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
+            try focusField(field)
+            XCUIElement.perform(withKeyModifiers: modifiers) { field.typeKey(key, modifierFlags: modifiers) }
+        }
     }
 
     /// Waits for exact replacement, including empty fields, so a lost Select All cannot silently append text.
     func replaceNativeText(in field: XCUIElement, with text: String) throws {
         try nativeKey("a", in: field)
-        field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        timedAction("Native replacement delivery (\(text.count) characters)") {
+            field.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        }
         try waitForNativeText(in: field, equals: text)
     }
 
@@ -661,6 +665,22 @@ final class NibUI {
                 + "app=\(app.frame) window=\(app.windows.firstMatch.frame) canvas=\(canvas.frame)\n"
                 + "touches=\(touches) selection=\(String(describing: selection))\n\(probe.value ?? "missing")")
             attachment.name = name; attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+    }
+
+    /// Records monotonic timestamps before and after one UI action, including any XCTest idle wait in that action.
+    /// The first attachment is emitted before touching AX so an idle stall still leaves a precise last-started action.
+    @discardableResult
+    func timedAction<T>(_ name: String, action: () throws -> T) rethrows -> T {
+        try XCTContext.runActivity(named: name) { activity in
+            let started = ProcessInfo.processInfo.systemUptime
+            let start = XCTAttachment(string: "start uptime=\(started) wall=\(Date())")
+            start.name = "action-start"; start.lifetime = .keepAlways; activity.add(start)
+            defer {
+                let end = XCTAttachment(string: "end uptime=\(ProcessInfo.processInfo.systemUptime) elapsed=\(ProcessInfo.processInfo.systemUptime - started)")
+                end.name = "action-end"; end.lifetime = .keepAlways; activity.add(end)
+            }
+            return try action()
         }
     }
 
