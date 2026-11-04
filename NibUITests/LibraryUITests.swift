@@ -1,4 +1,5 @@
 import XCTest
+import VisionKit
 
 /// Black-box coverage for the library inventory. Each launch uses the real isolated library;
 /// mutations are exclusively taps, keyboard input and touch gestures, never command injection.
@@ -738,7 +739,16 @@ final class LibraryUITests: XCTestCase {
         let menu = try XCTUnwrap(app.scrollViews.allElementsBoundByIndex.first {
             $0.buttons.matching(self.matching("Notebook")).count > 0
         }, "New must open its creation menu")
-        for label in ["Notebook", "QuickNote", "Whiteboard", "Text Document", "Study Set", "Import Files", "Scan Document"] {
+        // The fixture launches the real camera gate (ScanSupport.documentCamera); it does not fake support.
+        // QAState currently has no capability field, so use the same device API as that gate.
+        let supportsDocumentCamera = VNDocumentCameraViewController.isSupported
+        XCTContext.runActivity(named: "New menu document-camera capability") { activity in
+            let attachment = XCTAttachment(string: "VNDocumentCameraViewController.isSupported=\(supportsDocumentCamera); fixture is not hostless")
+            attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+        var entries = ["Notebook", "QuickNote", "Whiteboard", "Text Document", "Study Set", "Import Files"]
+        if supportsDocumentCamera { entries.append("Scan Document") }
+        for label in entries {
             let entry = menu.buttons.matching(matching(label)).firstMatch
             for _ in 0..<8 where !entry.isHittable { menu.swipeUp() }
             try visible(entry, "New menu must offer \(label)")
