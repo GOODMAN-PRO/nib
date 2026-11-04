@@ -353,12 +353,19 @@ enum PresetPresenter {
             let root = navigator.rootViewController
             var top = root
             while let presented = top?.presentedViewController { top = presented }
-            if let transition = top?.transitionCoordinator ?? root?.transitionCoordinator {
-                transition.animate(alongsideTransition: nil) { _ in
-                    navigator.presentModal(viewController)
-                }
-            } else {
+            var didPresent = false
+            let presentOnce = {
+                guard !didPresent else { return }
+                didPresent = true
                 navigator.presentModal(viewController)
+            }
+            if let transition = top?.transitionCoordinator ?? root?.transitionCoordinator {
+                // A coordinator may still exist after it stops accepting animations.
+                // In that case UIKit does not promise our completion will run.
+                let accepted = transition.animate(alongsideTransition: nil) { _ in presentOnce() }
+                if !accepted { presentOnce() }
+            } else {
+                presentOnce()
             }
             return
         }

@@ -919,6 +919,42 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertEqual(presets(h, "pen").color, custom)
     }
 
+    func testLocalSwatchDragCommitsOnceAndKeepsActiveColourAfterDone() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        let original = model.presets
+        model.beginArranging()
+        let drag = SwatchDrag(model: model, index: 0)
+        let task = try XCTUnwrap(drag.commit(model, at: 2))
+        model.endArranging()
+        let succeeded = await task.value
+        XCTAssertTrue(succeeded)
+        model.reload()
+        XCTAssertEqual(model.presets.swatches, [original.swatches[1], original.swatches[2], original.swatches[0]]
+            + Array(original.swatches.dropFirst(3)))
+        XCTAssertEqual(model.presets.color, original.color)
+        XCTAssertNil(drag.commit(model, at: 1))
+        let reopened = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        XCTAssertEqual(reopened.presets, model.presets)
+    }
+
+    func testSwatchDragRejectsOtherModelsCancelledModeAndChangedSlots() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        let other = PresetMenuModel(app: h.app, session: h.session, tool: "highlighter")
+        model.beginArranging(); other.beginArranging()
+        let drag = SwatchDrag(model: model, index: 0)
+        XCTAssertFalse(drag.accepts(other, at: 1))
+        XCTAssertFalse(drag.accepts(model, at: 0))
+        XCTAssertFalse(drag.accepts(model, at: 99))
+        model.endArranging()
+        XCTAssertNil(drag.commit(model, at: 1))
+        model.beginArranging()
+        try await h.run("preset.removeSwatch", ["tool": "pen", "index": 1])
+        model.reload()
+        XCTAssertNil(drag.commit(model, at: 1), "A source index must not target a changed list")
+    }
+
     func testCustomPickerUsesNativeControllerAndFullSizePresentation() throws {
         let h = Harness(features: [FeatPresetsFeature.self])
         let navigator = PresetTestNavigator(session: h.session)
