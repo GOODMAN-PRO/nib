@@ -22,6 +22,8 @@ final class InsertUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        // A timed-out denial test cannot run teardown. Reset TCC before every fresh fixture.
+        ui.app.resetAuthorizationStatus(for: .microphone)
         addUIInterruptionMonitor(withDescription: "System media permission") { alert in
             if let allow = alert.buttons.allElementsBoundByIndex.first(where: { $0.label.hasPrefix("Allow") || $0.label == "OK" }) {
                 allow.tap(); return true
@@ -53,12 +55,13 @@ final class InsertUITests: XCTestCase {
         self.ui = nil
     }
 
-    private func permissionAlert(timeout: TimeInterval) -> XCUIElement? {
+    private func permissionAlert(timeout: TimeInterval, until completed: @escaping () -> Bool = { false }) -> XCUIElement? {
         // Depending on the simulator OS, the permission sheet is exposed under the requesting app
         // or SpringBoard. Permission requests can arrive after the action's first idle transition.
         let sources = [ui.app, XCUIApplication(bundleIdentifier: "com.apple.springboard")]
         var found: XCUIElement?
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if completed() { return true }
             found = sources.flatMap { $0.alerts.allElementsBoundByIndex }.first {
                 $0.buttons.allElementsBoundByIndex.contains { $0.label.hasPrefix("Allow") || $0.label == "OK" }
             }
@@ -1205,9 +1208,15 @@ final class InsertUITests: XCTestCase {
 
     private func startRecording() throws {
         try ui.tapCommand("audio.record")
-        try allowSystemPermissionIfPresented()
-        if !visible("Pause Recording") { outside() }
-        try wait("Recording must start and expose Pause Recording", timeout: 15) { self.visible("Pause Recording") }
+        if let alert = permissionAlert(timeout: 10, until: { self.ui.app.buttons["Pause Recording"].exists }) {
+            let allow = alert.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Allow' OR label == 'OK'")).firstMatch
+            guard allow.exists else { throw NibUI.Failure.message("Microphone prompt must offer Allow") }
+            allow.tap()
+        }
+        try wait("Recording must start and expose Pause Recording", timeout: 15) {
+            let pause = self.ui.app.buttons["Pause Recording"]
+            return pause.exists && pause.isEnabled && pause.isHittable
+        }
     }
     private func recordClip(draw: Bool = false, minimumSeconds: Int = 4) throws {
         try startRecording()
