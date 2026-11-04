@@ -370,7 +370,7 @@ struct ToolbarCustomizationView: View {
                     newName = ""
                     naming = true
                 } label: {
-                    NibRow(String(localized: "Save Current Layout"), icon: .plus)
+                    NibRow(String(localized: "Save current layout"), icon: .plus)
                 }
                 .buttonStyle(.borderless)
             } header: {

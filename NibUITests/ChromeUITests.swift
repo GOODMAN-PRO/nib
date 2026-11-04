@@ -568,7 +568,7 @@ final class ChromeUITests: XCTestCase {
     private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
     private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
     private func saveLayout(_ name: String) throws {
-        try tap("Save Current Layout"); try replace("Layout name", name); try tap("cmd.toolbar.saveLayout")
+        try tap("Save current layout"); try replace("Layout name", name); try tap("cmd.toolbar.saveLayout")
         _ = try reachable("Apply " + name)
     }
     func testCustomizeHideShowAndReorderPersistsWithLassoFixedFirst() throws {
@@ -587,7 +587,7 @@ final class ChromeUITests: XCTestCase {
         XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Fountain Pen").frame.minY, "Reordered layout must persist")
     }
     func testSaveLayoutRejectsBlankAndNamedLayoutAppears() throws {
-        try open(); try customize(); try tap("Save Current Layout")
+        try open(); try customize(); try tap("Save current layout")
         XCTAssertFalse(try require("cmd.toolbar.saveLayout").isEnabled)
         try replace("Layout name", "   "); XCTAssertFalse(query("cmd.toolbar.saveLayout").firstMatch.isEnabled)
         try replace("Layout name", "Chrome layout"); try tap("cmd.toolbar.saveLayout")

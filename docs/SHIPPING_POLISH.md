@@ -12,18 +12,7 @@ Changes are confined to NibDesign, its unit tests, Nib/App, and docs. Feature fi
 
 ## Copy changes requiring feature owners
 
-These literal strings cannot be corrected in shared components without unsafe global text rewriting. They remain unchanged under this job's explicit file-ownership restriction:
-
-| Owner file | Existing wording | Required wording |
-|---|---|---|
-| FeatLibraryUI/LibraryItemMenu.swift | More Selection Actions | More selection actions |
-| FeatToolbar/ToolbarCustomization.swift | Save Current Layout | Save current layout |
-| FeatOutline/OutlinePanel.swift | Show Thumbnails | Show thumbnails |
-| FeatAIChat/ChatPanel.swift | Delete Conversation (confirmation, action, accessibility) | Delete conversation |
-| NibAIAgent/ChatCommands.swift | Delete Conversation | Delete conversation |
-| FeatBridgeUI/BridgeSettingsPage.swift | Rotate Token (confirmation and action) | Rotate token |
-
-Preserve proper names and acronyms in the same screens. No navigation or command behavior changes are needed.
+Applied on 2026-11-04 in the owners' files (sentence case, proper names preserved): "More selection actions" (FeatLibraryUI/LibraryItemMenu.swift), "Save current layout" (FeatToolbar/ToolbarCustomization.swift), "Show thumbnails" (FeatOutline/OutlinePanel.swift), "Delete conversation" (FeatAIChat/ChatPanel.swift, NibAIAgent/ChatCommands.swift) and "Rotate token" (FeatBridgeUI/BridgeSettingsPage.swift). The string catalog carries the existing translations over to the renamed keys.
 
 ## Verification
 

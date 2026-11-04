@@ -270,7 +270,7 @@ struct AIChatDelete: NibCommand {
         var chat: String
     }
     static let descriptor = CommandDescriptor(
-        id: "ai.chat.delete", title: "Delete Conversation",
+        id: "ai.chat.delete", title: "Delete conversation",
         summary: "Delete an AI conversation on every device (chat id from ai.chat.list); what the AI changed in notes stays.",
         params: .obj(["chat": .str("conversation id")], required: ["chat"]),
         examples: [["chat": "FIXTURECHAT1"]],

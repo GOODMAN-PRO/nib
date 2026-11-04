@@ -67,6 +67,10 @@ jobs:
       - name: Lint (this feature's module + spec + docs)
         run: python3 Scripts/lint.py --feature ${{ steps.feat.outputs.id }}
 
+      - name: Accessibility lint (F095; warnings only)
+        continue-on-error: true
+        run: python3 Scripts/a11y_lint.py --feature ${{ steps.feat.outputs.id }}
+
       - name: Select Xcode 26.6
         run: |
           if [ ! -d "$XCODE" ]; then
@@ -195,6 +199,14 @@ jobs:
 
       - name: Lint (code + docs)
         run: python3 Scripts/lint.py
+
+      - name: Accessibility lint (F095; warnings only)
+        continue-on-error: true
+        run: python3 Scripts/a11y_lint.py
+
+      - name: String catalog check (F095; warnings only)
+        continue-on-error: true
+        run: python3 Scripts/extract_strings.py --check --sources
 
       - name: Generate project
         run: xcodegen generate

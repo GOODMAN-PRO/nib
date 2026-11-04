@@ -640,7 +640,7 @@ struct OutlineOptionsMenu: View {
 
     var body: some View {
         Menu {
-            Toggle(String(localized: "Show Thumbnails"), isOn: option(OutlineSettings.showThumbnails, model.showsThumbnails))
+            Toggle(String(localized: "Show thumbnails"), isOn: option(OutlineSettings.showThumbnails, model.showsThumbnails))
             Toggle(String(localized: "PDF Outline"), isOn: option(OutlineSettings.showPDFOutline, model.showsPDF))
             Toggle(String(localized: "Custom Outline"), isOn: option(OutlineSettings.showCustomOutline, model.showsCustom))
             Divider()

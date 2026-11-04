@@ -1,0 +1,7 @@
+{"type":"object","additionalProperties":false,
+ "properties":{"verdict":{"type":"string","enum":["pass","needs-fix"]},
+   "issues":{"type":"array","items":{"type":"object","additionalProperties":false,
+     "properties":{"severity":{"type":"string","enum":["blocker","major","minor"]},"where":{"type":"string"},"problem":{"type":"string"},"fix":{"type":"string"}},
+     "required":["severity","where","problem","fix"]}},
+   "notes":{"type":"string"}},
+ "required":["verdict","issues","notes"]}

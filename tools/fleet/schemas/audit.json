@@ -1,0 +1,6 @@
+{"type":"object","additionalProperties":false,
+ "properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":false,
+     "properties":{"item":{"type":"string"},"status":{"type":"string","enum":["done","open","partial","not-applicable"]},"evidence":{"type":"string"},"owner":{"type":"string"},"fix":{"type":"string"}},
+     "required":["item","status","evidence","owner","fix"]}},
+   "notes":{"type":"string"}},
+ "required":["items","notes"]}

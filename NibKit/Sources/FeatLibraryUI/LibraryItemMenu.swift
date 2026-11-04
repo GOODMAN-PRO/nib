@@ -117,7 +117,7 @@ struct LibraryMenuEntries: View {
                     Menu {
                         ForEach(Array(entries.dropFirst(4)), id: \.id) { entry in menuButton(entry, context, native: true) }
                     } label: { Image(nib: .more).frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget) }
-                    .accessibilityLabel(String(localized: "More Selection Actions"))
+                    .accessibilityLabel(String(localized: "More selection actions"))
                 }
             } else {
                 ForEach(entries.filter { $0.submenu == nil }, id: \.id) { entry in menuButton(entry, context) }

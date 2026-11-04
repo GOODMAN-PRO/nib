@@ -46,10 +46,10 @@ struct ChatPanel: View {
         })) {
             if let pending = model.confirmation { ConfirmationSheet(model: model, pending: pending) }
         }
-        .confirmationDialog(String(localized: "Delete Conversation"), isPresented: Binding(
+        .confirmationDialog(String(localized: "Delete conversation"), isPresented: Binding(
             get: { deletingChat != nil }, set: { if !$0 { deletingChat = nil } }
         ), titleVisibility: .visible) {
-            Button(String(localized: "Delete Conversation"), role: .destructive) {
+            Button(String(localized: "Delete conversation"), role: .destructive) {
                 if let id = deletingChat { model.perform(CommandIDs.aiChatDelete, ["chat": .string(id)]) }
                 deletingChat = nil
             }
@@ -260,7 +260,7 @@ struct ChatPanel: View {
                                 model.perform(ChatCommand.inspect, ["section": "rename", "chat": .string(chat.id)])
                             }
                             .disabled(model.renamingChat == chat.id)
-                            NibButton(String(localized: "Delete Conversation"), kind: .destructivePlain, size: .compact) {
+                            NibButton(String(localized: "Delete conversation"), kind: .destructivePlain, size: .compact) {
                                 deletingChat = chat.id
                             }
                         }

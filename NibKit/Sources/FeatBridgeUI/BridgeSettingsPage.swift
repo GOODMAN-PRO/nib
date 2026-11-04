@@ -796,7 +796,7 @@ struct BridgeSettingsPage: View {
         }
         .confirmationDialog(String(localized: "Rotate the bridge token?"), isPresented: $confirmsRotation,
                             titleVisibility: .visible) {
-            Button(String(localized: "Rotate Token"), role: .destructive) {
+            Button(String(localized: "Rotate token"), role: .destructive) {
                 Task { await model.rotateToken() }
             }
             Button(String(localized: "Cancel"), role: .cancel) {}
@@ -988,7 +988,7 @@ struct BridgeSettingsPage: View {
                 if model.copied == "token" {
                     BridgeCopiedLine()
                 }
-                NibButton(String(localized: "Rotate Token"), symbol: .retry, kind: .destructive) {
+                NibButton(String(localized: "Rotate token"), symbol: .retry, kind: .destructive) {
                     confirmsRotation = true
                 }
                 .disabled(model.busy)

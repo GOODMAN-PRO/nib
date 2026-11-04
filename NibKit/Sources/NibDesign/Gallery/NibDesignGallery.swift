@@ -135,7 +135,7 @@ public struct NibGlassForegroundGallery: View {
         if surface == .library {
             HStack(spacing: NibSpacing.l) {
                 NibBarGroup(id: "library.controls") {
-                    NibToolbarItem(.search, label: "Search") {}
+                    NibToolbarItem(.search, label: String(localized: "Search", bundle: .module)) {}
                     NibToolbarItem(.sort, label: "Sort") {}
                     NibToolbarItem(.select, label: "Select") {}
                 }
@@ -168,10 +168,10 @@ public struct NibGlassForegroundGallery: View {
                     Circle().fill(ink.color).frame(width: 18, height: 18)
                 }
             } else if surface == .hud || surface == .standaloneHUD {
-                NibIconButton(.search, label: "Search") {}
+                NibIconButton(.search, label: String(localized: "Search", bundle: .module)) {}
                 NibHUDText("125%", secondary: "3 of 12")
             } else {
-                NibToolbarItem(.search, label: "Search") {}
+                NibToolbarItem(.search, label: String(localized: "Search", bundle: .module)) {}
                 NibBarTitle(title: "Physics — Motion", subtitle: "Page 1 of 4")
             }
         }

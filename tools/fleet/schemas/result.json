@@ -1,0 +1,7 @@
+{"type":"object","additionalProperties":false,
+ "properties":{"status":{"type":"string","enum":["ok","green","red","blocked"]},
+   "details":{"type":"array","items":{"type":"string"}},
+   "filesChanged":{"type":"array","items":{"type":"string"}},
+   "commit":{"type":"string"},
+   "notes":{"type":"string"}},
+ "required":["status","details","filesChanged","commit","notes"]}
