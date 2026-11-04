@@ -38,7 +38,8 @@ final class PagesUITests: XCTestCase {
         if let ui {
             let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             shot.name = "Pages-\(name)-screen"; shot.lifetime = .keepAlways; add(shot)
-            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(ui.app.debugDescription)")
+            let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Pages-\(name)-state-and-accessibility"; state.lifetime = .keepAlways; add(state)
             ui.app.terminate()
         }
@@ -351,7 +352,7 @@ final class PagesUITests: XCTestCase {
         try more("Move to Trash"); try count(3)
         try openTrash(); try trashMenu("Recover")
         try wait("Recover must return the original page") { (try? self.ids()) == order }
-        try tap("Documents"); try ui.openDocument(notebook)
+        try tap("Documents", prefix: true); try ui.openDocument(notebook)
         try pages(); try navigate(1)
         try ui.waitForState { $0.page == before.page && $0.strokeCountOnPage == before.strokeCountOnPage && $0.itemCountOnPage == before.itemCountOnPage }
     }
@@ -359,7 +360,17 @@ final class PagesUITests: XCTestCase {
     func testPurgePageRequiresConfirmationAndCancelRetainsTrash() throws {
         let removed = try ids()[0]
         try more("Move to Trash"); try count(3)
-        try openTrash(); try trashMenu("Delete Permanently"); try tap("Cancel")
+        try openTrash(); try trashMenu("Delete Permanently")
+        // iPad confirmationDialog omits Cancel; an outside tap is its native cancellation gesture.
+        let destructive = try require(button("Delete 1 item"))
+        if button("Cancel").exists { try tap("Cancel") }
+        else {
+            let heading = ui.app.staticTexts["Library"].firstMatch
+            try require(heading)
+            XCTAssertTrue(heading.isHittable && !heading.frame.intersects(destructive.frame))
+            heading.tap()
+        }
+        try wait("Cancelling purge must dismiss its confirmation") { !self.button("Delete 1 item").exists }
         XCTAssertTrue(try allPages().contains { $0["id"] as? String == removed && $0["deleted"] as? Bool == true })
         try trashMenu("Delete Permanently"); try tap("Delete 1 item")
         try wait("Permanently deleted page must no longer be recoverable") {
@@ -367,7 +378,7 @@ final class PagesUITests: XCTestCase {
             return !pages.contains { $0["id"] as? String == removed && $0["trashedAt"] != nil && !($0["trashedAt"] is NSNull) }
         }
         try require(label("Trash is empty"))
-        try tap("Documents"); try ui.openDocument(notebook); try count(3)
+        try tap("Documents", prefix: true); try ui.openDocument(notebook); try count(3)
     }
 
     func testBookmarkGlyphListNavigationAndUnbookmark() throws {
@@ -428,8 +439,8 @@ final class PagesUITests: XCTestCase {
         try require(label("D")).press(forDuration: 0.8); try tap("Move")
         let tooDeep = button("Nest in Previous Entry")
         XCTAssertFalse(tooDeep.exists && tooDeep.isEnabled, "Outline must not offer a fourth nesting level")
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         try outlineMenu("C", "Move Out a Level", move: true)
         try wait("Outdent must move C back under A") { (try? self.entry("C")["parent"] as? String) == (try? self.entry("A")["id"] as? String) }
         let parent = try XCTUnwrap(entry("A")["id"] as? String)
@@ -550,10 +561,11 @@ final class PagesUITests: XCTestCase {
         return matches.first { $0.isHittable } ?? matches.first { $0.frame.width > 0 && $0.frame.height > 0 } ?? query.firstMatch
     }
     @discardableResult private func require(_ element: XCUIElement, _ message: String = "Required page control missing") throws -> XCUIElement {
-        guard element.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("\(message): \(element)\n\(ui.app.debugDescription)") }
+        guard element.exists || element.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("\(message): \(element)\n\(ui.app.debugDescription)") }
         return element
     }
     private func wait(_ message: String, timeout: TimeInterval = 20, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let exp = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [exp], timeout: timeout) == .completed else { throw NibUI.Failure.message("\(message)\n\(ui.probe.value ?? "no probe")") }
     }

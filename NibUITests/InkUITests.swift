@@ -26,7 +26,7 @@ final class InkUITests: XCTestCase {
             shot.name = "\(name)-screen"; shot.lifetime = .keepAlways; add(shot)
             let state = XCTAttachment(string: String(describing: ui.probe.value))
             state.name = "\(name)-nib.qa.state"; state.lifetime = .keepAlways; add(state)
-            if testRun?.hasSucceeded == false {
+            if (testRun?.totalFailureCount ?? 0) > 0 {
                 let tree = XCTAttachment(string: ui.app.debugDescription)
                 tree.name = "\(name)-accessibility"; tree.lifetime = .keepAlways; add(tree)
             }
@@ -756,7 +756,7 @@ final class InkUITests: XCTestCase {
         let selection = try ui.state().selectionCount
         hex.tap()
         try wait("HEX field must be editable with its keyboard before Select All") { hex.isHittable && self.ui.app.keyboards.firstMatch.exists }
-        hex.typeKey("a", modifierFlags: .command); hex.typeText("D03080")
+        try ui.clearNativeText(in: hex); hex.typeText("D03080")
         try wait("HEX field must contain D03080 before closing") {
             (hex.value as? String)?.replacingOccurrences(of: "#", with: "").uppercased() == "D03080"
         }
@@ -771,7 +771,7 @@ final class InkUITests: XCTestCase {
         let invalid = try hexField()
         invalid.tap()
         try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
-        invalid.typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
+        try ui.clearNativeText(in: invalid); invalid.typeText("ZZZZZZ")
         XCTAssertNotNil(invalid.value as? String, "Native HEX editor must still expose its value")
         XCTAssertEqual(try ui.state().selectionCount, selection, "Invalid HEX edit must not select document contents")
         traceSwatch("preset.setSwatch-invalid-before-close", field: invalid)
@@ -827,7 +827,7 @@ final class InkUITests: XCTestCase {
         try fillColourSlots()
         // CONTRACTS KeyCommandRouting: notebook-specific preset keys beat the unrestricted pencil key 2.
         for index in indices {
-            ui.app.typeKey(index == 9 ? "0" : String(index + 1), modifierFlags: [])
+            try ui.chord(index == 9 ? "0" : String(index + 1), []) { }
             try wait("Digit key must select colour slot \(index + 1)") { self.swatches[index].isSelected }
             XCTAssertEqual(try ui.state().tool, "pen", "Preset arbitration must not unexpectedly select pencil")
             let before = try ui.state(), blank = try raster()
@@ -1190,7 +1190,7 @@ final class InkUITests: XCTestCase {
     }
 
     func testDrawShapeRecognisesOnLiftAndKeepsUnrecognisedInk() throws {
-        ui.app.typeKey("d", modifierFlags: [])
+        try ui.chord("d", []) { }
         _ = try ui.waitForState { $0.tool == "drawShape" }
         try settings("drawShape")
         try toggle("Draw and Hold", to: true); try toggle("Require Hold to Snap", to: false); closePopover()
@@ -1265,24 +1265,24 @@ final class InkUITests: XCTestCase {
 
     func testKeyboardToolWidthColourUndoAndRedoActions() throws {
         try ui.selectTool("lasso")
-        ui.app.typeKey("p", modifierFlags: [])
+        try ui.chord("p", []) { }
         _ = try ui.waitForState { $0.tool == "pen" }
         let before = try ui.state(); try draw()
-        ui.app.typeKey("z", modifierFlags: .command)
+        try ui.chord("z", .command) { }
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.redoAvailable }
-        ui.app.typeKey("z", modifierFlags: [.command, .shift])
+        try ui.chord("z", [.command, .shift]) { }
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && !$0.redoAvailable }
-        ui.app.typeKey("h", modifierFlags: [])
+        try ui.chord("h", []) { }
         _ = try ui.waitForState { $0.tool == "highlighter" }
         try width(1)
-        ui.app.typeKey("]", modifierFlags: [])
+        try ui.chord("]", []) { }
         XCTAssertTrue(try control("Thickness 2", type: .button).isSelected)
-        ui.app.typeKey("[", modifierFlags: [])
+        try ui.chord("[", []) { }
         XCTAssertTrue(try control("Thickness 1", type: .button).isSelected)
-        ui.app.typeKey("3", modifierFlags: [])
+        try ui.chord("3", []) { }
         XCTAssertTrue(swatches[2].isSelected)
         try draw()
-        ui.app.typeKey("e", modifierFlags: [])
+        try ui.chord("e", []) { }
         _ = try ui.waitForState { $0.tool == "eraser" }
     }
 
@@ -1340,7 +1340,7 @@ final class InkUITests: XCTestCase {
         try assertNoNewInk(before); try draw()
         try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         _ = try control("Pencil palette")
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         try wait("Escape dismisses the Pencil palette") { !self.ui.app.otherElements["Pencil palette"].exists }
     }
 

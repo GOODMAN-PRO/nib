@@ -45,7 +45,13 @@ final class QAStateProbe: UIView {
                 let own = receipts[page.id.raw]?.stringValue.flatMap(Rev.init(string:)) ?? baseline
                 return page.rev.device != app.clock.device && page.rev.effective() > max(baseline.effective(), own.effective())
             }.map { JSONValue.string($0.id.raw) }
+            // Hoisted out of the literal below: two more optional-map closures there would risk Swift's
+            // "expression too complex" type-check failure.
+            let keyResponder: JSONValue = ShellFocus.firstResponder().map { .string(NSStringFromClass(type(of: $0))) } ?? .null
+            let keyResponderIsText: JSONValue = .bool(ShellFocus.isEditingText(in: shell.view.window))
             let state: JSONValue = [
+                "keyResponder": keyResponder,
+                "keyResponderIsText": keyResponderIsText,
                 "screen": .string(UITestFixture.failure != nil ? "fixtureError" : !UITestFixture.isReady ? "loading" : doc == nil ? "library" : "document"),
                 "document": doc.map { .string($0.raw) } ?? .null,
                 "page": doc == nil ? .null : session.page.map { .string($0.raw) } ?? .null,

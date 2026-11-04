@@ -563,7 +563,11 @@ enum ShellFocus {
 
     /// True when an editable text field or text view (or another text input) in `window` has the keyboard.
     static func isEditingText(in window: UIWindow?) -> Bool {
-        guard let window, let responder = firstResponder(), self.window(of: responder) === window else { return false }
+        guard let window, let responder = firstResponder(), let responderWindow = self.window(of: responder) else { return false }
+        // Native alerts/popovers can host their editor in a separate window of this scene.
+        // Do not let shell commands steal system text editing from that presented input.
+        let sameScene = window.windowScene.map { $0 === responderWindow.windowScene } ?? false
+        guard responderWindow === window || sameScene else { return false }
         if let textView = responder as? UITextView { return textView.isEditable }
         if let field = responder as? UITextField { return field.isEnabled }
         // Hosting/keyboard responders can implement UIKeyInput just to receive keys.

@@ -34,7 +34,8 @@ final class CreateUITests: XCTestCase {
             shot.name = "Create-\(name)-screen"
             shot.lifetime = .keepAlways
             add(shot)
-            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(ui.app.debugDescription)")
+            let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
@@ -54,7 +55,7 @@ final class CreateUITests: XCTestCase {
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Title"], with: "Escape cancelled draft")
         try dismissKeyboard()
-        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.hardwareKey(XCUIKeyboardKey.escape.rawValue)
         try wait("create.cancel: Escape must dismiss the creation sheet") { !self.ui.app.textFields["Title"].exists }
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
@@ -670,17 +671,15 @@ final class CreateUITests: XCTestCase {
             String(try XCTUnwrap(components.day)), formatter.string(from: chosen))).firstMatch
         try require(day, "Native start-date picker must expose the chosen day")
         day.tap()
-        // Try picker delivery, then the app responder while the popover is still open; never dismiss the parent.
+        // The calendar is anchored above Starts. Its caption is an inert point inside the parent sheet.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
-            traceCreation("planner-before-picker-dismissal")
-            picker.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-            if ui.app.buttons["DatePicker.NextMonth"].exists {
-                ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-            }
+            let caption = ui.app.staticTexts["Starts"].firstMatch
+            try require(caption, "Start-date caption must remain visible outside the calendar")
+            XCTAssertTrue(caption.isHittable)
+            caption.tap()
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
-            traceCreation("planner-after-picker-dismissal")
         }
         try require(button("Create Planner"), "Picker dismissal must preserve the parent planner")
         try tap("Create Planner")
@@ -768,13 +767,14 @@ final class CreateUITests: XCTestCase {
     }
 
     private func require(_ element: XCUIElement, _ message: String, file: StaticString = #filePath, line: UInt = #line) throws {
-        guard element.waitForExistence(timeout: 10) else {
+        guard element.exists || element.waitForExistence(timeout: 10) else {
             XCTFail(message, file: file, line: line)
             throw NibUI.Failure.message(message)
         }
     }
 
     private func wait(_ message: String, timeout: TimeInterval = 15, _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             XCTFail(message)
@@ -861,23 +861,16 @@ final class CreateUITests: XCTestCase {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
         field.tap()
-        field.typeKey("a", modifierFlags: [.command])
-        field.typeText(text)
+        try ui.clearNativeText(in: field)
+        if !text.isEmpty { field.typeText(text) }
         try wait("Field must contain the replacement before dismissal: \(text)") {
             guard let actual = field.value as? String else { return false }
             return matcher?(actual, text) ?? (actual == text)
         }
     }
 
-    /// Waits for the observed native Hide keyboard button and then disappearance; never taps an assumed corner.
     private func dismissKeyboard(in application: XCUIApplication? = nil) throws {
-        let keyboard = (application ?? ui.app).keyboards.firstMatch
-        guard keyboard.exists else { return }
-        let hide = keyboard.buttons.matching(NSPredicate(
-            format: "label ==[c] 'Hide keyboard' OR label ==[c] 'Dismiss keyboard'")).firstMatch
-        try wait("Native keyboard must expose its dismissal control") { hide.exists && hide.isHittable }
-        hide.tap()
-        try wait("Keyboard must disappear after Hide keyboard") { !keyboard.exists }
+        try ui.dismissNativeKeyboard(in: application)
     }
 
     private func newMenu(_ choice: String) throws {
@@ -969,8 +962,12 @@ final class CreateUITests: XCTestCase {
         try scrollTap("Grid")
         try scrollTap("Graph Paper")
         let id = try create()
-        for _ in 0..<3 { try ui.tapCommand("page.add") }
-        try ui.waitForState { $0.pageCount == 4 }
+        for expected in 2...4 {
+            try ui.tapCommand("page.add")
+            try ui.waitForState { $0.pageCount == expected }
+        }
+        // The state probe sees the in-memory commit before its package write finishes.
+        try wait("All four pages must reach the persisted package") { (try? self.livePages(id).count) == 4 }
         let papers = try livePages(id).map(template)
         XCTAssertEqual(papers.count, 4)
         if choice == "All pages" { XCTAssertEqual(papers, Array(repeating: "builtin.graph", count: 4)) }

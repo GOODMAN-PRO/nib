@@ -24,7 +24,7 @@ final class LibraryUITests: XCTestCase {
             screenshot.name = name + "-library-screen"
             screenshot.lifetime = .keepAlways
             add(screenshot)
-            let tree = XCTAttachment(string: ui.app.debugDescription)
+            let tree = XCTAttachment(string: (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : "Successful test; see final screen and state")
             tree.name = name + "-accessibility-tree"
             tree.lifetime = .keepAlways
             add(tree)
@@ -51,7 +51,7 @@ final class LibraryUITests: XCTestCase {
 
     private func visible(_ element: XCUIElement, _ message: String, timeout: TimeInterval = 12,
                          file: StaticString = #filePath, line: UInt = #line) throws {
-        guard element.waitForExistence(timeout: timeout) else {
+        guard element.exists || element.waitForExistence(timeout: timeout) else {
             XCTFail(message, file: file, line: line)
             throw NibUI.Failure.message(message)
         }
@@ -60,6 +60,7 @@ final class LibraryUITests: XCTestCase {
     private func eventually(_ message: String, timeout: TimeInterval = 12,
                             file: StaticString = #filePath, line: UInt = #line,
                             _ predicate: @escaping () -> Bool) throws {
+        if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
         guard XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed else {
             XCTFail(message, file: file, line: line)
@@ -72,28 +73,20 @@ final class LibraryUITests: XCTestCase {
         try ui.timedAction("Library tap \(label)") { try self.performTap(label, file: file, line: line) }
     }
     private func performTap(_ label: String, file: StaticString = #filePath, line: UInt = #line) throws {
-        let candidates = app.buttons.matching(matching(label))
-        if !candidates.firstMatch.isHittable { revealFormElement(candidates.firstMatch) }
-        try visible(candidates.firstMatch, "Missing action: \(label)", file: file, line: line)
-        let target = candidates.allElementsBoundByIndex.last!
-        for _ in 0..<5 where !target.isHittable {
-            guard let scroll = app.scrollViews.allElementsBoundByIndex.last(where: {
-                $0.buttons.matching(self.matching(label)).count > 0
-            }) else { break }
-            if target.frame.midY < scroll.frame.minY { scroll.swipeDown() }
-            else { scroll.swipeUp() }
+        func candidate() -> XCUIElement? {
+            let query = app.buttons.matching(matching(label))
+            for index in 0..<min(query.count, 8) {
+                let element = query.element(boundBy: index)
+                if ui.hasVisibleFrame(element), element.isEnabled, element.isHittable { return element }
+            }
+            return nil
         }
-        guard target.isHittable && target.isEnabled else {
-            XCTFail("Action is not enabled and hittable: \(label)", file: file, line: line)
-            throw NibUI.Failure.message("Cannot activate \(label)")
+        if candidate() == nil {
+            ui.revealFormElement { self.app.buttons.matching(self.matching(label)).firstMatch }
         }
-        let inList = app.collectionViews.allElementsBoundByIndex.contains {
-            $0.buttons.matching(self.matching(label)).count > 0
-        }
-        // A row can be partly clipped by a fitted sheet. XCTest chooses its visible
-        // hit point; a normalized centre could fall outside that sheet's scroll viewport.
-        if inList { revealFormElement(target); target.tap() }
-        else { target.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
+        try eventually("Action is not enabled and hittable: \(label)", file: file, line: line) { candidate() != nil }
+        guard let target = candidate() else { throw NibUI.Failure.message("Cannot activate \(label)") }
+        target.tap()
     }
 
     private func library() throws {
@@ -375,7 +368,7 @@ final class LibraryUITests: XCTestCase {
         XCTAssertFalse(button("Finish Selecting").exists)
         try tap("Select Items")
         item(physics).tap()
-        app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         XCTAssertFalse(item(physics).isSelected, "Escape must clear selection")
         XCTAssertFalse(button("Finish Selecting").exists)
     }
@@ -389,7 +382,7 @@ final class LibraryUITests: XCTestCase {
         }
         try tap("Select Items")
         item(physics).tap()
-        app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.escape.rawValue, []) { }
         try eventually("Escape must exit selection and clear the checked cover") {
             !self.item(self.physics).isSelected && !self.button("Finish Selecting").exists
         }
