@@ -88,33 +88,46 @@ final class InsertUITests: XCTestCase {
             throw NibUI.Failure.message(message + "\nprobe: " + String(describing: ui.probe.value))
         }
     }
+    /// Waits for a freshly bound typed control in the active alert, menu or sheet, including native placeholders.
     private func control(_ name: String, _ type: XCUIElement.ElementType = .any, scroll: Bool = false) throws -> XCUIElement {
-        let q = query(name, type)
-        for attempt in 0..<(scroll ? 7 : 2) {
-            // The accessibility contract identifies controls, not an ordinal in a mixed
-            // container/control query. Native menus can expose both under the same label.
-            let types: [XCUIElement.ElementType] = type == .any
-                ? [.button, .textField, .secureTextField, .textView, .switch, .slider,
-                   .other, .staticText, .cell, .image]
-                : [type]
-            for kind in types {
-                let matches = query(name, kind)
-                if let found = matches.allElementsBoundByIndex.first(where: {
-                    !$0.frame.isEmpty && $0.isEnabled && $0.isHittable
-                }) { return found }
-            }
-            if attempt == 0 { _ = q.firstMatch.waitForExistence(timeout: 3) }
-            if scroll, let panel = (ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex).first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.height > 150 && $0.frame.width > 200
-            }) {
-                panel.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.80)).press(forDuration: 0.01,
-                    thenDragTo: panel.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.25)))
-            }
+        let types: [XCUIElement.ElementType] = type == .any
+            ? [.button, .menuItem, .textField, .secureTextField, .textView, .searchField, .switch, .slider, .cell, .image, .staticText] : [type]
+        func scope() -> XCUIElement {
+            if ui.app.alerts.firstMatch.exists { return ui.app.alerts.firstMatch }
+            if ui.app.menus.firstMatch.exists { return ui.app.menus.firstMatch }
+            if ui.app.sheets.firstMatch.exists { return ui.app.sheets.firstMatch }
+            return ui.app
         }
-        throw NibUI.Failure.message("Missing actionable insert control: \(name)\n\(ui.app.debugDescription)")
+        func target(_ kind: XCUIElement.ElementType) -> XCUIElement {
+            scope().descendants(matching: kind).matching(NSPredicate(
+                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+        }
+        if scroll {
+            for kind in types where target(kind).exists { ui.revealFormElement { target(kind) }; break }
+        }
+        func candidate() -> XCUIElement? {
+            for kind in types {
+                let element = target(kind)
+                if element.exists && element.isEnabled && element.isHittable { return element }
+            }
+            return nil
+        }
+        try wait("Missing actionable insert control: \(name)") { candidate() != nil }
+        return try XCTUnwrap(candidate())
     }
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
-    private func visible(_ name: String) -> Bool { query(name).allElementsBoundByIndex.contains { $0.isHittable } }
+    /// Samples typed controls in the active presentation without retaining mixed-type ordinals during transitions.
+    private func visible(_ name: String) -> Bool {
+        let scope = ui.app.alerts.firstMatch.exists ? ui.app.alerts.firstMatch
+            : ui.app.menus.firstMatch.exists ? ui.app.menus.firstMatch
+            : ui.app.sheets.firstMatch.exists ? ui.app.sheets.firstMatch : ui.app
+        for type in [XCUIElement.ElementType.button, .menuItem, .textField, .textView, .searchField, .staticText, .cell, .image] {
+            let target = scope.descendants(matching: type).matching(NSPredicate(
+                format: "identifier == %@ OR label == %@", name, name)).firstMatch
+            if target.exists && target.isHittable { return true }
+        }
+        return false
+    }
     /// Preserves focus for native editing only; global commands use NibUI.chord at their call sites.
     private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) throws {
         let field = try focusedField()
@@ -544,7 +557,7 @@ final class InsertUITests: XCTestCase {
     }
     func testShapePointsGestureChangesGeometryAndUndoRestores() throws {
         try shape("Triangle"); let before = try item("shape")
-        let handle = try control("Point 1 of 3")
+        let handle = try control("Point 1 of 3", .other)
         handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.05, thenDragTo: handle.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 65, dy: 40)))
         XCTAssertNotEqual(json(try item("shape")["points"]), json(before["points"]))
         try ui.tapCommand("edit.undo")
@@ -619,19 +632,19 @@ final class InsertUITests: XCTestCase {
             try menu("Connector Style", route)
             XCTAssertEqual(try item("connector")["route"] as? String, route.lowercased())
         }
-        let handle = try control("Connector end")
+        let handle = try control("Connector end", .other)
         let previous = try item("connector")
         handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.1, thenDragTo: ui.coordinate(CGPoint(x: 0.68, y: 0.85)))
         XCTAssertNotEqual(json(try item("connector")["to"]), json(previous["to"]))
         try ui.tapCommand("edit.undo"); XCTAssertEqual(json(try item("connector")["to"]), json(previous["to"]))
-        let startFrame = try control("Connector start").frame
-        let endFrame = try control("Connector end").frame
+        let startFrame = try control("Connector start", .other).frame
+        let endFrame = try control("Connector end", .other).frame
         let midpoint = ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
             dx: (startFrame.midX + endFrame.midX) / 2, dy: (startFrame.midY + endFrame.midY) / 2))
         midpoint.press(forDuration: 0.1, thenDragTo: midpoint.withOffset(CGVector(dx: -45, dy: 35)))
         let bends = try XCTUnwrap(try item("connector")["bends"] as? [JSON])
         XCTAssertEqual(bends.count, 1, "Dragging the midpoint must insert a control bend")
-        let bend = try control("Bend 1").coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let bend = try control("Bend 1", .other).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         bend.press(forDuration: 0.1, thenDragTo: bend.withOffset(CGVector(dx: 20, dy: 20)))
         XCTAssertNotEqual(json(try item("connector")["bends"]), json(bends))
         try menu("Connector Style", "Remove Bends")
@@ -707,7 +720,7 @@ final class InsertUITests: XCTestCase {
     }
     func testImageFreehandCropUsesDrawnPath() throws {
         try image(); try ui.tapCommand("image.crop"); try tap("Freehand")
-        let area = try control("Freehand crop area")
+        let area = try control("Freehand crop area", .other)
         let path = [CGPoint(x: 0.2, y: 0.2), CGPoint(x: 0.8, y: 0.25), CGPoint(x: 0.75, y: 0.8), CGPoint(x: 0.2, y: 0.2)]
         let points = path.map { NSValue(cgPoint: area.coordinate(withNormalizedOffset: CGVector(dx: $0.x, dy: $0.y)).screenPoint) }
         let done = XCTestExpectation(description: "Freehand crop path")
@@ -745,7 +758,7 @@ final class InsertUITests: XCTestCase {
         try counts(5); try selectAt()
         let before = try item("image")
         try menu("Replace Image")
-        let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
+        let photo = try ui.photoAsset()
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
         if visible("Add") { try tap("Add") }
         // F034 replaces an existing item, so its unchanged count is not a completion
@@ -762,7 +775,7 @@ final class InsertUITests: XCTestCase {
         try image(); try menu("Save to Photos")
         try allowSystemPermissionIfPresented()
         outside(); try ui.selectTool("image"); ui.coordinate(CGPoint(x: 0.63, y: 0.8)).tap(); try tap("Photos")
-        let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
+        let photo = try ui.photoAsset()
         XCTAssertTrue(photo.waitForExistence(timeout: 10), "Saved image must be available in Photos, or a useful permission error must be shown")
         try tap("Cancel"); try counts(5)
     }
@@ -824,7 +837,9 @@ final class InsertUITests: XCTestCase {
         try tap("Collection Options"); try tap("Move Collection Left")
         let after = ui.app.buttons.allElementsBoundByIndex.map(\.label).filter { collectionLabels.contains($0) }
         XCTAssertLessThan(try XCTUnwrap(after.firstIndex(of: "Renamed Lab")), try XCTUnwrap(before.firstIndex(of: "Renamed Lab")))
-        try tap("Collection Options"); try tap("Delete Collection"); try tap("Cancel")
+        try tap("Collection Options"); try tap("Delete Collection")
+        if visible("Cancel") { try tap("Cancel") } else { outside() }
+        try wait("Collection confirmation must dismiss") { !self.ui.app.buttons["Delete Collection"].exists }
         XCTAssertTrue(query("Renamed Lab").firstMatch.exists)
         try tap("Collection Options"); try tap("Delete Collection"); try tap("Delete Collection")
         try wait("Confirmed collection deletion removes only that collection") { !self.query("Renamed Lab").firstMatch.exists }
@@ -871,7 +886,7 @@ final class InsertUITests: XCTestCase {
         if visible("Replace") { try tap("Replace") }
         try ui.dismissSheets(); try elements(); try tap("Collection Options"); try tap("Import Collection")
         if visible("Recents") { try tap("Recents") }
-        let file = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Stickers' AND (elementType == %d OR elementType == %d)", XCUIElement.ElementType.cell.rawValue, XCUIElement.ElementType.button.rawValue)).firstMatch
+        let file = ui.app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Stickers'")).firstMatch
         XCTAssertTrue(file.waitForExistence(timeout: 10), "Exported Stickers.nibcollection must be selectable in Files")
         file.tap()
         try tap("Heart"); try counts(5)
@@ -1017,7 +1032,7 @@ final class InsertUITests: XCTestCase {
     func testTapeImportedPhotoPatternCanBeDrawnAndDeleted() throws {
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); outside()
         try ui.selectTool("tape"); try tap("tool.tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
-        let photo = ui.app.images.matching(NSPredicate(format: "label CONTAINS[c] 'Photo'")).firstMatch
+        let photo = try ui.photoAsset()
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); photo.tap()
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])
@@ -1110,12 +1125,20 @@ final class InsertUITests: XCTestCase {
         try clearText(composer)
         XCTAssertTrue(try message("Shape annotation").exists)
     }
+    /// Waits for the inline message editor by its current content within the scroll view containing Save.
+    private func commentEditor(_ original: String) throws -> XCUIElement {
+        let panel = ui.app.scrollViews.containing(.button, identifier: "Save").firstMatch
+        let field = panel.textFields.matching(NSPredicate(format: "value == %@", original)).firstMatch
+        try wait("Inline comment editor must expose its existing message") { field.exists && field.isHittable }
+        // Rebind without the mutable value: typing must not invalidate the editor query.
+        return panel.textFields.matching(NSPredicate(format: "identifier == %@ AND label == %@", field.identifier, field.label)).firstMatch
+    }
     func testCommentEditCancelSaveAndDeleteFinalMessageRemovesAnchor() throws {
         try comment(); try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
-        try replace(try control("Message"), with: "Cancelled edit"); try tap("Cancel")
+        try replace(try commentEditor("Check the units"), with: "Cancelled edit"); try tap("Cancel")
         XCTAssertTrue(try message("Check the units").exists)
         try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
-        try replace(try control("Message"), with: "Confirmed edit"); try tap("Save")
+        try replace(try commentEditor("Check the units"), with: "Confirmed edit"); try tap("Save")
         try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Cancel")
         XCTAssertTrue(try message("Confirmed edit").exists)
         try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Delete Thread")
@@ -1130,7 +1153,8 @@ final class InsertUITests: XCTestCase {
         try toggle("Show Resolved", to: true)
         try message("Check the units").tap(); try tap("Reopen Thread")
         try message("Check the units").press(forDuration: 0.8)
-        if visible("Cancel") { try tap("Cancel") }
+        if visible("Cancel") { try tap("Cancel") } else { outside() }
+        try wait("Message context menu must dismiss before panel controls") { !self.ui.app.buttons["Edit Message"].exists }
         try tap("cmd.panel.close"); try goToSecondPage(); try panel("Comments")
         try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page }
@@ -1237,7 +1261,9 @@ final class InsertUITests: XCTestCase {
         try tap("Pause")
         let position = try control("Playback position", .slider)
         let before = position.value as? String
-        position.adjust(toNormalizedSliderPosition: 0.75)
+        try ui.dragSlider(position, to: 0.75) {
+            try self.wait("Seek reaches three quarters") { guard let t = try? self.playbackTimes() else { return false }; return abs(t.position - t.duration * 0.75) < 1.5 }
+        }
         try wait("Scrub must change bounded playback position") { position.value as? String != before }
         let scrubbed = try playbackTimes()
         XCTAssertEqual(scrubbed.position, scrubbed.duration * 0.75, accuracy: 1.5)
@@ -1248,7 +1274,9 @@ final class InsertUITests: XCTestCase {
         for _ in 0..<3 { try tap("Playback Options"); try tap("Forward 10 Seconds") }
         let bounded = try playbackTimes()
         XCTAssertEqual(bounded.position, bounded.duration, accuracy: 1)
-        position.adjust(toNormalizedSliderPosition: 0.25)
+        try ui.dragSlider(position, to: 0.25) {
+            try self.wait("Seek reaches one quarter") { guard let t = try? self.playbackTimes() else { return false }; return abs(t.position - t.duration * 0.25) < 1.5 }
+        }
         for speed in ["0.5×", "2×", "1×"] {
             try tap("Playback Options"); try tap("Speed"); try tap(speed)
             XCTAssertTrue((try control("Playback Options").value as? String)?.contains(speed) == true)
@@ -1280,7 +1308,9 @@ final class InsertUITests: XCTestCase {
     func testReplayModesAndSeekFromRealTimestampedInk() throws {
         try recordClip(draw: true); try clipRow().tap(); try tap("Pause")
         let slider = try control("Playback position", .slider)
-        slider.adjust(toNormalizedSliderPosition: 0)
+        try ui.dragSlider(slider, to: 0) {
+            try self.wait("Replay must seek to the beginning") { ((try? self.playbackTimes().position) ?? .infinity) < 0.5 }
+        }
         let beginning = slider.value as? String
         try tap("cmd.panel.close")
         var rendered: [String: [UInt8]] = [:]

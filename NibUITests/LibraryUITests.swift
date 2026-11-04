@@ -308,13 +308,13 @@ final class LibraryUITests: XCTestCase {
         try visible(app.staticTexts["1 item · Name, Z to A"], "Child sort must be remembered independently")
     }
     func testSortModifiedNewest() throws {
-        try checkSort("Date modified", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
+        try checkSort("Modified, newest first", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
     }
     func testSortModifiedOldest() throws {
         try checkSort("Modified, oldest first", expected: [physics, "Concept map", "Lab report", "Motion flashcards"])
     }
     func testSortCreatedNewest() throws {
-        try checkSort("Date created", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
+        try checkSort("Created, newest first", expected: ["Motion flashcards", "Lab report", "Concept map", physics])
     }
     func testSortCreatedOldest() throws {
         try checkSort("Created, oldest first", expected: [physics, "Concept map", "Lab report", "Motion flashcards"])

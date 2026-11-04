@@ -408,6 +408,34 @@ final class NibUI {
         }
     }
 
+    /// Waits for a real asset cell in the native Photos grid, excluding the document's background image.
+    func photoAsset() throws -> XCUIElement {
+        let photos = NSPredicate(format: "label BEGINSWITH[c] 'Photo' OR label BEGINSWITH[c] 'Image'")
+        let cells = app.collectionViews.cells
+        let labelled = cells.matching(photos).firstMatch
+        let containing = cells.containing(photos).firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (labelled.exists && labelled.isHittable) || (containing.exists && containing.isHittable)
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
+            throw Failure.message("Photos must expose a selectable asset cell\n\(app.debugDescription)")
+        }
+        return labelled.exists && labelled.isHittable ? labelled : containing
+    }
+
+    /// Drags the visible custom track, then waits for the caller's playback-position oracle; native slider endpoints are absent.
+    func dragSlider(_ slider: XCUIElement, to fraction: CGFloat, verifying result: () throws -> Void) throws {
+        guard slider.exists && slider.isHittable && slider.frame.width > 28 else {
+            throw Failure.message("Custom slider needs a visible track: \(slider)")
+        }
+        // NibSlider reserves 14 points at each end for its bead; map the fraction onto the actual track.
+        let targetX = (14 + min(1, max(0, fraction)) * (slider.frame.width - 28)) / slider.frame.width
+        slider.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.01, thenDragTo: slider.coordinate(withNormalizedOffset:
+                CGVector(dx: targetX, dy: 0.5)), withVelocity: .slow, thenHoldForDuration: 0)
+        try result()
+    }
+
     /// Samples the live probe once, without nesting a state wait inside another expectation.
     func matchesState(_ predicate: (QAState) -> Bool) -> Bool {
         guard let current = try? readState() else { return false }

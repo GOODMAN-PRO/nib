@@ -175,7 +175,7 @@ final class PagesUITests: XCTestCase {
         ui.coordinate(CGPoint(x: 0.38, y: 0.85)).tap()
         let before = try ids()
         try more("Image")
-        let photo = ui.app.images.matching(NSPredicate(format: "label BEGINSWITH 'Photo' OR label BEGINSWITH 'Image'")).firstMatch
+        let photo = try ui.photoAsset()
         try require(photo, "Add Page > Image must present selectable Photos assets")
         photo.tap()
         let add = button("Add")
@@ -716,7 +716,7 @@ final class PagesUITests: XCTestCase {
         try tap(action)
     }
     private func openTrash() throws {
-        try closeNavigator(); try ui.tapCommand("window.showLibrary"); try tap("Trash")
+        try closeNavigator(); try ui.tapCommand("window.showLibrary"); try tap("Trash", prefix: true)
         try require(label("Page 1", exact: false))
     }
     private func label(_ text: String, exact: Bool) -> XCUIElement {

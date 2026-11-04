@@ -89,7 +89,8 @@ final class SelectionUITests: XCTestCase {
 
     private func toggle(_ name: String, to enabled: Bool) throws {
         let target = try control(name, type: .switch, scroll: true)
-        if (target.value as? String == "1") != enabled { target.tap() }
+        let nativeSwitch = target.descendants(matching: .switch).firstMatch
+        if (target.value as? String == "1") != enabled { (nativeSwitch.exists ? nativeSwitch : target).tap() }
         try wait("\(name) must retain its setting") { (target.value as? String == "1") == enabled }
     }
 
