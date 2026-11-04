@@ -105,10 +105,21 @@ final class CanvasUITests: XCTestCase {
         XCTAssertLessThanOrEqual(state.zoom, board ? 4.001 : 8.001)
     }
 
-    private func key(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) {
-        // Reacquire the current app after system/floating export windows from earlier tests.
-        ui.app.activate()
-        ui.app.typeKey(key, modifierFlags: modifiers)
+    /// Uses the shared non-text focus preparation and waits for the requested canvas action.
+    private func key(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command,
+                     verifying result: () throws -> Void) throws {
+        try ui.chord(key, modifiers, verifying: result)
+    }
+
+    /// Waits for an actual zoom step (or the already-reached clamp), never an unrelated probe change.
+    private func zoomKey(_ key: String) throws {
+        let before = try ui.state().zoom
+        try ui.chord(key, .command) {
+            try self.ui.waitForState {
+                key == "-" ? ($0.zoom < before || abs($0.zoom - 0.5) < 0.001)
+                    : ($0.zoom > before || abs($0.zoom - 8) < 0.001)
+            }
+        }
     }
 
     private func more(_ labels: String...) throws {
@@ -118,7 +129,7 @@ final class CanvasUITests: XCTestCase {
 
     private func go(_ number: Int, shortcut: Bool = false) throws {
         let count = try ui.state().pageCount
-        if shortcut { key("g", [.command, .option]) }
+        if shortcut { try key("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } } }
         else { try more("Go to Page…") }
         let field = try require("Page number or title")
         field.tap()
@@ -238,7 +249,7 @@ final class CanvasUITests: XCTestCase {
     // canvas.doubleTap; F006/F101. Blank paper avoids item handlers and the non-page desk.
     func testDoubleTapTogglesFitAndTwiceFitWithoutItems() throws {
         try open()
-        key("0")
+        try key("0") { self.eventually("Fit must restore the specified landscape paper width") { abs(((try? self.page().frame.width) ?? 0) - 760) < 3 } }
         let before = try ui.state()
         ui.doubleTap(at: CGPoint(x: 0.75, y: 0.65))
         let twice = try ui.waitForState { $0.zoom > before.zoom + 0.1 }
@@ -252,21 +263,21 @@ final class CanvasUITests: XCTestCase {
     func testKeyboardZoomInOutFitAndActualSize() throws {
         try open()
         let initial = try ui.state()
-        key("0", [.command, .option])
+        try key("0", [.command, .option]) { try self.ui.waitForState { abs($0.zoom - 1) < 0.001 } }
         _ = try ui.waitForState { abs($0.zoom - 1) < 0.001 }
-        key("=")
+        try zoomKey("=")
         _ = try ui.waitForState { abs($0.zoom - 1.25) < 0.001 }
-        key("+")
+        try zoomKey("+")
         _ = try ui.waitForState { abs($0.zoom - 1.5) < 0.001 }
-        key("-")
+        try zoomKey("-")
         _ = try ui.waitForState { abs($0.zoom - 1.25) < 0.001 }
-        key("0")
+        try key("0") { self.eventually("Fit must restore the specified landscape paper width") { abs(((try? self.page().frame.width) ?? 0) - 760) < 3 } }
         let fit = try ui.waitForState { abs($0.zoom - initial.zoom) < 0.01 }
         XCTAssertEqual(try page().frame.width, 760, accuracy: 3, "Landscape notebook fit width is 760 pt (DESIGN §14.2)")
         unchanged(initial, fit)
-        for _ in 0..<12 { key("=") }
+        for _ in 0..<12 { try zoomKey("=") }
         XCTAssertEqual(try ui.state().zoom, 8, accuracy: 0.001)
-        for _ in 0..<16 { key("-") }
+        for _ in 0..<16 { try zoomKey("-") }
         XCTAssertEqual(try ui.state().zoom, 0.5, accuracy: 0.001)
     }
 
@@ -289,7 +300,9 @@ final class CanvasUITests: XCTestCase {
         let initial = try ui.state()
         for arrow in [XCUIKeyboardKey.downArrow, .upArrow, .rightArrow, .leftArrow] {
             let before = try ui.state()
-            key(arrow.rawValue, .option)
+            try key(arrow.rawValue, .option) {
+                try self.ui.waitForState { abs($0.contentOffset.x - before.contentOffset.x) + abs($0.contentOffset.y - before.contentOffset.y) > 20 }
+            }
             let after = try ui.waitForState {
                 abs($0.contentOffset.x - before.contentOffset.x) + abs($0.contentOffset.y - before.contentOffset.y) > 20
             }
@@ -343,16 +356,13 @@ final class CanvasUITests: XCTestCase {
         try more("Go to Page…")
         let field = try require("Page number or title")
         for value in ["0", "5", "-1"] {
-            field.tap()
-            key("a")
-            field.typeText(value)
+            try ui.replaceNativeText(in: field, with: value)
             let goButton = ui.app.buttons.matching(NSPredicate(format: "label == %@", "Go")).firstMatch
             XCTAssertTrue(goButton.waitForExistence(timeout: 5))
             XCTAssertFalse(goButton.isEnabled, "Invalid page \(value) must disable the dialog Go button; field=\(String(describing: field.value))")
             XCTAssertEqual(try ui.state().page, before.page)
         }
-        key("a")
-        field.typeText("3")
+        try ui.replaceNativeText(in: field, with: "3")
         try tap("Go")
         _ = try page(3)
         let target = try ui.state()
@@ -445,9 +455,9 @@ final class CanvasUITests: XCTestCase {
             }
             unchanged(inked, try ui.state())
             let z = try ui.state().zoom
-            key("=")
+            try zoomKey("=")
             _ = try ui.waitForState { $0.zoom > z }
-            key("0")
+            try key("0") { try self.ui.waitForState { abs($0.zoom - z) < 0.01 } }
         }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage }
@@ -520,7 +530,7 @@ final class CanvasUITests: XCTestCase {
         eventually("Hide Minimap must remove the map") { !self.element("Board overview").exists }
         try tap("Show Minimap")
         _ = try require("Board overview")
-        key("0", [.command, .option])
+        try key("0", [.command, .option]) { try self.ui.waitForState { abs($0.zoom - 1) < 0.001 } }
         _ = try ui.waitForState { abs($0.zoom - 1) < 0.001 }
         try tap("Zoom In")
         _ = try ui.waitForState { abs($0.zoom - 1.25) < 0.001 }
@@ -603,9 +613,8 @@ final class CanvasUITests: XCTestCase {
         row.press(forDuration: 1)
         try tap("Rename")
         let field = try require("Board name")
-        field.tap()
-        key("a")
-        field.typeText("Canvas navigation board\n")
+        try ui.replaceNativeText(in: field, with: "Canvas navigation board")
+        field.typeText("\n")
         _ = try require("Canvas navigation board")
         try ui.tapCommand("window.showLibrary")
         try open(whiteboard)
@@ -639,9 +648,9 @@ final class CanvasUITests: XCTestCase {
         // Frameworks must remain editable objects, not a flattened preview bitmap.
         try ui.tapCommand("sidebar.toggle")
         try ui.selectTool("lasso")
-        key("a")
+        try key("a") { try self.ui.waitForState { $0.selectionCount == inserted.itemCountOnPage } }
         _ = try ui.waitForState { $0.selectionCount == inserted.itemCountOnPage }
-        key(XCUIKeyboardKey.delete.rawValue, [])
+        try key(XCUIKeyboardKey.delete.rawValue, []) { try self.ui.waitForState { $0.itemCountOnPage == 0 } }
         _ = try ui.waitForState { $0.itemCountOnPage == 0 }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == inserted.itemCountOnPage }
@@ -679,14 +688,13 @@ final class CanvasUITests: XCTestCase {
     func testZoomWindowToggleDoesNotEditDocument() throws {
         try open()
         let before = try ui.state()
-        key("z", [.command, .option])
-        _ = try require("Zoom Window writing area")
+        try key("z", [.command, .option]) { _ = try self.require("Zoom Window writing area") }
         try tap("Close Zoom Window")
         eventually("Close must remove the writing pane") { !self.element("Zoom Window writing area").exists }
         try tap("tool.more")
         try tap("cmd.zoom.toggle")
         _ = try require("Zoom box")
-        key("z", [.command, .option])
+        try key("z", [.command, .option]) { self.eventually("Shortcut closes Zoom box") { !self.element("Zoom box").exists } }
         eventually("Shortcut must close the target box") { !self.element("Zoom box").exists }
         ui.coordinate(CGPoint(x: 0.5, y: 0.6)).press(forDuration: 1)
         try tap("Zoom")
@@ -747,7 +755,9 @@ final class CanvasUITests: XCTestCase {
         let next = try boxRect()
         XCTAssertGreaterThan(next.minY, before.minY)
         XCTAssertEqual(next.minX, before.minX, accuracy: 2)
-        key(XCUIKeyboardKey.return.rawValue, .option)
+        try key(XCUIKeyboardKey.return.rawValue, .option) {
+            self.eventually("Option-Return advances writing line") { ((try? self.boxRect().minY) ?? next.minY) > next.minY }
+        }
         let keyboardNext = try boxRect()
         XCTAssertEqual(keyboardNext.minY - next.minY, next.minY - before.minY, accuracy: 2)
         XCTAssertEqual(keyboardNext.minX, next.minX, accuracy: 2)
@@ -779,7 +789,7 @@ final class CanvasUITests: XCTestCase {
         XCTAssertTrue(heightLabel.waitForExistence(timeout: 5))
         let words = heightLabel.label.split(separator: " ")
         let templateHeight = try XCTUnwrap(words.compactMap { Double($0) }.first)
-        key(XCUIKeyboardKey.escape.rawValue, [])
+        ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         let paper2 = try page(2).frame
         let secondBox = try require("Zoom box").frame
         let scale2 = try ui.state().zoom
@@ -933,7 +943,7 @@ final class CanvasUITests: XCTestCase {
         try tap("Try Again")
         eventually("Try Again must clear the failed-page state") { !self.element("Try Again").exists }
         unchanged(before, try ui.state())
-        key("=")
+        try zoomKey("=")
         _ = try ui.waitForState { $0.zoom > before.zoom }
     }
 

@@ -334,13 +334,15 @@ final class NibUI {
         let window = app.windows.firstMatch
         let title = app.buttons.matching(identifier: "menu.title").firstMatch
         // Use an empty part of the header row, never a canvas stroke, tool, or navigation action.
-        let y = title.exists ? title.frame.midY : window.frame.minY + 70
+        let sheet = app.sheets.firstMatch
+        let focusFrame = sheet.exists ? sheet.frame : window.frame
+        let y = sheet.exists ? focusFrame.minY + 24 : title.exists ? title.frame.midY : window.frame.minY + 70
         let occupied = app.buttons.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
             + app.textFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
             + app.searchFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
             + app.textViews.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
         let points = [CGFloat(0.5), 0.45, 0.55, 0.4, 0.6].map {
-            CGPoint(x: window.frame.minX + window.frame.width * $0, y: y)
+            CGPoint(x: focusFrame.minX + focusFrame.width * $0, y: y)
         }
         guard let focus = points.first(where: { point in
             window.frame.contains(point) && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
@@ -415,6 +417,16 @@ final class NibUI {
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
     func isKeyboardFocused(_ field: XCUIElement) -> Bool {
         field.exists && field.debugDescription.contains("Keyboard Focused")
+    }
+
+    /// Waits for the native keyboard's own dismissal before a global action; never taps document content.
+    func dismissNativeKeyboard() throws {
+        guard app.keyboards.firstMatch.exists else { return }
+        let hide = app.keyboards.buttons.matching(NSPredicate(format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).firstMatch
+        guard hide.exists && hide.isHittable else { throw Failure.message("No native keyboard dismissal control") }
+        hide.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in !app.keyboards.firstMatch.exists }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 5) == .completed else { throw Failure.message("Keyboard did not dismiss") }
     }
 
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.

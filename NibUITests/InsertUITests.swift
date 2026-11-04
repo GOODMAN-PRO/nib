@@ -138,7 +138,7 @@ final class InsertUITests: XCTestCase {
     private func finish() throws {
         if visible("Finish Editing") { try tap("Finish Editing") }
         else if visible("Done typing") { try tap("Done typing") }
-        else { try key(XCUIKeyboardKey.escape.rawValue, []); outside() }
+        else { ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: []); outside() }
         try wait("Text input must finish") { !self.ui.app.textViews.allElementsBoundByIndex.contains { $0.isHittable } }
     }
     private func replace(_ field: XCUIElement, with text: String) throws {
@@ -180,7 +180,7 @@ final class InsertUITests: XCTestCase {
     private func documentMenu(_ name: String) throws { try tap("menu.more"); try tap(name) }
     private func goToSecondPage() throws {
         let original = try ui.state().page
-        try key("g", [.command, .option])
+        try ui.chord("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } }
         try replace(try control("Page number or title"), with: "2"); try tap("Go")
         _ = try ui.waitForState(timeout: 10) { $0.page != original && !$0.openPanels.contains("pages.goToPage") }
     }
@@ -211,7 +211,8 @@ final class InsertUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
     }
     private func all() throws {
-        try ui.selectTool("lasso"); try key("a")
+        try ui.selectTool("lasso")
+        try ui.chord("a", .command) { try self.ui.waitForState { $0.selectionCount == $0.itemCountOnPage } }
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == $0.itemCountOnPage }
     }
     private func fragment() throws -> JSON {
@@ -489,7 +490,8 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((frame["x"] as? Double) ?? 0, 0)
         XCTAssertGreaterThan((frame["y"] as? Double) ?? 0, 0)
         XCTAssertLessThan((frame["w"] as? Double) ?? 595, 595)
-        outside(); try key("t", [.command, .alternate])
+        outside()
+        try ui.chord("t", [.command, .alternate]) { _ = try self.control("Page text", .textView) }
         let reopened = try control("Page text", .textView)
         XCTAssertTrue((reopened.value as? String)?.contains("Full page report") == true)
         try tap("Text Style"); try tap("Caption"); try finish(); try counts(5)
@@ -641,14 +643,15 @@ final class InsertUITests: XCTestCase {
         let state = try ui.state()
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
-        try key(","); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
+        try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("AI", scroll: true); try tap("Add provider", scroll: true)
         try tap("Preset"); try tap("Custom OpenAI-compatible")
         for (label, value) in [("Name", "Insert fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
                                ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")] {
             try replace(try control(label, .textField, scroll: true), with: value)
         }
-        try key("s"); XCTAssertTrue(query("Provider saved.").firstMatch.waitForExistence(timeout: 10))
+        try ui.dismissNativeKeyboard()
+        try ui.chord("s", .command) { try self.wait("Provider save must complete") { self.query("Provider saved.").firstMatch.exists } }
         try ui.dismissSheets()
     }
     func testNativeDiagramActionCreatesEditableNodesAndGroupedUndo() throws {
@@ -895,7 +898,7 @@ final class InsertUITests: XCTestCase {
         search.tap(); search.typeText("physics\n")
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
-        outside(); try key(","); try tap("Elements and GIFs", scroll: true); try tap("Remove Key")
+        outside(); try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("Elements and GIFs", scroll: true); try tap("Remove Key")
         XCTAssertTrue(query("Paste your GIPHY API key").firstMatch.waitForExistence(timeout: 8))
     }
 
@@ -1317,7 +1320,7 @@ final class InsertUITests: XCTestCase {
 
     private func transcript() throws {
         try configureProvider()
-        try key(","); try tap("Recording Settings", scroll: true); try toggle("Cloud transcription", to: true)
+        try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("Recording Settings", scroll: true); try toggle("Cloud transcription", to: true)
         try ui.dismissSheets()
         try recordClip(); try documentMenu("Transcript")
         _ = try ui.waitForState(timeout: 8) { $0.openPanels.contains("transcription") }

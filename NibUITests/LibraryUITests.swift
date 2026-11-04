@@ -355,7 +355,11 @@ final class LibraryUITests: XCTestCase {
         XCTAssertTrue(button("Duplicate").isEnabled)
         item(physics).tap()
         XCTAssertFalse(item(physics).isSelected)
-        app.typeKey("a", modifierFlags: .command)
+        try ui.chord("a", .command) {
+            try self.eventually("Command-A selects every library item") {
+                self.rootDocuments.allSatisfy { self.item($0).isSelected } && self.item(self.folder, folder: true).isSelected
+            }
+        }
         try eventually("Command-A must select all visible documents and the folder") {
             self.rootDocuments.allSatisfy { self.item($0).isSelected } && self.item(self.folder, folder: true).isSelected
         }
@@ -392,13 +396,12 @@ final class LibraryUITests: XCTestCase {
         try backFromDocument()
         try tap("Select Items")
         item(physics).tap()
-        app.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
-        _ = try ui.waitForState(timeout: 12) { $0.screen == "document" && $0.document == id }
+        try ui.chord(XCUIKeyboardKey.return.rawValue, []) { try self.ui.waitForState { $0.screen == "document" && $0.document == id } }
     }
     func testReturnOpensSelectedFolder() throws {
         try tap("Select Items")
         item(folder, folder: true).tap()
-        app.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+        try ui.chord(XCUIKeyboardKey.return.rawValue, []) { try self.visible(self.item("Lecture notes"), "Return opens selected folder") }
         try visible(item("Lecture notes"), "Return must open the selected folder")
         try library()
     }
@@ -611,7 +614,7 @@ final class LibraryUITests: XCTestCase {
     }
     func testNewFolderKeyboardShortcutUsesCurrentParent() throws {
         try openFolder(folder)
-        app.typeKey("n", modifierFlags: [.control, .command])
+        try ui.chord("n", [.control, .command]) { try self.ui.waitForState { $0.openPanels.contains("organize.folder.new") } }
         _ = try ui.waitForState { $0.openPanels.contains("organize.folder.new") }
         try replace(app.textFields["Folder name"], with: "Keyboard child")
         try tap("Create Folder")
@@ -690,7 +693,7 @@ final class LibraryUITests: XCTestCase {
         try visible(app.staticTexts["5 items · Manual"], "Reorder must choose Manual sort")
         try openFolder(folder); try tap("Back to Documents")
         XCTAssertEqual(documentOrder(), expected, "Drag order must persist")
-        app.typeKey("z", modifierFlags: .command)
+        try ui.chord("z", .command) { try self.eventually("Undo restores sibling order") { self.documentOrder() == before } }
         try eventually("Undo must restore the complete previous sibling order") { self.documentOrder() == before }
     }
     func testDragDocumentIntoFolderAndToastUndo() throws {
@@ -758,8 +761,8 @@ final class LibraryUITests: XCTestCase {
         try library()
     }
     func testSearchButtonFocusesLibrarySearch() throws { try ui.tapCommand("search.open"); try searchFocused() }
-    func testCommandFFocusesLibrarySearch() throws { app.typeKey("f", modifierFlags: .command); try searchFocused() }
-    func testCommandOFocusesLibrarySearch() throws { app.typeKey("o", modifierFlags: .command); try searchFocused() }
+    func testCommandFFocusesLibrarySearch() throws { try ui.chord("f", .command) { try self.searchFocused() } }
+    func testCommandOFocusesLibrarySearch() throws { try ui.chord("o", .command) { try self.searchFocused() } }
     private func appMenu(_ title: String, expected: String) throws {
         try tap("App Menu")
         // Trash also exists in the sidebar; command identity disambiguates the app-menu entry.

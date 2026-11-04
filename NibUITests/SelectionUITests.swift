@@ -76,8 +76,14 @@ final class SelectionUITests: XCTestCase {
     }
 
     private func tap(_ name: String, scroll: Bool = false) throws { try control(name, scroll: scroll).tap() }
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) {
-        ui.app.typeKey(value, modifierFlags: modifiers)
+    /// Waits for the specified global action after NibUI establishes non-text focus.
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command,
+                     verifying result: () throws -> Void) throws {
+        try ui.chord(value, modifiers, verifying: result)
+    }
+    /// Waits for Settings' real Editing entry, proving the shortcut opened its presentation.
+    private func settings() throws {
+        try key(",") { _ = try self.control("Editing") }
     }
     private func outside() { ui.coordinate(CGPoint(x: 0.95, y: 0.85)).tap() }
 
@@ -137,8 +143,7 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
     }
     private func selectAll(_ count: Int) throws {
-        key("a")
-        _ = try ui.waitForState(timeout: 8) { $0.selectionCount == count }
+        try key("a") { try self.ui.waitForState(timeout: 8) { $0.selectionCount == count } }
     }
 
     /// The capsule More shares its label with unrelated chrome. Find the one next to Copy.
@@ -241,7 +246,7 @@ final class SelectionUITests: XCTestCase {
     }
 
     func testVShortcutSelectsLassoAndCanEncloseInk() throws {
-        try draw(); key("v", [])
+        try draw(); try key("v", []) { try self.ui.waitForState { $0.tool == "lasso" } }
         _ = try ui.waitForState(timeout: 8) { $0.tool == "lasso" }
         try loop(count: 1)
     }
@@ -267,7 +272,7 @@ final class SelectionUITests: XCTestCase {
     }
 
     func testEscapeDeselectsAndRemovesHandles() throws {
-        try selectedInk(); key(XCUIKeyboardKey.escape.rawValue, [])
+        try selectedInk(); try key(XCUIKeyboardKey.escape.rawValue, []) { try self.ui.waitForState { $0.selectionCount == 0 } }
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         XCTAssertFalse(query("cmd.clipboard.copy").allElementsBoundByIndex.contains { $0.isHittable })
         XCTAssertFalse(query("Selection").allElementsBoundByIndex.contains {
@@ -322,7 +327,7 @@ final class SelectionUITests: XCTestCase {
             try tap("Remove line 2", scroll: true)
         }
         XCTAssertFalse(query("Remove line 2").firstMatch.exists)
-        let field = try control("LaTeX line 1"); field.tap(); key("a"); field.typeText("x=2")
+        let field = try control("LaTeX line 1"); try ui.replaceNativeText(in: field, with: "x=2")
         try wait("Valid LaTeX must enable Apply") { self.query("Apply", type: .button).firstMatch.isEnabled }
         try tap("Apply"); try tap("Done")
         try filter("Maths", excluded: 1)
@@ -468,7 +473,12 @@ final class SelectionUITests: XCTestCase {
                                   (XCUIKeyboardKey.upArrow.rawValue, 0.0, -1.0)] {
             for large in [false, true] {
                 let b = try bounds(), z = try ui.state().zoom, step = large ? 10.0 : 1.0
-                key(keyName, large ? .shift : [])
+                try key(keyName, large ? .shift : []) {
+                    try self.wait("Nudge must reach its requested displacement") {
+                        guard let a = try? self.bounds() else { return false }
+                        return abs(a.minX - b.minX - dx * step * z) < z * 0.25 && abs(a.minY - b.minY - dy * step * z) < z * 0.25
+                    }
+                }
                 try wait("Arrow nudge must move by \(step) page points") {
                     guard let a = try? self.bounds() else { return false }
                     return abs(a.minX - b.minX - dx * step * z) < z * 0.25 && abs(a.minY - b.minY - dy * step * z) < z * 0.25
@@ -555,7 +565,7 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage }
     }
     func testCommandDDuplicatesSelectedInk() throws {
-        try selectedInk(); let before = try ui.state(); key("d")
+        try selectedInk(); let before = try ui.state(); try key("d") { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage + 1 && $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try undoCounts(before)
     }
@@ -578,7 +588,7 @@ final class SelectionUITests: XCTestCase {
         try undoCounts(before)
     }
     func testCommandCCopyAndCommandVPaste() throws {
-        try selectedInk(); let before = try ui.state(); key("c"); try countsEqual(before); key("v")
+        try selectedInk(); let before = try ui.state(); try key("c") { try self.ui.waitForState { ($0.clipboardChangeCount ?? 0) > (before.clipboardChangeCount ?? 0) } }; try countsEqual(before); try key("v") { try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try undoCounts(before)
     }
@@ -593,9 +603,9 @@ final class SelectionUITests: XCTestCase {
         try undoCounts(before)
     }
     func testCommandXCutIsUndoableAndPasteable() throws {
-        try selectedInk(); let before = try ui.state(); key("x")
+        try selectedInk(); let before = try ui.state(); try key("x") { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage - 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage - 1 }
-        try undoCounts(before); key("v")
+        try undoCounts(before); try key("v") { try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
     }
 
@@ -640,7 +650,7 @@ final class SelectionUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 10) { $0.itemCountOnPage == before.itemCountOnPage - 1 }
     }
     func testDeleteKeyRemovesSelectionAndUndoRestores() throws {
-        try selectedInk(); let before = try ui.state(); key(XCUIKeyboardKey.delete.rawValue, [])
+        try selectedInk(); let before = try ui.state(); try key(XCUIKeyboardKey.delete.rawValue, []) { try self.ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage - 1 } }
         _ = try ui.waitForState(timeout: 10) { $0.strokeCountOnPage == before.strokeCountOnPage - 1 }
         try undoCounts(before)
     }
@@ -908,7 +918,7 @@ final class SelectionUITests: XCTestCase {
     // MARK: selection.selectAll / layer.moveItems
 
     private func enableLayers() throws {
-        key(",")
+        try settings()
         // DESIGN §14.8: iPad Settings shows sections, then their pages.
         try tap("Editing")
         try tap("Layers", scroll: true); try toggle("Layers", to: true)
@@ -916,25 +926,24 @@ final class SelectionUITests: XCTestCase {
     }
     func testSelectAllIncludesOnlyActiveLayer() throws {
         try enableLayers()
-        key("2", [.command, .option]); try draw()
-        try clear(); try selectAll(1)
-        key("1", [.command, .option]); try clear(); try selectAll(4)
+        try key("2", [.command, .option]) { try self.draw(); try self.clear(); try self.selectAll(1) }
+        try key("1", [.command, .option]) { try self.clear(); try self.selectAll(4) }
     }
     func testMoveObjectsToLayerChangesActiveLayerSelectionAndUndo() throws {
         try enableLayers(); try selectedInk(); let before = try ui.state()
         try menu("Move to Layer", "Layer 2")
         try clear(); try selectAll(4)
-        key("2", [.command, .option]); try clear(); try selectAll(1)
+        try key("2", [.command, .option]) { try self.clear(); try self.selectAll(1) }
         try countsEqual(before)
         try ui.tapCommand("edit.undo")
         try clear(); try selectAll(0)
-        key("1", [.command, .option]); try clear(); try selectAll(5)
+        try key("1", [.command, .option]) { try self.clear(); try self.selectAll(5) }
     }
 
     // MARK: selection.snap — both exposed options, alignment also controls equal-spacing guides.
 
     private func snapping(align: Bool, grid: Bool) throws {
-        key(","); try tap("Editing"); try tap("Alignment and snapping", scroll: true)
+        try settings(); try tap("Editing"); try tap("Alignment and snapping", scroll: true)
         try toggle("Alignment guides", to: align); try toggle("Snap to grid", to: grid)
         try ui.dismissSheets()
     }
@@ -985,7 +994,7 @@ final class SelectionUITests: XCTestCase {
     // MARK: item.moveToPage — a real cross-page drag; source and destination checked through page navigation.
 
     private func goToPage(_ number: Int, original: String? = nil) throws {
-        key("g", [.command, .option])
+        try key("g", [.command, .option]) { _ = try self.control("Page number or title", type: .textField) }
         let field = try control("Page number or title"); field.tap(); field.typeText(String(number)); try tap("Go")
         _ = try ui.waitForState(timeout: 10) { !$0.openPanels.contains("pages.goToPage") && (original == nil || $0.page == original) }
     }
@@ -1080,16 +1089,17 @@ final class SelectionUITests: XCTestCase {
         let provider = try SelectionProviderFixture(page: page)
         defer { provider.stop() }
         try wait("The local Assistant provider fixture must start") { provider.port != nil }
-        key(","); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
+        try settings(); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
         try tap("Preset"); try tap("Custom OpenAI-compatible")
         for (label, value) in [("Name", "Selection fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
                                ("Chat model", "selection-fixture")] {
             let field = try control(label, type: .textField, scroll: true)
-            field.tap(); key("a"); field.typeText(value)
+            try ui.replaceNativeText(in: field, with: value)
         }
         // Save through the editor's real keyboard shortcut; no settings or commands are injected.
-        key("s")
+        try ui.dismissNativeKeyboard()
+        try key("s") { try self.wait("Provider save must complete") { self.query("Provider saved.").firstMatch.exists } }
         XCTAssertTrue(query("Provider saved.").firstMatch.waitForExistence(timeout: 10))
         try ui.dismissSheets()
         try menu("Ask AI")

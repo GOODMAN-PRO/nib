@@ -89,7 +89,9 @@ final class PagesUITests: XCTestCase {
         try wait("Select All must check every thumbnail") { self.ui.app.staticTexts["4 Selected"].exists || (1...4).allSatisfy { self.thumb($0).isSelected } }
         try tap("Deselect All")
         XCTAssertFalse(thumb(2).isSelected)
-        ui.app.typeKey("a", modifierFlags: .command)
+        try ui.chord("a", .command) {
+            try self.wait("Command-A must check all four thumbnails") { (1...4).allSatisfy { self.thumb($0).isSelected } }
+        }
         try selectionAction("Bookmark")
         try wait("Cmd-A batch action must include all four pages") { (try? self.live().allSatisfy { $0["bookmarked"] as? Bool == true }) == true }
     }
@@ -596,8 +598,9 @@ final class PagesUITests: XCTestCase {
         if !state.openPanels.contains(where: navigatorIDs.contains) {
             // Other page tests use the real navigator shortcut so a HUD regression does not mask them.
             // The sidebar button and HUD have their own direct-tap acceptance tests above.
-            ui.app.typeKey("s", modifierFlags: [.control, .command])
-            try ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
+            try ui.chord("s", [.control, .command]) {
+                try self.ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
+            }
         }
         if !(try ui.state().openPanels.contains("sidebar.pages")) { try tab("Pages", id: "sidebar.pages") }
         try ui.waitForState { $0.openPanels.contains("sidebar.pages") }
@@ -612,8 +615,9 @@ final class PagesUITests: XCTestCase {
     }
     private func closeNavigator() throws {
         if try ui.state().openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) {
-            ui.app.typeKey("s", modifierFlags: [.control, .command])
-            try ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
+            try ui.chord("s", [.control, .command]) {
+                try self.ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
+            }
         }
     }
     private func thumb(_ number: Int) -> XCUIElement {
@@ -686,7 +690,9 @@ final class PagesUITests: XCTestCase {
         let before = try ids(), kinds = try itemKinds(try ids()[0]), content = try contentSignature(try ids()[0])
         try pages(); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let revision = try ui.state().clipboardChangeCount ?? 0
-        if keyboard { ui.app.typeKey("c", modifierFlags: .command) } else { try selectionAction("Copy") }
+        if keyboard {
+            try ui.chord("c", .command) { try self.ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision } }
+        } else { try selectionAction("Copy") }
         try ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision }
         XCTAssertEqual(try ids(), before)
         XCTAssertEqual(try itemKinds(before[0]), kinds)
@@ -792,8 +798,9 @@ final class PagesUITests: XCTestCase {
         try wait("Undo must restore all page backgrounds") { (try? self.live().map { self.canonical(self.background($0)) }) == before.map { self.canonical(self.background($0)) } }
     }
     private func manageTemplates() throws {
-        ui.app.typeKey("t", modifierFlags: [.command, .option, .shift])
-        try ui.waitForState { $0.openPanels.contains("templateui.manage") }
+        try ui.chord("t", [.command, .option, .shift]) {
+            try self.ui.waitForState { $0.openPanels.contains("templateui.manage") }
+        }
         try require(button("Import Template"))
     }
     private func importTemplate(kind: String, file: String) throws {
