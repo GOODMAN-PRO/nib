@@ -179,13 +179,62 @@ public extension View {
 private struct NibNativeActionModifier: ViewModifier {
     let action: () -> Void
     @Environment(\.isEnabled) private var isEnabled
+    @State private var hasWindow = false
+
     func body(content: Content) -> some View {
-        // Give native input sole ownership of touch without putting a UIKit
-        // overlay over artwork (which obscures it in SwiftUI/glass snapshots).
-        // Accessibility and keyboard actions remain on the original control.
-        content.allowsHitTesting(false).background {
-            NibActionTouchTarget(isEnabled: isEnabled, action: action)
+        // ImageRenderer substitutes a placeholder for a UIViewRepresentable,
+        // even when its UIView is clear. Changing its backing layer cannot make
+        // that placeholder SwiftUI artwork. Only install native input in a window.
+        // Until then the original button remains the touch owner; accessibility
+        // and keyboard actions always remain on it.
+        content.allowsHitTesting(!hasWindow).background {
+            if hasWindow {
+                NibActionTouchTarget(isEnabled: isEnabled, action: action)
+                    .accessibilityHidden(true)
+            }
+        }
+        .background {
+            NibActionWindowProbe { attached in
+                if hasWindow != attached { hasWindow = attached }
+            }
+                // The probe itself must contribute no placeholder pixels and
+                // must never participate in the control's layout or hit testing.
+                .frame(width: 0, height: 0)
+                .clipped()
+                .allowsHitTesting(false)
                 .accessibilityHidden(true)
+        }
+    }
+}
+
+private struct NibActionWindowProbe: UIViewRepresentable {
+    let onWindowChange: (Bool) -> Void
+
+    func makeUIView(context: Context) -> WindowView {
+        let view = WindowView()
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        view.onWindowChange = onWindowChange
+        return view
+    }
+
+    func updateUIView(_ view: WindowView, context: Context) {
+        view.onWindowChange = onWindowChange
+    }
+
+    final class WindowView: UIView {
+        var onWindowChange: (Bool) -> Void = { _ in }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            // UIKit can attach during a SwiftUI update. Publish on the next turn
+            // and read the current window so a quick detach/reattach cannot send
+            // a stale attachment value back into the modifier.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.onWindowChange(self.window != nil)
+            }
         }
     }
 }

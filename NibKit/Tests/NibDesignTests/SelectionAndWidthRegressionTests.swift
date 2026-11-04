@@ -100,6 +100,8 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
                 XCTAssertEqual(NibSnapshot.fittingSize(off, width: 44, variant: variant),
                                CGSize(width: NibMetrics.hitTarget, height: NibMetrics.hudHeight))
                 let dot = try XCTUnwrap(NibSnapshot.image(off, size: size, variant: variant))
+                let emptyCell = try XCTUnwrap(NibSnapshot.pixel(dot, at: CGPoint(x: 3, y: 10)))
+                XCTAssertEqual(emptyCell.a, 0, "Native input must not paint a placeholder outside the dot: \(variant), \(diameter)")
                 var minX = 44.0, minY = 44.0, maxX = 0.0, maxY = 0.0
                 for y in stride(from: 0.0, to: 44, by: 0.5) {
                     for x in stride(from: 0.0, to: 44, by: 0.5) {
@@ -112,6 +114,8 @@ final class SelectionAndWidthRegressionTests: XCTestCase {
                 XCTAssertEqual(maxX - minX + 0.5, Double(diameter), accuracy: 0.5)
                 XCTAssertEqual(maxY - minY + 0.5, Double(diameter), accuracy: 0.5, "Thickness is a dot, never a dash")
                 let selected = try XCTUnwrap(NibSnapshot.image(on, size: size, variant: variant))
+                let corner = try XCTUnwrap(NibSnapshot.pixel(selected, at: CGPoint(x: 1, y: 3)))
+                XCTAssertEqual(corner.a, 0, "Native input must preserve the selected cell's rounded corners")
                 let fill = try XCTUnwrap(NibSnapshot.pixel(selected, at: CGPoint(x: 22, y: 4)))
                 let outside = try XCTUnwrap(NibSnapshot.pixel(selected, at: CGPoint(x: 22, y: 1)))
                 XCTAssertGreaterThan(fill.a, 0, "Selected fill3 is visible beyond the dot")
