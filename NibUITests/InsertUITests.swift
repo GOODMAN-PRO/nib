@@ -336,14 +336,26 @@ final class InsertUITests: XCTestCase {
 
     // MARK: text, text.setText, text.format, text.setParagraph, text.autoLists
 
+    /// Waits for the committed text's live visible position after keyboard scrolling, editing or undo.
+    private func visibleCanvasText(_ value: String) throws -> XCUIElement {
+        let text = ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
+        try wait("Committed text must be visible at its current canvas position") { text.exists && text.isHittable }
+        ui.recordGeometry("Committed text position", touches: [text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint], selection: text.frame)
+        return text
+    }
     func testTextInsertCommitEditAndUndo() throws {
         try beginText("Velocity = distance / time"); try finish(); try counts(5, strokes: 1)
         try undo(4, redo: 5)
-        try selectAt(); ui.doubleTap(at: point)
+        try ui.selectTool("lasso")
+        let restored = try visibleCanvasText("Velocity = distance / time")
+        restored.tap()
+        try ui.waitForState { $0.selectionCount == 1 }
+        try visibleCanvasText("Velocity = distance / time").doubleTap()
         try replace(try control("Text box", .textView), with: "Acceleration = change in velocity")
         try finish()
         XCTAssertEqual(try plain(snapshot("text")), "Acceleration = change in velocity")
         try ui.tapCommand("edit.undo")
+        _ = try visibleCanvasText("Velocity = distance / time")
         XCTAssertEqual(try plain(snapshot("text")), "Velocity = distance / time")
     }
     func testTextSelectedRangeFontEmphasisColourAndHighlight() throws {
@@ -838,10 +850,15 @@ final class InsertUITests: XCTestCase {
     func testElementDragInsertsAtDropPoint() throws {
         try elements()
         let star = try control("Star")
-        star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: ui.coordinate(end))
+        let drop = ui.coordinate(end)
+        let dropPoint = drop.screenPoint
+        ui.recordGeometry("Element drag start", touches: [star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).screenPoint, dropPoint])
+        star.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: drop)
         try counts(5)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount > 0 }
-        XCTAssertTrue(try selectedBounds().insetBy(dx: -20, dy: -20).contains(ui.coordinate(end).screenPoint))
+        let selection = try selectedBounds()
+        ui.recordGeometry("Element drag selection projection", touches: [dropPoint], selection: selection)
+        XCTAssertTrue(selection.insetBy(dx: -20, dy: -20).contains(dropPoint))
     }
     func testCollectionCreateCancelRenameReorderDeleteConfirm() throws {
         try elements(); try tap("New Collection")

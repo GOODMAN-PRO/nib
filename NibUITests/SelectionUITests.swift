@@ -233,6 +233,7 @@ final class SelectionUITests: XCTestCase {
         try loop(count: 1)
         try countsEqual(before)
         let b = try bounds()
+        ui.recordGeometry("Lasso content versus selection accessibility frame", touches: stroke.map { ui.coordinate($0).screenPoint }, selection: b)
         XCTAssertTrue(b.contains(ui.coordinate(stroke[2]).screenPoint), "Lasso must select the enclosed stroke")
         XCTAssertFalse(b.contains(ui.coordinate(CGPoint(x: 0.5, y: 0.85)).screenPoint), "Unrelated stroke must remain outside selection")
     }

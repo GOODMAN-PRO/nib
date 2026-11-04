@@ -228,19 +228,19 @@ final class CanvasUITests: XCTestCase {
 
     // canvas.pinch; F006
     func testPinchChangesZoomAroundFocalContentAndClamps() throws {
-        try open()
+        try open(); try ui.selectTool("lasso")
         let before = try ui.state()
         let paper = try page().frame
         let focal = ui.coordinate(CGPoint(x: 0.5, y: 0.5)).screenPoint
         let anchor = CGPoint(x: (focal.x - paper.minX) / before.zoom, y: (focal.y - paper.minY) / before.zoom)
-        ui.canvas.pinch(withScale: 1.5, velocity: 1)
+        try ui.pinchZoom(scale: 1.5, at: CGPoint(x: 0.5, y: 0.5))
         let zoomed = try ui.waitForState { $0.zoom > before.zoom + 0.1 }
         let zoomedPaper = try page().frame
         XCTAssertEqual(zoomedPaper.minX + anchor.x * zoomed.zoom, focal.x, accuracy: 45, "Pinch must retain focal content")
         XCTAssertEqual(zoomedPaper.minY + anchor.y * zoomed.zoom, focal.y, accuracy: 45, "Pinch must retain focal content")
         unchanged(before, zoomed)
-        for _ in 0..<3 { ui.canvas.pinch(withScale: 4, velocity: 1); bounded(try ui.state()) }
-        for _ in 0..<4 { ui.canvas.pinch(withScale: 0.2, velocity: -1); bounded(try ui.state()) }
+        for _ in 0..<3 { try ui.pinchZoom(scale: 4, at: CGPoint(x: 0.5, y: 0.5)); bounded(try ui.state()) }
+        for _ in 0..<4 { try ui.pinchZoom(scale: 0.2, velocity: -1, at: CGPoint(x: 0.5, y: 0.5)); bounded(try ui.state()) }
         unchanged(before, try ui.state(), page: false)
         try go(1)
         XCTAssertEqual(try ui.state().strokeCountOnPage, before.strokeCountOnPage)

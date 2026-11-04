@@ -654,6 +654,16 @@ final class NibUI {
         canvas.coordinate(withNormalizedOffset: CGVector(dx: point.x, dy: point.y))
     }
 
+    /// Captures screen-point geometry at the action boundary so CI can distinguish gesture delivery from AX projection.
+    func recordGeometry(_ name: String, touches: [CGPoint], selection: CGRect? = nil) {
+        XCTContext.runActivity(named: name) { activity in
+            let attachment = XCTAttachment(string: "All frames and touches are screen points.\n"
+                + "app=\(app.frame) window=\(app.windows.firstMatch.frame) canvas=\(canvas.frame)\n"
+                + "touches=\(touches) selection=\(String(describing: selection))\n\(probe.value ?? "missing")")
+            attachment.name = name; attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+    }
+
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using
     /// XCTest's event synthesizer (test runner only); no commands or app-side gesture injection are used.
     func drawStroke(_ path: [CGPoint], duration: TimeInterval = 0.35) throws {
@@ -677,6 +687,8 @@ final class NibUI {
             [CGPoint(x: centre.x + direction * radius, y: centre.y),
              CGPoint(x: centre.x + direction * radius * scale, y: centre.y)]
         }
+        recordGeometry("Pinch focal point and contact paths", touches: [coordinate(centre).screenPoint]
+            + paths.flatMap { $0.map { coordinate($0).screenPoint } })
         try synthesize(paths, duration: duration)
     }
     func doubleTap(at point: CGPoint = CGPoint(x: 0.5, y: 0.5)) { coordinate(point).doubleTap() }
