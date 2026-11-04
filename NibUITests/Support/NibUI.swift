@@ -87,8 +87,13 @@ final class NibUI {
     func requireControl(_ name: String, type: XCUIElement.ElementType = .any,
                         scroll: Bool = false, timeout: TimeInterval = 3) throws -> XCUIElement {
         if let found = findControl(name, type: type) { return found }
-        if scroll, let target = findControl(name, type: type, actionable: false) {
-            revealFormElement(target)
+        if scroll {
+            // Virtualized native rows do not exist until their collection view scrolls.
+            revealFormElement {
+                self.findControl(name, type: type, actionable: false)
+                    ?? self.app.descendants(matching: type).matching(NSPredicate(
+                        format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            }
             if let found = findControl(name, type: type) { return found }
         }
         var found: XCUIElement?
@@ -109,49 +114,73 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
-        if form == nil, hasVisibleFrame(initial), initial.isHittable,
-           app.windows.firstMatch.frame.contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
-        if let form, hasVisibleFrame(initial, in: form.frame) && initial.isHittable,
-           form.frame.contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
-        let containers = (app.collectionViews.allElementsBoundByIndex + app.tables.allElementsBoundByIndex
-            + app.scrollViews.allElementsBoundByIndex).filter {
-                $0.identifier != "nib.canvas" && $0.frame.height > 100 && $0.frame.width > 200
-                    && app.windows.firstMatch.frame.intersects($0.frame)
-                    && ($0.isHittable || [.collectionView, .table].contains($0.elementType))
+        let identity = initial.exists ? (try? initial.snapshot()) : nil
+        // Rebuild queries on every iteration: library grids and native forms replace their containers on scroll.
+        func liveList() -> XCUIElement? {
+            if let form, form.exists, hasVisibleFrame(form), form.isHittable { return form }
+            var candidates: [(XCUIElement, CGRect, Bool)] = []
+            for kind in [XCUIElement.ElementType.collectionView, .table, .scrollView] {
+                let query = app.descendants(matching: kind)
+                for index in 0..<min(query.count, 24) {
+                    let list = query.element(boundBy: index)
+                    guard list.exists, list.identifier != "nib.canvas" else { continue }
+                    let frame = list.frame
+                    guard frame.height > 100, frame.width > 200,
+                          frame.intersects(app.windows.firstMatch.frame), list.exists, list.isHittable else { continue }
+                    let contains = identity.map { node in
+                        list.descendants(matching: node.elementType).matching(NSPredicate(
+                            format: "identifier == %@ AND label == %@", node.identifier, node.label)).firstMatch.exists
+                    } ?? false
+                    candidates.append((list, frame, contains))
+                }
             }
-        let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
-        let containing = containers.filter { list in
-            guard let initialSnapshot else { return false }
-            return list.descendants(matching: initialSnapshot.elementType).matching(NSPredicate(
-                format: "identifier == %@ AND label == %@", initialSnapshot.identifier, initialSnapshot.label)).firstMatch.exists
+            let containing = candidates.filter { $0.2 }
+            // A retained scaled popover must not win just because it has the smallest area.
+            return (containing.isEmpty ? candidates : containing).max {
+                $0.1.width * $0.1.height < $1.1.width * $1.1.height
+            }?.0
         }
-        guard let list = form ?? containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
-            ?? containers.max(by: { $0.frame.minX < $1.frame.minX }) else { return }
-        let firstDown = initial.exists && initial.frame.midY < list.frame.midY
-        for down in [firstDown, !firstDown] {
-            var visited = Set<String>()
-            for _ in 0..<8 {
-                let element = target()
-                let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
-                    + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
-                guard let viewport = NibUITestScrollGeometry.viewport(
-                    scroll: list.frame, window: app.windows.firstMatch.frame, obstructions: obstructions) else { return }
-                if hasVisibleFrame(element, in: viewport) && element.isHittable && viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
-                // One snapshot supplies the visible range; querying every row attribute separately can itself time out.
-                guard let snapshot = try? list.snapshot() else { return }
-                let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
-                if !visited.insert(signature).inserted { break }
-                let origin = app.coordinate(withNormalizedOffset: .zero)
-                // Custom pen forms put sliders across the centre. Their 16-point content inset is scrollable;
-                // native grouped lists instead need a row touch, away from the trailing switch.
-                let x = [.collectionView, .table].contains(list.elementType)
-                    ? viewport.midX : viewport.minX + 1
-                let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
-                let endY = viewport.minY + viewport.height * (down ? 0.75 : 0.25)
-                origin.withOffset(CGVector(dx: x - app.frame.minX, dy: startY - app.frame.minY))
-                    .press(forDuration: 0.01, thenDragTo: origin.withOffset(
-                        CGVector(dx: x - app.frame.minX, dy: endY - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
+        var visited = Set<String>()
+        for _ in 0..<16 {
+            guard let list = liveList(), list.exists else { return }
+            let listFrame = list.frame
+            let window = app.windows.firstMatch.frame
+            let obstructions = app.keyboards.allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+                + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+            guard let viewport = NibUITestScrollGeometry.viewport(
+                scroll: listFrame, window: window, obstructions: obstructions) else { return }
+            let element: XCUIElement
+            if let identity {
+                element = list.descendants(matching: identity.elementType).matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", identity.identifier, identity.label)).firstMatch
+            } else { element = target() }
+            let targetFrame = element.exists ? element.frame : nil
+            if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
+               element.isHittable { return }
+            guard list.exists, let snapshot = try? list.snapshot() else { return }
+            let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
+            guard visited.insert(signature).inserted else { return }
+            let down = targetFrame.map { $0.midY < viewport.midY } ?? false
+            // Prefer a noninteractive caption: dragging the bare edge previously produced no scroll.
+            func captions(_ node: XCUIElementSnapshot) -> [CGRect] {
+                if [.button, .switch, .slider, .textField, .textView, .cell].contains(node.elementType) { return [] }
+                if node.elementType == .staticText, viewport.insetBy(dx: 4, dy: 24).contains(node.frame) { return [node.frame] }
+                return node.children.flatMap { captions($0) }
             }
+            let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
+            let caption = captions(snapshot).min { abs($0.midY - startY) < abs($1.midY - startY) }
+            let native = [.collectionView, .table].contains(snapshot.elementType)
+            let start = caption.map { CGPoint(x: $0.midX, y: $0.midY) }
+                ?? CGPoint(x: native ? viewport.midX : listFrame.minX + 12, y: startY)
+            let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
+            XCTContext.runActivity(named: "Reveal form row") { activity in
+                let attachment = XCTAttachment(string: "container=\(snapshot.label) frame=\(listFrame) viewport=\(viewport) target=\(String(describing: targetFrame)) drag=\(start)->\(end) range=\(signature)")
+                attachment.lifetime = .keepAlways; activity.add(attachment)
+            }
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
+                .press(forDuration: 0.01, thenDragTo: origin.withOffset(
+                    CGVector(dx: end.x - app.frame.minX, dy: end.y - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
         }
     }
 
