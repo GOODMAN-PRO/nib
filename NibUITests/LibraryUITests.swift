@@ -701,12 +701,14 @@ final class LibraryUITests: XCTestCase {
         try eventually("Undo must restore the complete previous sibling order") { self.documentOrder() == before }
     }
     func testDragDocumentIntoFolderAndToastUndo() throws {
+        // Resolve a lazy toast-only query before the six-second lifetime begins.
+        let undo = app.otherElements.containing(.staticText, identifier: "Moved to " + folder).buttons["Undo"].firstMatch
         item(physics).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
             .press(forDuration: 0.4, thenDragTo: item(folder, folder: true).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                    withVelocity: .slow, thenHoldForDuration: 0.6)
-        try eventually("Folder drop must move document out of root") { !self.item(self.physics).exists }
-        try tap("Undo")
-        try visible(item(physics), "Toast Undo must restore original parent")
+        try eventually("Completed folder move must expose its Undo toast", timeout: 5) { undo.exists && !self.item(self.physics).exists }
+        undo.tap()
+        try eventually("Toast Undo command must restore the document to its original root parent") { self.item(self.physics).exists }
         try openFolder(folder)
         XCTAssertFalse(item(physics).exists, "Undo must remove document from drop destination")
     }

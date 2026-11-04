@@ -1296,10 +1296,15 @@ final class InsertUITests: XCTestCase {
         try tap("Stop Recording"); try panel("Audio"); XCTAssertTrue(try clipRow().exists)
     }
     func testAudioPlayPauseSeekSkipSettingsAndClose() throws {
-        try recordClip(minimumSeconds: 18); try clipRow().tap()
-        try wait("Playing clip exposes Pause") { self.visible("Pause") }
-        try tap("Pause")
-        let position = try control("Playback position", .slider)
+        try recordClip(minimumSeconds: 30)
+        let row = try clipRow()
+        let pause = ui.app.buttons["Pause"].firstMatch
+        let play = ui.app.buttons["Play"].firstMatch
+        let position = ui.app.sliders["Playback position"].firstMatch
+        row.tap()
+        try wait("Playback must immediately enter playing state", timeout: 5) { pause.exists && pause.isHittable }
+        pause.tap()
+        try wait("Pause must stop playback before expensive settings discovery") { play.exists && position.exists }
         let before = position.value as? String
         try ui.dragSlider(position, to: 0.75) {
             try self.wait("Seek reaches three quarters") { guard let t = try? self.playbackTimes() else { return false }; return abs(t.position - t.duration * 0.75) < 1.5 }
@@ -1309,9 +1314,10 @@ final class InsertUITests: XCTestCase {
         XCTAssertEqual(scrubbed.position, scrubbed.duration * 0.75, accuracy: 1.5)
         try tap("Playback Options"); try tap("Back 10 Seconds")
         XCTAssertEqual(try playbackTimes().position, max(0, scrubbed.position - 10), accuracy: 1)
-        try tap("Playback Options"); try tap("Back 10 Seconds")
+        // Duration is recorded, not assumed: enough bounded skips must reach each endpoint.
+        for _ in 0..<Int(ceil(scrubbed.duration / 10)) { try tap("Playback Options"); try tap("Back 10 Seconds") }
         XCTAssertEqual(try playbackTimes().position, 0, accuracy: 1)
-        for _ in 0..<3 { try tap("Playback Options"); try tap("Forward 10 Seconds") }
+        for _ in 0...Int(ceil(scrubbed.duration / 10)) { try tap("Playback Options"); try tap("Forward 10 Seconds") }
         let bounded = try playbackTimes()
         XCTAssertEqual(bounded.position, bounded.duration, accuracy: 1)
         try ui.dragSlider(position, to: 0.25) {
