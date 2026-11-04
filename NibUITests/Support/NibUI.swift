@@ -389,29 +389,12 @@ final class NibUI {
     /// The activity records requested modifiers beside the shell's existing Key routing / Library key diagnostic logs.
     func chord(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
                verifying postcondition: () throws -> Void) throws {
-        app.activate()
         let before = try state()
         guard !app.keyboards.firstMatch.exists else {
             throw Failure.message("Dismiss text editing explicitly before delivering a global chord")
         }
         let window = app.windows.firstMatch
-        let title = app.buttons.matching(identifier: "menu.title").firstMatch
-        // Use an empty part of the header row, never a canvas stroke, tool, or navigation action.
-        let sheet = app.sheets.firstMatch
-        let focusFrame = sheet.exists ? sheet.frame : window.frame
-        let y = sheet.exists ? focusFrame.minY + 24 : title.exists ? title.frame.midY : window.frame.minY + 70
-        let occupied = app.buttons.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
-            + app.textFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
-            + app.searchFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
-            + app.textViews.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
-        let points = [CGFloat(0.5), 0.45, 0.55, 0.4, 0.6].map {
-            CGPoint(x: focusFrame.minX + focusFrame.width * $0, y: y)
-        }
-        guard let focus = points.first(where: { point in
-            window.frame.contains(point) && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
-        }) else { throw Failure.message("No inert header focus target for keyboard chord") }
-        app.coordinate(withNormalizedOffset: .zero).withOffset(
-            CGVector(dx: focus.x - app.frame.minX, dy: focus.y - app.frame.minY)).tap()
+        let recipient = try globalKeyboardRecipient()
         let focused = try state()
         guard focused.document == before.document, focused.page == before.page,
               focused.strokeCountOnPage == before.strokeCountOnPage,
@@ -425,14 +408,39 @@ final class NibUI {
         try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
-            defer {
-                let result = XCTAttachment(string: "\(probe.value ?? "missing")\n\(app.debugDescription)")
-                result.name = "chord-result"; result.lifetime = .keepAlways; activity.add(result)
+            // Type into the verified responder, not a caption or an arbitrary unfocused application.
+            XCUIElement.perform(withKeyModifiers: modifiers) { recipient.typeKey(key, modifierFlags: modifiers) }
+            do { try postcondition() }
+            catch {
+                recordDiagnostics("Chord postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
+                throw error
             }
-            // Holding modifiers across the event avoids an unmodified fallback key between down/up events.
-            XCUIElement.perform(withKeyModifiers: modifiers) { [self] in app.typeKey(key, modifierFlags: modifiers) }
-            try postcondition()
         }
+    }
+
+    /// AX exposes keyboard focus separately from hittability. A hidden software keyboard is not proof of focus.
+    /// ShellViewController keeps library keys; CanvasKeyboardResponder keeps document keys and forwards shell keys.
+    private func globalKeyboardRecipient() throws -> XCUIElement {
+        let focused = app.descendants(matching: .any).matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+        func nonTextFocus() -> Bool {
+            guard focused.exists else { return false }
+            return ![XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField].contains(focused.elementType)
+        }
+        if nonTextFocus() { return focused }
+        if app.state != .runningForeground { app.activate() }
+        // A desk tap reaches the real document responder chain. Unlike tapping arbitrary header whitespace,
+        // it lets the canvas restore native key focus. Stay outside paper and away from the side palette.
+        if canvas.exists {
+            coordinate(CGPoint(x: 0.18, y: 0.85)).tap()
+        } else {
+            // The shell's library tap recognizer schedules reclaimKeyFocusIfNeeded after a real window tap.
+            app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.08)).tap()
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in nonTextFocus() }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed else {
+            throw Failure.message("No non-text keyboard responder after scene focus tap\n\(app.debugDescription)")
+        }
+        return focused
     }
 
     func state() throws -> QAState {
@@ -566,7 +574,7 @@ final class NibUI {
 
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
     func isKeyboardFocused(_ field: XCUIElement) -> Bool {
-        field.exists && field.debugDescription.contains("Keyboard Focused")
+        field.exists && NSPredicate(format: "hasKeyboardFocus == true").evaluate(with: field)
     }
 
     /// Waits for the native keyboard's own dismissal before a global action; never taps document content.

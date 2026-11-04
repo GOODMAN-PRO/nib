@@ -104,11 +104,11 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 12) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && $0.undoAvailable }
     }
     private func replace(_ name: String, _ text: String) throws {
-        let target = try reachable(name)
-        target.tap()
-        key("a", .command)
-        target.typeText(text.isEmpty ? XCUIKeyboardKey.delete.rawValue : text)
+        // Duration has a separate StaticText caption; only the native editor can accept key synthesis.
+        let target = try ui.requireControl(name, type: .textField, scroll: true, timeout: 8)
+        try ui.replaceNativeText(in: target, with: text)
     }
+
     private func toggle(_ name: String, to on: Bool) throws {
         let target = ui.app.switches.matching(NSPredicate(format: "label == %@", name)).firstMatch
         _ = try reachable(name)
