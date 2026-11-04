@@ -11,7 +11,7 @@ enum PanelSpot: String, Codable, CaseIterable {
     case left, right, floating, sheet, fullScreen
 
     /// The values of the per-panel device setting `chrome.panelPlacement.<panelId>` (D-136).
-    static let overrides: [PanelSpot] = [.left, .right, .floating]
+    static let overrides: [PanelSpot] = [.left, .right, .floating, .fullScreen]
 }
 
 enum SidebarSide: String, Codable, CaseIterable {
@@ -28,7 +28,7 @@ enum SidebarMode: String, Codable, CaseIterable {
 }
 
 enum ChromeSettings {
-    /// Device-local, one key per panel: "left" | "right" | "floating" (null = the panel's default place).
+    /// Device-local, one key per panel: "left" | "right" | "floating" | "fullScreen" (null = the panel's default place).
     static let placementPrefix = "chrome.panelPlacement."
 
     static func placementName(_ panel: String) -> String { placementPrefix + panel }
