@@ -472,14 +472,8 @@ final class ChromeUITests: XCTestCase {
     }
 
     // toolbar.dock left/right/top/bottom/return/undo
-    private func dragPalette(to point: CGPoint) throws {
-        let palette = try reachable("Tools")
-        let vertical = palette.frame.height > palette.frame.width
-        // Bare rim, away from tools: along-axis drags on a selected tool are intentionally scrubbing.
-        let start = palette.coordinate(withNormalizedOffset: CGVector(dx: vertical ? 0.1 : 0.5, dy: vertical ? 0.5 : 0.1))
-        start.press(forDuration: 0.15, thenDragTo: ui.app.coordinate(withNormalizedOffset: CGVector(dx: point.x, dy: point.y)),
-                    withVelocity: .slow, thenHoldForDuration: 0.5)
-    }
+    /// Waits for the visible separator grip and verifies that only the palette moves.
+    private func dragPalette(to point: CGPoint) throws { try ui.dragPalette(to: point) }
     private func dock(_ edge: String) throws {
         let target: CGPoint
         switch edge {

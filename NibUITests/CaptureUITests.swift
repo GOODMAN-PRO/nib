@@ -34,13 +34,15 @@ final class CaptureUITests: XCTestCase {
                     XCUIDevice.shared.orientation = .portrait
                     ui.app.launch()
                     _ = try ui.waitForState { $0.screen == "library" }
+                    try ui.establishFullScreen()
                     // Publish a populated accessibility layout, as NibUI.launchFixture does.
                     XCUIDevice.shared.orientation = .landscapeLeft
                     if direction == "portrait" { XCUIDevice.shared.orientation = .portrait }
                     try wait("The scene must reach \(direction)") {
-                        let frame = self.ui.app.frame
+                        let frame = self.ui.app.windows.firstMatch.frame
                         return direction == "portrait" ? frame.height > frame.width : frame.width > frame.height
                     }
+                    try ui.establishFullScreen()
                     try body()
                 } catch {
                     let reason = "\(name) / \(style) / \(direction): \(error)"
@@ -180,19 +182,13 @@ final class CaptureUITests: XCTestCase {
 
     private func dock(_ edge: String) throws {
         if try ui.state().paletteDock?.edge == edge { return }
-        let tools = try require("Tools")
-        // Start in the end padding, away from the selected-tool bead's scrub gesture.
-        let frame = tools.frame
-        let start = tools.coordinate(withNormalizedOffset: frame.height > frame.width
-            ? CGVector(dx: 0.5, dy: 0.01) : CGVector(dx: 0.01, dy: 0.5))
         let destination: CGVector
         switch edge {
         case "left": destination = CGVector(dx: 0.025, dy: 0.5)
         case "top": destination = CGVector(dx: 0.5, dy: 0.12)
         default: destination = CGVector(dx: 0.5, dy: 0.94)
         }
-        start.press(forDuration: 0.15, thenDragTo: ui.app.coordinate(withNormalizedOffset: destination),
-                    withVelocity: .slow, thenHoldForDuration: 0.3)
+        try ui.dragPalette(to: CGPoint(x: destination.dx, y: destination.dy))
         _ = try ui.waitForState(timeout: 12) { $0.paletteDock?.edge == edge }
     }
 

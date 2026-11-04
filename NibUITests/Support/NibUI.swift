@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 
 struct QAState: Decodable {
     struct Offset: Decodable { let x: Double; let y: Double }
@@ -90,6 +91,75 @@ final class NibUI {
         }
     }
 
+    /// Waits for the main window to cover the physical display before any orientation assertion.
+    /// Fixture data resets do not reset iPadOS window placement left by an earlier gesture.
+    func establishFullScreen() throws {
+        app.activate()
+        // Screenshot orientation is authoritative; UIImage.size may be pixels rather than screen points.
+        // The background test runner can retain portrait UIScreen bounds after the foreground app rotates.
+        let image = XCUIScreen.main.screenshot().image
+        let dimensions = UIScreen.main.bounds.size
+        let long = max(dimensions.width, dimensions.height), short = min(dimensions.width, dimensions.height)
+        let screen = CGRect(origin: .zero, size: image.size.width > image.size.height
+            ? CGSize(width: long, height: short) : CGSize(width: short, height: long))
+        /// Reads current window edges without waiting; the enclosing expectation waits for fullscreen placement.
+        func fillsScreen() -> Bool {
+            let window = app.windows.firstMatch
+            guard window.exists else { return false }
+            let f = window.frame
+            return abs(f.minX - screen.minX) <= 2 && abs(f.minY - screen.minY) <= 2
+                && abs(f.maxX - screen.maxX) <= 2 && abs(f.maxY - screen.maxY) <= 2
+        }
+        if fillsScreen() { return }
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let fullScreen = system.buttons.matching(NSPredicate(format: "label ==[c] 'Full Screen'")).firstMatch
+        let controls = system.buttons.matching(NSPredicate(format: "label ==[c] 'Window Controls'")).firstMatch
+        if !fullScreen.isHittable && controls.isHittable { controls.tap() }
+        if fullScreen.isHittable {
+            fullScreen.tap()
+        } else {
+            // Apple's system Globe-F shortcut; sent only when not already fullscreen.
+            // This also recovers a window whose controls have been displaced offscreen.
+            app.typeKey("f", modifierFlags: .function)
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in fillsScreen() }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
+            throw Failure.message("Full-screen recovery failed: display \(screen), window \(app.windows.firstMatch.frame)\n\(system.debugDescription)\n\(app.debugDescription)")
+        }
+    }
+
+    /// Waits for the visible palette separator grip, then checks that dragging it leaves the window fixed.
+    /// The aggregate Tools frame can include stale/offscreen layout; actual adjacent buttons locate the grip.
+    func dragPalette(to destination: CGPoint) throws {
+        let more = app.buttons.matching(identifier: "tool.more").firstMatch
+        let colour = app.buttons.matching(identifier: "cmd.preset.select")
+            .matching(NSPredicate(format: "label == 'Colour 1'")).firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            more.isHittable && colour.isHittable
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            throw Failure.message("Palette separator grip needs visible More tools and Colour 1")
+        }
+        let before = app.windows.firstMatch.frame
+        let a = more.frame, b = colour.frame
+        let vertical = abs(a.midY - b.midY) > abs(a.midX - b.midX)
+        let grip = vertical ? CGPoint(x: a.midX, y: (a.maxY + b.minY) / 2)
+                            : CGPoint(x: (a.maxX + b.minX) / 2, y: a.midY)
+        let gap = vertical ? b.minY - a.maxY : b.minX - a.maxX
+        guard gap > 2, before.insetBy(dx: 8, dy: 8).contains(grip) else {
+            throw Failure.message("No visible palette separator grip: More \(a), colour \(b), window \(before)")
+        }
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        origin.withOffset(CGVector(dx: grip.x - app.frame.minX, dy: grip.y - app.frame.minY))
+            .press(forDuration: 0.15, thenDragTo: app.coordinate(withNormalizedOffset:
+                CGVector(dx: destination.x, dy: destination.y)), withVelocity: .slow, thenHoldForDuration: 0.3)
+        let after = app.windows.firstMatch.frame
+        guard abs(after.minX - before.minX) <= 2, abs(after.minY - before.minY) <= 2,
+              abs(after.width - before.width) <= 2, abs(after.height - before.height) <= 2 else {
+            throw Failure.message("Palette gesture moved the app window: \(before) -> \(after); grip \(grip)")
+        }
+    }
+
     func launchFixture(scenario: FixtureScenario = .standard) throws {
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
@@ -100,7 +170,7 @@ final class NibUI {
         _ = try waitForState(timeout: 120) { $0.screen == "library" }
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
-        app.activate()
+        try establishFullScreen()
         // Device orientation may already say landscape after tearDown rotated
         // SpringBoard. Deliver the request to this scene too.
         XCUIDevice.shared.orientation = .landscapeLeft
@@ -115,6 +185,7 @@ final class NibUI {
         guard XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
             throw Failure.message("Nib's launched scene did not reach landscape")
         }
+        try establishFullScreen()
         _ = try waitForState { $0.screen == "library" }
     }
 
