@@ -160,17 +160,24 @@ final class NibUI {
         guard alert() == nil else { throw Failure.message("Outstanding authorization survived cleanup") }
     }
 
+    /// The display in screen points, in the current orientation, measured from a screenshot of the device rather
+    /// than from the runner's UIScreen (which reports the runner's compatibility size on large iPads). A screenshot
+    /// image carries the device scale when XCTest sets it; otherwise its size is in pixels and the runner's scale,
+    /// which is the device's, converts it.
+    static func displayRect() -> CGRect {
+        let image = XCUIScreen.main.screenshot().image
+        let scale = image.scale > 1 ? CGFloat(1) : UIScreen.main.scale
+        return CGRect(origin: .zero, size: CGSize(width: image.size.width / scale, height: image.size.height / scale))
+    }
+
     /// Waits for the main window to cover the physical display before any orientation assertion.
     /// Fixture data resets do not reset iPadOS window placement left by an earlier gesture.
     func establishFullScreen() throws {
         app.activate()
-        // Screenshot orientation is authoritative; UIImage.size may be pixels rather than screen points.
-        // The background test runner can retain portrait UIScreen bounds after the foreground app rotates.
-        let image = XCUIScreen.main.screenshot().image
-        let dimensions = UIScreen.main.bounds.size
-        let long = max(dimensions.width, dimensions.height), short = min(dimensions.width, dimensions.height)
-        let screen = CGRect(origin: .zero, size: image.size.width > image.size.height
-            ? CGSize(width: long, height: short) : CGSize(width: short, height: long))
+        // The screenshot is the device's display in its current orientation. The runner's own UIScreen is not:
+        // on an iPad Pro 13-inch it reports the runner's 768 x 1024 compatibility bounds while the app window is
+        // 1032 x 1376 points, and it keeps portrait bounds after the foreground app rotates.
+        let screen = NibUI.displayRect()
         /// Reads current window edges without waiting; the enclosing expectation waits for fullscreen placement.
         func fillsScreen() -> Bool {
             let window = app.windows.firstMatch
