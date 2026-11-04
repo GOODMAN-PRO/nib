@@ -764,21 +764,15 @@ final class SelectionUITests: XCTestCase {
 
     // MARK: selection.screenshot — export a real PNG, retaining the document and history.
 
-    private func copyScreenshotAndCheck(_ before: QAState) throws {
-        // Copy in UIActivityViewController transfers the generated PNG to the system clipboard.
-        // F013 exports through the share sheet. The selection's own Copy button remains
-        // visible behind that sheet and copies a fragment instead of the screenshot.
+    /// Waits for a real exported PNG, validates visible ink, and returns its pixel dimensions for region assertions.
+    @discardableResult
+    private func copyScreenshotAndCheck(_ before: QAState) throws -> CGSize {
         let activities = ui.app.otherElements["ActivityListView"].firstMatch
         XCTAssertTrue(activities.waitForExistence(timeout: 15), "Take Screenshot must present the system share sheet")
-        let copy = activities.descendants(matching: .any).matching(NSPredicate(format: "label == 'Copy'")).firstMatch
-        try wait("The screenshot share sheet must offer Copy") { copy.exists && copy.isHittable && copy.isEnabled }
-        copy.tap()
-        try wait("Take Screenshot must export a decodable PNG", timeout: 15) {
-            guard let data = UIPasteboard.general.data(forPasteboardType: UTType.png.identifier),
-                  let image = UIImage(data: data) else { return false }
-            return image.size.width > 10 && image.size.height > 10
-        }
-        let exported = try XCTUnwrap(UIPasteboard.general.image?.cgImage)
+        let data = try ui.saveSharedPNG()
+        let exported = try XCTUnwrap(UIImage(data: data)?.cgImage)
+        XCTAssertGreaterThan(exported.width, 10)
+        XCTAssertGreaterThan(exported.height, 10)
         var rgba = [UInt8](repeating: 0, count: exported.width * exported.height * 4)
         try rgba.withUnsafeMutableBytes { data in
             let context = try XCTUnwrap(CGContext(data: data.baseAddress, width: exported.width, height: exported.height,
@@ -794,23 +788,21 @@ final class SelectionUITests: XCTestCase {
         XCTAssertGreaterThan(visibleInk, 25, "Exported PNG must contain the chosen ink, not an empty region")
         try countsEqual(before)
         XCTAssertEqual(try ui.state().undoAvailable, before.undoAvailable, "Screenshot is a read-only action")
+        return CGSize(width: CGFloat(exported.width), height: CGFloat(exported.height))
     }
     func testSelectionScreenshotExportsPNGWithoutEditingDocument() throws {
         try selectedInk(); let before = try ui.state()
-        UIPasteboard.general.items = []
         try menu("Take Screenshot")
         try copyScreenshotAndCheck(before)
     }
     func testPageRegionScreenshotExportsChosenRegion() throws {
         try draw(); try clear(); let before = try ui.state()
-        UIPasteboard.general.items = []
         try pageMenu(); try tap("Take Screenshot")
         _ = try ui.waitForState(timeout: 8) { $0.tool == "objectmenu.screenshotTool" }
         try ui.drawStroke([CGPoint(x: 0.38, y: 0.52), CGPoint(x: 0.63, y: 0.76)])
-        try copyScreenshotAndCheck(before)
-        let image = try XCTUnwrap(UIPasteboard.general.image)
+        let imageSize = try copyScreenshotAndCheck(before)
         let expectedRatio = (0.25 * ui.canvas.frame.width) / (0.24 * ui.canvas.frame.height)
-        XCTAssertEqual(image.size.width / image.size.height, expectedRatio, accuracy: 0.05,
+        XCTAssertEqual(imageSize.width / imageSize.height, expectedRatio, accuracy: 0.05,
                        "PNG dimensions must follow the selected region")
     }
 

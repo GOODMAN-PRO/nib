@@ -423,6 +423,60 @@ final class NibUI {
         return labelled.exists && labelled.isHittable ? labelled : containing
     }
 
+    /// Exports the current share sheet to a uniquely named Files directory and waits for the real PNG bytes on disk.
+    /// The runner only reads the export; it never reads a background UIPasteboard or generates an expected image.
+    func saveSharedPNG() throws -> Data {
+        let action = app.buttons["Save to Files"].firstMatch
+        revealFormElement(action)
+        guard action.waitForExistence(timeout: 10), action.isHittable else {
+            throw Failure.message("PNG share sheet must offer Save to Files")
+        }
+        action.tap()
+        let local = app.cells["DOC.sidebar.item.On My iPad"].firstMatch
+        guard local.waitForExistence(timeout: 10), local.isHittable else { throw Failure.message("Files local provider missing") }
+        local.tap()
+        let nib = app.cells["Nib, Container"].firstMatch
+        if nib.waitForExistence(timeout: 3) && nib.isHittable { nib.tap() }
+        else {
+            guard app.buttons["Nib, Actions Menu"].exists else { throw Failure.message("Export must target Nib Documents") }
+        }
+        let folder = "QA Screenshot " + UUID().uuidString
+        let newFolder = app.buttons["New Folder"].firstMatch
+        if !newFolder.isHittable { app.buttons["More"].firstMatch.tap() }
+        guard newFolder.waitForExistence(timeout: 5), newFolder.isHittable else { throw Failure.message("Files New Folder missing") }
+        newFolder.tap()
+        try nameNewFilesFolder(folder)
+        let entered = app.buttons[folder + ", Actions Menu"].firstMatch
+        let directory = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", folder)).firstMatch
+        let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in entered.exists || directory.exists }, object: nil)
+        guard XCTWaiter.wait(for: [created], timeout: 8) == .completed else { throw Failure.message("Files did not create PNG destination") }
+        if !entered.exists { directory.tap() }
+        guard entered.waitForExistence(timeout: 8) else { throw Failure.message("Files must enter the unique PNG destination") }
+        let save = app.buttons["Save"].firstMatch
+        guard save.isEnabled && save.isHittable else { throw Failure.message("Files Save unavailable") }
+        save.tap()
+        // The native picker saves into the app container. The unique directory prevents stale exports matching.
+        let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()
+        let destinations = try FileManager.default.contentsOfDirectory(at: containers, includingPropertiesForKeys: nil)
+            .map { $0.appendingPathComponent("Documents").appendingPathComponent(folder) }
+        var bytes: Data?
+        let exported = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            for destination in destinations {
+                let files = (try? FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)) ?? []
+                for file in files where file.pathExtension.lowercased() == "png" {
+                    if let data = try? Data(contentsOf: file), UIImage(data: data) != nil { bytes = data; return true }
+                }
+            }
+            return false
+        }, object: nil)
+        guard XCTWaiter.wait(for: [exported], timeout: 15) == .completed, let bytes else {
+            throw Failure.message("Save to Files must produce a decodable PNG in the unique destination")
+        }
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !entered.exists }, object: nil)
+        guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else { throw Failure.message("Files must finish exporting") }
+        return bytes
+    }
+
     /// Drags the visible custom track, then waits for the caller's playback-position oracle; native slider endpoints are absent.
     func dragSlider(_ slider: XCUIElement, to fraction: CGFloat, verifying result: () throws -> Void) throws {
         guard slider.exists && slider.isHittable && slider.frame.width > 28 else {
