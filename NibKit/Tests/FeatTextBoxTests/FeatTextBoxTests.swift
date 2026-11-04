@@ -23,8 +23,12 @@ private final class FakeFloatingHost: FloatingHosting {
     var presented: [String] = []
     var anchors: [String: CGRect] = [:]
     var offset: CGFloat = 900
+    private(set) var presentationCount = 0
 
-    func present(_ id: String, content: AnyView) { if !presented.contains(id) { presented.append(id) } }
+    func present(_ id: String, content: AnyView) {
+        presentationCount += 1
+        if !presented.contains(id) { presented.append(id) }
+    }
     func dismiss(_ id: String) { presented.removeAll { $0 == id } }
     func isPresenting(_ id: String) -> Bool { presented.contains(id) }
     func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
@@ -788,6 +792,21 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertEqual(floating.anchors[TextPopoverIDs.source], more.bounds)
         XCTAssertTrue(st.popover.isPresented)
         XCTAssertGreaterThanOrEqual(st.popover.contentHeight, TextFormatPopover.minimumHeight)
+        // Both notifications occur for a single keyboard transition. Update the retained inspector,
+        // including when its own field caused the transition, without presenting a new SwiftUI root.
+        floating.offset = 300
+        let frameInfo = [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: CGRect(x: 0, y: 300, width: 1024, height: 400))]
+        for name in [UIResponder.keyboardWillChangeFrameNotification, UIResponder.keyboardDidChangeFrameNotification] {
+            NotificationCenter.default.post(name: name, object: nil, userInfo: frameInfo)
+        }
+        XCTAssertEqual(floating.presentationCount, 1)
+        XCTAssertTrue(st.popover.isPresented)
+        XCTAssertEqual(st.popover.contentHeight,
+                       300 - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight)
+        floating.offset = 900
+        NotificationCenter.default.post(name: UIResponder.keyboardWillHideNotification, object: nil)
+        XCTAssertEqual(floating.presentationCount, 1)
+        XCTAssertEqual(st.popover.contentHeight, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight)
         st.popover.isPresented = false   // a tap outside
         editor.presentInspector(from: more)
         XCTAssertEqual(floating.presented, [TextPopoverIDs.popover], "the popover is presented once per editing session")

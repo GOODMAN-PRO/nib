@@ -694,8 +694,14 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     }
 
     private func revealText() {
-        guard let t = text, let host, let scroll = host.canvasView as? UIScrollView else { return }
+        guard let t = text, let host else { return }
         layoutText(t, host: host)
+        guard let scroll = host.canvasView as? UIScrollView else {
+            if let item = try? host.app.workspace.item(t.doc, page: t.page, id: t.id), let shape = item.shape {
+                host.session.editor?.reveal(page: t.page, rect: shape.frame.bounds, animated: false)
+            }
+            return
+        }
         keyboard.reveal(t.textView.bounds, in: t.textView, scrolling: scroll)
     }
 

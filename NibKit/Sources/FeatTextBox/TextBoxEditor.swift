@@ -139,8 +139,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         keyboard.onChange = { [weak self] in
             guard let self else { return }
             self.ensureCaretVisible()
-            if let st = self.state, st.popover.isPresented, let source = self.inspectorSource {
-                _ = self.presentFloatingInspector(st, from: source)
+            if let st = self.state, st.popover.isPresented, let source = self.inspectorSource,
+               let host = self.host, let floating = self.floating,
+               let anchor = self.floatingAnchor(source, floating: floating, canvas: host.canvasView) {
+                self.updateFloatingGeometry(st, anchor: anchor, floating: floating, canvas: host.canvasView)
             }
         }
         center.addObserver(self, selector: #selector(willResignActive(_:)),
@@ -816,8 +818,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     /// Scrolls the canvas (instantly: typing never animates) so the caret stays above the keyboard.
     private func ensureCaretVisible() {
-        guard let st = state, let host, let scroll = host.canvasView as? UIScrollView,
+        guard let st = state, let host,
               let caretPosition = st.textView.selectedTextRange?.end else { return }
+        guard let scroll = host.canvasView as? UIScrollView else {
+            host.session.editor?.reveal(page: st.page, rect: st.box.frame.bounds, animated: false)
+            return
+        }
         keyboard.reveal(st.textView.caretRect(for: caretPosition), in: st.textView, scrolling: scroll)
     }
 
@@ -878,19 +884,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private func presentFloatingInspector(_ st: EditState, from source: UIView) -> Bool {
         guard let host = host, let floating = host.session.floatingHost,
               let anchor = floatingAnchor(source, floating: floating, canvas: host.canvasView) else { return false }
-        if let window = host.canvasView.window {
-            st.popover.viewport = floating.containerRect(keyboard.viewport(in: window), from: window)
-        }
-        // The popover rests above the button, so it needs the room between the button and the top of the window.
-        let top = st.popover.viewport?.minY ?? 0
-        let bottom = min(anchor.minY, st.popover.viewport?.maxY ?? anchor.minY)
-        let room = bottom - top - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight
-        let height = min(room, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight)
-        guard st.popover.isPresented || height >= TextFormatPopover.minimumHeight else {
+        updateFloatingGeometry(st, anchor: anchor, floating: floating, canvas: host.canvasView)
+        guard st.popover.isPresented || st.popover.contentHeight >= TextFormatPopover.minimumHeight else {
             floating.removeAnchor(TextPopoverIDs.source)
             return false
         }
-        st.popover.contentHeight = max(0, height)
         st.popover.onClose = { [weak self, weak st] in
             // Back to typing (the popover's own fields may have had the keyboard).
             guard let self = self, let st = st, self.state === st, !st.textView.isFirstResponder else { return }
@@ -902,6 +900,19 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         self.floating = floating
         st.popover.isPresented = true
         return true
+    }
+
+    /// Update the retained view's geometry only; keyboard notifications must not replace its focus or scroll state.
+    private func updateFloatingGeometry(_ st: EditState, anchor: CGRect, floating: FloatingHosting, canvas: UIView) {
+        let viewport = canvas.window.flatMap { window in
+            floating.containerRect(keyboard.viewport(in: window), from: window)
+        }
+        if st.popover.viewport != viewport { st.popover.viewport = viewport }
+        let top = viewport?.minY ?? 0
+        let bottom = min(anchor.minY, viewport?.maxY ?? anchor.minY)
+        let room = bottom - top - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight
+        let height = max(0, min(room, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight))
+        if st.popover.contentHeight != height { st.popover.contentHeight = height }
     }
 
     /// The button's rect as the popover's bud source, and where that is in the container. The keyboard bar lives in the

@@ -599,6 +599,8 @@ extension GiphyKind {
 
 struct ElementsPopover: View {
     @StateObject private var model: ElementsModel
+    @State private var availableHeight = NibMetrics.popoverMaxHeight
+    @State private var contentHeight = NibMetrics.popoverMaxHeight
 
     init(app: NibApp, session: EditorSession) {
         _model = StateObject(wrappedValue: ElementsModel(app: app, session: session))
@@ -609,15 +611,15 @@ struct ElementsPopover: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NibSpacing.m) {
-            NibSegmentedControl(selection: $model.tab, options: ElementsModel.Tab.allCases) { $0.title }
-            switch model.tab {
-            case .stickers:
-                ElementsStickersPane(model: model)
-            case .gifs:
-                ElementsGIFPane(model: model)
-            }
+        ScrollView {
+            content
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                    if abs(height - contentHeight) > 0.5 { contentHeight = height }
+                }
         }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: min(contentHeight, availableHeight))
+        .background(ElementsKeyboardViewport(height: $availableHeight).allowsHitTesting(false))
         .task { await model.start() }
         .onDisappear { model.stop() }
         .background(ElementsPromptPresenter(model: model).allowsHitTesting(false))
@@ -636,6 +638,65 @@ struct ElementsPopover: View {
             ElementsSheet(model: model)
         }
         .accessibilityElement(children: .contain)
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.m) {
+            NibSegmentedControl(selection: $model.tab, options: ElementsModel.Tab.allCases) { $0.title }
+            switch model.tab {
+            case .stickers:
+                ElementsStickersPane(model: model)
+            case .gifs:
+                ElementsGIFPane(model: model)
+            }
+        }
+    }
+}
+
+/// Measure in the popover's own window, never the app's first scene or the keyboard's window.
+/// The palette keeps ownership of the droplet; Elements bounds its content and scrolls within it.
+private struct ElementsKeyboardViewport: UIViewRepresentable {
+    @Binding var height: CGFloat
+
+    func makeUIView(context: Context) -> Probe { Probe(frame: .zero) }
+    func updateUIView(_ view: Probe, context: Context) {
+        view.onHeight = { height = $0 }
+        view.updateHeight()
+    }
+
+    final class Probe: UIView {
+        private let keyboard = NibKeyboardAvoidance()
+        var onHeight: ((CGFloat) -> Void)?
+        private var lastHeight: CGFloat?
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            keyboard.onChange = { [weak self] in self?.updateHeight() }
+        }
+        required init?(coder: NSCoder) { return nil }
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            updateHeight()
+        }
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            updateHeight()
+        }
+        func updateHeight() {
+            guard let window else { return }
+            let viewport = keyboard.viewport(in: window)
+            let top = max(viewport.minY, convert(bounds, to: window).minY)
+            // Leave room for the palette panel's bottom padding. Its title stays outside this scroll view.
+            let height = max(0, min(NibMetrics.popoverMaxHeight, viewport.maxY - top - NibSpacing.l))
+            guard lastHeight.map({ abs($0 - height) > 0.5 }) ?? true else { return }
+            lastHeight = height
+            // Geometry callbacks can run during SwiftUI layout; publish only after that pass finishes.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.window != nil, self.lastHeight == height else { return }
+                self.onHeight?(height)
+            }
+        }
     }
 }
 

@@ -453,14 +453,18 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         }
     }
 
-    /// Scrolls the note into view above the keyboard (without animation under Reduce Motion).
+    /// Scrolls the note into view above the keyboard immediately, without animation.
     private func reveal(_ note: StickyItem, page: PageID, host: CanvasHost) {
         host.session.editor?.reveal(page: page, rect: note.frame.bounds, animated: false)
         revealEditingNote()
     }
 
     private func revealEditingNote() {
-        guard let e = editing, let host, let scroll = host.canvasView as? UIScrollView else { return }
+        guard let e = editing, let host else { return }
+        guard let scroll = host.canvasView as? UIScrollView else {
+            host.session.editor?.reveal(page: e.page, rect: e.view.note.frame.bounds, animated: false)
+            return
+        }
         position(e.view, zoom: e.zoom, page: e.page, host: host)
         keyboard.reveal(e.view.bounds, in: e.view, scrolling: scroll)
     }
