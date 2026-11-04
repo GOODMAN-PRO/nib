@@ -233,8 +233,8 @@ final class NibUI {
 
     /// Waits for the main window to cover the physical display before any orientation assertion.
     /// Fixture data resets do not reset iPadOS window placement left by an earlier gesture.
-    func establishFullScreen() throws {
-        app.activate()
+    func establishFullScreen(allowFixtureRelaunch: Bool = false) throws {
+        if app.state != .runningForeground { app.activate() }
         // The screenshot is the device's display in its current orientation. The runner's own UIScreen is not:
         // on an iPad Pro 13-inch it reports the runner's 768 x 1024 compatibility bounds while the app window is
         // 1032 x 1376 points, and it keeps portrait bounds after the foreground app rotates.
@@ -249,20 +249,40 @@ final class NibUI {
         }
         if fillsScreen() { return }
         let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let fullScreen = system.buttons.matching(NSPredicate(format: "label ==[c] 'Full Screen'")).firstMatch
-        let controls = system.buttons.matching(NSPredicate(format: "label ==[c] 'Window Controls'")).firstMatch
-        if !fullScreen.isHittable && controls.isHittable { controls.tap() }
-        if fullScreen.isHittable {
-            fullScreen.tap()
-        } else {
-            // Apple's system Globe-F shortcut; sent only when not already fullscreen.
-            // This also recovers a window whose controls have been displaced offscreen.
-            app.typeKey("f", modifierFlags: .function)
+        func waitForPlacement(_ timeout: TimeInterval) -> Bool {
+            if fillsScreen() { return true }
+            return XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                fillsScreen()
+            }, object: nil)], timeout: timeout) == .completed
         }
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in fillsScreen() }, object: nil)
-        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
-            throw Failure.message("Full-screen recovery failed: display \(screen), window \(app.windows.firstMatch.frame)\n\(system.debugDescription)\n\(app.debugDescription)")
+        func expandWindow() -> Bool {
+            let controls = system.buttons.matching(identifier: "window-controls:app.nib.Nib").firstMatch
+            let named = system.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] 'Window Controls, Nib'")).firstMatch
+            let opener = controls.exists ? controls : named
+            if opener.exists && opener.isHittable { opener.tap() }
+            let fullScreen = system.buttons.matching(NSPredicate(
+                format: "label ==[c] 'Full Screen' OR label ==[c] 'Enter Full Screen'")).firstMatch
+            let menuItem = system.menuItems.matching(NSPredicate(
+                format: "label ==[c] 'Full Screen' OR label ==[c] 'Enter Full Screen'")).firstMatch
+            let menuReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                (fullScreen.exists && fullScreen.isHittable) || (menuItem.exists && menuItem.isHittable)
+            }, object: nil)
+            if XCTWaiter.wait(for: [menuReady], timeout: 3) == .completed {
+                if fullScreen.exists && fullScreen.isHittable { fullScreen.tap() } else { menuItem.tap() }
+                return waitForPlacement(5)
+            }
+            return fillsScreen()
         }
+        if expandWindow() { return }
+        // Only fixture setup may reset the scene. Mid-test orientation/restoration checks must preserve the document.
+        if allowFixtureRelaunch && app.launchArguments.contains("-NibUITestFixture") {
+            recordDiagnostics("Full-screen recovery needs fixture relaunch", facts: system.debugDescription)
+            app.terminate()
+            app.launch()
+            _ = try waitForState(timeout: 30) { $0.screen == "library" }
+            if waitForPlacement(3) || expandWindow() { return }
+        }
+        throw Failure.message("Full-screen recovery failed: display \(screen), window \(app.windows.firstMatch.frame)\n\(system.debugDescription)\n\(app.debugDescription)")
     }
 
     /// Waits for visible palette anchors, then uses an unobstructed adjacent gap or a verified container edge.
@@ -366,7 +386,7 @@ final class NibUI {
         try handleAuthorizationAlerts()
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
-        try establishFullScreen()
+        try establishFullScreen(allowFixtureRelaunch: true)
         // Device orientation may already say landscape after tearDown rotated
         // SpringBoard. Deliver the request to this scene too.
         XCUIDevice.shared.orientation = .landscapeLeft
@@ -381,7 +401,7 @@ final class NibUI {
         guard XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
             throw Failure.message("Nib's launched scene did not reach landscape")
         }
-        try establishFullScreen()
+        try establishFullScreen(allowFixtureRelaunch: true)
         _ = try waitForState { $0.screen == "library" }
     }
 
@@ -867,6 +887,32 @@ final class NibUI {
         try synthesize(paths, duration: duration)
     }
     func doubleTap(at point: CGPoint = CGPoint(x: 0.5, y: 0.5)) { coordinate(point).doubleTap() }
+
+    /// Keeps every touch in a small desk patch, never XCTest's automatically chosen window-edge hit points.
+    func canvasMultiTap(touches: Int, taps: Int = 2) throws {
+        guard (2...3).contains(touches), (1...2).contains(taps) else { throw Failure.message("Unsupported multi-tap") }
+        let before = app.windows.firstMatch.frame
+        let centre = coordinate(CGPoint(x: 0.18, y: 0.65)).screenPoint
+        let points = (0..<touches).map { index in
+            CGPoint(x: centre.x + CGFloat(index - 1) * 20, y: centre.y)
+        }
+        guard points.allSatisfy({ before.insetBy(dx: 60, dy: 60).contains($0) }) else {
+            throw Failure.message("Multi-tap must stay clear of system window edges")
+        }
+        recordGeometry("Stationary multi-tap", touches: points)
+        let done = XCTestExpectation(description: "Stationary multi-tap completed")
+        var failure: Error?
+        NibTouchPaths.tap(at: points.map { NSValue(cgPoint: $0) }, count: UInt(taps)) { error in
+            failure = error; done.fulfill()
+        }
+        guard XCTWaiter.wait(for: [done], timeout: 10) == .completed else { throw Failure.message("Multi-tap timed out") }
+        if let failure { throw failure }
+        let after = app.windows.firstMatch.frame
+        guard abs(after.minX - before.minX) <= 2, abs(after.minY - before.minY) <= 2,
+              abs(after.width - before.width) <= 2, abs(after.height - before.height) <= 2 else {
+            throw Failure.message("Multi-tap moved the app window: \(before) -> \(after)")
+        }
+    }
 
     func twoFingerScroll(from: CGPoint, to: CGPoint, duration: TimeInterval = 0.4) throws {
         let spacing = min(0.035, 24 / canvas.frame.width)

@@ -1287,12 +1287,10 @@ final class InkUITests: XCTestCase {
 
     func testTwoFingerUndoAndThreeFingerRedoDoubleTaps() throws {
         let before = try ui.state(); try draw()
-        // Keep the gestures in the canvas desk, away from the palette and page objects.
-        // XCUIElement.tap(withNumberOfTaps:numberOfTouches:) sends simultaneous direct fingers.
-        // Use the canvas element's centre, clear of the floating palette.
-        ui.canvas.tap(withNumberOfTaps: 2, numberOfTouches: 2)
+        // Element multi-tap spreads fingers to window edges on this SDK; use explicit desk contacts.
+        try ui.canvasMultiTap(touches: 2)
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage && $0.redoAvailable }
-        ui.canvas.tap(withNumberOfTaps: 2, numberOfTouches: 3)
+        try ui.canvasMultiTap(touches: 3)
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && !$0.redoAvailable }
     }
 
