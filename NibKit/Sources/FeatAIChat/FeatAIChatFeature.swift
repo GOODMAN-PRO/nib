@@ -14,7 +14,7 @@ public enum FeatAIChatFeature: NibFeature {
         let placement = "chrome.panelPlacement." + PanelIDs.assistant
         app.settings.declare(SettingKey(placement, default: "right"),
                              summary: "Assistant panel placement.", owner: id,
-                             schema: .str(choices: ["left", "right", "floating"]))
+                             schema: .str(choices: ["left", "right", "floating", "fullScreen"]))
         // Chrome reads the stored placement, not the declaration's default. Seed only an unset choice.
         if app.settings.json(placement) == nil { app.settings.setJSON(placement, "right") }
         // Keep the full-width panel host: sidebarTab is the 240 pt notebook navigator. The placement above docks
@@ -228,8 +228,8 @@ enum ChatCommands {
                 }
                 return try await model.applyProposals(id: p["id"]?.stringValue, context: ctx)
             }
-        register(ChatCommand.open, "Assistant", "Open the assistant in floating, sidebar or window mode with an optional selection or block context.",
-            schema: .obj(["scope": scopeSchema, "refs": .arr(.ref), "mode": .str(choices: ["floating", "sidebar", "window"])]),
+        register(ChatCommand.open, "Assistant", "Open the assistant as a floating, sidebar or full-screen panel in the current document window, or in a separate window, with an optional selection or block context.",
+            schema: .obj(["scope": scopeSchema, "refs": .arr(.ref), "mode": .str(choices: ["floating", "sidebar", "fullScreen", "window"])]),
             examples: [[:], ["scope": "block", "refs": ["block:FIXTUREDOC02/FIXTUREBLK01"]]]) { p, ctx in
                 let model = try model(ctx)
                 if ctx.dryRun { return [:] }
@@ -238,11 +238,12 @@ enum ChatCommands {
                     if ctx.principal.isUser { model.registerContextUndo() }
                     try model.setScope(try kind(scope), refs: try refs(p))
                 }
-                let panelParams: JSONValue = ["scope": .string(model.scope.kind.rawValue), "refs": .array(model.scope.refs.map(JSONValue.string))]
+                var panelParams: JSONValue = ["scope": .string(model.scope.kind.rawValue), "refs": .array(model.scope.refs.map(JSONValue.string))]
+                if let chat = model.chatID { panelParams = panelParams.merging(["chat": .string(chat)]) }
                 guard let mode = p["mode"]?.stringValue else {
                     return try await ctx.execute(CommandIDs.panelOpen, ["id": .string(PanelIDs.assistant), "params": panelParams])
                 }
-                guard ["floating", "sidebar", "window"].contains(mode) else { throw NibError.invalid("unknown panel mode", path: "$.mode") }
+                guard ["floating", "sidebar", "fullScreen", "window"].contains(mode) else { throw NibError.invalid("unknown panel mode", path: "$.mode") }
                 guard !model.isStreaming, !model.isGeneratingImage, !model.isApplyingProposals else { throw NibError(.conflict, "stop this turn before changing panel mode") }
                 if mode == "window" {
                     guard let app = ctx.app, let scenes = ChatRuntime.get(app).windowScenes else { throw NibError.unavailable("assistant window routing") }
@@ -252,7 +253,7 @@ enum ChatCommands {
                 let name = "chrome.panelPlacement." + PanelIDs.assistant
                 // The chrome owns and declares the placement setting; do not redeclare a shared key here.
                 if ctx.services.settings.descriptor(name) != nil {
-                    let placement = mode == "floating" ? "floating" : (ctx.services.settings.get(NibSettings.sidebarOnRight) ? "right" : "left")
+                    let placement = mode == "sidebar" ? (ctx.services.settings.get(NibSettings.sidebarOnRight) ? "right" : "left") : mode
                     _ = try await ctx.execute(CommandIDs.settingsSet, ["name": .string(name), "value": .string(placement)])
                 }
                 if ctx.activeSession?.openPanels.contains(PanelIDs.assistant) == true {

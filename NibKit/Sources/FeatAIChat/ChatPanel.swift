@@ -20,7 +20,7 @@ struct ChatPanel: View {
                         .disabled(!model.canUseHistory)
                     Button(String(localized: "Conversations")) { model.perform(ChatCommand.inspect, ["section": "conversations"]) }
                         .disabled(!model.canUseHistory)
-                    ForEach(sizeClass == .compact ? [PanelPresentation.floating, .sidebar] : [.floating, .sidebar, .window], id: \.self) { mode in
+                    ForEach(sizeClass == .compact ? [PanelPresentation.floating, .sidebar, .fullScreen] : [.floating, .sidebar, .fullScreen, .window], id: \.self) { mode in
                         Button(modeTitle(mode)) { model.perform(ChatCommand.open, ["mode": .string(mode.rawValue)]) }
                     }
                     Button(String(localized: "AI settings")) { model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)]) }
@@ -299,6 +299,7 @@ struct ChatPanel: View {
     private func modeTitle(_ mode: PanelPresentation) -> String {
         switch mode {
         case .sidebar: return String(localized: "Sidebar")
+        case .fullScreen: return String(localized: "Full Screen")
         case .window: return String(localized: "Window")
         default: return String(localized: "Floating")
         }

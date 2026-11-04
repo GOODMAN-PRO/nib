@@ -33,7 +33,7 @@ final class FeatAIChatTests: XCTestCase {
         let h = Harness(features: [FeatAIChatFeature.self])
         let name = "chrome.panelPlacement." + PanelIDs.assistant
         XCTAssertFalse(h.app.settings.get(NibSettings.sidebarOnRight), "The notebook sidebar is independent.")
-        for choice in ["floating", "left", "right"] {
+        for choice in ["floating", "left", "right", "fullScreen"] {
             h.app.settings.setJSON(name, .string(choice))
             FeatAIChatFeature.register(h.app)
             XCTAssertEqual(h.app.settings.json(name)?.stringValue, choice)
@@ -77,32 +77,75 @@ final class FeatAIChatTests: XCTestCase {
         } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
     }
 
-    func testSidebarAndFloatingUseTheChromePlacementSetting() async throws {
+    func testFullScreenSidebarAndFloatingUseTheChromePanelHost() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let name = "chrome.panelPlacement." + PanelIDs.assistant
         h.app.settings.declarePrefix("chrome.panelPlacement.", synced: false, summary: "Test chrome placement.", owner: "test",
-                                     schema: .str(choices: ["left", "right", "floating"]))
+                                     schema: .str(choices: ["left", "right", "floating", "fullScreen"]))
         var opened: [JSONValue] = []
+        var placements: [String?] = []
         var closed = 0
-        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelClose, title: "Close panel", summary: "Test panel host.", effect: .session)) { _, _ in
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.chatID = "FIXTURECHAT1"
+        let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.textID).description
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelClose, title: "Close panel", summary: "Test panel host.", effect: .session)) { p, ctx in
+            XCTAssertEqual(p["id"]?.stringValue, PanelIDs.assistant)
+            XCTAssertTrue(ctx.activeSession === h.session)
             closed += 1
+            h.session.openPanels.remove(PanelIDs.assistant)
             return [:]
         }
-        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open panel", summary: "Test panel host.", effect: .session)) { p, _ in
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open panel", summary: "Test panel host.", effect: .session)) { p, ctx in
+            XCTAssertTrue(ctx.activeSession === h.session)
             opened.append(p)
-            return [:]
+            placements.append(ctx.services.settings.json(name)?.stringValue)
+            h.session.openPanels.insert(PanelIDs.assistant)
+            return ["id": p["id"] ?? .null, "placement": ctx.services.settings.json(name) ?? .null]
         }
         _ = try await h.run(ChatCommand.open, ["mode": "sidebar"])
         let expected = h.app.settings.get(NibSettings.sidebarOnRight) ? "right" : "left"
         XCTAssertEqual(h.app.settings.json(name)?.stringValue, expected)
         _ = try await h.run(ChatCommand.open, ["mode": "floating"])
         XCTAssertEqual(h.app.settings.json(name)?.stringValue, "floating")
-        h.session.openPanels.insert(PanelIDs.assistant)
+        XCTAssertEqual(closed, 1)
         _ = try await h.run(ChatCommand.open)
         XCTAssertEqual(h.app.settings.json(name)?.stringValue, "floating")
-        XCTAssertEqual(closed, 0)
+        XCTAssertEqual(closed, 1, "Opening without a mode keeps the current panel.")
         XCTAssertEqual(opened.last?["params"]?["scope"]?.stringValue, "document")
-        XCTAssertEqual(opened.map { $0["id"]?.stringValue }, [PanelIDs.assistant, PanelIDs.assistant, PanelIDs.assistant])
+        let result = try await h.run(ChatCommand.open, ["mode": "fullScreen", "scope": "selection", "refs": [.string(ref)]])
+        XCTAssertEqual(result["id"]?.stringValue, PanelIDs.assistant)
+        XCTAssertEqual(result["placement"]?.stringValue, PanelPlacement.fullScreen.rawValue)
+        XCTAssertEqual(h.app.settings.json(name)?.stringValue, PanelPlacement.fullScreen.rawValue)
+        XCTAssertEqual(closed, 2)
+        XCTAssertNil(ChatRuntime.get(h.app).windowScenes, "Full screen must work without separate-window routing.")
+        let expectedParams: JSONValue = ["chat": "FIXTURECHAT1", "scope": "selection", "refs": [.string(ref)]]
+        XCTAssertEqual(opened.last?["params"], expectedParams)
+        _ = try await h.run(ChatCommand.open)
+        XCTAssertEqual(closed, 2)
+        XCTAssertEqual(opened.last?["params"], expectedParams)
+        _ = try await h.run(ChatCommand.open, ["mode": "sidebar"])
+        XCTAssertEqual(opened.last?["params"], expectedParams)
+        _ = try await h.run(ChatCommand.open, ["mode": "floating"])
+        XCTAssertEqual(opened.last?["params"], expectedParams)
+        XCTAssertEqual(closed, 4)
+        XCTAssertEqual(placements, [expected, "floating", "floating", "fullScreen", "fullScreen", expected, "floating"])
+        XCTAssertEqual(opened.map { $0["id"]?.stringValue }, Array(repeating: PanelIDs.assistant, count: 7))
+        XCTAssertEqual(model.chatID, "FIXTURECHAT1")
+        XCTAssertEqual(model.scope.refs, [ref])
+    }
+
+    func testFullScreenDryRunDoesNotChangePlacementOrOpenPanel() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        var opened = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open panel", summary: "Test panel host.", effect: .session)) { _, _ in
+            opened = true
+            return [:]
+        }
+        _ = try await h.app.bus.execute(Invocation(command: ChatCommand.open, params: ["mode": "fullScreen"],
+                                                  session: h.session, dryRun: true))
+        XCTAssertFalse(opened)
+        XCTAssertEqual(h.app.settings.json("chrome.panelPlacement." + PanelIDs.assistant), "right")
+        XCTAssertFalse(h.session.openPanels.contains(PanelIDs.assistant))
     }
 
     func testCitationsValidateAndDeduplicateRefs() {
