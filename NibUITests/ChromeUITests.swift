@@ -31,7 +31,8 @@ final class ChromeUITests: XCTestCase {
             state.name = "Chrome-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
-            ui.app.terminate()
+            defer { ui.app.terminate() }
+            try ui.handleAuthorizationAlerts()
         }
         if let imports { try FileManager.default.removeItem(at: imports) }
         XCUIDevice.shared.orientation = .landscapeLeft
@@ -59,25 +60,21 @@ final class ChromeUITests: XCTestCase {
         }
     }
 
-    /// Scroll the containing sheet/popover, never the document, to reach offscreen controls.
+    /// Waits for an actionable control in its containing form with bidirectional, progress-bounded scrolling.
     private func reachable(_ name: String) throws -> XCUIElement {
-        let q = query(name)
-        if !q.firstMatch.exists { ui.revealFormElement(q.firstMatch) }
-        _ = try require(name)
-        for _ in 0..<12 {
-            let candidates = q.allElementsBoundByIndex.filter { $0.isHittable && $0.isEnabled }
-            if let button = candidates.first(where: { $0.elementType == .button && !$0.identifier.hasPrefix("tool.") }) { return button }
-            if let target = candidates.first { return target }
-            let containers = ui.app.scrollViews.allElementsBoundByIndex + ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex
-            guard let scroller = containers.first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.descendants(matching: .any)
-                    .matching(NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).count > 0
-            }) else { break }
-            let dy: CGFloat = q.firstMatch.frame.midY < scroller.frame.minY ? 0.65 : -0.65
-            let start = scroller.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: dy > 0 ? 0.2 : 0.8))
-            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy * scroller.frame.height)))
+        let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
+        let buttons = ui.app.buttons.matching(predicate)
+        let target = {
+            buttons.allElementsBoundByIndex.first {
+                $0.isHittable && $0.isEnabled && !$0.identifier.hasPrefix("tool.")
+            } ?? (buttons.firstMatch.exists ? buttons.firstMatch : self.query(name).firstMatch)
         }
-        throw NibUI.Failure.message("Chrome control is not actionable: \(name)\n\(ui.app.debugDescription)")
+        ui.revealFormElement(target: target)
+        try wait("Chrome control is not actionable: \(name)", timeout: 8) {
+            let found = target()
+            return found.exists && found.isHittable && found.isEnabled
+        }
+        return target()
     }
 
     private func tap(_ name: String) throws { try reachable(name).tap() }
@@ -251,7 +248,7 @@ final class ChromeUITests: XCTestCase {
         try tap("Assistant"); try panel("aichat.panel")
         // DESIGN §14.9 transfers the droplet into the header, which has its own Close.
         try tap("Close Assistant"); try panel("aichat.panel", shown: false)
-        key("j", .command); try panel("aichat.panel")
+        try ui.chord("j", .command) { try self.panel("aichat.panel") }
         escape(); try panel("aichat.panel", shown: false)
         try sameContent(before); key("p"); try draw()
     }
@@ -472,14 +469,8 @@ final class ChromeUITests: XCTestCase {
     }
 
     // toolbar.dock left/right/top/bottom/return/undo
-    private func dragPalette(to point: CGPoint) throws {
-        let palette = try reachable("Tools")
-        let vertical = palette.frame.height > palette.frame.width
-        // Bare rim, away from tools: along-axis drags on a selected tool are intentionally scrubbing.
-        let start = palette.coordinate(withNormalizedOffset: CGVector(dx: vertical ? 0.1 : 0.5, dy: vertical ? 0.5 : 0.1))
-        start.press(forDuration: 0.15, thenDragTo: ui.app.coordinate(withNormalizedOffset: CGVector(dx: point.x, dy: point.y)),
-                    withVelocity: .slow, thenHoldForDuration: 0.5)
-    }
+    /// Waits for the visible separator grip and verifies that only the palette moves.
+    private func dragPalette(to point: CGPoint) throws { try ui.dragPalette(to: point) }
     private func dock(_ edge: String) throws {
         let target: CGPoint
         switch edge {
@@ -529,17 +520,21 @@ final class ChromeUITests: XCTestCase {
     func testDockKeyboardUndoRedoRestoresEdgeAndAlongWithDocumentPriority() throws {
         try open(); let before = try ui.state(); XCTAssertFalse(before.undoAvailable)
         try dock("right"); let moved = try ui.state()
-        key("z", .command)
-        _ = try ui.waitForState { $0.paletteDock?.edge == before.paletteDock?.edge }
+        try ui.chord("z", .command) {
+            _ = try self.ui.waitForState { $0.paletteDock?.edge == before.paletteDock?.edge }
+        }
         XCTAssertEqual(try XCTUnwrap(ui.state().paletteDock?.along), try XCTUnwrap(before.paletteDock?.along), accuracy: 0.02)
-        key("z", [.command, .shift])
-        _ = try ui.waitForState { $0.paletteDock?.edge == moved.paletteDock?.edge }
+        try ui.chord("z", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.paletteDock?.edge == moved.paletteDock?.edge }
+        }
         try ui.selectTool("pen"); try draw(); try dock("top")
-        key("z", .command)
-        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage }
+        try ui.chord("z", .command) {
+            _ = try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage }
+        }
         XCTAssertEqual(try ui.state().paletteDock?.edge, "top", "Document ink must undo before the window's newer docking step")
-        key("z", [.command, .shift])
-        _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
+        try ui.chord("z", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
+        }
     }
 
     // toolbar.setVisible/setLayout/reset/saveLayout/applyLayout/deleteLayout
@@ -606,7 +601,14 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize()
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5))
-        handle.press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen"))
+        let pen = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Fountain Pen'")).firstMatch
+        XCTAssertTrue(pen.exists && pen.isHittable, "Pen reorder handle must define the insertion row")
+        let insertion = pen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .withOffset(CGVector(dx: 0, dy: -pen.frame.height / 2 - 2))
+        let trace = XCTAttachment(string: "toolbar.setLayout via onMove: Highlighter \(handle.frame), Pen \(pen.frame), insertion \(insertion.screenPoint)\n\(ui.app.debugDescription)")
+        trace.name = "reorder-insertion-target"; trace.lifetime = .keepAlways; add(trace)
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: insertion, withVelocity: .slow, thenHoldForDuration: 0.2)
         try wait("Reordering must move Highlighter above Pen") {
             self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }
@@ -707,10 +709,11 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState { $0.document == first.document }
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         XCTAssertEqual(try ui.state().document, second.document)
-        key("w", .command); _ = try ui.waitForState { $0.document == first.document }
+        try ui.chord("w", .command) { _ = try self.ui.waitForState { $0.document == first.document } }
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
-        key("w", [.command, .option])
-        _ = try ui.waitForState { $0.screen == "library" && $0.document == nil }
+        try ui.chord("w", [.command, .option]) {
+            _ = try self.ui.waitForState { $0.screen == "library" && $0.document == nil }
+        }
         try open(); XCTAssertEqual(try ui.state().document, first.document)
         try ui.tapCommand("window.showLibrary"); try open("Concept map")
         XCTAssertEqual(try ui.state().document, second.document)
@@ -803,11 +806,16 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(try require("Layer 2").isSelected)
         let baseline = try require("Layer 2").value as? String
         try tap("cmd.panel.close"); try ui.selectTool("pen"); try draw()
-        key("l", [.command, .option]); try panel("layers")
+        try ui.chord("l", [.command, .option]) { try self.panel("layers") }
         XCTAssertNotEqual(try require("Layer 2").value as? String, baseline, "New stroke must belong to chosen layer")
         XCTAssertTrue((query("Layer 2").firstMatch.value as? String ?? "").contains("1 item"))
-        try tap("cmd.panel.close"); key("3", [.command, .option]); try draw(y: 0.73)
-        key("l", [.command, .option]); XCTAssertTrue(try require("Layer 3").isSelected)
+        try tap("cmd.panel.close"); try ui.chord("3", [.command, .option]) {
+            try self.more("Layers")
+            try self.wait("Layer 3 shortcut must select Layer 3") { self.query("Layer 3").firstMatch.isSelected }
+            try self.tap("cmd.panel.close")
+        }
+        try draw(y: 0.73)
+        try ui.chord("l", [.command, .option]) { try self.panel("layers") }; XCTAssertTrue(try require("Layer 3").isSelected)
         XCTAssertTrue((query("Layer 3").firstMatch.value as? String ?? "").contains("1 item"))
     }
     func testActiveLayerLimitsLassoSelectionToChosenLayer() throws {

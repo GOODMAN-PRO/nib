@@ -30,7 +30,8 @@ final class InkUITests: XCTestCase {
                 let tree = XCTAttachment(string: ui.app.debugDescription)
                 tree.name = "\(name)-accessibility"; tree.lifetime = .keepAlways; add(tree)
             }
-            ui.app.terminate()
+            defer { ui.app.terminate() }
+            try ui.handleAuthorizationAlerts()
         }
         ui = nil
     }
@@ -47,36 +48,71 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    /// Waits on typed identifier/label queries, re-resolving firstMatch rather than snapshot indices during menu transitions.
     private func control(_ label: String, type: XCUIElement.ElementType = .any,
                          scroll: Bool = false) throws -> XCUIElement {
-        let predicate = NSPredicate(format: "identifier == %@ OR label == %@", label, label)
-        let query = ui.app.descendants(matching: type).matching(predicate)
-        for attempt in 0..<(scroll ? 12 : 2) {
-            let matches = query.allElementsBoundByIndex.filter {
-                ($0.isHittable || !$0.isEnabled) && (label.hasPrefix("tool.") || !$0.identifier.hasPrefix("tool."))
+        let types: [XCUIElement.ElementType] = type == .any
+            ? [.button, .switch, .slider, .textField, .segmentedControl, .staticText, .other] : [type]
+        let predicate = NSPredicate(format: "(identifier == %@ OR label == %@) AND (identifier BEGINSWITH %@ OR NOT identifier BEGINSWITH 'tool.')",
+                                    label, label, label.hasPrefix("tool.") ? "tool." : "cmd.")
+        /// Resolves a fresh typed query without waiting; hittability is evaluated locally, not as an unsupported AX query attribute.
+        func candidate() -> XCUIElement? {
+            for kind in types {
+                let visible = ui.app.descendants(matching: kind).matching(predicate).firstMatch
+                if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
             }
-            let interactive = matches.filter { [.button, .switch, .slider, .textField, .segmentedControl].contains($0.elementType) }
-            // A settings choice can share its title with the tool behind the popover (Pencil, Highlighter,
-            // Fountain Pen). Choose the actual option/filter, not the underlying palette selector.
-            if let found = interactive.first(where: { !$0.identifier.hasPrefix("tool.") })
-                ?? interactive.first ?? matches.first {
-                // Native menus can remove their same-labelled wrapper after the first snapshot.
-                // Rebind a unique typed element so an Any-query index does not become stale before tapping.
-                let stable = ui.app.descendants(matching: found.elementType).matching(
-                    NSPredicate(format: "identifier == %@ AND label == %@", found.identifier, found.label))
-                return stable.count == 1 ? stable.firstMatch : found
+            if type == .any {
+                let visible = ui.app.descendants(matching: .any).matching(predicate).firstMatch
+                if visible.exists && (visible.isHittable || !visible.isEnabled) { return visible }
             }
-            if attempt == 0 { _ = query.firstMatch.waitForExistence(timeout: 3) }
-            if scroll {
-                let panels = scrollPanels
-                // Prefer the target's own scroller. Settings has a navigation list alongside its detail list.
-                let containing = panels.filter { $0.descendants(matching: type).matching(predicate).count > 0 }
-                guard let panel = containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
-                    ?? panels.max(by: { $0.frame.minX < $1.frame.minX }) else { break }
-                scrollPanel(panel, down: false)
+            return nil
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in candidate() != nil }, object: nil)
+        _ = XCTWaiter.wait(for: [ready], timeout: 3)
+        if let found = candidate() { return found }
+        if scroll {
+            ui.revealFormElement {
+                candidate() ?? self.ui.app.descendants(matching: type).matching(predicate).firstMatch
             }
+            if let found = candidate() { return found }
         }
         throw NibUI.Failure.message("Missing hittable control: \(label)\n\(ui.app.debugDescription)")
+    }
+
+    /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
+    private func squeezePaletteBinding() throws -> XCUIElement {
+        let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
+        ui.revealFormElement(heading)
+        try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
+        let detail = try XCTUnwrap(scrollPanels.filter {
+            $0.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).count > 0
+        }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+        let section = detail.otherElements.containing(.staticText, identifier: heading.label)
+            .matching(NSPredicate(format: "label != 'Double-tap'")).allElementsBoundByIndex
+            .filter {
+                let rows = $0.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
+                return rows.count == 1 && rows.firstMatch.frame.minY > heading.frame.maxY
+            }
+            .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        if let section {
+            let row = section.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).firstMatch
+            ui.revealFormElement(in: detail) { row }
+            if row.isHittable { return row }
+        }
+        // Native grouped lists can flatten Section containers. Bind by the visible header/footer range instead.
+        let footer = detail.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Squeeze Apple Pencil Pro'")).firstMatch
+        let choices = detail.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
+        /// Reacquires the row between current section boundaries; the enclosing form search waits for visibility.
+        func scopedRow() -> XCUIElement {
+            guard heading.exists else { return choices.matching(NSPredicate(value: false)).firstMatch }
+            return choices.allElementsBoundByIndex.first {
+                $0.frame.minY > heading.frame.maxY && (!footer.exists || $0.frame.maxY < footer.frame.minY)
+            } ?? choices.matching(NSPredicate(value: false)).firstMatch
+        }
+        ui.revealFormElement(in: detail, target: scopedRow)
+        let row = scopedRow()
+        guard row.exists && row.isHittable else { throw NibUI.Failure.message("Squeeze must offer its own palette binding") }
+        return row
     }
 
     private func tap(_ label: String, scroll: Bool = false) throws {
@@ -270,8 +306,8 @@ final class InkUITests: XCTestCase {
         let height: Int
         let bytes: [UInt8]
         @MainActor init(_ screenshot: XCUIScreenshot, screenSize: CGSize, rect: CGRect) throws {
-            // Device capture avoids XCUIApplication's incorrectly cropped landscape image on this SDK.
-            // UIImage.draw applies the capture's orientation before we address screen-coordinate pixels.
+            // raster() supplies a full-device capture and oriented screen dimensions in points.
+            // UIImage.draw applies its orientation before cropping; app captures crop landscape incorrectly on this SDK.
             let source = screenshot.image
             let format = UIGraphicsImageRendererFormat()
             format.scale = source.scale
@@ -313,10 +349,23 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    /// Waits for fullscreen at the screen origin before cropping a device capture in screen-point coordinates.
     private func raster(_ region: CGRect? = nil) throws -> Raster {
+        try ui.establishFullScreen()
+        let window = ui.app.windows.firstMatch.frame
+        guard window.origin == .zero else {
+            throw NibUI.Failure.message("Raster requires a full-screen window at (0,0): \(window)")
+        }
+        let screenshot = XCUIScreen.main.screenshot()
+        let dimensions = UIScreen.main.bounds.size
+        let long = max(dimensions.width, dimensions.height), short = min(dimensions.width, dimensions.height)
+        let screenSize = screenshot.image.size.width > screenshot.image.size.height
+            ? CGSize(width: long, height: short) : CGSize(width: short, height: long)
         let r = region ?? inkRegion, f = ui.canvas.frame
-        return try Raster(XCUIScreen.main.screenshot(), screenSize: ui.app.frame.size, rect: CGRect(x: f.minX + r.minX * f.width, y: f.minY + r.minY * f.height,
-                                                           width: r.width * f.width, height: r.height * f.height))
+        return try Raster(screenshot, screenSize: screenSize,
+                          rect: CGRect(x: f.minX - window.minX + r.minX * f.width,
+                                       y: f.minY - window.minY + r.minY * f.height,
+                                       width: r.width * f.width, height: r.height * f.height))
     }
 
     private func visibleInk(after before: Raster, region: CGRect? = nil) throws -> Raster {
@@ -438,10 +487,14 @@ final class InkUITests: XCTestCase {
             for value: CGFloat in [0.01, 0.99] {
                 try settings(tool); _ = try slider("Stabilisation", to: value); closePopover()
                 let before = try ui.state(), blank = try raster()
+                let endpoints = [zigzag.first!, zigzag.last!].map {
+                    CGRect(x: $0.x - 0.01, y: $0.y - 0.01, width: 0.02, height: 0.02)
+                }
+                let emptyEndpoints = try endpoints.map { try raster($0) }
                 try draw(zigzag); images.append(try visibleInk(after: blank))
-                for p in [zigzag.first!, zigzag.last!] {
-                    let endpoint = CGRect(x: p.x - 0.01, y: p.y - 0.01, width: 0.02, height: 0.02)
-                    XCTAssertGreaterThan(try raster(endpoint).darkPixels, 0, "Stabilisation must retain both endpoints")
+                for (endpoint, empty) in zip(endpoints, emptyEndpoints) {
+                    XCTAssertGreaterThan(try raster(endpoint).changed(from: empty), 0,
+                                         "Stabilisation must retain ink at each endpoint, including pale graphite")
                 }
                 try undo(to: before)
             }
@@ -613,11 +666,18 @@ final class InkUITests: XCTestCase {
         }
     }
 
+    /// Waits for the native spectrum surface's observed label so colour taps reach the picker.
+    private func colourSpectrum() throws -> XCUIElement {
+        let spectrum = ui.app.otherElements.matching(NSPredicate(format: "label ==[c] 'Color Spectrum'")).firstMatch
+        try wait("Native Color Spectrum must be visible") { spectrum.exists && spectrum.isHittable }
+        return spectrum
+    }
+
     func testHighlighterCustomColourPersistsAndDrawsTranslucentInk() throws {
         try settings("highlighter"); try tap("Custom…")
         try tap("Spectrum")
         // The system colour field is a real two-dimensional control, selected by its accessibility label.
-        let spectrum = try control("Color spectrum")
+        let spectrum = try colourSpectrum()
         spectrum.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.35)).tap()
         try closeColourPicker()
         closePopover()
@@ -692,18 +752,38 @@ final class InkUITests: XCTestCase {
         XCTAssertEqual(swatches[0].label, "Vermilion")
     }
 
+    /// Records native field and preset output at the action boundary without waiting; no command-bus result is fabricated.
+    private func traceSwatch(_ stage: String, field: XCUIElement? = nil) {
+        let attachment = XCTAttachment(string: "\(stage) field=\(String(describing: field?.value)) swatches=\(swatches.map(\.label))\n\(ui.probe.value ?? "missing")\n\(ui.app.debugDescription)")
+        attachment.name = stage; attachment.lifetime = .keepAlways; add(attachment)
+    }
+
     func testCustomColourValidHexUpdatesSlotAndInvalidHexIsRejected() throws {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
         try tap("Sliders")
         let hex = try hexField()
-        hex.tap(); ui.app.typeKey("a", modifierFlags: .command); hex.typeText("D03080")
+        let selection = try ui.state().selectionCount
+        hex.tap()
+        try wait("HEX field must be editable with its keyboard before Select All") { hex.isHittable && self.ui.app.keyboards.firstMatch.exists }
+        hex.typeKey("a", modifierFlags: .command); hex.typeText("D03080")
+        try wait("HEX field must contain D03080 before closing") {
+            (hex.value as? String)?.replacingOccurrences(of: "#", with: "").uppercased() == "D03080"
+        }
+        XCTAssertEqual(try ui.state().selectionCount, selection, "HEX Select All must not select document contents")
+        traceSwatch("preset.setSwatch-valid-before-close", field: hex)
+        defer { traceSwatch("preset.setSwatch-final") }
         try closeColourPicker()
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
         try swatchMenu("Change Colour"); try tap("Custom Colour"); try tap("Sliders")
         let invalid = try hexField()
-        invalid.tap(); ui.app.typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
+        invalid.tap()
+        try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
+        invalid.typeKey("a", modifierFlags: .command); invalid.typeText("ZZZZZZ")
+        XCTAssertNotNil(invalid.value as? String, "Native HEX editor must still expose its value")
+        XCTAssertEqual(try ui.state().selectionCount, selection, "Invalid HEX edit must not select document contents")
+        traceSwatch("preset.setSwatch-invalid-before-close", field: invalid)
         try closeColourPicker(); closePopover()
         XCTAssertEqual(swatches[0].label, valid, "Invalid HEX must not overwrite a valid colour")
         let blank = try raster(); try draw(); _ = try visibleInk(after: blank)
@@ -731,7 +811,8 @@ final class InkUITests: XCTestCase {
         try assertNoNewInk(before)
     }
 
-    func testAddColourPreservesExistingSlotsAndStopsAtTwelve() throws {
+    /// Waits for each appended colour and persistence at capacity; rendering is checked in bounded digit batches.
+    private func fillColourSlots() throws {
         let original = swatches.map(\.label)
         for count in original.count..<12 {
             try tap("Add Colour"); try chooseColour(count % 2 == 0 ? "Vermilion" : "Moss")
@@ -742,8 +823,19 @@ final class InkUITests: XCTestCase {
         XCTAssertFalse(ui.app.buttons["Add Colour"].isHittable, "A thirteenth slot must not be offered")
         try ui.selectTool("highlighter"); try ui.selectTool("pen")
         XCTAssertEqual(swatches.count, 12)
+    }
+
+    func testAddColourPreservesExistingSlotsAndStopsAtTwelve() throws {
+        executionTimeAllowance = 300
+        try fillColourSlots()
+    }
+
+    /// Waits for selection, real ink, and undo for two digit slots after establishing the same twelve-slot palette.
+    private func renderedAddedColours(_ indices: Range<Int>) throws {
+        executionTimeAllowance = 300
+        try fillColourSlots()
         // CONTRACTS KeyCommandRouting: notebook-specific preset keys beat the unrestricted pencil key 2.
-        for index in 0..<10 {
+        for index in indices {
             ui.app.typeKey(index == 9 ? "0" : String(index + 1), modifierFlags: [])
             try wait("Digit key must select colour slot \(index + 1)") { self.swatches[index].isSelected }
             XCTAssertEqual(try ui.state().tool, "pen", "Preset arbitration must not unexpectedly select pencil")
@@ -751,6 +843,12 @@ final class InkUITests: XCTestCase {
             try draw(); _ = try visibleInk(after: blank); try undo(to: before)
         }
     }
+
+    func testAddedColourDigits1And2RenderInk() throws { try renderedAddedColours(0..<2) }
+    func testAddedColourDigits3And4RenderInk() throws { try renderedAddedColours(2..<4) }
+    func testAddedColourDigits5And6RenderInk() throws { try renderedAddedColours(4..<6) }
+    func testAddedColourDigits7And8RenderInk() throws { try renderedAddedColours(6..<8) }
+    func testAddedColourDigits9And10RenderInk() throws { try renderedAddedColours(8..<10) }
 
     func testRemoveColourRemovesSelectedSlotButKeepsAtLeastOne() throws {
         let original = swatches.map(\.label)
@@ -1229,7 +1327,7 @@ final class InkUITests: XCTestCase {
     // The tests below verify settings and direct-touch behavior, never claim those hardware events.
 
     func testPencilPaletteKeyboardChoiceAppliesAndDismissesWithoutMarks() throws {
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         let palette = try control("Pencil palette")
         let eraser = palette.buttons["tool.eraser"]
         XCTAssertTrue(eraser.exists); eraser.tap()
@@ -1239,7 +1337,7 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         let desired = try XCTUnwrap(swatches.last?.label)
         let paletteColourFallback = "Colour \(swatches.count)"
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         let colours = try control("Pencil palette")
         let thickness = colours.buttons.matching(NSPredicate(format: "label ENDSWITH 'millimetres'")).allElementsBoundByIndex
         let thickest = try XCTUnwrap(thickness.last, "Pencil palette must offer the current tool's thickness attributes")
@@ -1251,14 +1349,14 @@ final class InkUITests: XCTestCase {
         XCTAssertEqual(swatches.first(where: \.isSelected)?.label, desired)
         XCTAssertTrue(try control("Thickness 3", type: .button).isSelected)
         try assertNoNewInk(before); try draw()
-        ui.app.typeKey("p", modifierFlags: [.control, .command])
+        try ui.chord("p", [.control, .command]) { _ = try self.control("Pencil palette") }
         _ = try control("Pencil palette")
         ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try wait("Escape dismisses the Pencil palette") { !self.ui.app.otherElements["Pencil palette"].exists }
     }
 
     func testSettingsKeyboardShortcutOpensInkPreferences() throws {
-        ui.app.typeKey(",", modifierFlags: .command)
+        try ui.chord(",", .command) { _ = try self.control("Stylus") }
         _ = try control("Stylus")
     }
 
@@ -1296,14 +1394,7 @@ final class InkUITests: XCTestCase {
         let first = choices.firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 5)); first.tap()
         XCTAssertTrue(first.isSelected, "Double-tap binding must persist its choice")
-        // Both gesture sections offer the same choices. Select the second section's palette binding.
-        let squeeze = ui.app.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).element(boundBy: 1)
-        for _ in 0..<12 {
-            if squeeze.exists && squeeze.isHittable { break }
-            let detail = try XCTUnwrap(scrollPanels.max(by: { $0.frame.minX < $1.frame.minX }))
-            scrollPanel(detail, down: false)
-        }
-        XCTAssertTrue(squeeze.exists && squeeze.isHittable, "Squeeze must offer its own palette binding")
+        let squeeze = try squeezePaletteBinding()
         squeeze.tap()
         XCTAssertTrue(squeeze.isSelected, "Squeeze binding must persist its choice")
         try closePreferences()

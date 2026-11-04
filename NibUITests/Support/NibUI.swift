@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 
 struct QAState: Decodable {
     struct Offset: Decodable { let x: Double; let y: Double }
@@ -39,26 +40,59 @@ final class NibUI {
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
     enum FixtureScenario: String { case standard, failedRender, largeDocument, unseenBoards }
 
-    func revealFormElement(_ element: XCUIElement) {
-        if !element.exists { _ = app.collectionViews.firstMatch.waitForExistence(timeout: 2) }
-        for _ in 0..<24 {
-            guard let list = app.collectionViews.allElementsBoundByIndex.last, list.isHittable else { return }
-            // Include the shortcuts bar: it is above the Keyboard accessibility frame.
-            let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
-                + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
-            guard let viewport = NibUITestScrollGeometry.viewport(
-                scroll: list.frame, window: app.frame, obstructions: obstructions) else { return }
-            if element.exists && element.isHittable {
-                let belongsToList = list.descendants(matching: element.elementType)
-                    .matching(NSPredicate(format: "label == %@", element.label)).count > 0
-                if !belongsToList || viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
+    /// Waits for a target in its actual form, searching both directions until the visible rows stop changing.
+    /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
+    func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
+
+    /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
+    func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
+        let initial = target()
+        if initial.exists && initial.isHittable,
+           (form?.frame ?? app.windows.firstMatch.frame).contains(CGPoint(x: initial.frame.midX, y: initial.frame.midY)) { return }
+        let containers = (app.collectionViews.allElementsBoundByIndex + app.tables.allElementsBoundByIndex
+            + app.scrollViews.allElementsBoundByIndex).filter {
+                $0.identifier != "nib.canvas" && $0.frame.height > 100 && $0.frame.width > 200
+                    && app.windows.firstMatch.frame.intersects($0.frame)
+                    && ($0.isHittable || [.collectionView, .table].contains($0.elementType))
             }
-            let drag = NibUITestScrollGeometry.drag(in: viewport, toward: element.exists ? element.frame.midY : nil)
-            let origin = app.coordinate(withNormalizedOffset: .zero)
-            let start = origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
-            let end = origin.withOffset(CGVector(dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY))
-            start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
+        let containing = containers.filter { list in
+            initial.exists && list.descendants(matching: initial.elementType).matching(NSPredicate(
+                format: "identifier == %@ AND label == %@", initial.identifier, initial.label)).count > 0
         }
+        guard let list = form ?? containing.min(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+            ?? containers.max(by: { $0.frame.minX < $1.frame.minX }) else { return }
+        for down in [false, true] {
+            var previous: String?
+            for _ in 0..<8 {
+                let element = target()
+                let obstructions = app.keyboards.allElementsBoundByIndex.map(\.frame)
+                    + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.map(\.frame)
+                guard let viewport = NibUITestScrollGeometry.viewport(
+                    scroll: list.frame, window: app.windows.firstMatch.frame, obstructions: obstructions) else { return }
+                if element.exists && element.isHittable && viewport.contains(CGPoint(x: element.frame.midX, y: element.frame.midY)) { return }
+                // One snapshot supplies the visible range; querying every row attribute separately can itself time out.
+                guard let snapshot = try? list.snapshot() else { return }
+                let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
+                if signature == previous { break }
+                previous = signature
+                let origin = app.coordinate(withNormalizedOffset: .zero)
+                let x = viewport.minX + viewport.width * 0.5
+                let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
+                let endY = viewport.minY + viewport.height * (down ? 0.75 : 0.25)
+                origin.withOffset(CGVector(dx: x - app.frame.minX, dy: startY - app.frame.minY))
+                    .press(forDuration: 0.01, thenDragTo: origin.withOffset(
+                        CGVector(dx: x - app.frame.minX, dy: endY - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
+            }
+        }
+    }
+
+    /// Reads one immutable snapshot without waiting so progress checks cannot retain stale virtualized element indices.
+    private func formVisibleRange(_ snapshot: XCUIElementSnapshot, viewport: CGRect) -> [String] {
+        let frame = snapshot.frame
+        let own = [.button, .staticText].contains(snapshot.elementType)
+            && viewport.contains(CGPoint(x: frame.midX, y: frame.midY))
+            ? ["\(snapshot.identifier)|\(snapshot.label)|\(Int(frame.minY))"] : []
+        return own + snapshot.children.flatMap { formVisibleRange($0, viewport: viewport) }
     }
 
     /// Complete Files' New Folder action using the editor supplied by the OS.
@@ -90,6 +124,168 @@ final class NibUI {
         }
     }
 
+    /// Waits for the actual microphone prompt (or an already-authorized Recording HUD), then for system alerts to disappear.
+    /// Startup/teardown callers drain outstanding known authorization prompts without accepting unrelated dialogs.
+    func handleAuthorizationAlerts(waitForMicrophone: Bool = false) throws {
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let permission = NSPredicate(format: "label CONTAINS[c] 'microphone' OR label CONTAINS[c] 'calendar' OR label CONTAINS[c] 'photos'")
+        /// Reads the currently visible authorization without waiting; the outer expectation handles asynchronous presentation.
+        func alert(microphoneOnly: Bool = false) -> XCUIElement? {
+            let filter = microphoneOnly ? NSPredicate(format: "label CONTAINS[c] 'microphone'") : permission
+            let title = system.alerts.matching(filter).firstMatch
+            if title.exists { return title }
+            let content = system.alerts.containing(filter).firstMatch
+            return content.exists ? content : nil
+        }
+        if waitForMicrophone {
+            let recording = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Recording' AND value != nil")).firstMatch
+            let requested = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                alert(microphoneOnly: true) != nil || recording.exists
+            }, object: nil)
+            guard XCTWaiter.wait(for: [requested], timeout: 15) == .completed else {
+                throw Failure.message("Quick Record produced neither microphone authorization nor Recording HUD\n\(system.debugDescription)")
+            }
+        }
+        for _ in 0..<3 {
+            guard let prompt = alert() else { return }
+            let allow = prompt.buttons.matching(NSPredicate(
+                format: "label IN {'Allow', 'OK', 'Allow Full Access', 'Allow Access to All Photos'}")).firstMatch
+            guard allow.isHittable else { throw Failure.message("Authorization has no observed affirmative action\n\(system.debugDescription)") }
+            allow.tap()
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !prompt.exists }, object: nil)
+            guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+                throw Failure.message("Authorization alert must disappear before continuing\n\(system.debugDescription)")
+            }
+        }
+        guard alert() == nil else { throw Failure.message("Outstanding authorization survived cleanup") }
+    }
+
+    /// Waits for the main window to cover the physical display before any orientation assertion.
+    /// Fixture data resets do not reset iPadOS window placement left by an earlier gesture.
+    func establishFullScreen() throws {
+        app.activate()
+        // Screenshot orientation is authoritative; UIImage.size may be pixels rather than screen points.
+        // The background test runner can retain portrait UIScreen bounds after the foreground app rotates.
+        let image = XCUIScreen.main.screenshot().image
+        let dimensions = UIScreen.main.bounds.size
+        let long = max(dimensions.width, dimensions.height), short = min(dimensions.width, dimensions.height)
+        let screen = CGRect(origin: .zero, size: image.size.width > image.size.height
+            ? CGSize(width: long, height: short) : CGSize(width: short, height: long))
+        /// Reads current window edges without waiting; the enclosing expectation waits for fullscreen placement.
+        func fillsScreen() -> Bool {
+            let window = app.windows.firstMatch
+            guard window.exists else { return false }
+            let f = window.frame
+            return abs(f.minX - screen.minX) <= 2 && abs(f.minY - screen.minY) <= 2
+                && abs(f.maxX - screen.maxX) <= 2 && abs(f.maxY - screen.maxY) <= 2
+        }
+        if fillsScreen() { return }
+        let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let fullScreen = system.buttons.matching(NSPredicate(format: "label ==[c] 'Full Screen'")).firstMatch
+        let controls = system.buttons.matching(NSPredicate(format: "label ==[c] 'Window Controls'")).firstMatch
+        if !fullScreen.isHittable && controls.isHittable { controls.tap() }
+        if fullScreen.isHittable {
+            fullScreen.tap()
+        } else {
+            // Apple's system Globe-F shortcut; sent only when not already fullscreen.
+            // This also recovers a window whose controls have been displaced offscreen.
+            app.typeKey("f", modifierFlags: .function)
+        }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in fillsScreen() }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 12) == .completed else {
+            throw Failure.message("Full-screen recovery failed: display \(screen), window \(app.windows.firstMatch.frame)\n\(system.debugDescription)\n\(app.debugDescription)")
+        }
+    }
+
+    /// Waits for visible palette anchors, then uses an unobstructed adjacent gap or a verified container edge.
+    /// Records the frames for CI and checks that the gesture leaves the app window fixed.
+    func dragPalette(to destination: CGPoint) throws {
+        let more = app.buttons.matching(identifier: "tool.more").firstMatch
+        let colour = app.buttons.matching(identifier: "cmd.preset.select")
+            .matching(NSPredicate(format: "label == 'Colour 1'")).firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            more.isHittable && colour.isHittable
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed else {
+            throw Failure.message("Palette separator grip needs visible More tools and Colour 1")
+        }
+        let before = app.windows.firstMatch.frame
+        let a = more.frame, b = colour.frame
+        let vertical = abs(a.midY - b.midY) > abs(a.midX - b.midX)
+        let gap = vertical ? b.minY - a.maxY : b.minX - a.maxX
+        let crossMin = vertical ? max(a.minX, b.minX) : max(a.minY, b.minY)
+        let crossMax = vertical ? min(a.maxX, b.maxX) : min(a.maxY, b.maxY)
+        let separator = vertical
+            ? CGRect(x: crossMin, y: a.maxY, width: max(0, crossMax - crossMin), height: max(0, gap))
+            : CGRect(x: a.maxX, y: crossMin, width: max(0, gap), height: max(0, crossMax - crossMin))
+        let midpoint = CGPoint(x: separator.midX, y: separator.midY)
+        // Structural containers and captions are not hit targets. Include native and custom leaf controls.
+        let containers: [XCUIElement.ElementType] = [.application, .window, .other, .scrollView,
+            .table, .collectionView, .toolbar, .navigationBar, .tabBar, .staticText]
+        let controls = try app.descendants(matching: .any).allElementsBoundByIndex.compactMap { element
+            -> (identifier: String, label: String, frame: CGRect)? in
+            // One snapshot supplies type/children/identity/frame rather than separate AX round trips for each attribute.
+            let snapshot = try element.snapshot()
+            guard !containers.contains(snapshot.elementType)
+                || (snapshot.elementType == .other && snapshot.children.isEmpty) else { return nil }
+            guard element.isHittable else { return nil }
+            return (snapshot.identifier, snapshot.label, snapshot.frame)
+        }
+        let others = controls.filter {
+            !($0.identifier == "tool.more" && $0.frame == a)
+                && !($0.identifier == "cmd.preset.select" && $0.label == "Colour 1" && $0.frame == b)
+        }
+        let visible = before.insetBy(dx: 8, dy: 8)
+        let adjacent = gap > 2 && crossMax - crossMin > 2 && visible.contains(separator)
+            && !others.contains { $0.frame.intersects(separator) || $0.frame.contains(midpoint) }
+        var chosen: CGPoint? = adjacent ? midpoint : nil
+        var paletteFrame: CGRect?
+        if !adjacent {
+            // Bind Tools to both live anchors; a stale aggregate frame alone is not evidence of a safe edge.
+            let palette = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Tools'"))
+                .allElementsBoundByIndex.filter {
+                    $0.frame.contains(a) && $0.frame.contains(b)
+                        && $0.buttons.matching(identifier: "tool.more").count > 0
+                        && $0.buttons.matching(identifier: "cmd.preset.select")
+                            .matching(NSPredicate(format: "label == 'Colour 1'")).count > 0
+                }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+            if let palette {
+                let frame = palette.frame
+                paletteFrame = frame
+                // End-padding is on the long axis; stay inside the rounded body and clear of all live controls.
+                let edges = vertical
+                    ? [CGPoint(x: frame.midX, y: frame.minY + 2), CGPoint(x: frame.midX, y: frame.maxY - 2)]
+                    : [CGPoint(x: frame.minX + 2, y: frame.midY), CGPoint(x: frame.maxX - 2, y: frame.midY)]
+                let thickness = vertical ? frame.width : frame.height
+                let anchorThickness = vertical ? max(a.width, b.width) : max(a.height, b.height)
+                if visible.contains(frame), thickness <= anchorThickness + 8 {
+                    chosen = edges.first { point in
+                        frame.contains(point) && !controls.contains { $0.frame.insetBy(dx: -1, dy: -1).contains(point) }
+                    }
+                }
+            }
+        }
+        XCTContext.runActivity(named: "Palette drag anchor geometry") { activity in
+            let frames = controls.map { "\($0.identifier) | \($0.label): \($0.frame)" }.joined(separator: "\n")
+            let attachment = XCTAttachment(string: "More \(a), Colour 1 \(b), window \(before)\n"
+                + "gap \(gap), separator \(separator), adjacent \(adjacent), palette \(String(describing: paletteFrame))\n"
+                + "chosen \(String(describing: chosen)), destination \(destination)\n\(frames)")
+            attachment.name = "palette-drag-frames"; attachment.lifetime = .keepAlways; activity.add(attachment)
+        }
+        guard let grip = chosen else {
+            throw Failure.message("No unobstructed palette separator or container edge: More \(a), colour \(b), window \(before)")
+        }
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        origin.withOffset(CGVector(dx: grip.x - app.frame.minX, dy: grip.y - app.frame.minY))
+            .press(forDuration: 0.15, thenDragTo: app.coordinate(withNormalizedOffset:
+                CGVector(dx: destination.x, dy: destination.y)), withVelocity: .slow, thenHoldForDuration: 0.3)
+        let after = app.windows.firstMatch.frame
+        guard abs(after.minX - before.minX) <= 2, abs(after.minY - before.minY) <= 2,
+              abs(after.width - before.width) <= 2, abs(after.height - before.height) <= 2 else {
+            throw Failure.message("Palette gesture moved the app window: \(before) -> \(after); grip \(grip)")
+        }
+    }
+
     func launchFixture(scenario: FixtureScenario = .standard) throws {
         app.launchArguments = ["-NibUITestFixture", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-NibUITestScenario", scenario.rawValue]
@@ -97,10 +293,12 @@ final class NibUI {
         // Cold package creation and service startup share the machine with builds.
         // Keep the readiness assertion, but do not give launch the short deadline
         // used for an already-running command.
+        try handleAuthorizationAlerts()
         _ = try waitForState(timeout: 120) { $0.screen == "library" }
+        try handleAuthorizationAlerts()
         // Rotate only the running app, not SpringBoard or a previous test's system service. Repeated portrait
         // resets add an unrelated orientation-confirmation race before Nib even launches.
-        app.activate()
+        try establishFullScreen()
         // Device orientation may already say landscape after tearDown rotated
         // SpringBoard. Deliver the request to this scene too.
         XCUIDevice.shared.orientation = .landscapeLeft
@@ -115,7 +313,56 @@ final class NibUI {
         guard XCTWaiter.wait(for: [landscape], timeout: 30) == .completed else {
             throw Failure.message("Nib's launched scene did not reach landscape")
         }
+        try establishFullScreen()
         _ = try waitForState { $0.screen == "library" }
+    }
+
+    /// Activates this scene, waits for non-text focus without editing/navigating, and verifies the chord's action.
+    /// The activity records requested modifiers beside the shell's existing Key routing / Library key diagnostic logs.
+    func chord(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
+               verifying postcondition: () throws -> Void) throws {
+        app.activate()
+        let before = try state()
+        guard !app.keyboards.firstMatch.exists else {
+            throw Failure.message("Dismiss text editing explicitly before delivering a global chord")
+        }
+        let window = app.windows.firstMatch
+        let title = app.buttons.matching(identifier: "menu.title").firstMatch
+        // Use an empty part of the header row, never a canvas stroke, tool, or navigation action.
+        let y = title.exists ? title.frame.midY : window.frame.minY + 70
+        let occupied = app.buttons.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+            + app.textFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+            + app.searchFields.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+            + app.textViews.allElementsBoundByIndex.filter { $0.isHittable }.map(\.frame)
+        let points = [CGFloat(0.5), 0.45, 0.55, 0.4, 0.6].map {
+            CGPoint(x: window.frame.minX + window.frame.width * $0, y: y)
+        }
+        guard let focus = points.first(where: { point in
+            window.frame.contains(point) && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+        }) else { throw Failure.message("No inert header focus target for keyboard chord") }
+        app.coordinate(withNormalizedOffset: .zero).withOffset(
+            CGVector(dx: focus.x - app.frame.minX, dy: focus.y - app.frame.minY)).tap()
+        let focused = try state()
+        guard focused.document == before.document, focused.page == before.page,
+              focused.strokeCountOnPage == before.strokeCountOnPage,
+              focused.itemCountOnPage == before.itemCountOnPage, focused.selectionCount == before.selectionCount,
+              focused.undoAvailable == before.undoAvailable, focused.redoAvailable == before.redoAvailable,
+              focused.zoom == before.zoom, focused.contentOffset.x == before.contentOffset.x,
+              focused.contentOffset.y == before.contentOffset.y, focused.openPanels == before.openPanels,
+              !app.keyboards.firstMatch.exists else {
+            throw Failure.message("Keyboard focus preparation changed document content or navigation")
+        }
+        try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
+            let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) window=\(window.frame)\n\(probe.value ?? "missing")")
+            request.lifetime = .keepAlways; activity.add(request)
+            defer {
+                let result = XCTAttachment(string: "\(probe.value ?? "missing")\n\(app.debugDescription)")
+                result.name = "chord-result"; result.lifetime = .keepAlways; activity.add(result)
+            }
+            // Holding modifiers across the event avoids an unmodified fallback key between down/up events.
+            XCUIElement.perform(withKeyModifiers: modifiers) { [self] in app.typeKey(key, modifierFlags: modifiers) }
+            try postcondition()
+        }
     }
 
     func state() throws -> QAState {

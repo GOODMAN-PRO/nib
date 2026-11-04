@@ -38,18 +38,22 @@ final class CreateUITests: XCTestCase {
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
             add(state)
-            ui.app.terminate()
+            defer { ui.app.terminate() }
+            try ui.handleAuthorizationAlerts()
         }
     }
 
     // MARK: Entry, title, kind and cancellation
 
     func testNotebookKeyboardShortcutOpensDraftAndEscapeCancels() throws {
-        ui.app.typeKey("n", modifierFlags: [.command, .alternate])
+        try ui.chord("n", [.command, .alternate]) {
+            try self.require(self.ui.app.textFields["Title"], "Creation chord must open Title")
+        }
         try require(ui.app.textFields["Title"], "create.newNotebook: Option-Command-N must open the creation sheet")
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Title"], with: "Escape cancelled draft")
+        try dismissKeyboard()
         ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         try wait("create.cancel: Escape must dismiss the creation sheet") { !self.ui.app.textFields["Title"].exists }
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
@@ -74,6 +78,7 @@ final class CreateUITests: XCTestCase {
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Title"], with: "Cancelled draft")
+        try dismissKeyboard()
         try tap("Cancel")
         try ui.waitForState { $0.screen == "library" && $0.document == nil }
         try wait("create.cancel must dismiss the draft") { !self.ui.app.textFields["Title"].exists }
@@ -126,7 +131,9 @@ final class CreateUITests: XCTestCase {
         try require(cardFace("Term"), "create.type: Study set must open the front input")
         try require(cardFace("Definition"), "create.type: Study set must open the back input")
         try replace(cardFace("Term"), with: "Typed front")
+        try dismissKeyboard()
         try replace(cardFace("Definition"), with: "Typed back")
+        try dismissKeyboard()
         XCTAssertEqual(cardFace("Term").value as? String, "Typed front")
         XCTAssertEqual(cardFace("Definition").value as? String, "Typed back")
     }
@@ -146,6 +153,7 @@ final class CreateUITests: XCTestCase {
             (titleField.value as? String) == "Suggested creation title"
         }
         try replace(titleField, with: "Temporary override")
+        try dismissKeyboard()
         try tap("Use “Suggested creation title”")
         XCTAssertEqual(titleField.value as? String, "Suggested creation title")
         try tap("Save as “Suggested creation title”")
@@ -214,16 +222,21 @@ final class CreateUITests: XCTestCase {
         try notebook("Custom dimensions")
         try tap("No cover")
         try chooseSize("Custom")
-        try replace(ui.app.textFields["Width in millimetres"], with: "100")
-        try replace(ui.app.textFields["Height in millimetres"], with: "150")
+        try replace(ui.app.textFields["Width in millimetres"], with: "100", matching: numericValueMatches)
+        try dismissKeyboard()
+        try replace(ui.app.textFields["Height in millimetres"], with: "150", matching: numericValueMatches)
+        try dismissKeyboard()
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
     func testInvalidCustomSizePreventsCreation() throws {
+        executionTimeAllowance = 300 // Diagnostic only; quiescence remains enabled.
         try notebook("Invalid dimensions")
         try chooseSize("Custom")
-        try replace(ui.app.textFields["Width in millimetres"], with: "0")
-        try replace(ui.app.textFields["Height in millimetres"], with: "0")
+        try replace(ui.app.textFields["Width in millimetres"], with: "0", matching: numericValueMatches)
+        try dismissKeyboard()
+        try replace(ui.app.textFields["Height in millimetres"], with: "0", matching: numericValueMatches)
+        try dismissKeyboard()
         let create = ui.app.buttons["cmd.doc.create"]
         if create.isEnabled { create.tap() }
         let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -239,6 +252,7 @@ final class CreateUITests: XCTestCase {
     }
 
     func testOrientationChangesCreatedDimensions() throws {
+        executionTimeAllowance = 300
         try notebook("Landscape notebook")
         try tap("No cover")
         try chooseSize("Letter")
@@ -286,7 +300,8 @@ final class CreateUITests: XCTestCase {
         let hex = ui.app.descendants(matching: .any).matching(NSPredicate(
             format: "(elementType == %d OR elementType == %d) AND (label CONTAINS[c] 'hex' OR placeholderValue CONTAINS[c] 'hex')",
             XCUIElement.ElementType.textField.rawValue, XCUIElement.ElementType.textView.rawValue)).firstMatch
-        try replace(hex, with: "#CEDFED")
+        try replace(hex, with: "#CEDFED", matching: hexValueMatches)
+        try dismissKeyboard()
         try tap("Choose Template")
         try scrollTo(ui.app.textFields["Title"], name: "Title")
         try assertPreviewColour(0xCEDFED)
@@ -295,8 +310,14 @@ final class CreateUITests: XCTestCase {
         XCTAssertEqual(((ref?["params"] as? [String: Any])?["paper"] as? String)?.uppercased(), "#CEDFEDFF")
     }
 
-    func testApplyEveryOtherDistributesPaperAcrossPages() throws { try distribution("Every other") }
-    func testApplyAllPagesDistributesPaperAcrossPages() throws { try distribution("All pages") }
+    func testApplyEveryOtherDistributesPaperAcrossPages() throws {
+        executionTimeAllowance = 300
+        try distribution("Every other")
+    }
+    func testApplyAllPagesDistributesPaperAcrossPages() throws {
+        executionTimeAllowance = 300 // Diagnostic headroom for the observed animation-idle stall.
+        try distribution("All pages")
+    }
 
     func testSavedDefaultsReopenWithoutChangingExistingNotebook() throws {
         try ui.openDocument("Physics — Motion")
@@ -362,6 +383,7 @@ final class CreateUITests: XCTestCase {
     func testWhiteboardOptionsReachNewBoard() throws {
         try newMenu("Whiteboard")
         try replace(ui.app.textFields["Whiteboard name"], with: "Board options")
+        try dismissKeyboard()
         try scrollTap("Grid")
         try scrollTap("Ivory")
         try scrollTap("Handwriting language", prefix: true)
@@ -400,11 +422,14 @@ final class CreateUITests: XCTestCase {
     }
 
     func testWhiteboardKeyboardShortcutOpensOptionsWithoutCreating() throws {
-        ui.app.typeKey("w", modifierFlags: [.command, .shift])
+        try ui.chord("w", [.command, .shift]) {
+            try self.require(self.ui.app.textFields["Whiteboard name"], "Creation chord must open Whiteboard name")
+        }
         try require(ui.app.textFields["Whiteboard name"], "whiteboard.create: Shift-Command-W must open board options")
         XCTAssertNil(try ui.state().document)
         XCTAssertEqual(Set(packages().map(\.path)), originalPackages)
         try replace(ui.app.textFields["Whiteboard name"], with: "Keyboard board")
+        try dismissKeyboard()
         try tap("Create")
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "whiteboard", pages: 1)
@@ -412,7 +437,9 @@ final class CreateUITests: XCTestCase {
     }
 
     func testTextDocumentKeyboardShortcutCreatesEditableFirstBlock() throws {
-        ui.app.typeKey("t", modifierFlags: [.command, .shift])
+        try ui.chord("t", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.document != nil }
+        }
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "textDocument", pages: 0)
         let block = ui.app.textViews.firstMatch
@@ -431,7 +458,9 @@ final class CreateUITests: XCTestCase {
         try require(cardFace("Term"),
                     "create.studySet must open the card editor with front/back inputs")
         try replace(cardFace("Term"), with: "Question from UI")
+        try dismissKeyboard()
         try replace(cardFace("Definition"), with: "Answer from UI")
+        try dismissKeyboard()
         try ui.tapCommand("window.showLibrary")
         try wait("create.studySet must persist both faces") {
             guard let data = try? self.head(id), let cards = data["cards"] as? [[String: Any]], let card = cards.first else { return false }
@@ -481,7 +510,9 @@ final class CreateUITests: XCTestCase {
     }
 
     func testQuickNoteKeyboardShortcutCreatesUntitledDefaultPaper() throws {
-        ui.app.typeKey("n", modifierFlags: [.command, .shift])
+        try ui.chord("n", [.command, .shift]) {
+            _ = try self.ui.waitForState { $0.document != nil }
+        }
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "notebook", pages: 1)
         XCTAssertEqual(try livePages(id).map(template), ["builtin.ruled"])
@@ -495,6 +526,7 @@ final class CreateUITests: XCTestCase {
         try drawAndUndoRedo()
         try exitQuickNote()
         try replace(ui.app.textFields["Title"], with: "Saved QuickNote")
+        try dismissKeyboard()
         try tap("Save as “Saved QuickNote”")
         try ui.openDocument("Saved QuickNote")
         XCTAssertEqual(try ui.state().document, id)
@@ -525,7 +557,27 @@ final class CreateUITests: XCTestCase {
         try drawAndUndoRedo()
         try exitQuickNote()
         try tap("Combine to a Document…")
-        try tap("Physics — Motion", prefix: true)
+        let targetID = try XCTUnwrap(target.document)
+        let beforePages = try livePages(targetID).compactMap { $0["id"] as? String }
+        traceCreation("doc.merge-request source=\(source) into=\(targetID)")
+        defer { traceCreation("doc.merge-final source=\(source) into=\(targetID)") }
+        // The chooser row is not the cmd.doc.open library card behind the sheet.
+        let destinationName = NSPredicate(format: "label BEGINSWITH %@ AND identifier != 'cmd.doc.open'", "Physics — Motion")
+        let chooser = try XCTUnwrap((ui.app.collectionViews.allElementsBoundByIndex + ui.app.tables.allElementsBoundByIndex)
+            .filter { $0.isHittable && $0.buttons.matching(destinationName).count > 0 }
+            .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height },
+            "Combine must expose its own target list")
+        let destination = chooser.buttons.matching(destinationName).firstMatch
+        try require(destination, "Combine chooser must offer the intended target")
+        destination.tap()
+        try wait("doc.merge must persist the appended page before reopening its target", timeout: 30) {
+            guard let pages = self.persistedHead(targetID)?["pages"] as? [[String: Any]] else { return false }
+            return pages.filter { ($0["deleted"] as? Bool) != true }.count == beforePages.count + 1
+        }
+        traceCreation("doc.merge-persisted source=\(source) into=\(targetID)")
+        XCTAssertEqual(Array(try livePages(targetID).compactMap { $0["id"] as? String }.prefix(beforePages.count)), beforePages,
+                       "doc.merge must preserve all original target page identities")
+        try wait("Combine chooser must finish before reopening") { !destination.exists }
         try ui.openDocument("Physics — Motion")
         let merged = try ui.waitForState { $0.pageCount == target.pageCount + 1 }
         XCTAssertEqual(merged.document, target.document)
@@ -560,13 +612,8 @@ final class CreateUITests: XCTestCase {
     // MARK: Audio and calendar
 
     func testQuickRecordCreatesTextDocumentAndAdvancingHUD() throws {
-        let monitor = addUIInterruptionMonitor(withDescription: "Microphone access") { alert in
-            for title in ["Allow", "OK"] where alert.buttons[title].exists { alert.buttons[title].tap(); return true }
-            return false
-        }
-        defer { removeUIInterruptionMonitor(monitor) }
         try newMenu("Quick Record")
-        ui.app.tap()
+        try ui.handleAuthorizationAlerts(waitForMicrophone: true)
         let state = try ui.waitForState { $0.document != nil }
         let id = try XCTUnwrap(state.document)
         try assertDocument(id, kind: "textDocument", pages: 0)
@@ -623,15 +670,19 @@ final class CreateUITests: XCTestCase {
             String(try XCTUnwrap(components.day)), formatter.string(from: chosen))).firstMatch
         try require(day, "Native start-date picker must expose the chosen day")
         day.tap()
-        // The native compact date picker can overlap the header while XCTest still reports
-        // Create as hittable. Dismiss that system popover before invoking the create action;
-        // tapping the covered header instead can open the picker's month/year controls.
+        // Try picker delivery, then the app responder while the popover is still open; never dismiss the parent.
         if ui.app.buttons["DatePicker.NextMonth"].exists {
-            ui.app.coordinate(withNormalizedOffset: CGVector(dx: 0.05, dy: 0.5)).tap()
+            traceCreation("planner-before-picker-dismissal")
+            picker.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+            if ui.app.buttons["DatePicker.NextMonth"].exists {
+                ui.app.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+            }
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
+            traceCreation("planner-after-picker-dismissal")
         }
+        try require(button("Create Planner"), "Picker dismissal must preserve the parent planner")
         try tap("Create Planner")
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)
         try assertDocument(id, kind: "notebook", pages: 7)
@@ -741,12 +792,13 @@ final class CreateUITests: XCTestCase {
         element.tap()
     }
 
-    private func scrollTo(_ element: XCUIElement, name: String = "creation control") throws {
+    private func scrollTo(_ element: XCUIElement, name: String = "creation control", in application: XCUIApplication? = nil) throws {
+        let app = application ?? ui.app
         for _ in 0..<12 {
             let exists = element.exists
             if exists && element.elementType != .textField && element.isHittable { return }
             let target = exists ? element.frame : nil
-            let candidates = (ui.app.collectionViews.allElementsBoundByIndex + ui.app.scrollViews.allElementsBoundByIndex)
+            let candidates = (app.collectionViews.allElementsBoundByIndex + app.scrollViews.allElementsBoundByIndex)
                 .filter { $0.isHittable && $0.frame.height > 40 }
             // Scroll the target's own container, not an unrelated card editor or paper grid.
             let containers = exists ? candidates.filter { scroll in
@@ -763,9 +815,9 @@ final class CreateUITests: XCTestCase {
             }
             // DESIGN uses the native keyboard. Its covered area cannot receive form gestures,
             // even when accessibility reports a scroll frame extending underneath it.
-            let keyboards = ui.app.keyboards.allElementsBoundByIndex.map(\.frame)
+            let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
             guard let visible = NibUITestScrollGeometry.viewport(
-                scroll: scroll.frame, window: ui.app.frame, obstructions: keyboards) else { break }
+                scroll: scroll.frame, window: app.frame, obstructions: keyboards) else { break }
             if exists && element.isHittable, let target {
                 var required = target
                 if name == "Title" {
@@ -775,10 +827,10 @@ final class CreateUITests: XCTestCase {
             }
             let targetY = name == "Title" ? target.map { $0.midY - 68 } : target?.midY
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
-            let origin = ui.app.coordinate(withNormalizedOffset: .zero)
-            origin.withOffset(CGVector(dx: drag.start.x - ui.app.frame.minX, dy: drag.start.y - ui.app.frame.minY))
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
-                    dx: drag.end.x - ui.app.frame.minX, dy: drag.end.y - ui.app.frame.minY)),
+                    dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
                     withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
         }
         try require(element, "Missing required creation control: \(name)")
@@ -791,26 +843,41 @@ final class CreateUITests: XCTestCase {
         element.tap()
     }
 
-    private func replace(_ field: XCUIElement, with text: String) throws {
+    /// Compares numeric values without waiting; replace() waits for equivalent decimal formatting, not a different value.
+    private func numericValueMatches(_ actual: String, _ expected: String) -> Bool {
+        guard let value = Double(actual), let wanted = Double(expected), value.isFinite, wanted.isFinite else { return false }
+        return value == wanted
+    }
+
+    /// Compares hex spelling without waiting; replace() still requires every digit before the picker is dismissed.
+    private func hexValueMatches(_ actual: String, _ expected: String) -> Bool {
+        actual.replacingOccurrences(of: "#", with: "").uppercased()
+            == expected.replacingOccurrences(of: "#", with: "").uppercased()
+    }
+
+    /// Waits for the edited value before dismissal; only explicitly formatted fields opt out of exact string comparison.
+    private func replace(_ field: XCUIElement, with text: String, in application: XCUIApplication? = nil,
+                         matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
-        try scrollTo(field, name: field.label)
+        try scrollTo(field, name: field.label, in: application)
         field.tap()
         field.typeKey("a", modifierFlags: [.command])
         field.typeText(text)
-        dismissKeyboard()
+        try wait("Field must contain the replacement before dismissal: \(text)") {
+            guard let actual = field.value as? String else { return false }
+            return matcher?(actual, text) ?? (actual == text)
+        }
     }
 
-    private func dismissKeyboard() {
-        let keyboard = ui.app.keyboards.firstMatch
+    /// Waits for the observed native Hide keyboard button and then disappearance; never taps an assumed corner.
+    private func dismissKeyboard(in application: XCUIApplication? = nil) throws {
+        let keyboard = (application ?? ui.app).keyboards.firstMatch
         guard keyboard.exists else { return }
         let hide = keyboard.buttons.matching(NSPredicate(
-            format: "label CONTAINS[c] 'hide keyboard' OR label CONTAINS[c] 'dismiss keyboard'")).firstMatch
-        if hide.exists && hide.isHittable {
-            hide.tap()
-        } else {
-            // iPad's system keyboard has a dismissal key at its lower-right corner.
-            keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.94)).tap()
-        }
+            format: "label ==[c] 'Hide keyboard' OR label ==[c] 'Dismiss keyboard'")).firstMatch
+        try wait("Native keyboard must expose its dismissal control") { hide.exists && hide.isHittable }
+        hide.tap()
+        try wait("Keyboard must disappear after Hide keyboard") { !keyboard.exists }
     }
 
     private func newMenu(_ choice: String) throws {
@@ -828,6 +895,7 @@ final class CreateUITests: XCTestCase {
     private func notebook(_ title: String) throws {
         try newMenu("Notebook")
         try replace(ui.app.textFields["Title"], with: title)
+        try dismissKeyboard()
         // Resign focus without Return, which is the Create action on this field.
         try tap("Notebook")
     }
@@ -954,8 +1022,13 @@ final class CreateUITests: XCTestCase {
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
         try NibUI.openCalendarEvent(in: calendar)
         let title = calendar.textFields["Title"]
-        try replace(title, with: eventTitle)
-        calendar.buttons["Add"].tap()
+        try replace(title, with: eventTitle, in: calendar)
+        try dismissKeyboard(in: calendar)
+        let save = calendar.buttons["add-button"]
+        try require(save, "Calendar must expose its observed add-button (Done)")
+        XCTAssertTrue(save.isEnabled)
+        save.tap()
+        try wait("Calendar must save the event and close its editor") { !title.exists }
         ui.app.activate()
         try tap("Calendar")
         let connect = button("Connect Calendars")
@@ -992,6 +1065,37 @@ final class CreateUITests: XCTestCase {
         let row = try XCTUnwrap(containers.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height },
                                "calendar: missing \(action) action for \(eventTitle)")
         row.buttons[action].firstMatch.tap()
+    }
+
+    /// Reads a fresh persisted head without XCTest assertions so a pending write can be polled safely.
+    private func persistedHead(_ id: String) -> [String: Any]? {
+        for url in packages() {
+            for file in (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+                where file.lastPathComponent.hasPrefix("doc.") && file.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: file),
+                      let head = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                      (head["meta"] as? [String: Any])?["id"] as? String == id else { continue }
+                return head
+            }
+        }
+        return nil
+    }
+
+    /// Captures current picker/merge evidence without waiting or mutating; persisted IDs distinguish wrong targets from stale UI.
+    private func traceCreation(_ stage: String) {
+        var heads: [[String: Any]] = []
+        for url in packages() {
+            for file in (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+                where file.lastPathComponent.hasPrefix("doc.") && file.pathExtension == "json" {
+                if let data = try? Data(contentsOf: file), let head = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    heads.append(["package": url.path, "head": head])
+                }
+            }
+        }
+        let json = (try? JSONSerialization.data(withJSONObject: heads, options: [.prettyPrinted, .sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "unreadable persisted heads"
+        let attachment = XCTAttachment(string: "\(stage)\n\(json)\n\(ui.probe.value ?? "missing")\n\(ui.app.debugDescription)")
+        attachment.name = stage; attachment.lifetime = .keepAlways; add(attachment)
     }
 
     // MARK: Read-only persisted results (simulator fixture only)
