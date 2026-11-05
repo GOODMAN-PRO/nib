@@ -3,16 +3,16 @@ import NibContracts
 
 /// Gregorian calendar maths for the planners (UTC, so no daylight-saving edge; names follow the device locale).
 enum PlannerCalendar {
-    static func calendar() -> Calendar {
+    static func calendar(locale: Locale = .current) -> Calendar {
         var cal = Calendar(identifier: .gregorian)
-        cal.locale = Locale.current
+        cal.locale = locale
         cal.timeZone = TimeZone(secondsFromGMT: 0) ?? cal.timeZone
         return cal
     }
 
     /// Weekday names in display order.
-    static func weekdays(_ style: WeekdayStyle, startMonday: Bool) -> [String] {
-        let cal = calendar()
+    static func weekdays(_ style: WeekdayStyle, startMonday: Bool, locale: Locale = .current) -> [String] {
+        let cal = calendar(locale: locale)
         var names: [String]
         switch style {
         case .full: names = cal.standaloneWeekdaySymbols
@@ -38,6 +38,18 @@ enum PlannerCalendar {
     static func monthName(_ month: Int) -> String {
         let names = calendar().standaloneMonthSymbols
         return names.indices.contains(month - 1) ? names[month - 1] : ""
+    }
+
+    static func monthYear(month: Int, year: Int, locale: Locale = .current) -> String {
+        let cal = calendar(locale: locale)
+        guard (1...12).contains(month), (1...9999).contains(year),
+              let date = cal.date(from: DateComponents(year: year, month: month, day: 1)) else { return "" }
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.calendar = cal
+        formatter.timeZone = cal.timeZone
+        formatter.setLocalizedDateFormatFromTemplate("yMMMM")
+        return formatter.string(from: date)
     }
 }
 
@@ -145,7 +157,10 @@ enum PlannerTemplates {
     }
 
     /// Monthly planner: `month` 1–12 with `year` gives a dated calendar; month 0 is an undated grid.
-    static let monthly = TemplateFactory.paper("builtin.plannerMonthly", String(localized: "Monthly Planner"), category: "Planners", order: 330,
+    static let monthly = makeMonthly()
+
+    static func makeMonthly(locale: Locale = .current) -> TemplateDefinition {
+        TemplateFactory.paper("builtin.plannerMonthly", String(localized: "Monthly Planner"), category: "Planners", order: 330,
                                                params: colours + [
                                                    TemplateParam(name: "month", title: "Month (0 = undated)", kind: "number",
                                                                  minimum: 0, maximum: 12),
@@ -154,46 +169,47 @@ enum PlannerTemplates {
                                                    ParamSpec.startMonday
                                                ],
                                                defaults: ["startMonday": true]) { c in
-        let m = Layout.margin(c)
-        let month = Int(c.number("month", 0, in: 0...12).rounded())
-        let year = Int(c.number("year", 0, in: 0...9999).rounded())
-        let startMonday = c.flag("startMonday", true)
-        let layout = PlannerCalendar.layout(month: month, year: year, startMonday: startMonday)
-        if layout != nil {
-            c.text("\(PlannerCalendar.monthName(month)) \(year)", Rect(x: m, y: m - 6, width: c.width - 2 * m, height: 30),
-                   size: 22, weight: .semibold)
-        } else {
-            Layout.field(&c, String(localized: "Month"), x: m, y: m, to: c.width * 0.6, size: 14)
-        }
-        let colW = (c.width - 2 * m) / 7
-        let namesTop = m + 32
-        for (i, name) in PlannerCalendar.weekdays(.short, startMonday: startMonday).enumerated() {
-            c.text(name, Rect(x: m + Double(i) * colW + 4, y: namesTop, width: colW - 8, height: 14), size: 9,
-                   align: .center, weight: .medium)
-        }
-        let gridTop = namesTop + 18
-        let notesH = c.height * 0.16
-        let rows = layout.map { Int((Double($0.offset + $0.days) / 7).rounded(.up)) } ?? 5
-        let rowH = (c.height - m - notesH - gridTop) / Double(rows)
-        guard rowH > 8 else { return }
-        let gridBottom = gridTop + Double(rows) * rowH
-        for i in 0...rows {
-            let y = gridTop + Double(i) * rowH
-            c.line(m, y, c.width - m, y, color: c.style.strong)
-        }
-        for j in 0...7 {
-            let x = m + Double(j) * colW
-            c.line(x, gridTop, x, gridBottom, color: c.style.strong)
-        }
-        if let l = layout {
-            for day in 1...l.days {
-                let index = l.offset + day - 1
-                c.text("\(day)", Rect(x: m + Double(index % 7) * colW + 4, y: gridTop + Double(index / 7) * rowH + 3,
-                                      width: colW - 8, height: 12), size: min(9, rowH * 0.4), align: .right, weight: .medium)
+            let m = Layout.margin(c)
+            let month = Int(c.number("month", 0, in: 0...12).rounded())
+            let year = Int(c.number("year", 0, in: 0...9999).rounded())
+            let startMonday = c.flag("startMonday", true)
+            let layout = PlannerCalendar.layout(month: month, year: year, startMonday: startMonday)
+            if layout != nil {
+                c.text(PlannerCalendar.monthYear(month: month, year: year, locale: locale), Rect(x: m, y: m - 6, width: c.width - 2 * m, height: 30),
+                       size: 22, weight: .semibold)
+            } else {
+                Layout.field(&c, String(localized: "Month"), x: m, y: m, to: c.width * 0.6, size: 14)
             }
+            let colW = (c.width - 2 * m) / 7
+            let namesTop = m + 32
+            for (i, name) in PlannerCalendar.weekdays(.short, startMonday: startMonday, locale: locale).enumerated() {
+                c.text(name, Rect(x: m + Double(i) * colW + 4, y: namesTop, width: colW - 8, height: 14), size: 9,
+                       align: .center, weight: .medium)
+            }
+            let gridTop = namesTop + 18
+            let notesH = c.height * 0.16
+            let rows = layout.map { Int((Double($0.offset + $0.days) / 7).rounded(.up)) } ?? 5
+            let rowH = (c.height - m - notesH - gridTop) / Double(rows)
+            guard rowH > 8 else { return }
+            let gridBottom = gridTop + Double(rows) * rowH
+            for i in 0...rows {
+                let y = gridTop + Double(i) * rowH
+                c.line(m, y, c.width - m, y, color: c.style.strong)
+            }
+            for j in 0...7 {
+                let x = m + Double(j) * colW
+                c.line(x, gridTop, x, gridBottom, color: c.style.strong)
+            }
+            if let l = layout {
+                for day in 1...l.days {
+                    let index = l.offset + day - 1
+                    c.text("\(day)", Rect(x: m + Double(index % 7) * colW + 4, y: gridTop + Double(index / 7) * rowH + 3,
+                                          width: colW - 8, height: 12), size: min(9, rowH * 0.4), align: .right, weight: .medium)
+                }
+            }
+            let notesTop = Layout.section(&c, String(localized: "Notes"), x: m, y: gridBottom + 8, width: c.width - 2 * m)
+            c.hlines(Rect(x: m, y: notesTop - 6, width: c.width - 2 * m, height: c.height - m - notesTop + 6), spacing: 20)
         }
-        let notesTop = Layout.section(&c, String(localized: "Notes"), x: m, y: gridBottom + 8, width: c.width - 2 * m)
-        c.hlines(Rect(x: m, y: notesTop - 6, width: c.width - 2 * m, height: c.height - m - notesTop + 6), spacing: 20)
     }
 
     /// Habit tracker: a name column and 31 day columns.
