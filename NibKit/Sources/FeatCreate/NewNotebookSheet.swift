@@ -1221,10 +1221,12 @@ struct NewNotebookSheet: View {
             NibInspectorSection(String(localized: "Cover colour")) {
                 NibChip(String(localized: "Use cover's colour"), style: .filter(isSelected: draft.cloth == nil),
                         action: { model.selectCloth(nil) })
-                NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
-                              selection: Binding(get: { model.draft.cloth?.rawValue },
-                                                 set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
-                              columns: swatchColumns(count: NibCoverCloth.allCases.count))
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: NibMetrics.hitTarget), spacing: 0),
+                                        count: swatchColumns(count: NibCoverCloth.allCases.count)), spacing: 0) {
+                    ForEach(NibCoverCloth.allCases, id: \.self) { cloth in
+                        CoverColourSwatch(cloth: cloth, isSelected: draft.cloth == cloth) { model.selectCloth(cloth) }
+                    }
+                }
             }
         }
     }
@@ -1514,13 +1516,43 @@ private struct CoverPreview: View {
     let params: [String: JSONValue]
     let page: PageSize
     let cloth: NibCoverCloth?
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        if let definition {
-            TemplatePreview(definition: definition, params: params, page: page, paper: .white)
-        } else {
-            NibClothCover(cloth ?? .navy)
+        Group {
+            if let definition {
+                TemplatePreview(definition: definition, params: params, page: page, paper: .white)
+            } else {
+                NibClothCover(cloth ?? .navy)
+            }
         }
+        .overlay {
+            if scheme == .dark {
+                RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous)
+                    .strokeBorder(NibColor.labelSecondary, lineWidth: NibStroke.thin)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+/// Keep the actual cloth colour in the preview and saved document; contrast comes from the well's edge.
+private struct CoverColourSwatch: View {
+    let cloth: NibCoverCloth
+    let isSelected: Bool
+    let action: () -> Void
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        NibPenSwatch(NibSwatch(cloth: cloth), isSelected: isSelected, size: .popover, action: action)
+            .overlay {
+                if scheme == .dark {
+                    Circle().strokeBorder(NibColor.labelSecondary, lineWidth: NibStroke.thin)
+                        .frame(width: NibPenSwatch.Size.popover.diameter, height: NibPenSwatch.Size.popover.diameter)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
     }
 }
 
