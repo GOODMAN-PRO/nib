@@ -38,10 +38,49 @@ enum ImportLocations {
         return false
     }
 
-    /// Open In copies and share-extension files: Nib's to delete once imported or declined.
-    static func isInConsumableInbox(_ url: URL) -> Bool {
-        if isInside(url, openInInbox) { return true }
-        if let inbox = appGroupInbox, isInside(url, inbox) { return true }
+    static var inboxes: [URL] { [openInInbox] + [appGroupInbox].compactMap { $0 } }
+
+    /// Use the public catalog as well as disk records: a provider may have evicted a folder's metadata.
+    @MainActor
+    static func userFolders(_ library: LibraryService?) -> [URL] {
+        guard let library else { return [] }
+        var folders = library.allNodes().filter { $0.kind == .folder }.map {
+            library.rootURL.appendingPathComponent($0.path, isDirectory: true)
+        }
+        if canonical(library.rootURL) == canonical(openInInbox) { folders.append(library.rootURL) }
+        return folders
+    }
+
+    static func isUserOwned(_ url: URL, folders: [URL]) -> Bool {
+        folders.contains { canonical(url) == canonical($0) || isInside(url, $0) }
+    }
+
+    /// Like NibLibrary's catalog scanner, ownership is proved by the record name, not readable JSON.
+    /// Also protect damaged names and evicted iCloud records. A failed listing is never permission to delete.
+    /// NibContracts documents the record format but does not yet expose a shared classifier.
+    static func isHandoffInbox(_ directory: URL, userFolders: [URL] = []) -> Bool {
+        guard !isUserOwned(directory, folders: userFolders),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return false }
+        return !names.contains { $0.hasPrefix(".nibfolder.") || $0.hasPrefix("..nibfolder.") }
+    }
+
+    /// Open In copies and share-extension files, rechecked immediately before consumption.
+    static func isInConsumableInbox(_ url: URL, inboxes: [URL] = ImportLocations.inboxes,
+                                    userFolders: [URL] = []) -> Bool {
+        guard !isUserOwned(url, folders: userFolders) else { return false }
+        for inbox in inboxes where isInside(url, inbox) {
+            guard isHandoffInbox(inbox, userFolders: userFolders) else { return false }
+            // A recorded folder nested inside staging is still the user's folder.
+            var parent = url.deletingLastPathComponent()
+            while isInside(parent, inbox) {
+                guard isHandoffInbox(parent, userFolders: userFolders) else { return false }
+                parent.deleteLastPathComponent()
+            }
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                return isHandoffInbox(url, userFolders: userFolders)
+            }
+            return true
+        }
         return false
     }
 }
@@ -102,7 +141,7 @@ enum ShareHandoff {
         }
         // Persist provenance before clearing the only upstream copy. A later inbox scan (even after
         // relaunch) must distinguish these originals from the disposable copies iOS makes for Open In.
-        for url in urls { try Data(InboxFiles.key(url).utf8).write(to: recoveryMarker(url), options: .atomic) }
+        for url in urls { rememberRecoveryOriginal(url) }
         board.items = []
         lastTaken = Date()
         deniedChangeCount = nil
@@ -113,9 +152,68 @@ enum ShareHandoff {
         url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".nib-handoff")
     }
 
+    static let recoveryKey = SettingKey("import.handoffRecovery", default: [String: String]())
+    // Recovery also runs before feature startup (deep links) and off-main (inbox scans).
+    private static let recoveryStore: SettingsStore = {
+        let store = SettingsStore()
+        declareRecovery(in: store)
+        return store
+    }()
+    private static let recoveryLock = NSLock()
+
+    static func declareRecovery(in store: SettingsStore) {
+        store.declare(recoveryKey, summary: "Local recovery provenance for shared originals whose sidecar could not be written.",
+                      owner: "import", readOnly: true)
+    }
+
+    /// A marker failure must not leave the pasteboard populated after its files were already written.
+    /// Keep fallback provenance outside the inbox so a later failed import still preserves the originals.
+    static func rememberRecoveryOriginal(_ url: URL) {
+        let key = InboxFiles.key(url)
+        do {
+            try Data(key.utf8).write(to: recoveryMarker(url), options: .atomic)
+        } catch {
+            recoveryLock.lock()
+            defer { recoveryLock.unlock() }
+            var recovery = recoveryStore.get(recoveryKey)
+            recovery[url.standardizedFileURL.path] = key
+            recoveryStore.set(recoveryKey, recovery)
+        }
+    }
+
     static func isRecoveryOriginal(_ url: URL) -> Bool {
-        guard url.isFileURL, let data = try? Data(contentsOf: recoveryMarker(url)) else { return false }
-        return String(decoding: data, as: UTF8.self) == InboxFiles.key(url)
+        guard url.isFileURL else { return false }
+        let key = InboxFiles.key(url)
+        if let data = try? Data(contentsOf: recoveryMarker(url)), String(decoding: data, as: UTF8.self) == key { return true }
+        let recovery = recoveryStore.get(recoveryKey)
+        return recovery[url.standardizedFileURL.path] == key
+    }
+
+    /// Only called in readable hand-off directories (or loose Documents), never in recorded user folders.
+    static func sweepRecoveryMarkers(in directory: URL) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey]) else { return }
+        let suffix = ".nib-handoff"
+        for marker in entries {
+            let name = marker.lastPathComponent
+            guard name.hasPrefix("."), name.hasSuffix(suffix), name.count > suffix.count + 1,
+                  (try? marker.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+            let originalName = String(name.dropFirst().dropLast(suffix.count))
+            let original = directory.appendingPathComponent(originalName)
+            if !fm.fileExists(atPath: original.path) { try? fm.removeItem(at: marker) }
+        }
+        recoveryLock.lock()
+        defer { recoveryLock.unlock() }
+        var recovery = recoveryStore.get(recoveryKey)
+        let orphaned = recovery.keys.filter { path in
+            let original = URL(fileURLWithPath: path)
+            return ImportLocations.canonical(original.deletingLastPathComponent()) == ImportLocations.canonical(directory)
+                && !fm.fileExists(atPath: path)
+        }
+        if !orphaned.isEmpty {
+            for path in orphaned { recovery.removeValue(forKey: path) }
+            recoveryStore.set(recoveryKey, recovery)
+        }
     }
 
     /// Writes every hand-off item (name + bytes) into `dir`; other pasteboard items are ignored.
@@ -135,7 +233,7 @@ enum ShareHandoff {
 
 // MARK: - Inbox scan
 
-/// Files waiting to be imported. Pure apart from reading directories.
+/// Files waiting to be imported. Also clears recovery markers whose originals have left.
 enum InboxFiles {
     struct Entry: Equatable {
         var url: URL
@@ -149,13 +247,17 @@ enum InboxFiles {
     /// Everything in the inboxes, plus loose files in Documents (never plain folders: the library, or its folders,
     /// may live there). Nib documents put into Documents with Finder count too, unless Documents is the library
     /// itself (`packagesFromDocuments` false), where they already are library documents.
-    static func entries(inboxes: [URL], documents: URL, packagesFromDocuments: Bool = false) -> [Entry] {
+    static func entries(inboxes: [URL], documents: URL, packagesFromDocuments: Bool = false,
+                        userFolders: [URL] = []) -> [Entry] {
         var out: [Entry] = []
-        for inbox in inboxes {
+        for inbox in inboxes where ImportLocations.isHandoffInbox(inbox, userFolders: userFolders) {
+            ShareHandoff.sweepRecoveryMarkers(in: inbox)
             for e in ArchiveIO.visibleEntries(of: inbox) {
+                guard ImportLocations.isInConsumableInbox(e.url, inboxes: [inbox], userFolders: userFolders) else { continue }
                 out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: true, key: key(e.url)))
             }
         }
+        ShareHandoff.sweepRecoveryMarkers(in: documents)
         for e in ArchiveIO.visibleEntries(of: documents) {
             guard !e.isDirectory || (packagesFromDocuments && PackageImporter.isPackage(e.url)) else { continue }
             out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: false, key: key(e.url)))
@@ -234,11 +336,12 @@ enum InboxScanner {
             await runImport([ShareHandoff.link], app: app, navigator: nav)
             return
         }
-        let inboxes = [ImportLocations.openInInbox] + [ImportLocations.appGroupInbox].compactMap { $0 }
+        let inboxes = ImportLocations.inboxes
+        let userFolders = ImportLocations.userFolders(library)
         let documents = ImportLocations.documents
         let packages = ImportLocations.canonical(library.rootURL) != ImportLocations.canonical(documents)
         let found = await Task.detached(priority: .utility) {
-            InboxFiles.entries(inboxes: inboxes, documents: documents, packagesFromDocuments: packages)
+            InboxFiles.entries(inboxes: inboxes, documents: documents, packagesFromDocuments: packages, userFolders: userFolders)
         }.value
         let content = app.content
         let offered = InboxFiles.offered(found, inFlight: ImportEngine.inFlight, declined: declined) { url, isDirectory in

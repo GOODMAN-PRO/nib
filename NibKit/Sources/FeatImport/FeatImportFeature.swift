@@ -12,6 +12,7 @@ public enum FeatImportFeature: NibFeature {
     public static let id = "import"
 
     public static func register(_ app: NibApp) {
+        ShareHandoff.declareRecovery(in: app.services.settings)
         app.commands.register(ImportFiles.self)
         app.commands.register(ImportPick.self)
 

@@ -320,9 +320,13 @@ struct NodeInsert: NibCommand {
                 page.size = content.livePages.last?.size ?? .a4   // notebook pages are never infinite by accident
             }
             try Edits.ensureNew(page.id, in: content.pages, what: "page")
-            if let at = p.at { page.order = Shapes.orderKey(at: at, among: content.livePages.map { $0.order }) }
+            let placement = p.at.map { Shapes.pageOrderPlan(at: $0, among: content.livePages) }
+            if let placement { page.order = placement.keys[0] }
             let stored = page
-            let saved = try ctx.mutate { tx in try tx.put(stored, doc: doc) }
+            let saved = try ctx.mutate { tx in
+                if let placement { try tx.put(placement.rekeyed, doc: doc) }
+                return try tx.put(stored, doc: doc)
+            }
             return Output(ref: NodeRef.page(doc, saved.id).description)
         case "block":
             var block = try Shapes.decode(TextBlock.self, .object(node), at: "$.node")
@@ -546,7 +550,14 @@ struct NodeMove: NibCommand {
             return Output(newRef: NodeRef.item(doc, target, id).description)
         case let .page(_, id):
             try requireDocTarget(to)
-            try Edits.reorder(content.livePages, id, at: p.at, order: \.order, what: "page", ctx) { tx, r in try tx.put(r, doc: doc) }
+            guard var page = content.livePages.first(where: { $0.id == id }) else { throw NibError.notFound("page \(id)") }
+            let placement = Shapes.pageOrderPlan(at: p.at, among: content.livePages.filter { $0.id != id })
+            page.order = placement.keys[0]
+            let stored = page
+            try ctx.mutate { tx in
+                try tx.put(placement.rekeyed, doc: doc)
+                try tx.put(stored, doc: doc)
+            }
         case let .block(_, id):
             try requireDocTarget(to)
             try Edits.reorder(content.liveBlocks, id, at: p.at, order: \.order, what: "block", ctx) { tx, r in try tx.put(r, doc: doc) }

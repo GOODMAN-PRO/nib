@@ -56,7 +56,8 @@ enum ImageImporter {
             let stored = try await store(urls, doc: doc, assets: assets)
             // Read the neighbours after the await: other commands may have changed the page list meanwhile.
             let live = try ctx.workspace.content(doc).livePages
-            let keys = PageSlot.keys(live, target.position, anchor: target.anchorPage, count: stored.count)
+            let placement = PageSlot.plan(target.position, anchor: target.anchorPage, count: stored.count, in: live)
+            let keys = placement.keys
             var pages: [PageRecord] = []
             for i in stored.indices {
                 pages.append(PageRecord(id: pageIDs[i], order: keys[i],
@@ -64,6 +65,7 @@ enum ImageImporter {
                                         background: .ofImage(stored[i].asset)))
             }
             try ctx.mutate(String(localized: "Import Images")) { tx in
+                try tx.put(placement.rekeyed, doc: doc)
                 _ = try tx.put(pages, doc: doc)
             }
             return ImageImportOutcome(documents: [doc], pages: pageIDs)

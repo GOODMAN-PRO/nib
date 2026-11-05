@@ -441,6 +441,20 @@ final class PageCommandTests: XCTestCase {
 
     // MARK: page.moveTo
 
+    func testMoveWithinDocumentAppendsAfterTiesInRequestedOrder() async throws {
+        let h = harness()
+        try makeTiedNotebook(h)
+        let before = try h.snapshot("TIES")
+        _ = try await h.run("page.moveTo", ["pages": ["page:TIES/D", "page:TIES/A"], "doc": "doc:TIES"])
+        XCTAssertEqual(try livePageIDs(h, "TIES"), ["B", "C", "D", "A"])
+        let pages = try h.app.workspace.content("TIES").livePages
+        XCTAssertGreaterThan(pages[2].order, pages[1].order)
+        XCTAssertGreaterThan(pages[3].order, pages[2].order)
+        XCTAssertEqual(h.undoDepth("TIES"), 1)
+        XCTAssertTrue(h.app.bus.undo("TIES"))
+        XCTAssertEqual(try h.snapshot("TIES"), before)
+    }
+
     func testMoveToAnotherDocumentKeepsGeometryAndUndoesInBoth() async throws {
         let h = harness()
         let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
@@ -702,6 +716,32 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(pages.count, 6)
         XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+    }
+
+    func testBatchRestoreKeepsSeparateLiveSnapshotsForEachDocument() async throws {
+        let h = harness()
+        for doc in ["RESTORE1", "RESTORE2"] {
+            var first = PageRecord(id: "FIRST", order: "V")
+            first.deleted = true
+            first.trashedAt = 1
+            var second = PageRecord(id: "SECOND", order: "V")
+            second.deleted = true
+            second.trashedAt = 1
+            let content = DocumentContent(meta: DocumentMeta(id: NibID(doc), kind: .notebook), pages: [
+                PageRecord(id: "LIVE", order: "V"), first, second, PageRecord(id: "END", order: "k")
+            ])
+            _ = try h.library.createDocument(content, title: doc, in: nil)
+        }
+        let before = try h.snapshot("RESTORE1")
+        _ = try await h.run("page.restore", ["pages": ["page:RESTORE1/FIRST", "page:RESTORE2/FIRST",
+            "page:RESTORE1/SECOND", "page:RESTORE2/SECOND"]])
+        for doc in ["RESTORE1", "RESTORE2"] {
+            let pages = try h.app.workspace.content(NibID(doc)).livePages
+            XCTAssertEqual(pages.map { $0.id.raw }, ["LIVE", "SECOND", "FIRST", "END"])
+            XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+        }
+        XCTAssertTrue(h.app.bus.undo("RESTORE1"))
+        XCTAssertEqual(try h.snapshot("RESTORE1"), before)
     }
 
     func testTrashRestoreAndPurge() async throws {

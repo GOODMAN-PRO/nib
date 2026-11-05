@@ -495,6 +495,43 @@ struct ImportGroup: Equatable {
 
 /// Page order keys around an insertion point. Pure.
 enum PageSlot {
+    /// Exact insertion, including a gap inside a tie run. Apply `rekeyed` in the same transaction as the new pages.
+    static func plan(_ position: PagePosition, anchor: PageID?, count: Int,
+                     in pages: [PageRecord]) -> (keys: [String], rekeyed: [PageRecord]) {
+        guard count > 0 else { return ([], []) }
+        let at: Int
+        switch position {
+        case .start: at = 0
+        case .end: at = pages.count
+        case .before, .after:
+            if let anchor, let i = pages.firstIndex(where: { $0.id == anchor }) {
+                at = position == .before ? i : i + 1
+            } else { at = pages.count }
+        }
+        let lowKey = at > 0 ? pages[at - 1].order : nil
+        let highKey = at < pages.count ? pages[at].order : nil
+        guard let low = lowKey, let high = highKey, low == high else {
+            let keys = count == 1 ? [FractionalIndex.between(lowKey, highKey)]
+                : FractionalIndex.balanced(count: count, after: lowKey, before: highKey)
+            return (keys, [])
+        }
+        var start = at - 1
+        var end = at + 1
+        while start > 0 && pages[start - 1].order == low { start -= 1 }
+        while end < pages.count && pages[end].order == low { end += 1 }
+        let keys = FractionalIndex.balanced(count: end - start + count,
+            after: start > 0 ? pages[start - 1].order : nil,
+            before: end < pages.count ? pages[end].order : nil)
+        let offset = at - start
+        let rekeyed = (start..<end).map { i -> PageRecord in
+            var page = pages[i]
+            page.order = keys[i - start + (i < at ? 0 : count)]
+            return page
+        }
+        return (Array(keys[offset..<(offset + count)]), rekeyed)
+    }
+
+
     /// Order keys of the live pages around the insertion point (nil = open end). A missing anchor means the end, like
     /// `DocumentContent.orderKey`.
     static func neighbours(_ live: [PageRecord], _ position: PagePosition, anchor: PageID?) -> (String?, String?) {
@@ -662,7 +699,7 @@ enum ImportEngine {
                                            idQueue: idQueue, library: library, staging: staging, ctx: ctx, dialog: ask,
                                            reveal: true)
         case .cancelled:
-            for s in sources { consumeInboxCopy(s.original) }                      // a declined Open In leaves nothing behind
+            for s in sources { consumeInboxCopy(s.original, library: library) }                      // a declined Open In leaves nothing behind
             return .cancelledResult
         case .notShown:
             throw NibError(.unavailable, "Nib couldn't show the import dialog",
@@ -738,7 +775,7 @@ enum ImportEngine {
                 }
                 for f in files {
                     if report.skipped.isEmpty {
-                        consumeImported(f.source.original, converted: report.converted)
+                        consumeImported(f.source.original, converted: report.converted, library: library)
                     } else {
                         keepSource(f.source.original)
                     }
@@ -764,7 +801,7 @@ enum ImportEngine {
             // original saved from the pasteboard, including when this is a later inbox-scan retry.
             for f in failed where f.entry == nil {
                 if let url = URL(string: f.url), ShareHandoff.isRecoveryOriginal(url) { keepSource(f.url) }
-                else { consumeInboxCopy(f.url) }
+                else { consumeInboxCopy(f.url, library: library) }
             }
         } else if ctx.principal.isUser, !failed.isEmpty {
             ImportUI.reportPartialFailure(failed, ctx: ctx)
@@ -869,8 +906,11 @@ enum ImportEngine {
     }
 
     /// Open In copies (Documents/Inbox) and share-extension files (App Group inbox) belong to Nib once seen.
-    static func consumeInboxCopy(_ original: String) {
-        guard let url = URL(string: original), url.isFileURL, ImportLocations.isInConsumableInbox(url) else { return }
+    static func consumeInboxCopy(_ original: String, library: LibraryService? = nil,
+                                 inboxes: [URL] = ImportLocations.inboxes) {
+        guard let url = URL(string: original), url.isFileURL,
+              ImportLocations.isInConsumableInbox(url, inboxes: inboxes,
+                  userFolders: ImportLocations.userFolders(library)) else { return }
         try? FileManager.default.removeItem(at: url)
         if !FileManager.default.fileExists(atPath: url.path) {
             try? FileManager.default.removeItem(at: ShareHandoff.recoveryMarker(url))
@@ -880,9 +920,13 @@ enum ImportEngine {
     /// After a complete import: inbox copies, plus loose Documents files the inbox scan offered, are removed. A loose
     /// file that went through a lossy conversion (Word, PowerPoint, web pages → PDF) is the person's original: it
     /// stays, and the scan does not offer it again.
-    private static func consumeImported(_ original: String, converted: Bool) {
-        consumeInboxCopy(original)
+    private static func consumeImported(_ original: String, converted: Bool, library: LibraryService) {
+        consumeInboxCopy(original, library: library)
         guard let url = URL(string: original), url.isFileURL else { return }
+        let folders = ImportLocations.userFolders(library)
+        guard !ImportLocations.isUserOwned(url, folders: folders) else { return }
+        if ImportLocations.inboxes.contains(where: { ImportLocations.isInside(url, $0) }),
+           !ImportLocations.isInConsumableInbox(url, userFolders: folders) { return }
         let path = url.standardizedFileURL.path
         guard consumableFiles.remove(path) != nil else { return }
         if converted {

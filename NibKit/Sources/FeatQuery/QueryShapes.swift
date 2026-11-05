@@ -388,6 +388,33 @@ enum Shapes {
         return FractionalIndex.between(i > 0 ? keys[i - 1] : nil, i < keys.count ? keys[i] : nil)
     }
 
+    /// Exact insertion, including a gap inside a tie run. Apply `rekeyed` in the same transaction as the new pages.
+    static func pageOrderPlan(at index: Int?, among pages: [PageRecord]) -> (keys: [String], rekeyed: [PageRecord]) {
+        let count = 1
+        let at = min(max(index ?? pages.count, 0), pages.count)
+        let lowKey = at > 0 ? pages[at - 1].order : nil
+        let highKey = at < pages.count ? pages[at].order : nil
+        guard let low = lowKey, let high = highKey, low == high else {
+            let keys = count == 1 ? [FractionalIndex.between(lowKey, highKey)]
+                : FractionalIndex.balanced(count: count, after: lowKey, before: highKey)
+            return (keys, [])
+        }
+        var start = at - 1
+        var end = at + 1
+        while start > 0 && pages[start - 1].order == low { start -= 1 }
+        while end < pages.count && pages[end].order == low { end += 1 }
+        let keys = FractionalIndex.balanced(count: end - start + count,
+            after: start > 0 ? pages[start - 1].order : nil,
+            before: end < pages.count ? pages[end].order : nil)
+        let offset = at - start
+        let rekeyed = (start..<end).map { i -> PageRecord in
+            var page = pages[i]
+            page.order = keys[i - start + (i < at ? 0 : count)]
+            return page
+        }
+        return (Array(keys[offset..<(offset + count)]), rekeyed)
+    }
+
     // MARK: Paging (ARCHITECTURE §7.4)
 
     static func offset(_ cursor: String?) throws -> Int {
