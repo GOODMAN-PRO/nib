@@ -5,6 +5,59 @@ import QuartzCore
 
 @MainActor
 final class AnimationIdleTests: XCTestCase {
+    func testCancelledMoveReleasesAndNextPickupBeginsAfresh() {
+        for style in [DropletStyle.floatingPanel, .palette] {
+            let field = DropletField()
+            defer { field.setActive(false) }
+            field.reduceMotion = true
+            field.setRest("panel", CGRect(x: 40, y: 40, width: 300, height: 200), style: style)
+            var lifetime = DropletDragLifetime()
+            var pickups: [CGPoint] = []
+            var drops = 0
+            let callback: (NibDropletDrag) -> Void = { event in
+                switch event {
+                case .began(let location): pickups.append(location)
+                case .ended: drops += 1
+                case .changed: break
+                }
+            }
+            lifetime.move(id: "panel", field: field, start: CGPoint(x: 60, y: 60),
+                          location: CGPoint(x: 160, y: 60), onDrag: callback)
+            lifetime.cancel(id: "panel", field: field)
+            lifetime.cancel(id: "panel", field: field)
+            XCTAssertNil(lifetime.mode)
+            XCTAssertFalse(field.isDragging("panel"))
+            XCTAssertEqual(field.node("panel").presentation.bodyOffset, .zero)
+            let next = CGPoint(x: 200, y: 100)
+            lifetime.move(id: "panel", field: field, start: next, location: next, onDrag: callback)
+            XCTAssertEqual(pickups, [CGPoint(x: 60, y: 60), next])
+            XCTAssertEqual(field.node("panel").presentation.bodyOffset, .zero, "Fresh pickup must use the new offset")
+            XCTAssertEqual(drops, 0, "Cancellation must not deliver a successful drop")
+            lifetime.cancel(id: "panel", field: field)
+        }
+    }
+
+    func testCancelledPaletteScrubRestoresBeadAndClearsMode() {
+        let field = DropletField()
+        defer { field.setActive(false) }
+        field.reduceMotion = true
+        field.setRest("palette", CGRect(x: 40, y: 40, width: 56, height: 300), style: .palette)
+        _ = field.beadNode("palette")
+        field.setBead("palette", head: 44, glide: false)
+        var lifetime = DropletDragLifetime()
+        lifetime.mode = .scrub
+        field.scrubBead("palette", to: 132)
+        lifetime.cancel(id: "palette", field: field, selectedHead: 44)
+        XCTAssertNil(lifetime.mode)
+        XCTAssertEqual(field.beadNode("palette").head, 44)
+        lifetime.move(id: "palette", field: field, start: CGPoint(x: 60, y: 60),
+                      location: CGPoint(x: 80, y: 60), onDrag: nil)
+        XCTAssertEqual(lifetime.mode, .move)
+        XCTAssertTrue(field.isDragging("palette"))
+        lifetime.cancel(id: "palette", field: field)
+        XCTAssertFalse(field.isDragging("palette"))
+    }
+
     func testSquareReshapeParksAfterReachingItsLayout() {
         for reduced in [false, true] {
             let field = DropletField()

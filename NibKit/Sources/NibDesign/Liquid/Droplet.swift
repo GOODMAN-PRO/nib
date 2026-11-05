@@ -74,6 +74,10 @@ struct AttachedDroplet<Content: View>: View {
     let bud: NibBudRequest?
     var layoutSize: CGSize? = nil
 
+    @GestureState private var dragLive = false
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var dragLifetime = DropletDragLifetime()
+
     /// Presentation can lag the binding until onChange runs and throughout retraction.
     /// Retain the visual content, but release input and accessibility at dismissal.
     var acceptsInteraction: Bool {
@@ -150,7 +154,18 @@ struct AttachedDroplet<Content: View>: View {
             .background(RestReader(id: id, style: style, field: field))
             .gesture(dragGesture, including: draggable ? .all : .subviews)
             .onAppear { field.register(id, style: style) }
-            .onDisappear { field.unregister(id) }
+            .onDisappear { dragLifetime.cancel(id: id, field: field); field.unregister(id) }
+            .onChange(of: dragLive) { _, live in
+                guard !live else { return }
+                // Let a successful onEnded consume the lifetime before handling a cancellation.
+                DispatchQueue.main.async {
+                    guard !dragLive else { return }
+                    dragLifetime.cancel(id: id, field: field)
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { dragLifetime.cancel(id: id, field: field) }
+            }
             .onChange(of: dragScale, initial: true) { _, scale in field.setDragScale(id, scale) }
             .onChange(of: bondsWith, initial: true) { _, target in field.setBondTarget(id, target) }
             .onChange(of: bud?.isPresented.wrappedValue ?? false, initial: true) { _, presented in
@@ -176,15 +191,14 @@ struct AttachedDroplet<Content: View>: View {
 
     private var dragGesture: some Gesture {
         DragGesture(minimumDistance: DropletPhysics.pickupSlop, coordinateSpace: NibLiquid.space)
+            .updating($dragLive) { _, live, _ in live = true }
             .onChanged { value in
-                if !field.isDragging(id) {
-                    field.beginDrag(id, at: value.startLocation)
-                    onDrag?(.began(location: value.startLocation))
-                }
-                field.drag(id, to: value.location)
-                onDrag?(.changed(location: value.location))
+                dragLifetime.move(id: id, field: field, start: value.startLocation,
+                                  location: value.location, onDrag: onDrag)
             }
             .onEnded { value in
+                guard dragLifetime.mode != nil else { return }
+                dragLifetime.mode = nil
                 let v = CGVector(dx: value.velocity.width, dy: value.velocity.height)
                 let released = field.endDrag(id, velocity: v)
                 onDrag?(.ended(location: value.location, velocity: released))
@@ -321,5 +335,36 @@ struct BudAnchorReader: View {
                 field?.setWorldAnchor(id, frame)
             }
             .onDisappear { field?.removeWorldAnchor(id) }
+    }
+}
+
+/// Owns the lifetime of a gesture, including cancellation without a successful drop.
+@MainActor
+struct DropletDragLifetime {
+    enum Mode { case move, scrub }
+    var mode: Mode?
+
+    mutating func move(id: String, field: DropletField, start: CGPoint, location: CGPoint,
+                       onDrag: ((NibDropletDrag) -> Void)?) {
+        if mode == nil {
+            mode = .move
+            field.beginDrag(id, at: start)
+            onDrag?(.began(location: start))
+        }
+        field.drag(id, to: location)
+        onDrag?(.changed(location: location))
+    }
+
+    mutating func cancel(id: String, field: DropletField, selectedHead: CGFloat? = nil) {
+        guard let previous = mode else { return }
+        mode = nil
+        switch previous {
+        case .move:
+            field.endDrag(id, velocity: .zero)
+            field.setMeniscus(id, towards: nil)
+        case .scrub:
+            field.endScrub(id)
+            if let selectedHead { field.setBead(id, head: selectedHead, glide: false) }
+        }
     }
 }
