@@ -425,7 +425,7 @@ struct FaceThumbnail: View {
             if mode == .image, face.kind == .image, let asset = face.asset {
                 CardPicture(model: model, asset: asset, maxPixels: Int(NibMetrics.thumbnailWidth * max(displayScale, 1)))
                     .padding(NibSpacing.xs)
-            } else if mode == .ink, renderedKey == renderKey, let ink {
+            } else if mode == .ink, let ink = model.cachedInkPicture(renderKey) ?? (renderedKey == renderKey ? ink : nil) {
                 Image(uiImage: ink)
                     .resizable()
                     .scaledToFit()

@@ -579,14 +579,99 @@ final class FeatCalendarTests: XCTestCase {
         let sync = store.cache.latestSync
         XCTAssertTrue(store.isSyncing, "the older read is still running")
         provider.release()
-        do { _ = try await old.value; XCTFail("superseded read must be cancelled") }
-        catch { XCTAssertTrue(error is CancellationError) }
+        let older = try await old.value
+        XCTAssertEqual(older, [oldEvent], "superseded callers still receive their own successful read")
         XCTAssertEqual(latest.map(\.id), [newEvent.id])
         XCTAssertEqual(store.upcoming.map(\.id), [newEvent.id])
         XCTAssertEqual(store.cache.events(overlapping: window.start, window.end).map(\.id), [newEvent.id], "planner reads the same protected cache")
         XCTAssertEqual(store.cache.latestSync, sync)
         XCTAssertEqual(store.revision, revision)
         XCTAssertFalse(store.isSyncing)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testEventLookupReturnsItsOwnReadWhenBackgroundRefreshSupersedesIt() async throws {
+        let oldEvent = event("Requested event", Date().addingTimeInterval(3_600))
+        let newEvent = event("New snapshot", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "event lookup blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [newEvent], started: started)
+        store.provider = provider
+        let lookup = Task { try await store.event(id: oldEvent.id, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        let window = CalendarDates.upcomingWindow()
+        _ = try await store.fetch(from: window.start, to: window.end, principal: .user)
+        let revision = store.revision
+        provider.release()
+        let found = try await lookup.value
+        XCTAssertEqual(found, oldEvent)
+        XCTAssertEqual(store.upcoming, [newEvent])
+        XCTAssertEqual(store.cache.events(overlapping: window.start, window.end), [newEvent])
+        XCTAssertEqual(store.revision, revision)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testInFlightReadReturnsEmptyAfterAccessLossEvenIfAccessReturns() async throws {
+        let oldEvent = event("Private event", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "private read blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let read = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        store.provider = FakeCalendarProvider(access: .denied, events: [])
+        store.refreshAccess() // forgetEvents invalidates the in-flight read, even with an empty cache.
+        store.provider = FakeCalendarProvider(access: .granted, events: [])
+        provider.release()
+        let result = try await read.value
+        XCTAssertTrue(result.isEmpty)
+        XCTAssertTrue(store.upcoming.isEmpty)
+        XCTAssertNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testProviderSwapReturnsOldReadWithoutPublishingIt() async throws {
+        let oldEvent = event("Old provider", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "old provider blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let read = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        store.provider = FakeCalendarProvider(access: .granted, events: [])
+        provider.release()
+        let result = try await read.value
+        XCTAssertEqual(result, [oldEvent])
+        XCTAssertTrue(store.upcoming.isEmpty)
+        XCTAssertTrue(store.accounts.isEmpty)
+        XCTAssertNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testExplicitlyCancelledCalendarReadStillThrowsCancellation() async throws {
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "cancelled read blocked")
+        let provider = BlockingCalendarRead(old: [], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let read = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        read.cancel()
+        provider.release()
+        do { _ = try await read.value; XCTFail("explicit cancellation must still throw") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
     }
 
     func testOtherEventsIgnoresAnOlderSuccessAfterTheNewDayFinishes() async throws {
@@ -755,17 +840,57 @@ final class FeatCalendarTests: XCTestCase {
         let id = try XCTUnwrap(plan.first?.identifier)
         let original = try XCTUnwrap(requests.pending[id])
         requests.fail = true
-        store.notifier = TestCalendarScheduler(scheduler)
+        let notifier = TestCalendarScheduler(scheduler)
+        store.notifier = notifier
         store.cache.store([soon], from: Date().addingTimeInterval(-3_600), to: Date().addingTimeInterval(Self.day), at: Date())
         h.app.settings.set(CalendarSettings.reminderMinutes, 30)
         await store.rescheduleReminders()
         XCTAssertNotNil(store.reminderError)
         XCTAssertTrue(requests.pending[id] === original)
+        notifier.status = .denied
+        await store.rescheduleReminders()
+        XCTAssertNil(store.reminderError, "a retry banner is not actionable without notification authorization")
+        notifier.status = .authorized
         requests.fail = false
         await store.rescheduleReminders()
         XCTAssertNil(store.reminderError)
         XCTAssertFalse(requests.pending[id] === original)
         XCTAssertEqual(requests.pending.count, 1)
+    }
+
+    func testMovingEventPreservesPreviousReminderUntilReplacementSucceeds() async throws {
+        var original = event("Meeting", Date().addingTimeInterval(3 * 3_600))
+        original.id = CalendarEventID.make(externalID: "meeting", occurrence: original.start, allDay: false, calendar: .current)
+        original.key = CalendarEventID.key(externalID: "meeting", recurrence: nil, allDay: false, calendar: .current)
+        var moved = original
+        moved.start = original.start.addingTimeInterval(3_600)
+        moved.end = original.end.addingTimeInterval(3_600)
+        moved.id = CalendarEventID.make(externalID: "meeting", occurrence: moved.start, allDay: false, calendar: .current)
+        let obsolete = event("Deleted meeting", Date().addingTimeInterval(5 * 3_600))
+        let requests = FailingCalendarRequests()
+        let scheduler = UserNotificationScheduler(requests: requests)
+        let prefix = CalendarReminderNames.identifierPrefix
+        let oldPlan = CalendarReminderPlanner.plan([original, obsolete], minutesBefore: 10, now: Date())
+        let newPlan = CalendarReminderPlanner.plan([moved], minutesBefore: 10, now: Date())
+        let oldID = prefix + original.id
+        let newID = prefix + moved.id
+        XCTAssertNotEqual(oldID, newID)
+        try await scheduler.replace(prefix: prefix, with: oldPlan)
+        let previous = try XCTUnwrap(requests.pending[oldID])
+        requests.fail = true
+        do {
+            try await scheduler.replace(prefix: prefix, with: newPlan)
+            XCTFail("replacement should fail")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .unavailable) }
+        XCTAssertTrue(requests.pending[oldID] === previous)
+        XCTAssertNil(requests.pending[newID])
+        requests.fail = false
+        try await scheduler.replace(prefix: prefix, with: newPlan)
+        XCTAssertNil(requests.pending[oldID])
+        XCTAssertEqual(Set(requests.pending.keys), [newID])
+        XCTAssertEqual(requests.pending[newID]?.content.userInfo[CalendarReminderNames.eventKey] as? String, moved.id)
+        try await scheduler.replace(prefix: prefix, with: newPlan)
+        XCTAssertEqual(Set(requests.pending.keys), [newID], "retries do not duplicate reminders")
     }
 
     // MARK: The cache horizon
@@ -932,7 +1057,7 @@ final class FeatCalendarTests: XCTestCase {
 private final class FailingCalendarRequests: CalendarNotificationRequests {
     var pending: [String: UNNotificationRequest] = [:]
     var fail = false
-    func pendingIdentifiers() async -> [String] { Array(pending.keys) }
+    func pendingRequests() async -> [UNNotificationRequest] { Array(pending.values) }
     func add(_ request: UNNotificationRequest) async throws {
         if fail { throw NibError.unavailable("test scheduling failure") }
         pending[request.identifier] = request
@@ -943,8 +1068,9 @@ private final class FailingCalendarRequests: CalendarNotificationRequests {
 @MainActor
 private final class TestCalendarScheduler: NotificationScheduling {
     let scheduler: UserNotificationScheduler
+    var status = NotificationAuthorization.authorized
     init(_ scheduler: UserNotificationScheduler) { self.scheduler = scheduler }
-    func authorization() async -> NotificationAuthorization { .authorized }
+    func authorization() async -> NotificationAuthorization { status }
     func requestAuthorization() async -> Bool { true }
     func replace(prefix: String, with reminders: [PlannedReminder]) async throws {
         try await scheduler.replace(prefix: prefix, with: reminders)

@@ -414,8 +414,12 @@ final class FeatStudyEditorTests: XCTestCase {
         let line = Stroke(style: InkStyle(), points: [StrokePoint(x: 100, y: 100, width: 2, height: 2),
                                                       StrokePoint(x: 49_000, y: 29_000, width: 2, height: 2)])
         let huge = CardFace(kind: .ink, ink: [line], size: PageSize(50_000, 30_000))
+        let cacheKey = StudySetModel.inkRenderKey("huge", displayScale: 3)
+        XCTAssertNil(model.cachedInkPicture(cacheKey))
         let rendered = await model.inkPicture(huge, key: "huge", displayScale: 3)
         let image = try XCTUnwrap(rendered)
+        XCTAssertTrue(model.cachedInkPicture(cacheKey) === image, "cached ink is available before a thumbnail task starts")
+        XCTAssertNil(model.cachedInkPicture(StudySetModel.inkRenderKey("huge", displayScale: 2)))
         XCTAssertLessThanOrEqual(image.size.width * image.scale, 1_100)
     }
 

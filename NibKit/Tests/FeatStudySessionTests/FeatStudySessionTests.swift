@@ -167,8 +167,11 @@ final class FeatStudySessionTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(dark.pngData()), try expected(.dark))
         let cachedDark = await model.picture(face, card: card, back: false)
         XCTAssertTrue(cachedDark === dark)
+        XCTAssertTrue(model.cachedPicture(model.pictureKey(card: card, back: false)) === dark)
         try await h.run(CommandIDs.studySetTheme, ["doc": .string(docRef), "card": "white"])
         try await model.reload()
+        XCTAssertTrue(model.cachedPicture(model.pictureKey(card: card, back: false)) === light,
+                      "a cached theme is available synchronously before the view task starts")
         let cachedLight = await model.picture(face, card: card, back: false)
         XCTAssertTrue(cachedLight === light)
     }
@@ -193,10 +196,46 @@ final class FeatStudySessionTests: XCTestCase {
         store.release()
         let result = await old.value
         XCTAssertNil(result, "cancelled artwork must not be cached or displayed by an obsolete view task")
+        XCTAssertNil(model.cachedPicture(key))
         XCTAssertFalse(store.readOnMain)
         h.app.services.assets = h.assets
         let latest = await model.picture(changed.back, card: changed, back: true)
         XCTAssertNotNil(latest)
+        XCTAssertTrue(model.cachedPicture(model.pictureKey(card: changed, back: true)) === latest)
+    }
+
+    func testInterruptedCardDragResetsPositionWithoutGradingOrMovingNextCard() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": "practice"])
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "flip", "instant": true])
+        let first = try XCTUnwrap(model.current)
+        let before = try h.snapshot(doc)
+        var drag = StudyCardDragState()
+        var gradeCommands = 0
+        drag.changed(CGSize(width: 240, height: 60), reduceMotion: false)
+        XCTAssertNotEqual(drag.offset, .zero)
+        XCTAssertNotEqual(StudyCardDragState.rotation(for: drag.offset, width: 560, reduceMotion: false), 0)
+        // The exact callback used when GestureState resets after interruption (no onEnded).
+        drag.activityChanged(false)
+        XCTAssertEqual(drag.offset, .zero)
+        XCTAssertEqual(StudyCardDragState.rotation(for: drag.offset, width: 560, reduceMotion: false), 0)
+        // A late completion after cancellation must not dispatch the grade command either.
+        drag.ended { gradeCommands += 1; model.grade(.good) }
+        XCTAssertEqual(gradeCommands, 0)
+        XCTAssertEqual(model.current?.id, first.id)
+        XCTAssertTrue(model.reviewed.isEmpty)
+        XCTAssertEqual(try h.snapshot(doc), before)
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "next", "instant": true])
+        XCTAssertNotEqual(model.current?.id, first.id)
+        XCTAssertEqual(drag.offset, .zero)
+        XCTAssertEqual(StudyCardDragState.rotation(for: drag.offset, width: 560, reduceMotion: false), 0)
+        drag.changed(CGSize(width: 12, height: 3), reduceMotion: false)
+        XCTAssertEqual(drag.offset, CGSize(width: 12, height: 3), "the next drag inherits no displacement")
+        var completions = 0
+        drag.ended { completions += 1 }
+        XCTAssertEqual(completions, 1, "ordinary gesture completion still works")
+        XCTAssertEqual(drag.offset, .zero)
     }
 
     func testPracticeNavigationSpeechAndDueOnlySessionSummary() async throws {

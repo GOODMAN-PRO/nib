@@ -225,6 +225,23 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(copyID, page: page).contains { $0.id == secret.id })
     }
 
+    func testSuccessfulPrivateSavesDoNotReportSyncStatus() throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        var reports = 0
+        let store = PrivateLessonPersistence(base: h.persistence, root: h.persistence.root.appendingPathComponent("quiet-private-save"),
+                                             report: { _, _ in reports += 1 })
+        var head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook))
+        try store.seed(LessonSnapshot(content: head, items: [:]))
+        for index in 0..<3 {
+            head.meta.layers[0].name = "Stroke \(index)"
+            store.didChange(doc, head: head, pages: [:])
+            store.flush(doc)
+        }
+        XCTAssertEqual(reports, 0)
+        XCTAssertNil(store.saveError(doc))
+    }
+
     func testFailedPrivateSaveRetainsSnapshotReportsAndRetriesOnFlush() throws {
         let h = harness()
         let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
@@ -244,10 +261,15 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertNotNil(store.saveError(doc))
         XCTAssertEqual(store.pendingSnapshot(doc)?.content, changed)
         XCTAssertTrue(reported.contains { $0 != nil })
+        XCTAssertEqual(reported.count, 1, "repeated failures with the same error report once")
         failure.setFailing(false)
         store.flush(doc)
         XCTAssertNil(store.pendingSnapshot(doc))
         XCTAssertNil(store.saveError(doc))
+        XCTAssertEqual(reported.count, 2)
+        if reported.count == 2 { XCTAssertNil(reported[1], "one recovery clears the earlier error") }
+        store.flush(doc)
+        XCTAssertEqual(reported.count, 2)
         let fresh = PrivateLessonPersistence(base: h.persistence, root: root)
         XCTAssertEqual(try fresh.loadHead(doc), changed)
     }

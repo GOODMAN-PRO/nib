@@ -250,6 +250,35 @@ final class FeatTeacherTests: XCTestCase {
         }
     }
 
+    func testSwitchingUnchangedHintFieldsPreservesDraftIDs() {
+        var baseline = ["First", "Second"]
+        var drafts = baseline.map { AnswerZoneHintDraft(text: $0) }
+        let ids = drafts.map(\.id)
+        for focus in [ids[1], ids[0], ids[1]] {
+            XCTAssertNil(AnswerZoneHintDraft.editedHints(drafts, baseline: baseline))
+            AnswerZoneHintDraft.reconcile(&drafts, baseline: &baseline, hints: ["First", "Second"], focused: focus)
+            XCTAssertEqual(drafts.map(\.id), ids)
+            XCTAssertTrue(drafts.contains { $0.id == focus })
+        }
+    }
+
+    func testAddingHintWhileAnotherFieldIsFocusedPreservesBlankDraft() {
+        var baseline = ["First", "Second"]
+        var drafts = baseline.map { AnswerZoneHintDraft(text: $0) }
+        let blank = AnswerZoneHintDraft(text: "")
+        drafts.append(blank) // Add Hint moves focus and commits the previous, untouched field.
+        let ids = drafts.map(\.id)
+        XCTAssertNil(AnswerZoneHintDraft.editedHints(drafts, baseline: baseline))
+        AnswerZoneHintDraft.reconcile(&drafts, baseline: &baseline, hints: ["First", "Second"], focused: blank.id)
+        XCTAssertEqual(drafts.map(\.id), ids)
+        AnswerZoneHintDraft.reconcile(&drafts, baseline: &baseline, hints: ["First", "Changed elsewhere"], focused: blank.id)
+        XCTAssertEqual(drafts.last, blank, "an external update must also retain the focused blank row")
+        XCTAssertEqual(drafts.map(\.id), ids)
+        XCTAssertEqual(baseline, ["First", "Changed elsewhere"])
+        drafts[2].text = "Third"
+        XCTAssertEqual(AnswerZoneHintDraft.editedHints(drafts, baseline: baseline), ["First", "Changed elsewhere", "Third"])
+    }
+
     func testHintDraftBaselineDoesNotOverwriteAnotherWindowsHints() async throws {
         let h = harness()
         let ref = try await create(h)

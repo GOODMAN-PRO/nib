@@ -427,6 +427,8 @@ final class StudySetModel: ObservableObject {
         key + "/light@" + String(Double(max(displayScale, 1)))
     }
 
+    func cachedInkPicture(_ key: String) -> UIImage? { inkPictures.object(forKey: key as NSString) }
+
     func inkPicture(_ face: CardFace, key: String, displayScale: CGFloat) async -> UIImage? {
         let cacheKey = Self.inkRenderKey(key, displayScale: displayScale) as NSString
         if let hit = inkPictures.object(forKey: cacheKey) { return hit }

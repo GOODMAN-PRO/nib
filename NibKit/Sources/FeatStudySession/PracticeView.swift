@@ -247,6 +247,8 @@ final class StudySessionModel: ObservableObject {
         return card.id.raw + card.rev.description + side + appearance
     }
 
+    func cachedPicture(_ key: String) -> UIImage? { pictures.object(forKey: key as NSString) }
+
     func picture(_ face: CardFace, card: StudyCard, back: Bool) async -> UIImage? {
         let key = pictureKey(card: card, back: back) as NSString
         if let image = pictures.object(forKey: key) { return image }
@@ -295,14 +297,40 @@ enum StudyCardLayout {
     }
 }
 
+/// Shared by the gesture callbacks, including GestureState's reset when iOS interrupts a drag.
+struct StudyCardDragState {
+    private(set) var offset = CGSize.zero
+    private(set) var isDragging = false
+
+    mutating func changed(_ translation: CGSize, reduceMotion: Bool) {
+        isDragging = true
+        offset = reduceMotion ? .zero : translation
+    }
+
+    mutating func activityChanged(_ active: Bool) {
+        if !active { offset = .zero; isDragging = false }
+    }
+
+    mutating func ended(_ complete: () -> Void) {
+        guard isDragging else { return }
+        activityChanged(false)
+        complete()
+    }
+
+    static func rotation(for offset: CGSize, width: CGFloat, reduceMotion: Bool) -> Double {
+        reduceMotion ? 0 : min(6, max(-6, Double(offset.width / max(width, 1)) * 6))
+    }
+}
+
 struct StudySessionView: View {
     @ObservedObject var model: StudySessionModel
     let smartLearn: Bool
     let close: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @GestureState private var liveDrag = CGSize.zero
+    @GestureState private var dragActive = false
+    @State private var dragState = StudyCardDragState()
     @State private var swipeOffset = CGSize.zero
-    private var drag: CGSize { swiping ? swipeOffset : liveDrag }
+    private var drag: CGSize { swiping ? swipeOffset : (dragActive ? dragState.offset : .zero) }
     @State private var swiping = false
     @State private var resetConfirmed = false
     @State private var optionsPresented = false
@@ -321,6 +349,7 @@ struct StudySessionView: View {
             }
         }
         .onDisappear {
+            dragState.activityChanged(false)
             model.onEnd = nil
             if !model.scratchPresented && !optionsPresented {
                 model.app.perform(StudySessionAction.id, ["doc": .string(model.docRef), "action": "end"], session: model.session)
@@ -427,36 +456,42 @@ struct StudySessionView: View {
         }
         .frame(width: size.width, height: size.height)
         .offset(drag)
-        .rotationEffect(.degrees(reduceMotion ? 0 : min(6, max(-6, Double(drag.width / max(size.width, 1)) * 6))))
+        .rotationEffect(.degrees(StudyCardDragState.rotation(for: drag, width: size.width, reduceMotion: reduceMotion)))
         .transaction { if model.instantFlip { $0.disablesAnimations = true } }
         .contentShape(RoundedRectangle(cornerRadius: NibRadius.studyCard))
         .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.studyCard))
         .hoverEffect(.highlight)
         .onTapGesture { model.action("flip") }
-        .gesture(DragGesture(minimumDistance: NibSpacing.l).updating($liveDrag) { value, state, _ in
+        .gesture(DragGesture(minimumDistance: NibSpacing.l).updating($dragActive) { _, state, _ in
+            state = true
+        }.onChanged { value in
             guard !model.busy, !swiping else { return }
-            if !reduceMotion { state = value.translation }
+            dragState.changed(value.translation, reduceMotion: reduceMotion)
         }.onEnded { value in
-            guard !model.busy, !swiping else { return }
-            let travel = value.predictedEndTranslation.width
-            if abs(travel) > size.width / 4 {
-                if model.flipped, !model.readOnly {
-                    if reduceMotion { model.grade(travel > 0 ? .good : .again) }
-                    else {
-                        swipeOffset = value.translation
-                        swiping = true
-                        withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
-                            swipeOffset = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
-                        } completion: {
-                            if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
-                            swiping = false
-                            var transaction = Transaction(); transaction.disablesAnimations = true
-                            withTransaction(transaction) { swipeOffset = .zero }
+            dragState.ended {
+                guard !model.busy, !swiping else { return }
+                let travel = value.predictedEndTranslation.width
+                if abs(travel) > size.width / 4 {
+                    if model.flipped, !model.readOnly {
+                        if reduceMotion { model.grade(travel > 0 ? .good : .again) }
+                        else {
+                            swipeOffset = value.translation
+                            swiping = true
+                            withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
+                                swipeOffset = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
+                            } completion: {
+                                if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
+                                swiping = false
+                                var transaction = Transaction(); transaction.disablesAnimations = true
+                                withTransaction(transaction) { swipeOffset = .zero }
+                            }
                         }
-                    }
-                } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
+                    } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
+                }
             }
         })
+        .onChange(of: dragActive) { _, active in dragState.activityChanged(active) }
+        .onChange(of: card.id) { _, _ in dragState.activityChanged(false) }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isButton)
         .accessibilityLabel(model.flipped ? String(localized: "Answer side") : String(localized: "Question side"))
@@ -639,7 +674,7 @@ struct StudyFaceView: View {
                     text.fixedSize(horizontal: false, vertical: true)
                     ScrollView { text }
                 }
-            } else if renderedKey == renderKey, let image {
+            } else if let image = model.cachedPicture(renderKey) ?? (renderedKey == renderKey ? image : nil) {
                 Image(uiImage: image).resizable().scaledToFit().padding(NibSpacing.l)
                     .accessibilityLabel(face.kind == .ink ? String(localized: "Handwritten card side") : String(localized: "Image card side"))
             } else if renderedKey != renderKey {

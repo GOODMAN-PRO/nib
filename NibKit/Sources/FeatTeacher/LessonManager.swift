@@ -193,6 +193,8 @@ enum LessonManager {
 private final class PrivateLessonWrites {
     var pending: [DocumentID: LessonSnapshot] = [:]
     var errors: [DocumentID: String] = [:]
+    var statusChanges: [(DocumentID, String?)] = []
+    private var reportedErrors: [DocumentID: String] = [:]
     let write: (LessonSnapshot, URL) throws -> Void
     init(write: @escaping (LessonSnapshot, URL) throws -> Void) { self.write = write }
     func retry(_ doc: DocumentID, at url: URL) {
@@ -202,6 +204,12 @@ private final class PrivateLessonWrites {
             pending[doc] = nil
             errors[doc] = nil
         } catch { errors[doc] = error.localizedDescription }
+        recordStatus(doc, error: errors[doc])
+    }
+    func recordStatus(_ doc: DocumentID, error: String?) {
+        guard reportedErrors[doc] != error else { return }
+        reportedErrors[doc] = error
+        statusChanges.append((doc, error))
     }
 }
 
@@ -227,7 +235,14 @@ final class PrivateLessonPersistence: DocumentPersistence {
     }
     func pendingSnapshot(_ doc: DocumentID) -> LessonSnapshot? { writer.sync { writes.pending[doc] } }
     func saveError(_ doc: DocumentID) -> String? { writer.sync { writes.errors[doc] } }
-    private func reportStatus(_ doc: DocumentID) { report(doc, saveError(doc)) }
+    private func reportStatus() {
+        let changes = writer.sync {
+            let changes = writes.statusChanges
+            writes.statusChanges.removeAll()
+            return changes
+        }
+        for (doc, error) in changes { report(doc, error) }
+    }
 
     static func reportStatus(_ doc: DocumentID, message: String?, app: NibApp) {
         let text = message.map { String(localized: "Private notes could not be saved. Keep Nib open, free storage, then close the document to retry. \($0)") }
@@ -247,8 +262,10 @@ final class PrivateLessonPersistence: DocumentPersistence {
             try writes.write(snapshot, url)
             writes.pending[doc] = nil
             writes.errors[doc] = nil
+            writes.recordStatus(doc, error: nil)
         }
         cache[doc] = snapshot
+        reportStatus()
     }
     private func snapshot(_ doc: DocumentID) throws -> LessonSnapshot {
         if let value = cache[doc] { return value }
@@ -278,18 +295,19 @@ final class PrivateLessonPersistence: DocumentPersistence {
             writer.async { [weak self] in
                 writes.pending[doc] = value
                 writes.retry(doc, at: url)
-                Task { @MainActor [weak self] in self?.reportStatus(doc) }
+                Task { @MainActor [weak self] in self?.reportStatus() }
             }
         } catch {
             log.error("Could not load private presentation: \(error.localizedDescription, privacy: .public)")
-            report(doc, error.localizedDescription)
+            writer.sync { writes.recordStatus(doc, error: error.localizedDescription) }
+            reportStatus()
         }
     }
     func flush(_ doc: DocumentID) {
         guard LessonManager.isPrivate(doc) else { base.flush(doc); return }
         let url = package(doc).appendingPathComponent("presentation.json")
         writer.sync { writes.retry(doc, at: url) }
-        reportStatus(doc)
+        reportStatus()
     }
     func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
         guard LessonManager.isPrivate(doc) else { return try base.fileURL(doc, relativePath: relativePath) }

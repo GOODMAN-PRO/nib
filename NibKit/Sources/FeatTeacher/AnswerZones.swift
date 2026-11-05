@@ -1444,6 +1444,19 @@ struct AnswerZoneHintDraft: Identifiable, Equatable {
         return hints == baseline ? nil : hints
     }
 
+    static func reconcile(_ drafts: inout [Self], baseline: inout [String], hints: [String], focused: UUID?) {
+        guard hints != baseline else { return }
+        let blank = drafts.first { $0.id == focused && $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let existing = drafts.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        drafts = hints.enumerated().map { index, text in
+            var draft = index < existing.count ? existing[index] : Self(text: text)
+            draft.text = text
+            return draft
+        }
+        if let blank { drafts.append(blank) }
+        baseline = hints
+    }
+
 }
 
 /// Everything about one zone: the score box, the hints (edited in place, saved when a field loses focus), and the
@@ -1494,7 +1507,7 @@ struct AnswerZoneEditor: View {
         }
         .onChange(of: model.zone?.hints ?? []) { _, hints in
             // Undo, another window or the assistant changed them: show theirs unless a field is being edited.
-            if focused == nil && cleaned(drafts) == hintBaseline { loadHints(hints) }
+            if focused == nil && cleaned(drafts) == hintBaseline { reconcileHints(hints) }
         }
         .onDisappear { commitHints() }
     }
@@ -1601,10 +1614,14 @@ struct AnswerZoneEditor: View {
     private func commitHints() {
         guard let zone = model.zone else { return }
         guard let hints = AnswerZoneHintDraft.editedHints(drafts, baseline: hintBaseline) else {
-            loadHints(zone.hints)
+            reconcileHints(zone.hints)
             return
         }
         model.setHints(hints, expected: hintBaseline) { hintBaseline = hints }
+    }
+
+    private func reconcileHints(_ hints: [String]) {
+        AnswerZoneHintDraft.reconcile(&drafts, baseline: &hintBaseline, hints: hints, focused: focused)
     }
 }
 
