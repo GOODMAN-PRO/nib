@@ -441,6 +441,20 @@ final class PageCommandTests: XCTestCase {
 
     // MARK: page.moveTo
 
+    func testMoveWithinDocumentAppendsAfterTiesInRequestedOrder() async throws {
+        let h = harness()
+        try makeTiedNotebook(h)
+        let before = try h.snapshot("TIES")
+        _ = try await h.run("page.moveTo", ["pages": ["page:TIES/D", "page:TIES/A"], "doc": "doc:TIES"])
+        XCTAssertEqual(try livePageIDs(h, "TIES"), ["B", "C", "D", "A"])
+        let pages = try h.app.workspace.content("TIES").livePages
+        XCTAssertGreaterThan(pages[2].order, pages[1].order)
+        XCTAssertGreaterThan(pages[3].order, pages[2].order)
+        XCTAssertEqual(h.undoDepth("TIES"), 1)
+        XCTAssertTrue(h.app.bus.undo("TIES"))
+        XCTAssertEqual(try h.snapshot("TIES"), before)
+    }
+
     func testMoveToAnotherDocumentKeepsGeometryAndUndoesInBoth() async throws {
         let h = harness()
         let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)

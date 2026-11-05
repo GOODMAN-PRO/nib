@@ -495,6 +495,43 @@ struct ImportGroup: Equatable {
 
 /// Page order keys around an insertion point. Pure.
 enum PageSlot {
+    /// Exact insertion, including a gap inside a tie run. Apply `rekeyed` in the same transaction as the new pages.
+    static func plan(_ position: PagePosition, anchor: PageID?, count: Int,
+                     in pages: [PageRecord]) -> (keys: [String], rekeyed: [PageRecord]) {
+        guard count > 0 else { return ([], []) }
+        let at: Int
+        switch position {
+        case .start: at = 0
+        case .end: at = pages.count
+        case .before, .after:
+            if let anchor, let i = pages.firstIndex(where: { $0.id == anchor }) {
+                at = position == .before ? i : i + 1
+            } else { at = pages.count }
+        }
+        let lowKey = at > 0 ? pages[at - 1].order : nil
+        let highKey = at < pages.count ? pages[at].order : nil
+        guard let low = lowKey, let high = highKey, low == high else {
+            let keys = count == 1 ? [FractionalIndex.between(lowKey, highKey)]
+                : FractionalIndex.balanced(count: count, after: lowKey, before: highKey)
+            return (keys, [])
+        }
+        var start = at - 1
+        var end = at + 1
+        while start > 0 && pages[start - 1].order == low { start -= 1 }
+        while end < pages.count && pages[end].order == low { end += 1 }
+        let keys = FractionalIndex.balanced(count: end - start + count,
+            after: start > 0 ? pages[start - 1].order : nil,
+            before: end < pages.count ? pages[end].order : nil)
+        let offset = at - start
+        let rekeyed = (start..<end).map { i -> PageRecord in
+            var page = pages[i]
+            page.order = keys[i - start + (i < at ? 0 : count)]
+            return page
+        }
+        return (Array(keys[offset..<(offset + count)]), rekeyed)
+    }
+
+
     /// Order keys of the live pages around the insertion point (nil = open end). A missing anchor means the end, like
     /// `DocumentContent.orderKey`.
     static func neighbours(_ live: [PageRecord], _ position: PagePosition, anchor: PageID?) -> (String?, String?) {

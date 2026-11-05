@@ -270,6 +270,43 @@ struct ScanPlacement: Equatable {
     }
 
     /// `count` increasing order keys for the new pages, in scan order, between the neighbours of the place.
+    /// Exact insertion, including a gap inside a tie run. Apply `rekeyed` in the same transaction as the new pages.
+    func plan(count: Int, in content: DocumentContent) -> (keys: [String], rekeyed: [PageRecord]) {
+        let pages = content.livePages
+        guard count > 0 else { return ([], []) }
+        let at: Int
+        switch position {
+        case .start: at = 0
+        case .end: at = pages.count
+        case .before, .after:
+            if let anchor, let i = pages.firstIndex(where: { $0.id == anchor }) {
+                at = position == .before ? i : i + 1
+            } else { at = pages.count }
+        }
+        let lowKey = at > 0 ? pages[at - 1].order : nil
+        let highKey = at < pages.count ? pages[at].order : nil
+        guard let low = lowKey, let high = highKey, low == high else {
+            let keys = count == 1 ? [FractionalIndex.between(lowKey, highKey)]
+                : FractionalIndex.balanced(count: count, after: lowKey, before: highKey)
+            return (keys, [])
+        }
+        var start = at - 1
+        var end = at + 1
+        while start > 0 && pages[start - 1].order == low { start -= 1 }
+        while end < pages.count && pages[end].order == low { end += 1 }
+        let keys = FractionalIndex.balanced(count: end - start + count,
+            after: start > 0 ? pages[start - 1].order : nil,
+            before: end < pages.count ? pages[end].order : nil)
+        let offset = at - start
+        let rekeyed = (start..<end).map { i -> PageRecord in
+            var page = pages[i]
+            page.order = keys[i - start + (i < at ? 0 : count)]
+            return page
+        }
+        return (Array(keys[offset..<(offset + count)]), rekeyed)
+    }
+
+    /// Read-only compatibility helper. Writers use plan and commit its rekeyed neighbours.
     func orders(count: Int, in content: DocumentContent) -> [String] {
         let pages = content.livePages
         var low: String?
@@ -411,7 +448,9 @@ enum ScanPipeline {
         // The stand-in is replaced, so it is not a neighbour.
         var others = content
         if let standIn { others.pages.removeAll { $0.id == standIn } }
-        let orders = placement.orders(count: sheets.count, in: others)
+        let planned = placement.plan(count: sheets.count, in: others)
+        let orders = planned.keys
+        try tx.put(planned.rekeyed, doc: doc)
         var records: [PageRecord] = []
         records.reserveCapacity(sheets.count)
         for (i, (sheet, id)) in zip(sheets, ids).enumerated() {

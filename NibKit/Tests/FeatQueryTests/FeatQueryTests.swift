@@ -6,6 +6,34 @@ import FeatQuery
 
 @MainActor
 final class FeatQueryTests: XCTestCase {
+    func testPageInsertAndMoveSplitTiedNeighboursAtomically() async throws {
+        for command in ["node.insert", "node.move"] {
+            let h = harness()
+            let content = DocumentContent(meta: DocumentMeta(id: "TIES", kind: .notebook), pages: [
+                PageRecord(id: "A", order: "A"), PageRecord(id: "B", order: "V"),
+                PageRecord(id: "C", order: "V"), PageRecord(id: "D", order: "V1")
+            ])
+            _ = try h.library.createDocument(content, title: "Tied pages", in: nil)
+            let before = try h.snapshot("TIES")
+            let params: JSONValue = command == "node.insert"
+                ? ["parent": "doc:TIES", "id": "NEW", "node": ["type": "page"], "at": 2]
+                : ["ref": "page:TIES/A", "to": "doc:TIES", "at": 1]
+            let expected = command == "node.insert" ? ["A", "B", "NEW", "C", "D"] : ["B", "A", "C", "D"]
+            _ = try await h.app.bus.execute(Invocation(command: command, params: params, dryRun: true))
+            XCTAssertEqual(try h.snapshot("TIES"), before)
+            _ = try await h.run(command, params)
+            let pages = try h.app.workspace.content("TIES").livePages
+            XCTAssertEqual(pages.map { $0.id.raw }, expected)
+            XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+            XCTAssertEqual(pages.last?.order, "V1")
+            XCTAssertEqual(h.undoDepth("TIES"), 1)
+            XCTAssertTrue(h.app.bus.undo("TIES"))
+            XCTAssertEqual(try h.snapshot("TIES"), before)
+            XCTAssertTrue(h.app.bus.redo("TIES"))
+            XCTAssertEqual(try h.app.workspace.content("TIES").livePages.map { $0.id.raw }, expected)
+        }
+    }
+
     func testNodeSetRejectsTombstonesWithoutWritingOrAddingUndo() async throws {
         for ref in ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "block:FIXTUREDOC02/FIXTUREBLK02",
                     "card:FIXTUREDOC03/FIXTURECRD01", "audio:FIXTUREDOC01/FIXTUREAUD01",
