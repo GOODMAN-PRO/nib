@@ -275,7 +275,7 @@ struct CalendarTabBody: View {
 
     private func reminderFailure(_ message: String) -> some View {
         NibBanner(message, action: NibAction(String(localized: "Retry Reminders")) {
-            Task { await store.rescheduleReminders() }
+            app.perform(CalendarEvents.descriptor.id, PlannerPage.upcomingParams, session: context.session)
         })
     }
 
@@ -904,7 +904,7 @@ struct CalendarSettingsPage: View {
                 }
                 if let error = store.reminderError {
                     NibBanner(error, action: NibAction(String(localized: "Retry Reminders")) {
-                        Task { await store.rescheduleReminders() }
+                        app.perform(CalendarEvents.descriptor.id, PlannerPage.upcomingParams, session: app.services.sessions.active)
                     })
                 }
                 if store.notifications == .denied && app.settings.get(CalendarSettings.reminderMinutes) > 0 {
