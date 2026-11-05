@@ -50905,6 +50905,95 @@
         }
       }
     },
+    "Backup incomplete. These items are not downloaded and were omitted:\n%@\nDownload them in Files and create another library backup." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup unvollständig. Diese Objekte sind nicht geladen und wurden ausgelassen:\n%@\nLade sie in „Dateien“ und erstelle ein weiteres Backup der Bibliothek."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copia de seguridad incompleta. Estos ítems no están descargados y se han omitido:\n%@\nDescárgalos en Archivos y crea otra copia de seguridad de la biblioteca."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sauvegarde incomplète. Ces éléments ne sont pas téléchargés et ont été omis :\n%@\nTéléchargez-les dans Fichiers, puis créez une nouvelle sauvegarde de la bibliothèque."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup incompleto. Questi elementi non sono stati scaricati e sono stati omessi:\n%@\nScaricali in File e crea un altro backup della libreria."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "バックアップは不完全です。次の項目はダウンロードされていないため、含まれていません:\n%@\n“ファイル”でダウンロードしてから、ライブラリのバックアップをもう一度作成してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "백업이 완료되지 않았습니다. 다음 항목은 다운로드되지 않아 제외되었습니다.\n%@\n파일 앱에서 다운로드한 다음 보관함 백업을 다시 생성하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reservekopie onvolledig. Deze onderdelen zijn niet gedownload en zijn weggelaten:\n%@\nDownload ze in Bestanden en maak een nieuwe reservekopie van de bibliotheek."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kopia zapasowa jest niekompletna. Te rzeczy nie są pobrane i zostały pominięte:\n%@\nPobierz je w aplikacji Pliki i utwórz kolejną kopię zapasową biblioteki."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup incompleto. Estes itens não foram baixados e ficaram de fora:\n%@\nBaixe-os no app Arquivos e crie outro backup da biblioteca."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Резервная копия неполная. Эти объекты не загружены и были пропущены:\n%@\nЗагрузите их в приложении «Файлы» и создайте резервную копию медиатеки еще раз."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Säkerhetskopian är ofullständig. De här objekten är inte hämtade och togs inte med:\n%@\nHämta dem i Filer och skapa en ny säkerhetskopia av biblioteket."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Yedekleme eksik. Bu öğeler indirilmediği için dahil edilmedi:\n%@\nBunları Dosyalar’da indirin ve kitaplığın yeni bir yedeğini oluşturun."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "备份不完整。以下项目尚未下载，已被省略：\n%@\n请在“文件”中下载这些项目，然后再次创建资料库备份。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "備份不完整。下列項目尚未下載，已被略過：\n%@\n請在「檔案」中下載這些項目，然後再次建立資料庫備份。"
+          }
+        }
+      }
+    },
     "Backup options" : {
       "extractionState" : "manual",
       "localizations" : {
