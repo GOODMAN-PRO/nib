@@ -231195,6 +231195,95 @@
         }
       }
     },
+    "Order keys must contain only letters A–Z, a–z and digits, and must not end in 0." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sortierschlüssel dürfen nur die Buchstaben A–Z, a–z und Ziffern enthalten und nicht auf 0 enden."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Las claves de orden solo pueden contener las letras A–Z, a–z y dígitos, y no pueden terminar en 0."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les clés d’ordre ne doivent contenir que les lettres A–Z, a–z et des chiffres, et ne doivent pas se terminer par 0."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le chiavi di ordinamento possono contenere solo le lettere A–Z, a–z e cifre, e non possono terminare con 0."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "順序キーには英字（A–Z、a–z）と数字のみを使用でき、末尾を0にすることはできません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "순서 키에는 영문자(A–Z, a–z)와 숫자만 사용할 수 있으며 0으로 끝날 수 없습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Volgordesleutels mogen alleen de letters A–Z, a–z en cijfers bevatten en mogen niet op 0 eindigen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Klucze kolejności mogą zawierać tylko litery A–Z, a–z oraz cyfry i nie mogą kończyć się na 0."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "As chaves de ordem devem conter apenas as letras A–Z, a–z e dígitos, e não podem terminar em 0."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ключи порядка могут содержать только буквы A–Z, a–z и цифры и не могут оканчиваться на 0."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ordningsnycklar får bara innehålla bokstäverna A–Z, a–z och siffror, och får inte sluta på 0."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sıra anahtarları yalnızca A–Z, a–z harflerini ve rakamları içerebilir ve 0 ile bitemez."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排序键只能包含字母 A–Z、a–z 和数字，且不能以 0 结尾。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "排序鍵只能包含字母 A–Z、a–z 和數字，且不能以 0 結尾。"
+          }
+        }
+      }
+    },
     "Organise your library" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -261035,6 +261124,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "錄音設定"
+          }
+        }
+      }
+    },
+    "Recording audio is missing. Restore the recording to transcribe it." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Audio der Aufnahme fehlt. Stelle die Aufnahme wieder her, um sie zu transkribieren."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Falta el audio de la grabación. Restaura la grabación para transcribirla."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’audio de l’enregistrement est introuvable. Restaurez l’enregistrement pour le transcrire."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’audio della registrazione è mancante. Ripristina la registrazione per trascriverla."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "録音のオーディオが見つかりません。文字起こしをするには録音を復元してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "녹음 오디오가 없습니다. 대본을 만들려면 녹음을 복원하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De audio van de opname ontbreekt. Zet de opname terug om deze te transcriberen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Brakuje dźwięku nagrania. Przywróć nagranie, aby je transkrybować."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O áudio da gravação está ausente. Restaure a gravação para transcrevê-la."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аудио записи отсутствует. Восстановите запись, чтобы расшифровать ее."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inspelningens ljud saknas. Återställ inspelningen för att transkribera den."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kaydın sesi eksik. Yazıya dökmek için kaydı geri yükleyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "录音的音频缺失。请恢复录音后再转录。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "錄音的音訊遺失。請先復原錄音再轉寫。"
           }
         }
       }
@@ -297000,6 +297178,95 @@
         }
       }
     },
+    "Selective undo cannot be previewed. Run Revert Changes to apply it." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Für selektives Widerrufen gibt es keine Vorschau. Führe „Änderungen zurücksetzen“ aus, um es anzuwenden."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se puede previsualizar la acción de deshacer selectiva. Ejecuta Revertir cambios para aplicarla."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’annulation sélective ne peut pas être prévisualisée. Exécutez Rétablir les modifications pour l’appliquer."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Non è possibile visualizzare l’anteprima dell’annullamento selettivo. Esegui Ripristina modifiche per applicarlo."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "選択的な取り消しはプレビューできません。適用するには「変更を元に戻す」を実行してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택적 실행 취소는 미리 볼 수 없습니다. 적용하려면 변경 사항 되돌리기를 실행하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Selectief herstellen kan niet worden bekeken. Voer Wijzigingen terugdraaien uit om het toe te passen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można wyświetlić podglądu selektywnego cofania. Uruchom Przywróć zmiany, aby je zastosować."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não é possível pré-visualizar o desfazer seletivo. Execute Reverter Alterações para aplicá-lo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предварительный просмотр выборочной отмены невозможен. Выполните команду «Вернуть изменения», чтобы применить ее."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Selektiv ångring kan inte förhandsvisas. Kör Återställ ändringar för att tillämpa den."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seçmeli geri alma önizlenemez. Uygulamak için Değişiklikleri Geri Al komutunu çalıştırın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法预览选择性撤销。请运行“复原更改”以应用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法預覽選擇性還原。請執行「回復更動」以套用。"
+          }
+        }
+      }
+    },
     "Selects or deselects the page" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -313906,6 +314173,184 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "朗讀"
+          }
+        }
+      }
+    },
+    "Speech did not accept recorded audio. Try regenerating the transcript." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Spracherkennung hat das aufgenommene Audio nicht angenommen. Versuche, das Transkript neu zu erstellen."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El reconocimiento de voz no ha aceptado el audio grabado. Prueba a regenerar la transcripción."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La reconnaissance vocale n’a pas accepté l’audio enregistré. Essayez de régénérer la transcription."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il riconoscimento vocale non ha accettato l’audio registrato. Prova a rigenerare la trascrizione."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音声認識が録音されたオーディオを受け付けませんでした。文字起こしを再生成してみてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "음성 인식이 녹음된 오디오를 받아들이지 않았습니다. 대본을 다시 생성해 보십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spraakherkenning heeft de opgenomen audio niet geaccepteerd. Probeer de transcriptie opnieuw te genereren."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rozpoznawanie mowy nie przyjęło nagranego dźwięku. Spróbuj ponownie wygenerować transkrypcję."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O reconhecimento de fala não aceitou o áudio gravado. Tente gerar a transcrição novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Распознавание речи не приняло записанное аудио. Попробуйте создать расшифровку заново."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Taligenkänningen accepterade inte det inspelade ljudet. Försök skapa transkriptionen igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konuşma tanıma kaydedilen sesi kabul etmedi. Transkripti yeniden oluşturmayı deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "语音识别未接受录制的音频。请尝试重新生成转录文本。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "語音辨識未接受錄製的音訊。請嘗試重新產生逐字稿。"
+          }
+        }
+      }
+    },
+    "Speech did not finish this recording window" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Spracherkennung hat diesen Aufnahmeabschnitt nicht abgeschlossen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El reconocimiento de voz no ha terminado este tramo de la grabación"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La reconnaissance vocale n’a pas terminé cette portion de l’enregistrement"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il riconoscimento vocale non ha completato questa porzione di registrazione"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "音声認識がこの録音区間を完了できませんでした"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "음성 인식이 이 녹음 구간을 완료하지 못했습니다"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spraakherkenning heeft dit deel van de opname niet voltooid"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rozpoznawanie mowy nie ukończyło tego fragmentu nagrania"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O reconhecimento de fala não concluiu este trecho da gravação"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Распознавание речи не завершило этот фрагмент записи"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Taligenkänningen slutförde inte det här inspelningsavsnittet"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konuşma tanıma bu kayıt bölümünü tamamlamadı"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "语音识别未完成此录音片段"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "語音辨識未完成此錄音片段"
           }
         }
       }
@@ -342329,6 +342774,95 @@
         }
       }
     },
+    "The selected photo could not be loaded. Please try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das ausgewählte Foto konnte nicht geladen werden. Versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se ha podido cargar la foto seleccionada. Inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible de charger la photo sélectionnée. Veuillez réessayer."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile caricare la foto selezionata. Riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "選択した写真を読み込めませんでした。もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 사진을 불러올 수 없습니다. 다시 시도하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De geselecteerde foto kan niet worden geladen. Probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można wczytać wybranego zdjęcia. Spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível carregar a foto selecionada. Tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось загрузить выбранное фото. Повторите попытку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det valda fotot kunde inte läsas in. Försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seçilen fotoğraf yüklenemedi. Lütfen yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法载入所选照片。请重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法載入所選照片。請再試一次。"
+          }
+        }
+      }
+    },
     "The server answered %lld to %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -348021,6 +348555,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此文件沒有來源檔案。"
+          }
+        }
+      }
+    },
+    "This document is in the Trash. Restore it before opening the link." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Dokument liegt im Papierkorb. Stelle es wieder her, bevor du den Link öffnest."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este documento está en la Papelera. Restáuralo antes de abrir el enlace."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ce document se trouve dans la Corbeille. Restaurez-le avant d’ouvrir le lien."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo documento è nel Cestino. Ripristinalo prima di aprire il link."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この書類はゴミ箱にあります。リンクを開く前に復元してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 문서는 휴지통에 있습니다. 링크를 열기 전에 복원하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dit document staat in de prullenmand. Zet het terug voordat je de link opent."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ten dokument jest w Koszu. Przywróć go przed otwarciem łącza."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este documento está na Lixeira. Restaure-o antes de abrir o link."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этот документ находится в Корзине. Восстановите его, прежде чем открывать ссылку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det här dokumentet ligger i papperskorgen. Återställ det innan du öppnar länken."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu belge Çöp Kutusu’nda. Bağlantıyı açmadan önce geri yükleyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文稿位于废纸篓中。请先恢复再打开链接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此文件位於垃圾桶中。請先復原再打開連結。"
           }
         }
       }
