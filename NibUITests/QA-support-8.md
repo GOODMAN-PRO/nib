@@ -86,3 +86,11 @@ S:singles-insert#0 and S:singles-rest#0 correction show real visible Photo frame
 | --- | --- | --- |
 | Three Photos selection flows | Photos asset coordinate selection / selection unobserved | Did the coordinate tap enable Add/Done or close the picker? Failure retains hierarchy and screenshot. |
 | All four Photos lookup callers | Photos assets before/after lookup | Are grid assets visible and still reported non-hittable? |
+
+## H5 - expanded image share actions
+
+S:singles-rest#7 confirms actionGroupCell View More and no Save to Files in the image activity sheet. saveSharedPNG now searches buttons, cells and static texts, opens View More only if Save to Files is absent, and uses the existing shared reveal on the resulting list when needed. Existing unique-directory PNG-byte and dismissal assertions stay. Expected Selection screenshot and page-region screenshot exports. Next CI must expose Save to Files after expansion and save a decodable PNG; the resulting list was not observed in the baseline.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Both Selection PNG export tests | PNG share View More | Which action types and rows appear after expansion? Existing export-failed diagnostics retain screenshot. |

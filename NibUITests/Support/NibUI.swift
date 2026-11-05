@@ -1037,9 +1037,36 @@ final class NibUI {
         defer {
             if !finished { recordDiagnostics("Save to Files PNG export failed") }
         }
-        let action = app.buttons["Save to Files"].firstMatch
-        revealFormElement(action)
-        guard action.waitForExistence(timeout: 10), action.isHittable else {
+        func shareAction(_ name: String, actionable: Bool = true) -> XCUIElement? {
+            for type in [XCUIElement.ElementType.button, .cell, .staticText] {
+                if let found = findControl(name, type: type, actionable: actionable) { return found }
+            }
+            return nil
+        }
+        if shareAction("Save to Files", actionable: false) == nil {
+            var more: XCUIElement?
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                more = shareAction("View More")
+                return more != nil || shareAction("Save to Files") != nil
+            }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: 10) == .completed else {
+                throw Failure.message("PNG share sheet must offer Save to Files or View More")
+            }
+            if shareAction("Save to Files") == nil, let more {
+                more.tap()
+                logQA("PNG share View More", app.debugDescription)
+            }
+        }
+        if shareAction("Save to Files") == nil {
+            revealFormElement {
+                shareAction("Save to Files", actionable: false) ?? self.app.cells["Save to Files"].firstMatch
+            }
+        }
+        var action: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            action = shareAction("Save to Files"); return action != nil
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 10) == .completed, let action else {
             throw Failure.message("PNG share sheet must offer Save to Files")
         }
         action.tap()
