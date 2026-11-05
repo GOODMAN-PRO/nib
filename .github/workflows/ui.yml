@@ -196,6 +196,16 @@ jobs:
               except Exception as error:
                   with open(name + '.txt', 'a') as note:
                       note.write('sample failed: ' + str(error) + '\n')
+              # The app can be idle while XCTest's requests no longer reach it: the test runner and the
+              # test manager daemon show which side is waiting.
+              for label, finder in (('runner', ['pgrep', '-f', 'NibUITests-Runner']), ('testmanagerd', ['pgrep', '-x', 'testmanagerd'])):
+                  try:
+                      others = subprocess.run(finder, capture_output=True, text=True).stdout.split()
+                      if others:
+                          subprocess.run(['sample', others[-1], '2', '-file', name + '-' + label + '.txt'], capture_output=True, timeout=30)
+                  except Exception as error:
+                      with open(name + '.txt', 'a') as note:
+                          note.write(label + ' sample failed: ' + str(error) + '\n')
           def watchdog():
               while not watch['done']:
                   time.sleep(5)
@@ -214,7 +224,7 @@ jobs:
                   watch['line'] = line.strip()[:300]
                   if test_start is None and ('Testing started' in line or "Test Suite '" in line):
                       test_start = time.time()
-                  if 'notification not received' in line:
+                  if 'notification not received' in line or 'Timed out while evaluating UI query' in line:
                       threading.Thread(target=sample, args=(line.strip()[:300],), daemon=True).start()
               code = process.wait()
           watch['done'] = True
