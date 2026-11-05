@@ -1404,14 +1404,23 @@ final class InkUITests: XCTestCase {
         try tap("Stylus"); try tap("Apple Pencil", scroll: true)
     }
 
+    private func revealPencilPreference(_ name: String) {
+        let detail = ui.app.collectionViews.containing(NSPredicate(
+            format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
+            "Switch between current tool and eraser")).firstMatch
+        ui.revealFormElement(in: detail) { self.ui.app.switches[name].firstMatch }
+    }
+
     func testPencilHoverSettingPersistsWithoutCreatingMarks() throws {
         let before = try ui.state()
         try pencilSettings()
+        revealPencilPreference("Show hover preview")
         try toggle("Show hover preview", to: false)
         try toggle("Show hover preview", to: true)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
+        revealPencilPreference("Show hover preview")
         XCTAssertEqual(try control("Show hover preview", type: .switch, scroll: true).value as? String, "1")
     }
 
@@ -1433,11 +1442,13 @@ final class InkUITests: XCTestCase {
     func testPencilHapticsPreferencePersistsWithoutMarks() throws {
         let before = try ui.state()
         try pencilSettings()
+        revealPencilPreference("Pencil haptics")
         try toggle("Pencil haptics", to: false)
         try toggle("Pencil haptics", to: true)
         try closePreferences()
         try assertNoNewInk(before)
         try pencilSettings()
+        revealPencilPreference("Pencil haptics")
         XCTAssertEqual(try control("Pencil haptics", type: .switch, scroll: true).value as? String, "1")
     }
 

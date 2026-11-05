@@ -228,3 +228,7 @@ S:singles-rest#12 correction proves Done was tapped while the picker remained, b
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Ink colour picker close callers | Colour picker Done candidate | What frame and parent did the ambiguous Done have? |
+
+## C18 - explicit Apple Pencil detail container
+
+D:controls-forms#2 shows absent lazy Hover/Haptics rows and successful explicit-container Squeeze scrolling. Both preference tests now pass the collection containing Switch between current tool and eraser to shared reveal before initial use and reopen assertions. No reveal implementation changes. CI must show detail-pane drags and persisted on/off state with no marks; initial absent-target direction remains measured by existing reveal diagnostics.
