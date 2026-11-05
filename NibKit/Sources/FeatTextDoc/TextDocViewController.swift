@@ -67,6 +67,9 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     private var embedded: [NibID: EmbeddedView] = [:]
     static let detachedTableLimit = 4
     private var embeddedRecency: [NibID] = []
+    private var activeTableQueues: CurrentValueSubject<Set<UIView>, Never>? {
+        app.services.get("tables.activeQueues")
+    }
     var retainedEmbeddedViewCount: Int { embedded.count }
     private var embeddedHeights: [NibID: CGFloat] = [:]
 
@@ -86,6 +89,12 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         super.init(nibName: nil, bundle: nil)
         session.editor = self
         undoProxy.editor = self
+        // The table service updates synchronously on the main actor. Trim using that exact activity update.
+        if let activeTableQueues {
+            activeTableQueues.sink { [weak self] active in
+                self?.trimDetachedTables(active: active)
+            }.store(in: &cancellables)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -1129,7 +1138,7 @@ extension TextDocViewController: UICollectionViewDelegate {
         // UIKit may redisplay a prepared cell without calling its registration/provider again.
         guard let cell = cell as? BlockCell, let block = cell.block,
               Self.embeddedKey(block) != nil, !Self.hasFirstResponder(cell) else { return }
-        configure(cell, id: block.id)
+        cell.reattachEmbeddedView()
     }
 
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell,
@@ -1261,9 +1270,14 @@ extension TextDocViewController: BlockCellHost {
 
     /// Keep the visible/active editors and a few recently detached tables. Heights remain cheap to retain.
     func trimDetachedTables() {
+        trimDetachedTables(active: activeTableQueues?.value ?? [])
+    }
+
+    private func trimDetachedTables(active: Set<UIView>) {
         let detached = embeddedRecency.filter { id in
             guard let entry = embedded[id] else { return false }
-            return entry.key == BlockKind.table.rawValue && entry.view.superview == nil && !Self.hasFirstResponder(entry.view)
+            return entry.key == BlockKind.table.rawValue && entry.view.superview == nil
+                && !active.contains(entry.view) && !Self.hasFirstResponder(entry.view)
         }
         for id in detached.prefix(max(0, detached.count - Self.detachedTableLimit)) {
             embedded[id] = nil

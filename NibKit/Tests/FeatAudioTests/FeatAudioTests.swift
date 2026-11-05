@@ -1022,6 +1022,25 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(reads, 2, "A pending buffer callback cannot resume reading after failure")
     }
 
+    func testStreamingShortReadsOnlyFailBeforeTheFinalChunk() throws {
+        for isFinal in [false, true] {
+            XCTAssertNoThrow(try PlaybackProgress.validateRead(frames: 0, requested: 100, isFinal: isFinal))
+            XCTAssertNoThrow(try PlaybackProgress.validateRead(frames: 100, requested: 100, isFinal: isFinal))
+        }
+        XCTAssertNoThrow(try PlaybackProgress.validateRead(frames: 40, requested: 100, isFinal: true))
+        XCTAssertThrowsError(try PlaybackProgress.validateRead(frames: 40, requested: 100, isFinal: false)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+        let plan = PlaybackPlan.make(from: 0, duration: 3, silence: nil, skipSilence: false)
+        var cursor = PlaybackPlan.ChunkCursor(plan: plan, sampleRate: 100, fileLength: 250, maxFrames: 100)
+        _ = cursor.next()
+        XCTAssertFalse(cursor.isAtEnd)
+        _ = cursor.next()
+        XCTAssertFalse(cursor.isAtEnd)
+        XCTAssertEqual(cursor.next()?.count, 50)
+        XCTAssertTrue(cursor.isAtEnd)
+    }
+
     func testThePlaybackBarShowsWhileAClipIsLoaded() async throws {
         let (h, audio) = try harness()
         audio.makeEngine = { FakePlaybackEngine(length: 600) }

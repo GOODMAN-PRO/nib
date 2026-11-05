@@ -973,15 +973,16 @@ enum TextDocPrintImages {
     }
 
     /// Validate headers AND pixels; a readable header alone does not guarantee a decodable image.
-    /// Each bitmap is released before the next, including when preparing the print renderer.
+    /// Each bitmap is released before the next. Printing preflights headers only; drawing validates the pixels.
     static func validate(_ snapshot: TextDocPrintSnapshot,
+                         decodePixels: Bool = true,
                          decode: (AssetStore, AssetRef, DocumentID, CGFloat) -> UIImage? = BlockImageLoader.load) throws {
         for block in snapshot.blocks where block.kind == .image {
             guard let asset = block.asset else { continue } // An empty image placeholder has no referenced content.
             try autoreleasepool {
                 guard let store = snapshot.assets,
                       pixelSize(store, asset: asset, doc: snapshot.doc) != nil,
-                      decode(store, asset, snapshot.doc, snapshot.paper.width * 3) != nil else {
+                      !decodePixels || decode(store, asset, snapshot.doc, snapshot.paper.width * 3) != nil else {
                     throw unreadable(asset)
                 }
             }
@@ -1035,7 +1036,7 @@ enum TextDocPrinter {
             ?? String(localized: "Text Document")
         let snapshot = TextDocPrintSnapshot.make(doc: doc, title: title, blocks: blocks, assets: app.services.assets,
                                                  options: [:])
-        try TextDocPrintImages.validate(snapshot)
+        try TextDocPrintImages.validate(snapshot, decodePixels: false)
         return TextDocPageRenderer(snapshot: snapshot, paper: nil)
     }
 

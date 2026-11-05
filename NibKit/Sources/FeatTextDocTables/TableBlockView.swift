@@ -798,6 +798,7 @@ final class TableBlockView: UIView {
     private var heightCache: [CellPosition: (text: RichText, width: CGFloat, height: CGFloat)] = [:]
 
     private var tail: Task<Void, Never>?
+    private var queuedOperations = 0
     private var pendingText: (cell: CellPosition, text: RichText)?
     private var commitTask: Task<Void, Never>?
     private var inFlight = 0
@@ -1639,14 +1640,27 @@ final class TableBlockView: UIView {
     @discardableResult
     private func enqueue(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let previous = tail
+        queuedOperations += 1
+        publishQueueActivity()
         let task = Task { @MainActor [self] in
             await previous?.value
             await operation()
-            // A detached table can leave the editor's bounded cache while commands are queued.
-            withExtendedLifetime(self) {}
+            queuedOperations -= 1
+            publishQueueActivity()
         }
         tail = task
         return task
+    }
+
+    /// Synchronous main-actor service for FeatTextDoc: keep this editor discoverable until its queue is idle.
+    /// Detaching flushes debounced typing before the host considers eviction.
+    private func publishQueueActivity() {
+        guard let active: CurrentValueSubject<Set<UIView>, Never> = app.services.get("tables.activeQueues") else { return }
+        var views = active.value
+        let changed: Bool
+        if queuedOperations > 0 { changed = views.insert(self).inserted }
+        else { changed = views.remove(self) != nil }
+        if changed { active.send(views) }
     }
 
     @discardableResult
@@ -1866,7 +1880,7 @@ final class TableBlockView: UIView {
     }
 
     /// Puts text on the pasteboard through clipboard.copyText (F014).
-    private func copyToPasteboard(_ text: String, afterCopy: (@MainActor () -> Void)? = nil) {
+    private func copyToPasteboard(_ text: String, afterCopy: (@MainActor () async -> Void)? = nil) {
         let params: JSONValue = ["text": .string(text)]
         let session = self.session
         let app = self.app
@@ -1874,7 +1888,7 @@ final class TableBlockView: UIView {
             do {
                 _ = try await app.bus.execute(Invocation(command: "clipboard.copyText", params: params, principal: .user,
                                                          session: session))
-                afterCopy?()
+                await afterCopy?()
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                 userInfo: ["command": "clipboard.copyText", "error": NibError.wrap(error)])
@@ -2164,12 +2178,50 @@ final class TableBlockView: UIView {
     }
 
     private func deleteSelection(_ target: TableMenuTarget) {
-        guard !isReadOnly else { return }
+        flushTyping()
+        guard let operation = selectionDeletion(target) else { return }
+        enqueue(operation)
+    }
+
+    /// Capture the deletion now, but execute it directly in the caller's queue position (also used by Cut).
+    private func selectionDeletion(_ target: TableMenuTarget) -> (@MainActor () async -> Void)? {
+        guard !isReadOnly, let range = target.range(in: table) else { return nil }
+        newTypingGroup()
+        let group = NibID.make().raw
+        let after: AfterEdit = editing != nil ? .editCell : .clearSelection
+        let params: [TableEdit.Params]
         switch target {
-        case .rows: run(.deleteRows, on: target)
-        case .columns: run(.deleteColumns, on: target)
-        case .cells: run(.clearContents, on: target)
-        case .table: run(.deleteTable, on: target)
+        case .rows:
+            guard range.rowCount < table.rows.count else { return nil }
+            params = [TableEdit.Params(ref: ref, op: .deleteRow, row: range.top,
+                                       column: editing?.column ?? range.left, count: range.rowCount)]
+        case .columns:
+            guard range.columnCount < columnCount else { return nil }
+            params = [TableEdit.Params(ref: ref, op: .deleteColumn, row: editing?.row ?? range.top,
+                                       column: range.left, count: range.columnCount)]
+        case .cells:
+            params = TableOps.visibleCells(table).filter { range.contains($0) && !cellText($0).isEmpty }.map {
+                TableEdit.Params(ref: ref, op: .setCell, row: $0.row, column: $0.column, text: .empty)
+            }
+        case .table:
+            let refs: JSONValue = ["refs": .array([.string(ref)])]
+            return { [self] in
+                closeMenus(dismiss: false)
+                await execute("block.delete", refs, group: group)
+            }
+        }
+        return { [self] in
+            for p in params {
+                guard let out = await execute(p, group: group) else { return }
+                switch target {
+                case .rows, .columns:
+                    if after == .clearSelection { select(TableSelection.none) }
+                    finish(after, out)
+                case .cells:
+                    if let e = editing, range.contains(e) { editor.attributedText = style.attributed(.empty) }
+                case .table: break
+                }
+            }
         }
     }
 
@@ -2213,9 +2265,7 @@ final class TableBlockView: UIView {
         case .cut:
             guard !isReadOnly, let range = target.range(in: table) else { return }
             flushTyping()
-            copyToPasteboard(TableOps.tabSeparated(table, range)) { [weak self] in
-                self?.deleteSelection(target)
-            }
+            copyToPasteboard(TableOps.tabSeparated(table, range), afterCopy: selectionDeletion(target))
         }
     }
 

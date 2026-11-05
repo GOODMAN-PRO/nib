@@ -965,6 +965,15 @@ final class BlockCell: UICollectionViewCell {
         }
     }
 
+    /// Redisplay a prepared cell without configuring it or applying plugin decorators a second time.
+    func reattachEmbeddedView() {
+        guard !mediaIsEmbedded, let block, let view = host?.embeddedView(for: block) else { return }
+        let height = host?.embeddedHeight(for: block.id)
+            ?? (block.kind == .custom ? CGFloat(block.custom?.height ?? 120)
+                : max(view.intrinsicContentSize.height, NibMetrics.hitTarget))
+        setMediaContent(view, height: height, embedded: true)
+    }
+
     // MARK: Accessories
 
     /// Shows the assistant mark on the focused or hovered block (never while reading only).

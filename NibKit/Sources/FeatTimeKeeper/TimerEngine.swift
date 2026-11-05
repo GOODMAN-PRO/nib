@@ -435,9 +435,14 @@ enum DurationParser {
 
     static func unitValue(_ word: String) -> Double? {
         switch word {
-        case "h", "hr", "hrs", "hour", "hours", "std", "stunde", "stunden": return 3600
-        case "m", "min", "mins", "minute", "minutes", "minuten": return 60
-        case "s", "sec", "secs", "second", "seconds", "sek", "sekunde", "sekunden": return 1
+        case "h", "hr", "hrs", "hour", "hours", "std", "stunde", "stunden",
+             "hora", "horas", "heure", "heures", "ora", "ore", "uur", "godz", "godzina", "godziny",
+             "timme", "timmar", "saat": return 3600
+        case "m", "min", "mins", "minute", "minutes", "minuten",
+             "minuto", "minutos", "minuut", "minut", "minuty", "minuta", "minuter", "dakika", "minuti": return 60
+        case "s", "sec", "secs", "second", "seconds", "sek", "sekunde", "sekunden",
+             "segundo", "segundos", "seconde", "secondes", "secondo", "secondi", "seconden",
+             "sekund", "sekundy", "sekunder", "saniye": return 1
         default: return nil
         }
     }

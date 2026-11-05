@@ -80,6 +80,11 @@ struct PlaybackPlan: Equatable {
             }
             return nil
         }
+
+        var isAtEnd: Bool {
+            var probe = self
+            return probe.next() == nil
+        }
     }
 }
 
@@ -103,6 +108,13 @@ struct PlaybackProgress: Equatable {
         guard !failed else { return nil }
         do { try operation(); return nil }
         catch { failed = true; return error }
+    }
+
+    /// Compressed files can overstate their length. Empty reads and a short final chunk are normal EOF.
+    static func validateRead(frames: Int, requested: Int, isFinal: Bool) throws {
+        guard frames == 0 || frames == requested || isFinal else {
+            throw NibError(.unavailable, String(localized: "The recording could not be read completely."))
+        }
     }
 
     mutating func scheduled() { pending += 1 }
@@ -371,20 +383,19 @@ final class AVPlaybackEngine: PlaybackEngine {
 
     /// The queue: reads, processes and schedules the plan's next chunk, or marks the plan as run out.
     private func scheduleNext() {
-        guard var r = reader, !r.progress.failed, let file else { return }
+        guard var r = reader, !r.progress.failed, !r.progress.exhausted, let file else { return }
         let format = file.processingFormat
         while let chunk = r.cursor.next() {
             let count = AVAudioFrameCount(chunk.count)
+            let isFinal = r.cursor.isAtEnd
             var loaded: AVAudioPCMBuffer?
             if let error = r.progress.read({
                 guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count) else {
-                    throw NibError.unavailable(String(localized: "Audio playback buffer"))
+                    throw NibError(.internalError, String(localized: "The audio could not be prepared for playback."))
                 }
                 file.framePosition = chunk.start
                 try file.read(into: buffer, frameCount: count)
-                guard buffer.frameLength == count else {
-                    throw NibError.unavailable(String(localized: "The recording could not be read completely."))
-                }
+                try PlaybackProgress.validateRead(frames: Int(buffer.frameLength), requested: Int(count), isFinal: isFinal)
                 loaded = buffer
             }) {
                 reader = r
@@ -394,7 +405,8 @@ final class AVPlaybackEngine: PlaybackEngine {
             }
             guard let buffer = loaded else { return }
             let frames = Int(buffer.frameLength)
-            guard frames > 0 else { continue }
+            guard frames > 0 else { break }
+            if frames < Int(count) { r.progress.ranOut() }
             if let data = buffer.floatChannelData {
                 for ch in 0..<min(Int(format.channelCount), r.reducers.count) {
                     if reduceNoise { r.reducers[ch].process(data[ch], count: frames) }

@@ -135,6 +135,18 @@ final class TimerEngineTests: XCTestCase {
         for (text, expected) in cases {
             XCTAssertEqual(DurationParser.seconds(from: text), expected, "'\(text)'")
         }
+        let localised: [(Int, [String])] = [
+            (3600, ["hora", "horas", "heure", "heures", "ora", "ore", "uur", "godz", "godzina", "godziny",
+                    "timme", "timmar", "saat"]),
+            (60, ["minuto", "minutos", "minuut", "minut", "minuty", "minuta", "minuter", "dakika", "minuti"]),
+            (1, ["segundo", "segundos", "seconde", "secondes", "secondo", "secondi", "seconden",
+                 "sekund", "sekundy", "sekunder", "saniye"])
+        ]
+        for (seconds, words) in localised {
+            for word in words {
+                XCTAssertEqual(DurationParser.seconds(from: "2 \(word)"), 2 * seconds, word)
+            }
+        }
     }
 
     func testPresetAndSavedModeSupersedePendingRecognition() {

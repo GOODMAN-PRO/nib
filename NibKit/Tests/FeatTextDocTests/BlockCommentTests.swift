@@ -986,6 +986,10 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertNotNil(TextDocPrintImages.pixelSize(h.assets, asset: Fixtures.pngAsset, doc: doc))
         XCTAssertThrowsError(try TextDocPrintImages.validate(valid, decode: { _, _, _, _ in nil }),
                              "A valid header with failed pixel decoding must fail preflight")
+        XCTAssertNoThrow(try TextDocPrintImages.validate(valid, decodePixels: false, decode: { _, _, _, _ in
+            XCTFail("Print preflight must not decode pixels on the main actor")
+            return nil
+        }))
         XCTAssertNoThrow(try TextDocPDF.data(valid))
     }
 
