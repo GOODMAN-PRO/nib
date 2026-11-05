@@ -283,7 +283,7 @@ struct CollabDigest: Codable, Equatable {
     static func delta(content: DocumentContent, items: [PageID: [Item]], against other: CollabDigest,
                       doc: DocumentID) -> DocumentPatch {
         var patch = DocumentPatch(doc: doc)
-        if isNewer(content.meta.rev, than: other.meta) { patch.meta = content.meta }
+        if isNewer(content.meta.rev, than: other.meta) { patch.meta = CollabPrivacy.meta(content.meta) }
         patch.pages = content.pages.filter { isNewer($0.rev, than: other.pages[$0.id.raw]) }
         patch.outline = content.outline.filter { isNewer($0.rev, than: other.outline[$0.id.raw]) }
         patch.blocks = content.blocks.filter { isNewer($0.rev, than: other.blocks[$0.id.raw]) }
@@ -457,7 +457,13 @@ enum CollabFrames {
     static func damaged() -> NibError { NibError.invalid("damaged collaboration frame") }
 
     static func frames(for message: CollabMessage) throws -> [Data] {
-        let json = try makeEncoder().encode(message)
+        // The wire boundary covers initial sync, live commits and forwarding another peer's patch.
+        var outgoing = message
+        if let meta = outgoing.patch?.meta { outgoing.patch?.meta = CollabPrivacy.meta(meta) }
+        if let meta = outgoing.snapshot?.content?.content.meta {
+            outgoing.snapshot?.content?.content.meta = CollabPrivacy.meta(meta)
+        }
+        let json = try makeEncoder().encode(outgoing)
         guard json.count <= maxMessageBytes else { throw tooLarge() }
         var body = json
         var flags: UInt8 = 0
@@ -885,6 +891,35 @@ enum CollabBlobIO {
 
 // MARK: - Package snapshots
 
+enum CollabPrivacy {
+    static func meta(_ incoming: DocumentMeta) -> DocumentMeta {
+        var clean = incoming
+        clean.sourceBookmark = nil
+        clean.trashedFrom = nil
+        clean.favorite = false
+        clean.locked = false
+        return clean
+    }
+
+    /// Preserve unknown fields and revisions in every device head, including provider conflict copies.
+    /// Some library implementations wrap the head in `content`; never ship that wrapper's private meta either.
+    static func headData(_ data: Data) throws -> Data {
+        guard var head = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+        let keys = ["sourceBookmark", "trashedFrom", "favorite", "locked"]
+        var changed = false
+        if var meta = head["meta"] as? [String: Any] {
+            for key in keys { if meta.removeValue(forKey: key) != nil { changed = true } }
+            head["meta"] = meta
+        }
+        if var content = head["content"] as? [String: Any], var meta = content["meta"] as? [String: Any] {
+            for key in keys { if meta.removeValue(forKey: key) != nil { changed = true } }
+            content["meta"] = meta
+            head["content"] = content
+        }
+        return changed ? try JSONSerialization.data(withJSONObject: head, options: [.sortedKeys]) : data
+    }
+}
+
 /// Zips a document package for a joiner and unpacks one safely. Runs off the main actor (file I/O only).
 enum CollabPackageIO {
     /// Largest expanded snapshot accepted (1 GB).
@@ -898,7 +933,16 @@ enum CollabPackageIO {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let zipURL = dir.appendingPathComponent("snapshot.zip")
         do {
-            try fm.zipItem(at: package, to: zipURL, shouldKeepParent: true, compressionMethod: .deflate)
+            let copy = dir.appendingPathComponent(package.lastPathComponent, isDirectory: true)
+            try fm.copyItem(at: package, to: copy)
+            // Sanitize the scratch copy before any bytes enter the transport; the host's package stays untouched.
+            for file in try fm.contentsOfDirectory(at: copy, includingPropertiesForKeys: nil) where file.pathExtension == "json" {
+                let data = try Data(contentsOf: file)
+                let clean = try CollabPrivacy.headData(data)
+                if clean != data { try clean.write(to: file, options: .atomic) }
+            }
+            try fm.zipItem(at: copy, to: zipURL, shouldKeepParent: true, compressionMethod: .deflate)
+            try fm.removeItem(at: copy)
         } catch {
             try? fm.removeItem(at: dir)
             throw error
@@ -2510,6 +2554,7 @@ final class CollabSession {
     static func rewrite(_ patch: DocumentPatch, to doc: DocumentID) -> DocumentPatch {
         var p = patch
         p.doc = doc
+        p.meta = p.meta.map { CollabPrivacy.meta($0) }
         p.meta?.id = doc
         return p
     }
@@ -2527,12 +2572,7 @@ final class CollabSession {
 
     /// The same for a document arriving in this library for the first time.
     static func receivedMeta(_ incoming: DocumentMeta) -> DocumentMeta {
-        var m = incoming
-        m.favorite = false
-        m.locked = false
-        m.trashedFrom = nil
-        m.sourceBookmark = nil
-        return m
+        CollabPrivacy.meta(incoming)
     }
 
     static func makeSecret() -> String {

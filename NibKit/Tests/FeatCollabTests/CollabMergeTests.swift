@@ -150,6 +150,47 @@ final class CollabMergeTests: XCTestCase {
 
     // MARK: Wire format
 
+    func testPrivateMetaNeverEntersPatchSyncOrContentSnapshotFrames() async throws {
+        let h = Harness()
+        var content = try h.app.workspace.content(Fixtures.docID)
+        content.meta.sourceBookmark = Data("/Users/Ada/Private/source.pdf".utf8)
+        content.meta.trashedFrom = "Private/Class"
+        content.meta.favorite = true
+        content.meta.locked = true
+        content.meta.language = "de-DE"
+        let delta = CollabDigest.delta(content: content, items: [:], against: CollabDigest(), doc: Fixtures.docID)
+        assertPrivateMetaRemoved(try XCTUnwrap(delta.meta))
+        let patch = DocumentPatch(doc: Fixtures.docID, meta: content.meta)
+        assertPrivateMetaRemoved(try XCTUnwrap(CollabSession.rewrite(patch, to: Fixtures.docID).meta))
+        let snapshot = CollabMessage.Snapshot(doc: Fixtures.docID, title: "Shared", kind: .notebook, format: .content,
+            content: CollabMessage.SnapshotContent(content: content, items: [:]))
+        // Even a caller supplying unsanitized records cannot bypass the wire boundary.
+        let messages = [CollabMessage(kind: .patch, session: "S", from: "host", patch: patch),
+                        CollabMessage(kind: .syncReply, session: "S", from: "host", patch: patch),
+                        CollabMessage(kind: .snapshot, session: "S", from: "host", snapshot: snapshot)]
+        for message in messages {
+            let frames = try CollabFrames.frames(for: message)
+            let assembler = CollabFrames.Assembler()
+            var decoded: CollabMessage?
+            for frame in frames {
+                if let value = Self.message(try assembler.feed(frame, from: "host", trusted: true)) { decoded = value }
+            }
+            let meta = try XCTUnwrap(decoded?.patch?.meta ?? decoded?.snapshot?.content?.content.meta)
+            assertPrivateMetaRemoved(meta)
+            XCTAssertEqual(meta.language, "de-DE")
+            XCTAssertEqual(meta.rev, content.meta.rev)
+        }
+        XCTAssertNotNil(content.meta.sourceBookmark)
+        XCTAssertEqual(content.meta.trashedFrom, "Private/Class")
+    }
+
+    private func assertPrivateMetaRemoved(_ meta: DocumentMeta, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertNil(meta.sourceBookmark, file: file, line: line)
+        XCTAssertNil(meta.trashedFrom, file: file, line: line)
+        XCTAssertFalse(meta.favorite, file: file, line: line)
+        XCTAssertFalse(meta.locked, file: file, line: line)
+    }
+
     func testSmallMessagesAreOneFrame() throws {
         let message = CollabMessage(kind: .status, session: "S1", from: "00000007",
                                     status: CollabMessage.Status(page: "page:FIXTUREDOC01/FIXTUREPG001"))
@@ -452,6 +493,30 @@ final class CollabMergeTests: XCTestCase {
     }
 
     // MARK: Package snapshots
+
+    func testOutgoingPackageSanitizesAllHeadsAndLeavesOriginalBytesIntact() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("collab-private-" + UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let package = root.appendingPathComponent("Private.nibnote", isDirectory: true)
+        try fm.createDirectory(at: package, withIntermediateDirectories: true)
+        var content = try Harness().app.workspace.content(Fixtures.docID)
+        content.meta.sourceBookmark = Data("/Users/Ada/private.pdf".utf8)
+        content.meta.trashedFrom = "Private/Class"
+        content.meta.favorite = true
+        content.meta.locked = true
+        let original = try JSONEncoder().encode(content)
+        let names = ["doc.00000007.json", "doc.00000008.json", "doc.00000007 (conflicted copy).json"]
+        for name in names { try original.write(to: package.appendingPathComponent(name)) }
+        let unpacked = try CollabPackageIO.unzip(CollabPackageIO.zip(package))
+        defer { try? fm.removeItem(at: CollabPackageIO.scratchFolder(of: unpacked)) }
+        for name in names {
+            let received = try JSONDecoder().decode(DocumentContent.self, from: Data(contentsOf: unpacked.appendingPathComponent(name)))
+            assertPrivateMetaRemoved(received.meta)
+            XCTAssertEqual(received.pages, content.pages)
+            XCTAssertEqual(try Data(contentsOf: package.appendingPathComponent(name)), original)
+        }
+    }
 
     func testPackageSnapshotRoundTrip() throws {
         let fm = FileManager.default
