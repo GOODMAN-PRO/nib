@@ -899,19 +899,44 @@ final class SelectionUITests: XCTestCase {
         XCTAssertEqual(try bounds().minY, bottom.minY, accuracy: 2)
     }
     func testNeatenHandwritingChangesInkAndUndoRestoresMeaningfulSource() throws {
-        // Draw the word HI using four actual pen strokes, readable by on-device recognition.
-        for path in [[CGPoint(x: 0.41, y: 0.56), CGPoint(x: 0.41, y: 0.68)],
-                     [CGPoint(x: 0.47, y: 0.56), CGPoint(x: 0.47, y: 0.68)],
-                     [CGPoint(x: 0.41, y: 0.62), CGPoint(x: 0.47, y: 0.62)],
-                     [CGPoint(x: 0.55, y: 0.57), CGPoint(x: 0.558, y: 0.70)]] { try draw(path) }
+        // Dense, gently curved pen paths are a diagnostic input improvement, not proof that
+        // Vision can recognize text on this simulator. Keep the meaningful-source assertion below.
+        func roundedStroke(_ a: CGPoint, _ b: CGPoint, _ c: CGPoint, _ d: CGPoint) -> [CGPoint] {
+            (0..<16).map { index in
+                let t = CGFloat(index) / 15
+                let u = 1 - t
+                let w0 = u * u * u, w1 = 3 * u * u * t
+                let w2 = 3 * u * t * t, w3 = t * t * t
+                let x = w0 * a.x + w1 * b.x + w2 * c.x + w3 * d.x
+                let y = w0 * a.y + w1 * b.y + w2 * c.y + w3 * d.y
+                return CGPoint(x: x, y: y)
+            }
+        }
+        let sourcePaths = [
+            roundedStroke(CGPoint(x: 0.415, y: 0.54), CGPoint(x: 0.403, y: 0.58),
+                          CGPoint(x: 0.413, y: 0.68), CGPoint(x: 0.41, y: 0.72)),
+            roundedStroke(CGPoint(x: 0.487, y: 0.54), CGPoint(x: 0.477, y: 0.59),
+                          CGPoint(x: 0.488, y: 0.68), CGPoint(x: 0.48, y: 0.72)),
+            roundedStroke(CGPoint(x: 0.41, y: 0.627), CGPoint(x: 0.43, y: 0.617),
+                          CGPoint(x: 0.46, y: 0.622), CGPoint(x: 0.484, y: 0.62)),
+            roundedStroke(CGPoint(x: 0.565, y: 0.54), CGPoint(x: 0.59, y: 0.535),
+                          CGPoint(x: 0.565, y: 0.715), CGPoint(x: 0.59, y: 0.72))
+        ]
+        for path in sourcePaths { try draw(path) }
         try clear(); let source = try pixels(), before = try ui.state()
+        ui.recordDiagnostics("Neaten source ink", facts: "paths=\(sourcePaths) canvas=\(ui.canvas.frame)", includeHierarchy: false)
         try loop(count: 4)
         let sourceItems = try copiedItems()
         try menu("Convert", "Text")
         let sourceRecognition = try control("Recognised text")
         ui.recordDiagnostics("Neaten source recognition and stroke geometry", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)", includeHierarchy: false)
-        try wait("Source HI must be recognised before testing preservation", timeout: 30) {
-            (sourceRecognition.value as? String ?? "").uppercased().filter { $0.isLetter } == "HI"
+        do {
+            defer {
+                ui.recordDiagnostics("Neaten source recognition final", facts: "recognition=\(String(describing: sourceRecognition.value)); records=\(sourceItems)", includeHierarchy: false)
+            }
+            try wait("Source HI must be recognised before testing preservation", timeout: 30) {
+                (sourceRecognition.value as? String ?? "").uppercased().filter { $0.isLetter } == "HI"
+            }
         }
         try tap("Cancel")
         try loop(count: 4)

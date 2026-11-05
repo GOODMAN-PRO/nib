@@ -231,3 +231,14 @@ C5 source-review correction to the diagnosis's inferred label: baseline ui-Pages
 P:pages-drag-select#4's verifier overturns the scene attribution: 5B77B4C2 was original, 0198F6CA new; the missing press log does not prove delivery to no scene or a simulator limitation. Current test calls pages() immediately after Open in New Window. It now logs the AX window list and each window's full raw probe before that chord, including current keyWindowState.isKey/sceneActivation and keyResponder/keyLog. Later control discovery uses H3. All cross-window copy/source/content expectations remain.
 
 The current probe does not identify UIScenes or tie its global responder class to a specific scene; keyboard-focus ownership therefore remains explicitly unavailable under the NibUITests-only scope. Next CI must correlate per-window probe facts with app scene logs to determine which window is key and whether the chord arrives. Authoritative keyboard-focus scene IDs need an app-side probe extension; no focus-reset workaround is added. Uses H3's Window scene probe/count and top-control diagnostics with the unique before-Pages-chord step label.
+
+### C7 - Neaten source diagnostic
+
+Confirmed S:selection-timeouts-and-ink#2's **holds=false** verdict: empty Vision output is established, but straight segments are not a proven cause; the run never demonstrated reading meaningful text. Current test has four two-point strokes. Per the requested input experiment, replaced them with four 16-point cubic pen paths forming gently rounded H/I, 0.18 canvas heights tall (larger than the prior 0.12/0.13-height input), within the existing lasso region. Both glyphs retain four total strokes and all selection, source HI, restyled HI, pixel-change and exact Undo checks. Source screenshot/paths are captured before opening Convert; recognition value and copied source records are logged before and at completion/failure of the unchanged 30-second recognition assertion.
+
+No claim that denser handwriting fixes Vision. Next CI must show source HI and preserve meaning after Neaten, or retain the empty preview with legible source screenshot. The verifier's typed-image control through the app's Vision path and actual InkRender bitmap require app-side work outside this scope; runner screenshots/records cannot substitute for that raster. Raw [Nib QA recognize] bitmap/results remain in app.log.gz, not available to the runner probe.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Selection NeatenHandwriting | Neaten source ink | What 16-point paths and visible source did the test actually draw? |
+| Same | Neaten source recognition and stroke geometry / Neaten source recognition final | What text/placeholder and source records existed before and after the bounded source assertion? |
