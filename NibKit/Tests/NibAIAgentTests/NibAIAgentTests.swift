@@ -23,7 +23,7 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(NibAIAgentFeature.id, "aiagent")
         let h = Harness(features: [NibAIAgentFeature.self])
         XCTAssertTrue(h.app.services.ai is AgentService)
-        for id in ["ai.ask", "ai.chat.list", "ai.chat.rename", "ai.chat.delete", "ai.chat.feedback"] {
+        for id in ["ai.ask", "ai.chat.list", "ai.chat.save", "ai.chat.rename", "ai.chat.delete", "ai.chat.feedback"] {
             XCTAssertEqual(h.app.commands.descriptor(id)?.owner, "aiagent", id)
         }
         let ask = try XCTUnwrap(h.app.commands.descriptor("ai.ask"))
@@ -76,9 +76,71 @@ final class NibAIAgentTests: XCTestCase {
 
     // MARK: Conversations
 
-    /// Acceptance: chat files written by two devices merge by message id.
-    func testFailedTurnWriteReportsErrorAndFlushRecoversWithoutDuplicates() async throws {
-        let (h, agent) = AgentFixture.make(P(events: [P.answer("Saved on retry")]))
+    func testHistoryCommandRejectsLibrarySwitchDuringEitherLoad() async throws {
+        for selectedStage in [false, true] {
+            let (h, agent) = AgentFixture.make(P(events: []))
+            let other = Harness(features: [])
+            let original = agent.chatStore
+            original.ensureChat("PRIVATECHAT", title: "Private title", doc: nil)
+            original.append([original.makeMessage(role: "user", text: "Private question")], chat: "PRIVATECHAT")
+            XCTAssertNil(original.flush())
+            var entered = false
+            var release = false
+            original.beforeHistoryRead = { chat in
+                guard (chat != nil) == selectedStage else { return }
+                entered = true
+                for _ in 0..<1000 where !release { try? await Task.sleep(nanoseconds: 1_000_000) }
+            }
+            defer { original.beforeHistoryRead = nil }
+            let task = Task { try await h.run("ai.chat.list", ["all": true, "chat": "PRIVATECHAT"]) }
+            for _ in 0..<500 where !entered { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertTrue(entered, "The requested history stage must suspend")
+            h.app.services.library = other.library
+            release = true
+            do {
+                _ = try await task.value
+                XCTFail("No summary or message from the old library may be delivered")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+            let fresh = try await h.run("ai.chat.list", ["all": true])
+            XCTAssertEqual(fresh["chats"]?.arrayValue?.count, 0)
+        }
+    }
+
+    func testFailedDeletionCommandRetriesUntilTombstoneIsDurable() async throws {
+        let (h, agent) = AgentFixture.make(P(events: []))
+        let chat = "DELETEFAILURE"
+        let original = agent.chatStore
+        original.ensureChat(chat, title: "Delete me", doc: Fixtures.docID)
+        original.append([original.makeMessage(role: "user", text: "Saved question")], chat: chat)
+        XCTAssertNil(original.flush())
+        let directory = h.library.metadataURL.appendingPathComponent("ai")
+        let destination = directory.appendingPathComponent(original.ownFileName(chat))
+        let backup = try Data(contentsOf: destination)
+        try FileManager.default.removeItem(at: destination)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        for _ in 0..<2 {
+            do {
+                _ = try await h.run("ai.chat.delete", ["chat": .string(chat)])
+                XCTFail("Deletion must not succeed before the tombstone is durable")
+            } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        }
+        h.app.gateway.isLocked = { $0 == Fixtures.docID }
+        do {
+            _ = try await h.run("ai.chat.delete", ["chat": .string(chat)], as: .ai("OTHER"))
+            XCTFail("Retry must retain the deleted conversation's lock check")
+        } catch let error as NibError { XCTAssertEqual(error.code, .locked) }
+        try FileManager.default.removeItem(at: destination)
+        try backup.write(to: destination)
+        _ = try await h.run("ai.chat.delete", ["chat": .string(chat)])
+        let fresh = store(directory, device: 0x0B)
+        XCTAssertTrue(fresh.isDeleted(chat))
+        XCTAssertTrue(fresh.messages(chat).isEmpty)
+        XCTAssertTrue(fresh.summaries(doc: nil, all: true).isEmpty)
+    }
+
+    func testFailedTurnWriteRecoversThroughSaveCommandWithoutRegeneration() async throws {
+        let provider = P(events: [P.answer("Saved on retry")])
+        let (h, agent) = AgentFixture.make(provider)
         let chat = "CHATTEST0001"
         let destination = h.library.metadataURL.appendingPathComponent("ai")
             .appendingPathComponent(agent.chatStore.ownFileName(chat))
@@ -88,16 +150,77 @@ final class NibAIAgentTests: XCTestCase {
             XCTFail("A completed turn must report its persistence failure")
         } catch let error as NibError {
             XCTAssertEqual(error.code, .unavailable)
+            XCTAssertEqual(error.path, "$.chat.persistence")
             XCTAssertNotNil(error.hint)
         }
         XCTAssertNotNil(agent.chatStore.flush())
+        // The old chat UI's generation Retry cannot duplicate the completed question/answer.
+        do {
+            _ = try await agent.complete(AgentFixture.request("Keep my question"))
+            XCTFail("Pending saves require save-only recovery")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        do {
+            _ = try await h.run("ai.chat.save", ["chat": .string(chat)])
+            XCTFail("Save retry must report the still-blocked destination")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        XCTAssertEqual(provider.requests.count, 1)
+        let preview = try await h.app.bus.execute(Invocation(command: "ai.chat.save", params: ["chat": .string(chat)],
+                                                            principal: .user, dryRun: true))
+        XCTAssertEqual(preview.value["text"]?.stringValue, "Saved on retry")
+        XCTAssertNotNil(agent.chatStore.flush(), "A dry run must not acknowledge the blocked save")
+        let other = Harness(features: [])
+        h.app.services.library = other.library
+        do {
+            _ = try await h.run("ai.chat.save", ["chat": .string(chat)])
+            XCTFail("Another library cannot recover this answer")
+        } catch let error as NibError { XCTAssertEqual(error.code, .notFound) }
+        h.app.services.library = h.library
+        h.app.gateway.isLocked = { $0 == Fixtures.docID }
+        do {
+            _ = try await h.run("ai.chat.save", ["chat": .string(chat)], as: .ai("OTHER"))
+            XCTFail("Save recovery must respect document locks")
+        } catch let error as NibError { XCTAssertEqual(error.code, .locked) }
+        let providers = try XCTUnwrap(agent.providerStore as? ScriptedProviderStore)
+        providers.activeID = nil
         try FileManager.default.removeItem(at: destination)
+        let result = try await h.run("ai.chat.save", ["chat": .string(chat)])
+        let response = try result.decode(AIResponse.self)
+        XCTAssertEqual(response.text, "Saved on retry")
+        XCTAssertEqual(response.chatID, chat)
+        XCTAssertEqual(response.usage.output, 10)
+        XCTAssertEqual(provider.requests.count, 1)
         XCTAssertNil(agent.chatStore.flush())
         XCTAssertNil(agent.chatStore.flush())
         let reopened = store(destination.deletingLastPathComponent(), device: 0x0B)
         XCTAssertEqual(reopened.messages(chat).map(\.text), ["Keep my question", "Saved on retry"])
         let records = ChatStore.decodeLines(try Data(contentsOf: destination)).records
         XCTAssertEqual(records.count, 3)
+    }
+
+    func testSaveFailureDoesNotMaskProviderFailureOrSuccessfulCancellation() async throws {
+        for cancelled in [false, true] {
+            let provider = P(events: [P.answer("Unused")])
+            let expected = NibError(.timeout, "Provider timed out")
+            if cancelled { provider.beforeEvents = { throw CancellationError() } }
+            else { provider.failures[0] = expected }
+            let (h, agent) = AgentFixture.make(provider)
+            let destination = h.library.metadataURL.appendingPathComponent("ai")
+                .appendingPathComponent(agent.chatStore.ownFileName("CHATTEST0001"))
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            var finished: [NibEvent] = []
+            let token = h.app.events.subscribe { if $0.type == NibEventType.aiTurnFinished { finished.append($0) } }
+            defer { token.cancel() }
+            do {
+                _ = try await agent.complete(AgentFixture.request("Question"))
+                XCTAssertTrue(cancelled, "Provider failure must still throw")
+            } catch let error as NibError {
+                XCTAssertFalse(cancelled, "Cancellation should retain its successful receipt")
+                XCTAssertEqual(error, expected)
+            }
+            XCTAssertEqual(finished.count, 1)
+            XCTAssertNotNil(finished.first?.payload?["persistenceError"])
+            XCTAssertEqual(finished.first?.payload?["recovery"]?["command"], "ai.chat.save")
+        }
     }
 
     func testHistoryIndexDoesNotRetainBodiesAndSelectionUsesABoundedCache() async throws {

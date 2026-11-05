@@ -198,6 +198,8 @@ final class ChatStore {
     let deviceHex: String
     /// How often `refresh()` rescans the folder for files other devices wrote (forced reads ignore it).
     var scanInterval: TimeInterval = 2
+    /// Test seam for suspending either stage of a command's history load.
+    var beforeHistoryRead: (@MainActor (String?) async -> Void)?
 
     private let directoryProvider: Directory
     private let clock: HLCClock
@@ -285,11 +287,13 @@ final class ChatStore {
     /// The command path awaits disk work instead of blocking the main actor. Synchronous AIService
     /// consumers retain their contract and use the same index and bounded body cache.
     func summariesAsync(doc: DocumentID?, all: Bool = false) async -> [AIChatSummary] {
+        await beforeHistoryRead?(nil)
         await refreshAsync()
         return listedSummaries(doc: doc, all: all)
     }
 
     func stateAsync(_ chat: String) async -> ChatState? {
+        await beforeHistoryRead?(chat)
         await refreshAsync(loading: chat)
         touch(chat)
         guard let state = chats[chat], !state.isDeleted else { return nil }
@@ -304,7 +308,11 @@ final class ChatStore {
         return s
     }
 
-    func ownerDoc(_ chat: String) -> DocumentID? { state(chat)?.meta?.doc.map { DocumentID($0) } }
+    func ownerDoc(_ chat: String) -> DocumentID? {
+        refresh(loading: chat)
+        // Tombstones retain their owner, including while a failed deletion is retried.
+        return overviews[chat]?.meta?.doc.map { DocumentID($0) }
+    }
 
     /// Bare chat ids carry no document ref for the gateway to inspect.
     func checkAccess(_ chat: String, principal: Principal, gateway: Gateway) throws {
@@ -387,7 +395,13 @@ final class ChatStore {
     /// (and shrink to the tombstone the next time those devices read the folder).
     func delete(_ chat: String) throws {
         refresh(force: true, loading: chat)
-        guard let state = chats[chat], !state.isDeleted else { throw ChatStore.unknownChat(chat) }
+        guard let state = chats[chat] else { throw ChatStore.unknownChat(chat) }
+        if state.isDeleted {
+            // A previous attempt may have installed the tombstone but failed to write it.
+            // Deletion is idempotent; success still requires the queued write to be durable.
+            if let error = flush() { throw error }
+            return
+        }
         var meta = state.meta ?? ChatRecord(id: ChatRecord.metaID, rev: .zero, type: ChatRecord.metaType)
         meta.deleted = true
         meta.rev = clock.tick()

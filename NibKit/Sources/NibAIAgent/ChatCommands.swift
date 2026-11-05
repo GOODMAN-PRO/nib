@@ -7,6 +7,7 @@ enum ChatCommands {
     static func register(_ r: CommandRegistry) {
         r.register(AIAsk.self)
         r.register(AIChatList.self)
+        r.register(AIChatSave.self)
         r.register(AIChatRename.self)
         r.register(AIChatDelete.self)
         r.register(AIChatFeedback.self)
@@ -169,6 +170,23 @@ struct AIAsk: NibCommand {
 
 // MARK: - Conversations
 
+/// Persistence recovery is deliberately separate from ai.ask / AIService.stream: no generation.
+struct AIChatSave: NibCommand {
+    struct Params: Codable { var chat: String }
+    typealias Output = AIResponse
+    static let descriptor = CommandDescriptor(
+        id: "ai.chat.save", title: "Retry Saving Conversation",
+        summary: "Save a retained answer after a conversation write failed, without asking the provider again.",
+        params: .obj(["chat": .str("conversation id with an unsaved answer")], required: ["chat"]),
+        examples: [["chat": "FIXTURECHAT1"]], effect: .session, target: .app)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> AIResponse {
+        try ChatCommands.checkChatID(p.chat)
+        let agent = try ChatCommands.agent(ctx)
+        return try await agent.retrySave(chatID: p.chat, principal: ctx.principal, dryRun: ctx.dryRun)
+    }
+}
+
 struct AIChatList: NibCommand {
     struct Params: Codable {
         var doc: String?
@@ -219,9 +237,21 @@ struct AIChatList: NibCommand {
             ctx.principal.isUser || owner.map { !ctx.bus.gateway.isLocked($0) } ?? true
         }
         let store = agent?.chatStore
+        let library = ctx.services.library
+        let libraryRoot = library?.rootURL
+        let metadata = library?.metadataURL
+        func checkLibrary() throws {
+            guard ctx.services.library === library,
+                  ctx.services.library?.rootURL == libraryRoot,
+                  ctx.services.library?.metadataURL == metadata else {
+                throw NibError(.conflict, String(localized: "The library changed while loading conversations."),
+                               hint: String(localized: "Open conversation history again."))
+            }
+        }
         let loaded: [AIChatSummary]
         if let store = store { loaded = await store.summariesAsync(doc: doc, all: p.all ?? false) }
         else { loaded = ai.chats(doc: doc) }
+        try checkLibrary()
         let summaries = loaded.filter { visible($0.doc) }
         let rows = summaries.map { s -> Row in
             let count = store?.messageCount(s.id) ?? ai.messages(chatID: s.id).count
@@ -235,7 +265,9 @@ struct AIChatList: NibCommand {
             }
             return Output(chats: rows, messages: list)
         }
-        guard let state = await store.stateAsync(chat) else { throw ChatStore.unknownChat(chat) }
+        let loadedState = await store.stateAsync(chat)
+        try checkLibrary()
+        guard let state = loadedState else { throw ChatStore.unknownChat(chat) }
         guard visible(state.meta?.doc.map { DocumentID($0) }) else {
             throw NibError(.locked, "the conversation belongs to a locked document", hint: "ask the user to unlock it first")
         }
