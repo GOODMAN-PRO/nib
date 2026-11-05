@@ -44,6 +44,11 @@ enum PageDialogs {
 
 /// What the Go to Page field means: a 1-based page number, else the start (then any part) of a page title.
 enum GoToPageResolver {
+    static func outOfRangeMessage(count: Int) -> String {
+        if count == 1 { return String(localized: "This notebook has 1 page. Enter page 1.") }
+        return String(localized: "This notebook has \(count) pages. Enter a number from 1 to \(count).")
+    }
+
     enum Outcome: Equatable {
         case empty
         case page(Int)
@@ -151,7 +156,7 @@ struct GoToPageDialog: View {
             if let title = pages[index].title, !title.isEmpty { return String(localized: "Page \(index + 1): \(title)") }
             return String(localized: "Page \(index + 1)")
         case .outOfRange:
-            return String(localized: "This notebook has \(pages.count) pages. Enter a number from 1 to \(pages.count).")
+            return GoToPageResolver.outOfRangeMessage(count: pages.count)
         case .noMatch:
             let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
             return String(localized: "No page title matches \u{201C}\(text)\u{201D}.")
