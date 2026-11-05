@@ -34,13 +34,24 @@ final class PluginManagerModel: ObservableObject {
             let value = try await call(CommandIDs.pluginList)
             let entries = try (value["plugins"] ?? []).decode([InstalledPlugin].self)
             let store = app.services.get(ManagerGrants.serviceKey, as: ManagerGrants.self)
-            let grants = try await Task.detached { try store?.read() ?? [:] }.value
+            let grantResult = await Task.detached { Result { try store?.read() ?? [:] } }.value
+            let grants: [String: JSONValue]
+            let grantWarning: String?
+            switch grantResult {
+            case .success(let value):
+                grants = value
+                grantWarning = nil
+            case .failure(let error):
+                // Fail closed, but keep the list available so the user can review, disable or remove plugins.
+                grants = [:]
+                grantWarning = NibError.wrap(error).message
+            }
             let setting = try await call(CommandIDs.settingsGet, ["name": .string(NibSettings.pluginGalleries.name)])
             guard generation == pluginGeneration, !Task.isCancelled else { return }
             plugins = entries
             consented = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, ManagerGrants.scopes($0.id, hash: $0.sha256, grants: grants)) })
             galleries = setting["value"]?.arrayValue?.compactMap(\.stringValue) ?? []
-            error = nil
+            error = grantWarning
         } catch { if generation == pluginGeneration, !Task.isCancelled { self.error = NibError.wrap(error).message } }
     }
     func loadGallery(_ params: JSONValue = [:]) async {

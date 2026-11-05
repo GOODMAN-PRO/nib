@@ -147,6 +147,33 @@ final class FeatPluginManagerTests: XCTestCase {
         XCTAssertTrue(host.loads.isEmpty)
         XCTAssertTrue(ManagerGrants.scopes(plugin.id, hash: "changed", grants: try store.read()).isEmpty)
     }
+    func testUnreadableGrantsKeepPluginsVisibleAndClearStaleConsent() async throws {
+        let h = Harness(features: [FeatPluginManagerFeature.self])
+        let plugin = try installed(source: nil, enabled: false)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.pluginList, title: "List", summary: "List test plugins.",
+                                                  effect: .read, target: .app)) { _, _ in
+            ["plugins": try JSONValue.from([plugin])]
+        }
+        let url = h.library.metadataURL.appendingPathComponent("unreadable-grants.json")
+        let store = ManagerGrants(url: url)
+        h.app.services.set(store, for: ManagerGrants.serviceKey)
+        let grants: JSONValue = [.init(plugin.id): ["sha256": "hash", "scopes": ["network"]]]
+        try JSONEncoder().encode(grants).write(to: url)
+        let model = PluginManagerModel(app: h.app)
+        await model.loadPlugins()
+        XCTAssertEqual(model.consentedScopes(for: plugin), ["network"])
+        for text in ["{truncated", "[]"] {
+            let corrupt = Data(text.utf8)
+            try corrupt.write(to: url)
+            await model.loadPlugins()
+            XCTAssertEqual(model.plugins.map { $0.id }, [plugin.id])
+            XCTAssertTrue(model.consentedScopes(for: plugin).isEmpty)
+            XCTAssertNotNil(model.error, "the recovery warning remains visible alongside the list")
+            XCTAssertFalse(model.loading)
+            XCTAssertEqual(try Data(contentsOf: url), corrupt, "reading must not overwrite the damaged grants")
+        }
+    }
+
     func testNewPluginForwardsEscapedSkeletonThroughInstaller() async throws {
         let h = Harness(features: [FeatPluginManagerFeature.self])
         let host = ManagerHostFake(manifest: try PluginManifest.fixture())
