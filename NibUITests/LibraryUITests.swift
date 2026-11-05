@@ -130,8 +130,14 @@ final class LibraryUITests: XCTestCase {
         else { outside() }
     }
 
-    private func option(_ title: String) throws {
+    private func option(_ title: String, diagnostics: Bool = false) throws {
+        func inspect(_ stage: String) {
+            if diagnostics { ui.recordDiagnostics("Library sort " + stage, facts: ui.elementFacts(app.buttons["cmd.library.setView"].firstMatch), includeHierarchy: false) }
+        }
+        inspect("before tap")
+        defer { inspect("completion") }
         try tap("Sort and View")
+        inspect("after tap")
         // Identify the panel by its own accessible title. Manual is the eighth
         // sort row and can lie outside the native scroll view's accessibility viewport.
         let menu = app.scrollViews.matching(matching("Sort and View")).firstMatch
@@ -703,6 +709,16 @@ final class LibraryUITests: XCTestCase {
             .press(forDuration: 0.4, thenDragTo: item(folder, folder: true).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                    withVelocity: .slow, thenHoldForDuration: 0.6)
         try eventually("Completed folder move must expose its Undo toast", timeout: 5) { undo.exists && !self.item(self.physics).exists }
+        defer { ui.recordDiagnostics("Toast Undo completion", facts: ui.elementFacts(undo), includeHierarchy: false) }
+        var previous: CGRect?
+        try eventually("Toast Undo must have two equal frames", timeout: 3) {
+            guard undo.exists else { return false }
+            let frame = undo.frame
+            self.ui.logQA("Toast Undo frame", "previous=\(String(describing: previous)) current=\(frame) hittable=\(undo.isHittable)")
+            let stable = previous == frame && !frame.isEmpty
+            previous = frame
+            return stable
+        }
         undo.tap()
         try eventually("Toast Undo command must restore the document to its original root parent") { self.item(self.physics).exists }
         try openFolder(folder)
@@ -870,7 +886,7 @@ final class LibraryUITests: XCTestCase {
 
     // library.reorderAccessible
     func testAccessibleMoveEarlierLaterAndBoundaries() throws {
-        try option("Name, A to Z")
+        try option("Name, A to Z", diagnostics: true)
         let before = documentOrder()
         // The visible equivalents call NibReflow.step, the exact handler used by the
         // accessibility custom actions. Simulator runtimes do not provide VoiceOver.

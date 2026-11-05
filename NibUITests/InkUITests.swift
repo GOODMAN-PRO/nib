@@ -58,7 +58,10 @@ final class InkUITests: XCTestCase {
     /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
     private func squeezePaletteBinding() throws -> XCUIElement {
         let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
-        ui.revealFormElement(heading)
+        let pencilDetail = ui.app.collectionViews.containing(NSPredicate(
+            format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
+            "Switch between current tool and eraser")).firstMatch
+        ui.revealFormElement(in: pencilDetail) { heading }
         try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
         let detail = try XCTUnwrap(scrollPanels.filter {
             $0.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).count > 0
@@ -97,10 +100,11 @@ final class InkUITests: XCTestCase {
         element.tap()
     }
 
-    private func settings(_ tool: String) throws {
-        try ui.selectTool(tool)
+    private func settings(_ tool: String, alreadySelected: Bool = false, revealTop: Bool = true) throws {
+        if !alreadySelected { try ui.selectTool(tool) }
         // Tapping the active tool opens its settings even when navigation has folded the options bar.
         try tap("tool." + tool)
+        if !revealTop { return }
         // Popover ScrollViews keep their offset when closed. Start at the type/mode grid each time.
         let topLabel: String
         switch tool {
@@ -109,13 +113,8 @@ final class InkUITests: XCTestCase {
         case "drawShape": topLabel = "Draw and Hold"
         default: topLabel = "Fountain Pen"
         }
-        for _ in 0..<8 {
-            if ui.findControl(topLabel) != nil { return }
-            guard let panel = ui.app.scrollViews.allElementsBoundByIndex.first(where: {
-                $0.identifier != "nib.canvas" && $0.isHittable && $0.frame.width > 200 && $0.frame.width < 600 && $0.frame.height > 180
-            }) else { break }
-            scrollPanel(panel, down: true)
-        }
+        _ = try control(topLabel, scroll: true)
+
     }
 
     private var scrollPanels: [XCUIElement] {
@@ -128,17 +127,6 @@ final class InkUITests: XCTestCase {
             return [.collectionView, .table].contains(panel.elementType)
                 && panel.buttons.allElementsBoundByIndex.contains { $0.isHittable }
         }
-    }
-
-    private func scrollPanel(_ panel: XCUIElement, down: Bool) {
-        // The centre of a pen popover contains custom sliders which consume drag gestures.
-        // Scroll from the panel's 16-point content padding, clear of every slider and toggle.
-        // Native Settings lists inset their cells farther than that padding; their empty margin
-        // does not scroll. Use a row's centre for those lists, away from the trailing switches.
-        let x: CGFloat = [.collectionView, .table].contains(panel.elementType) ? 0.5 : 0.025
-        let start = panel.coordinate(withNormalizedOffset: CGVector(dx: x, dy: down ? 0.2 : 0.8))
-        let end = panel.coordinate(withNormalizedOffset: CGVector(dx: x, dy: down ? 0.8 : 0.2))
-        start.press(forDuration: 0.01, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0)
     }
 
     private func closePopover() {
@@ -172,7 +160,7 @@ final class InkUITests: XCTestCase {
                 // Scroll the actual tap point into view before exercising the switch.
                 let centre = CGPoint(x: target.frame.midX, y: target.frame.midY)
                 if target.isHittable && panel.frame.insetBy(dx: 2, dy: 2).contains(centre) { break }
-                scrollPanel(panel, down: centre.y < panel.frame.minY)
+                ui.revealFormElement(in: panel) { element }
             }
             XCTAssertTrue(target.isHittable, "\(label) switch thumb must be visible")
             target.coordinate(withNormalizedOffset: CGVector(dx: native.exists ? 0.5 : 0.92, dy: 0.5)).tap()
@@ -622,23 +610,24 @@ final class InkUITests: XCTestCase {
     func testHighlighterStabilisationAndCustomWidthChangeRenderedInk() throws {
         let zigzag = (0...12).map { i in CGPoint(x: 0.40 + Double(i) / 60, y: i % 2 == 0 ? 0.61 : 0.64) }
         var smoothed: [Raster] = []
+        try ui.selectTool("highlighter")
         for position: CGFloat in [0.01, 0.99] {
-            try settings("highlighter")
+            try settings("highlighter", alreadySelected: true, revealTop: false)
             _ = try slider("Stabilisation", to: position); closePopover()
             let before = try ui.state(), blank = try raster()
             try draw(zigzag); smoothed.append(try visibleInk(after: blank)); try undo(to: before)
         }
         XCTAssertGreaterThan(smoothed[0].changed(from: smoothed[1]), 20, "Highlighter smoothing must change the drawn path")
         var areas: [Int] = []
+        try settings("highlighter", alreadySelected: true, revealTop: false)
         for position: CGFloat in [0.15, 0.85] {
-            try settings("highlighter")
             let widthValue = try slider("Thickness", to: position); closePopover()
-            try settings("highlighter")
-            XCTAssertEqual(String(describing: try control("Thickness", type: .slider, scroll: true).value), widthValue)
-            closePopover()
             let before = try ui.state(), blank = try raster()
             try draw(); areas.append(try visibleInk(after: blank).changed(from: blank)); try undo(to: before)
+            try settings("highlighter", alreadySelected: true, revealTop: false)
+            XCTAssertEqual(String(describing: try control("Thickness", type: .slider, scroll: true).value), widthValue)
         }
+        closePopover()
         XCTAssertGreaterThan(areas[1], areas[0], "Larger custom highlighter width must cover more paper")
     }
 
@@ -751,7 +740,9 @@ final class InkUITests: XCTestCase {
 
     func testCustomColourValidHexUpdatesSlotAndInvalidHexIsRejected() throws {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
-        try tap("Sliders")
+        try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
+            try tap("Sliders")
+        }
         let hex = try hexField()
         let selection = try ui.state().selectionCount
         hex.tap()
@@ -767,7 +758,9 @@ final class InkUITests: XCTestCase {
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
-        try swatchMenu("Change Colour"); try tap("Custom Colour"); try tap("Sliders")
+        try swatchMenu("Change Colour"); try tap("Custom Colour"); try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
+            try tap("Sliders")
+        }
         let invalid = try hexField()
         invalid.tap()
         try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
@@ -981,13 +974,15 @@ final class InkUITests: XCTestCase {
         }
         let mixed = try ui.state()
         XCTAssertEqual(mixed.itemCountOnPage, initial.itemCountOnPage + 4)
-        for enabled in labels {
-            try settings("eraser"); try tap("Whole stroke")
+        try settings("eraser"); try tap("Whole stroke")
+        let chips = try labels.map { try control($0, type: .button, scroll: true) }
+        for (index, enabled) in labels.enumerated() {
+            if index > 0 { try settings("eraser", alreadySelected: true, revealTop: false) }
             // Enable target first, so the last-enabled-filter guard is respected.
-            let target = try control(enabled, type: .button, scroll: true)
+            let target = chips[index]
             if !target.isSelected { target.tap() }
-            for label in labels where label != enabled {
-                let chip = try control(label, type: .button, scroll: true)
+            for (chipIndex, label) in labels.enumerated() where label != enabled {
+                let chip = chips[chipIndex]
                 if chip.isSelected { chip.tap() }
                 XCTAssertFalse(chip.isSelected)
             }
@@ -1299,15 +1294,35 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try draw()
         try draw([CGPoint(x: 0.4, y: 0.72), CGPoint(x: 0.6, y: 0.72)])
+        func pageFrame() throws -> CGRect {
+            let page = try XCTUnwrap(ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 1 of 4'"))
+                .allElementsBoundByIndex.first { $0.frame.height > 100 })
+            return page.frame
+        }
+        let originalPage = try pageFrame(), originalCanvas = ui.canvas.frame
+        ui.recordDiagnostics("History page before sidebar", facts: "page=\(originalPage) canvas=\(originalCanvas)", includeHierarchy: false)
+        defer { ui.recordDiagnostics("History page completion", facts: "page=\(String(describing: try? pageFrame()))", includeHierarchy: false) }
         try ui.tapCommand("sidebar.toggle"); try tap("Panel Options"); try tap("History")
         _ = try ui.waitForState { $0.openPanels.contains("undo.history") }
         let reverts = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Revert '"))
         try wait("History must offer a Revert action for each stroke") { reverts.count == 2 }
+        ui.recordDiagnostics("History before revert", facts: "page=\(try pageFrame())", includeHierarchy: false)
         reverts.element(boundBy: 1).tap() // newest first: choose the older stroke
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try ui.tapCommand("sidebar.toggle")
-        XCTAssertGreaterThan(try raster(CGRect(x: 0.42, y: 0.71, width: 0.16, height: 0.02)).darkPixels, 10, "Later unrelated stroke must survive selective revert")
-        XCTAssertEqual(try raster(CGRect(x: 0.42, y: 0.61, width: 0.16, height: 0.02)).darkPixels, 0, "Chosen earlier stroke must disappear")
+        let currentPage = try pageFrame(), currentCanvas = ui.canvas.frame
+        ui.recordDiagnostics("History page after sidebar", facts: "page=\(currentPage) canvas=\(currentCanvas)", includeHierarchy: false)
+        // Preserve both bands in page coordinates, including scale changes, rather than a fixed window y.
+        func band(_ y: CGFloat) -> CGRect {
+            let x = (originalCanvas.minX + 0.42 * originalCanvas.width - originalPage.minX) / originalPage.width
+            let localY = (originalCanvas.minY + y * originalCanvas.height - originalPage.minY) / originalPage.height
+            return CGRect(x: (currentPage.minX + x * currentPage.width - currentCanvas.minX) / currentCanvas.width,
+                y: (currentPage.minY + localY * currentPage.height - currentCanvas.minY) / currentCanvas.height,
+                width: 0.16 * originalCanvas.width / originalPage.width * currentPage.width / currentCanvas.width,
+                height: 0.02 * originalCanvas.height / originalPage.height * currentPage.height / currentCanvas.height)
+        }
+        XCTAssertGreaterThan(try raster(band(0.71)).darkPixels, 10, "Later unrelated stroke must survive selective revert")
+        XCTAssertEqual(try raster(band(0.61)).darkPixels, 0, "Chosen earlier stroke must disappear")
     }
 
     // MARK: Pencil palette and simulator-testable Pencil preferences

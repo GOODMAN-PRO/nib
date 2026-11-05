@@ -111,9 +111,22 @@ final class ChromeUITests: XCTestCase {
             XCTAssertEqual(after.redoAvailable, before.redoAvailable)
         }
     }
-    private func draw(y: CGFloat = 0.65) throws {
+    private func diagnosedDraw(_ name: String) throws {
+        defer { ui.recordDiagnostics(name + " completion", includeHierarchy: false) }
+        try wait("Tool settings must be gone before diagnostic stroke") {
+            !self.ui.app.scrollViews.matching(NSPredicate(format: "label == 'Fountain Pen'")).allElementsBoundByIndex.contains {
+                self.ui.hasVisibleFrame($0) && $0.isHittable
+            } && self.ui.app.popovers.count == 0
+        }
+        try draw(diagnostic: name)
+    }
+    private func draw(y: CGFloat = 0.65, diagnostic: String? = nil) throws {
         let before = try ui.state()
-        try ui.drawStroke([CGPoint(x: 0.4, y: y), CGPoint(x: 0.6, y: y + 0.03)])
+        if let diagnostic {
+            try ui.diagnoseAction(diagnostic + " stroke", facts: { String(describing: self.ui.probe.value) }) {
+                try ui.drawStroke([CGPoint(x: 0.4, y: y), CGPoint(x: 0.6, y: y + 0.03)])
+            }
+        } else { try ui.drawStroke([CGPoint(x: 0.4, y: y), CGPoint(x: 0.6, y: y + 0.03)]) }
         _ = try ui.waitForState(timeout: 12) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && $0.undoAvailable }
     }
     private func replace(_ name: String, _ text: String) throws {
@@ -234,7 +247,11 @@ final class ChromeUITests: XCTestCase {
         try open()
         for orientation in [UIDeviceOrientation.portrait, .landscapeLeft] {
             XCUIDevice.shared.orientation = orientation
-            try more("Go to Page…")
+            try ui.diagnoseAction("Rotated More", facts: { self.ui.elementFacts(self.query("menu.more").firstMatch, includeOverlaps: true) }) {
+                try tap("menu.more")
+            }
+            defer { ui.recordDiagnostics("Rotated More final", facts: ui.elementFacts(query("menu.more").firstMatch), includeHierarchy: false) }
+            try tap("Go to Page…")
             try panel("pages.goToPage"); try ui.dismissSheets()
             try more("Hide Tools")
             try wait("More Hide Tools must retract palette") { !self.query("tool.pen").firstMatch.exists }
@@ -438,8 +455,11 @@ final class ChromeUITests: XCTestCase {
     func testMoreImageOpensSourcePickerAndCancelDoesNotInsert() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.image"); ui.coordinate(CGPoint(x: 0.5, y: 0.65)).tap(); try tap("Files")
+        filesDiagnostics("image opened")
+        defer { filesDiagnostics("image completion") }
         let provider = ui.app.cells["DOC.sidebar.item.On My iPad"].firstMatch
         XCTAssertTrue(provider.exists || provider.waitForExistence(timeout: 8), "Files picker must expose its local provider")
+        filesDiagnostics("before Cancel")
         try tap("Cancel"); try sameContent(before)
     }
 
@@ -503,7 +523,7 @@ final class ChromeUITests: XCTestCase {
         try open(); try dock("right"); try settings("pen")
         let option = try reachable("Fountain Pen")
         XCTAssertTrue(ui.app.frame.contains(option.frame), "Right-docked settings must stay onscreen")
-        outside(); try draw()
+        outside(); try diagnosedDraw("Dock right")
     }
     func testDockTopHasHorizontalOptionsAndUndoableInk() throws {
         try open(); try dock("top")
@@ -559,7 +579,7 @@ final class ChromeUITests: XCTestCase {
         try tap("Show Tools"); _ = try reachable("tool.pen")
         try ui.twoFingerScroll(from: CGPoint(x: 0.12, y: 0.35), to: CGPoint(x: 0.12, y: 0.75))
         try more("Hide Tools"); try more("Show Tools"); _ = try reachable("menu.toolSettings")
-        try sameContent(before); try ui.selectTool("pen"); try draw()
+        try sameContent(before); try ui.selectTool("pen"); try diagnosedDraw("Hide show tools")
     }
     func testPageScrollCollapsesOptionsAndChoosingToolRestoresThem() throws {
         try open(); try ui.selectTool("pen"); let before = try ui.state()
@@ -570,13 +590,22 @@ final class ChromeUITests: XCTestCase {
             !self.query("menu.toolSettings").firstMatch.exists
         }
         try ui.selectTool("highlighter"); _ = try reachable("menu.toolSettings")
-        try settings("highlighter"); try tap("Thickness 2"); outside(); try draw()
+        try settings("highlighter")
+        try ui.diagnoseAction("Thickness 2 after settings", facts: { self.ui.elementFacts(self.query("Thickness 2").firstMatch, includeOverlaps: true) }) {
+            try tap("Thickness 2")
+        }
+        outside(); try draw()
     }
     private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
     private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
     private func saveLayout(_ name: String) throws {
         try tap("Save current layout"); try replace("Layout name", name); try tap("cmd.toolbar.saveLayout")
         _ = try reachable("Apply " + name)
+    }
+    private func reorderHighlighterAbovePen(_ handle: XCUIElement) throws {
+        let destination = try reachable("Hide Fountain Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2))
+        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: destination)
     }
     func testCustomizeHideShowAndReorderPersistsWithLassoFixedFirst() throws {
         try open(); try customize()
@@ -588,7 +617,7 @@ final class ChromeUITests: XCTestCase {
         try customize(); try tap("Show Highlighter")
         let handle = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS 'Reorder' AND label CONTAINS 'Highlighter'")).firstMatch
         XCTAssertTrue(handle.waitForExistence(timeout: 5), "Customise must expose a real reorder handle")
-        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.5, thenDragTo: try reachable("Hide Fountain Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2)))
+        try reorderHighlighterAbovePen(handle)
         try doneCustomizing(); try customize()
         XCTAssertFalse(query("Hide Lasso").firstMatch.exists)
         XCTAssertLessThan(try reachable("Hide Highlighter").frame.minY, try reachable("Hide Fountain Pen").frame.minY, "Reordered layout must persist")
@@ -617,12 +646,7 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(pen.exists && pen.isHittable, "Pen reorder handle must define the insertion row")
         let row = ui.app.collectionViews.cells.containing(.button, identifier: pen.label).firstMatch
         XCTAssertTrue(row.exists, "Reorder destination must be the Pen row")
-        let insertion = pen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .withOffset(CGVector(dx: 0, dy: row.frame.minY + 4 - pen.frame.midY))
-        let trace = XCTAttachment(string: "toolbar.setLayout via onMove: Highlighter \(handle.frame), Pen \(pen.frame), insertion \(insertion.screenPoint)\n\(ui.app.debugDescription)")
-        trace.name = "reorder-insertion-target"; trace.lifetime = .keepAlways; add(trace)
-        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.05, thenDragTo: insertion, withVelocity: XCUIGestureVelocity(rawValue: 100), thenHoldForDuration: 0.5)
+        try reorderHighlighterAbovePen(handle)
         try wait("Reordering must move Highlighter above Pen") {
             self.query("Hide Highlighter").firstMatch.frame.minY < self.query("Hide Fountain Pen").firstMatch.frame.minY
         }
@@ -642,7 +666,11 @@ final class ChromeUITests: XCTestCase {
         try open(); try customize(); try saveLayout("Keep chrome"); try saveLayout("Delete chrome")
         let row = ui.app.cells.containing(.button, identifier: "Apply Delete chrome").firstMatch
         XCTAssertTrue(row.exists, "Saved layout must expose a deletable row")
-        row.swipeLeft(); try tap("Delete")
+        let remove = row.images.matching(NSPredicate(format: "label == 'remove'")).firstMatch
+        XCTAssertTrue(remove.exists && remove.isHittable, "Saved layout edit-mode minus must be available")
+        remove.tap()
+        ui.logQA("Saved layout after minus", row.debugDescription)
+        try tap("Delete")
         try wait("Delete must remove only the chosen saved layout") { !self.query("Apply Delete chrome").firstMatch.exists }
         _ = try reachable("Apply Keep chrome")
         try doneCustomizing(); try customize()
@@ -925,6 +953,9 @@ final class ChromeUITests: XCTestCase {
     func testRulerTwoFingerRotationSnapsToFortyFiveWithoutEditing() throws {
         try showRuler(); let before = try ui.state()
         try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try tap("Set Angle")
+        defer { ui.recordDiagnostics("Ruler rotation completion", facts: ui.elementFacts(ruler), includeHierarchy: false) }
+        try wait("Set Angle panel must be gone before rotation") { !self.ui.app.textFields["Angle in degrees"].exists }
+        ui.recordDiagnostics("Ruler rotation before", facts: ui.elementFacts(ruler), includeHierarchy: false)
         let frame = ruler.frame, radius = min(frame.width * 0.3, 90)
         let paths = [CGFloat(-1), CGFloat(1)].map { direction in
             (0...12).map { step -> NSValue in
@@ -937,6 +968,7 @@ final class ChromeUITests: XCTestCase {
         var failure: Error?
         NibTouchPaths.perform(paths, duration: 0.8) { error in failure = error; done.fulfill() }
         XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 16), .completed)
+        ui.recordDiagnostics("Ruler rotation after", facts: ui.elementFacts(ruler), includeHierarchy: false)
         if let failure { throw failure }
         try wait("Two-finger rotation must snap to 45 degrees") {
             (self.ruler.value as? String ?? "").hasPrefix("45 degrees")
@@ -981,9 +1013,9 @@ final class ChromeUITests: XCTestCase {
         // End field editing before a global canvas shortcut can be interpreted as text.
         try key(XCUIKeyboardKey.escape.rawValue)
         try tap("Start Timer")
-        let alert = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
-        if alert.waitForExistence(timeout: 2), alert.buttons["Don't Allow"].exists { alert.buttons["Don't Allow"].tap() }
+        try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Countdown must expose a running clock") { self.clockValue.exists }
+        try ui.handleAuthorizationAlerts()
     }
     func testTimeKeeperPaletteAndKeyboardToggleRetainActiveCountdown() throws {
         try open(); let before = try ui.state()
@@ -1000,6 +1032,7 @@ final class ChromeUITests: XCTestCase {
         try open(); try timeKeeper(); try tap("5 min")
         XCTAssertTrue(try require("5 min").isSelected)
         try replace("Timer name", "Preset countdown"); try tap("Start Timer")
+        try ui.handleAuthorizationAlerts(waitForCountdown: { self.clockValue.exists })
         try wait("Preset countdown must run") { self.clockValue.exists }
         let before = clockValue.label
         try wait("Countdown must decrease", timeout: 8) { self.clockValue.label != before }
@@ -1086,6 +1119,16 @@ final class ChromeUITests: XCTestCase {
     // pdf.textActions/markSelection/copyDefineSpeak. An external input PDF is generated in a
     // disposable Files subfolder; importing, selecting and annotating it all use the actual UI.
     // No document package, settings, probe, app command or selection is injected.
+    private func filesDiagnostics(_ stage: String) {
+        let includeTrees = ["opened", "before folder", "image opened"].contains(stage)
+        ui.recordDiagnostics("Files picker " + stage,
+            facts: ui.elementFacts(ui.app.buttons["Cancel"].firstMatch, includeOverlaps: true), includeHierarchy: includeTrees)
+        if includeTrees {
+            ui.logQA("Files DocumentsApp " + stage, XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp").debugDescription)
+            ui.logQA("Files SpringBoard " + stage, XCUIApplication(bundleIdentifier: "com.apple.springboard").debugDescription)
+        }
+    }
+
     private func importTextPDF() throws {
         let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()
         let fm = FileManager.default
@@ -1107,16 +1150,21 @@ final class ChromeUITests: XCTestCase {
                 withAttributes: [.font: UIFont.systemFont(ofSize: 22), .foregroundColor: UIColor.black])
         }
         try data.write(to: folder.appendingPathComponent("Chrome selection.pdf"))
+        ui.recordDiagnostics("Files picker before import", includeHierarchy: false)
         try tap("New"); try tap("Import Files")
+        filesDiagnostics("opened")
+        defer { filesDiagnostics("PDF completion") }
         let local = ui.app.cells["DOC.sidebar.item.On My iPad"]
         if local.waitForExistence(timeout: 5), local.isHittable { local.tap() }
         let nib = ui.app.cells["Nib, Container"]
         if nib.waitForExistence(timeout: 3), nib.isHittable { nib.tap() }
+        filesDiagnostics("before folder")
         let directory = ui.app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", folderName)).firstMatch
         XCTAssertTrue(directory.waitForExistence(timeout: 10), "Files must show external PDF input folder")
         directory.tap()
         let pdf = ui.app.cells.matching(NSPredicate(format: "label CONTAINS 'Chrome selection'")).firstMatch
         XCTAssertTrue(pdf.waitForExistence(timeout: 10)); pdf.tap()
+        filesDiagnostics("before Open")
         let pick = ui.app.buttons["Open"]
         if pick.waitForExistence(timeout: 2), pick.isHittable { pick.tap() }
         _ = try ui.waitForState { $0.screen == "document" && $0.pageCount == 1 }

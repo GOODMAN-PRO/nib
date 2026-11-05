@@ -224,9 +224,9 @@ final class CreateUITests: XCTestCase {
         try tap("No cover")
         try chooseSize("Custom")
         try replace(ui.app.textFields["Width in millimetres"], with: "100", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         try replace(ui.app.textFields["Height in millimetres"], with: "150", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
@@ -235,9 +235,9 @@ final class CreateUITests: XCTestCase {
         try notebook("Invalid dimensions")
         try chooseSize("Custom")
         try replace(ui.app.textFields["Width in millimetres"], with: "0", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         try replace(ui.app.textFields["Height in millimetres"], with: "0", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         let create = ui.app.buttons["cmd.doc.create"]
         if create.isEnabled { create.tap() }
         let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -675,8 +675,10 @@ final class CreateUITests: XCTestCase {
         if ui.app.buttons["DatePicker.NextMonth"].exists {
             let caption = ui.app.staticTexts["Starts"].firstMatch
             try require(caption, "Start-date caption must remain visible outside the calendar")
-            XCTAssertTrue(caption.isHittable)
-            caption.tap()
+            let frame = caption.frame
+            XCTAssertTrue(ui.app.windows.firstMatch.frame.contains(frame) && !frame.isEmpty)
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                dx: frame.midX - ui.app.frame.minX, dy: frame.midY - ui.app.frame.minY)).tap()
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }
@@ -794,10 +796,25 @@ final class CreateUITests: XCTestCase {
 
     private func scrollTo(_ element: XCUIElement, name: String = "creation control", in application: XCUIApplication? = nil) throws {
         let app = application ?? ui.app
+        func visibleRows(_ scroll: XCUIElement, viewport: CGRect) -> [String]? {
+            guard scroll.exists, let snapshot = try? scroll.snapshot() else { return nil }
+            func rows(_ node: XCUIElementSnapshot) -> [String] {
+                let rowTypes: [XCUIElement.ElementType] = [.cell, .button, .textField, .switch, .slider]
+                let own = rowTypes.contains(node.elementType) && node.frame.intersects(viewport)
+                    ? ["\(node.elementType.rawValue)|\(node.identifier)|\(node.label)|\(node.frame)"] : []
+                return own + node.children.flatMap { rows($0) }
+            }
+            let signature = rows(snapshot)
+            return signature.isEmpty ? nil : signature
+        }
         for _ in 0..<12 {
             let exists = element.exists
             if exists && element.elementType != .textField && element.isHittable { return }
             let target = exists ? element.frame : nil
+            let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
+            if name != "Title", exists, element.elementType == .textField, element.isHittable, let target,
+               let usable = NibUITestScrollGeometry.viewport(scroll: app.windows.firstMatch.frame,
+                   window: app.windows.firstMatch.frame, obstructions: keyboards), usable.contains(target) { return }
             let candidates = (app.collectionViews.allElementsBoundByIndex + app.scrollViews.allElementsBoundByIndex)
                 .filter { $0.isHittable && $0.frame.height > 40 }
             // Scroll the target's own container, not an unrelated card editor or paper grid.
@@ -815,7 +832,6 @@ final class CreateUITests: XCTestCase {
             }
             // DESIGN uses the native keyboard. Its covered area cannot receive form gestures,
             // even when accessibility reports a scroll frame extending underneath it.
-            let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
             guard let visible = NibUITestScrollGeometry.viewport(
                 scroll: scroll.frame, window: app.frame, obstructions: keyboards) else { break }
             if exists && element.isHittable, let target {
@@ -826,12 +842,21 @@ final class CreateUITests: XCTestCase {
                 if element.elementType != .textField || visible.contains(required) { return }
             }
             let targetY = name == "Title" ? target.map { $0.midY - 68 } : target?.midY
+            let beforeRows = target == nil ? visibleRows(scroll, viewport: visible) : nil
             let drag = NibUITestScrollGeometry.drag(in: visible, toward: targetY)
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: drag.start.x - app.frame.minX, dy: drag.start.y - app.frame.minY))
                 .press(forDuration: 0.05, thenDragTo: origin.withOffset(CGVector(
                     dx: drag.end.x - app.frame.minX, dy: drag.end.y - app.frame.minY)),
                     withVelocity: XCUIGestureVelocity(rawValue: 80), thenHoldForDuration: 0.3)
+            let after = element.exists ? element.frame : nil
+            ui.logQA("Creation scroll", "name=\(name) target=\(String(describing: target)) after=\(String(describing: after)) viewport=\(visible)")
+            if let target, let after, after == target { break }
+            if target == nil, after == nil, let beforeRows,
+               let afterRows = visibleRows(scroll, viewport: visible), beforeRows == afterRows {
+                ui.logQA("Creation scroll exhausted", "name=\(name) visible rows unchanged=\(afterRows)")
+                break
+            }
         }
         try require(element, "Missing required creation control: \(name)")
         XCTAssertTrue(element.isHittable, "Creation control is unreachable after scrolling")

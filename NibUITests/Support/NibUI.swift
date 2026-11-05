@@ -121,45 +121,87 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
-        let identity = initial.exists ? (try? initial.snapshot()) : nil
-        // Rebuild queries on every iteration: library grids and native forms replace their containers on scroll.
+        let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
+        // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
+        let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
-            if let form, form.exists, hasVisibleFrame(form), form.isHittable { return form }
-            var candidates: [(XCUIElement, CGRect, Bool, String)] = []
-            for kind in [XCUIElement.ElementType.collectionView, .table, .scrollView] {
-                let query = app.descendants(matching: kind)
-                for index in 0..<min(query.count, 24) {
-                    let list = query.element(boundBy: index)
-                    guard list.exists, list.identifier != "nib.canvas" else { continue }
-                    let frame = list.frame
-                    guard frame.height > 100, frame.width > 200,
-                          frame.intersects(app.windows.firstMatch.frame), list.exists, list.isHittable else { continue }
-                    let contains = identity.map { node in
-                        list.descendants(matching: node.elementType).matching(NSPredicate(
-                            format: "identifier == %@ AND label == %@", node.identifier, node.label)).firstMatch.exists
-                    } ?? false
-                    candidates.append((list, frame, contains, list.label))
-                }
-            }
-            // Prefer the full-size copy of the SAME named popover, then the tightest containing
-            // viewport. Time Keeper has a taller inner ScrollView clipped by its outer panel.
-            let live = candidates.filter { candidate in
-                candidate.3.isEmpty || !candidates.contains {
-                    $0.3 == candidate.3 && $0.1.width * $0.1.height > candidate.1.width * candidate.1.height
-                }
-            }
-            let containing = live.filter { $0.2 }
-            return (containing.isEmpty ? live : containing).min {
-                $0.1.width * $0.1.height < $1.1.width * $1.1.height
-            }?.0
-        }
-        var visited = Set<String>()
-        for _ in 0..<16 {
-            guard let list = liveList(), list.exists else { return }
-            let listFrame = list.frame
+            if let form, form.exists, hasVisibleFrame(form) { return form }
+            guard let root = try? app.snapshot() else { return nil }
             let window = app.windows.firstMatch.frame
-            let obstructions = app.keyboards.allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
-                + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+            var candidates: [(element: XCUIElement, node: XCUIElementSnapshot, surface: Int, contains: Bool, overflow: Bool)] = []
+            var surfaceOrder = 0
+            func containsTarget(_ node: XCUIElementSnapshot) -> Bool {
+                guard let identity else { return false }
+                if node.elementType == identity.elementType && node.identifier == identity.identifier
+                    && node.label == identity.label { return true }
+                return node.children.contains { containsTarget($0) }
+            }
+            func overflows(_ node: XCUIElementSnapshot, frame: CGRect) -> Bool {
+                if node.label.hasPrefix("Vertical scroll bar,") {
+                    let words = node.label.split(separator: " ")
+                    if words.count > 3, let pages = Int(words[3]), pages > 1 { return true }
+                }
+                if node.frame.height > frame.height + 2 && node.frame.width <= frame.width + 2 { return true }
+                return node.children.contains { overflows($0, frame: frame) }
+            }
+            func visit(_ node: XCUIElementSnapshot, element: XCUIElement, surface: Int) {
+                var scope = surface
+                if [.sheet, .popover, .alert].contains(node.elementType), node.frame.intersects(window) {
+                    surfaceOrder += 1; scope = surfaceOrder
+                }
+                let frame = node.frame
+                if [.collectionView, .table, .scrollView].contains(node.elementType), node.identifier != "nib.canvas",
+                   frame.width > 200, frame.height > 100, frame.intersects(window) {
+                    candidates.append((element, node, scope, containsTarget(node), overflows(node, frame: frame)))
+                }
+                for (index, child) in node.children.enumerated() {
+                    visit(child, element: element.children(matching: .any).element(boundBy: index), surface: scope)
+                }
+            }
+            visit(root, element: app, surface: 0)
+            let foremost = surfaceOrder
+            // Surface traversal is a preference, not z-order. Rank from the snapshot, then probe
+            // only successive winners; retained modal copies must not hide the live form.
+            // Keeping all candidates also covers a foremost popover with no scrolling content.
+            func smallerNamedCopy(_ node: XCUIElementSnapshot, surface: Int) -> Bool {
+                !node.label.isEmpty && candidates.contains {
+                    $0.surface == surface && $0.node.label == node.label
+                        && $0.node.frame.width * $0.node.frame.height > node.frame.width * node.frame.height
+                }
+            }
+            let ranked = candidates.sorted {
+                if ($0.surface == foremost) != ($1.surface == foremost) { return $0.surface == foremost }
+                if $0.surface != $1.surface { return $0.surface > $1.surface }
+                let firstArea = $0.node.frame.width * $0.node.frame.height
+                let secondArea = $1.node.frame.width * $1.node.frame.height
+                let firstCopy = smallerNamedCopy($0.node, surface: $0.surface)
+                let secondCopy = smallerNamedCopy($1.node, surface: $1.surface)
+                if firstCopy != secondCopy { return !firstCopy }
+                if $0.contains != $1.contains { return $0.contains }
+                if $0.contains { return firstArea < secondArea }
+                // Lazy rows are absent: overflow, native detail type, then area (never narrowest).
+                if $0.overflow != $1.overflow { return $0.overflow }
+                let firstNative = [.collectionView, .table].contains($0.node.elementType)
+                let secondNative = [.collectionView, .table].contains($1.node.elementType)
+                if firstNative != secondNative { return firstNative }
+                return firstArea > secondArea
+            }
+            return ranked.first { $0.element.exists && $0.element.isHittable }?.element
+        }
+        guard var list = liveList(), let firstSnapshot = try? list.snapshot() else {
+            logQA("Form reveal unavailable", "No live container snapshot; caller retains its wait/fallback")
+            return
+        }
+        let window = app.windows.firstMatch.frame
+        let obstructions = app.keyboards.allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+            + app.otherElements.matching(identifier: "inputAssistantView").allElementsBoundByIndex.filter { $0.exists }.map(\.frame)
+        var snapshot = firstSnapshot
+        var visited = Set<String>()
+        var direction: Bool?
+        var reversed = false
+        var endSignatures: [String] = []
+        for _ in 0..<16 {
+            let listFrame = snapshot.frame
             guard let viewport = NibUITestScrollGeometry.viewport(
                 scroll: listFrame, window: window, obstructions: obstructions) else { return }
             let element: XCUIElement
@@ -170,40 +212,138 @@ final class NibUI {
             let targetFrame = element.exists ? element.frame : nil
             if let targetFrame, viewport.contains(CGPoint(x: targetFrame.midX, y: targetFrame.midY)),
                element.isHittable { return }
-            guard list.exists, let snapshot = try? list.snapshot() else { return }
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
-            guard visited.insert(signature).inserted else { return }
-            let down = targetFrame.map { $0.midY < viewport.midY } ?? false
-            // Prefer a noninteractive caption: dragging the bare edge previously produced no scroll.
-            func captions(_ node: XCUIElementSnapshot) -> [CGRect] {
-                if [.button, .switch, .slider, .textField, .textView, .cell].contains(node.elementType) { return [] }
-                if node.elementType == .staticText, viewport.insetBy(dx: 4, dy: 24).contains(node.frame) { return [node.frame] }
-                return node.children.flatMap { captions($0) }
+            if !visited.insert(signature).inserted {
+                endSignatures.append(signature)
+                guard !reversed else {
+                    logQA("Form search exhausted", "both ends=\(endSignatures)")
+                    return
+                }
+                reversed = true
+                direction = !(direction ?? false)
+                visited = [signature]
             }
-            let startY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
-            let caption = captions(snapshot).min { abs($0.midY - startY) < abs($1.midY - startY) }
-            let native = [.collectionView, .table].contains(snapshot.elementType)
-            let start = caption.map { CGPoint(x: $0.midX, y: $0.midY) }
-                ?? CGPoint(x: native ? viewport.midX : listFrame.minX + 12, y: startY)
+            if direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } ?? false }
+            let down = direction ?? false
+            guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
-            XCTContext.runActivity(named: "Reveal form row") { activity in
-                let attachment = XCTAttachment(string: "container=\(snapshot.label) frame=\(listFrame) viewport=\(viewport) target=\(String(describing: targetFrame)) drag=\(start)->\(end) range=\(signature)")
-                attachment.lifetime = .keepAlways; activity.add(attachment)
-            }
+            let values = formControlValues(snapshot)
+            logQA("Form drag before", "point=\(start) container=\(listFrame) rows=\(signature)")
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                     CGVector(dx: end.x - app.frame.minX, dy: end.y - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
+            // Library grids can replace their containers while scrolling. Keep the cheap cached query
+            // normally, but reacquire it if that container disappears or its snapshot becomes unavailable.
+            var nextSnapshot: XCUIElementSnapshot? = list.exists ? (try? list.snapshot()) : nil
+            if nextSnapshot == nil, let replacement = liveList() {
+                list = replacement
+                nextSnapshot = try? replacement.snapshot()
+            }
+            guard let after = nextSnapshot else {
+                logQA("Form reveal unavailable", "Container disappeared after drag; caller retains its wait/fallback")
+                return
+            }
+            logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
+            snapshot = after // Reuse this post-drag snapshot as the next iteration's before state.
+            let afterValues = formControlValues(after)
+            // Virtualization can renumber repeated identities. Compare only unchanged-size groups.
+            let changed = values.keys.filter {
+                guard let before = values[$0], let after = afterValues[$0], before.count == after.count else { return false }
+                return before != after
+            }
+            guard changed.isEmpty else {
+                logQA("Form drag changed controls", "before=\(values) after=\(afterValues)")
+                XCTFail("Reveal drag changed slider/switch values: \(changed)"); return
+            }
         }
+        logQA("Form search bounded", "ends=\(endSignatures) visited=\(visited.sorted())")
     }
 
-    /// Reads one immutable snapshot without waiting so progress checks cannot retain stale virtualized element indices.
+    /// Frames and control identities only: numeric captions and control values are not scroll progress.
     private func formVisibleRange(_ snapshot: XCUIElementSnapshot, viewport: CGRect) -> [String] {
         let frame = snapshot.frame
-        let own = [.button, .staticText].contains(snapshot.elementType)
+        let rowTypes: [XCUIElement.ElementType] = [.button, .switch, .slider, .textField, .textView,
+            .searchField, .secureTextField, .stepper, .segmentedControl, .picker, .pickerWheel]
+        let own = rowTypes.contains(snapshot.elementType)
             && viewport.contains(CGPoint(x: frame.midX, y: frame.midY))
-            ? ["\(snapshot.identifier)|\(snapshot.label)|\(Int(frame.minY))"] : []
+            ? ["\(snapshot.elementType.rawValue)|\(snapshot.identifier)|\(snapshot.label)|\(frame)"] : []
         return own + snapshot.children.flatMap { formVisibleRange($0, viewport: viewport) }
+    }
+
+    private func formControlValues(_ snapshot: XCUIElementSnapshot) -> [String: [String]] {
+        var result: [String: [String]] = [:]
+        func visit(_ node: XCUIElementSnapshot, parent: String) {
+            let identity = "\(node.elementType.rawValue)|\(node.identifier)|\(node.label)"
+            let path = parent + "/" + identity
+            if [.slider, .switch].contains(node.elementType) {
+                result[path, default: []].append(String(describing: node.value))
+            }
+            // A native row exposes a labelled switch plus an unlabelled thumb. Keep its parent identity,
+            // so virtualizing another row cannot renumber unrelated thumbs and report a false mutation.
+            let ancestor = [.slider, .switch].contains(node.elementType) ? path : parent
+            node.children.forEach { visit($0, parent: ancestor) }
+        }
+        visit(snapshot, parent: "")
+        return result
+    }
+
+    /// Search real row gaps before considering the leading inset of a dense form.
+    private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool) -> CGPoint? {
+        let interactive: [XCUIElement.ElementType] = [.slider, .switch, .button, .textField, .textView,
+            .secureTextField, .searchField, .stepper, .segmentedControl, .picker, .pickerWheel, .link]
+        func controls(_ node: XCUIElementSnapshot) -> [(String, CGRect)] {
+            let own = interactive.contains(node.elementType) ? [(node.label, node.frame)] : []
+            return own + node.children.flatMap { controls($0) }
+        }
+        let blocked = controls(snapshot)
+        let preferredY = viewport.minY + viewport.height * (down ? 0.25 : 0.75)
+        let ys = stride(from: viewport.minY + 24, through: viewport.maxY - 24, by: 4).sorted {
+            abs($0 - preferredY) < abs($1 - preferredY)
+        }
+        let endY = down ? viewport.maxY - 24 : viewport.minY + 24
+        // First pass ignores x: every interactive frame must be at least 32pt away vertically.
+        for y in ys where abs(endY - y) >= 24 {
+            let clearance = blocked.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
+            if clearance >= 32 {
+                let point = CGPoint(x: viewport.midX, y: y)
+                logQA("Form drag point", "pass=row-gap point=\(point) verticalMargin=\(clearance) viewport=\(viewport)")
+                return point
+            }
+        }
+        // Second pass: only the leading inset, retaining the 4pt horizontal exclusion.
+        let x = viewport.minX + 6
+        var best: (point: CGPoint, clearance: CGFloat)?
+        for y in ys {
+            guard abs(endY - y) >= 24 else { continue }
+            let point = CGPoint(x: x, y: y)
+            let relevant = blocked.filter { x >= $0.1.minX - 4 && x <= $0.1.maxX + 4 }
+            let clearance = relevant.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
+            if clearance >= 32 {
+                logQA("Form drag point", "pass=leading-inset point=\(point) verticalMargin=\(clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
+                return point
+            }
+            // Never start inside an interactive frame, even in the best-effort fallback.
+            if clearance > 0, clearance > (best?.clearance ?? 0) {
+                best = (point, clearance)
+            }
+        }
+        if let best {
+            logQA("Form best clearance", "pass=leading-inset point=\(best.point) verticalMargin=\(best.clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
+            return best.point
+        }
+        logQA("Form no safe point", "container=\(snapshot.frame) viewport=\(viewport) controls=\(blocked)")
+        return nil
+    }
+
+    /// Runner NSLog is exported in ui.log; text attachments are not. Bound every line, including long trees.
+    func logQA(_ prefix: String, _ facts: String) {
+        let characters = Array(facts)
+        if characters.isEmpty { NSLog("[Nib QA] %@", prefix); return }
+        for start in stride(from: 0, to: characters.count, by: 1200) {
+            let chunk = String(characters[start..<min(start + 1200, characters.count)])
+            NSLog("[Nib QA] %@ [%ld] %@", prefix, start / 1200, chunk)
+        }
     }
 
     /// Complete Files' New Folder action using the editor supplied by the OS.
@@ -235,16 +375,17 @@ final class NibUI {
 
     /// Waits for the actual microphone prompt (or an already-authorized Recording HUD), then for system alerts to disappear.
     /// Startup/teardown callers drain outstanding known authorization prompts without accepting unrelated dialogs.
-    func handleAuthorizationAlerts(waitForMicrophone: Bool = false) throws {
+    func handleAuthorizationAlerts(waitForMicrophone: Bool = false, waitForCountdown: (() -> Bool)? = nil) throws {
         let system = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let permission = NSPredicate(format: "label CONTAINS[c] 'microphone' OR label CONTAINS[c] 'calendar' OR label CONTAINS[c] 'photos'")
+        let permission = NSPredicate(format: "label CONTAINS[c] 'microphone' OR label CONTAINS[c] 'calendar' OR label CONTAINS[c] 'photos' OR label CONTAINS[c] 'notification'")
         /// Reads the currently visible authorization without waiting; the outer expectation handles asynchronous presentation.
         func alert(microphoneOnly: Bool = false) -> XCUIElement? {
             let filter = microphoneOnly ? NSPredicate(format: "label CONTAINS[c] 'microphone'") : permission
             let title = system.alerts.matching(filter).firstMatch
             if title.exists { return title }
             let content = system.alerts.containing(filter).firstMatch
-            return content.exists ? content : nil
+            if content.exists { return content }
+            return nil
         }
         if waitForMicrophone {
             let recording = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Recording' AND value != nil")).firstMatch
@@ -255,11 +396,22 @@ final class NibUI {
                 throw Failure.message("Quick Record produced neither microphone authorization nor Recording HUD\n\(system.debugDescription)")
             }
         }
+        if let waitForCountdown {
+            let requested = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                alert() != nil || waitForCountdown()
+            }, object: nil)
+            guard XCTWaiter.wait(for: [requested], timeout: 12) == .completed else {
+                throw Failure.message("Start Timer produced neither authorization nor countdown")
+            }
+        }
         for _ in 0..<3 {
             guard let prompt = alert() else { return }
-            let allow = prompt.buttons.matching(NSPredicate(
+            let notification = prompt.label.localizedCaseInsensitiveContains("notification")
+                || prompt.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'notification'")).firstMatch.exists
+            let allow = notification ? prompt.buttons.matching(NSPredicate(
+                format: "label BEGINSWITH 'Don' AND label ENDSWITH 'Allow'")).firstMatch : prompt.buttons.matching(NSPredicate(
                 format: "label IN {'Allow', 'OK', 'Allow Full Access', 'Allow Access to All Photos'}")).firstMatch
-            guard allow.isHittable else { throw Failure.message("Authorization has no observed affirmative action\n\(system.debugDescription)") }
+            guard allow.isHittable else { throw Failure.message("Authorization has no observed permission action\n\(system.debugDescription)") }
             allow.tap()
             let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !prompt.exists }, object: nil)
             guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
@@ -465,6 +617,7 @@ final class NibUI {
         }
         try establishFullScreen(allowFixtureRelaunch: true)
         _ = try waitForState { $0.screen == "library" }
+        try handleAuthorizationAlerts()
     }
 
     /// Activates this scene, waits for non-text focus without editing/navigating, and verifies the chord's action.
@@ -485,7 +638,7 @@ final class NibUI {
               focused.zoom == before.zoom, focused.contentOffset.x == before.contentOffset.x,
               focused.contentOffset.y == before.contentOffset.y, focused.openPanels == before.openPanels,
               !app.keyboards.firstMatch.exists else {
-            throw Failure.message("Keyboard focus preparation changed document content or navigation")
+            throw Failure.message("Keyboard focus preparation changed document content or navigation; before=\(before); after=\(focused)")
         }
         try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
@@ -513,6 +666,12 @@ final class NibUI {
             throw Failure.message("Global chord rejected text responder: \(current.keyResponder ?? "unknown")")
         }
         if app.state != .runningForeground { app.activate() }
+        if let responder = current.keyResponder {
+            guard current.keyResponderIsText == false else {
+                throw Failure.message("Cannot classify existing keyboard responder: \(responder)")
+            }
+            return responder
+        }
 
         func tapInertHeader(in surface: XCUIElement, modal: Bool) throws {
             // One snapshot avoids per-control AX round trips. Conservatively exclude every control frame,
@@ -531,15 +690,40 @@ final class NibUI {
             }
             let offsets: [CGFloat] = modal ? [24, 40, 56] : [70, 56, 40]
             let fractions: [CGFloat] = [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8]
-            let points = offsets.flatMap { offset in
+            var points = offsets.flatMap { offset in
                 fractions.map { fraction in
                     CGPoint(x: visible.minX + visible.width * fraction, y: visible.minY + offset)
                 }
             }
-            guard let point = points.first(where: { point in
+            var chromeInsets: [CGPoint] = []
+            if !modal, canvas.exists {
+                // The whiteboard extends behind window-header whitespace. Only use the inset of
+                // an observed bar group (NavBar/NibBarGroup) or Tabs droplet (TabStripView), not that desk.
+                let anchors: Set<String> = ["menu.title", "cmd.edit.redo", "cmd.search.open"]
+                func hasAnchor(_ node: XCUIElementSnapshot) -> Bool {
+                    anchors.contains(node.identifier) || node.children.contains { hasAnchor($0) }
+                }
+                func chromeFrames(_ node: XCUIElementSnapshot) -> [CGRect] {
+                    let children = node.children.flatMap { chromeFrames($0) }
+                    if !children.isEmpty { return children } // Innermost group, never the whole nav row.
+                    guard node.elementType == .other, node.frame.height > 16, node.frame.height <= 60,
+                          node.frame.width < visible.width * 0.75,
+                          node.label == "Tabs" || hasAnchor(node) else { return [] }
+                    return [node.frame]
+                }
+                chromeInsets = chromeFrames(snapshot).flatMap { frame in
+                    [CGPoint(x: frame.minX + 3, y: frame.midY), CGPoint(x: frame.maxX - 3, y: frame.midY)]
+                }.filter { point in
+                    visible.contains(point) && !occupied.contains { $0.insetBy(dx: -2, dy: -2).contains(point) }
+                }
+                let drawingSurface = canvas.frame
+                points = points.filter { !drawingSurface.contains($0) }
+            }
+            guard let point = chromeInsets.first ?? points.first(where: { point in
                 visible.insetBy(dx: 8, dy: 8).contains(point)
                     && !occupied.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
             }) else { throw Failure.message("No inert header focus target inside the presented surface") }
+            logQA("Keyboard focus header", "point=\(point) modal=\(modal) surface=\(visible) chromeInsets=\(chromeInsets)")
             app.coordinate(withNormalizedOffset: .zero).withOffset(
                 CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
         }
@@ -551,8 +735,37 @@ final class NibUI {
         if let surface {
             try tapInertHeader(in: surface, modal: true)
         } else if canvas.exists {
-            // Reach the real document responder chain outside paper and away from the side palette.
-            coordinate(CGPoint(x: 0.18, y: 0.85)).tap()
+            // NavBar inserts NibBarSeparator between editingOrder 1 (Redo) and 2 (Search).
+            // Chrome.swift defines a non-action Rectangle, 0.5pt + 6pt padding on either side,
+            // within the fixed bar droplet. Never use empty window space over the whiteboard.
+            let redo = app.buttons["cmd.edit.redo"].firstMatch
+            let search = app.buttons["cmd.search.open"].firstMatch
+            var separatorFocused = false
+            if redo.exists, search.exists {
+                let left = redo.frame, right = search.frame
+                let gap = right.minX - left.maxX
+                let point = CGPoint(x: (left.maxX + right.minX) / 2, y: left.midY)
+                if abs(gap - 12.5) <= 2, abs(left.midY - right.midY) < 1,
+                   app.windows.firstMatch.frame.contains(point) {
+                    app.coordinate(withNormalizedOffset: .zero).withOffset(
+                        CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+                    // An inert separator is not itself a responder. Observe recovery before relying on it;
+                    // a missing responder is a bounded fallback condition, not a failed chord assertion.
+                    let focused = try? waitForState(timeout: 2) { $0.keyResponder != nil }
+                    if let focused {
+                        guard focused.keyResponderIsText == false else {
+                            throw Failure.message("Separator focus reached unclassified/text responder: \(focused.keyResponder ?? "unknown")")
+                        }
+                        separatorFocused = true
+                    }
+                } else {
+                    logQA("Keyboard focus fallback", "Separator geometry unavailable: redo=\(left) search=\(right)")
+                }
+            }
+            if !separatorFocused {
+                logQA("Keyboard focus fallback", "Separator absent or no responder after tap; trying inert header")
+                try tapInertHeader(in: app.windows.firstMatch, modal: false)
+            }
         } else {
             // The shell's library tap recognizer schedules reclaimKeyFocusIfNeeded after a real window tap.
             try tapInertHeader(in: app.windows.firstMatch, modal: false)
@@ -619,10 +832,21 @@ final class NibUI {
     }
 
     /// Photos on iOS 26 exposes assets as Images under photos_sectioned_layout, not collection cells.
-    func photoAsset() throws -> XCUIElement {
+    func photoAsset(diagnostics: Bool = false) throws -> XCUIElement {
         let assets = app.otherElements["photos_sectioned_layout"].images.matching(
             NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH 'Photo,'"))
         let legacy = app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Photo,'"))
+        func inspect(_ stage: String) {
+            guard diagnostics else { return }
+            let first = assets.firstMatch
+            logQA("Photos assets " + stage, "first.exists=\(first.exists)")
+            for asset in assets.allElementsBoundByIndex.prefix(8) {
+                logQA("Photos assets " + stage, elementFacts(asset))
+            }
+            recordDiagnostics("Photos assets " + stage, includeHierarchy: false)
+        }
+        inspect("before lookup")
+        defer { inspect("after lookup") }
         func candidate() -> XCUIElement? {
             for query in [assets, legacy] {
                 let first = query.firstMatch
@@ -739,7 +963,7 @@ final class NibUI {
 
     /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
     /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
-    func dismissNativeKeyboard(in application: XCUIApplication? = nil) throws {
+    func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
         let viewport = source.windows.firstMatch.frame
@@ -748,6 +972,18 @@ final class NibUI {
                 hasVisibleFrame($0, in: viewport)
             }
         let route = hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button"
+        func inspect(_ stage: String) {
+            guard diagnoseWidth else { return }
+            for button in source.keyboards.buttons.allElementsBoundByIndex {
+                logQA("Width keyboard " + stage, "label=\(button.label) frame=\(button.frame)")
+            }
+            let width = source.textFields["Width in millimetres"].firstMatch
+            recordDiagnostics("Width keyboard " + stage,
+                facts: "route=\(route) width.exists=\(width.exists) focused=\(width.exists && isKeyboardFocused(width, allowingAttributeFallback: true))",
+                includeHierarchy: false)
+        }
+        inspect("before Hide")
+        defer { inspect("completion") }
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
@@ -759,6 +995,7 @@ final class NibUI {
                     .withOffset(CGVector(dx: centre.x - source.frame.minX, dy: centre.y - source.frame.minY)).tap()
             } else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
         }
+        inspect("after Hide")
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
             throw Failure.message("Keyboard did not dismiss after \(route)")
@@ -788,7 +1025,7 @@ final class NibUI {
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
     func focusField(_ field: XCUIElement) throws {
         if isKeyboardFocused(field) { return }
-        revealFormElement(field)
+        if !hasVisibleFrame(field) || !field.isHittable { revealFormElement(field) }
         guard hasVisibleFrame(field) && field.isHittable else {
             // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
             if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
@@ -821,13 +1058,17 @@ final class NibUI {
         if value.isEmpty || value == field.placeholderValue { return }
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         field.typeText(XCUIKeyboardKey.delete.rawValue)
-        guard let remaining = field.value as? String else { throw Failure.message("Native editor lost its value after deletion") }
+        let remainingValue = field.value as? String
+        guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
+            throw Failure.message("Native editor lost its value after deletion")
+        }
         if !remaining.isEmpty && remaining != field.placeholderValue {
-            // Collapse any selection to its right edge and move beyond every remaining character.
-            // Plain arrow events do not depend on Command-A or the app's command routing.
-            guard remaining.count <= 4096 else { throw Failure.message("Native clear exceeds bounded editor length") }
-            field.typeText(String(repeating: XCUIKeyboardKey.rightArrow.rawValue, count: remaining.count + 1))
-            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: remaining.count))
+            // typeText inserts arrow raw values literally. Place the caret after the text with a real tap.
+            field.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: field.elementType == .textView ? 0.98 : 0.5)).tap()
+            guard let current = (field.value as? String) ?? (field.elementType == .textView ? "" : nil),
+                  current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
+            logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
+            if !current.isEmpty { field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count)) }
         }
         try waitForNativeText(in: field, equals: "")
     }
@@ -844,7 +1085,8 @@ final class NibUI {
     /// Waits for the native editor's actual text; a placeholder represents an empty value, not user content.
     func waitForNativeText(in field: XCUIElement, equals text: String) throws {
         func matches() -> Bool {
-            guard let value = field.value as? String else { return false }
+            guard field.exists else { return false }
+            guard let value = field.value as? String else { return text.isEmpty && field.elementType == .textView }
             return value == text || (text.isEmpty && value == field.placeholderValue)
         }
         if matches() { return }
@@ -1070,10 +1312,33 @@ final class NibUI {
             let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             screen.name = name + "-screen"; screen.lifetime = .keepAlways; activity.add(screen)
             let hierarchy = includeHierarchy ? "\n" + app.debugDescription : ""
+            logQA(name, "uptime=\(ProcessInfo.processInfo.systemUptime) \(facts) probe=\(probe.value ?? "missing")\(hierarchy)")
             let tree = XCTAttachment(string: "uptime=\(ProcessInfo.processInfo.systemUptime)\n\(facts)\n"
                 + "probe=\(probe.value ?? "missing")\(hierarchy)")
             tree.name = name + "-state-and-tree"; tree.lifetime = .keepAlways; activity.add(tree)
         }
+    }
+
+    func elementFacts(_ element: XCUIElement, includeOverlaps: Bool = false) -> String {
+        guard element.exists else { return "exists=false popovers=\(app.popovers.count) menus=\(app.menus.count) window=\(app.windows.firstMatch.frame)" }
+        guard let snapshot = try? element.snapshot() else { return "exists=true snapshot unavailable" }
+        let frame = snapshot.frame
+        let centre = CGPoint(x: frame.midX, y: frame.midY)
+        func covering(_ node: XCUIElementSnapshot) -> [String] {
+            guard node.frame.contains(centre) else { return [] }
+            let own = "\(node.elementType.rawValue):\(node.identifier):\(node.label):\(node.frame)"
+            return [own] + node.children.flatMap { covering($0) }
+        }
+        // XCUITest has no public UIKit hitTest API. Report overlapping AX frames, not an invented hit result.
+        let overlaps = includeOverlaps ? ((try? app.snapshot()).map { covering($0) } ?? []) : []
+        return "exists=true id=\(snapshot.identifier) label=\(snapshot.label) frame=\(frame) enabled=\(snapshot.isEnabled) hittable=\(element.isHittable) value=\(String(describing: snapshot.value)) popovers=\(app.popovers.count) menus=\(app.menus.count) window=\(app.windows.firstMatch.frame) centreOverlaps=\(overlaps)"
+    }
+
+    /// Observe the same decisive action on success or failure; no retry, alternate tap or softened oracle.
+    func diagnoseAction<T>(_ name: String, facts: () -> String, action: () throws -> T) rethrows -> T {
+        recordDiagnostics(name + " before", facts: facts(), includeHierarchy: false)
+        defer { recordDiagnostics(name + " after", facts: facts(), includeHierarchy: false) }
+        return try action()
     }
 
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using
