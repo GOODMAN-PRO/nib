@@ -1709,6 +1709,53 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "Cancelling must not add document history")
     }
 
+    func testUnchangedRenameDraftDoesNotRestoreAnExternallyChangedTitle() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let context = chrome.panelContext(ChromePanels.rename, presentation: .sheet)
+        var draft = RenameDocumentDraft(context: context)
+        let calls = CallLog()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
+                                                  effect: .library, target: .app)) { params, _ in
+            calls.params.append(params)
+            return [:]
+        }
+        try h.library.rename(Fixtures.docID, to: "New title from another window")
+        try await draft.submit(context: context)
+        XCTAssertTrue(calls.params.isEmpty)
+        XCTAssertEqual(h.library.node(Fixtures.docID)?.title, "New title from another window")
+        draft.title = "My edited draft"
+        do {
+            try await draft.submit(context: context)
+            XCTFail("An edited stale draft must report the conflict")
+        } catch {
+            XCTAssertFalse(NibError.wrap(error).message.isEmpty)
+        }
+        XCTAssertEqual(draft.title, "My edited draft", "Keep the user's work available after a conflict")
+        XCTAssertTrue(calls.params.isEmpty)
+    }
+
+    func testRenameDraftRetainsItsOriginalDocumentAndPropagatesCommandFailure() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let context = chrome.panelContext(ChromePanels.rename, presentation: .sheet)
+        var draft = RenameDocumentDraft(context: context)
+        draft.title = "Edited title"
+        h.session.document = Fixtures.textDocID
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
+                                                  effect: .library, target: .app)) { params, _ in
+            XCTAssertEqual(params["ref"]?.stringValue, NodeRef.document(Fixtures.docID).description)
+            throw NibError.invalid("Rename failed")
+        }
+        do {
+            try await draft.submit(context: context)
+            XCTFail("The sheet must receive errors instead of dismissing")
+        } catch {
+            XCTAssertEqual(NibError.wrap(error).message, "Rename failed")
+        }
+        XCTAssertEqual(draft.title, "Edited title")
+    }
+
     func testPresentedPanelHeadersCloseThroughEscapeButDockedHeadersDecline() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let chrome = try makeWindow(h)
