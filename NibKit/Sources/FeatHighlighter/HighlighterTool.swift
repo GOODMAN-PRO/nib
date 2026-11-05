@@ -460,6 +460,10 @@ enum PresetEdit: Equatable {
     /// What a thickness of `points` means: a slot's own width selects that slot, anything else resizes the selected
     /// slot (to 0.1 pt). nil when nothing changes.
     static func width(_ points: Double, in p: ToolPresets) -> PresetEdit? {
+        // An unchanged stored width (including hundredths) must never become a write on appearance/reload.
+        if let i = p.widths.firstIndex(where: { abs($0 - points) < 1e-9 }) {
+            return i == p.selectedWidth ? nil : .selectWidth(i)
+        }
         let w = (points * 10).rounded() / 10
         if let i = p.widths.firstIndex(where: { abs($0 - w) < 0.01 }) {
             return i == p.selectedWidth ? nil : .selectWidth(i)

@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatHighlighter
@@ -138,6 +139,24 @@ final class FeatHighlighterTests: XCTestCase {
         // Every highlighter colour, preset or custom, carries the contracts' highlighter translucency.
         XCTAssertTrue(NibHighlighter.allCases.allSatisfy { $0.rgba.a == RGBA.highlighterAlpha })
         XCTAssertEqual(RGBA(0x12, 0x34, 0x56).asHighlighter, RGBA(0x12, 0x34, 0x56, RGBA.highlighterAlpha))
+    }
+
+    func testOpeningSettingsDoesNotRoundAStoredThickness() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        var presets = h.app.settings.get(HighlighterSettings.presets)
+        presets.widths = [9.87, 14, 20]
+        presets.selectedWidth = 0
+        h.app.settings.set(HighlighterSettings.presets, presets)
+        let roundTrip = HighlighterUnits.points(HighlighterUnits.millimetres(presets.width))
+        XCTAssertNil(PresetEdit.width(roundTrip, in: presets))
+        let controller = UIHostingController(rootView: HighlighterSettingsView(app: h.app, session: h.session))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        controller.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(h.app.settings.get(HighlighterSettings.presets), presets)
     }
 
     func testDesignWidthsReachFinishedStrokesWithoutChangingTools() async throws {
