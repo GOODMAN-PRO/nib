@@ -361,6 +361,32 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testEditingClaimsOnlyTextContactsAndConsumesNativeSelectionReplay() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        let selection = NSRange(location: 0, length: 5)
+        tv.selectedRange = selection
+        XCTAssertTrue(editor.hitTest(CGPoint(x: 100, y: 410), host: host))
+        let contact = CanvasSample(page: Fixtures.page1, location: Point(100, 410))
+        XCTAssertTrue(editor.gesture(.doubleTap, at: contact, host: host))
+        XCTAssertEqual(tv.selectedRange, selection)
+        // Each outside contact must remain eligible for the canvas navigation gate, including a two-finger pan.
+        XCTAssertFalse(editor.hitTest(CGPoint(x: 600, y: 700), host: host))
+        XCTAssertFalse(editor.hitTest(CGPoint(x: 650, y: 700), host: host))
+        editor.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(600, 600))], host: host)
+        XCTAssertTrue(editor.isEditing)
+        XCTAssertEqual(tv.selectedRange, selection)
+        let dismissed = try await h.run(CommandIDs.textTapAt,
+                                       ["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [600, 700], "gesture": "tap"])
+        XCTAssertEqual(dismissed["handled"]?.boolValue, true, "the dismissal tap cannot reach the active tool")
+        await editor.flush()
+        XCTAssertFalse(editor.isEditing)
+        editor.detach(from: host)
+    }
+
     func testTypingInANewBoxCreatesItOnTheFirstCommit() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let host = FakeCanvasHost(h)

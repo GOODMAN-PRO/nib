@@ -23,11 +23,11 @@ public enum FeatTextBoxFeature: NibFeature {
             TextLayout.layoutInfo(item)
         })
 
-        // Select a box, then tap it (or double-tap it with any tool) to type; before selection.tapAt (400).
+        // Dismiss an active editor before other canvas taps; otherwise only text-box targets are handled.
         for gesture in [CanvasGesture.tap, CanvasGesture.doubleTap] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
                 id: CommandIDs.textTapAt + "." + gesture.rawValue, owner: id, gesture: gesture, command: CommandIDs.textTapAt,
-                order: 350, itemKinds: [.text]))
+                order: 50))
         }
 
         let settings = app.settings

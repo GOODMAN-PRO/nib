@@ -886,11 +886,15 @@ struct TextTapAt: NibCommand {
         if let r = p.ref, case let .item(d, pg, id)? = NodeRef(r), d == doc, pg == page {
             target = items.first { $0.id == id && $0.kind == .text }
         }
-        if target == nil { target = TextHitTest.textItem(at: point, in: items) }
+        if target == nil, p.ref == nil { target = TextHitTest.textItem(at: point, in: items) }
+        let editor = TextBoxEditor.editor(for: session)
         guard let item = target, item.layer == session.activeLayer, !session.hiddenLayers.contains(item.layer) else {
+            if let editor, editor.isEditing {
+                editor.endEditing()
+                return Output(handled: true, ref: nil)
+            }
             return Output(handled: false, ref: nil)
         }
-        let editor = TextBoxEditor.editor(for: session)
         let wants = p.gesture == CanvasGesture.doubleTap.rawValue || session.tool == TextTool.toolID
             || session.selection.items.contains(item.id) || (editor?.isEditing ?? false)
         guard wants else { return Output(handled: false, ref: nil) }

@@ -107,7 +107,6 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private var needsNormalize = false
     private var pendingInsert: NSRange?
     private var lastCaret: Int?
-    private var outsideTouch: CGPoint?
     /// The window's floating host while it shows this editor's More popover.
     private weak var floating: FloatingHosting?
     /// Fires whenever the text, selection or style changes (the keyboard bar and inspector refresh on it).
@@ -161,30 +160,16 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         layoutEditing()
     }
 
-    /// While editing, every canvas touch is claimed: inside the box it belongs to the text view; outside, a tap ends
-    /// editing (a drag, such as a scroll, does not).
+    /// Native text contacts are exclusive; outside contacts remain eligible for canvas navigation.
+    /// Outside taps finish through text.tapAt; outside drags never enter the tap command chain.
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
         guard let st = state else { return false }
         let local = st.container.convert(viewPoint, from: host.canvasView)
-        outsideTouch = st.container.bounds.insetBy(dx: -6, dy: -6).contains(local) ? nil : viewPoint
-        return true
+        return st.container.bounds.insetBy(dx: -6, dy: -6).contains(local)
     }
 
-    func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
-        guard let start = outsideTouch, let s = samples.last else { return }
-        let v = host.viewPoint(s.location, page: s.page)
-        if hypot(v.x - start.x, v.y - start.y) > 10 { outsideTouch = nil }
-    }
-
-    func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
-        guard outsideTouch != nil else { return }
-        outsideTouch = nil
-        endEditing()
-    }
-
-    func touchesCancelled(host: CanvasHost) {
-        outsideTouch = nil
-    }
+    // UITextView already handled these contacts, including double-tap word selection.
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool { true }
 
     // MARK: Starting and ending
 
