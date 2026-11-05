@@ -284,7 +284,9 @@ struct StudySessionView: View {
     let smartLearn: Bool
     let close: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var drag = CGSize.zero
+    @GestureState private var liveDrag = CGSize.zero
+    @State private var swipeOffset = CGSize.zero
+    private var drag: CGSize { swiping ? swipeOffset : liveDrag }
     @State private var swiping = false
     @State private var resetConfirmed = false
     @State private var optionsPresented = false
@@ -415,30 +417,28 @@ struct StudySessionView: View {
         .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.studyCard))
         .hoverEffect(.highlight)
         .onTapGesture { model.action("flip") }
-        .gesture(DragGesture(minimumDistance: NibSpacing.l).onChanged { value in
+        .gesture(DragGesture(minimumDistance: NibSpacing.l).updating($liveDrag) { value, state, _ in
             guard !model.busy, !swiping else { return }
-            if !reduceMotion { drag = value.translation }
+            if !reduceMotion { state = value.translation }
         }.onEnded { value in
-            guard !model.busy, !swiping else { drag = .zero; return }
+            guard !model.busy, !swiping else { return }
             let travel = value.predictedEndTranslation.width
             if abs(travel) > size.width / 4 {
                 if model.flipped, !model.readOnly {
-                    if reduceMotion { model.grade(travel > 0 ? .good : .again); drag = .zero }
+                    if reduceMotion { model.grade(travel > 0 ? .good : .again) }
                     else {
+                        swipeOffset = value.translation
                         swiping = true
                         withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
-                            drag = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
+                            swipeOffset = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
                         } completion: {
                             if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
                             swiping = false
                             var transaction = Transaction(); transaction.disablesAnimations = true
-                            withTransaction(transaction) { drag = .zero }
+                            withTransaction(transaction) { swipeOffset = .zero }
                         }
                     }
                 } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
-            }
-            if !(model.flipped && !model.readOnly && !reduceMotion && abs(travel) > size.width / 4) {
-                withAnimation(NibMotion.slot.animation) { drag = .zero }
             }
         })
         .accessibilityElement(children: .contain)
