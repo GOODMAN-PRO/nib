@@ -136,6 +136,9 @@ final class ToolbarModel: ObservableObject {
     /// One popover at a time: opening it closes the options bar's own popover.
     @Published var settingsOpen = false {
         didSet {
+            #if DEBUG
+            NSLog("%@", "[Nib QA ink] toolbar settings=\(oldValue)->\(settingsOpen) tool=\(tool) more=\(moreOpen) options=\(optionsPopovers.filter { $0.value.wrappedValue }.map(\.key)) dock=\(String(describing: savedDock))")
+            #endif
             if settingsOpen && !oldValue {
                 moreOpen = false
                 closeOptionsPopovers()
@@ -145,6 +148,9 @@ final class ToolbarModel: ObservableObject {
     /// The palette's More grid (`NibToolPalette(morePresented:)`); it too closes the options bar's popover.
     @Published var moreOpen = false {
         didSet {
+            #if DEBUG
+            NSLog("%@", "[Nib QA ink] toolbar more=\(oldValue)->\(moreOpen) tool=\(tool) settings=\(settingsOpen) options=\(optionsPopovers.filter { $0.value.wrappedValue }.map(\.key))")
+            #endif
             if moreOpen && !oldValue {
                 settingsOpen = false
                 closeOptionsPopovers()

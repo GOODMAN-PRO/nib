@@ -1,9 +1,44 @@
 import XCTest
 import SwiftUI
+import QuartzCore
 @testable import NibDesign
 
 @MainActor
 final class AnimationIdleTests: XCTestCase {
+    func testSquareReshapeParksAfterReachingItsLayout() {
+        for reduced in [false, true] {
+            let field = DropletField()
+            defer { field.setActive(false) }
+            field.reduceMotion = reduced
+            field.setRest("square", CGRect(x: 40, y: 40, width: 56, height: 56), style: .palette)
+            field.beginReshape("square", towards: CGPoint(x: 68, y: 68), velocity: .zero)
+            var busy = true
+            for _ in 0..<600 { busy = field.tick(1.0 / 120) }
+            XCTAssertEqual(field.node("square").presentation.reshape, .idle)
+            XCTAssertFalse(busy)
+        }
+    }
+
+    func testRepeatedBudSessionsSettleAndUnregisterParks() {
+        let field = DropletField()
+        defer { field.setActive(false) }
+        field.setRest("source", CGRect(x: 20, y: 20, width: 44, height: 44), style: .bar)
+        field.setRest("sheet", CGRect(x: 80, y: 80, width: 320, height: 400), style: .popover)
+        for _ in 0..<2 {
+            field.setBud("sheet", source: "source", presented: true, instant: false, dismiss: {})
+            let now = CACurrentMediaTime()
+            var busy = true
+            for i in 0..<600 { busy = field.tick(1.0 / 120, now: now + Double(i) / 120) }
+            XCTAssertFalse(busy)
+            field.setBud("sheet", source: "source", presented: false, instant: false, dismiss: {})
+            for i in 0..<600 { busy = field.tick(1.0 / 120, now: now + Double(i) / 120) }
+            XCTAssertFalse(busy)
+        }
+        field.unregister("sheet")
+        field.unregister("source")
+        XCTAssertFalse(field.tick(1.0 / 120))
+    }
+
     func testDriverParksWhenWorkFinishesAndCanWakeAgain() {
         var remaining = 2
         var steps: [Double] = []

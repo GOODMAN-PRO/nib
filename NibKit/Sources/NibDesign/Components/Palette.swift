@@ -669,7 +669,7 @@ public struct NibToolPalette<Settings: View>: View {
         .clipShape(NibDropletShape())
         .contentShape(NibDropletShape())
         .nibChromeTypeCap()
-        .droplet(id, style: .palette, managesDrag: false)
+        .droplet(id, style: .palette, managesDrag: false, layoutSize: s)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Tools", bundle: .module))
         .accessibilityActions {

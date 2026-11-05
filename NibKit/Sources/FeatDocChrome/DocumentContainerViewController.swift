@@ -1321,6 +1321,9 @@ struct EditorHost: UIViewControllerRepresentable {
             || viewportWidth < NibMetrics.compactBreakpoint
         let additional = Self.additionalInsets(insets, system: system, canvas: canvas, compactCanvas: compactCanvas)
         guard existing != additional else { return }
+        #if DEBUG
+        NSLog("%@", "[Nib QA sidebar] editor=\(ObjectIdentifier(uiViewController)) bounds=\(uiViewController.view.bounds) desired=\(insets) safe=\(safe) system=\(system) additional=\(existing)->\(additional)")
+        #endif
         uiViewController.additionalSafeAreaInsets = additional
         // Safe-area changes update scrolling immediately. Refresh fit through the public editor contract too:
         // the canvas retains the user's zoom/anchor, but recomputes fitted zoom for the new usable viewport.

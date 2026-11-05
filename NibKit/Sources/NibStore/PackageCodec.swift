@@ -636,10 +636,6 @@ struct PackageFiles {
                now: Date) throws {
         let pkg = try PackageFiles.existingPackage(doc, locator)
         let fm = FileManager.default
-        if let head = head {
-            let data = try PackageCodec.encodeHead(PackageCodec.pruned(head, now: now))
-            try PackageFiles.coordinatedWrite(data, to: pkg.appendingPathComponent(PackageCodec.headFileName(device)))
-        }
         for (page, items) in pages {
             guard NibID.isValid(page.raw) else {
                 PackageFiles.log.error("skipping page with invalid id \(page.raw, privacy: .public)")
@@ -649,6 +645,14 @@ struct PackageFiles {
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             let data = try PackageCodec.encodeItems(PackageCodec.pruned(items, now: now))
             try PackageFiles.coordinatedWrite(data, to: dir.appendingPathComponent(PackageCodec.pageFileName(device)))
+        }
+        // Publish page membership only after all supplied page files exist. Assets
+        // are already written synchronously by PackageAssetStore.put before their
+        // refs enter a transaction. A failed page write must retain the old head;
+        // an orphan page after a failed head write is harmless to head readers.
+        if let head = head {
+            let data = try PackageCodec.encodeHead(PackageCodec.pruned(head, now: now))
+            try PackageFiles.coordinatedWrite(data, to: pkg.appendingPathComponent(PackageCodec.headFileName(device)))
         }
         for url in copies { PackageFiles.coordinatedDelete(url) }
     }

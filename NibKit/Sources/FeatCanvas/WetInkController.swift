@@ -466,24 +466,32 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         canvas.accessibilityElementsHidden = true
         if highlighter { canvas.layer.compositingFilter = "multiplyBlendMode" }
         canvas.acceptsContact = { [weak self, weak surface, weak canvas] point, event in
+            func report(_ accepted: Bool, _ reason: String) -> Bool {
+                #if DEBUG
+                let host = self?.host
+                let hit = event?.allTouches?.first?.view
+                NSLog("%@", "[Nib QA ink] contact accepted=\(accepted) reason=\(reason) point=\(point) tool=\(host?.session.tool ?? "nil") inkEnabled=\(host?.isInkEnabled ?? false) drawingGesture=\(canvas?.drawingGestureRecognizer.isEnabled ?? false) hitView=\(String(describing: hit.map { type(of: $0) })) surfaceActive=\(surface?.active ?? false) allowedPage=\(String(describing: surface?.page)) allowedRegion=\(String(describing: surface?.region)) panels=\(String(describing: host?.session.openPanels)) presented=\(String(describing: canvas?.window?.rootViewController?.presentedViewController.map { type(of: $0) }))")
+                #endif
+                return accepted
+            }
             guard let self = self, let surface = surface, let canvas = canvas, surface.active, let host = self.host,
-                  host.isInkEnabled, host.activeTool?.inputMode == .pencilKit else { return false }
-            guard let event = event, let touches = event.allTouches, !touches.isEmpty else { return true }
+                  host.isInkEnabled, host.activeTool?.inputMode == .pencilKit else { return report(false, "inactive/missing surface or ink/tool disabled") }
+            guard let event = event, let touches = event.allTouches, !touches.isEmpty else { return report(true, "speculative hit test without touches") }
             let at = canvas.convert(point, to: host.canvasView)
             let touch = touches.min { a, b in
                 let pa = a.location(in: host.canvasView), pb = b.location(in: host.canvasView)
                 return hypot(pa.x - at.x, pa.y - at.y) < hypot(pb.x - at.x, pb.y - at.y)
             }
-            guard let touch = touch else { return false }
+            guard let touch = touch else { return report(false, "no nearest touch") }
             let contact = ObjectIdentifier(touch)
             guard surface.acceptedContacts.isEmpty || surface.acceptedContacts.contains(contact),
                   let sample = TouchTap.sample(touch, event: event, touchID: 0, host: host),
-                  sample.page == surface.page, surface.region.contains(sample.location) else { return false }
+                  sample.page == surface.page, surface.region.contains(sample.location) else { return report(false, "contact ownership or page/region exclusion") }
             // UIKit may hit-test speculatively, or again after touchesEnded. A probe is not
             // contact delivery: reserving it here can permanently exclude the next finger.
             // TouchTap admits the contact from its actual hit view in begin(_:event:id:).
-            if case .tool(let tool) = self.decision(touch, remember: false), tool.inputMode == .pencilKit { return true }
-            return false
+            if case .tool(let tool) = self.decision(touch, remember: false), tool.inputMode == .pencilKit { return report(true, "PencilKit tool") }
+            return report(false, "routing chose attachment/navigation/palm or non-PencilKit tool")
         }
         surfaces.append(surface)
         surfaceContainer.addSubview(canvas)
@@ -546,6 +554,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         if case .attachment = candidate { route = candidate }
         else if rejectsPalm(touch, host: host) { route = .rejected }
         else { route = candidate }
+        #if DEBUG
+        if touch.phase == .began {
+            NSLog("%@", "[Nib QA ink] route=\(String(describing: route)) candidate=\(String(describing: candidate)) tool=\(host.session.tool) stylusMode=\(stylusMode) inkEnabled=\(host.isInkEnabled) readOnly=\(host.isReadOnly) point=\(at) hitView=\(String(describing: touch.view.map { type(of: $0) })) panels=\(host.session.openPanels)")
+        }
+        #endif
         if remember { decisions[key] = route }
         return route
     }

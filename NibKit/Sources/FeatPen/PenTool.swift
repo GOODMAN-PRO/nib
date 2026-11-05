@@ -50,6 +50,9 @@ final class PenTool: CanvasTool {
     func deactivate(_ host: CanvasHost) { touchesCancelled(host: host); pendingLoop = nil }
 
     func strokeFinished(_ stroke: Stroke, page: PageID, host: CanvasHost) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA ink] pen native stroke tool=\(id) page=\(page) points=\(stroke.points.count) consumedPress=\(consumedPress != nil)")
+        #endif
         if let press = consumedPress {
             consumedPress = nil
             let elapsed = ProcessInfo.processInfo.systemUptime - press.at
@@ -177,6 +180,9 @@ final class PenTool: CanvasTool {
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA ink] pen sample begin tool=\(id) inputMode=\(inputMode) predicted=\(sample.isPredicted) accepted=\(inputMode == .samples && !sample.isPredicted)")
+        #endif
         consumedPress = nil
         guard inputMode == .samples, !sample.isPredicted else { return }
         samplePage = sample.page; sampleStyle = inkStyle(host); sampleStart = sample.timestamp

@@ -1,4 +1,6 @@
 import SwiftUI
+import Combine
+import UIKit
 import NibContracts
 
 /// The one container per window for everything that floats. iOS 26+: the system's Liquid Glass inside a
@@ -41,6 +43,15 @@ public struct NibDropletContainer<Content: View>: View {
             .onAppear { isVisible = true; field.setActive(scenePhase == .active) }
             .onDisappear { isVisible = false; field.setActive(false) }
             .onChange(of: scenePhase) { _, phase in field.setActive(isVisible && phase == .active) }
+            #if DEBUG
+            .onReceive(Publishers.MergeMany([
+                UITextField.textDidBeginEditingNotification, UITextField.textDidChangeNotification,
+                UITextField.textDidEndEditingNotification, UITextView.textDidBeginEditingNotification,
+                UITextView.textDidChangeNotification, UITextView.textDidEndEditingNotification
+            ].map { NotificationCenter.default.publisher(for: $0) })) { notification in
+                field.noteQAInput(in: (notification.object as? UIView)?.window)
+            }
+            #endif
     }
 
     private var containerBody: some View {
@@ -192,7 +203,12 @@ struct DismissCatcher: View {
     var body: some View {
         Color.clear
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onEnded { _ in field.dismissBuds() })
+            .gesture(DragGesture(minimumDistance: 0).onEnded { value in
+                #if DEBUG
+                NSLog("%@", "[Nib QA ink] rejected by modal dismiss cover point=\(value.location) hasOpenBud=\(field.hasOpenBud)")
+                #endif
+                field.dismissBuds()
+            })
             .ignoresSafeArea()
             .accessibilityHidden(true)
     }

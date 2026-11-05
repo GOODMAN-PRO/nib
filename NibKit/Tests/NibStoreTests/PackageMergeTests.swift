@@ -5,6 +5,42 @@ import NibTesting
 
 @MainActor
 final class PackageMergeTests: XCTestCase {
+    func testFailedPageWriteDoesNotPublishNewHeadOrDeleteConflictCopies() throws {
+        let lib = TestLibrary()
+        let (head, pages) = Fixtures.sampleContent()
+        let pkg = lib.package(head.meta.id)
+        let files = PackageFiles(device: "00000007", locator: lib.locator)
+        try files.write(head.meta.id, head: head, pages: pages, deleting: [], now: Date())
+        let headURL = pkg.appendingPathComponent(PackageCodec.headFileName("00000007"))
+        let before = try Data(contentsOf: headURL)
+        let page = PageRecord(id: "NEWWRITEPAGE")
+        var next = head
+        next.pages.append(page)
+        // A file at the required directory forces a real I/O failure, after the
+        // old implementation would already have published the extra page.
+        let blocker = pkg.appendingPathComponent(PackageCodec.pageDirectory(page.id))
+        try Data([1]).write(to: blocker)
+        let conflict = pkg.appendingPathComponent("doc.00000007 2.json")
+        try before.write(to: conflict)
+        XCTAssertThrowsError(try files.write(head.meta.id, head: next, pages: [page.id: []],
+                                             deleting: [conflict], now: Date()))
+        XCTAssertEqual(try Data(contentsOf: headURL), before)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: conflict.path))
+    }
+
+    func testOrphanPageFileDoesNotChangeHeadMembership() throws {
+        let lib = TestLibrary()
+        let (head, pages) = Fixtures.sampleContent()
+        lib.package(head.meta.id)
+        let files = PackageFiles(device: "00000007", locator: lib.locator)
+        try files.write(head.meta.id, head: head, pages: pages, deleting: [], now: Date())
+        let orphan: PageID = "ORPHANPAGE01"
+        try files.write(head.meta.id, head: nil, pages: [orphan: []], deleting: [], now: Date())
+        let reader = lib.store("00000008")
+        XCTAssertEqual(try reader.loadHead(head.meta.id), head)
+        XCTAssertNil(try reader.loadHead(head.meta.id).page(orphan))
+    }
+
     func testConflictCopyNamePatterns() {
         XCTAssertEqual(PackageCodec.headRole("doc.1a2b3c4d.json"), .device("1a2b3c4d"))
         for name in ["doc.1a2b3c4d 2.json", "doc.1a2b3c4d (conflicted copy).json",
