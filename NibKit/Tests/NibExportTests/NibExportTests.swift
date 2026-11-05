@@ -231,6 +231,21 @@ final class NibExportTests: XCTestCase {
 
     // MARK: Packages
 
+    func testOmissionMessageUsesDisplayLabelsAndCountNeutralWording() {
+        let omission = ExportOmission(document: "Notebook", asset: "missing.png",
+            pages: ["Notes (draft) (PRIVATEPAGEID)"], pageLabels: ["Notes (draft)"])
+        for count in [1, 2] {
+            let message = ExportOmission.message(Array(repeating: omission, count: count))
+            XCTAssertTrue(message.contains("Notes (draft)"))
+            XCTAssertFalse(message.contains("PRIVATEPAGEID"))
+            XCTAssertTrue(message.contains("Unreadable assets omitted: \(count)."))
+            let records = ExportOmission.message(Array(repeating:
+                ExportOmission(document: "Notebook", asset: "missing.png", pages: []), count: count))
+            XCTAssertTrue(records.contains("Unreadable assets omitted: \(count)."))
+            XCTAssertTrue(records.contains("document records"))
+        }
+    }
+
     /// The package holds the store's files: the head, one compressed page file per page with items on the exported
     /// layers (comments included), the assets, and the audio transcript.
     func testNibnotePackageHasTheStoreFormatWithAudioCommentsAndVisibleLayersOnly() async throws {
@@ -383,7 +398,9 @@ final class NibExportTests: XCTestCase {
             XCTAssertEqual(omissions.count, 1)
             XCTAssertEqual(omissions[0]["asset"]?.stringValue, Fixtures.pngAsset.name)
             XCTAssertTrue(omissions[0]["pages"]?.arrayValue?.contains { $0.stringValue?.contains(Fixtures.page1.raw) == true } == true)
-            XCTAssertNotNil(result["warning"]?.stringValue)
+            let warning = try XCTUnwrap(result["warning"]?.stringValue)
+            XCTAssertFalse(warning.contains(Fixtures.page1.raw))
+            XCTAssertTrue(warning.contains("Unreadable assets omitted: 1."))
             let file = try XCTUnwrap(result["files"]?.arrayValue?.first)
             let data = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(file["base64"]?.stringValue)))
             XCTAssertNotNil(data.range(of: Data("Export Report.txt".utf8)))
