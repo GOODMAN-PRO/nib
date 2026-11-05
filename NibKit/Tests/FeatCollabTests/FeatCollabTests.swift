@@ -128,6 +128,8 @@ final class InterruptedCollabTransport: CollabTransport {
     var failedCount = 0
     var minimumSendInterval: TimeInterval = 0
     var shouldThrottle: (() -> Bool)?
+    /// A deliberate wire drop before bandwidth accounting (for protocol compatibility tests).
+    var dropFrame: ((Data) -> Bool)?
     private var lastSend = Date.distantPast
     init(_ base: InMemoryCollabTransport) { self.base = base }
     var id: String { base.id }
@@ -154,6 +156,7 @@ final class InterruptedCollabTransport: CollabTransport {
     }
     func join(code: String, displayName: String) async throws { try await base.join(code: code, displayName: displayName) }
     func send(_ data: Data, to peers: [CollabPeer]?) throws {
+        if dropFrame?(data) == true { return }
         if shouldThrottle?() == true, Date().timeIntervalSince(lastSend) < minimumSendInterval {
             throw NibError(.timeout, "Relay queue is full", hint: "relay-busy")
         }
