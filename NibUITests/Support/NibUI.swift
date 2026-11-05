@@ -179,6 +179,9 @@ final class NibUI {
             }.first?.element
         }
         var visited = Set<String>()
+        var direction: Bool?
+        var reversed = false
+        var endSignatures: [String] = []
         for _ in 0..<16 {
             guard let list = liveList(), list.exists else { return }
             let listFrame = list.frame
@@ -197,8 +200,18 @@ final class NibUI {
                element.isHittable { return }
             guard list.exists, let snapshot = try? list.snapshot() else { return }
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
-            guard visited.insert(signature).inserted else { return }
-            let down = targetFrame.map { $0.midY < viewport.midY } ?? false
+            if !visited.insert(signature).inserted {
+                endSignatures.append(signature)
+                guard !reversed else {
+                    logQA("Form search exhausted", "both ends=\(endSignatures)")
+                    XCTFail("Form target not revealed in either direction; signatures=\(endSignatures)"); return
+                }
+                reversed = true
+                direction = !(direction ?? false)
+                visited = [signature]
+            }
+            if direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } ?? false }
+            let down = direction ?? false
             guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             let values = formControlValues(snapshot)
@@ -217,8 +230,9 @@ final class NibUI {
                 logQA("Form drag changed controls", "before=\(values) after=\(afterValues)")
                 XCTFail("Reveal drag changed slider/switch values: \(changed)"); return
             }
-
         }
+        logQA("Form search bounded", "ends=\(endSignatures) visited=\(visited.sorted())")
+        XCTFail("Form reveal exceeded 16 drags; ends=\(endSignatures) visited=\(visited.sorted())")
     }
 
     /// Frames and control identities only: numeric captions and control values are not scroll progress.
