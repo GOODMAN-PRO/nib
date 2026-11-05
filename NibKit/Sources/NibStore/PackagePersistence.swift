@@ -164,6 +164,8 @@ final class PackagePersistence: DocumentPersistence {
         let token = UUID()
         var stamp: String
         var head: DocumentContent
+        // The winning meta can be older-format even when a losing candidate contains unknown fields.
+        var format: Int
         var validUntil: UInt64
     }
     private var headReads: [DocumentID: HeadRead] = [:]
@@ -256,6 +258,8 @@ final class PackagePersistence: DocumentPersistence {
         let stamp = diskHeadStamp(doc)
         if let stamp, let cached = headReads[doc], cached.stamp == stamp,
            PackageCodec.ms(Date()) < cached.validUntil {
+            // Never lower an independently established gate using a cached snapshot.
+            if cached.format > NibFormat.version { applyFormatGate(doc, format: cached.format) }
             retainReadCache(doc)
             return cached.head
         }
@@ -271,7 +275,9 @@ final class PackagePersistence: DocumentPersistence {
         var candidates = read.values + logged
         if let head = queued?.head { candidates.append(head) }
         if let head = pending[doc]?.head { candidates.append(head) }
+        let format = candidates.map { $0.meta.format }.max() ?? NibFormat.version
         guard var head = PackageCodec.mergeHeads(candidates) else { throw NibError.notFound("document \(doc.raw)") }
+        applyFormatGate(doc, format: format)
         head.meta.id = doc
         let now = PackageCodec.ms(Date())
         var revisions: [Rev] = []
@@ -285,7 +291,7 @@ final class PackagePersistence: DocumentPersistence {
         }
         let validUntil = Self.validUntil(revisions, now: now)
         if let stamp, diskHeadStamp(doc) == stamp {
-            headReads[doc] = HeadRead(stamp: stamp, head: head, validUntil: validUntil)
+            headReads[doc] = HeadRead(stamp: stamp, head: head, format: format, validUntil: validUntil)
         }
         return head
     }
@@ -293,6 +299,16 @@ final class PackagePersistence: DocumentPersistence {
     private static func validUntil(_ revisions: [Rev], now: UInt64) -> UInt64 {
         revisions.filter { PackageCodec.isFuture($0, now: now) }
             .map { $0.wallMs - PackageCodec.futureSkewMs }.min() ?? UInt64.max
+    }
+
+    private func applyFormatGate(_ doc: DocumentID, format: Int) {
+        let readOnly = format > NibFormat.version
+        let wasReadOnly = gate.contains(doc)
+        gate.set(doc, readOnly: readOnly)
+        if readOnly, !wasReadOnly {
+            log.error("\(doc.raw, privacy: .public) has format \(format) > \(NibFormat.version): read-only")
+            emit(doc, StoreStatus.newerFormat)
+        }
     }
 
     private func readHead(_ doc: DocumentID, remembering: Bool) throws -> DocumentContent {
@@ -319,11 +335,7 @@ final class PackagePersistence: DocumentPersistence {
         // being rewritten by this build).
         let format = candidates.map { $0.meta.format }.max() ?? NibFormat.version
         let readOnly = format > NibFormat.version
-        gate.set(doc, readOnly: readOnly)
-        if readOnly {
-            log.error("\(doc.raw, privacy: .public) has format \(format) > \(NibFormat.version): read-only")
-            emit(doc, StoreStatus.newerFormat)
-        }
+        applyFormatGate(doc, format: format)
         // Replay: pages logged but not written before the app died, merged over what the device files hold.
         var recovered: [PageID: [Item]] = [:]
         for entry in logged {

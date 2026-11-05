@@ -5,6 +5,80 @@ import NibTesting
 
 @MainActor
 final class PackageMergeTests: XCTestCase {
+    func testPeekOfNewerFormatPreservesPackageAndConflictCopiesAfterFlush() throws {
+        for newerHeadInWAL in [false, true] {
+            let lib = TestLibrary()
+            var (head, pages) = Fixtures.sampleContent()
+            let doc = head.meta.id, page = Fixtures.page1
+            let pkg = lib.package(doc)
+            head.meta.rev = Rev(wallMs: 100, counter: 0, device: 7)
+            let writer = lib.store("00000007")
+            writer.didChange(doc, head: head, pages: pages)
+            writer.flush(doc)
+
+            // The newer-format candidate loses the metadata merge, but must still protect all its fields.
+            var newer = head
+            newer.meta.format = NibFormat.version + 1
+            newer.meta.rev = Rev(wallMs: 1, counter: 0, device: 8)
+            if newerHeadInWAL {
+                try writer.wal.append(WriteAheadLog.Entry(head: newer, pages: [:]), doc: doc)
+            } else {
+                try PackageCodec.encodeHead(newer).write(to: pkg.appendingPathComponent("doc.00000008.json"))
+            }
+            var conflictItem = try XCTUnwrap(pages[page]?.first)
+            conflictItem.rev = Rev(wallMs: 200, counter: 0, device: 8)
+            let encoded = try PackageCodec.encoder().encode([conflictItem])
+            var records = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [[String: Any]])
+            records[0]["futureField"] = ["mustSurvive": true]
+            let json = try JSONSerialization.data(withJSONObject: records)
+            let conflictBytes = try (json as NSData).compressed(using: .lzfse) as Data
+            let conflict = pkg.appendingPathComponent("pages/\(page.raw)/00000008 2.nibpage")
+            try conflictBytes.write(to: conflict)
+
+            func packageBytes() throws -> [String: Data] {
+                var result: [String: Data] = [:]
+                for path in try FileManager.default.subpathsOfDirectory(atPath: pkg.path) {
+                    let url = pkg.appendingPathComponent(path)
+                    if try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+                        result[path] = try Data(contentsOf: url)
+                    }
+                }
+                return result
+            }
+            let before = try packageBytes()
+            let walBefore = try? Data(contentsOf: writer.wal.url(doc))
+            let events = EventBus()
+            var reasons: [String] = []
+            let subscription = events.subscribe { event in
+                if let reason = event.decode(SyncStatusPayload.self)?.reason { reasons.append(reason) }
+            }
+            defer { subscription.cancel() }
+            let gate = ReadOnlyGate()
+            let reader = lib.store("00000007", events: events, gate: gate)
+            XCTAssertEqual(try reader.peekHead(doc).meta.format, NibFormat.version)
+            XCTAssertTrue(reader.isReadOnly(doc))
+            XCTAssertTrue(gate.published.contains(doc.raw))
+            XCTAssertEqual(reasons, ["newerFormat"])
+            let headReads = reader.headFileReads
+            let metadataReads = reader.wal.metadataReads
+            for _ in 0..<3 {
+                _ = try reader.peekHead(doc)
+                XCTAssertTrue(reader.isReadOnly(doc), "cached losing candidates must keep the format gate")
+            }
+            XCTAssertEqual(reader.headFileReads, headReads)
+            XCTAssertEqual(reader.wal.metadataReads, metadataReads)
+            XCTAssertEqual(reader.wal.replayReads, 0)
+            XCTAssertEqual(reader.itemPageReads, 0)
+            XCTAssertEqual(reasons, ["newerFormat"], "cache hits must not repeat the warning")
+            let items = try reader.loadItems(doc, page: page)
+            XCTAssertEqual(items.first { $0.id == conflictItem.id }?.rev, conflictItem.rev)
+            reader.flush(doc)
+            XCTAssertEqual(try packageBytes(), before, "neither file contents nor the set of package files may change")
+            XCTAssertEqual(try Data(contentsOf: conflict), conflictBytes)
+            XCTAssertEqual(try? Data(contentsOf: reader.wal.url(doc)), walBefore)
+        }
+    }
+
     func testFailedPageWriteDoesNotPublishNewHeadOrDeleteConflictCopies() throws {
         let lib = TestLibrary()
         let (head, pages) = Fixtures.sampleContent()
