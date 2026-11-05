@@ -1801,10 +1801,12 @@ final class FeatDocChromeTests: XCTestCase {
         let context = chrome.panelContext(ChromePanels.rename, presentation: .sheet)
         var draft = RenameDocumentDraft(context: context)
         draft.title = "Edited title"
+        let expectedTitle = draft.originalTitle
         h.session.document = Fixtures.textDocID
         h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
                                                   effect: .library, target: .app)) { params, _ in
             XCTAssertEqual(params["ref"]?.stringValue, NodeRef.document(Fixtures.docID).description)
+            XCTAssertEqual(params["expectedTitle"]?.stringValue, expectedTitle)
             throw NibError.invalid("Rename failed")
         }
         do {
