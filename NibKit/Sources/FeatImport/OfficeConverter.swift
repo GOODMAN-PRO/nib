@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import WebKit
+import PDFKit
 import NibContracts
 
 /// Word and PowerPoint files and web pages become PDFs, which the PDF importer (F024) then imports: the document is
@@ -318,14 +319,10 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
             return
         }
         renderer.prepare(forDrawingPages: NSRange(location: 0, length: count))
-        let pdf = UIGraphicsPDFRenderer(bounds: renderer.paperRect)
         do {
-            try pdf.writePDF(to: url) { context in
-                for index in 0..<count {
-                    context.beginPage()
-                    renderer.drawPage(at: index, in: context.pdfContextBounds)
-                }
-            }
+            try await OfficePDFBatches.write(renderer, count: count, to: url)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw NibError(.internalError, "could not write the converted PDF: \(error.localizedDescription)")
         }
@@ -381,5 +378,73 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         finishLoading(NibError(.unavailable, "the page couldn't be loaded: \(error.localizedDescription)",
                                hint: "check the address and the connection, then import again"))
+    }
+}
+
+/// UIKit draws at most four pages per main-actor turn. Only one batch of PDF bytes is retained;
+/// temporary-file writes and final PDF assembly run on the generic executor.
+enum OfficePDFBatches {
+    static let pagesPerBatch = 4
+
+    @MainActor
+    static func write(_ renderer: UIPrintPageRenderer, count: Int, to url: URL,
+                      betweenBatches: @MainActor () async throws -> Void = { await Task.yield() }) async throws {
+        let scratch = url.deletingLastPathComponent().appendingPathComponent("pdf-batches-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        do {
+            var files: [URL] = []
+            for start in stride(from: 0, to: count, by: pagesPerBatch) {
+                try Task.checkCancellation()
+                let end = min(count, start + pagesPerBatch)
+                let data = autoreleasepool {
+                    UIGraphicsPDFRenderer(bounds: renderer.paperRect).pdfData { context in
+                        for index in start..<end {
+                            context.beginPage()
+                            renderer.drawPage(at: index, in: context.pdfContextBounds)
+                        }
+                    }
+                }
+                let file = scratch.appendingPathComponent("\(start).pdf")
+                try await Task.detached(priority: .userInitiated) { try data.write(to: file) }.value
+                files.append(file)
+                try await betweenBatches()
+            }
+            try Task.checkCancellation()
+            let inputs = files
+            let output = scratch.appendingPathComponent("assembled.pdf")
+            let assembly = Task.detached(priority: .userInitiated) { try assemble(inputs, to: output) }
+            try await withTaskCancellationHandler(operation: { try await assembly.value }, onCancel: { assembly.cancel() })
+            try Task.checkCancellation()
+            // Publish only a complete PDF. The converter supplies a new output path.
+            try FileManager.default.moveItem(at: output, to: url)
+            await Task.detached { try? FileManager.default.removeItem(at: scratch) }.value
+        } catch {
+            await Task.detached { try? FileManager.default.removeItem(at: scratch) }.value
+            throw error
+        }
+    }
+
+    private static func assemble(_ files: [URL], to url: URL) throws {
+        // Insert PDF pages instead of drawing them again, retaining searchable text and link annotations.
+        let output = PDFDocument()
+        for file in files {
+            try Task.checkCancellation()
+            try autoreleasepool {
+                guard let document = PDFDocument(url: file), document.pageCount > 0 else {
+                    throw NibError(.unavailable, String(localized: "The converted PDF could not be read. Try importing again."))
+                }
+                for index in 0..<document.pageCount {
+                    try Task.checkCancellation()
+                    guard let page = document.page(at: index)?.copy() as? PDFPage else {
+                        throw NibError(.unavailable, String(localized: "A converted PDF page could not be read. Try importing again."))
+                    }
+                    output.insert(page, at: output.pageCount)
+                }
+            }
+        }
+        try Task.checkCancellation()
+        guard output.write(to: url) else {
+            throw NibError(.unavailable, String(localized: "The converted PDF could not be written. Try importing again."))
+        }
     }
 }
