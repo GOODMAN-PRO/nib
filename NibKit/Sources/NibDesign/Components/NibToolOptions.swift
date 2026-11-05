@@ -1,5 +1,38 @@
 import SwiftUI
 
+/// The selected tool's strip state, independent of whether a settings popover temporarily covers it.
+public struct NibToolOptionsState: Equatable {
+    public let hasStrip: Bool
+    public let foldedByUser: Bool
+    public let foldedByScroll: Bool
+
+    public init(hasStrip: Bool, foldedByUser: Bool, foldedByScroll: Bool) {
+        self.hasStrip = hasStrip
+        self.foldedByUser = foldedByUser
+        self.foldedByScroll = foldedByScroll
+    }
+
+    public enum Reselection: Equatable {
+        case hideOptions, showOptions, settings(Bool), none
+    }
+
+    /// Reselecting a strip tool always closes settings; only an explicit show clears a manual fold.
+    public func reselect(hasSettings: Bool, settingsOpen: Bool) -> Reselection {
+        if hasStrip { return foldedByUser || foldedByScroll ? .showOptions : .hideOptions }
+        return hasSettings ? .settings(!settingsOpen) : .none
+    }
+
+    public func hint(hasSettings: Bool, settingsOpen: Bool) -> String {
+        switch reselect(hasSettings: hasSettings, settingsOpen: settingsOpen) {
+        case .hideOptions: return String(localized: "Hides options", bundle: .module)
+        case .showOptions: return String(localized: "Shows options", bundle: .module)
+        case .settings(true): return String(localized: "Opens settings", bundle: .module)
+        case .settings(false): return String(localized: "Closes settings", bundle: .module)
+        case .none: return ""
+        }
+    }
+}
+
 /// What `NibToolPalette(toolOptions:)` shows for the active tool (DESIGN.md §13.3): the options bar fused to the
 /// palette and, optionally, one popover budded from a control inside that bar. The bar's droplet clips its content,
 /// so a popover cannot live inside it; the palette places this one as a full-size child of the container instead.

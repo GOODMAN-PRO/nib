@@ -161,8 +161,7 @@ final class ChromeUITests: XCTestCase {
         try wait("\(name) must become \(on)") { (target.value as? String == "1") == on }
     }
     private func settings(_ tool: String) throws {
-        try ui.selectTool(tool)
-        try tap("menu.toolSettings")
+        try ui.openToolSettings(tool)
     }
     private func editing(_ page: String) throws {
         try more("Document Editing Settings")
@@ -359,13 +358,13 @@ final class ChromeUITests: XCTestCase {
         try assertToolSettings("highlighter", obsolete: "Fountain Pen")
     }
 
-    func testSelectedToolTapOpensSettingsAndChangesPenType() throws {
-        try open(); try ui.selectTool("pen"); try tap("tool.pen")
+    func testSettingsChevronOpensSettingsAndChangesPenType() throws {
+        try open(); try ui.openToolSettings("pen")
         // F007 defines Pencil as a separate canvas tool, not a pen.style value.
         // Reopen the selected tool's settings after choosing it in the type grid.
         try tap("Pencil"); _ = try ui.waitForState { $0.tool == "pencil" }
         outside(); try draw()
-        try tap("tool.pencil"); XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@ AND NOT identifier BEGINSWITH %@", "Pencil", "tool.")).firstMatch.isSelected)
+        try ui.openToolSettings("pencil"); XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@ AND NOT identifier BEGINSWITH %@", "Pencil", "tool.")).firstMatch.isSelected)
         outside(); try draw(y: 0.72)
     }
 
@@ -493,7 +492,7 @@ final class ChromeUITests: XCTestCase {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("tool.elements")
         _ = try ui.waitForState { $0.tool == "elements" }
-        try tap("tool.elements"); try replace("Search elements", "Heart"); try ui.dismissNativeKeyboard(); try tap("Heart")
+        try ui.openToolSettings("elements"); try replace("Search elements", "Heart"); try ui.dismissNativeKeyboard(); try tap("Heart")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage + 1 }
         try ui.tapCommand("edit.undo")
         _ = try ui.waitForState { $0.itemCountOnPage == before.itemCountOnPage }
@@ -607,6 +606,24 @@ final class ChromeUITests: XCTestCase {
         try more("Hide Tools"); try more("Show Tools"); _ = try reachable("menu.toolSettings")
         try sameContent(before); try ui.selectTool("pen"); try diagnosedDraw("Hide show tools")
     }
+    func testSelectedPenTogglesOptionsAndSwatchPreservesManualFold() throws {
+        try open(); try ui.selectTool("pen")
+        _ = try reachable("menu.toolSettings")
+        try tap("tool.pen")
+        try wait("Reselecting Pen must fold its options") {
+            !self.query("menu.toolSettings").firstMatch.exists
+        }
+        let swatch = ui.app.buttons.matching(identifier: "cmd.preset.select")
+            .allElementsBoundByIndex.first { $0.isHittable && !$0.isSelected }
+        try XCTUnwrap(swatch).tap()
+        _ = try ui.waitForState { $0.tool == "pen" }
+        XCTAssertFalse(query("menu.toolSettings").firstMatch.exists, "A quick colour must preserve the manual fold")
+        try tap("tool.pen")
+        try tap("menu.toolSettings")
+        _ = try ui.waitForState { $0.toolSettingsOpen == "pen" }
+        _ = try require("Fountain Pen")
+    }
+
     func testPageScrollCollapsesOptionsAndChoosingToolRestoresThem() throws {
         try open(); try ui.selectTool("pen"); let before = try ui.state()
         _ = try reachable("menu.toolSettings")

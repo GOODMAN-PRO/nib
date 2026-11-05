@@ -378,9 +378,8 @@ final class FeatToolbarTests: XCTestCase {
                 return !panels().contains { hit === $0 || hit.isDescendant(of: $0) }
             }
         }
-        // NibToolPalette calls onReselect, then toggles the settings binding.
-        model.toolReselected("pencil")
-        model.settingsOpen.toggle()
+        // The options chevron opens settings without folding the selected tool's strip.
+        model.openSettings()
         try await waitUntil("the selected Pencil settings becomes interactive again") {
             host.view.layoutIfNeeded()
             return panels().contains { $0.isUserInteractionEnabled && $0.bounds.height > 400 }
@@ -1436,6 +1435,68 @@ final class FeatToolbarTests: XCTestCase {
         let otherModel = ToolbarModel(app: h.app, session: other)
         try await waitUntil("the new window restores the remembered tool") { other.tool == "note" }
         withExtendedLifetime([model, otherModel]) {}
+    }
+
+    func testManualOptionsFoldSurvivesColoursPagesScrollingAndWindowChromeRecreation() throws {
+        let h = harness()
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertNotNil(model.toolOptions(for: "pen"))
+        model.toolReselected("pen")
+        XCTAssertTrue(model.optionsCollapsed)
+        XCTAssertNil(model.toolOptions(for: "pen"))
+        model.selectSwatch(0)
+        h.session.page = Fixtures.page2
+        h.session.visibleRect = Rect(x: 0, y: 0, width: 400, height: 600)
+        h.session.visibleRect = Rect(x: 0, y: 100, width: 400, height: 600)
+        XCTAssertTrue(model.optionsCollapsed)
+        XCTAssertNil(model.toolOptions(for: "pen"))
+        h.session.tool = "eraser"
+        XCTAssertFalse(model.optionsCollapsed, "A different tool has its own strip")
+        h.session.tool = "pen"
+        XCTAssertTrue(model.optionsCollapsed, "Returning to Pen remembers its manual fold")
+        let rebuilt = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertTrue(rebuilt.optionsCollapsed, "Rebuilding chrome must preserve the window's choice")
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        other.page = Fixtures.page1
+        h.app.services.sessions.add(other)
+        let otherModel = ToolbarModel(app: h.app, session: other)
+        XCTAssertFalse(otherModel.optionsCollapsed, "A new window starts with options visible")
+        model.openSettings()
+        XCTAssertTrue(model.settingsOpen, "Settings remain reachable while the strip is folded")
+        XCTAssertTrue(model.optionsCollapsed)
+        model.toolReselected("pen")
+        XCTAssertFalse(model.settingsOpen)
+        XCTAssertFalse(model.optionsCollapsed)
+        XCTAssertFalse(rebuilt.optionsCollapsed)
+        XCTAssertNotNil(model.toolOptions(for: "pen"))
+    }
+
+    func testReselectingClosesOptionsPopoverAndExplicitlyRestoresScrollFold() throws {
+        let h = harness()
+        let flag = PopoverFlag()
+        var menu = ToolMenuDescriptor(tool: "pen", owner: TestToolsFeature.id) { _ in AnyView(EmptyView()) }
+        menu.makePopover = { _ in
+            ToolMenuPopover(source: "pen.thickness", isPresented: flag.binding, title: "Thickness") { EmptyView() }
+        }
+        h.app.ui.toolMenus.register(menu)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        _ = model.toolOptions(for: "pen")
+        flag.isOpen = true
+        model.toolReselected("pen")
+        XCTAssertFalse(flag.isOpen)
+        XCTAssertTrue(model.optionsCollapsed)
+        model.toolReselected("pen")
+        h.session.visibleRect = Rect(x: 0, y: 0, width: 400, height: 600)
+        h.session.visibleRect = Rect(x: 0, y: 40, width: 400, height: 600)
+        XCTAssertTrue(model.optionsCollapsed)
+        model.toolReselected("pen")
+        XCTAssertFalse(model.optionsCollapsed)
+        XCTAssertFalse(model.settingsOpen)
+        model.openSettings()
+        model.toolReselected("pen")
+        XCTAssertFalse(model.settingsOpen)
+        XCTAssertTrue(model.optionsCollapsed, "An open settings popover must not turn reselection into a settings toggle")
     }
 
     /// T-109 and the options bar's sources.

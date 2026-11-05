@@ -241,8 +241,7 @@ final class CaptureUITests: XCTestCase {
     private func toolOptions(_ id: String, title: String, number: Int) {
         variants {
             try self.openNotebook()
-            try self.ui.selectTool(id)
-            try self.tap("menu.toolSettings")
+            try self.ui.openToolSettings(id)
             _ = try self.ui.requireControl(title, type: .staticText, timeout: 12)
             try self.capture(number, id == "shape" ? "shapes-options" : id + "-options") {
                 $0.screen == "document" && $0.tool == id

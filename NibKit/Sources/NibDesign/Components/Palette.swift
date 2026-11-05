@@ -259,6 +259,7 @@ public struct NibToolPalette<Settings: View>: View {
     let settingsPresented: Binding<Bool>?
     let morePresented: Binding<Bool>?
     let onReselect: ((String) -> Void)?
+    let optionsState: ((String) -> NibToolOptionsState)?
     let settings: (String) -> Settings
 
     @Environment(DropletField.self) private var field: DropletField?
@@ -332,6 +333,7 @@ public struct NibToolPalette<Settings: View>: View {
         self.settingsPresented = nil
         self.morePresented = nil
         self.onReselect = nil
+        self.optionsState = nil
         self.settings = settings
     }
 
@@ -343,12 +345,14 @@ public struct NibToolPalette<Settings: View>: View {
     ///   - settingsPresented: owns the selected tool's settings presentation (a chevron in the options bar
     ///     opens it; the chrome keeps one popover open at a time and guards touches while it is open).
     ///   - morePresented: owns the More grid's presentation state.
-    ///   - onReselect: called with the tool's id when the selected tool is tapped again (before its settings bud).
+    ///   - optionsState: strip capability and fold state, even while the bar is absent.
+    ///   - onReselect: handles the selected tool's tap, including strip and settings presentation.
     public init(id: String = "palette", tools: [NibTool], moreTools: [NibTool] = [], selection: Binding<String>,
                 swatches: [NibSwatch], swatch: Binding<Int>, dock: Binding<NibPaletteDock>,
                 allowedEdges: [NibDock] = NibDock.allCases, reservedTrailing: CGFloat = 0,
                 toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
-                morePresented: Binding<Bool>? = nil, onReselect: ((String) -> Void)? = nil,
+                morePresented: Binding<Bool>? = nil, optionsState: ((String) -> NibToolOptionsState)? = nil,
+                onReselect: ((String) -> Void)? = nil,
                 @ViewBuilder settings: @escaping (String) -> Settings) {
         self.id = id
         self.tools = tools
@@ -364,6 +368,7 @@ public struct NibToolPalette<Settings: View>: View {
         self.settingsPresented = settingsPresented
         self.morePresented = morePresented
         self.onReselect = onReselect
+        self.optionsState = optionsState
         self.settings = settings
     }
 
@@ -750,11 +755,21 @@ public struct NibToolPalette<Settings: View>: View {
     }
 
     private func toolButton(_ tool: NibTool, _ d: NibPaletteDock, _ map: [String: CGFloat]) -> some View {
-        NibToolButton(tool: tool, isSelected: tool.id == selection, paletteID: id, along: map[tool.id] ?? 0,
+        let hint = optionsState.map { $0(tool.id).hint(hasSettings: tool.hasSettings, settingsOpen: settingsOpen) } ?? ""
+        return NibToolButton(tool: tool, isSelected: tool.id == selection, paletteID: id, along: map[tool.id] ?? 0,
                       pitch: pitch) {
             tap(tool)
         }
         .frame(width: d.isVertical ? thick : pitch, height: d.isVertical ? pitch : thick)
+        .accessibilityHint(tool.id == selection ? hint : "")
+        .accessibilityActions {
+            if tool.id == selection && tool.hasSettings {
+                Button(String(localized: "Open settings", bundle: .module)) {
+                    moreOpen = false
+                    settingsOpen = true
+                }
+            }
+        }
     }
 
     private func divider(_ d: NibPaletteDock) -> some View {
@@ -769,8 +784,8 @@ public struct NibToolPalette<Settings: View>: View {
     private func tap(_ tool: NibTool) {
         moreOpen = false
         if tool.id == selection {
-            onReselect?(tool.id)
-            if tool.hasSettings { settingsOpen.toggle() }
+            if let onReselect { onReselect(tool.id) }
+            else if tool.hasSettings { settingsOpen.toggle() }
         } else {
             settingsOpen = false
             tapped = tool.id

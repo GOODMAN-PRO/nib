@@ -129,7 +129,10 @@ final class ToolbarModel: ObservableObject {
     /// A dock the palette was just dragged (or moved by an accessibility action) to while `toolbar.dock` stores it:
     /// the palette lands there at once instead of flowing home for a frame.
     @Published private(set) var pendingDock: NibPaletteDock?
-    @Published private(set) var optionsCollapsed = false
+    @Published private var optionsFoldedByScroll = false
+    /// Window-local choices survive page/document changes and returning to a previously folded tool.
+    @Published private var manuallyFoldedTools: Set<String> = []
+    var optionsCollapsed: Bool { optionsFoldedByScroll || manuallyFoldedTools.contains(tool) }
     /// Settings › Appearance › Liquid (`NibSettings.liquidMode`).
     @Published private(set) var liquidMode: NibLiquidMode = .full
     /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): the options bar's chevron opens it.
@@ -325,6 +328,11 @@ final class ToolbarModel: ObservableObject {
             guard let self else { return }
             self.isVisible = !hidden.contains(self.session.id)
         }.store(in: &cancellables)
+        runtime?.$foldedOptions.sink { [weak self] choices in
+            guard let self else { return }
+            let folded = choices[self.session.id, default: []]
+            if folded != self.manuallyFoldedTools { self.manuallyFoldedTools = folded }
+        }.store(in: &cancellables)
         let registries: [AnyObject] = [app.ui.toolbar, app.ui.toolMenus, app.ui.canvasTools, app.commands,
                                        app.content.keyCommands]
         for registry in registries {
@@ -412,7 +420,7 @@ final class ToolbarModel: ObservableObject {
     // MARK: Options bar (T-109)
 
     /// Scrolling or pulling the page folds the secondary bar away (and its popover with it); choosing a tool brings it
-    /// back. A zoom changes the visible size and does not count.
+    /// back unless the user folded that tool. A zoom changes the visible size and does not count.
     private func canvasDidScroll(_ rect: Rect?) {
         defer {
             lastRect = rect
@@ -423,20 +431,20 @@ final class ToolbarModel: ObservableObject {
         scrollTravel += abs(rect.y - last.y) + abs(rect.x - last.x)
         if scrollTravel >= Self.collapseTravel {
             closeOptionsPopovers()
-            optionsCollapsed = true
+            optionsFoldedByScroll = true
         }
     }
 
     private func expandOptions() {
-        optionsCollapsed = false
+        optionsFoldedByScroll = false
         scrollTravel = 0
     }
 
     /// The options bar fused to the palette (`NibToolPalette(toolOptions:)`) and, when the tool's menu has one, the
     /// popover that buds from a control inside it (`ToolMenuDescriptor.makePopover`, contracts-v2): the palette places
-    /// it beside the bar and closes it with the bar. nil while scrolling has folded the bar.
+    /// it beside the bar and closes it with the bar. nil while either fold hides the bar.
     func toolOptions(for id: String) -> NibToolOptions? {
-        guard !optionsCollapsed, let d = descriptors[id],
+        guard !optionsFoldedByScroll, !manuallyFoldedTools.contains(id), let d = descriptors[id],
               let bar = ActiveToolMenuHost.optionsBar(for: d, app: app, session: session, openSettings: { [weak self] in
                   self?.openSettings()
               }) else { return nil }
@@ -468,10 +476,34 @@ final class ToolbarModel: ObservableObject {
         settingsOpen = true
     }
 
-    /// The selected tool tapped again (the palette buds or closes its settings itself): acting on the tool brings its
-    /// folded options bar back.
+    func optionsState(for id: String) -> NibToolOptionsState {
+        let descriptor = descriptors[id]
+        let hasStrip = descriptor.map {
+            ActiveToolMenuHost.source(for: $0, app: app) != .absent || $0.settings != nil
+        } ?? false
+        return NibToolOptionsState(hasStrip: hasStrip, foldedByUser: manuallyFoldedTools.contains(id),
+                                   foldedByScroll: optionsFoldedByScroll)
+    }
+
+    /// The palette delegates the whole reselection decision, including settings, to its window's model.
     func toolReselected(_ id: String) {
-        expandOptions()
+        guard id == tool else { return }
+        let action = optionsState(for: id).reselect(hasSettings: descriptors[id]?.settings != nil,
+                                                   settingsOpen: settingsOpen)
+        switch action {
+        case .hideOptions:
+            settingsOpen = false
+            closeOptionsPopovers()
+            manuallyFoldedTools.insert(id)
+        case .showOptions:
+            settingsOpen = false
+            closeOptionsPopovers()
+            manuallyFoldedTools.remove(id)
+            expandOptions()
+        case .settings(let presented): settingsOpen = presented
+        case .none: break
+        }
+        runtime?.setOptionsFolded(manuallyFoldedTools, session: session)
     }
 
     func settingsView(for id: String) -> AnyView? {
@@ -506,7 +538,7 @@ final class ToolbarModel: ObservableObject {
     }
 
     /// A quick colour: the current writing tool's colour slot, switching back to that tool if another is active. Acting
-    /// on the writing tool brings its folded options bar back.
+    /// on the writing tool clears only a scroll fold, preserving its manual choice.
     func selectSwatch(_ index: Int) {
         expandOptions()
         app.perform(Self.presetSelect, ["tool": .string(inkTool), "swatch": .number(Double(index))], session: session)
@@ -601,6 +633,7 @@ struct ToolbarRootView: View {
                                        dock: dockBinding(dock),
                                        toolOptions: { model.toolOptions(for: $0) },
                                        settingsPresented: $model.settingsOpen, morePresented: $model.moreOpen,
+                                       optionsState: { model.optionsState(for: $0) },
                                        onReselect: { model.toolReselected($0) }) { id in
                             ToolSettingsContent(model: model, toolID: id)
                         }

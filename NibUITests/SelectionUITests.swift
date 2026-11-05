@@ -81,8 +81,7 @@ final class SelectionUITests: XCTestCase {
     }
 
     private func lassoSettings() throws {
-        try ui.selectTool("lasso")
-        try tap("tool.lasso")
+        try ui.openToolSettings("lasso")
     }
 
     private func loop(_ rect: CGRect? = nil, count: Int) throws {
@@ -489,7 +488,7 @@ final class SelectionUITests: XCTestCase {
     private func shape(_ kind: String, from: CGPoint, to: CGPoint) throws {
         try ui.selectTool("shape")
         if ui.findControl(kind, type: .button) == nil {
-            try tap("tool.shape")
+            try ui.openToolSettings("shape")
         }
         try tap(kind, scroll: true); outside()
         let before = try ui.state()
