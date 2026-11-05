@@ -528,6 +528,24 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertFalse(only.exists("Documents/diagnostics"), "a folder that held only copies goes with them")
     }
 
+    func testUnreadableLibraryListingIsReportedAndNeverProvesEmptiness() throws {
+        for failedListing in [1, 2] {
+            let c = try TempContainer()
+            defer { try? FileManager.default.removeItem(at: c.root) }
+            c.write("Documents/Mixed/A.nibnote/doc.00000007.json")
+            c.write("Documents/Mixed/unrelated.pdf")
+            let fm = FailingListingFileManager()
+            fm.target = c.url("Documents/Mixed")
+            fm.failedListing = failedListing
+            let plan = DeletionPlanner.plan(includeLibrary: true, libraryRoot: c.locations.documents,
+                                            locations: c.locations)
+            let report = DataEraser(fileManager: fm, coordinatesFiles: false).erase(plan)
+            XCTAssertTrue(c.exists("Documents/Mixed/unrelated.pdf"))
+            XCTAssertEqual(c.exists("Documents/Mixed/A.nibnote"), failedListing == 1)
+            XCTAssertTrue(report.failures.contains { $0.contains("Mixed") })
+        }
+    }
+
     func testEraseWithLibraryRemovesOnlyWhatNibMade() throws {
         let c = try TempContainer()
         let lib = "iCloud Drive/Nib/"
@@ -975,5 +993,20 @@ final class FeatAboutTests: XCTestCase {
         cells.append(current)
         return Array(cells.dropFirst().dropLast())
             .map { $0.replacingOccurrences(of: "\\|", with: "|").trimmingCharacters(in: .whitespaces) }
+    }
+}
+
+private final class FailingListingFileManager: FileManager, @unchecked Sendable {
+    var target: URL?
+    var failedListing = 1
+    private var listings = 0
+
+    override func contentsOfDirectory(at url: URL, includingPropertiesForKeys keys: [URLResourceKey]?,
+                                     options mask: FileManager.DirectoryEnumerationOptions = []) throws -> [URL] {
+        if url.standardizedFileURL == target?.standardizedFileURL {
+            listings += 1
+            if listings == failedListing { throw CocoaError(.fileReadNoPermission) }
+        }
+        return try super.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: mask)
     }
 }
