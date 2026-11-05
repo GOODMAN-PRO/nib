@@ -23184,6 +23184,95 @@
         }
       }
     },
+    "A page ref is required." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eine Seitenreferenz ist erforderlich."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se necesita una referencia de página."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Une référence de page est requise."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "È necessario un riferimento di pagina."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ページ参照が必要です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페이지 참조가 필요합니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Een paginaverwijzing is vereist."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wymagane jest odwołanie do strony."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uma referência de página é obrigatória."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Требуется ссылка на страницу."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "En sidreferens krävs."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sayfa başvurusu gereklidir."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要页面引用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要頁面參照。"
+          }
+        }
+      }
+    },
     "A participant uses a newer version of Nib." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -38241,6 +38330,95 @@
         }
       }
     },
+    "An unsaved stroke already uses this id." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein nicht gespeicherter Strich verwendet diese ID bereits."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un trazo sin guardar ya usa este id."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un trait non enregistré utilise déjà cet identifiant."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un tratto non salvato usa già questo ID."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保存されていないストロークが、すでにこのIDを使用しています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장되지 않은 획이 이미 이 ID를 사용하고 있습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Een niet-opgeslagen streek gebruikt deze id al."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Niezapisana kreska już używa tego identyfikatora."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Um traço não salvo já usa este id."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Несохраненный штрих уже использует этот идентификатор."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ett osparat streck använder redan det här id:t."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kaydedilmemiş bir çizgi bu kimliği zaten kullanıyor."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有一笔未保存的笔画已在使用此 ID。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有一筆未儲存的筆畫已在使用此 ID。"
+          }
+        }
+      }
+    },
     "And me" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -50638,6 +50816,95 @@
         }
       }
     },
+    "Backup otherwise complete, with omitted assets.\n%@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup ansonsten vollständig, mit ausgelassenen Ressourcen.\n%@"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copia de seguridad completa, salvo por los recursos omitidos.\n%@"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sauvegarde par ailleurs complète, avec des ressources omises.\n%@"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup per il resto completo, con risorse omesse.\n%@"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "バックアップは完了しましたが、一部のアセットは含まれていません。\n%@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "백업은 완료되었으나 일부 에셋이 제외되었습니다.\n%@"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Back-up verder voltooid, met weggelaten bestanden.\n%@"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kopia zapasowa jest poza tym kompletna, ale pominięto niektóre zasoby.\n%@"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup concluído, com recursos omitidos.\n%@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Резервная копия в остальном завершена, но некоторые ресурсы пропущены.\n%@"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Säkerhetskopian är i övrigt komplett, men vissa resurser utelämnades.\n%@"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Yedekleme, atlanan varlıklar dışında tamamlandı.\n%@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "备份已完成，但省略了部分素材。\n%@"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "備份已完成，但省略了部分素材。\n%@"
+          }
+        }
+      }
+    },
     "Backup paused. Pending documents will resume on the next run." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -62801,6 +63068,95 @@
         }
       }
     },
+    "Change width or another style field, or use solid tape to change colour." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ändere die Breite oder ein anderes Stilfeld oder verwende einfarbiges Klebeband, um die Farbe zu ändern."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cambia el ancho u otro campo de estilo, o usa cinta lisa para cambiar el color."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modifiez la largeur ou un autre champ de style, ou utilisez un ruban uni pour changer la couleur."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modifica la larghezza o un altro campo di stile, oppure usa un nastro in tinta unita per cambiare colore."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "幅やその他のスタイル項目を変更するか、単色のテープを使って色を変更してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "너비나 다른 스타일 항목을 변경하거나, 단색 테이프를 사용해 색상을 변경하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wijzig de breedte of een ander stijlveld, of gebruik effen tape om de kleur te wijzigen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zmień szerokość lub inne pole stylu albo użyj jednolitej taśmy, aby zmienić kolor."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Altere a largura ou outro campo de estilo, ou use fita lisa para mudar a cor."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Измените ширину или другой параметр стиля либо используйте однотонную ленту, чтобы изменить цвет."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ändra bredden eller ett annat stilfält, eller använd enfärgad tejp för att ändra färg."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Genişliği veya başka bir stil alanını değiştirin ya da rengi değiştirmek için düz bant kullanın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更改宽度或其他样式字段，或使用纯色胶带来更改颜色。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "變更寬度或其他樣式欄位，或使用純色膠帶來變更顏色。"
+          }
+        }
+      }
+    },
     "Change your library" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -68226,6 +68582,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "選擇最接近你手部姿勢的圖示。Nib 會忽略手掌擱放處的觸碰。"
+          }
+        }
+      }
+    },
+    "Choose two different items to connect." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wähle zwei verschiedene Objekte zum Verbinden aus."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Elige dos elementos distintos para conectar."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choisissez deux éléments différents à relier."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scegli due elementi diversi da collegare."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "接続する2つの異なる項目を選択してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "연결할 서로 다른 항목 두 개를 선택하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kies twee verschillende onderdelen om te verbinden."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wybierz dwa różne elementy do połączenia."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escolha dois itens diferentes para conectar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выберите два разных элемента для соединения."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Välj två olika objekt att koppla ihop."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bağlamak için iki farklı öğe seçin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请选择两个不同的项目来连接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請選擇兩個不同的項目來連接。"
           }
         }
       }
@@ -103803,6 +104248,95 @@
         }
       }
     },
+    "Deleting this selection also affected %lld attached items on hidden layers. Undo restores them." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Löschen dieser Auswahl hat auch angehängte Objekte auf ausgeblendeten Ebenen betroffen (%lld). Mit „Widerrufen“ stellst du sie wieder her."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Al eliminar esta selección también se vieron afectados %lld elementos adjuntos en capas ocultas. Deshacer los restaura."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La suppression de cette sélection a aussi affecté %lld éléments associés sur des calques masqués. Annuler les rétablit."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’eliminazione di questa selezione ha interessato anche %lld elementi allegati su livelli nascosti. Annulla li ripristina."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この選択範囲を削除したことで、非表示のレイヤー上の添付項目%lld個にも影響がありました。取り消すと元に戻ります。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 선택 항목을 삭제하면서 숨겨진 레이어의 첨부 항목 %lld개도 영향을 받았습니다. 실행 취소하면 복원됩니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het verwijderen van deze selectie heeft ook %lld gekoppelde onderdelen op verborgen lagen beïnvloed. Met Herstel zet je ze terug."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Usunięcie tego zaznaczenia wpłynęło też na dołączone elementy na ukrytych warstwach (%lld). Cofnij przywraca je."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A exclusão desta seleção também afetou %lld itens anexados em camadas ocultas. Desfazer os restaura."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удаление этого выделения также затронуло прикрепленные элементы на скрытых слоях (%lld). Отмена вернет их."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Raderingen av det här urvalet påverkade även %lld bifogade objekt på dolda lager. Ångra återställer dem."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu seçimi silmek, gizli katmanlardaki %lld ekli öğeyi de etkiledi. Geri Al bunları geri yükler."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除此所选内容时，隐藏图层上的 %lld 个附属项目也受到了影响。撤销即可恢复。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "刪除此選取內容時，隱藏圖層上的 %lld 個附屬項目也受到了影響。還原即可復原。"
+          }
+        }
+      }
+    },
     "Deletions" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -106469,6 +107003,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "捨棄建議"
+          }
+        }
+      }
+    },
+    "Discard Unsaved Ink" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht gespeicherte Tinte verwerfen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Descartar tinta sin guardar"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abandonner l’encre non enregistrée"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Elimina inchiostro non salvato"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未保存のインクを破棄"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장되지 않은 잉크 폐기"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Niet-opgeslagen inkt verwijderen"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odrzuć niezapisany tusz"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Descartar Tinta Não Salva"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отбросить несохраненные чернила"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kassera osparat bläck"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kaydedilmemiş Mürekkebi At"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "放弃未保存的墨迹"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "捨棄未儲存的墨跡"
           }
         }
       }
@@ -126825,7 +127448,7 @@
       }
     },
     "Export completed without %lld unreadable assets in document records. See Export Report.txt in the archive." : {
-      "extractionState" : "manual",
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -126914,7 +127537,7 @@
       }
     },
     "Export completed without %lld unreadable assets on pages %@. See Export Report.txt in the archive." : {
-      "extractionState" : "manual",
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -127176,6 +127799,184 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "輸出 nib.d.ts"
+          }
+        }
+      }
+    },
+    "Export otherwise complete. Unreadable assets omitted: %lld. Location: document records. See Export Report.txt in the archive." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export ansonsten vollständig. Nicht lesbare Ressourcen ausgelassen: %lld. Ort: Dokumentdatensätze. Siehe Export Report.txt im Archiv."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportación completa, salvo por los recursos ilegibles omitidos: %lld. Ubicación: registros del documento. Consulta Export Report.txt en el archivo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportation par ailleurs complète. Ressources illisibles omises : %lld. Emplacement : enregistrements du document. Consultez Export Report.txt dans l’archive."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esportazione per il resto completa. Risorse illeggibili omesse: %lld. Posizione: record del documento. Consulta Export Report.txt nell’archivio."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "書き出しは完了しましたが、読み込めないアセット%lld個は含まれていません。場所：書類のレコード。アーカイブ内のExport Report.txtを参照してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내보내기는 완료되었으나 읽을 수 없는 에셋 %lld개가 제외되었습니다. 위치: 문서 레코드. 아카이브의 Export Report.txt를 확인하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export verder voltooid. Weggelaten onleesbare bestanden: %lld. Locatie: documentgegevens. Zie Export Report.txt in het archief."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eksport jest poza tym kompletny. Pominięte nieczytelne zasoby: %lld. Lokalizacja: rekordy dokumentu. Zobacz Export Report.txt w archiwum."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportação concluída, com recursos ilegíveis omitidos: %lld. Local: registros do documento. Consulte Export Report.txt no arquivo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Экспорт в остальном завершен. Пропущено нечитаемых ресурсов: %lld. Расположение: записи документа. См. Export Report.txt в архиве."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exporten är i övrigt komplett. Oläsbara resurser som utelämnats: %lld. Plats: dokumentposter. Se Export Report.txt i arkivet."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dışa aktarma tamamlandı. Atlanan okunamayan varlıklar: %lld. Konum: belge kayıtları. Arşivdeki Export Report.txt dosyasına bakın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出已完成，但省略了 %lld 个无法读取的素材。位置：文稿记录。请查看归档中的 Export Report.txt。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸出已完成，但省略了 %lld 個無法讀取的素材。位置：文件記錄。請查看封存檔中的 Export Report.txt。"
+          }
+        }
+      }
+    },
+    "Export otherwise complete. Unreadable assets omitted: %lld. Pages: %@. See Export Report.txt in the archive." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export ansonsten vollständig. Nicht lesbare Ressourcen ausgelassen: %lld. Seiten: %@. Siehe Export Report.txt im Archiv."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportación completa, salvo por los recursos ilegibles omitidos: %lld. Páginas: %@. Consulta Export Report.txt en el archivo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportation par ailleurs complète. Ressources illisibles omises : %lld. Pages : %@. Consultez Export Report.txt dans l’archive."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esportazione per il resto completa. Risorse illeggibili omesse: %lld. Pagine: %@. Consulta Export Report.txt nell’archivio."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "書き出しは完了しましたが、読み込めないアセット%lld個は含まれていません。ページ：%@。アーカイブ内のExport Report.txtを参照してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내보내기는 완료되었으나 읽을 수 없는 에셋 %lld개가 제외되었습니다. 페이지: %@. 아카이브의 Export Report.txt를 확인하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export verder voltooid. Weggelaten onleesbare bestanden: %lld. Pagina’s: %@. Zie Export Report.txt in het archief."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eksport jest poza tym kompletny. Pominięte nieczytelne zasoby: %lld. Strony: %@. Zobacz Export Report.txt w archiwum."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportação concluída, com recursos ilegíveis omitidos: %lld. Páginas: %@. Consulte Export Report.txt no arquivo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Экспорт в остальном завершен. Пропущено нечитаемых ресурсов: %lld. Страницы: %@. См. Export Report.txt в архиве."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exporten är i övrigt komplett. Oläsbara resurser som utelämnats: %lld. Sidor: %@. Se Export Report.txt i arkivet."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dışa aktarma tamamlandı. Atlanan okunamayan varlıklar: %lld. Sayfalar: %@. Arşivdeki Export Report.txt dosyasına bakın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出已完成，但省略了 %lld 个无法读取的素材。页面：%@。请查看归档中的 Export Report.txt。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸出已完成，但省略了 %lld 個無法讀取的素材。頁面：%@。請查看封存檔中的 Export Report.txt。"
           }
         }
       }
@@ -133398,6 +134199,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "垂直翻轉"
+          }
+        }
+      }
+    },
+    "Flip the card to grade your answer." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Drehe die Karte um, um deine Antwort zu bewerten."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Da la vuelta a la tarjeta para valorar tu respuesta."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Retournez la fiche pour évaluer votre réponse."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gira la scheda per valutare la tua risposta."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "カードをめくって、答えを採点してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "카드를 뒤집어 답을 채점하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draai de kaart om om je antwoord te beoordelen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odwróć fiszkę, aby ocenić swoją odpowiedź."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vire o cartão para avaliar sua resposta."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Переверните карточку, чтобы оценить свой ответ."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vänd på kortet för att betygsätta ditt svar."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cevabınızı derecelendirmek için kartı çevirin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "翻转卡片以评定你的答案。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "翻轉卡片以評定你的答案。"
           }
         }
       }
@@ -159066,6 +159956,95 @@
         }
       }
     },
+    "Ink recovery is already running." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Tintenwiederherstellung läuft bereits."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La recuperación de tinta ya está en curso."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La récupération de l’encre est déjà en cours."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il recupero dell’inchiostro è già in corso."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "インクの復元はすでに実行中です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "잉크 복구가 이미 진행 중입니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het herstellen van inkt is al bezig."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odzyskiwanie tuszu już trwa."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A recuperação de tinta já está em andamento."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Восстановление чернил уже выполняется."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Återställning av bläck pågår redan."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mürekkep kurtarma zaten çalışıyor."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "墨迹恢复已在进行中。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "墨跡復原已在進行中。"
+          }
+        }
+      }
+    },
     "Ink width %@ millimetres" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -162533,6 +163512,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "網際網路協作"
+          }
+        }
+      }
+    },
+    "Invalid stroke id." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ungültige Strich-ID."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Id de trazo no válido."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Identifiant de trait non valide."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ID del tratto non valido."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ストロークIDが無効です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "획 ID가 올바르지 않습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ongeldige streek-id."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nieprawidłowy identyfikator kreski."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Id de traço inválido."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Недопустимый идентификатор штриха."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ogiltigt streck-id."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geçersiz çizgi kimliği."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "笔画 ID 无效。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "筆畫 ID 無效。"
           }
         }
       }
@@ -166433,6 +167501,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "保持選取文字工具"
+          }
+        }
+      }
+    },
+    "Keep Unsaved Ink" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht gespeicherte Tinte behalten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conservar tinta sin guardar"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conserver l’encre non enregistrée"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantieni inchiostro non salvato"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未保存のインクを保持"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장되지 않은 잉크 유지"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Niet-opgeslagen inkt behouden"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zachowaj niezapisany tusz"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Manter Tinta Não Salva"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставить несохраненные чернила"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Behåll osparat bläck"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kaydedilmemiş Mürekkebi Tut"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保留未保存的墨迹"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保留未儲存的墨跡"
           }
         }
       }
@@ -171201,6 +172358,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "圖層名稱"
+          }
+        }
+      }
+    },
+    "Layer visibility changed while copying. Copy the selection again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Sichtbarkeit der Ebene hat sich beim Kopieren geändert. Kopiere die Auswahl erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La visibilidad de la capa cambió durante la copia. Vuelve a copiar la selección."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La visibilité du calque a changé pendant la copie. Copiez de nouveau la sélection."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La visibilità del livello è cambiata durante la copia. Copia di nuovo la selezione."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コピー中にレイヤーの表示状態が変わりました。選択範囲をもう一度コピーしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복사하는 동안 레이어 표시 상태가 변경되었습니다. 선택 항목을 다시 복사하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De zichtbaarheid van de laag is gewijzigd tijdens het kopiëren. Kopieer de selectie opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Widoczność warstwy zmieniła się podczas kopiowania. Skopiuj zaznaczenie ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A visibilidade da camada mudou durante a cópia. Copie a seleção novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Видимость слоя изменилась во время копирования. Скопируйте выделение снова."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lagrets synlighet ändrades under kopieringen. Kopiera urvalet igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Katman görünürlüğü kopyalama sırasında değişti. Seçimi yeniden kopyalayın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "拷贝时图层可见性发生了变化。请重新拷贝所选内容。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "拷貝時圖層可見性發生了變更。請重新拷貝所選內容。"
           }
         }
       }
@@ -237604,6 +238850,95 @@
         }
       }
     },
+    "Pages %@ had no readable image background. Their original image references were kept." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Seiten %@ hatten keinen lesbaren Bildhintergrund. Ihre ursprünglichen Bildverweise wurden beibehalten."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Las páginas %@ no tenían un fondo de imagen legible. Se conservaron sus referencias de imagen originales."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les pages %@ n’avaient aucun arrière-plan image lisible. Leurs références d’image d’origine ont été conservées."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le pagine %@ non avevano uno sfondo immagine leggibile. I loro riferimenti immagine originali sono stati mantenuti."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ページ%@には読み込める画像の背景がありませんでした。元の画像の参照はそのまま保持されています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페이지 %@에 읽을 수 있는 이미지 배경이 없습니다. 원래 이미지 참조는 유지되었습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pagina’s %@ hadden geen leesbare afbeeldingsachtergrond. Hun oorspronkelijke afbeeldingsverwijzingen zijn behouden."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Strony %@ nie miały czytelnego obrazu tła. Ich oryginalne odwołania do obrazów zostały zachowane."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "As páginas %@ não tinham um fundo de imagem legível. As referências de imagem originais foram mantidas."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "У страниц %@ нет читаемого фонового изображения. Исходные ссылки на изображения сохранены."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sidorna %@ hade ingen läsbar bildbakgrund. Deras ursprungliga bildreferenser behölls."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ sayfalarında okunabilir bir görüntü arka planı yoktu. Özgün görüntü başvuruları korundu."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "页面 %@ 没有可读取的图像背景。其原始图像引用已保留。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "頁面 %@ 沒有可讀取的影像背景。其原始影像參照已保留。"
+          }
+        }
+      }
+    },
     "Pages and panels cross-fade instead of moving." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -241516,6 +242851,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "圖樣跟隨筆畫"
+          }
+        }
+      }
+    },
+    "Patterned tape cannot be recoloured." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gemustertes Klebeband lässt sich nicht umfärben."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La cinta con motivos no se puede cambiar de color."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Un ruban à motif ne peut pas être recoloré."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il nastro con motivo non può essere ricolorato."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "柄付きのテープは色を変更できません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "패턴 테이프는 색상을 바꿀 수 없습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tape met patroon kan niet opnieuw worden gekleurd."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Taśmy ze wzorem nie można przekolorować."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A fita estampada não pode ser recolorida."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ленту с узором нельзя перекрасить."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mönstrad tejp kan inte färgas om."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desenli bant yeniden renklendirilemez."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "图案胶带无法重新着色。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "圖案膠帶無法重新著色。"
           }
         }
       }
@@ -262107,6 +263531,95 @@
         }
       }
     },
+    "Recover Unsaved Ink" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht gespeicherte Tinte wiederherstellen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recuperar tinta sin guardar"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Récupérer l’encre non enregistrée"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recupera inchiostro non salvato"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未保存のインクを復元"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장되지 않은 잉크 복구"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Niet-opgeslagen inkt herstellen"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Odzyskaj niezapisany tusz"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recuperar Tinta Não Salva"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Восстановить несохраненные чернила"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Återställ osparat bläck"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kaydedilmemiş Mürekkebi Kurtar"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "恢复未保存的墨迹"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "復原未儲存的墨跡"
+          }
+        }
+      }
+    },
     "Recovered" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -275916,6 +277429,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "重試辨識"
+          }
+        }
+      }
+    },
+    "Retry Unsaved Ink" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tinte erneut speichern"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reintentar guardar tinta"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Réessayer d’enregistrer l’encre"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Riprova a salvare l’inchiostro"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未保存のインクを再試行"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장되지 않은 잉크 다시 시도"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Opslaan van inkt opnieuw proberen"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ponów zapis tuszu"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tentar Salvar a Tinta Novamente"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторить сохранение чернил"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Försök spara bläcket igen"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mürekkebi Yeniden Kaydetmeyi Dene"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重试保存墨迹"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重試儲存墨跡"
           }
         }
       }
@@ -308388,6 +309990,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "顯示文字"
+          }
+        }
+      }
+    },
+    "Show the layer before cutting this selection." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Blende die Ebene ein, bevor du diese Auswahl ausschneidest."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muestra la capa antes de cortar esta selección."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Affichez le calque avant de couper cette sélection."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mostra il livello prima di tagliare questa selezione."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この選択範囲をカットする前に、レイヤーを表示してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 선택 항목을 오려두기 전에 레이어를 표시하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Toon de laag voordat je deze selectie knipt."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pokaż warstwę przed wycięciem tego zaznaczenia."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mostre a camada antes de recortar esta seleção."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Покажите слой, прежде чем вырезать это выделение."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Visa lagret innan du klipper ut det här urvalet."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu seçimi kesmeden önce katmanı gösterin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剪切此所选内容之前，请先显示该图层。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剪下此選取內容之前，請先顯示該圖層。"
           }
         }
       }
@@ -342418,6 +344109,95 @@
         }
       }
     },
+    "The page changed while copying. Nothing was cut. Try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Seite hat sich beim Kopieren geändert. Es wurde nichts ausgeschnitten. Versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La página cambió durante la copia. No se cortó nada. Inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La page a changé pendant la copie. Rien n’a été coupé. Réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La pagina è cambiata durante la copia. Non è stato tagliato nulla. Riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "コピー中にページが変更されました。何もカットされていません。もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복사하는 동안 페이지가 변경되었습니다. 아무것도 오려두지 않았습니다. 다시 시도하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De pagina is gewijzigd tijdens het kopiëren. Er is niets geknipt. Probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Strona zmieniła się podczas kopiowania. Nic nie zostało wycięte. Spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A página mudou durante a cópia. Nada foi recortado. Tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Страница изменилась во время копирования. Ничего не вырезано. Повторите попытку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sidan ändrades under kopieringen. Inget klipptes ut. Försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sayfa kopyalama sırasında değişti. Hiçbir şey kesilmedi. Yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "拷贝时页面发生了变化。未剪切任何内容。请重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "拷貝時頁面發生了變更。未剪下任何內容。請再試一次。"
+          }
+        }
+      }
+    },
     "The page renderer could not finish drawing this page." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -343393,6 +345173,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "錄音已保留，但暫時無法完成以供播放。請釋放一些空間；打開「音訊」標籤頁時，Nib 會再試一次。"
+          }
+        }
+      }
+    },
+    "The recovered stroke id is already in use." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die wiederhergestellte Strich-ID wird bereits verwendet."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El id del trazo recuperado ya está en uso."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’identifiant du trait récupéré est déjà utilisé."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’ID del tratto recuperato è già in uso."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "復元したストロークのIDはすでに使用されています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복구된 획 ID가 이미 사용 중입니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De id van de herstelde streek is al in gebruik."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Identyfikator odzyskanej kreski jest już używany."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O id do traço recuperado já está em uso."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Идентификатор восстановленного штриха уже используется."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det återställda streckets id används redan."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kurtarılan çizginin kimliği zaten kullanımda."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已恢复笔画的 ID 已被使用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已復原筆畫的 ID 已被使用。"
           }
         }
       }
@@ -349093,6 +350962,95 @@
         }
       }
     },
+    "This cut would change content on a hidden layer." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Ausschneiden würde Inhalte auf einer ausgeblendeten Ebene ändern."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este corte cambiaría contenido de una capa oculta."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cette coupe modifierait du contenu sur un calque masqué."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Questo taglio modificherebbe il contenuto di un livello nascosto."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このカットでは、非表示のレイヤー上のコンテンツが変更されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 오려두기는 숨겨진 레이어의 콘텐츠를 변경하게 됩니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deze knipactie zou inhoud op een verborgen laag wijzigen."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "To wycięcie zmieniłoby zawartość ukrytej warstwy."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este recorte alteraria o conteúdo de uma camada oculta."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Это вырезание изменит содержимое скрытого слоя."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den här utklippningen skulle ändra innehåll på ett dolt lager."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu kesme işlemi gizli bir katmandaki içeriği değiştirirdi."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此次剪切会更改隐藏图层上的内容。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此次剪下會變更隱藏圖層上的內容。"
+          }
+        }
+      }
+    },
     "This deletion would change content on a hidden layer." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -351670,6 +353628,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此頁面"
+          }
+        }
+      }
+    },
+    "This page could not be displayed. Try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Seite konnte nicht angezeigt werden. Versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo mostrar esta página. Inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cette page n’a pas pu être affichée. Réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile visualizzare questa pagina. Riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このページを表示できませんでした。もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 페이지를 표시할 수 없습니다. 다시 시도하세요."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deze pagina kon niet worden weergegeven. Probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można wyświetlić tej strony. Spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível exibir esta página. Tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось показать эту страницу. Повторите попытку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den här sidan kunde inte visas. Försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bu sayfa görüntülenemedi. Yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法显示此页面。请重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法顯示此頁面。請再試一次。"
           }
         }
       }
@@ -365287,6 +367334,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已解鎖的文件會在你離開 Nib 2 分鐘後，以及你鎖定%@時立即重新鎖定。"
+          }
+        }
+      }
+    },
+    "Unreadable assets omitted: %lld. See Export Report.txt in the archive." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht lesbare Ressourcen ausgelassen: %lld. Siehe Export Report.txt im Archiv."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recursos ilegibles omitidos: %lld. Consulta Export Report.txt en el archivo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ressources illisibles omises : %lld. Consultez Export Report.txt dans l’archive."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Risorse illeggibili omesse: %lld. Consulta Export Report.txt nell’archivio."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "読み込めないアセットを%lld個省略しました。アーカイブ内のExport Report.txtを参照してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽을 수 없는 에셋 %lld개가 제외되었습니다. 아카이브의 Export Report.txt를 확인하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weggelaten onleesbare bestanden: %lld. Zie Export Report.txt in het archief."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pominięte nieczytelne zasoby: %lld. Zobacz Export Report.txt w archiwum."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recursos ilegíveis omitidos: %lld. Consulte Export Report.txt no arquivo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пропущено нечитаемых ресурсов: %lld. См. Export Report.txt в архиве."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Oläsbara resurser som utelämnats: %lld. Se Export Report.txt i arkivet."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Atlanan okunamayan varlıklar: %lld. Arşivdeki Export Report.txt dosyasına bakın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已省略 %lld 个无法读取的素材。请查看归档中的 Export Report.txt。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已省略 %lld 個無法讀取的素材。請查看封存檔中的 Export Report.txt。"
           }
         }
       }
