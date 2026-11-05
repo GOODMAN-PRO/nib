@@ -138,3 +138,11 @@ D:controls-forms#4 correction and D:controls-menus#1 show keyboard overlap/degen
 ## C1 - cancel iPad confirmations
 
 D:controls-forms#6 shows destructive-only confirmation Sheets, with cancellation through PopoverDismissRegion. Shared cancelConfirmation scopes Cancel to the presented confirmation, otherwise taps its live dismiss region outside all popovers, and waits for the captured heading to disappear. Applied to the four Insert destructive-cancel paths and Pages group/batch-trash cancellation. The already-correct Pages purge path retains its geometric assertions and outside cancellation. No ordinary edit Cancel changed. CI must reach the original retained-content checks, then confirmed deletion, with heading disappearance on cancel.
+
+## C2 - provider preset button
+
+D:controls-forms#7 confirms Button label Preset, Anthropic and a separate non-actionable Preset caption. Both provider setup paths now match the Button prefix Preset, and choose Custom OpenAI-compatible through the existing row helper. Expected three Insert provider/diagram/transcript cases and Selection Assistant attribution. Later provider fields/save are unobserved; CI must show the custom preset and then exact field/save assertions.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Insert/Selection provider setup | Provider custom preset selected | Did the next previously unobserved menu choice complete? Facts and screenshot retained. |

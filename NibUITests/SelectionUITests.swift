@@ -1129,7 +1129,12 @@ final class SelectionUITests: XCTestCase {
         defer { provider.stop() }
         try wait("The local Assistant provider fixture must start") { provider.port != nil }
         try settings(); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
-        try tap("Preset", scroll: true); try tap("Custom OpenAI-compatible", scroll: true)
+        let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
+        ui.revealFormElement(preset)
+        try wait("Provider preset button must be available") { preset.exists && preset.isHittable }
+        preset.tap()
+        try tap("Custom OpenAI-compatible", scroll: true)
+        ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
         for (label, value) in [("Name", "Selection fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
                                ("Chat model", "selection-fixture")] {

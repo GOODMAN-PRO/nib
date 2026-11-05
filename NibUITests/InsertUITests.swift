@@ -671,7 +671,12 @@ final class InsertUITests: XCTestCase {
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
         try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("AI", scroll: true); try tap("Add provider", scroll: true)
-        try tap("Preset", scroll: true); try tap("Custom OpenAI-compatible", scroll: true)
+        let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
+        ui.revealFormElement(preset)
+        try wait("Provider preset button must be available") { preset.exists && preset.isHittable }
+        preset.tap()
+        try tap("Custom OpenAI-compatible", scroll: true)
+        ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
         for (label, value) in [("Name", "Insert fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
                                ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")] {
