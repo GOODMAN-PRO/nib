@@ -93,6 +93,12 @@ final class ZoomWindowController: ObservableObject {
         session.$tool.removeDuplicates().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.configureWriting() }
             .store(in: &subscriptions)
+        session.$hiddenLayers.removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRender() }
+            .store(in: &subscriptions)
+        session.$replay.receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.scheduleRender() }
+            .store(in: &subscriptions)
         canvasResized(host.canvasView.bounds.size)
         updateActive()
     }

@@ -964,6 +964,28 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertFalse(view.isUsingTool, "an ink type change must finish capture")
     }
 
+    func testLayerVisibilityRerendersStationaryPane() async throws {
+        let h = harness(), renderer = FakeRenderer()
+        h.app.services.renderer = renderer
+        let (host, overlay) = try await openWindow(h)
+        let controller = overlay.controller
+        _ = controller.writingView()
+        controller.paneAppeared()
+        defer { controller.paneDisappeared(); overlay.detach(from: host) }
+        for _ in 0..<100 where renderer.requests.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertFalse(renderer.requests.isEmpty)
+        h.session.hiddenLayers = [0]
+        for _ in 0..<100 where renderer.requests.last?.layers?.contains(0) != false {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.layers?.contains(0), false)
+        h.session.hiddenLayers = []
+        for _ in 0..<100 where renderer.requests.last?.layers?.contains(0) != true {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(renderer.requests.last?.layers?.contains(0), true)
+    }
+
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
         let h = harness()
         let (host, overlay) = try await openWindow(h)
