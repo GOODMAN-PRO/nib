@@ -273,7 +273,13 @@ final class ChromeUITests: XCTestCase {
         try menu("share", "Export all…")
         // ExportPresentation presents exportui.dialog directly, outside the registered panel state.
         _ = try reachable("Share & Export")
-        _ = try reachable("PDF")
+        let export = ui.app.scrollViews["Share & Export"].firstMatch
+        ui.logQA("Export before reveal", "scroll: " + ui.elementFacts(export)
+            + "\nPDF: " + ui.elementFacts(ui.app.staticTexts["PDF"].firstMatch))
+        if let snapshot = try? export.snapshot() {
+            ui.logQA("Export content geometry", "viewport=\(snapshot.frame) children=\(snapshot.children.map { $0.frame }); AX provides no contentOffset attribute")
+        }
+        XCTAssertEqual(try reachable("Format", type: .button).value as? String, "PDF")
         XCTAssertTrue(try reachable("All").isSelected, "Export all must select every page")
         try ui.dismissSheets()
         try wait("Export options must close") { self.ui.findControl("Share & Export") == nil }
@@ -383,8 +389,13 @@ final class ChromeUITests: XCTestCase {
         try open()
         for (tool, option) in [("pen", "Fountain Pen"), ("highlighter", "Straight line"), ("eraser", "Whole stroke")] {
             try settings(tool); _ = try require(option)
-            XCTAssertEqual(query("menu.toolSettings").count, 1, "Only the active tool may own the settings trigger")
+            _ = try ui.waitForState { $0.toolSettingsOpen == tool }
             outside()
+            _ = try ui.waitForState { $0.toolSettingsOpen == nil }
+            _ = try reachable("menu.toolSettings", type: .button)
+            XCTAssertEqual(query("menu.toolSettings").count, 1, "Only the active tool may own the settings trigger")
+            let title = tool == "pen" ? "Fountain Pen" : (tool == "highlighter" ? "Highlighter" : "Eraser")
+            XCTAssertEqual(ui.app.buttons["menu.toolSettings"].firstMatch.label, title + " Settings")
             if tool != "eraser" { try draw(y: tool == "pen" ? 0.62 : 0.72) }
         }
         try settings("pen")
@@ -590,7 +601,15 @@ final class ChromeUITests: XCTestCase {
     func testDockTopHasHorizontalOptionsAndUndoableInk() throws {
         try open(); try dock("top")
         let palette = try require("Tools"); XCTAssertGreaterThan(palette.frame.width, palette.frame.height)
-        try settings("highlighter"); try tap("Thickness 2"); outside(); try draw()
+        try settings("highlighter")
+        let presets = ui.app.scrollViews["Highlighter"].buttons.matching(NSPredicate(
+            format: "label ENDSWITH ' millimetres' OR label ENDSWITH ' points'"))
+        let ordered = presets.allElementsBoundByIndex.filter { $0.isHittable }.sorted { $0.frame.minX < $1.frame.minX }
+        XCTAssertEqual(ordered.count, 3, "Highlighter settings must expose three width presets")
+        let middle = try XCTUnwrap(ordered.dropFirst().first)
+        middle.tap()
+        try wait("Middle highlighter width preset must be selected") { middle.isSelected }
+        outside(); try draw()
     }
     func testDockBottomLeavesLastPageScrollableAboveTools() throws {
         try open(); try dock("bottom")
@@ -650,12 +669,15 @@ final class ChromeUITests: XCTestCase {
         try wait("Reselecting Pen must fold its options") {
             !self.query("menu.toolSettings").firstMatch.exists
         }
+        _ = try ui.waitForState { $0.toolSettingsOpen == nil }
         let swatch = ui.app.buttons.matching(identifier: "cmd.preset.select")
             .allElementsBoundByIndex.first { $0.isHittable && !$0.isSelected }
         try XCTUnwrap(swatch).tap()
         _ = try ui.waitForState { $0.tool == "pen" }
         XCTAssertFalse(query("menu.toolSettings").firstMatch.exists, "A quick colour must preserve the manual fold")
         try tap("tool.pen")
+        _ = try reachable("menu.toolSettings", type: .button)
+        XCTAssertNil(try ui.state().toolSettingsOpen, "Unfolding the strip must not open settings")
         try tap("menu.toolSettings")
         _ = try ui.waitForState { $0.toolSettingsOpen == "pen" }
         _ = try require("Fountain Pen")

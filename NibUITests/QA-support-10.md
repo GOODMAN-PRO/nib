@@ -109,3 +109,13 @@ Confirmed chrome-singles#3 correction: the app logged off, AX retained the pill/
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | BridgeStatusPillOpensDetailsAndTurnOffHasEffect | Bridge after Turn Off first / second | Do pixels and AX facts agree, and does the retained pill/popover disappear between failure observations? |
+
+### C8 - current settings/strip and export contracts
+
+Confirmed chrome-singles#4/#5/#10 corrections. Highlighter top-dock settings now select the middle visible width-labelled preset and require its Selected trait (not a nonexistent Thickness 2). Export reads the Format menu button's PDF value, retaining All-selected and cancel-inert assertions; pre-reveal PDF and scroll geometry are logged. AX exposes no direct scroll contentOffset, so child/viewport frames are recorded without inventing an offset. The single-chevron assertion moved to closed settings and checks the active tool's exact Settings label; open settings are checked through toolSettingsOpen.
+
+Read ToolbarModel.optionsState/toolReselected, NibToolOptionsState and the probe. Current strip-job commits 1ea1e22/bdec046/aee67a9/479550b already migrated Capture, Ink, Insert and Selection to openToolSettings; their old second-tap settings assumption is already resolved. Grepped EVERY class file for settings helpers, selectTool, raw tool taps, menu.toolSettings and preset/strip dependencies; Canvas, Create, Library, Pages, Smoke and CaptureReadiness introduce no remaining double-tap-settings helper. Shared selectTool preserves selection; openToolSettings unfolds a folded strip and uses its chevron, while tools without a strip reselect for settings. Existing manual-fold Chrome test now explicitly requires nil settings after folding and unfolding, then the chevron opens settings. No unrelated class edits were needed. CI must verify both strip states, settings replacement, width selection and Format PDF under the existing assertions.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ShareExportOpensCorrectSheetAndCancelIsInert | Export before reveal / Export content geometry | Where were PDF and the scroll content before reveal, including negative-y frames? |
