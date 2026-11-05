@@ -181,8 +181,6 @@ final class PagesUITests: XCTestCase {
         let photo = try ui.photoAsset(diagnostics: true)
         try require(photo, "Add Page > Image must present selectable Photos assets")
         try ui.tapPhotoAsset(photo)
-        let add = button("Add")
-        if add.exists && add.isHittable { add.tap() }
         try count(5)
         XCTAssertEqual(Set(try ids()).intersection(before).count, 4)
         let newImages = try live().filter { background($0)["kind"] as? String == "image" }

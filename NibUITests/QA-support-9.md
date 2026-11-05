@@ -210,3 +210,18 @@ Should unblock OutlineSortByCurrentPageNumberAndSwipeDelete and cover both platf
 P:pages-outline-templates#2 and verdict establish no menu after the Custom switch and long press, but do not distinguish layout movement, button arbitration or a delayed/swallowed touch (gesture-gate timeout). Current custom tile still has its own contextMenu. Template deletion now goes through H2 after switching to Custom, so the tile must have two consecutive stable visible frames before the single press. Confirmation and chosen-template-only, built-in availability, flattened-asset and page-count assertions remain.
 
 Should unblock CreateTemplateFromDrawnPageFlattensAppearanceAndDeleteOnlyChosenTemplate if delivery/readiness was responsible. Otherwise H2 logs the target/probe/tree and screenshot without blindly repressing. Next CI must show Delete Template followed by its separate confirmation and all original results; cause remains unknown until then. Uses H2's diagnostic table.
+
+### C5 - Photos selection and confirmation
+
+P:pages-outline-templates#3 and verdict prove the asset was selected while Add/Done-only readiness failed. Current helper had exactly that postcondition. The baseline tree also exposes the count as Button "1 Photo, Location Included" and the Photos container at (331,196,714,640), above the banner Close at y276. Selection now requires selected/value evidence or a positive photo-count button/text, or an already-dismissed picker. A single app snapshot, clipped to the observed picker bounds, logs every picker button's label, identifier, frame and enabled state. Confirmation must be one enabled inventoried button in the evidenced top-right title-bar region (trailing 80pt, top 60pt), excluding Close/Cancel/Back, or an existing legacy Add/Done. Duplicate remote-tree frames collapse; ambiguity fails with diagnostics. Resolve by identifier when unique, otherwise use that observed button's centre. The helper requires picker disappearance before returning.
+
+Audited all Photos callers: Pages AddImage and Insert ImageReplace/TapeImport select; Insert ImageSaveToPhotos only checks availability then cancels, so its contract stays. Removed redundant caller Add taps; all content/frame/undo/page-count checks remain. Next CI must record the actual confirm identity, selection count and closed picker before Pages reaches five pages or Insert asserts the replaced asset/pattern. No guessed confirm label or hard-coded screen tap.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages AddImage; Insert ImageReplace / TapeImport | Photos asset coordinate selection | Did AX selection state/value or the photo count prove the tap selected an asset? |
+| Same | Photos picker buttons / Photos picker confirm | Which actual control confirms the picker, and which observed frame was pressed? |
+| Same, failures | Photos confirm unresolved / Photos confirmation did not dismiss | Was confirmation ambiguous/absent, or did the chosen control fail to close the picker? |
+
+C5 source-review correction to the diagnosis's inferred label: baseline ui-PagesUITests/ui.log lines 12365-12370 (chunk 24) actually show Button identifier `Add`, label `Done`, frame (995,210,36,36). It is a title-bar sibling of the inner Other labelled Photos, not its descendant. Thus the failed Add/Done lookup was scoped too narrowly; the label itself is not unknown. Inventory and identifier rebinding now include title-bar siblings within the picker frame. The selected-state postcondition and actual-button requirement remain. This current artifact evidence supersedes the summary's missing-label inference.
+

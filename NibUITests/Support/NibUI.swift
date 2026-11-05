@@ -1257,14 +1257,23 @@ final class NibUI {
         let grid = app.otherElements["photos_sectioned_layout"].firstMatch
         let picker = app.otherElements.matching(NSPredicate(format: "label == 'Photos'")).firstMatch
         let selectionScope = picker.exists ? picker : app
+        func pickerGone() -> Bool { !grid.exists && !asset.exists && !picker.exists }
         app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(dx: frame.midX - origin.x, dy: frame.midY - origin.y)).tap()
         var outcome = "unobserved"
-        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            if !grid.exists && !asset.exists { outcome = "picker closed"; return true }
-            for name in ["Add", "Done"] {
-                let button = selectionScope.buttons[name].firstMatch
-                if button.exists && button.isEnabled { outcome = name + " enabled"; return true }
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if pickerGone() { outcome = "picker closed"; return true }
+            if asset.exists, let snapshot = try? asset.snapshot() {
+                let value = (snapshot.value as? String ?? "").lowercased()
+                if snapshot.isSelected || value == "1" || value == "selected" {
+                    outcome = "asset selected value=\(value)"; return true
+                }
+            }
+            // iOS 26 exposes "1 Photo, Location Included" as a Button, not static text.
+            for kind in [XCUIElement.ElementType.button, .staticText] {
+                let count = selectionScope.descendants(matching: kind).matching(NSPredicate(
+                    format: "label MATCHES[c] '^[1-9][0-9]* Photos?([, ].*)?$'")).firstMatch
+                if count.exists { outcome = "selection count: " + count.label; return true }
             }
             return false
         }, object: nil)
@@ -1273,6 +1282,60 @@ final class NibUI {
         guard result == .completed else {
             recordDiagnostics("Photos asset selection unobserved")
             throw Failure.message("Coordinate tap did not select the Photos asset")
+        }
+        if pickerGone() { return }
+        // The title-bar confirm is a sibling of the inner Other labelled Photos (baseline
+        // id=Add, label=Done), so inventory the app once and clip to the picker's observed frame.
+        let bounds = selectionScope.frame
+        guard let snapshot = try? app.snapshot() else {
+            throw Failure.message("Selected Photos picker has no button inventory")
+        }
+        func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+            (node.elementType == .button ? [node] : []) + node.children.flatMap { buttons($0) }
+        }
+        let inventory = buttons(snapshot).filter { button in
+            bounds.contains(CGPoint(x: button.frame.midX, y: button.frame.midY))
+        }
+        for button in inventory {
+            let identity = "label=\(button.label) id=\(button.identifier)"
+            logQA("Photos picker buttons", "\(identity) frame=\(button.frame) enabled=\(button.isEnabled)")
+        }
+        // The evidenced iOS 26 checkmark is in the top-right title bar, above the Private Access
+        // banner's Close button. Require an actual inventoried button in that region, never a guessed point.
+        var candidates = inventory.filter { button in
+            let f = button.frame
+            let visible = !f.isEmpty && !f.isNull && !f.isInfinite && bounds.contains(CGPoint(x: f.midX, y: f.midY))
+            let excluded = ["close", "cancel", "back"].contains(button.label.lowercased())
+            let titleBar = f.midX > bounds.maxX - 80 && f.midY < bounds.minY + 60
+            let named = button.label == "Add" || button.label == "Done"
+            return visible && button.isEnabled && !excluded && (titleBar || named)
+        }
+        // Remote trees can expose the same control twice. Geometry, not snapshot ordinal, identifies it.
+        var frames: [CGRect] = []
+        candidates = candidates.filter { button in
+            guard !frames.contains(button.frame) else { return false }
+            frames.append(button.frame); return true
+        }
+        guard candidates.count == 1, let confirm = candidates.first else {
+            recordDiagnostics("Photos confirm unresolved")
+            throw Failure.message("Selected Photos picker must expose one confirmation button; candidates=\(candidates.count)")
+        }
+        logQA("Photos picker confirm", "id=\(confirm.identifier) label=\(confirm.label) frame=\(confirm.frame)")
+        if !confirm.identifier.isEmpty {
+            let identified = app.buttons.matching(identifier: confirm.identifier)
+            let button = identified.firstMatch
+            if identified.count == 1, button.exists, button.frame == confirm.frame {
+                try pressWithoutIdle(at: CGPoint(x: button.frame.midX, y: button.frame.midY), duration: 0.05)
+            } else {
+                try pressWithoutIdle(at: CGPoint(x: confirm.frame.midX, y: confirm.frame.midY), duration: 0.05)
+            }
+        } else {
+            try pressWithoutIdle(at: CGPoint(x: confirm.frame.midX, y: confirm.frame.midY), duration: 0.05)
+        }
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in pickerGone() }, object: nil)
+        guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else {
+            recordDiagnostics("Photos confirmation did not dismiss")
+            throw Failure.message("Photos picker must close after confirmation")
         }
     }
 
