@@ -241,6 +241,8 @@ final class NibStoreTests: XCTestCase {
         lib.package(other.meta.id)
         store.didChange(other.meta.id, head: other, pages: items)
         store.flush(other.meta.id)
+        let workspace = Workspace(clock: HLCClock(device: 10), persistence: store, events: EventBus())
+        _ = try workspace.allItems(other.meta.id, page: Fixtures.page1)
 
         // Simulate a provider holding the head until the UI has finished reading. The watchdog prevents a broken
         // implementation from hanging the test process; waiting for it is a failure, not the synchronization path.
@@ -272,6 +274,10 @@ final class NibStoreTests: XCTestCase {
         store.didChange(doc, head: head, pages: [Fixtures.page2: [nudged]])
         store.write(doc, synchronously: false)
 
+        // This clean document has no durability obligation. Eviction must finish before releasing the held
+        // writer above; draining the shared queue here would hit that writer's bounded watchdog.
+        workspace.evictPages(other.meta.id, keeping: [])
+        XCTAssertFalse(workspace.isPageCached(other.meta.id, page: Fixtures.page1))
         XCTAssertEqual(try store.loadHead(doc), head)
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [nudged])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), nudged.rev)

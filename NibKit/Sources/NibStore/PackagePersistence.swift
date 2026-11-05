@@ -370,6 +370,9 @@ final class PackagePersistence: DocumentPersistence {
     func write(_ doc: DocumentID, synchronously: Bool) {
         timers.removeValue(forKey: doc)?.cancel()
         let job = pending.removeValue(forKey: doc) ?? PendingWrite()
+        // Clean page eviction must not wait behind another document's coordinated write. Every queued or failed
+        // write has a readable snapshot until it succeeds, so this check does not skip a durability obligation.
+        if job.isEmpty && readable.snapshot(doc) == nil { return }
         guard !gate.contains(doc) else {
             if !job.isEmpty {
                 log.error("not saving \(doc.raw, privacy: .public): \(ReadOnlyGate.refusal(doc).message, privacy: .public)")
@@ -417,8 +420,7 @@ final class PackagePersistence: DocumentPersistence {
         if e.code != .notFound { scheduleWrite(doc) }
     }
 
-    /// Drops what this device remembers of a closed document (the workspace flushed it before closing). The page
-    /// revisions stay: they are checked against the files on every use.
+    /// Drops rebuildable read caches of a closed document. Pending, queued and failed writes remain recoverable.
     func forget(_ doc: DocumentID) {
         known[doc] = nil
         seen[doc] = nil
