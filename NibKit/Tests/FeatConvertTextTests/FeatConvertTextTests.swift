@@ -192,6 +192,26 @@ final class FeatConvertTextTests: XCTestCase {
         XCTAssertEqual(try h.snapshotAll(), after)
     }
 
+    func testLanguageListRetriesFailureAndCachesSuccess() async throws {
+        actor Provider {
+            var attempts = 0
+            func load() throws -> [String] {
+                attempts += 1
+                if attempts == 1 { throw NibError.unavailable("Vision language list") }
+                return ["en-US"]
+            }
+        }
+        let provider = Provider()
+        let cache = RecognitionLanguageCache { try await provider.load() }
+        await assertError(.unavailable) { _ = try await cache.supported() }
+        let retried = try await cache.supported()
+        let cached = try await cache.supported()
+        let attempts = await provider.attempts
+        XCTAssertEqual(retried, ["en-US"])
+        XCTAssertEqual(cached, retried)
+        XCTAssertEqual(attempts, 2)
+    }
+
     func testLanguageNormalizesValidatesRebuildsAndUndoes() async throws {
         let h = harness()
         let languages = try await RecognitionLanguages.supported()

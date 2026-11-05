@@ -14,7 +14,7 @@ public enum NibRenderFeature: NibFeature {
     }
 }
 
-/// `render.page {page, scale?, region?, marks?, layers?, background?}` (read) →
+/// `render.page {page, scale?, region?, marks?, layers?, background?, refs?}` (read) →
 /// `{asset: "tmp:<name>", pxPerPt, region, marks?}`. The scale is lowered so the long edge stays ≤ 1568 px.
 struct RenderPage: NibCommand {
     struct Params: Codable {
@@ -24,6 +24,7 @@ struct RenderPage: NibCommand {
         var marks: Bool?
         var layers: [Int]?
         var background: Bool?
+        var refs: [String]?
     }
 
     struct Output: Codable {
@@ -48,6 +49,7 @@ struct RenderPage: NibCommand {
                       "region": .rect,
                       "marks": .bool("draw numbered boxes over the items and return {\"1\": \"item:…\"}"),
                       "layers": .arr(.int(min: 0, max: 4), "layers to draw (default: the layers visible in the editor)"),
+                      "refs": .arr(.ref, "draw only these items from this page (default: all items)"),
                       "background": .bool("draw the paper, template, PDF or image background (default true)")],
                      required: ["page"]),
         examples: [exampleMarks, exampleRegion],
@@ -67,6 +69,15 @@ struct RenderPage: NibCommand {
         let requested = p.scale ?? defaultScale
         guard requested.isFinite, requested > 0 else { throw NibError.invalid("scale must be a positive number", path: "$.scale") }
         let layers = p.layers.map { Set($0) } ?? RenderGeometry.visibleLayers(ctx.activeSession, doc: doc)
+        let included: Set<ElementID>? = try p.refs.map { refs in
+            try Set(refs.enumerated().map { index, ref in
+                guard case let .item(itemDoc, itemPage, id)? = NodeRef(ref), itemDoc == doc, itemPage == pageID else {
+                    throw NibError.invalid("expected an item ref from the rendered page", path: "$.refs[\(index)]")
+                }
+                _ = try ctx.workspace.item(doc, page: pageID, id: id)
+                return id
+            })
+        }
         let region: Rect
         if let r = p.region {
             guard RenderGeometry.isUsable(r) else {
@@ -77,7 +88,7 @@ struct RenderPage: NibCommand {
             region = Rect(x: 0, y: 0, width: s.width, height: s.height)
         } else {
             // A board's content bounds scan every stroke point: off the main actor (ARCHITECTURE §14).
-            let items = try ctx.workspace.items(doc, page: pageID)
+            let items = try ctx.workspace.items(doc, page: pageID).filter { included?.contains($0.id) ?? true }
             region = await Task.detached(priority: .userInitiated) {
                 RenderGeometry.defaultRegion(size: nil, bounds: items.compactMap { layers.contains($0.layer) ? $0.bounds : nil })
             }.value
@@ -85,7 +96,15 @@ struct RenderPage: NibCommand {
         var request = RenderRequest(doc: doc, page: pageID, region: region, scale: cappedScale(requested, region: region),
                                     layers: layers, background: p.background ?? true, marks: p.marks ?? false)
         request.purpose = .query
-        let result = try await renderer.render(request)
+        let result: RenderResult
+        if let included {
+            guard let selectionRenderer = renderer as? NibPageRenderer else {
+                throw NibError.unavailable("selected-item rendering")
+            }
+            result = try await selectionRenderer.render(request, including: included)
+        } else {
+            result = try await renderer.render(request)
+        }
         let image = result.image
         // PNG encoding and the temporary file write stay off the main actor.
         let name = try await Task.detached(priority: .userInitiated) { () throws -> String in

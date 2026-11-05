@@ -23,7 +23,11 @@ final class PDFRenderPool {
     func draw(url: URL, pageIndex: Int, rotation: Int, pageSize: PageSize?, cg: CGContext) -> Bool {
         let slot = checkout()
         defer { checkin(slot) }
-        guard let page = document(url, in: slot)?.page(at: pageIndex + 1) else { return false }
+        guard let page = document(url, in: slot)?.page(at: pageIndex + 1) else {
+            // A partially downloaded or locked document must be reopened on retry.
+            slot.documents.removeAll { $0.path == url.path }
+            return false
+        }
         PDFRenderPool.draw(page, rotation: rotation, pageSize: pageSize, cg: cg)
         return true
     }

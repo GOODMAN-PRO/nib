@@ -353,11 +353,12 @@ enum PageCompositor {
                       marks: [SetOfMarks.Mark]) -> CGImage? {
         guard let cg = makeContext(width: width, height: height) else { return nil }
         applyPageTransform(cg, region: region, width: width, height: height)
+        var succeeded = false
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            draw(job, region: region, scale: scale, width: width, height: height, cg: cg)
-            SetOfMarks.draw(marks, region: region, scale: scale, cg: cg)
+            succeeded = draw(job, region: region, scale: scale, width: width, height: height, cg: cg)
+            if succeeded { SetOfMarks.draw(marks, region: region, scale: scale, cg: cg) }
         }
-        return cg.makeImage()
+        return succeeded ? cg.makeImage() : nil
     }
 
     /// Assembles cached tiles (page rects) into a region at any scale. Antialiasing is off for the tile images so
@@ -374,19 +375,20 @@ enum PageCompositor {
         return cg.makeImage()
     }
 
-    static func draw(_ job: RenderJob, region: Rect, scale: Double, width: Int, height: Int, cg: CGContext) {
+    static func draw(_ job: RenderJob, region: Rect, scale: Double, width: Int, height: Int, cg: CGContext) -> Bool {
         cg.saveGState()
         defer { cg.restoreGState() }
         if let page = job.pageRect { cg.clip(to: page.cg) }
-        let paper = drawBackground(job, region: region, scale: scale, cg: cg)
+        guard let paper = drawBackground(job, region: region, scale: scale, cg: cg) else { return false }
         let items = job.visible.compactMap { $0.paint.intersects(region) ? $0.item : nil }
         for band in InkBands.make(items, replay: job.replay) {
             drawBand(band, job: job, region: region, scale: scale, width: width, height: height, paper: paper, cg: cg)
         }
+        return true
     }
 
-    /// Draws the page background (when requested) and returns the paper, which decides dark-paper blending.
-    static func drawBackground(_ job: RenderJob, region: Rect, scale: Double, cg: CGContext) -> Paper {
+    /// nil means a requested asset background could not be read: never return or cache that render as blank paper.
+    static func drawBackground(_ job: RenderJob, region: Rect, scale: Double, cg: CGContext) -> Paper? {
         let bg = job.background
         let area = (job.pageRect ?? region).cg
         switch bg.kind {
@@ -405,16 +407,15 @@ enum PageCompositor {
         case .pdf:
             guard job.drawBackground else { return Paper() }
             fill(area, .white, cg)
-            if let url = job.pdfURL {
-                job.pdf.draw(url: url, pageIndex: bg.pdfPage ?? 0, rotation: job.rotation, pageSize: job.size, cg: cg)
-            }
+            guard let url = job.pdfURL,
+                  job.pdf.draw(url: url, pageIndex: bg.pdfPage ?? 0, rotation: job.rotation, pageSize: job.size, cg: cg)
+            else { return nil }
             return Paper()
         case .image:
             guard job.drawBackground else { return Paper() }
             fill(area, .white, cg)
-            if let ref = bg.asset, let raster = job.rasters.image(ref, doc: job.doc, assets: job.assets) {
-                raster.draw(rotation: job.rotation, pageSize: job.size, cg: cg)
-            }
+            guard let ref = bg.asset, let raster = job.rasters.image(ref, doc: job.doc, assets: job.assets) else { return nil }
+            raster.draw(rotation: job.rotation, pageSize: job.size, cg: cg)
             return Paper()
         }
     }

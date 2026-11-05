@@ -415,8 +415,8 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertNil(calls.params[CommandIDs.itemTransform], "the rotation travels with the frame")
     }
 
-    /// Failed shape creation keeps its preview until the fallback ink commit succeeds.
-    func testFailedShapeFallbackKeepsPreviewUntilInkCommitSucceeds() async throws {
+    /// The preview lasts until ink is committed, or is retired with an error when neither write succeeds.
+    func testFailedShapeFallbackRetiresPreviewOnSuccessAndFailure() async throws {
         for succeeds in [false, true] {
             let h = Harness(features: [FeatShapeRecognitionFeature.self])
             let host = ControlledInkHost(h)
@@ -436,7 +436,7 @@ final class FeatShapeRecognitionTests: XCTestCase {
             await fulfillment(of: [notice], timeout: 0.1)
             NotificationCenter.default.removeObserver(token)
             XCTAssertEqual(host.base.committed.count, 1)
-            XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, succeeds ? 0 : 1)
+            XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, 0)
             XCTAssertEqual(host.base.renderWaits.count, succeeds ? 1 : 0)
         }
     }
@@ -456,6 +456,29 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertNil(calls.params[CommandIDs.itemDelete], "nothing was deleted")
         XCTAssertEqual(host.committed.count, 1)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "no revert step on the undo stack")
+        XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
+    }
+
+    func testFailedNeighbourDeleteReportsFailureAndKeepsBothShapes() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
+        let calls = Calls()
+        standIn(CommandIDs.shapeCreate, h, calls)
+        standIn(CommandIDs.itemDelete, h, calls, fails: true)
+        let notice = expectation(description: "merged neighbour delete failed")
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.itemDelete)
+            XCTAssertEqual((note.userInfo?["error"] as? NibError)?.code, .unavailable)
+            notice.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        let plain = ShapeRecognizer.pointShape(.line, [Point(402, 305), Point(402, 400)])
+        let joined = ShapeRecognizer.pointShape(.polyline, [Point(300, 300), Point(400, 300), Point(402, 400)])
+        let made = await ShapeCommit.create(SnapResult(shape: joined, mergeWith: [itemRef("OLDLINE00001")]),
+            plain: plain, doc: Fixtures.docID, page: page, app: h.app, session: h.session)
+        await fulfillment(of: [notice], timeout: 1)
+        XCTAssertEqual(made, joined)
+        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
         XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
     }
 

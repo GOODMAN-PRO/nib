@@ -263,19 +263,36 @@ struct HandwritingToTextPages: NibCommand {
 
 /// Vision supplies the actual on-device language list, never a hand-maintained list.
 enum RecognitionLanguages {
-    private static let cached = Task.detached { () throws -> [String] in
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        return try request.supportedRecognitionLanguages().sorted()
+    private static let cached = RecognitionLanguageCache {
+        try await Task.detached { () throws -> [String] in
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            return try request.supportedRecognitionLanguages().sorted()
+        }.value
     }
 
-    static func supported() async throws -> [String] { try await cached.value }
+    static func supported() async throws -> [String] { try await cached.supported() }
     static func resolve(_ input: String, supported: [String]) throws -> String {
         let normalized = input.replacingOccurrences(of: "_", with: "-")
         guard let language = supported.first(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) else {
             throw NibError(.invalidParams, "This recognition language is not supported on this device.", path: "$.language", hint: "Choose a language from the Recognition Language menu.")
         }
         return language
+    }
+}
+
+/// Failed Vision requests are retryable; only a successful list is retained for the app's lifetime.
+actor RecognitionLanguageCache {
+    private let provider: @Sendable () async throws -> [String]
+    private var languages: [String]?
+
+    init(provider: @escaping @Sendable () async throws -> [String]) { self.provider = provider }
+
+    func supported() async throws -> [String] {
+        if let languages { return languages }
+        let result = try await provider()
+        languages = result
+        return result
     }
 }
 

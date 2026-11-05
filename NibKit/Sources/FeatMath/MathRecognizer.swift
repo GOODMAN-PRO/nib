@@ -57,19 +57,38 @@ enum MathRecognizer {
         let region = selection.bounds
         let pageRef = NodeRef.page(selection.doc, selection.page).description
         let layers = Set(selection.items.map(\.layer))
-        let result = try await ctx.execute(CommandIDs.renderPage,
-                                          ["page": .string(pageRef), "region": try JSONValue.from([region.x, region.y, region.width, region.height]), "background": true, "layers": try JSONValue.from(layers.sorted())])
+        let params: JSONValue = ["page": .string(pageRef),
+            "region": try JSONValue.from([region.x, region.y, region.width, region.height]),
+            "background": false, "layers": try JSONValue.from(layers.sorted()),
+            "refs": .array(selection.refs.map(JSONValue.string))]
+        let result = try await ctx.execute(CommandIDs.renderPage, params)
         guard let name = result["asset"]?.stringValue else { throw NibError(.internalError, "render.page returned no image") }
         let url = try await ctx.inputFile(name)
         let image = try await Task.detached(priority: .userInitiated) {
             guard let loaded = UIImage(contentsOfFile: url.path)?.cgImage else { throw NibError(.internalError, "The selection image could not be read") }
-            return loaded
+            // Ink-only renders have transparent paper. Both Vision and providers need opaque pixels.
+            guard let bitmap = CGContext(data: nil, width: loaded.width, height: loaded.height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+                throw NibError(.internalError, "The selection image could not be prepared")
+            }
+            let bounds = CGRect(x: 0, y: 0, width: loaded.width, height: loaded.height)
+            bitmap.setFillColor(CGColor(gray: 1, alpha: 1))
+            bitmap.fill(bounds)
+            bitmap.draw(loaded, in: bounds)
+            guard let flattened = bitmap.makeImage() else { throw NibError(.internalError, "The selection image could not be prepared") }
+            return flattened
         }.value
-        let asset = AssetRef(name.hasPrefix("tmp:") ? String(name.dropFirst(4)) : name)
         try Task.checkCancellation()
         var warning: String?
         if let ai = ctx.services.ai, ai.isConfigured, ai.supportsVision {
             do {
+                guard let assets = ctx.services.assets else { throw NibError.unavailable("The asset store is not installed") }
+                let asset = try await Task.detached(priority: .userInitiated) {
+                    guard let png = UIImage(cgImage: image).pngData() else { throw NibError(.internalError, "The selection image could not be encoded") }
+                    return try assets.putTemporary(png, ext: "png")
+                }.value
+                try Task.checkCancellation()
                 let request = AIRequest(system: "Transcribe only the selected handwritten mathematics. Return JSON {\"lines\":[\"LaTeX\"]}, one entry per line. Do not solve, explain or call tools.",
                                         messages: [AIMessage(role: "user", text: "Convert this handwriting to LaTeX.", images: [asset])],
                                         tools: [], mode: .ask,

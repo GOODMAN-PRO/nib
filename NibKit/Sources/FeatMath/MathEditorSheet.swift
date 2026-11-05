@@ -19,6 +19,7 @@ struct MathEditorSheet: View {
     @State private var loaded = false
     @State private var targetInitialized = false
     @State private var applyFailed = false
+    @State private var recognitionStale = false
     @State private var previewBusy = false
     @State private var ref: String?
     @State private var refs: [String] = []
@@ -43,7 +44,7 @@ struct MathEditorSheet: View {
                     if busy { NibTraceRow(String(localized: "Recognising the selected handwriting…"), phase: .running) }
                     if let warning { NibBanner(warning, style: .info) }
                     if let error {
-                        NibBanner(error, action: NibAction(String(localized: "Retry")) { if applyFailed { apply() } else { Task { await load() } } })
+                        NibBanner(error, action: NibAction(String(localized: "Retry")) { retry() })
                     }
                     if !lines.isEmpty {
                         Text(String(localized: "Preview"))
@@ -124,6 +125,7 @@ struct MathEditorSheet: View {
     }
 
     private func transfer(_ ref: String, _ format: String, _ action: String) {
+        error = nil
         Task { @MainActor in
             do {
                 let result = try await context.app.bus.execute(Invocation(command: CommandIDs.mathCopy,
@@ -161,7 +163,22 @@ struct MathEditorSheet: View {
                 sheet.popoverPresentationController?.sourceView = top.view
                 sheet.popoverPresentationController?.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 1, height: 1)
                 navigator.presentModal(sheet)
-            } catch { self.error = NibError.wrap(error).message; applyFailed = false }
+            } catch { self.error = NibError.wrap(error).message; applyFailed = false; recognitionStale = false }
+        }
+    }
+
+    private func retry() {
+        guard !busy else { return }
+        error = nil
+        if recognitionStale {
+            loaded = false; lines = []; revs = nil
+            preview = nil; warning = nil; recognitionStale = false; applyFailed = false
+            Task { await load() }
+        } else if applyFailed {
+            apply()
+        } else {
+            // A transfer failure only needs dismissing; load retries only an unfinished initial recognition.
+            Task { await load() }
         }
     }
 
@@ -227,7 +244,11 @@ struct MathEditorSheet: View {
                 let result = try await context.app.bus.execute(Invocation(command: command, params: .object(params), session: context.session))
                 if ref == nil { ref = result.value["ref"]?.stringValue }
                 undoGroup = result.group; applied = true; applyFailed = false
-            } catch { self.error = NibError.wrap(error).message }
+            } catch {
+                let failure = NibError.wrap(error)
+                self.error = failure.message
+                recognitionStale = ref == nil && failure.code == .conflict
+            }
         }
     }
 }
