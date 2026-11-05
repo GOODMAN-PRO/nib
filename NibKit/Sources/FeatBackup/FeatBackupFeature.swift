@@ -74,7 +74,7 @@ final class BackupEngine {
     private var pendingCommit: Task<Void, Never>?
     private var scheduledDue: Double?
     // Lifecycle and archive hooks keep interruption tests independent of a foreground simulator window.
-    var archive: (URL, [URL], Progress, Set<DocumentID>, Set<DocumentID>) async throws -> URL = {
+    var archive: (URL, [URL], Progress, Set<DocumentID>, Set<DocumentID>) async throws -> BackupWriter.ArchiveResult = {
         try await BackupWriter.archive(root: $0, blocked: $1, progress: $2, unlockedDocuments: $3, lockedDocuments: $4)
     }
     var resumeManual: (() -> Void)?
@@ -476,6 +476,7 @@ final class BackupEngine {
     }
 
     func manual(_ ctx: CommandContext) async throws -> JSONValue {
+        try await ensureLoaded()
         guard !running else { throw NibError.unavailable("A backup is already running") }
         let library = try ctx.services.require(ctx.services.library, "Library")
         let navigator = ctx.navigator
@@ -513,9 +514,10 @@ final class BackupEngine {
             if !NibApp.isHostlessTest, UIApplication.shared.applicationState == .active { resumeInterruptedManual() }
         }
         do {
-            let url = try await withTaskCancellationHandler {
+            let archived = try await withTaskCancellationHandler {
                 try await archive(library.rootURL, blocked, progress, unlockedDocuments, lockedDocuments)
             } onCancel: { progress.cancel() }
+            let url = archived.url
             defer { try? FileManager.default.removeItem(at: url) }
             for node in library.allNodes() + library.trashedNodes() where unlockedDocuments.contains(node.id) {
                 if isLocked(node.id, node: node, ctx: ctx) { progress.cancel() }
@@ -525,6 +527,10 @@ final class BackupEngine {
             manualArchiving = false; manualInterrupted = false
             var result: [String: JSONValue] = ["name": .string(url.lastPathComponent),
                 "skippedLocked": .number(Double(skippedLocked)), "restoreCommand": .string(CommandIDs.importPick)]
+            if let warning = BackupWriter.omissionWarning(archived.notDownloaded) {
+                result["warning"] = .string(warning)
+                result["omissions"] = .array(archived.notDownloaded.map { .string($0) })
+            }
             if let navigator {
                 try await userInterface.saveArchive(url, navigator: navigator)
             } else if let assets {
@@ -533,7 +539,9 @@ final class BackupEngine {
                 }.value
                 result["asset"] = .string("tmp:" + ref.name)
             }
-            state = skippedLocked == 0 ? "ok" : "warning"
+            queue.manualOmissions = archived.notDownloaded
+            try await persist().value
+            state = skippedLocked == 0 && queue.omissionWarning == nil ? "ok" : "warning"
             manualInterrupted = false
             if skippedLocked > 0 { error = String(localized: "Locked documents were skipped. Unlock them and create another backup to include them.") }
             return .object(result)

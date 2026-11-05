@@ -468,7 +468,7 @@ final class FeatBackupTests: XCTestCase {
             let output = root.appendingPathComponent("manual.zip")
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             try Data("archive".utf8).write(to: output)
-            return output
+            return BackupWriter.ArchiveResult(url: output)
         }
         h.app.commands.register(CommandDescriptor(id: "test.manual", title: "Manual", summary: "Exercise engine", effect: .session)) { _, ctx in
             try await engine.manual(ctx)
@@ -514,7 +514,7 @@ final class FeatBackupTests: XCTestCase {
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
                 let url = root.appendingPathComponent("manual.zip")
                 try Data("archive".utf8).write(to: url)
-                return url
+                return BackupWriter.ArchiveResult(url: url)
             }
             engine.resumeManual = { resumes += 1 }
             picker.onSave = {
@@ -588,6 +588,77 @@ final class FeatBackupTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: library.appendingPathComponent("secret.pdf").path))
     }
 
+    func testManualArchiveReportsEvictedDocumentsAndAssetsWithoutArchivingStubs() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        try fm.createDirectory(at: root.appendingPathComponent("School/Local.nibnote/assets"), withIntermediateDirectories: true)
+        let placeholders = [".A.nibnote.icloud", "School/.B.nibnote.icloud", "School/Local.nibnote/assets/.image.png.icloud", ".Locked.nibnote.icloud"]
+        for path in placeholders { try Data("placeholder".utf8).write(to: root.appendingPathComponent(path)) }
+        try Data("local notes".utf8).write(to: root.appendingPathComponent("School/Local.nibnote/content.txt"))
+        // A user file must not be overwritten by the generated omission report.
+        try Data("user report".utf8).write(to: root.appendingPathComponent("Backup Report.txt"))
+        let result = try await BackupWriter.archive(root: root, blocked: [root.appendingPathComponent("Locked.nibnote")], progress: Progress(totalUnitCount: 1))
+        defer { try? fm.removeItem(at: result.url) }
+        XCTAssertEqual(Set(result.notDownloaded), ["A.nibnote", "School/B.nibnote", "School/Local.nibnote/assets/image.png"])
+        let zip = try Archive(url: result.url, accessMode: .read)
+        XCTAssertFalse(zip.contains { $0.path.hasSuffix(".icloud") })
+        XCTAssertNotNil(zip["School/Local.nibnote/content.txt"])
+        var report = Data()
+        _ = try zip.extract(XCTUnwrap(zip["Backup Report 2.txt"])) { report.append($0) }
+        let text = String(decoding: report, as: UTF8.self)
+        for path in result.notDownloaded { XCTAssertTrue(text.contains(path)) }
+        XCTAssertFalse(text.contains("Locked"))
+        var original = Data()
+        _ = try zip.extract(XCTUnwrap(zip["Backup Report.txt"])) { original.append($0) }
+        XCTAssertEqual(original, Data("user report".utf8))
+    }
+
+    func testManualMissingDownloadsPersistUntilACompleteArchiveIsDelivered() async throws {
+        let (h, engine, root) = try makeHarness()
+        let fm = FileManager.default
+        defer { try? fm.removeItem(at: root); try? fm.removeItem(at: h.library.rootURL) }
+        try fm.createDirectory(at: h.library.rootURL, withIntermediateDirectories: true)
+        let placeholder = h.library.rootURL.appendingPathComponent(".A.nibnote.icloud")
+        try Data("placeholder".utf8).write(to: placeholder)
+        let navigator = BackupTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let picker = BackupTestPicker()
+        engine.userInterface = picker
+        h.app.commands.register(CommandDescriptor(id: "test.manualInitial", title: "Manual", summary: "Exercise engine", effect: .session)) { _, ctx in
+            try await engine.manual(ctx)
+        }
+        let result = try await h.run("test.manualInitial")
+        XCTAssertEqual(result["omissions"], .array([.string("A.nibnote")]))
+        XCTAssertTrue(try XCTUnwrap(result["warning"]?.stringValue).contains("A.nibnote"))
+        XCTAssertEqual(engine.status().state, "warning")
+        XCTAssertNil(engine.queue.lastSuccess, "a partial manual archive is never a complete backup")
+
+        let reloaded = BackupEngine(app: h.app)
+        reloaded.store = BackupQueueStore(url: root.appendingPathComponent("queue.json"))
+        reloaded.userInterface = picker
+        try await reloaded.ensureLoaded()
+        XCTAssertEqual(reloaded.queue.manualOmissions, ["A.nibnote"])
+        XCTAssertEqual(reloaded.status().state, "warning")
+        XCTAssertTrue(try XCTUnwrap(reloaded.status().error).contains("A.nibnote"))
+        h.app.commands.register(CommandDescriptor(id: "test.manual", title: "Manual", summary: "Exercise restored engine", effect: .session)) { _, ctx in
+            try await reloaded.manual(ctx)
+        }
+        try fm.removeItem(at: placeholder)
+        try Data("downloaded".utf8).write(to: h.library.rootURL.appendingPathComponent("notes.txt"))
+        picker.cancel = true
+        do { _ = try await h.run("test.manual"); XCTFail("Cancelled picker succeeded") }
+        catch let error as NibError { XCTAssertEqual(error.code, .userDenied) }
+        XCTAssertEqual(reloaded.queue.manualOmissions, ["A.nibnote"], "a cancelled save cannot replace the delivered report")
+        picker.cancel = false
+        let complete = try await h.run("test.manual")
+        XCTAssertNil(complete["warning"])
+        XCTAssertEqual(reloaded.status().state, "ok")
+        XCTAssertNil(reloaded.status().error)
+        let disk = try await BackupQueueStore(url: root.appendingPathComponent("queue.json")).load()
+        XCTAssertTrue(disk.manualOmissions.isEmpty)
+    }
+
     func testManualArchivePreservesUserFoldersAndOmitsJunkSymlinksAndLockedPackages() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("library-" + UUID().uuidString)
         let fm = FileManager.default
@@ -605,7 +676,9 @@ final class FeatBackupTests: XCTestCase {
         var lockedHead = head; lockedHead.meta.id = Fixtures.textDocID; lockedHead.meta.locked = true
         try JSONEncoder().encode(lockedHead).write(to: root.appendingPathComponent("Locked.nibnote/doc.00000001.json"))
         let progress = Progress(totalUnitCount: 1)
-        let output = try await BackupWriter.archive(root: root, blocked: [], progress: progress, unlockedDocuments: [Fixtures.docID])
+        let result = try await BackupWriter.archive(root: root, blocked: [], progress: progress, unlockedDocuments: [Fixtures.docID])
+        XCTAssertTrue(result.notDownloaded.isEmpty)
+        let output = result.url
         defer { try? fm.removeItem(at: output) }
         let zip = try Archive(url: output, accessMode: .read)
         let paths = Set(zip.map(\.path))

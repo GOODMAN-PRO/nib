@@ -116,6 +116,21 @@ final class BackupQueueTests: XCTestCase {
         XCTAssertEqual(legacy.lastSuccess, 100)
     }
 
+    func testManualOmissionsPersistAlongsideExportReportsAndSurviveQueuePruning() throws {
+        var queue = BackupQueue()
+        queue.manualOmissions = ["School/A.nibnote"]
+        queue.exportReports["DOC/nibnote"] = BackupQueue.ExportReport(document: "Notes", warning: "Missing image", omissions: [])
+        let restored = try JSONDecoder().decode(BackupQueue.self, from: JSONEncoder().encode(queue))
+        XCTAssertEqual(restored, queue)
+        XCTAssertTrue(try XCTUnwrap(restored.omissionWarning).contains("School/A.nibnote"))
+        XCTAssertTrue(try XCTUnwrap(restored.omissionWarning).contains("Missing image"))
+        queue.pruneReports(keeping: [], formats: [])
+        queue.clear()
+        XCTAssertTrue(try XCTUnwrap(queue.omissionWarning).contains("School/A.nibnote"))
+        let legacy = try JSONDecoder().decode(BackupQueue.self, from: Data(#"{"entries":[],"exportReports":{}}"#.utf8))
+        XCTAssertTrue(legacy.manualOmissions.isEmpty)
+    }
+
     func testReportsKeepOnlyEligibleDocumentsAndConfiguredFormats() {
         var queue = BackupQueue()
         let document = NibID("DOC/with-slash")

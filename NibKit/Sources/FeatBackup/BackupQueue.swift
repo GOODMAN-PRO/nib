@@ -18,10 +18,12 @@ struct BackupQueue: Codable, Equatable {
     var lastSuccess: Double?
     /// Last delivered omission report per document/format, retained across runs and app restarts.
     var exportReports: [String: ExportReport] = [:]
+    /// Last delivered manual archive's missing downloads; automatic passes cannot clear this report.
+    var manualOmissions: [String] = []
     // Derived from entries and excluded from disk state. Commits must not scan the whole queue.
     private var indices: [DocumentID: Int] = [:]
 
-    private enum CodingKeys: String, CodingKey { case entries, lastAttempt, lastSuccess, exportReports }
+    private enum CodingKeys: String, CodingKey { case entries, lastAttempt, lastSuccess, exportReports, manualOmissions }
 
     init() { }
 
@@ -31,16 +33,19 @@ struct BackupQueue: Codable, Equatable {
         lastAttempt = try values.decodeIfPresent(Double.self, forKey: .lastAttempt)
         lastSuccess = try values.decodeIfPresent(Double.self, forKey: .lastSuccess)
         exportReports = try values.decodeIfPresent([String: ExportReport].self, forKey: .exportReports) ?? [:]
+        manualOmissions = try values.decodeIfPresent([String].self, forKey: .manualOmissions) ?? []
         rebuildIndices()
     }
 
     var omissionWarning: String? {
-        guard !exportReports.isEmpty else { return nil }
+        let manualWarning = BackupWriter.omissionWarning(manualOmissions)
+        guard !exportReports.isEmpty else { return manualWarning }
         let details = exportReports.keys.sorted().compactMap { key -> String? in
             guard let report = exportReports[key] else { return nil }
             return report.document + ": " + report.warning
         }.joined(separator: "\n")
-        return String(localized: "Backup otherwise complete, with omitted assets.\n\(details)")
+        let exportWarning = String(localized: "Backup otherwise complete, with omitted assets.\n\(details)")
+        return [exportWarning, manualWarning].compactMap { $0 }.joined(separator: "\n")
     }
 
     private mutating func rebuildIndices() {
