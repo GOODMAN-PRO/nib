@@ -635,10 +635,11 @@ public enum ShellChromePolicy {
         controller.presentedViewController != nil || controller.children.contains { hasModal($0) }
     }
 
-    public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool) -> Bool {
+    public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool,
+                               context: KeyCommandContext = KeyCommandContext(docKind: nil), effect: Effect? = nil) -> Bool {
         // The presented controller owns its keys. Filtering one scope must never promote
         // an underlying document/global descriptor that happens to share the shortcut.
-        !hasModal
+        !hasModal && !(context.readOnly && effect == .edit)
     }
 
     public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {

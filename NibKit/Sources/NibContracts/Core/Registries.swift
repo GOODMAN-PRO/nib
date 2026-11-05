@@ -615,17 +615,20 @@ public struct KeyCommandContext: Equatable {
     /// The window has open tabs (`SceneNavigator.openDocuments`), also while it shows the library with its tab strip:
     /// `.document` keys marked `whileTabsOpen` stay live there.
     public var hasTabs: Bool
+    /// The invoking window or its document is read-only; editing shortcuts must not run.
+    public var readOnly: Bool
 
-    public init(inDocument: Bool, docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
+    public init(inDocument: Bool, docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false, readOnly: Bool = false) {
         self.inDocument = inDocument
         self.docKind = docKind
         self.isEditingText = isEditingText
         self.hasTabs = hasTabs
+        self.readOnly = readOnly
     }
 
     /// A window showing a document of `docKind` (nil: the library).
-    public init(docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
-        self.init(inDocument: docKind != nil, docKind: docKind, isEditingText: isEditingText, hasTabs: hasTabs)
+    public init(docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false, readOnly: Bool = false) {
+        self.init(inDocument: docKind != nil, docKind: docKind, isEditingText: isEditingText, hasTabs: hasTabs, readOnly: readOnly)
     }
 }
 

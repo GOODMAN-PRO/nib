@@ -296,7 +296,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             }
             guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
                 descriptors: app.content.keyCommands.all.filter {
-                    ShellChromePolicy.permits($0, hasModal: ShellChromePolicy.hasModal(self))
+                    ShellChromePolicy.permits($0, hasModal: ShellChromePolicy.hasModal(self),
+                                              context: keyCommandContext, effect: app.commands.descriptor($0.command)?.effect)
                 }, in: keyCommandContext),
                   let command = keyCommands?.first(where: { $0.propertyList as? String == descriptor.id }),
                   let action = command.action, canPerformAction(action, withSender: command) else { continue }
@@ -341,7 +342,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     var keyCommandContext: KeyCommandContext {
         let typing = session.isEditingText || ShellFocus.isEditingText(in: viewIfLoaded?.window)
         return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing,
-                                 hasTabs: !openDocuments.isEmpty)
+                                 hasTabs: !openDocuments.isEmpty,
+                                 readOnly: session.readOnly || session.document.map { app.isReadOnly($0) } == true)
     }
 
     /// One UIKeyCommand per shortcut: the registered descriptors live in this window (`KeyScope`, `docKinds`), the most
@@ -352,7 +354,9 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         let generation = app.content.keyCommands.generation
         if let cache = keyCommandCache, cache.generation == generation, cache.context == context,
            cache.hasModal == hasModal { return cache.commands }
-        let descriptors = app.content.keyCommands.all.filter { ShellChromePolicy.permits($0, hasModal: hasModal) }
+        let descriptors = app.content.keyCommands.all.filter {
+            ShellChromePolicy.permits($0, hasModal: hasModal, context: context, effect: app.commands.descriptor($0.command)?.effect)
+        }
         let commands = KeyCommandRouting.active(descriptors, in: context).map { d -> UIKeyCommand in
             let command = UIKeyCommand(title: d.title, action: #selector(runKeyCommand(_:)),
                                        input: ShellViewController.keyInput(d.shortcut.key),
@@ -410,7 +414,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// The descriptor behind a UIKeyCommand this shell built, when it is still registered and live in this window.
     private func liveKeyCommand(_ command: UIKeyCommand) -> KeyCommandDescriptor? {
         guard let id = command.propertyList as? String, let d = app.content.keyCommands.get(id),
-              ShellChromePolicy.permits(d, hasModal: ShellChromePolicy.hasModal(self)),
+              ShellChromePolicy.permits(d, hasModal: ShellChromePolicy.hasModal(self),
+                                        context: keyCommandContext, effect: app.commands.descriptor(d.command)?.effect),
               d.isActive(in: keyCommandContext) else { return nil }
         return d
     }

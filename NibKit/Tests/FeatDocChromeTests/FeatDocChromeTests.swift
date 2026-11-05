@@ -47,6 +47,44 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(KeyCommandRouting.active(restored, in: context).map(\.id), active.map(\.id))
     }
 
+    func testReadOnlyShellRoutingBlocksEditsButKeepsViewingCopyAndSelection() {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let commands: [(String, Effect, String)] = [
+            (CommandIDs.undo, .edit, "z"), (CommandIDs.redo, .edit, "y"),
+            ("test.view", .session, "f"), ("clipboard.copy", .read, "c"),
+            ("test.select", .session, "a")
+        ]
+        for (id, effect, _) in commands where h.app.commands.entry(id) == nil {
+            h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Routing stand-in",
+                params: .anything(), effect: effect)) { _, _ in [:] }
+        }
+        let keys = commands.map { id, _, key in
+            KeyCommandDescriptor(id: id, title: id, shortcut: KeyShortcut(key, [.command]),
+                                 command: id, scope: .canvas, owner: "tests")
+        }
+        let writable = KeyCommandContext(docKind: .notebook)
+        let readOnly = KeyCommandContext(docKind: .notebook, readOnly: true)
+        XCTAssertNotEqual(writable, readOnly, "changing read-only mode must invalidate the shell's key cache")
+        for context in [writable, readOnly] {
+            let allowed = keys.filter {
+                ShellChromePolicy.permits($0, hasModal: false, context: context,
+                                          effect: h.app.commands.descriptor($0.command)?.effect)
+            }
+            let expected = context.readOnly ? Array(keys.dropFirst(2)) : keys
+            XCTAssertEqual(KeyCommandRouting.active(allowed, in: context).map(\.id), expected.map(\.id))
+            for key in keys {
+                let permitted = !context.readOnly || h.app.commands.descriptor(key.command)?.effect != .edit
+                XCTAssertEqual(KeyCommandRouting.unhandledPress(key.shortcut, descriptors: allowed, in: context)?.id,
+                               permitted ? key.id : nil)
+                // A UIKeyCommand already handed to UIKit must be rechecked before UndoManager fallback.
+                XCTAssertEqual(ShellChromePolicy.permits(key, hasModal: false, context: context,
+                    effect: h.app.commands.descriptor(key.command)?.effect), permitted)
+                XCTAssertFalse(ShellChromePolicy.permits(key, hasModal: true, context: context,
+                    effect: h.app.commands.descriptor(key.command)?.effect))
+            }
+        }
+    }
+
     func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
         let h = Harness(features: [FeatDocChromeFeature.self])
         var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]

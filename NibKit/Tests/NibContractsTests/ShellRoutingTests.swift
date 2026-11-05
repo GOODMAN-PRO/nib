@@ -202,6 +202,15 @@ final class ShellRoutingTests: XCTestCase {
         }
     }
 
+    func testReadOnlyParticipatesInTheWindowKeyContextWithoutChangingScope() {
+        let writable = KeyCommandContext(docKind: .notebook, hasTabs: true)
+        let frozen = KeyCommandContext(inDocument: true, docKind: .notebook, hasTabs: true, readOnly: true)
+        XCTAssertFalse(writable.readOnly, "existing callers default to writable")
+        XCTAssertNotEqual(writable, frozen, "the shell must rebuild its cached keys after Read Only changes")
+        XCTAssertEqual(frozen, KeyCommandContext(docKind: .notebook, hasTabs: true, readOnly: true))
+        XCTAssertTrue(key("view", scope: .canvas).isActive(in: frozen), "scope alone must not disable viewing commands")
+    }
+
     func testTheLibraryContext() {
         XCTAssertEqual(KeyCommandContext(docKind: nil), KeyCommandContext(inDocument: false, docKind: nil))
         XCTAssertEqual(KeyCommandContext(docKind: .whiteboard, isEditingText: true),
