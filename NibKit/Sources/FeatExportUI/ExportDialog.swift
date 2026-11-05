@@ -417,12 +417,23 @@ struct ExportFormatPicker: View {
     }
 
     private var menu: some View {
-        Picker(String(localized: "Format"), selection: $selection) {
-            ForEach(options, id: \.self) { id in Text(title(id)).tag(id) }
+        Menu {
+            Picker(String(localized: "Format"), selection: $selection) {
+                ForEach(options, id: \.self) { id in Text(title(id)).tag(id) }
+            }
+        } label: {
+            HStack(spacing: NibSpacing.s) {
+                Text(title(selection)).font(NibFont.body)
+                Spacer(minLength: NibSpacing.s)
+                Image(nib: .chevronDown).font(NibFont.footnote).accessibilityHidden(true)
+            }
+            .foregroundStyle(NibColor.label)
+            .padding(.horizontal, NibSpacing.m)
+            .frame(minHeight: NibMetrics.hitTarget)
+            .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field))
         }
-        .pickerStyle(.menu)
-        .font(NibFont.body)
-        .frame(minHeight: NibMetrics.hitTarget)
+        .accessibilityLabel(String(localized: "Format"))
+        .accessibilityValue(title(selection))
     }
 }
 
