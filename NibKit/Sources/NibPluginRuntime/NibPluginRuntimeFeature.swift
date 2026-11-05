@@ -30,6 +30,8 @@ struct PluginLimits {
     var storageBytes = 5 * 1_048_576
     /// Acknowledged storage operations are durable before their JavaScript promise resolves.
     /// Explicit batching remains available to storage tests, but production never delays these writes.
+    /// This trades one whole-file atomic write per mutation (up to storageBytes) for durability;
+    /// writes run on the plugin's storage queue, not the main thread.
     var storageWriteDelay: TimeInterval = 0
     /// `nib.storage` lists its (synced) folder for other devices' changes at most this often.
     var storageRefreshInterval: TimeInterval = 1
