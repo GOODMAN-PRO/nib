@@ -460,11 +460,18 @@ struct StudySessionView: View {
         VStack(spacing: NibSpacing.s) {
             // The reveal action lives in the header, so grading reserves only the grade rows.
             // GeometryReader receives the remaining height and StudyCardLayout shrinks the paper to fit.
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: NibSpacing.l) { ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) } }
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: NibSpacing.l) {
-                    ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) }
+            if model.flipped {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: NibSpacing.l) { ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) } }
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: NibSpacing.l) {
+                        ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) }
+                    }
                 }
+            } else {
+                Text(String(localized: "Flip the card to grade your answer."))
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.label)
+                    .frame(minHeight: NibMetrics.hitTarget)
             }
             if model.readOnly { Text(String(localized: "This study set is read-only.")) }
         }
@@ -472,8 +479,7 @@ struct StudySessionView: View {
     }
     private func gradeButton(_ rating: StudyRating) -> some View {
         let key = String((StudyRating.allCases.firstIndex(of: rating) ?? 0) + 1)
-        return NibDropletButton(id: "studysession.grade." + rating.rawValue,
-            title: rating.title, detail: model.interval(rating), kind: .clear,
+        return StudyGradeButton(title: rating.title, detail: model.interval(rating),
             shortcut: KeyboardShortcut(KeyEquivalent(Character(key)), modifiers: [])) { model.grade(rating) }
             .disabled(model.busy || !model.flipped || model.readOnly)
     }
@@ -564,6 +570,38 @@ struct StudySessionView: View {
         }
     }
 
+}
+
+/// Opaque neutral pills keep both the grade and its small interval readable on every study desk colour.
+struct StudyGradeButton: View {
+    let title: String
+    let detail: String
+    let shortcut: KeyboardShortcut
+    let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+
+    static let foreground = NibColor.label
+    static let background = NibColor.backgroundTertiary
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 0) {
+                Text(title).font(NibFont.button)
+                Text(detail).font(NibFont.caption1Emphasis)
+            }
+            .foregroundStyle(Self.foreground)
+            .padding(.horizontal, NibSpacing.l)
+            .padding(.vertical, NibSpacing.xs)
+            .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+            .background(Self.background, in: Capsule())
+            .opacity(isEnabled ? 1 : NibOpacity.disabled)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(NibPressStyle(shape: Capsule()))
+        .nibShortcut(shortcut)
+        .accessibilityLabel(String(localized: "\(title), \(detail)"))
+        .accessibilityShowsLargeContentViewer { Text(String(localized: "\(title), \(detail)")) }
+    }
 }
 
 struct StudyFaceView: View {

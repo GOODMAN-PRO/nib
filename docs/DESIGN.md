@@ -793,7 +793,7 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibBarTitle`** | Title (barTitle) over subtitle (caption1 **semibold, `label`**: §2.4) | Truncates the title first | The subtitle turns `warning` for "Offline · changes saved on this iPad" |
 | **`NibHUD`** | Optional icon button + primary number + secondary part, both in `hud` type and `label` | 40 pt tall, always | Digits change with no animation. Capped at xxxLarge |
 | **`NibHUDGroup` + `NibHUDText`** | A `hud` droplet holding any mix of `NibHUDText` (primary + lighter secondary, both `label`), `NibIconButton(.bar)`s, `NibStatusDot` and `NibWaveform` | 40 pt tall, 4 pt inner padding | "3 of 11" with previous and next, the presenter HUD, the recording HUD, "Following Sam · Stop", the bridge status pill. Capped at xxxLarge |
-| **`NibDropletButton`** | One droplet that is one button: glyph and/or title (`button` type) with an optional detail line (caption1 semibold `label`, the one small type allowed on Clear); `tinted` (accent, `onAccent`) or `clear` | ≥ 44 × 44; icon-only is 44 × 44 | The library's "+ New" (Tinted, at most one per screen), the iPhone search and New droplets, the study grading droplets (Again · Hard · Good · Easy + next interval: §14.11's caption2 becomes caption1 semibold to meet §2.4). Large Content Viewer; capped at xxxLarge |
+| **`NibDropletButton`** | One droplet that is one button: glyph and/or title (`button` type) with an optional detail line (caption1 semibold `label`, the one small type allowed on Clear); `tinted` (accent, `onAccent`) or `clear` | ≥ 44 × 44; icon-only is 44 × 44 | The library's "+ New" (Tinted, at most one per screen), the iPhone search and New droplets. Large Content Viewer; capped at xxxLarge |
 | **`NibStatusDot`** | 6 pt dot: `unseen` (accent), `connected` (success), `recording` (destructive), `warning` | 6 | Never the only signal: beside a label, or the element carries a value |
 | **`NibPresenceStack`** | Up to three 22 pt `presence` beads after the title, then a "+N" bead; compact: one bead and the count | 22 pt beads, 4 pt apart | VoiceOver reads the names as a list |
 | **`NibWaveform`** | 2 pt bars 4 pt apart in `labelSecondary`, newest on the right, at least 2 pt tall | 24 bars × 20 pt by default | Redraws when its levels change; nothing moves on its own |
@@ -1047,9 +1047,11 @@ The palette is `NibToolPalette`: six everyday tools by default (pen, highlighter
 ### 14.11 Study sets
 
 - **Editor (iPad)**: two panes on opaque surfaces: the card list (Term | Definition rows in body, image slots; ⇥ moves between fields; ⌘⏎ adds a card) and a large preview card (560 × 360, radius 20, `cardFace`).
-- **Practice / Smart Learn**: a paper card 560 × 360 (E1, paper not water) centred on the desk; the front in `cardFace`; tap or Space flips it around the Y axis with `sheet` (no bounce; Reduce Motion cross-fades); a 3 pt `fill1` progress line with a `label` fill and "12 of 42" in hud at the top; grading as four Clear droplets at the bottom centre, 16 pt apart: Again · Hard · Good · Easy, each with the next interval in caption2 (1–4 keys). Swiping the card grades it: it follows the finger, tilts ±6° and flies out with the release velocity.
+- **Practice / Smart Learn**: a paper card 560 × 360 (E1, paper not water) centred on the desk; the front in `cardFace`; tap or Space flips it around the Y axis with `sheet` (no bounce; Reduce Motion cross-fades); a 3 pt `fill1` progress line with a `label` fill and "12 of 42" in hud at the top; grading after reveal as four opaque neutral capsules at the bottom centre, 16 pt apart: Again · Hard · Good · Easy, each with the next interval in caption1 semibold (1–4 keys). Swiping the card grades it: it follows the finger, tilts ±6° and flies out with the release velocity.
 - **Session summary**: a quiet list (reviewed, due tomorrow, hardest cards), no confetti.
-- **iPhone**: the card fills the width − 32; grading droplets at the bottom; swipe to grade.
+- **iPhone**: the card fills the width − 32; grading capsules at the bottom; swipe to grade.
+
+Practice grading uses opaque neutral capsules (`backgroundTertiary` with full-strength `label`) so grade titles and caption1 semibold intervals meet 4.5:1 in both appearances over any custom desk colour. Before the answer is revealed, a readable instruction replaces unavailable grading controls; the single Flip Card action stays in the header. Busy and read-only grading keeps the shared disabled opacity.
 
 ### 14.12 Presentation mode
 
