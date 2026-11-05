@@ -59,6 +59,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         var epoch = 0
         var stagingError: Error?
         var recoveryKey = ""
+        var recoverySubscription: EventSubscription?
+
+        deinit { recoverySubscription?.cancel() }
         var session: EditorSession?
         var layer = 0
         /// The plain text when editing started: typed URLs are linked only when the text changed, so a link the user
@@ -181,11 +184,15 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     }
 
     func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
-        if isPencil, state != nil, !hitTest(viewPoint, host: host) {
-            endEditing()
-            return true // Own the whole dismissal stream; it must never reach a drawing tool.
-        }
-        return hitTest(viewPoint, host: host)
+        // WetInkController probes more than once before retaining the route. Probes must not dismiss.
+        (isPencil && state != nil) || hitTest(viewPoint, host: host)
+    }
+
+    func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
+        guard sample.isPencil, state != nil,
+              !hitTest(host.viewPoint(sample.location, page: sample.page), host: host) else { return }
+        // GestureRouter has retained this attachment for the whole contact, including its lift.
+        endEditing()
     }
 
     // UITextView already handled these contacts, including double-tap word selection.
@@ -307,7 +314,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         changes.send()
     }
 
-    /// Ends editing: commits the text (deleting a box left empty), then removes the overlay once the commit landed so
+    /// Ends editing: commits the text, then removes the overlay once the commit landed so
     /// the page never shows the box twice or not at all.
     func endEditing(commit: Bool = true, detaching: Bool = false) {
         guard let st = state else { return }
@@ -315,10 +322,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         debounce = nil
         let text = currentRichText()
         if commit, st.stagingError != nil {
-            Self.drafts[st.recoveryKey] = st
+            retainDraft(st)
             if !detaching { return }
         }
-        if commit { Self.drafts[st.recoveryKey] = st }
+        if commit { retainDraft(st) }
         state = nil
         st.textView.delegate = nil
         dismissFloatingInspector(st)
@@ -333,7 +340,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         removeKeyboardInset()
         if commit, st.stagingError == nil {
             // Reconcile even an empty new draft: a preceding create may still be suspended.
-            submit(text, for: st, finishing: true)
+            submit(text, for: st)
             if text.plainText != st.openedText { autodetectLinks(text, for: st) }
         }
         if detaching {
@@ -349,6 +356,21 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
         revertTool(st)
         changes.send()
+    }
+
+    private func retainDraft(_ st: EditState) {
+        Self.drafts[st.recoveryKey] = st
+        guard st.recoverySubscription == nil else { return }
+        st.recoverySubscription = app.bus.observeCommits { [weak st] changes in
+            guard let st else { return }
+            for mutation in changes.mutations {
+                guard case let .item(doc, page, _, after) = mutation,
+                      doc == st.doc, page == st.page, after.id == st.id, after.deleted else { continue }
+                if Self.drafts[st.recoveryKey] === st { Self.drafts[st.recoveryKey] = nil }
+                st.recoverySubscription?.cancel()
+                st.recoverySubscription = nil
+            }
+        }
     }
 
     /// The text tool is non-sticky unless pinned (T-035): a box started with it gives the previous tool back.
@@ -386,7 +408,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         submit(text, for: st)
     }
 
-    private func submit(_ text: RichText, for st: EditState, finishing: Bool = false) {
+    private func submit(_ text: RichText, for st: EditState) {
         let epoch = st.epoch
         enqueue { [self] in
             guard st.stagingError == nil else { return }
@@ -396,8 +418,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                 report(NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept.")))
                 return
             }
-            let deleting = finishing && st.exists && text.isEmpty && app.commands.descriptor(CommandIDs.itemDelete) != nil
-            guard text != st.lastCommitted || deleting else { return }
+            guard text != st.lastCommitted else { return }
             let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
             let command: String
             let params: JSONValue
@@ -418,12 +439,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                 st.lastCommitted = text
                 st.persisted = text
                 st.box.text = text
-                // item.delete owns attached children, connectors, comments and selection pruning.
-                // Only remove after the guarded empty write succeeds; both commands share undo.
-                if deleting, await execute(CommandIDs.itemDelete, ["refs": .array([.string(st.ref)])],
-                                           group: st.group, session: st.session) {
-                    st.exists = false
-                }
+                // Retain empty boxes until item.delete supports a mutation-time precondition.
+                // A separate unguarded delete can suspend in hooks and erase a newer writer's text
+                // and attached contents. Deletion's dependent-item cleanup belongs to that command.
                 if state === st { hide(st.id, page: st.page); publishFocus() }
             }
         }
@@ -589,8 +607,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             try tagAttachments(st)
             st.stagingError = nil
         } catch {
+            let shouldReport = st.stagingError == nil
             st.stagingError = error
-            report(error)
+            if shouldReport {
+                report(NibError(.unavailable, String(localized: "Could not save the image. Your text has been kept.")))
+            }
         }
         let s = st.textView.textStorage
         return TextLayout.richText(from: s, base: st.base) { index in
@@ -618,7 +639,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                     data = png
                 }
             }
-            guard let d = data, let assets = self.app.services.assets else { return }
+            guard let d = data else { return }
+            guard let assets = self.app.services.assets else {
+                failure = NibError(.unavailable, String(localized: "Could not save the image. Your text has been kept."))
+                return
+            }
             do {
                 found.append((range, try assets.put(d, ext: ext, doc: st.doc)))
             } catch { failure = error }

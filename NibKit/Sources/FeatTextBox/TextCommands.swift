@@ -893,7 +893,7 @@ struct TextTapAt: NibCommand {
                 return Output(handled: false, ref: nil)
             }
         } else if editor?.isEditing != true, p.ref == nil, session.tool != TextTool.toolID,
-                  p.gesture != CanvasGesture.doubleTap.rawValue, session.selection.items.isEmpty {
+                  p.gesture != CanvasGesture.doubleTap.rawValue {
             return Output(handled: false, ref: nil)
         }
         let items = try ctx.workspace.items(doc, page: page)

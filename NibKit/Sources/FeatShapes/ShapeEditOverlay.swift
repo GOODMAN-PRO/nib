@@ -168,10 +168,14 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         /// The page is dark paper: the editor shows near-black text as chalk, as the tiles will.
         let darkPaper: Bool
         var committed: RichText
-        var persisted: RichText
+        var persisted: RichText { didSet { conflictAnnounced = false } }
+        var conflictAnnounced = false
         var pending: RichText?
         var epoch = 0
         var recoveryKey = ""
+        var recoverySubscription: EventSubscription?
+
+        deinit { recoverySubscription?.cancel() }
         var debounce: Task<Void, Never>?
 
         init(doc: DocumentID, page: PageID, id: ElementID, textView: ShapeTextView, scale: Double, darkPaper: Bool,
@@ -358,9 +362,12 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
                         t.committed = ShapeTextStyle.richText(attributed, shape: shape, scale: t.scale)
                     } else {
                         t.debounce?.cancel()
-                        NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
-                            userInfo: ["command": CommandIDs.textSetText, "error": NibError(.conflict,
-                                String(localized: "Text changed elsewhere. Your draft has been kept."))])
+                        if !t.conflictAnnounced {
+                            t.conflictAnnounced = true
+                            NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                                userInfo: ["command": CommandIDs.textSetText, "error": NibError(.conflict,
+                                    String(localized: "Text changed elsewhere. Your draft has been kept."))])
+                        }
                     }
                 }
             }
@@ -657,7 +664,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     /// Ends editing; the shape reappears once the last commit has landed, so the text never blinks.
     func endTextEditing(commit: Bool) {
         guard let t = text else { return }
-        if commit { Self.drafts[t.recoveryKey] = t }
+        if commit { retainDraft(t) }
         text = nil
         keyboard.reset()
         t.debounce?.cancel()
@@ -698,6 +705,21 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         guard let t = text else { return }
         t.debounce?.cancel()
         flush(t)
+    }
+
+    private func retainDraft(_ t: TextSession) {
+        Self.drafts[t.recoveryKey] = t
+        guard t.recoverySubscription == nil, let app = host?.app else { return }
+        t.recoverySubscription = app.bus.observeCommits { [weak t] changes in
+            guard let t else { return }
+            for mutation in changes.mutations {
+                guard case let .item(doc, page, _, after) = mutation,
+                      doc == t.doc, page == t.page, after.id == t.id, after.deleted else { continue }
+                if Self.drafts[t.recoveryKey] === t { Self.drafts[t.recoveryKey] = nil }
+                t.recoverySubscription?.cancel()
+                t.recoverySubscription = nil
+            }
+        }
     }
 
     /// Commits the text through `text.setText` when it changed since the last commit.

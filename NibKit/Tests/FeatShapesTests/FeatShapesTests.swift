@@ -738,7 +738,13 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertEqual(tv.text, "External clean")
         tv.attributedText = NSAttributedString(string: "Local label", attributes: tv.typingAttributes)
         try await h.run(CommandIDs.textSetText, ["ref": .string(shapeRef), "text": "External dirty"])
-        overlay.canvasDidChange(host)
+        var conflicts = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            conflicts += 1
+        }
+        for _ in 0..<3 { overlay.canvasDidChange(host) }
+        NotificationCenter.default.removeObserver(observer)
+        XCTAssertEqual(conflicts, 1, "Unrelated canvas refreshes must not repeat the conflict toast")
         XCTAssertEqual(tv.text, "Local label")
         overlay.endTextEditing(commit: true)
         await overlay.pendingFlush?.value
@@ -750,6 +756,35 @@ final class FeatShapesTests: XCTestCase {
         overlay.endTextEditing(commit: true)
         await overlay.pendingFlush?.value
         XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "Recovered label")
+        overlay.detach(from: host)
+    }
+
+    func testDeletedShapeDropsItsClosedDraft() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTextStandIn(h.app)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete", summary: "Test deletion.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(item: Fixtures.shapeID, doc: Fixtures.docID, page: Fixtures.page1) }
+            return [:]
+        }
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        let tv = try XCTUnwrap(overlay.text?.textView)
+        tv.attributedText = NSAttributedString(string: "Discard on deletion", attributes: tv.typingAttributes)
+        h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+            throw NibError(.unavailable, "Rejected save")
+        })
+        overlay.endTextEditing(commit: true)
+        await overlay.pendingFlush?.value
+        h.app.bus.hooks.unregister(id: "test.reject")
+        try await h.run(CommandIDs.itemDelete)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        XCTAssertEqual(overlay.text?.textView.text, "", "Deleted items must release their cached drafts even without a canvas refresh")
+        overlay.endTextEditing(commit: false)
         overlay.detach(from: host)
     }
 

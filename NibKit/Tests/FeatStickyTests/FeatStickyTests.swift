@@ -346,7 +346,13 @@ final class FeatStickyTests: XCTestCase {
         XCTAssertEqual(view.textView.text, "External clean")
         view.textView.attributedText = NSAttributedString(string: "Local draft", attributes: StickyText.typingAttributes(zoom: 1))
         try await h.run(CommandIDs.textSetText, ["ref": .string(stickyRef), "text": "External dirty"])
-        editor.canvasDidChange(host)
+        var conflicts = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            conflicts += 1
+        }
+        for _ in 0..<3 { editor.canvasDidChange(host) }
+        NotificationCenter.default.removeObserver(observer)
+        XCTAssertEqual(conflicts, 1, "Unrelated canvas refreshes must not repeat the conflict toast")
         XCTAssertEqual(view.textView.text, "Local draft")
         editor.endEditing(save: true)
         await editor.flush()
@@ -358,6 +364,30 @@ final class FeatStickyTests: XCTestCase {
         editor.endEditing(save: true)
         await editor.flush()
         XCTAssertEqual(text(h), "Recovered edit")
+    }
+
+    func testDeletedStickyDropsItsClosedDraft() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        installDeleteStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        view.textView.attributedText = NSAttributedString(string: "Discard on deletion", attributes: StickyText.typingAttributes(zoom: 1))
+        h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+            throw NibError(.unavailable, "Rejected save")
+        })
+        editor.endEditing(save: true)
+        await editor.flush()
+        h.app.bus.hooks.unregister(id: "test.reject")
+        try await h.run(CommandIDs.itemDelete, ["ref": .string(stickyRef)])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let reopened = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        XCTAssertEqual(reopened.textView.text, "Remember", "Deleted items must release their cached drafts even without a canvas refresh")
+        editor.endEditing(save: false)
+        await editor.flush()
     }
 
     func testSuspendedStickySaveRejectsChangedTextAtMutation() async throws {

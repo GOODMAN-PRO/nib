@@ -354,10 +354,14 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         let view: StickyNoteView
         /// The last successfully saved text, in the editor's normal form.
         var saved: RichText
-        var persisted: RichText
+        var persisted: RichText { didSet { conflictAnnounced = false } }
+        var conflictAnnounced = false
         var pending: RichText?
         var epoch = 0
         var recoveryKey = ""
+        var recoverySubscription: EventSubscription?
+
+        deinit { recoverySubscription?.cancel() }
         var zoom: CGFloat
         /// False while the tool's `sticky.create` has not landed yet.
         var placed: Bool
@@ -551,7 +555,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             autosave?.cancel()
             autosave = nil
         }
-        if save { Self.drafts[e.recoveryKey] = e }
+        if save { retainDraft(e) }
         editing = nil
         keyboard.reset()
         observers.removeAll()
@@ -577,6 +581,21 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
     }
 
     func flush() async { await writes?.value }
+
+    private func retainDraft(_ e: Editing) {
+        Self.drafts[e.recoveryKey] = e
+        guard e.recoverySubscription == nil, let app = host?.app else { return }
+        e.recoverySubscription = app.bus.observeCommits { [weak e] changes in
+            guard let e else { return }
+            for mutation in changes.mutations {
+                guard case let .item(doc, page, _, after) = mutation,
+                      doc == e.doc, page == e.page, after.id == e.id, after.deleted else { continue }
+                if Self.drafts[e.recoveryKey] === e { Self.drafts[e.recoveryKey] = nil }
+                e.recoverySubscription?.cancel()
+                e.recoverySubscription = nil
+            }
+        }
+    }
 
     /// Runs `work` after every write queued before it.
     private func write(_ work: @escaping @MainActor () async -> Void) {
@@ -614,9 +633,12 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
                     e.saved = StickyText.normalised(note.text)
                 } else {
                     autosave?.cancel()
-                    NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
-                        userInfo: ["command": CommandIDs.textSetText, "error": NibError(.conflict,
-                            String(localized: "Text changed elsewhere. Your draft has been kept."))])
+                    if !e.conflictAnnounced {
+                        e.conflictAnnounced = true
+                        NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                            userInfo: ["command": CommandIDs.textSetText, "error": NibError(.conflict,
+                                String(localized: "Text changed elsewhere. Your draft has been kept."))])
+                    }
                 }
             }
             if note != e.view.note { e.view.note = note }

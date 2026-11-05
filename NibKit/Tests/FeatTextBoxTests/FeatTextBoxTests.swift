@@ -121,7 +121,7 @@ final class FeatTextBoxTests: XCTestCase {
         return (page, id)
     }
 
-    /// F013 owns deletion; assert the editor delegates only after a guarded empty write.
+    /// F013 owns deletion; this legacy command has no mutation-time text precondition.
     private func installDeleteStandIn(_ h: Harness, calls: Calls) {
         h.app.commands.register(CommandDescriptor(
             id: CommandIDs.itemDelete, title: "Delete", summary: "Test deletion routing.",
@@ -425,6 +425,33 @@ final class FeatTextBoxTests: XCTestCase {
         }
     }
 
+    func testDeletedTextBoxDropsItsClosedDraft() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete", summary: "Test deletion.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(item: Fixtures.textID, doc: Fixtures.docID, page: Fixtures.page1) }
+            return [:]
+        }
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        editor.editingTextView?.attributedText = NSAttributedString(string: "Discard on deletion")
+        h.app.bus.hooks.register(.guarding(id: "test.reject", owner: "test", commands: [CommandIDs.textSetText]) { _, _, _ in
+            throw NibError(.unavailable, "Rejected save")
+        })
+        editor.detach(from: host)
+        await editor.flush()
+        h.app.bus.hooks.unregister(id: "test.reject")
+        try await h.run(CommandIDs.itemDelete)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        editor.attach(to: host)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        XCTAssertEqual(editor.currentRichText(), item.text?.text, "Deleted items must release their cached drafts even after detach")
+        editor.endEditing(commit: false)
+        await editor.flush()
+        editor.detach(from: host)
+    }
+
     func testExternalRestyleRebasesDraftAndTypingWithoutClearingUndo() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let (host, editor) = self.editor(h)
@@ -558,6 +585,47 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testMissingAssetStoreReportsOnceRetainsBytesAndRetries() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let bytes = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image { ctx in
+            UIColor.red.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }.pngData())
+        let attachment = NSTextAttachment(data: bytes, ofType: "public.png")
+        editor.editingTextView?.attributedText = NSAttributedString(attachment: attachment)
+        h.app.services.assets = nil
+        var errors: [NibError] = []
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) {
+            if let error = $0.userInfo?["error"] as? NibError { errors.append(error) }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        editor.commitNow()
+        _ = editor.currentRichText()
+        editor.endEditing()
+        XCTAssertTrue(editor.isEditing)
+        XCTAssertNotNil(editor.editingState?.stagingError)
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertEqual(errors.first, NibError(.unavailable,
+            String(localized: "Could not save the image. Your text has been kept.")))
+        editor.detach(from: host)
+        await editor.flush()
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertEqual(try box(h).text, item.text?.text)
+        editor.attach(to: host)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let retained = editor.editingTextView?.textStorage.attribute(.attachment, at: 0, effectiveRange: nil) as? NSTextAttachment
+        XCTAssertEqual(retained?.contents, bytes)
+        h.app.services.assets = h.assets
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertFalse(editor.isEditing)
+        let asset = try XCTUnwrap(try box(h).text.paragraphs.first?.runs.first?.attrs.attachment)
+        XCTAssertEqual(try h.assets.data(asset, doc: Fixtures.docID), bytes)
+        editor.detach(from: host)
+    }
+
     func testAttachmentWithoutDataDoesNotTrapTheEditor() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let (host, editor) = self.editor(h)
@@ -567,6 +635,7 @@ final class FeatTextBoxTests: XCTestCase {
         let content = NSMutableAttributedString(string: "Keep this", attributes: tv.typingAttributes)
         content.append(NSAttributedString(attachment: NSTextAttachment()))
         tv.attributedText = content
+        h.app.services.assets = nil
         _ = editor.currentRichText()
         XCTAssertNil(editor.editingState?.stagingError)
         editor.endEditing()
@@ -620,12 +689,12 @@ final class FeatTextBoxTests: XCTestCase {
                 XCTAssertFalse(editor.isEditing)
                 release.fulfill()
                 await editor.flush()
-                if rejectCreate || canDelete {
+                if rejectCreate {
                     XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: page, id: id))
                 } else {
                     XCTAssertTrue(try box(h, id, page: page).text.isEmpty)
                 }
-                XCTAssertEqual(calls.params.count, canDelete && !rejectCreate ? 1 : 0)
+                XCTAssertEqual(calls.params.count, 0, "Legacy deletion cannot safely follow the guarded empty write")
                 XCTAssertNil(host.hidden[page])
                 editor.detach(from: host)
             }
@@ -640,10 +709,22 @@ final class FeatTextBoxTests: XCTestCase {
         let outside = CGPoint(x: 600, y: 700)
         XCTAssertFalse(editor.hitTest(outside, isPencil: false, host: host))
         XCTAssertTrue(editor.isEditing)
-        XCTAssertTrue(editor.hitTest(outside, isPencil: true, host: host))
-        XCTAssertTrue(editor.gesture(.tap, at: CanvasSample(page: Fixtures.page1, location: Point(600, 700), isPencil: true), host: host))
+        // WetInkController's uncached PencilKit-admission probes precede actual route delivery.
+        for _ in 0..<3 {
+            XCTAssertTrue(editor.hitTest(outside, isPencil: true, host: host), "Every probe must exclude PencilKit")
+            XCTAssertTrue(editor.isEditing, "A speculative probe cannot dismiss the editor")
+        }
+        let sample = CanvasSample(page: Fixtures.page1, location: Point(600, 700), isPencil: true, touchID: 7)
+        let retainedRoute: CanvasAttachment = editor
+        retainedRoute.touchesBegan(sample, host: host)
+        XCTAssertFalse(editor.isEditing)
+        // GestureRouter retains this route through movement and lift, even after dismissal.
+        retainedRoute.touchesMoved([sample], host: host)
+        retainedRoute.touchesEnded(sample, host: host)
+        XCTAssertTrue(retainedRoute.gesture(.tap, at: sample, host: host), "The dismissal contact is consumed, never sent to a drawing tool")
         await editor.flush()
         XCTAssertFalse(editor.isEditing)
+        XCTAssertTrue(host.committed.isEmpty, "Dismissing with Pencil must not commit an ink stroke")
         editor.detach(from: host)
     }
 
@@ -874,7 +955,7 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
-    func testEmptyCloseUsesItemDeleteInSameUndoGroupAndRejectsStaleText() async throws {
+    func testEmptyCloseRetainsBoxWithoutGuardedDeletionAndRejectsStaleText() async throws {
         for conflict in [false, true] {
             let h = Harness(features: [FeatTextBoxFeature.self])
             let calls = Calls()
@@ -891,18 +972,53 @@ final class FeatTextBoxTests: XCTestCase {
             editor.endEditing()
             await editor.flush()
             subscription.cancel()
-            XCTAssertEqual(calls.params.count, conflict ? 0 : 1)
+            XCTAssertEqual(calls.params.count, 0)
             if conflict {
                 XCTAssertEqual(try box(h).text.plainText, "Other window")
             } else {
-                XCTAssertEqual(groups.count, 2)
+                XCTAssertEqual(groups.count, 1)
                 XCTAssertEqual(Set(groups).count, 1)
-                XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
+                XCTAssertTrue(try box(h).text.isEmpty)
                 XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
                 XCTAssertEqual(try box(h).text, item.text?.text)
             }
             editor.detach(from: host)
         }
+    }
+
+    func testEmptyCloseCannotDeleteNewTextDuringSuspendedDeletion() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let calls = Calls()
+        installDeleteStandIn(h, calls: calls)
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        editor.editingTextView?.attributedText = NSAttributedString(string: "")
+        let boundary = expectation(description: "Deletion suspended or safe close completed")
+        let resume = expectation(description: "Resume unsafe deletion if attempted")
+        let finished = expectation(description: "Close drained")
+        var deletionSuspended = false
+        h.app.bus.hooks.register(.guarding(id: "test.suspendDelete", owner: "test", commands: [CommandIDs.itemDelete]) { _, _, _ in
+            deletionSuspended = true
+            boundary.fulfill()
+            await self.fulfillment(of: [resume], timeout: 1)
+            return nil
+        })
+        editor.endEditing()
+        Task { @MainActor in
+            await editor.flush()
+            if !deletionSuspended { boundary.fulfill() }
+            finished.fulfill()
+        }
+        // The fixed path finishes without calling delete; the old path pauses inside its hook.
+        await fulfillment(of: [boundary], timeout: 1)
+        try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "Newer window text"])
+        resume.fulfill()
+        await fulfillment(of: [finished], timeout: 1)
+        XCTAssertEqual(try box(h).text.plainText, "Newer window text")
+        XCTAssertFalse(deletionSuspended, "Until guarded deletion exists, leave the safely emptied box")
+        XCTAssertTrue(calls.params.isEmpty)
+        editor.detach(from: host)
     }
 
     func testURLDetectionFindsUnlinkedAddresses() {
@@ -1124,6 +1240,23 @@ final class FeatTextBoxTests: XCTestCase {
         editor.endEditing()
         await editor.flush()
         editor.detach(from: host)
+    }
+
+    func testEmptyPaperTapNearSelectedBoxDoesNotStartEditing() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let frame = try box(h).frame
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.textID])
+        let point: JSONValue = .array([.number(frame.x - 3), .number(frame.y + frame.h / 2)])
+        let out = try await h.run(CommandIDs.textTapAt, ["page": "page:FIXTUREDOC01/FIXTUREPG001",
+                                                       "point": point, "gesture": "tap"])
+        XCTAssertEqual(out["handled"]?.boolValue, false)
+        XCTAssertFalse(editor.isEditing)
+        let direct = try await h.run(CommandIDs.textTapAt, ["page": "page:FIXTUREDOC01/FIXTUREPG001",
+            "point": point, "ref": .string(textRef), "gesture": "tap"])
+        XCTAssertEqual(direct["handled"]?.boolValue, true, "An actual selected-item hit still edits")
+        editor.detach(from: host)
+        await editor.flush()
     }
 
     func testTheTextToolGivesThePreviousToolBackUnlessPinned() async throws {
