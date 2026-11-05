@@ -189,6 +189,7 @@ extension UnseenTracker {
     /// Stores revisions actually present in the document. G9's content revision falls back to loading the page
     /// when persistence cannot supply it; a local wall clock must never hide a collaborator's next edit.
     func markSeen(_ doc: DocumentID, pages: [PageID]?) throws {
+        guard let app else { throw NibError.unavailable("live collaboration") }
         let content = try app.workspace.peekContent(doc)
         let records = pages.map { wanted in content.pages.filter { wanted.contains($0.id) } } ?? content.pages
         var pageMarks: [PageID: Rev] = [:]
