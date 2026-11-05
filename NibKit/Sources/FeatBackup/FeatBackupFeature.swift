@@ -112,7 +112,10 @@ final class BackupEngine {
         else { let disk = store; task = Task { try await disk.load() }; loading = task }
         do {
             let recovered = try await task.value
-            if !loaded { queue = recovered; loaded = true }
+            if !loaded {
+                queue = recovered; loaded = true
+                if queue.omissionWarning != nil { state = "warning" }
+            }
             loading = nil
         } catch {
             loading = nil
@@ -280,6 +283,7 @@ final class BackupEngine {
         guard let app else { return }
         let nodes = app.services.library?.allNodes() ?? []
         queue.clear()
+        queue.exportReports.removeAll()
         if BackupSettings.read(app.settings).destination.kind != "none" {
             for id in eligible(nodes).sorted() { queue.enqueue(id, at: now().timeIntervalSince1970) }
         }
@@ -308,16 +312,20 @@ final class BackupEngine {
         let config = BackupSettings.read(app.settings)
         let next = queue.entries.isEmpty || config.destination.kind == "none" ? nil :
             (queue.lastAttempt ?? queue.entries.map(\.queuedAt).min() ?? now().timeIntervalSince1970) + BackupQueue.interval(frequent: config.frequent)
+        let omissionWarning = queue.omissionWarning
+        let message = [error, omissionWarning].compactMap { $0 }.joined(separator: "\n")
+        let displayState = !running && error == nil && omissionWarning != nil ? "warning" : state
         return BackupStatusInfo(configuration: config, folderName: app.settings.get(BackupSettings.folderName),
             folderChosen: app.settings.get(BackupSettings.bookmark) != nil, queued: queue.entries.count, running: running,
-            state: state, progress: manualProgress?.fractionCompleted ?? progress, lastAttempt: queue.lastAttempt,
-            lastSuccess: queue.lastSuccess, error: error, skippedLocked: skippedLocked, nextRun: next, manual: manualProgress != nil, manualInterrupted: manualInterrupted)
+            state: displayState, progress: manualProgress?.fractionCompleted ?? progress, lastAttempt: queue.lastAttempt,
+            lastSuccess: queue.lastSuccess, error: message.isEmpty ? nil : message, skippedLocked: skippedLocked, nextRun: next, manual: manualProgress != nil, manualInterrupted: manualInterrupted)
     }
 
     func emit() {
         guard let app else { return }
-        app.events.emit(NibEventType.backupStatus, payload: ["state": .string(state), "queued": .number(Double(queue.entries.count))])
-        app.events.emit(SyncStatusPayload(state: state, source: "backup", message: error))
+        let current = status()
+        app.events.emit(NibEventType.backupStatus, payload: ["state": .string(current.state), "queued": .number(Double(queue.entries.count))])
+        app.events.emit(SyncStatusPayload(state: current.state, source: "backup", message: current.error))
     }
     func report(_ failure: Error) { error = NibError.wrap(failure).message; state = "error"; emit() }
 
@@ -388,7 +396,12 @@ final class BackupEngine {
                 let formats = config.format == "both" ? ["nibnote", "pdf"] : [config.format == "nib" ? "nibnote" : "pdf"]
                 for format in formats {
                     try Task.checkCancellation()
-                    let result = try await ctx.execute(CommandIDs.exportRun, ["docs": .array([.string("doc:" + entry.document.raw)]), "format": .string(format)])
+                    let reportKey = entry.document.raw + "/" + format
+                    var params: [String: JSONValue] = ["docs": .array([.string("doc:" + entry.document.raw)]), "format": .string(format)]
+                    if automatic, let report = queue.exportReports[reportKey] {
+                        params["reportedOmissions"] = .array(report.omissions)
+                    }
+                    let result = try await ctx.execute(CommandIDs.exportRun, .object(params))
                     guard let files = result["files"]?.arrayValue, !files.isEmpty else { throw NibError(.internalError, "The exporter returned no backup files") }
                     for (fileIndex, file) in files.enumerated() {
                         try Task.checkCancellation()
@@ -408,6 +421,17 @@ final class BackupEngine {
                             try await BackupWriter.write(source: source, relativePath: path, bookmark: bookmark, libraryRoot: library.rootURL)
                         }
                     }
+                    guard generation == runGeneration else { throw CancellationError() }
+                    let omissions = result["omissions"]?.arrayValue ?? []
+                    if let warning = result["warning"]?.stringValue, !warning.isEmpty {
+                        queue.exportReports[reportKey] = BackupQueue.ExportReport(document: node.title, warning: warning, omissions: omissions)
+                    } else if !omissions.isEmpty {
+                        let count = omissions.count
+                        let warning = String(localized: "Unreadable assets omitted: \(count). See Export Report.txt in the archive.")
+                        queue.exportReports[reportKey] = BackupQueue.ExportReport(document: node.title, warning: warning, omissions: omissions)
+                    } else {
+                        queue.exportReports[reportKey] = nil
+                    }
                 }
                 if generation == runGeneration {
                     try await store.saveStamp(stamp, document: entry.document)
@@ -425,6 +449,7 @@ final class BackupEngine {
         if let failure { report(failure) }
         else if self.error == nil {
             if skippedLocked > 0 { state = "warning"; self.error = String(localized: "Locked documents were skipped. Unlock them to include them in the next backup.") }
+            else if queue.omissionWarning != nil { state = "warning"; progress = 1 }
             else { state = "ok"; queue.lastSuccess = now().timeIntervalSince1970; progress = 1 }
         }
         try await persist().value

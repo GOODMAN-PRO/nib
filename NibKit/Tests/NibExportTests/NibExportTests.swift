@@ -2,9 +2,22 @@ import XCTest
 import UIKit
 import PDFKit
 import ImageIO
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import NibExport
+
+@MainActor
+private final class OmissionToastHost: FloatingHosting {
+    var messages: [String] = []
+    func present(_ id: String, content: AnyView) {}
+    func dismiss(_ id: String) {}
+    func isPresenting(_ id: String) -> Bool { false }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { nil }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { messages.append(message) }
+}
 
 @MainActor
 final class NibExportTests: XCTestCase {
@@ -441,6 +454,30 @@ final class NibExportTests: XCTestCase {
             XCTAssertNotNil(data.range(of: Data("assets/fixture-page.pdf".utf8)))
             XCTAssertNil(data.range(of: Data("assets/fixture-image.png".utf8)))
         }
+    }
+
+    func testExportRunSuppressesOnlyPreviouslyReportedOmissionToasts() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let host = OmissionToastHost()
+        h.session.floatingHost = host
+        h.app.services.assets = InMemoryAssetStore(root: h.persistence.root)
+        let params: JSONValue = ["docs": ["doc:FIXTUREDOC01"], "format": "nibnote"]
+        let first = try await h.run(CommandIDs.exportRun, params)
+        XCTAssertEqual(host.messages.count, 1)
+        let previous = try XCTUnwrap(first["omissions"])
+        let repeatParams: JSONValue = ["docs": ["doc:FIXTUREDOC01"], "format": "nibnote", "reportedOmissions": previous]
+        let repeated = try await h.run(CommandIDs.exportRun, repeatParams)
+        XCTAssertEqual(repeated["omissions"], previous)
+        XCTAssertNotNil(repeated["warning"], "suppression must not hide the persistent report")
+        XCTAssertEqual(host.messages.count, 1)
+        // A changed omission set must alert again; normal user exports always alert.
+        let assets = try XCTUnwrap(h.app.services.assets as? InMemoryAssetStore)
+        assets.install(try h.assets.data(Fixtures.pdfAsset, doc: Fixtures.docID), as: Fixtures.pdfAsset, doc: Fixtures.docID)
+        _ = try await h.run(CommandIDs.exportRun, repeatParams)
+        XCTAssertEqual(host.messages.count, 2)
+        _ = try await h.run(CommandIDs.exportRun, params)
+        XCTAssertEqual(host.messages.count, 3)
+        XCTAssertTrue(host.messages.allSatisfy { !$0.contains(Fixtures.page1.raw) })
     }
 
     func testPackageSilentlySkipsAssetsReferencedOnlyByTrashedPages() async throws {

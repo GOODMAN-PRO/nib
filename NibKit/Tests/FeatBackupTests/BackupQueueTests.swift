@@ -103,6 +103,19 @@ final class BackupQueueTests: XCTestCase {
         do { _ = try await first.load(); XCTFail("Corruption must be reported") } catch { }
     }
 
+    func testOmissionReportsPersistAndOldQueuesStillDecode() throws {
+        var queue = BackupQueue()
+        queue.exportReports["DOC/nibnote"] = BackupQueue.ExportReport(document: "Notes",
+            warning: "Page 1: missing image", omissions: [["asset": "missing.png", "pages": ["Page 1"]]])
+        let restored = try JSONDecoder().decode(BackupQueue.self, from: JSONEncoder().encode(queue))
+        XCTAssertEqual(restored, queue)
+        XCTAssertTrue(try XCTUnwrap(restored.omissionWarning).contains("Page 1: missing image"))
+        let legacy = try JSONDecoder().decode(BackupQueue.self, from: Data(#"{"entries":[],"lastSuccess":100}"#.utf8))
+        XCTAssertTrue(legacy.exportReports.isEmpty)
+        XCTAssertNil(legacy.omissionWarning)
+        XCTAssertEqual(legacy.lastSuccess, 100)
+    }
+
     func testMirroredPathsAndTraversalValidation() throws {
         let folder = LibraryNode(id: Fixtures.folderID, kind: .folder, title: "School", path: "School")
         let doc = LibraryNode(id: Fixtures.docID, kind: .document, title: "Physics/Notes", path: "School/Notes.nibnote", parent: folder.id)

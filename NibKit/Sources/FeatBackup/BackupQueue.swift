@@ -3,6 +3,11 @@ import NibContracts
 
 /// A pending document is replaced when it changes again. A writer can acknowledge only the exact version it read.
 struct BackupQueue: Codable, Equatable {
+    struct ExportReport: Codable, Equatable {
+        var document: String
+        var warning: String
+        var omissions: [JSONValue]
+    }
     struct Entry: Codable, Equatable {
         var document: DocumentID
         var token: UUID = UUID()
@@ -11,10 +16,12 @@ struct BackupQueue: Codable, Equatable {
     private(set) var entries: [Entry] = []
     var lastAttempt: Double?
     var lastSuccess: Double?
+    /// Last delivered omission report per document/format, retained across runs and app restarts.
+    var exportReports: [String: ExportReport] = [:]
     // Derived from entries and excluded from disk state. Commits must not scan the whole queue.
     private var indices: [DocumentID: Int] = [:]
 
-    private enum CodingKeys: String, CodingKey { case entries, lastAttempt, lastSuccess }
+    private enum CodingKeys: String, CodingKey { case entries, lastAttempt, lastSuccess, exportReports }
 
     init() { }
 
@@ -23,7 +30,17 @@ struct BackupQueue: Codable, Equatable {
         entries = try values.decode([Entry].self, forKey: .entries)
         lastAttempt = try values.decodeIfPresent(Double.self, forKey: .lastAttempt)
         lastSuccess = try values.decodeIfPresent(Double.self, forKey: .lastSuccess)
+        exportReports = try values.decodeIfPresent([String: ExportReport].self, forKey: .exportReports) ?? [:]
         rebuildIndices()
+    }
+
+    var omissionWarning: String? {
+        guard !exportReports.isEmpty else { return nil }
+        let details = exportReports.keys.sorted().compactMap { key -> String? in
+            guard let report = exportReports[key] else { return nil }
+            return report.document + ": " + report.warning
+        }.joined(separator: "\n")
+        return String(localized: "Backup otherwise complete, with omitted assets.\n\(details)")
     }
 
     private mutating func rebuildIndices() {

@@ -116,6 +116,76 @@ final class FeatBackupTests: XCTestCase {
         XCTAssertTrue(engine.queue.entries.isEmpty)
     }
 
+    func testAutomaticOmissionsSurviveRestartSuppressRepeatsAndClearOnlyAfterDelivery() async throws {
+        let (h, engine, root) = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var time = 100.0
+        engine.now = { Date(timeIntervalSince1970: time) }
+        let omissions: JSONValue = [["document": "Notebook", "asset": "missing.png",
+            "pages": ["Page 1 (ID)"], "pageLabels": ["Page 1"]]]
+        var partial = true, failDelivery = false
+        var receivedReports: [JSONValue?] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.exportRun, title: "Export", summary: "Partial export", effect: .read)) { params, ctx in
+            let ref = try ctx.services.assets!.putTemporary(Data("backup".utf8), ext: "zip")
+            var result: [String: JSONValue] = ["files": [["asset": .string("tmp:" + ref.name)]]]
+            if params["docs"]?.arrayValue?.first?.stringValue == "doc:" + Fixtures.docID.raw {
+                receivedReports.append(params["reportedOmissions"])
+                if partial {
+                    result["omissions"] = omissions
+                    result["warning"] = "Export otherwise complete. Unreadable assets omitted: 1. Pages: Page 1."
+                }
+            }
+            return .object(result)
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.webdavPut, title: "PUT", summary: "Delivery", effect: .session)) { _, ctx in
+            if !ctx.dryRun && failDelivery { throw NibError.unavailable("Offline") }
+            return [:]
+        }
+        _ = try await h.run(CommandIDs.backupConfigure, ["destination": ["kind": "webdav"], "format": "nib", "frequent": true])
+        let first = try await BackupExecution.$automatic.withValue(true) { try await h.run(CommandIDs.backupNow) }
+        XCTAssertEqual(first["state"], "warning")
+        XCTAssertTrue(try XCTUnwrap(first["error"]?.stringValue).contains("Page 1"))
+        XCTAssertTrue(engine.queue.entries.isEmpty)
+        XCTAssertNil(engine.queue.lastSuccess, "an incomplete archive is not a clean success")
+        XCTAssertNil(receivedReports[0])
+
+        let reloaded = BackupEngine(app: h.app)
+        reloaded.store = BackupQueueStore(url: root.appendingPathComponent("queue.json"))
+        reloaded.now = { Date(timeIntervalSince1970: time) }
+        h.app.services.set(reloaded, for: BackupEngine.serviceKey)
+        await reloaded.start()
+        XCTAssertEqual(reloaded.status().state, "warning")
+        XCTAssertEqual(reloaded.status().error, first["error"]?.stringValue)
+        let (_, items) = Fixtures.sampleContent()
+        var changedItem = items[Fixtures.page1]![0]
+        changedItem.z = "zz"
+        try await h.insert([changedItem])
+        time += 100
+        _ = try await BackupExecution.$automatic.withValue(true) { try await h.run(CommandIDs.backupNow) }
+        XCTAssertEqual(receivedReports.count, 2)
+        XCTAssertEqual(receivedReports[1], omissions, "the persisted report must reach the toast owner on automatic runs")
+
+        partial = false; failDelivery = true
+        changedItem.z = "zzz"
+        try await h.insert([changedItem])
+        time += 100
+        do {
+            _ = try await BackupExecution.$automatic.withValue(true) { try await h.run(CommandIDs.backupNow) }
+            XCTFail("delivery failure must surface")
+        } catch { }
+        XCTAssertFalse(reloaded.queue.exportReports.isEmpty, "a failed delivery cannot clear the previous partial-backup status")
+        XCTAssertTrue(try XCTUnwrap(reloaded.status().error).contains("Page 1"))
+        failDelivery = false
+        time += 100
+        _ = try await BackupExecution.$automatic.withValue(true) { try await h.run(CommandIDs.backupNow) }
+        XCTAssertTrue(reloaded.queue.exportReports.isEmpty)
+        XCTAssertEqual(reloaded.status().state, "ok")
+        XCTAssertNil(reloaded.status().error)
+        XCTAssertNotNil(reloaded.queue.lastSuccess)
+        let disk = try await reloaded.store.load()
+        XCTAssertTrue(disk.exportReports.isEmpty)
+    }
+
     func testClearDuringExportDoesNotSendOrConsumeNewQueue() async throws {
         let (h, engine, root) = try makeHarness()
         defer { try? FileManager.default.removeItem(at: root) }
