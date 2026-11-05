@@ -212,6 +212,11 @@ struct StickyInspector: View {
     @State private var size: Double
     @State private var alignment: ParagraphAlignment
 
+    /// Rebuild local editing state whenever the host supplies a new item revision (including undo and sync).
+    static func identity(_ items: [Item]) -> String {
+        items.map { $0.id.raw + ":" + $0.rev.description }.joined(separator: ",")
+    }
+
     init(context ctx: InspectorContext) {
         app = ctx.app
         session = ctx.session

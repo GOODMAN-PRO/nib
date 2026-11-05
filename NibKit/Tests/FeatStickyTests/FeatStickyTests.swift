@@ -557,6 +557,25 @@ final class FeatStickyTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
     }
 
+    func testInspectorIdentityRefreshesForExternalChangesAndUndo() async throws {
+        let h = harness()
+        func identity() throws -> String {
+            StickyInspector.identity([try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)])
+        }
+        let original = try identity()
+        try await h.run("sticky.setCollapsed", ["refs": [.string(stickyRef)], "collapsed": true])
+        let collapsed = try identity()
+        XCTAssertNotEqual(collapsed, original, "the host must recreate the inspector's local toggle state")
+        XCTAssertTrue(try note(h).collapsed)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertNotEqual(try identity(), collapsed)
+        XCTAssertFalse(try note(h).collapsed)
+        let expanded = try identity()
+        try await h.run("sticky.resolve", ["ref": .string(stickyRef), "resolved": true])
+        XCTAssertNotEqual(try identity(), expanded)
+        XCTAssertTrue(try note(h).resolved)
+    }
+
     func testInspectorFormattingKeepsTextChangedSinceItOpened() async throws {
         let h = harness()
         installTextStandIn(h)
