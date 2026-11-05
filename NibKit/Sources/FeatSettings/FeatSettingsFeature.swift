@@ -200,7 +200,9 @@ final class SettingsRouter {
             let known = ui.settingsPages.all.map { $0.id }.joined(separator: ", ")
             throw NibError(.notFound, "settings page '\(id)' not found", path: "$.page", hint: "known pages: \(known)")
         }
-        if let root = visibleRoot, root.viewIfLoaded?.window != nil {
+        if let root = visibleRoot, let window = root.viewIfLoaded?.window,
+           let invokingWindow = ctx.navigator?.rootViewController?.viewIfLoaded?.window,
+           window === invokingWindow || (window.windowScene != nil && window.windowScene === invokingWindow.windowScene) {
             if let id = page { root.show(page: id) }
             return SettingsOpen.Output(opened: "settings", page: page, panel: nil)
         }

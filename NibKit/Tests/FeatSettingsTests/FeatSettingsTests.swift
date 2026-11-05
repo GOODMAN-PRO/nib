@@ -325,6 +325,33 @@ final class FeatSettingsTests: XCTestCase {
         XCTAssertEqual(navigator.libraryShown, 0)
     }
 
+    func testSettingsOpenInAnotherWindowDoesNotChangeTheFirstWindow() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let first = RecordingNavigator(h)
+        h.app.ui.activeNavigator = first
+        try await h.run(CommandIDs.settingsOpen, ["page": "settings.stylus"])
+        let root = try XCTUnwrap(first.presented as? SettingsRootViewController)
+        let firstWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 760, height: 706))
+        firstWindow.addSubview(root.view)
+        first.rootViewController = root
+
+        let second = RecordingNavigator(h)
+        let secondRoot = UIViewController()
+        let secondWindow = UIWindow(frame: firstWindow.frame)
+        secondWindow.addSubview(secondRoot.view)
+        second.rootViewController = secondRoot
+        h.app.ui.activeNavigator = second
+        let out = try await h.run(CommandIDs.settingsOpen, ["page": "settings.language"])
+        XCTAssertEqual(out["opened"]?.stringValue, "settings")
+        XCTAssertEqual(second.requestedPages, ["settings.language"])
+        XCTAssertEqual(root.state.section, .stylus)
+        let shown = try XCTUnwrap(second.presented as? SettingsRootViewController)
+        XCTAssertEqual(shown.state.section, .general)
+        XCTAssertEqual(shown.state.detailPath.count, 1)
+        XCTAssertEqual(first.requestedPages, ["settings.stylus"])
+        withExtendedLifetime((firstWindow, secondWindow)) {}
+    }
+
     func testSettingsOpenMovesSettingsAlreadyOnScreen() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
         let navigator = RecordingNavigator(h)
@@ -333,6 +360,7 @@ final class FeatSettingsTests: XCTestCase {
         let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 760, height: 706))
         window.addSubview(root.view)
+        navigator.rootViewController = root
 
         let out = try await h.run(CommandIDs.settingsOpen, ["page": "settings.language"])
         XCTAssertEqual(out["page"]?.stringValue, "settings.language")
