@@ -653,7 +653,7 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var target: NibReflowTouchTarget
         weak var probe: Probe?
-        lazy var gesture = LiftRecognizer(target: self, action: #selector(handle))
+        lazy var gesture = LiftRecognizer(target: self, action: #selector(handle as () -> Void))
         init(_ target: NibReflowTouchTarget) { self.target = target }
         func attach(_ probe: Probe) {
             detach(); self.probe = probe

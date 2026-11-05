@@ -104,6 +104,7 @@ final class FeatLibraryUITests: XCTestCase {
         let target = NibReflowTouchTarget(id: "cover", reflow: NibReflow<String>(),
                                          order: ["cover"], onDrop: { _ in })
         let coordinator = target.makeCoordinator()
+        XCTAssertTrue(coordinator.responds(to: NSSelectorFromString("handle")))
         let card = LibraryItemTouchView()
         // The native context menu's recognizer is not required to subclass UILongPressGestureRecognizer.
         let nativeMenu = UIGestureRecognizer()
@@ -128,6 +129,23 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
         card.reflowTouchBegan()
         XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+    }
+
+    func testLiftRenderingWarmupBoundsFailedAndCancelledAttempts() {
+        var budget = LibraryLiftWarmupBudget()
+        XCTAssertTrue(budget.begin())
+        XCTAssertFalse(budget.begin(), "Concurrent appearance and row-loading calls share one attempt")
+        budget.finish(rendered: false)
+        XCTAssertTrue(budget.begin(), "An interrupted or failed warmup gets one retry")
+        budget.finish(rendered: false)
+        for _ in 0..<5 {
+            XCTAssertFalse(budget.begin(), "Repeated failures must not keep mounting warmup hosts")
+        }
+
+        var successful = LibraryLiftWarmupBudget()
+        XCTAssertTrue(successful.begin())
+        successful.finish(rendered: true)
+        XCTAssertFalse(successful.begin(), "A successful snapshot needs no retry")
     }
 
     func testQueuedMenuCompletionPreservesLiftAndDeliversDropExactlyOnce() async throws {
@@ -281,8 +299,16 @@ final class FeatLibraryUITests: XCTestCase {
         let card = try XCTUnwrap(descendants(host.view).compactMap { $0 as? LibraryItemTouchView }.first)
         let tap = try XCTUnwrap(card.gestureRecognizers?.compactMap { $0 as? LibraryItemTapRecognizer }.first)
         let frame = card.convert(card.bounds, to: window)
+        let interaction = try XCTUnwrap(card.interactions.compactMap { $0 as? UIContextMenuInteraction }.first)
+        var dismissals = 0
+        card.dismissContextMenu = { _ in dismissals += 1 }
         tap.pressed(true)
         for menu in ["sort", "none", "app", "none"] {
+            card.reflowTouchBegan()
+            let configuration = try XCTUnwrap(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+            let queued = QueuedMenuAnimation()
+            card.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: queued)
+            card.reflowLiftBegan()
             model.setView(["menu": .string(menu)])
             try await Task.sleep(for: .milliseconds(150))
             host.view.layoutIfNeeded()
@@ -292,7 +318,23 @@ final class FeatLibraryUITests: XCTestCase {
             XCTAssertTrue(tap.view === card)
             XCTAssertTrue(card.window === window)
             XCTAssertEqual(card.convert(card.bounds, to: window), frame, "Press feedback must not move the native touch target")
+            if menu != "none" {
+                XCTAssertFalse(card.liftRecognized, "Disabling drag must retire the previous lift")
+                let next = try XCTUnwrap(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+                let before = dismissals
+                queued.complete()
+                card.contextMenuInteraction(interaction, willDisplayMenuFor: next, animator: nil)
+                XCTAssertEqual(dismissals, before, "Neither an old completion nor the next hold may dismiss the menu")
+            }
         }
+        card.reflowLiftBegan()
+        model.collection = .recents
+        try await Task.sleep(for: .milliseconds(150))
+        host.view.layoutIfNeeded()
+        let recentCard = try XCTUnwrap(descendants(host.view).compactMap { $0 as? LibraryItemTouchView }.first)
+        XCTAssertTrue(recentCard === card)
+        XCTAssertFalse(card.liftRecognized, "A reused card outside Documents must allow stationary menus")
+        XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
         tap.pressed(false)
     }
 

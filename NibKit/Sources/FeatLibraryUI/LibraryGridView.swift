@@ -305,6 +305,7 @@ struct LibraryCell: View {
                 identifier: row.isFolder ? "cmd.library.setView" : "cmd.doc.open",
                 value: accessibilityValue(subtitle: visibleSubtitle),
                 selected: model.selection.isSelecting && model.selection.refs.contains(row.ref),
+                dragEnabled: LibraryItemReflow.acceptsDrag(model),
                 earlier: model.collection == .documents ? { step(-1) } : nil,
                 later: model.collection == .documents ? { step(1) } : nil, action: {
                 guard !LibraryCarrierVisibility.hides(row.ref, in: reflow) else { return }
@@ -362,6 +363,7 @@ struct LibraryItemTapTarget: UIViewRepresentable {
     var identifier: String
     var value: String
     var selected: Bool
+    var dragEnabled: Bool
     var earlier: (() -> Void)?
     var later: (() -> Void)?
     var action: () -> Void
@@ -382,6 +384,9 @@ struct LibraryItemTapTarget: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: LibraryItemTouchView, context: Context) {
+        // A reused card may stop receiving lift touches after a drop or collection change.
+        // Retire the old sequence so its queued menu completion cannot affect the next hold.
+        if !dragEnabled && view.liftRecognized { view.reflowTouchBegan() }
         view.menu = menu
         view.preview = preview
         view.isAccessibilityElement = true

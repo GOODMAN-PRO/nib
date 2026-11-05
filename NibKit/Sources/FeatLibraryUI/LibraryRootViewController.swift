@@ -513,10 +513,25 @@ final class LibraryFloatingAdapter: FloatingHosting {
     }
 }
 
+/// Share in-flight work and permit at most one retry per controller, even if drawing fails.
+struct LibraryLiftWarmupBudget {
+    private var attempts = 0
+    private var reserved = false
+
+    mutating func begin() -> Bool {
+        guard !reserved, attempts < 2 else { return false }
+        attempts += 1
+        reserved = true
+        return true
+    }
+
+    mutating func finish(rendered: Bool) { reserved = rendered }
+}
+
 @MainActor
 final class LibraryRootViewController: UIViewController {
     let model: LibraryViewModel
-    private var warmedLiftRendering = false
+    private var liftWarmupBudget = LibraryLiftWarmupBudget()
     init(app: NibApp, navigator: SceneNavigator) {
         model = LibraryModels.get(app).model(navigator.session)
         super.init(nibName: nil, bundle: nil)
@@ -563,9 +578,11 @@ final class LibraryRootViewController: UIViewController {
         Task { [weak self] in await self?.warmLiftedCardRendering() }
     }
     func warmLiftedCardRendering() async {
-        guard !warmedLiftRendering, viewIfLoaded?.window != nil,
-              let row = model.documentRows.first ?? model.folderRows.first else { return }
-        warmedLiftRendering = true
+        guard viewIfLoaded?.window != nil,
+              let row = model.documentRows.first ?? model.folderRows.first,
+              liftWarmupBudget.begin() else { return }
+        var rendered = false
+        defer { liftWarmupBudget.finish(rendered: rendered) }
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] lifted card warmup began windowAttached=\(view.window != nil)")
         #endif
@@ -592,16 +609,14 @@ final class LibraryRootViewController: UIViewController {
         // One yield can resume before either the native glass or its lifted foreground exists.
         for _ in 0..<3 {
             do { try await Task.sleep(for: .milliseconds(32)) }
-            catch { warmedLiftRendering = false; return }
+            catch { return }
             host.view.layoutIfNeeded()
         }
-        guard !Task.isCancelled, view.window != nil else { warmedLiftRendering = false; return }
+        guard !Task.isCancelled, view.window != nil else { return }
         host.view.layoutIfNeeded()
-        var rendered = false
         _ = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
             rendered = host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
         }
-        warmedLiftRendering = rendered
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] lifted card warmup snapshotRendered=\(rendered)")
         #endif
