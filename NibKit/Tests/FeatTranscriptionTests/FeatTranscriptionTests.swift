@@ -8,6 +8,37 @@ import NibTesting
 final class FeatTranscriptionTests: XCTestCase {
     private let ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
+    func testDeletingRecordingEndsLocalAndCloudJobs() async throws {
+        for cloud in [false, true] {
+            let h = Harness(features: [FeatTranscriptionFeature.self])
+            try writeAudio(h)
+            let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+            let speech = TestSpeechBackend()
+            live.speech = speech
+            _ = try await h.run(CommandIDs.settingsSet, ["name": "transcription.live", "value": true])
+            _ = try await h.run(CommandIDs.settingsSet, ["name": "security.transcription.cloud", "value": .bool(cloud)])
+            live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 0))
+            try await Task.sleep(nanoseconds: 100_000_000)
+            h.app.commands.register(CommandDescriptor(id: "test.deleteRecording", title: "Delete", summary: "Tombstone recording", effect: .edit)) { _, ctx in
+                var clip = try XCTUnwrap(ctx.workspace.content(Fixtures.docID).liveAudio.first)
+                clip.deleted = true
+                try ctx.mutate { tx in _ = try tx.put(clip, doc: Fixtures.docID) }
+                return [:]
+            }
+            live.recording(AudioRecordingPayload(clip: ref, state: "stopped", duration: 1))
+            _ = try await h.run("test.deleteRecording")
+            let audio = try h.persistence.fileURL(Fixtures.docID, relativePath: "audio/FIXTUREAUD01.caf")
+            try FileManager.default.removeItem(at: audio)
+            let deadline = Date().addingTimeInterval(4)
+            while live.jobs[ref] != nil && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            XCTAssertNil(live.jobs[ref])
+            // Cancel on failure too, so a regression never leaves the test runner with a retrying task.
+            live.jobs[ref]?.cancel()
+            await live.waitForRecording(ref)
+            XCTAssertTrue(speech.sessions.allSatisfy(\.cancelled))
+        }
+    }
+
     func testCommandConformanceAndExtensionPoints() async throws {
         let problems = await CommandConformance.check(features: [FeatTranscriptionFeature.self])
         XCTAssertEqual(problems, [])

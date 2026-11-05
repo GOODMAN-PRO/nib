@@ -325,6 +325,7 @@ final class LiveTranscriber {
         let language = clip.record.language ?? app.settings.get(TranscriptSettings.language)
         while let state = states[ref] {
             try Task.checkCancellation()
+            _ = try store.clip(ref, workspace: app.workspace)
             guard app.settings.get(TranscriptSettings.live), app.settings.get(TranscriptSettings.cloud) else { return }
             do {
                 let elapsed = try await TranscriptAudioReader.duration(url: clip.audio)
@@ -339,7 +340,10 @@ final class LiveTranscriber {
                 }
                 if state.state == "stopped" { return }
             } catch is CancellationError { throw CancellationError() }
-            catch { report(error, clip: ref) } // Keep the cursor: retry exactly this range on the next tick.
+            catch {
+                try checkRecordingSource(ref, audio: clip.audio, store: store)
+                report(error, clip: ref)
+            } // Keep the cursor: retry exactly this range on the next tick.
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
     }
@@ -360,6 +364,7 @@ final class LiveTranscriber {
         defer { session?.cancel() }
         while let state = states[ref] {
             try Task.checkCancellation()
+            _ = try store.clip(ref, workspace: app.workspace)
             let enabled = app.settings.get(TranscriptSettings.live)
             // Finish before reading: Speech may have completed while the disk read was suspended.
             if let current = session, current.isComplete || !enabled {
@@ -372,6 +377,7 @@ final class LiveTranscriber {
             let end: Double
             do { end = try await TranscriptAudioReader.duration(url: clip.audio) }
             catch {
+                try checkRecordingSource(ref, audio: clip.audio, store: store)
                 report(error, clip: ref)
                 try await Task.sleep(nanoseconds: 1_000_000_000)
                 continue
@@ -398,7 +404,10 @@ final class LiveTranscriber {
                 }
                 cursor = min(cursor, chunk.end)
             } catch is CancellationError { throw CancellationError() }
-            catch { report(error, clip: ref) }
+            catch {
+                try checkRecordingSource(ref, audio: clip.audio, store: store)
+                report(error, clip: ref)
+            }
             let drained = cursor >= end - 0.02
             if current.isComplete || cursor >= windowStart + 60 - 0.02
                 || ((state.state == "stopped" || state.state == "paused") && drained)
@@ -411,6 +420,16 @@ final class LiveTranscriber {
                 continue
             }
             try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
+    private func checkRecordingSource(_ ref: String, audio: URL, store: TranscriptStore) throws {
+        guard let app else { throw CancellationError() }
+        _ = try store.clip(ref, workspace: app.workspace)
+        let base = audio.deletingPathExtension()
+        guard [audio, base.appendingPathExtension("caf"), base.appendingPathExtension("aac")]
+            .contains(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            throw NibError(.notFound, String(localized: "Recording audio is missing. Restore the recording to transcribe it."))
         }
     }
 
