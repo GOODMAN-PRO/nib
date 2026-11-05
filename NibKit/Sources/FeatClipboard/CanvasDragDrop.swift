@@ -36,8 +36,20 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
     private var highlightedPage: PageID?
     /// Recognised text of the current ink-only selection, prepared when the selection changes so a drag can offer
     /// text before the picture (handwriting dragged into another app lands as text).
-    private var recognized: (ids: [ElementID], text: String)?
-    private var lastSelection: Selection?
+    private struct SelectionKey: Equatable {
+        let doc: DocumentID?
+        let page: PageID?
+        let items: Set<ElementID>
+        init(_ selection: Selection) {
+            doc = selection.doc
+            page = selection.page
+            items = Set(selection.items)
+        }
+    }
+    private var recognized: (key: SelectionKey, text: String)?
+    private var lastSelection: SelectionKey?
+    private var recognitionTask: Task<Void, Never>?
+    private static let recognitionDebounce: UInt64 = 200_000_000
     /// ponytail: only selections up to this many strokes are recognised ahead of a drag (big lassos that are only
     /// moved would pay full recognition each time); larger ones offer the PNG first and recognise when asked.
     static let prerecognizeLimit = 300
@@ -71,6 +83,8 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         highlightedPage = nil
         drag = nil
         drop = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
         recognized = nil
         lastSelection = nil
         self.host = nil
@@ -112,7 +126,7 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
             // Other Nib windows read the fragment; other apps never see it.
             DragFlavours.now(provider, NibFragment.typeIdentifier, visibility: .ownProcess, data: data)
         }
-        let prepared = recognized?.ids == host.session.selection.items ? recognized?.text : nil
+        let prepared = recognized?.key == SelectionKey(host.session.selection) ? recognized?.text : nil
         let png: @MainActor () async -> Data? = {
             let pageItems = (try? app.workspace.items(doc, page: page)) ?? []
             return await ClipboardRender.png(items, doc: doc, page: page, pageItems: pageItems, renderer: app.services.renderer)
@@ -138,11 +152,14 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         return provider
     }
 
-    /// Recognises an ink-only selection in the background when the selection changes.
+    /// Debounces changes to the selected item set. Restyling or reordering the same selection does not redo OCR.
     private func prepareText(_ host: CanvasHost) {
         let selection = host.session.selection
-        guard selection != lastSelection else { return }
-        lastSelection = selection
+        let key = SelectionKey(selection)
+        guard key != lastSelection else { return }
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        lastSelection = key
         recognized = nil
         let doc = host.documentID
         guard !selection.isEmpty, selection.doc == doc, let page = selection.page,
@@ -151,13 +168,15 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         guard !items.isEmpty, items.count <= CanvasDragDrop.prerecognizeLimit,
               items.allSatisfy({ ClipboardText.isHandwriting($0) }) else { return }
         let app = host.app
-        let ids = selection.items
-        Task { @MainActor [weak self] in
+        recognitionTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: CanvasDragDrop.recognitionDebounce) }
+            catch { return }
+            guard !Task.isCancelled else { return }
             let text = await ClipboardText.text(for: items, doc: doc, page: page) { refs in
                 try? await app.bus.execute(CommandIDs.recognizeItems, ["refs": .array(refs.map { .string($0) })])
             }
-            guard let self = self, self.lastSelection?.items == ids else { return }
-            self.recognized = (ids: ids, text: text)
+            guard !Task.isCancelled, let self = self, self.lastSelection == key else { return }
+            self.recognized = (key: key, text: text)
         }
     }
 

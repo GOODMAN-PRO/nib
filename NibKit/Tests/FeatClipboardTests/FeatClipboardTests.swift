@@ -833,6 +833,80 @@ final class FeatClipboardTests: XCTestCase {
     }
 
     /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
+    func testDragTextPreparationIgnoresSelectionRestylingAndOrder() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let host = FakeCanvasHost(h)
+        let attachment = CanvasDragDrop()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        var second = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        second.id = ElementID("SECONDINK")
+        try await h.insert([second])
+        let first = expectation(description: "first selection recognised")
+        let repeated = expectation(description: "restyling must not recognise again")
+        repeated.isInverted = true
+        var calls = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "Test stand-in.", effect: .read)) { _, _ in
+            calls += 1
+            if calls == 1 { first.fulfill() } else { repeated.fulfill() }
+            return ["text": "ink"]
+        }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID, second.id])
+        attachment.canvasDidChange(host)
+        await fulfillment(of: [first], timeout: 1)
+        for width in 1...10 {
+            h.session.selection.bounds = Rect(x: 0, y: 0, width: Double(width), height: 10)
+            h.session.selection.outline = [Point(Double(width), 0)]
+            h.session.selection.items.reverse()
+            attachment.canvasDidChange(host)
+        }
+        await fulfillment(of: [repeated], timeout: 0.35)
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testDragTextPreparationCancelsOldSelectionAndDebouncesNewOnes() async throws {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let host = FakeCanvasHost(h)
+        let attachment = CanvasDragDrop()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        var second = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        second.id = ElementID("SECONDINK")
+        try await h.insert([second])
+        let started = expectation(description: "old selection recognition started")
+        let cancelled = expectation(description: "old recognition cancelled")
+        let next = expectation(description: "new selection recognised")
+        var calls = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "Test stand-in.", effect: .read)) { _, _ in
+            calls += 1
+            if calls == 1 {
+                started.fulfill()
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                catch {
+                    XCTAssertTrue(Task.isCancelled)
+                    cancelled.fulfill()
+                }
+            } else { next.fulfill() }
+            return ["text": "ink"]
+        }
+        let old = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
+        let new = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [second.id])
+        h.session.selection = old
+        attachment.canvasDidChange(host)
+        await fulfillment(of: [started], timeout: 1)
+        h.session.selection = new
+        attachment.canvasDidChange(host)
+        // Changes inside the debounce window must not start intermediate requests.
+        h.session.selection = old
+        attachment.canvasDidChange(host)
+        h.session.selection = new
+        attachment.canvasDidChange(host)
+        await fulfillment(of: [cancelled, next], timeout: 1)
+        XCTAssertEqual(calls, 2)
+    }
+
     func testOwnDragDropRouting() {
         let source = CanvasDragContext(host: ObjectIdentifier(self), doc: Fixtures.docID, page: Fixtures.page1,
                                        start: Point(150, 240), bounds: Rect(x: 100, y: 200, width: 120, height: 90),
