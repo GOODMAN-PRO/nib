@@ -2254,6 +2254,19 @@ final class NibUI {
         try synthesize(screenPaths: [[screen]], duration: duration)
     }
 
+    /// AX frames are interface points; XCTest synthesis requires screen points in landscape.
+    func synthesizeInterfacePaths(_ paths: [[CGPoint]], duration: TimeInterval) throws {
+        let frame = app.frame
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        let screenPaths = paths.map { path in
+            path.map { point in
+                origin.withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).screenPoint
+            }
+        }
+        logQA("Interface touch conversion", "interface=\(paths) screen=\(screenPaths)")
+        try synthesize(screenPaths: screenPaths, duration: duration)
+    }
+
     private func synthesize(_ paths: [[CGPoint]], duration: TimeInterval) throws {
         try synthesize(screenPaths: paths.map { $0.map { coordinate($0).screenPoint } }, duration: duration)
     }

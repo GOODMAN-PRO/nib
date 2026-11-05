@@ -1050,19 +1050,14 @@ final class ChromeUITests: XCTestCase {
         ui.recordDiagnostics("Ruler rotation before", facts: ui.elementFacts(ruler), includeHierarchy: false)
         let frame = ruler.frame, radius = min(frame.width * 0.3, 90)
         let paths = [CGFloat(-1), CGFloat(1)].map { direction in
-            (0...12).map { step -> NSValue in
+            (0...12).map { step -> CGPoint in
                 let angle = CGFloat(step) / 12 * .pi / 4
-                return NSValue(cgPoint: CGPoint(x: frame.midX + direction * radius * cos(angle),
-                                               y: frame.midY - direction * radius * sin(angle)))
+                return CGPoint(x: frame.midX + direction * radius * cos(angle),
+                               y: frame.midY - direction * radius * sin(angle))
             }
         }
-        let done = XCTestExpectation(description: "Two fingers rotate ruler")
-        var failure: Error?
-        ui.logTouchPaths(paths)
-        NibTouchPaths.perform(paths, duration: 0.8) { error in failure = error; done.fulfill() }
-        XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 16), .completed)
+        try ui.synthesizeInterfacePaths(paths, duration: 0.8)
         ui.recordDiagnostics("Ruler rotation after", facts: ui.elementFacts(ruler), includeHierarchy: false)
-        if let failure { throw failure }
         try wait("Two-finger rotation must snap to 45 degrees") {
             (self.ruler.value as? String ?? "").hasPrefix("45 degrees")
         }

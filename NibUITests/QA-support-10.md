@@ -38,3 +38,11 @@ Confirmed chrome-state-pdf#1, chrome-singles#6 corrections and insert-pickers-au
 | --- | --- | --- |
 | Chrome More/tool-More and draw; shared dismissal callers | Menu remained open / State step | Which menu frame survived, and what panels/probe state followed its action? |
 | Insert Replay and shared dismissal callers | Popover still open | Was a dismissal region exposed without safe surface geometry? |
+
+### H5 - ruler touch coordinate conversion
+
+Confirmed chrome-singles#1 verifier diagnosis: AX frame points were sent directly to the screen-point API, transposing ruler contacts into pen input in landscape. Added synthesizeInterfacePaths using the exact app-coordinate-to-screenPoint conversion of pressWithoutIdle and the existing checked synthesis completion/error route. The rotation test now uses it; NibTouchPaths.m is unchanged. CI must show two ruler contacts, snapped 45 degrees and unchanged document/ink counters. This is a coordinate fix, not a gesture-timing hypothesis.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| RulerTwoFingerRotation | Interface touch conversion / Touch path orientation | Which interface and converted screen points were delivered? |
