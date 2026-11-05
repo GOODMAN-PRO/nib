@@ -136,11 +136,17 @@ enum FileNames {
             ? String(localized: "\(base) folder") : base
         let fm = FileManager.default
         let ignored = ignoring?.standardizedFileURL.path.lowercased()
+        // File Providers may compare names case-insensitively even on a case-sensitive volume.
+        // Reserve the same names before asking the coordinator to move into that directory.
+        let occupied = Set(((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { name in
+            dir.appendingPathComponent(name).standardizedFileURL.path.lowercased() != ignored
+        }.map { $0.lowercased() })
         func taken(_ name: String) -> Bool {
             let file = ext.map { name + "." + $0 } ?? name
             if reservedNames.contains(file.lowercased()) { return true }
             let url = dir.appendingPathComponent(file)
             if let i = ignored, url.standardizedFileURL.path.lowercased() == i { return false }
+            if occupied.contains(file.lowercased()) || occupied.contains(("." + file + LibraryLayout.placeholderSuffix).lowercased()) { return true }
             if fm.fileExists(atPath: url.path) { return true }
             return fm.fileExists(atPath: dir.appendingPathComponent("." + file + LibraryLayout.placeholderSuffix).path)
         }
