@@ -78,22 +78,13 @@ final class NibUI {
         let first = matches.firstMatch
         // A missing control should cost one query, not every typed query on each poll.
         guard first.exists else { return nil }
-        // Remote picker trees can lose an indexed Any match between count and exists.
-        // Resolve concrete first matches before using that fallback, preserving disabled controls.
-        if kind == .any {
-            for candidateType in priority {
-                let candidate = (scope ?? app).descendants(matching: candidateType).matching(predicate).firstMatch
-                if candidate.exists, hasVisibleFrame(candidate), !candidate.isEnabled || candidate.isHittable {
-                    return candidate
-                }
-            }
-        }
         if kind != .any {
             if !actionable, matches.count == 1 { return first }
             if hasVisibleFrame(first), !first.isEnabled || first.isHittable { return first }
         }
         var candidates: [(XCUIElement, XCUIElementSnapshot)] = []
-        for index in 0..<min(matches.count, 16) {
+        let indexed = min(matches.count, 16)
+        for index in 0..<indexed {
             let element = matches.element(boundBy: index)
             guard element.exists, let snapshot = try? element.snapshot() else { continue }
             candidates.append((element, snapshot))
@@ -107,6 +98,16 @@ final class NibUI {
             let visible = snapshot.frame.intersection(viewport)
             guard !visible.isNull, visible.width > 1, visible.height > 1 else { continue }
             if !snapshot.isEnabled || (element.exists && element.isHittable) { return element }
+        }
+        // Remote picker trees can lose an indexed Any match between count and exists (the Files picker's
+        // Cancel button). Only then resolve concrete first matches, so ordinary lookups cost what they did.
+        if actionable, kind == .any, candidates.count < indexed {
+            for candidateType in priority {
+                let candidate = (scope ?? app).descendants(matching: candidateType).matching(predicate).firstMatch
+                if candidate.exists, hasVisibleFrame(candidate), !candidate.isEnabled || candidate.isHittable {
+                    return candidate
+                }
+            }
         }
         return actionable ? nil : candidates.first?.0
     }
@@ -758,7 +759,7 @@ final class NibUI {
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
-            let logBeforeDelivery = (try? state())?.keyLog ?? []
+            let logBeforeDelivery = focused.keyLog ?? []
             try hardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
