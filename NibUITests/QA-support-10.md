@@ -389,3 +389,23 @@ Caller audit: all dismissSheets uses in Canvas, Capture, Ink, Library, Selection
 | Replay dismissal failures | Menu remained open / Popover still open | Did content or the native cover survive, or was safe geometry unavailable? |
 
 Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Source review covers changed Swift blocks, caller argument labels/defaults, predicate placeholders, optional-binding scopes, existing query APIs and bounded waits. Existing test declarations, XCTAssert lines, execution allowances and sleep/skip inventory are preserved. Compilation and XCUITest execution remain unavailable on Windows and require GitHub Actions, particularly native sharing, palette reselection and Replay dismissal. No runtime saving is claimed; the extra lazy moves can increase worst-case search time. Earlier app/CI-owned limitations in Round 10b remain. One new round-4 commit with the requested attribution, no amendment or push.
+
+## Review fixes (round 5) - 2026-11-06
+
+Read jobs 10a, 10b and 10c, the prior QA notes, the current reviewer findings and shared-helper callers. NewNotebookSheet and QuickNoteFlow still use interactiveDismissDisabled(model.isWorking), so an idle sheet can accept a downward dismissal gesture. No simulator evidence establishes that dismissal occurred; this correction removes the reviewed gesture regression at its source. Only NibUITests files change.
+
+| Review issue | Root correction | Required CI evidence |
+| --- | --- | --- |
+| Lazy reveal can dismiss an idle sheet (major) | For an absent target with a visible app sheet, scan toward the bottom first and reverse only after a repeated visible range, using the existing two-direction search. Other lazy lists retain bounded top homing followed by a downward scan. All reveal drags now use slow velocity, including homing when AX does not expose a sheet. Preserve the six-homing-move cap, 22 total lazy moves, 16 ordinary moves, safe starts, clipping and value checks. | Create, Settings and provider sheets stay presented while lazy fields are revealed; Customise Toolbar still reaches deep rows within the unchanged allowance. |
+| Array inference (minor) | Declare fillNativeForm's search scopes explicitly as [XCUIElement] and resolve that list once per batch. | UI test target compiles in Swift 5 mode. |
+| Default modal lookup escapes its container (minor) | Default nativeFormContainer entry searches only that container. App-wide fallback is retained only for an explicit non-app scope; explicit app scope searches app once. Missing default-modal fields therefore reveal or fail instead of selecting a same-named background field. | Modal Title/Name entry never edits a background field; Calendar and explicit Time Keeper entry retain their prior lookup routes and exact value checks. |
+
+Caller audit: re-read direct reveal calls in Create (Calendar summary), Ink (Pencil scoped headings/rows, switch and preferences), Library (folder editor, favourite, hex, emoji and About), Pages (button fallback), Insert and Selection (provider preset), plus shared requireControl, setSwitch, focusField and command paths. Signatures and existing-target direction behavior are unchanged. Re-read every fillNativeForm call: Chrome replace/ruler defaults, explicit Time Keeper form, Insert/Selection provider defaults, Insert GIPHY search and explicit Create Calendar app. Default callers keep modal scope; both explicit non-app callers retain fallback. No caller, test assertion, allowance, sleep or skip changes.
+
+| Diagnostic | Log prefix | Question |
+| --- | --- | --- |
+| Every reveal with a container snapshot | Form reveal path | Was the path sheet bottom-first, slow home then scan, or target-directed? |
+| Two-direction search reaches a repeated range | Form search reverse | Which path reversed, in which drag direction, after how many moves? |
+| Existing move/reveal timing | Form move timing / Form reveal timing | Does slower homing remain within the test allowance? |
+
+Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Source review checked the changed search branches, existing hasVisibleFrame/snapshot/gesture APIs, optional and identity comparisons, explicit array typing and caller compatibility. Windows has no Swift toolchain or simulator, so compilation, sheet accessibility exposure, gesture dismissal behavior and runtime cost remain for GitHub Actions. Slow homing may add time; no speedup or runtime pass is claimed. One new round-5 commit with the requested attribution, no amendment or push.

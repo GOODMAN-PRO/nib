@@ -173,7 +173,7 @@ final class NibUI {
         }
     }
 
-    /// Reveals in the actual form: absent lazy rows home to an edge, then scan in one direction.
+    /// Reveals in the actual form: sheets scan toward the bottom first; other lazy lists home then scan.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
 
@@ -376,15 +376,16 @@ final class NibUI {
         var direction: Bool?
         var reversed = false
         var endSignatures: [String] = []
-        // An absent lazy row has no directional evidence. Establish the top edge,
-        // confirmed by an unchanged visible range, then scan only toward the bottom.
+        // Pulling down at the top of an idle sheet can dismiss it. Preserve the original
+        // bottom-first search there, reversing only after a repeated visible range.
         let lazySearch = initialSnapshot == nil
-        var homing = lazySearch
+        let sheetVisible = lazySearch && app.sheets.allElementsBoundByIndex.contains { hasVisibleFrame($0) }
+        let homeThenScan = lazySearch && !sheetVisible
+        var homing = homeThenScan
         var homeMoves = 0
         let appFrame = app.frame
-        func hasSlider(_ node: XCUIElementSnapshot) -> Bool {
-            node.elementType == .slider || node.children.contains { hasSlider($0) }
-        }
+        let searchPath = sheetVisible ? "sheet bottom-first then reverse" : (homeThenScan ? "slow home then scan" : "target-directed")
+        logQA("Form reveal path", "path=\(searchPath) lazy=\(lazySearch) velocity=slow")
         // Homing may consume six moves; preserve sixteen downward scans for a lazy row.
         let moveLimit = lazySearch ? 22 : 16
         for _ in 0..<moveLimit {
@@ -408,7 +409,7 @@ final class NibUI {
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
             if !visited.insert(signature).inserted {
                 endSignatures.append(signature)
-                if lazySearch {
+                if homeThenScan {
                     guard homing else {
                         logQA("Form search exhausted", "one-way scan reached bottom; moves=\(moves)")
                         return
@@ -424,15 +425,18 @@ final class NibUI {
                     reversed = true
                     direction = !(direction ?? false)
                     visited = [signature]
+                    logQA("Form search reverse", "path=\(searchPath) dragDown=\(direction == true) moves=\(moves)")
                 }
             }
-            if lazySearch && homing && homeMoves >= 6 {
+            if homeThenScan && homing && homeMoves >= 6 {
                 logQA("Form lazy edge unavailable", "Top not confirmed within six bounded moves")
                 return
             }
-            if !lazySearch && direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } ?? false }
-            guard lazySearch || direction != nil else { return }
-            let down = lazySearch ? homing : (direction == true)
+            if !homeThenScan && direction == nil {
+                direction = sheetVisible ? false : (targetFrame.map { $0.midY < viewport.midY } ?? false)
+            }
+            guard homeThenScan || direction != nil else { return }
+            let down = homeThenScan ? homing : (direction == true)
             guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             let values = formControlValues(snapshot)
@@ -443,7 +447,7 @@ final class NibUI {
             origin.withOffset(CGVector(dx: start.x - appFrame.minX, dy: start.y - appFrame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                     CGVector(dx: end.x - appFrame.minX, dy: end.y - appFrame.minY)),
-                       withVelocity: lazySearch && homing && !hasSlider(snapshot) ? .fast : .slow, thenHoldForDuration: 0)
+                       withVelocity: .slow, thenHoldForDuration: 0)
             moves += 1
             if homing { homeMoves += 1 }
             logQA("Form move timing", "move=\(moves) homing=\(homing) seconds=\(Date().timeIntervalSince(moveStarted))")
@@ -1731,6 +1735,9 @@ final class NibUI {
     @discardableResult
     func fillNativeForm(_ values: [(String, String)], in scope: XCUIElement? = nil) throws -> XCUIElement {
         let container = scope ?? nativeFormContainer()
+        // Only an explicit non-app scope retains the legacy app-wide fallback.
+        // Default modal entry must never bind a same-named field behind that modal.
+        let scopes: [XCUIElement] = scope != nil && container !== app ? [container, app] : [container]
         var last: XCUIElement?
         for (name, value) in values {
             let started = Date()
@@ -1738,7 +1745,6 @@ final class NibUI {
             let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
             var field = container.textFields.matching(predicate).firstMatch
             var fieldContainer = container
-            let scopes = container === app ? [app] : [container, app]
             search: for candidateScope in scopes {
                 for kind in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
                     let candidate = candidateScope.descendants(matching: kind).matching(predicate).firstMatch
