@@ -356,6 +356,7 @@ final class LiveTranscriber {
         var committed = try await store.read(clip)
         var cursor = max(cursors[ref] ?? 0, committed.map { $0.start + $0.duration }.max() ?? 0)
         var windowStart = cursor
+        var emptyWindows = 0
         var windowIndex = try await nextIndex(clip, store: store)
         var sessionStarted = Date()
         var session: TranscriptSpeechSession? = try speech.session(language: language) { [weak self] lines in
@@ -371,6 +372,8 @@ final class LiveTranscriber {
                 let lines = try await finish(current, seconds: cursor - windowStart, ref: ref)
                 if !lines.isEmpty { try await append(Self.offset(lines, start: windowStart, index: windowIndex), ref: ref) }
                 current.cancel(); session = nil; cursors[ref] = cursor
+                emptyWindows = cursor > windowStart ? 0 : emptyWindows + 1
+                try await backOffEmptyWindow(emptyWindows, ref: ref)
                 windowStart = cursor
             }
             if !enabled { return }
@@ -415,6 +418,8 @@ final class LiveTranscriber {
                 let lines = try await finish(current, seconds: cursor - windowStart, ref: ref)
                 if !lines.isEmpty { try await append(Self.offset(lines, start: windowStart, index: windowIndex), ref: ref) }
                 current.cancel(); session = nil; cursors[ref] = cursor
+                emptyWindows = cursor > windowStart ? 0 : emptyWindows + 1
+                try await backOffEmptyWindow(emptyWindows, ref: ref)
                 windowStart = cursor
                 if state.state == "stopped" && drained { return }
                 continue
@@ -433,19 +438,33 @@ final class LiveTranscriber {
         }
     }
 
-    private func finish(_ session: TranscriptSpeechSession, seconds: Double, ref: String) async throws -> [TranscriptSegment] {
-        guard seconds > 0 else { session.cancel(); return [] }
+    private func backOffEmptyWindow(_ count: Int, ref: String) async throws {
+        guard count > 0 else { return }
+        if count >= 3 {
+            throw errors[ref] ?? NibError(.unavailable, String(localized: "Speech did not accept recorded audio. Try regenerating the transcript."))
+        }
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+
+    private func finish(_ session: TranscriptSpeechSession, seconds: Double, ref: String,
+                        onFailure: ((NibError) -> Void)? = nil) async throws -> [TranscriptSegment] {
+        guard seconds > 0 || session.isComplete else { session.cancel(); return [] }
         do {
             let result = try await session.finish(windowSeconds: seconds)
             if let error = result.error {
                 if SpeechWindowResult.isNoSpeech(error) { return [] }
-                report(error, clip: ref); return []
+                onFailure?(error); report(error, clip: ref); return []
             }
-            guard result.complete else { report(NibError(.timeout, "Speech did not finish this recording window"), clip: ref); return [] }
+            guard result.complete else {
+                let error = NibError(.timeout, String(localized: "Speech did not finish this recording window"))
+                onFailure?(error); report(error, clip: ref); return []
+            }
             return result.lines
         } catch is CancellationError { throw CancellationError() }
         catch {
-            if !SpeechWindowResult.isNoSpeech(error) { report(error, clip: ref) }
+            if !SpeechWindowResult.isNoSpeech(error) {
+                onFailure?(NibError.wrap(error)); report(error, clip: ref)
+            }
             return []
         }
     }
@@ -492,6 +511,7 @@ final class LiveTranscriber {
         let ref = NodeRef.audio(clip.doc, clip.record.id).description
         var result: [TranscriptSegment] = []
         var cursor = 0.0
+        var firstFailure: NibError?
         while cursor < duration {
             try Task.checkCancellation()
             let session = try speech.session(language: language) { _ in }
@@ -503,10 +523,14 @@ final class LiveTranscriber {
                 cursor += Double(buffer.frameLength) / buffer.format.sampleRate
             }
             cursor = min(cursor, chunk.end)
-            result += Self.offset(try await finish(session, seconds: cursor - start, ref: ref), start: start, index: result.count)
+            let lines = try await finish(session, seconds: cursor - start, ref: ref) { error in
+                if firstFailure == nil { firstFailure = error }
+            }
+            result += Self.offset(lines, start: start, index: result.count)
             // A recognizer that refuses all audio must not spin forever.
-            guard cursor > start else { throw NibError.unavailable("Speech did not accept recorded audio") }
+            guard cursor > start else { throw firstFailure ?? NibError.unavailable("Speech did not accept recorded audio") }
         }
+        if result.isEmpty, let firstFailure { throw firstFailure }
         return result
     }
 
