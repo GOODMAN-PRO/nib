@@ -718,6 +718,32 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
     }
 
+    func testBatchRestoreKeepsSeparateLiveSnapshotsForEachDocument() async throws {
+        let h = harness()
+        for doc in ["RESTORE1", "RESTORE2"] {
+            var first = PageRecord(id: "FIRST", order: "V")
+            first.deleted = true
+            first.trashedAt = 1
+            var second = PageRecord(id: "SECOND", order: "V")
+            second.deleted = true
+            second.trashedAt = 1
+            let content = DocumentContent(meta: DocumentMeta(id: NibID(doc), kind: .notebook), pages: [
+                PageRecord(id: "LIVE", order: "V"), first, second, PageRecord(id: "END", order: "k")
+            ])
+            _ = try h.library.createDocument(content, title: doc, in: nil)
+        }
+        let before = try h.snapshot("RESTORE1")
+        _ = try await h.run("page.restore", ["pages": ["page:RESTORE1/FIRST", "page:RESTORE2/FIRST",
+            "page:RESTORE1/SECOND", "page:RESTORE2/SECOND"]])
+        for doc in ["RESTORE1", "RESTORE2"] {
+            let pages = try h.app.workspace.content(NibID(doc)).livePages
+            XCTAssertEqual(pages.map { $0.id.raw }, ["LIVE", "SECOND", "FIRST", "END"])
+            XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+        }
+        XCTAssertTrue(h.app.bus.undo("RESTORE1"))
+        XCTAssertEqual(try h.snapshot("RESTORE1"), before)
+    }
+
     func testTrashRestoreAndPurge() async throws {
         let h = harness()
         try await h.run("page.trash", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])

@@ -746,8 +746,10 @@ struct PageRestore: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let targets = try PageArgs.pages(p.pages, ctx)
         var records: [(doc: DocumentID, page: PageRecord)] = []
+        var liveByDocument: [DocumentID: [PageRecord]] = [:]
         for (i, t) in targets.enumerated() {
             let content = try PageArgs.pagedContent(t.doc, ctx, path: "$.pages[\(i)]")
+            if liveByDocument[t.doc] == nil { liveByDocument[t.doc] = content.livePages }
             guard var page = content.page(t.page) else { throw PageArgs.notLive(t.page, path: "$.pages[\(i)]") }
             guard page.deleted, page.trashedAt != nil else { continue }
             page.deleted = false
@@ -757,17 +759,21 @@ struct PageRestore: NibCommand {
         try ctx.mutate { tx in
             for r in records {
                 var page = r.page
-                let content = try tx.content(r.doc)
-                // Only sort when a collision needs neighbouring keys; match livePages' id tie-break.
-                if let collision = content.pages.lazy.filter({ !$0.deleted && $0.order == page.order })
-                    .max(by: { $0.id.raw < $1.id.raw }) {
-                    let live = content.livePages
+                var live = liveByDocument[r.doc] ?? []
+                if let collision = live.last(where: { $0.order == page.order }) {
                     // Earlier restores in this same transaction also occupy their new keys.
                     let placement = OrderKeys.plan(.after, anchor: collision.id, count: 1, in: live)
-                    if !placement.rekeyed.isEmpty { try tx.put(placement.rekeyed, doc: r.doc) }
+                    if !placement.rekeyed.isEmpty {
+                        let rekeyed = try tx.put(placement.rekeyed, doc: r.doc)
+                        let byID = Dictionary(rekeyed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                        live = live.map { byID[$0.id] ?? $0 }
+                    }
                     page.order = placement.keys[0]
                 }
-                try tx.put(page, doc: r.doc)
+                let saved = try tx.put(page, doc: r.doc)
+                let at = live.firstIndex { $0.order > saved.order } ?? live.count
+                live.insert(saved, at: at)
+                liveByDocument[r.doc] = live
             }
         }
         return Output(restored: records.count)
