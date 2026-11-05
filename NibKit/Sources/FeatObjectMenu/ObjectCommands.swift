@@ -250,6 +250,7 @@ enum SelectionPruning {
             let rest = s.selection.items.filter { !gone.contains($0) }
             if rest.isEmpty {
                 s.selection = Selection()
+                if s.tool == "lasso" { s.endTemporaryTool() }
                 continue
             }
             let keep = Set(rest)
