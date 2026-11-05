@@ -508,6 +508,33 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(store(dir, device: 0x0B).messages(chat).map(\.id), [record.id])
     }
 
+    func testChangedConflictSurvivesRetainedFlushWithoutRescanning() throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = store(dir, device: 0x0A)
+        let chat = "CHATMERGELATE"
+        let first = writer.makeMessage(role: "user", text: "Captured before storage failed")
+        let second = writer.makeMessage(role: "assistant", text: "Synced while storage was blocked")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
+        let destination = dir.appendingPathComponent(writer.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try ChatStore.encodeLines([first]).write(to: conflict)
+        writer.refresh(force: true)
+        XCTAssertNotNil(writer.flush())
+        let updated = ChatStore.encodeLines([first, second])
+        try updated.write(to: conflict, options: .atomic)
+        try FileManager.default.removeItem(at: destination)
+        // Deliberately no refresh/messages/state call between sync and recovery.
+        XCTAssertNil(writer.flush())
+        XCTAssertEqual(try Data(contentsOf: conflict), updated)
+        let reopened = store(dir, device: 0x0B)
+        XCTAssertEqual(reopened.messages(chat).map(\.id), [first.id, second.id])
+        XCTAssertNil(reopened.flush())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+        XCTAssertEqual(store(dir, device: 0x0C).messages(chat).map(\.id), [first.id, second.id])
+    }
+
     func testRepeatedConflictScansKeepOnePendingMergePerSnapshot() throws {
         let dir = tempFolder()
         defer { try? FileManager.default.removeItem(at: dir) }

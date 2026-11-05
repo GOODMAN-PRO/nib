@@ -578,7 +578,7 @@ final class ChatStore {
             guard changed || (loading == chat && input.states[chat] == nil) else { continue }
             var state = input.states[chat] ?? ChatState()
             if let meta = input.overviews[chat]?.meta { state.absorb(meta, now: now) }
-            var conflicts: [URL] = []
+            var conflicts: [URL: Data] = [:]
             for file in entries {
                 let url = dir.appendingPathComponent(file.name)
                 guard let data = try? Data(contentsOf: url) else { continue }
@@ -586,7 +586,7 @@ final class ChatStore {
                 let conflict = file.device != device && !isDeviceHex(file.device)
                 if conflict {
                     guard records.count == lines else { continue }
-                    conflicts.append(url)
+                    conflicts[url] = data
                 }
                 result.signatures[file.name] = file.signature
                 for record in records { clock.observe(record.rev); state.absorb(record, now: now) }
@@ -604,15 +604,17 @@ final class ChatStore {
                 let records = state.isDeleted ? state.meta.map { [$0] } ?? [] : ordered(state)
                 let data = encodeLines(records)
                 let destination = dir.appendingPathComponent("\(chat).\(device).\(fileExtension)")
-                let merge = ChatWrites.MergeKey(destination: destination, data: data, conflicts: Set(conflicts))
+                let merge = ChatWrites.MergeKey(destination: destination, data: data, conflicts: Set(conflicts.keys))
                 writes.enqueueOnQueue(merge: merge) {
                     try fm.createDirectory(at: dir, withIntermediateDirectories: true)
                     try data.write(to: destination, options: .atomic)
-                    for url in conflicts where fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+                    for (url, snapshot) in conflicts {
+                        try removeConflict(url, matching: snapshot)
+                    }
                 }
                 result.ownLines[chat] = records.count
                 if state.isDeleted { result.tombstoned.insert(chat) }
-                for url in conflicts { result.signatures[url.lastPathComponent] = nil }
+                for url in conflicts.keys { result.signatures[url.lastPathComponent] = nil }
             }
         }
         return result
@@ -665,6 +667,24 @@ final class ChatStore {
 
     // MARK: Files
 
+    /// A retained job may outlive the conflict version it scanned. Coordinate the comparison
+    /// and removal together; newer sync contents stay on disk for the next scan to merge.
+    nonisolated private static func removeConflict(_ url: URL, matching snapshot: Data) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        var coordinationError: NSError?
+        var removalError: Error?
+        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: url, options: .forDeleting,
+                                                        error: &coordinationError) { coordinatedURL in
+            do {
+                guard FileManager.default.fileExists(atPath: coordinatedURL.path) else { return }
+                guard try Data(contentsOf: coordinatedURL) == snapshot else { return }
+                try FileManager.default.removeItem(at: coordinatedURL)
+            } catch { removalError = error }
+        }
+        if let error = coordinationError { throw error }
+        if let error = removalError { throw error }
+    }
+
     func ownFileName(_ chat: String) -> String { "\(chat).\(deviceHex).\(ChatStore.fileExtension)" }
 
     /// "<chat>.<device>.jsonl" → (chat, device). The device part of a provider conflict copy is not 8 hex characters
@@ -715,6 +735,8 @@ final class ChatStore {
     }
 
     nonisolated static func appendData(_ data: Data, to url: URL, directory: URL) throws {
+        // Atomic replacement avoids partial appends on failure. compactIfNeeded bounds redundant
+        // lines to 2 * live records + 16; the full-file write still scales with live history.
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
         var contents = fm.fileExists(atPath: url.path) ? try Data(contentsOf: url) : Data()
