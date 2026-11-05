@@ -85,12 +85,11 @@ final class InkUITests: XCTestCase {
             }
             let footer = all.first { $0.elementType == .staticText && $0.label.hasPrefix("Squeeze Apple Pencil Pro") }
             let footerY = footer?.frame.minY ?? CGFloat.greatestFiniteMagnitude
-            let row = all.first {
+            guard let match = all.first(where: {
                 $0.elementType == .button && $0.label == "Show tool palette"
                     && $0.frame.minY > heading.frame.maxY && $0.frame.maxY < footerY
-            }
-            guard let row else { return choices.matching(NSPredicate(value: false)).firstMatch }
-            for candidate in choices.allElementsBoundByIndex.prefix(8) where candidate.frame == row.frame { return candidate }
+            }) else { return choices.matching(NSPredicate(value: false)).firstMatch }
+            for candidate in choices.allElementsBoundByIndex.prefix(8) where candidate.frame == match.frame { return candidate }
             return choices.matching(NSPredicate(value: false)).firstMatch
         }
         ui.revealFormElement(in: detail, target: scopedRow)

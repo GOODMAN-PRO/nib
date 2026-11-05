@@ -1066,13 +1066,18 @@ final class CreateUITests: XCTestCase {
         let allow = springboard.buttons.matching(NSPredicate(format: "label CONTAINS 'Allow Full Access'")).firstMatch
         let summary = ui.app.descendants(matching: .any)
             .matching(NSPredicate(format: "label BEGINSWITH %@", eventTitle)).firstMatch
-        try wait("Calendar access must expose the newly saved event before scrolling", timeout: 15) {
+        let calendarReady = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             if allow.exists && allow.isHittable {
                 self.ui.logQA("Calendar full access", "Accepting observed Allow Full Access prompt")
                 allow.tap()
                 return false
             }
             return summary.exists
+        }, object: nil)
+        // A lazy event row may enter AX only after scrollTo reveals it. This is an early exit,
+        // not an assertion; tapEventAction retains the required event/action checks after scrolling.
+        if XCTWaiter.wait(for: [calendarReady], timeout: 15) != .completed {
+            ui.logQA("Calendar readiness", "Event not exposed yet; continuing with bounded scrollTo")
         }
         try tapEventAction("Take Notes", eventTitle: eventTitle)
         let id = try XCTUnwrap(ui.waitForState { $0.document != nil }.document)

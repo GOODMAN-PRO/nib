@@ -172,18 +172,23 @@ final class NibUI {
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         formRevealFailure = nil
         var ancestorClip: CGRect?
-        func clippedFrame(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> CGRect? {
-            func visit(_ node: XCUIElementSnapshot, clip: CGRect) -> CGRect? {
+        var containerIsTransient = false
+        func ancestry(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> (clip: CGRect, transient: Bool)? {
+            func visit(_ node: XCUIElementSnapshot, clip: CGRect, transient: Bool) -> (clip: CGRect, transient: Bool)? {
                 let frame = node.frame
                 let clipped = frame.isNull || frame.isInfinite || frame.isEmpty ? clip : clip.intersection(frame)
+                // UIKit's native context menu in L:#0 exposes Other ancestors and a Preview sibling,
+                // rather than a Menu node. Keep that observed surface distinct from ordinary forms.
+                let isTransient = transient || node.elementType == .menu || node.elementType == .popover
+                    || (node.elementType == .other && node.children.contains { $0.elementType == .other && $0.label == "Preview" })
                 if node.elementType == target.elementType && node.identifier == target.identifier
-                    && node.label == target.label && node.frame == target.frame { return clipped }
+                    && node.label == target.label && node.frame == target.frame { return (clipped, isTransient) }
                 for child in node.children {
-                    if let match = visit(child, clip: clipped) { return match }
+                    if let match = visit(child, clip: clipped, transient: isTransient) { return match }
                 }
                 return nil
             }
-            return visit(root, clip: app.windows.firstMatch.frame)
+            return visit(root, clip: app.windows.firstMatch.frame, transient: false)
         }
         func containerLost(_ detail: String) {
             let message = "Reveal drag dismissed or replaced its menu/popover/container: " + detail
@@ -197,12 +202,15 @@ final class NibUI {
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
             if let form, form.exists, hasVisibleFrame(form) {
-                guard let node = try? form.snapshot(), let root = try? app.snapshot(),
-                      let clip = clippedFrame(node, in: root) else {
-                    logQA("Form reveal unavailable", "Explicit container ancestry unavailable; no unbounded viewport drag")
-                    return nil
+                ancestorClip = nil
+                containerIsTransient = false
+                if let node = try? form.snapshot(), let root = try? app.snapshot(),
+                   let context = ancestry(node, in: root) {
+                    ancestorClip = context.clip
+                    containerIsTransient = context.transient
+                } else {
+                    logQA("Form reveal ancestry unavailable", "Using explicit container with window clip; caller retains its form")
                 }
-                ancestorClip = clip
                 return form
             }
             guard let root = try? app.snapshot() else {
@@ -272,7 +280,9 @@ final class NibUI {
             var fallback: (element: XCUIElement, rank: Int, frame: CGRect)?
             func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool) -> XCUIElement {
                 let node = ranked[rank].node
-                ancestorClip = clippedFrame(node, in: root)
+                let context = ancestry(node, in: root)
+                ancestorClip = context?.clip
+                containerIsTransient = context?.transient ?? false
                 logQA("Form reveal container", "type=\(node.elementType) label=\(node.label) frame=\(frame) rank=\(rank + 1)/\(ranked.count) hittable=\(hittable)")
                 return element
             }
@@ -371,6 +381,7 @@ final class NibUI {
             guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             let values = formControlValues(snapshot)
+            let wasTransient = containerIsTransient
             logQA("Form drag before", "point=\(start) container=\(listFrame) rows=\(signature)")
             let origin = app.coordinate(withNormalizedOffset: .zero)
             origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
@@ -384,15 +395,19 @@ final class NibUI {
                 nextSnapshot = try? replacement.snapshot()
             }
             guard let after = nextSnapshot else {
-                containerLost("container disappeared after drag; before=\(listFrame)")
+                logQA("Form reveal unavailable", "Container snapshot unavailable after drag; before=\(listFrame); caller retains its wait/fallback")
                 return
             }
             let sameFrame = abs(after.frame.minX - listFrame.minX) <= 1
                 && abs(after.frame.minY - listFrame.minY) <= 1
                 && abs(after.frame.maxX - listFrame.maxX) <= 1
                 && abs(after.frame.maxY - listFrame.maxY) <= 1
-            guard after.elementType == snapshot.elementType, sameFrame else {
+            if wasTransient && (after.elementType != snapshot.elementType || !sameFrame) {
                 containerLost("before=\(snapshot.elementType) \(listFrame) after=\(after.elementType) \(after.frame)")
+                return
+            }
+            if after.elementType != snapshot.elementType || !sameFrame {
+                logQA("Form container changed", "Ordinary form rebuilt or resized; before=\(listFrame) after=\(after.frame); caller retains its wait/fallback")
                 return
             }
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
@@ -1413,16 +1428,18 @@ final class NibUI {
         inspect("after Hide")
         // In the custom-size decimal editor the first outside tap dismisses only the floating pad.
         // A second contact is justified only by a still-present keyboard, never by a fixed delay.
-        if inertHeader != nil, source.keyboards.firstMatch.exists {
-            let hide = source.keyboards.buttons.matching(NSPredicate(
-                format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first {
+        let firstDismissal = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
+        if inertHeader != nil, source.keyboards.firstMatch.exists,
+           XCTWaiter.wait(for: [firstDismissal], timeout: 2) != .completed,
+           source.keyboards.firstMatch.exists {
+            guard let dockedHide = source.keyboards.buttons.matching(NSPredicate(
+                format: "label IN {'Hide keyboard', 'Dismiss keyboard'}")).allElementsBoundByIndex.prefix(8).first(where: {
                     hasVisibleFrame($0, in: viewport)
-                }
-            guard let hide else {
+                }) else {
                 logQA("Decimal keyboard remaining", source.keyboards.debugDescription)
                 throw Failure.message("Decimal keyboard remains but exposes no visible Hide keyboard key")
             }
-            let frame = hide.frame
+            let frame = dockedHide.frame
             logQA("Decimal keyboard remaining", "second contact on Hide keyboard frame=\(frame)")
             source.coordinate(withNormalizedOffset: .zero).withOffset(
                 CGVector(dx: frame.midX - source.frame.minX, dy: frame.midY - source.frame.minY)).tap()
