@@ -759,7 +759,7 @@ struct CatalogScanner {
         var out = Result()
         let values = try? url.resourceValues(forKeys: Set(CatalogScanner.keys))
         let ext = url.pathExtension.lowercased()
-        if ext == NibFormat.packageExtension || (ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url)) {
+        if Self.isDocumentPackage(url) {
             out.entries.append(document(url, path: path, parent: parent, values: values,
                                         legacy: ext != NibFormat.packageExtension, inTrash: inTrash, trashTop: trashTop))
         } else {
@@ -800,16 +800,23 @@ struct CatalogScanner {
             guard values?.isDirectory == true else { continue }
             if isRoot && skipInbox && name == LibraryLayout.inboxName { continue }
             let ext = url.pathExtension.lowercased()
-            if ext == NibFormat.packageExtension {
-                out.entries.append(document(url, path: path, parent: parent, values: values, legacy: false,
-                                            inTrash: inTrash, trashTop: trashTop))
-            } else if ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url) {
-                out.entries.append(document(url, path: path, parent: parent, values: values, legacy: true,
+            if Self.isDocumentPackage(url) {
+                out.entries.append(document(url, path: path, parent: parent, values: values, legacy: ext != NibFormat.packageExtension,
                                             inTrash: inTrash, trashTop: trashTop))
             } else {
                 folder(url, path: path, parent: parent, values: values, inTrash: inTrash, trashTop: trashTop, into: &out)
             }
         }
+    }
+
+    /// Preserve recorded folders from older versions, while still listing damaged packages as documents.
+    static func isDocumentPackage(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        guard ext == NibFormat.packageExtension || ext == NibFormat.legacyPackageExtension else { return false }
+        if PackageIO.hasHeadFile(url) { return true }
+        guard ext == NibFormat.packageExtension else { return false }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        return !names.contains(where: LibraryLayout.isFolderFile)
     }
 
     /// A temporary rename directory holding a document's heads or a folder record (not an empty leftover).

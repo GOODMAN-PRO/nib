@@ -128,11 +128,17 @@ enum FileNames {
 
     /// The file name for `base` in `dir` that is free: "Name", "Name 2", "Name 3"… (`ext` appended). An existing item
     /// at `ignoring` does not count (renaming an item to its own name, or changing only the case).
-    static func unique(_ base: String, ext: String?, in dir: URL, ignoring: URL? = nil) -> String {
+    static func unique(_ base: String, ext: String?, in dir: URL, ignoring: URL? = nil,
+                       reservedNames: Set<String> = []) -> String {
+        // A folder must never acquire a document-package extension, including on recovery.
+        let suffix = (base as NSString).pathExtension.lowercased()
+        let base = ext == nil && [NibFormat.packageExtension, NibFormat.legacyPackageExtension].contains(suffix)
+            ? String(localized: "\(base) folder") : base
         let fm = FileManager.default
         let ignored = ignoring?.standardizedFileURL.path.lowercased()
         func taken(_ name: String) -> Bool {
             let file = ext.map { name + "." + $0 } ?? name
+            if reservedNames.contains(file.lowercased()) { return true }
             let url = dir.appendingPathComponent(file)
             if let i = ignored, url.standardizedFileURL.path.lowercased() == i { return false }
             if fm.fileExists(atPath: url.path) { return true }
@@ -244,6 +250,12 @@ final class FolderLibrary: LibraryService {
 
     private var isDefaultRoot: Bool {
         rootURL.resolvingSymlinksInPath().standardizedFileURL.path == defaultRoot.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private func uniqueName(_ base: String, ext: String?, in dir: URL, ignoring: URL? = nil) -> String {
+        let isRoot = dir.resolvingSymlinksInPath().standardizedFileURL == rootURL.resolvingSymlinksInPath().standardizedFileURL
+        let reserved: Set<String> = isDefaultRoot && isRoot ? [LibraryLayout.inboxName.lowercased()] : []
+        return FileNames.unique(base, ext: ext, in: dir, ignoring: ignoring, reservedNames: reserved)
     }
 
     private func url(of entry: CatalogEntry) -> URL {
@@ -409,7 +421,7 @@ final class FolderLibrary: LibraryService {
         }
         let dir = try directory(of: folder)
         let base = FileNames.sanitize(title, fallback: String(localized: "Untitled"))
-        let name = FileNames.unique(base, ext: NibFormat.packageExtension, in: dir)
+        let name = uniqueName(base, ext: NibFormat.packageExtension, in: dir)
         let pkg = dir.appendingPathComponent(FileNames.fileName(name, ext: NibFormat.packageExtension), isDirectory: true)
         if content.meta.rev == .zero { content.meta.rev = clock.tick() }
         let data = try PackageIO.encoder().encode(content)
@@ -444,7 +456,7 @@ final class FolderLibrary: LibraryService {
             throw NibError(.conflict, "the library already has an item with id \(fid.raw)", hint: "omit id to get a fresh one")
         }
         let dir = try directory(of: parent)
-        let name = FileNames.unique(FileNames.sanitize(title, fallback: String(localized: "New Folder")), ext: nil, in: dir)
+        let name = uniqueName(FileNames.sanitize(title, fallback: String(localized: "New Folder")), ext: nil, in: dir)
         let url = dir.appendingPathComponent(name, isDirectory: true)
         let record = FolderRecord(id: fid, rev: clock.tick(), style: style ?? FolderStyle())
         let data = try FolderRecords.encode(record)
@@ -487,7 +499,7 @@ final class FolderLibrary: LibraryService {
         try pinFolderIDs(under: e)
         flushDocuments(under: e)
         let dir = old.deletingLastPathComponent()
-        let name = FileNames.unique(base, ext: ext, in: dir, ignoring: old)
+        let name = uniqueName(base, ext: ext, in: dir, ignoring: old)
         let new = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         try moveItem(old, to: new)
         relocate(e, to: new, inTrash: e.inTrash, trashTop: e.trashTop, parent: e.node.parent)
@@ -512,7 +524,7 @@ final class FolderLibrary: LibraryService {
         flushDocuments(under: e)
         let old = url(of: e)
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
-        let name = FileNames.unique(e.node.title, ext: ext, in: destination, ignoring: old)
+        let name = uniqueName(e.node.title, ext: ext, in: destination, ignoring: old)
         let new = destination.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         try moveItem(old, to: new)
         relocate(e, to: new, inTrash: false, trashTop: false, parent: folder)
@@ -582,7 +594,7 @@ final class FolderLibrary: LibraryService {
         let dir = source.deletingLastPathComponent()
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
         let base = FileNames.sanitize(String(localized: "\(e.node.title) copy"), fallback: e.node.title)
-        let name = FileNames.unique(base, ext: ext, in: dir)
+        let name = uniqueName(base, ext: ext, in: dir)
         let destination = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         return CopyJob(source: source, destination: destination, topID: top, device: device, clock: clock,
                        taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true)
@@ -615,7 +627,7 @@ final class FolderLibrary: LibraryService {
         let old = url(of: e)
         let title = e.node.title
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
-        let name = FileNames.unique(title, ext: ext, in: trashURL)
+        let name = uniqueName(title, ext: ext, in: trashURL)
         let new = trashURL.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         try moveItem(old, to: new)
         do {
@@ -701,7 +713,7 @@ final class FolderLibrary: LibraryService {
         let old = url(of: e)
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
         let title = e.trashTop ? e.originalTitle : e.node.title
-        let name = FileNames.unique(title, ext: ext, in: destination)
+        let name = uniqueName(title, ext: ext, in: destination)
         let new = destination.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         try pinFolderIDs(under: e)
         try moveItem(old, to: new)
@@ -805,16 +817,16 @@ final class FolderLibrary: LibraryService {
                            hint: "import files with import.files")
         }
         let dir = try directory(of: folder)
-        let ext = url.pathExtension.lowercased()
-        let isPackage = ext == NibFormat.packageExtension || (ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url))
+        let isPackage = CatalogScanner.isDocumentPackage(url)
         // A folder is copied in only when it holds a Nib document somewhere (nothing else is left behind).
         guard isPackage || FolderLibrary.holdsPackages(url) else {
             throw NibError(.invalidParams, "'\(url.lastPathComponent)' holds no Nib documents",
                            hint: "import PDFs, images and other files with import.files")
         }
-        let base = FileNames.sanitize(url.deletingPathExtension().lastPathComponent, fallback: String(localized: "Imported"))
+        let sourceName = isPackage ? url.deletingPathExtension().lastPathComponent : url.lastPathComponent
+        let base = FileNames.sanitize(sourceName, fallback: String(localized: "Imported"))
         let targetExt: String? = isPackage ? NibFormat.packageExtension : nil
-        let name = FileNames.unique(base, ext: targetExt, in: dir)
+        let name = uniqueName(base, ext: targetExt, in: dir)
         let destination = dir.appendingPathComponent(FileNames.fileName(name, ext: targetExt), isDirectory: true)
         return CopyJob(source: url, destination: destination, topID: nil, device: device, clock: clock,
                        taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: false)
@@ -843,9 +855,7 @@ final class FolderLibrary: LibraryService {
                                                           options: [.skipsHiddenFiles]) else { return false }
         for case let url as URL in walker {
             guard (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
-            let ext = url.pathExtension.lowercased()
-            if ext == NibFormat.packageExtension { return true }
-            if ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url) { return true }
+            if CatalogScanner.isDocumentPackage(url) { return true }
         }
         return false
     }
@@ -1031,7 +1041,7 @@ final class FolderLibrary: LibraryService {
                 }
             }
             let dir = temp.deletingLastPathComponent()
-            let name = FileNames.unique(FileNames.sanitize(intended, fallback: String(localized: "Recovered")), ext: ext, in: dir)
+            let name = uniqueName(FileNames.sanitize(intended, fallback: String(localized: "Recovered")), ext: ext, in: dir)
             let target = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
             do {
                 try FileOps.move(temp, to: target)
@@ -1108,7 +1118,7 @@ final class FolderLibrary: LibraryService {
         if workspace.isLoaded(doc) { workspace.persistence.flush(doc) }
         let old = url(of: e)
         let dir = old.deletingLastPathComponent()
-        let name = FileNames.unique(e.node.title, ext: NibFormat.packageExtension, in: dir)
+        let name = uniqueName(e.node.title, ext: NibFormat.packageExtension, in: dir)
         let new = dir.appendingPathComponent(FileNames.fileName(name, ext: NibFormat.packageExtension), isDirectory: true)
         do {
             try FileOps.move(old, to: new)
@@ -1360,7 +1370,7 @@ struct CopyJob {
     private func identify(_ url: URL, isTop: Bool, used: inout Set<NibID>) throws {
         let ext = url.pathExtension.lowercased()
         let fm = FileManager.default
-        if ext == NibFormat.packageExtension || (ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url)) {
+        if CatalogScanner.isDocumentPackage(url) {
             var target = url
             if ext != NibFormat.packageExtension {
                 let dir = url.deletingLastPathComponent()
