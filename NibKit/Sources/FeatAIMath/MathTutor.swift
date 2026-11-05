@@ -246,30 +246,43 @@ enum MathTutor {
     }
 
     static func spoken(_ latex: String) -> String {
-        let commands: [String: String] = [
-            "frac": String(localized: "fraction"), "sqrt": String(localized: "square root"),
-            "times": String(localized: "times"), "cdot": String(localized: "times"),
-            "div": String(localized: "divided by"), "int": String(localized: "integral"),
-            "pi": String(localized: "pi"), "infty": String(localized: "infinity"),
-            "approx": String(localized: "approximately equals"),
-            "sin": String(localized: "sine"), "cos": String(localized: "cosine"),
-            "tan": String(localized: "tangent"), "ln": String(localized: "natural logarithm"),
-            "log": String(localized: "logarithm"), "neq": String(localized: "not equal to"),
-            "ne": String(localized: "not equal to"), "leq": String(localized: "less than or equal to"),
-            "le": String(localized: "less than or equal to"), "geq": String(localized: "greater than or equal to"),
-            "ge": String(localized: "greater than or equal to"), "pm": String(localized: "plus or minus"),
-            "left": "", "right": ""
-        ]
+        var commands: [String: String] = [:]
+        commands["frac"] = String(localized: "fraction")
+        commands["sqrt"] = String(localized: "square root")
+        commands["times"] = String(localized: "times")
+        commands["cdot"] = String(localized: "times")
+        commands["div"] = String(localized: "divided by")
+        commands["int"] = String(localized: "integral")
+        commands["pi"] = String(localized: "pi")
+        commands["infty"] = String(localized: "infinity")
+        commands["approx"] = String(localized: "approximately equals")
+        commands["sin"] = String(localized: "sine")
+        commands["cos"] = String(localized: "cosine")
+        commands["tan"] = String(localized: "tangent")
+        commands["ln"] = String(localized: "natural logarithm")
+        commands["log"] = String(localized: "logarithm")
+        commands["neq"] = String(localized: "not equal to")
+        commands["ne"] = String(localized: "not equal to")
+        commands["leq"] = String(localized: "less than or equal to")
+        commands["le"] = String(localized: "less than or equal to")
+        commands["geq"] = String(localized: "greater than or equal to")
+        commands["ge"] = String(localized: "greater than or equal to")
+        commands["pm"] = String(localized: "plus or minus")
+        commands["left"] = ""
+        commands["right"] = ""
         let regex = try! NSRegularExpression(pattern: #"\\([a-zA-Z]+)"#)
-        let source = latex as NSString
-        let result = NSMutableString(string: latex)
-        for match in regex.matches(in: latex, range: NSRange(location: 0, length: source.length)).reversed() {
+        // A single exponent atom needs no spoken group boundary.
+        let ungrouped = latex.replacingOccurrences(of: #"(\^)\{([0-9]+|[a-zA-Z])\}"#,
+                                                   with: "$1 $2 ", options: .regularExpression)
+        let source = ungrouped as NSString
+        let result = NSMutableString(string: ungrouped)
+        for match in regex.matches(in: ungrouped, range: NSRange(location: 0, length: source.length)).reversed() {
             let name = source.substring(with: match.range(at: 1))
             // Match whole commands: unknown functions/relations retain their name and therefore meaning.
             result.replaceCharacters(in: match.range, with: " " + (commands[name] ?? name) + " ")
         }
         var text = result as String
-        let symbols = [("=", String(localized: "equals")), ("^", String(localized: "to the power of")),
+        let symbols: [(String, String)] = [("=", String(localized: "equals")), ("^", String(localized: "to the power of")),
                        ("+", String(localized: "plus")), ("-", String(localized: "minus")),
                        ("<", String(localized: "less than")), (">", String(localized: "greater than")),
                        ("{", String(localized: "open group")), ("}", String(localized: "close group"))]

@@ -46,6 +46,11 @@ struct ChatEntry: Identifiable {
         displayText = ChatCitations.replacingRefs(in: text, labels: citationLabels, refs: citationRefs)
     }
 
+    mutating func finishText(_ label: (String) -> String) {
+        refreshCitations()
+        resolveCitations(label)
+    }
+
     mutating func appendText(_ delta: String, label: (String) -> String) {
         if citationStream == nil {
             citationStream = ChatCitationStream(labels: citationLabels)
@@ -560,6 +565,11 @@ final class ChatViewModel: ObservableObject {
             guard generation == token, !Task.isCancelled else { throw CancellationError() }
             throw NibError(.unavailable, "the provider closed the stream before completing the answer", hint: "retry this turn")
         } catch {
+            // Parse the final unterminated token before archiving partial answers. Stop may already
+            // have invalidated this generation; never touch an entry reused by a newer retry.
+            if generation == token, let i = entries.firstIndex(where: { $0.id == answerID }) {
+                entries[i].finishText(citationLabel)
+            }
             if generation == token, !(error is CancellationError) { self.error = NibError.wrap(error) }
             try? await persistConversation()
             throw error
@@ -573,6 +583,7 @@ final class ChatViewModel: ObservableObject {
         isLoadingChat = false
         if let id = chatID { app?.services.ai?.cancel(chatID: id) }
         for i in entries.indices {
+            entries[i].finishText(citationLabel)
             for j in entries[i].tools.indices where entries[i].tools[j].succeeded == nil {
                 entries[i].tools[j].succeeded = false
                 entries[i].tools[j].cancelled = true

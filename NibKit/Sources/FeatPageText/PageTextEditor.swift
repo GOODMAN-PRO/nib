@@ -148,6 +148,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     private var ghosts: [ElementID: (view: UIView, page: PageID, frame: Frame, storage: NSTextStorage?)] = [:]
     private var dirty = false
     private var commitTask: Task<Void, Never>?
+    /// A dispatched autosave outlives the debounce task; Done must send after it, using its saved baseline.
+    private var inFlight: (task: Task<Bool, Never>, text: RichText, group: String)?
     /// Model of the last paragraph while it has no character of its own to carry its style, list and indent.
     private var trailing = Paragraph()
     private var afterReturn: Paragraph?
@@ -286,12 +288,13 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             // Ending typing must remain possible. Reopening this box restores the draft with its original
             // baseline, so neither Done nor a later session silently adopts the foreign text as its baseline.
             unsaved[e.item] = (text, false, e.baseline)
-            if !commitFailing, let host {
+            if !commitFailing, let host = self.host {
                 Self.report(Self.textConflict, command: CommandIDs.itemUpdate, app: host.app)
             }
         }
         let send = commit && dirty && !conflicted
         let group = self.group
+        let preceding = inFlight.flatMap { $0.group == group ? $0 : nil }
         let textStorage = storage                               // the view's text lives as long as it is shown
         editing = nil
         dirty = false
@@ -331,12 +334,19 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         let session = host.session
         let ref = NodeRef.item(e.doc, e.page, e.item).description
         Task { @MainActor [weak self, weak tv] in
-            let ok = await PageTextEditor.send(text, baseline: e.baseline, ref: ref, group: group, session: session, app: app)
+            var target = e
+            if let preceding, await preceding.task.value {
+                target.baseline = preceding.text
+                if self?.unsaved[e.item]?.text == text {
+                    self?.unsaved[e.item]?.baseline = preceding.text
+                }
+            }
+            let ok = await PageTextEditor.send(text, baseline: target.baseline, ref: ref, group: group, session: session, app: app)
             guard let self = self else {
                 tv?.removeFromSuperview()
                 return
             }
-            self.landed(e, text: text, group: group, ghost: tv, ok: ok)
+            self.landed(target, text: text, group: group, ghost: tv, ok: ok)
         }
     }
 
@@ -836,14 +846,23 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     }
 
     func commitNow() async {
-        guard !hasTextConflict, dirty, let e = editing, let host = host else { return }
+        guard inFlight == nil, !hasTextConflict, dirty, let e = editing, let host = host else { return }
         dirty = false                                          // typing during the send marks it dirty again
         let text = currentRichText()
         let group = self.group                                 // the session's commits merge into one undo step
-        let ok = await Self.send(text, baseline: e.baseline, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
-                                 session: host.session, app: host.app, quiet: commitFailing)
+        let quiet = commitFailing
+        let task = Task { @MainActor in
+            await Self.send(text, baseline: e.baseline, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
+                            session: host.session, app: host.app, quiet: quiet)
+        }
+        inFlight = (task, text, group)
+        let ok = await task.value
+        inFlight = nil
         commitFailing = !ok
-        guard !ok else { return }
+        if ok {
+            if dirty { scheduleCommit() }
+            return
+        }
         if let now = editing, now.item == e.item, now.doc == e.doc {
             dirty = true                                       // keep the text and try again
             scheduleCommit()
@@ -869,8 +888,10 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                 throw textConflict
             }
             let json = try JSONValue.from(text)
+            let expectedText = try JSONValue.from(baseline)
             _ = try await app.bus.execute(Invocation(command: CommandIDs.itemUpdate,
-                                                     params: ["ref": .string(ref), "patch": ["text": ["text": json]]],
+                                                     params: ["ref": .string(ref), "patch": ["text": ["text": json]],
+                                                              "expectedText": expectedText],
                                                      session: session, group: group))
             return true
         } catch {
@@ -901,7 +922,9 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                     editing?.baseline = box.text
                     return
                 }
+                let saving = inFlight?.group == group
                 group = NibID.make().raw                            // typing after an outside change is a new step
+                if saving { dirty = true }                         // an awaiting save still owns a local draft
                 if cs.command == CommandIDs.undo || cs.command == CommandIDs.redo || cs.command == CommandIDs.revertGroup {
                     commitTask?.cancel()                            // the undo wins over typing not yet committed
                     dirty = false

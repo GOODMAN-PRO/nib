@@ -6,6 +6,10 @@ import NibTesting
 @MainActor
 final class MathTutorTests: XCTestCase {
     func testSpokenMathPreservesFunctionsRelationsAndGroupBoundaries() {
+        XCTAssertEqual(MathTutor.spoken(#"x^{2}+y^{12}+a^{n}"#), "x to the power of 2 plus y to the power of 12 plus a to the power of n")
+        XCTAssertEqual(MathTutor.spoken(#"x^{2}y"#), "x to the power of 2 y")
+        XCTAssertEqual(MathTutor.spoken(#"x^{a+b}"#), "x to the power of open group a plus b close group")
+        XCTAssertEqual(MathTutor.spoken(#"\sqrt{x+1}"#), "square root open group x plus 1 close group")
         XCTAssertEqual(MathTutor.spoken(#"\sin(x)=0"#), "sine (x) equals 0")
         XCTAssertEqual(MathTutor.spoken(#"x\neq y"#), "x not equal to y")
         XCTAssertEqual(MathTutor.spoken(#"\frac{a+b}{c}"#),

@@ -24,6 +24,7 @@ private struct SeedItems: NibCommand {
 
 /// Stand-in for F003's `item.update` (not linked into this test target) with the part the editor uses: it applies
 /// `patch.text.text` and, like the real command, checks the document lock only, never `item.locked`.
+/// The expectedText guard models the required F003 contract; production ItemUpdate still needs this guard.
 private struct FakeItemUpdate: NibCommand {
     struct Params: Codable {
         struct Patch: Codable {
@@ -32,6 +33,7 @@ private struct FakeItemUpdate: NibCommand {
         }
         var ref: String
         var patch: Patch
+        var expectedText: RichText? = nil
     }
 
     static let descriptor = CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update Item", summary: "Test only.",
@@ -41,6 +43,9 @@ private struct FakeItemUpdate: NibCommand {
         guard case let .item(doc, page, id)? = NodeRef(p.ref) else { throw NibError.invalid("item ref", path: "$.ref") }
         try ctx.mutate { tx in
             var item = try tx.item(doc, page: page, id: id)
+            if let expected = p.expectedText, item.text?.text != expected {
+                throw NibError(.conflict, "the text changed elsewhere")
+            }
             item.text?.text = p.patch.text.text
             try tx.put(item, doc: doc, page: page)
         }
@@ -490,6 +495,49 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: page).contains(where: PageTextModel.isFullPageBox))
     }
 
+    func testDoneWaitsForInFlightAutosaveAndAdvancesFinalBaseline() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(FakeItemUpdate.self)
+        let host = FakeCanvasHost(h)
+        let editor = PageTextEditor()
+        editor.attach(to: host)
+        defer { editor.finish(commit: false); editor.detach(from: host) }
+        let (page, id) = try await start(h, page2Ref)
+        let tv = try XCTUnwrap(textView(host))
+        var started = false
+        var released = false
+        var calls = 0
+        h.app.bus.hooks.register(CommandHookDescriptor(id: "test.pauseAutosave", owner: "test",
+                                                       commands: [CommandIDs.itemUpdate]) { _, _ in
+            calls += 1
+            if calls == 1 {
+                started = true
+                for _ in 0..<300 where !released { try await Task.sleep(nanoseconds: 10_000_000) }
+                guard released else { throw NibError(.unavailable, "autosave gate timed out") }
+            }
+            return nil
+        })
+        let reports = Counter()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            reports.count += 1
+        }
+        defer { released = true; NotificationCenter.default.removeObserver(observer) }
+        XCTAssertTrue(typeText("One", editor, tv))
+        let autosave = Task { await editor.commitNow() }
+        let paused = await eventually { started }
+        XCTAssertTrue(paused)
+        XCTAssertTrue(typeText(" two", editor, tv))
+        editor.finish()
+        XCTAssertFalse(h.session.isEditingText)
+        released = true
+        await autosave.value // the hook has a bounded wait even if the test fails
+        let saved = await eventually { self.boxText(h, page, id)?.plainText == "One two" }
+        XCTAssertTrue(saved, "the final save must accept this session's earlier autosave as its baseline")
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(reports.count, 0)
+        XCTAssertFalse(h.session.isEditingText, "Done must not reopen a falsely conflicted draft")
+    }
+
     func testAFailedFinalCommitReopensTheBoxWithTheText() async throws {
         let h = Harness(features: [FeatPageTextFeature.self])
         h.app.commands.register(FlakyItemUpdate.self)
@@ -591,6 +639,53 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertTrue(typeText("!", editor, reopened))
         await editor.commitNow()
         XCTAssertEqual(boxText(h, page, id)?.plainText, "Their paragraph")
+    }
+
+    func testExpectedTextContractRejectsExternalEditAfterPreflightAndRetainsDraft() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(FakeItemUpdate.self)
+        let host = FakeCanvasHost(h)
+        let editor = PageTextEditor()
+        editor.attach(to: host)
+        defer { editor.finish(commit: false); editor.detach(from: host) }
+        let (page, id) = try await start(h, page2Ref)
+        let tv = try XCTUnwrap(textView(host))
+        var started = false
+        var released = false
+        h.app.bus.hooks.register(CommandHookDescriptor(id: "test.pauseGuardedAutosave", owner: "test",
+                                                       commands: [CommandIDs.itemUpdate]) { _, params in
+            // Only suspend the editor's guarded call. The foreign write proceeds normally.
+            if params["expectedText"] != nil {
+                started = true
+                for _ in 0..<300 where !released { try await Task.sleep(nanoseconds: 10_000_000) }
+                guard released else { throw NibError(.unavailable, "autosave gate timed out") }
+            }
+            return nil
+        })
+        let reports = Counter()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            if (note.userInfo?["error"] as? NibError)?.code == .conflict { reports.count += 1 }
+        }
+        defer { released = true; NotificationCenter.default.removeObserver(observer) }
+        XCTAssertTrue(typeText("My draft", editor, tv))
+        let autosave = Task { await editor.commitNow() }
+        let paused = await eventually { started }
+        XCTAssertTrue(paused)
+        let ref = NodeRef.item(Fixtures.docID, page, id).description
+        try await h.run(CommandIDs.itemUpdate, ["ref": .string(ref), "patch": ["text": ["text": "Their paragraph"]]])
+        let depth = h.undoDepth(Fixtures.docID)
+        released = true
+        await autosave.value
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "Their paragraph")
+        XCTAssertEqual(tv.text, "My draft", "a dispatched save still owns its unsaved draft")
+        XCTAssertGreaterThan(reports.count, 0)
+        editor.finish()
+        let current = try h.app.workspace.item(Fixtures.docID, page: page, id: id)
+        editor.beginEditing(current, doc: Fixtures.docID, page: page)
+        XCTAssertEqual(textView(host)?.text, "My draft")
+        await editor.commitNow()
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "Their paragraph")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
     }
 
     func testAnInsertThatDoesNotFitIsRejectedAndOffersANewPage() async throws {

@@ -431,6 +431,58 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertNil(model.error)
     }
 
+    func testTrailingCitationFinalizesAfterFailureOrUnexpectedClosure() async throws {
+        let ref = "page:FIXTUREDOC01/FIXTUREPG001"
+        for fails in [true, false] {
+            let h = Harness(features: [FeatAIChatFeature.self])
+            let service = ScriptedChatService()
+            service.events = [.text("See " + ref)]
+            if fails { service.events.append(.failed(NibError(.unavailable, "offline"))) }
+            h.app.services.ai = service
+            let model = ChatRuntime.get(h.app).model(for: h.session)
+            do {
+                _ = try await model.send(prompt: "Read", principal: .user, group: "G1")
+                XCTFail("expected an incomplete stream")
+            } catch {}
+            XCTAssertEqual(model.entries.last?.text, "See " + ref)
+            XCTAssertEqual(model.entries.last?.displayText, "See Page 1")
+            XCTAssertEqual(model.entries.last?.citationRefs, [ref], "the navigation chip must survive termination")
+            XCTAssertEqual(model.entries.last?.citationLabels[ref], "Page 1")
+        }
+    }
+
+    func testTrailingCitationFinalizesAfterStopOrTaskCancellation() async throws {
+        let ref = "page:FIXTUREDOC01/FIXTUREPG001"
+        for stops in [true, false] {
+            let h = Harness(features: [FeatAIChatFeature.self])
+            let service = ScriptedChatService()
+            service.suspended = true
+            h.app.services.ai = service
+            let model = ChatRuntime.get(h.app).model(for: h.session)
+            let ended = expectation(description: "cancelled stream ended")
+            let turn = Task {
+                do {
+                    _ = try await model.send(prompt: "Read", principal: .user, group: "G1")
+                    XCTFail("expected cancellation")
+                } catch {}
+                ended.fulfill()
+            }
+            defer { turn.cancel(); service.continuation?.finish() }
+            for _ in 0..<100 where service.continuation == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+            XCTAssertNotNil(service.continuation)
+            service.continuation?.yield(.text("See " + ref))
+            for _ in 0..<100 where model.entries.last?.text != "See " + ref { try await Task.sleep(nanoseconds: 10_000_000) }
+            XCTAssertEqual(model.entries.last?.text, "See " + ref)
+            XCTAssertEqual(model.entries.last?.citationRefs, [], "no delimiter has arrived yet")
+            if stops { model.stop() } else { turn.cancel() }
+            await fulfillment(of: [ended], timeout: 3)
+            XCTAssertEqual(model.entries.last?.displayText, "See Page 1")
+            XCTAssertEqual(model.entries.last?.citationRefs, [ref])
+            XCTAssertEqual(model.entries.last?.citationLabels[ref], "Page 1")
+            XCTAssertFalse(model.isStreaming)
+        }
+    }
+
     func testStopDoesNotAcceptLateStreamEvents() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let service = ScriptedChatService()
