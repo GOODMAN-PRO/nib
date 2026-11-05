@@ -506,6 +506,12 @@ final class NibIndexTests: XCTestCase {
         XCTAssertEqual(model.status, IndexSettingsModel.idleStatus(h.app))
     }
 
+    func testIndexedStatusHandlesZeroOneAndManyPages() {
+        XCTAssertEqual(IndexSettingsModel.indexedStatus(pages: 0), "0 pages indexed on this device")
+        XCTAssertEqual(IndexSettingsModel.indexedStatus(pages: 1), "1 page indexed on this device")
+        XCTAssertEqual(IndexSettingsModel.indexedStatus(pages: 2), "2 pages indexed on this device")
+    }
+
     func testRebuildDocument() async throws {
         let (h, _) = harness()
         let r = try await h.run("index.rebuild", ["doc": "doc:FIXTUREDOC01"])

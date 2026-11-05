@@ -55,7 +55,8 @@ final class IndexSettingsModel: ObservableObject {
             // `decode` is nil for every other event type.
             guard let model = self, let progress = event.decode(IndexProgressPayload.self) else { return }
             Task { @MainActor in
-                model.status = progress.running ? String(localized: "Indexing \(progress.done) of \(progress.total)…")
+                // The catalogue's first placeholder is %@ (the total is %lld).
+                model.status = progress.running ? String(localized: "Indexing \(String(progress.done)) of \(progress.total)…")
                     : IndexSettingsModel.idleStatus(model.app)
             }
         }
@@ -71,7 +72,13 @@ final class IndexSettingsModel: ObservableObject {
 
     static func idleStatus(_ app: NibApp) -> String {
         let pages = app.services.get(IndexKeys.service, as: Indexer.self)?.indexedPageCount() ?? 0
-        return String(localized: "\(pages) pages indexed on this device")
+        return indexedStatus(pages: pages)
+    }
+
+    static func indexedStatus(pages: Int) -> String {
+        if pages == 1 { return String(localized: "1 page indexed on this device") }
+        // Keep the existing translated %@ key; numbers supplied as Int select a different (%lld) key.
+        return String(localized: "\(String(pages)) pages indexed on this device")
     }
 
     /// Settings change through the command, like every other caller.
