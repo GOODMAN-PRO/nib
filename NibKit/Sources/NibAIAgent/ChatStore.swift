@@ -170,6 +170,7 @@ final class ChatStore {
 
     private let directoryProvider: Directory
     private let clock: HLCClock
+    private let accessURL: URL?
     private let io = DispatchQueue(label: "app.nib.aiagent.chats", qos: .utility)
     private var directory: URL?
     private var resolvedOnce = false
@@ -186,11 +187,14 @@ final class ChatStore {
     }
 
     /// `directory` is resolved at every access (the library folder can change); nil keeps chats in memory only.
-    init(directory: @escaping Directory, deviceHex: String, clock: HLCClock) {
+    init(directory: @escaping Directory, deviceHex: String, clock: HLCClock, accessURL: URL? = nil) {
         self.directoryProvider = directory
         self.deviceHex = deviceHex
         self.clock = clock
+        self.accessURL = accessURL?.startAccessingSecurityScopedResource() == true ? accessURL : nil
     }
+
+    deinit { accessURL?.stopAccessingSecurityScopedResource() }
 
     // MARK: Reading
 

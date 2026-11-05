@@ -24,15 +24,24 @@ final class AgentService: AIService {
     var historyCharacters = 80_000
 
     weak var app: NibApp?
-    let chatStore: ChatStore
+    private var chatStores: [URL?: ChatStore] = [:]
+    var chatStore: ChatStore {
+        let library = app?.services.library
+        let directory = library?.metadataURL.appendingPathComponent("ai", isDirectory: true)
+        if let store = chatStores[directory] { return store }
+        let store = ChatStore(directory: { directory }, deviceHex: deviceHex, clock: clock,
+                              accessURL: library?.rootURL)
+        chatStores[directory] = store
+        return store
+    }
+    private let deviceHex: String
+    private let clock: HLCClock
     private var running: [String: Task<TurnOutcome, Never>] = [:]
 
     init(app: NibApp) {
         self.app = app
-        let services = app.services
-        chatStore = ChatStore(directory: { [weak services] in
-            services?.library?.metadataURL.appendingPathComponent("ai", isDirectory: true)
-        }, deviceHex: app.deviceHex, clock: app.clock)
+        deviceHex = app.deviceHex
+        clock = app.clock
     }
 
     // MARK: Provider
@@ -154,6 +163,8 @@ final class AgentService: AIService {
         guard incoming.contains(where: { !$0.text.isEmpty || !($0.images ?? []).isEmpty }) else {
             return .failure(NibError(.invalidParams, "the request has no message", path: "$.messages"))
         }
+        // Keep the originating destination through completion and cancellation.
+        let chatStore = self.chatStore
         let chatID = request.chatID ?? NibID.make().raw
         let basePrincipal = caller?.principal ?? request.principal
         if request.chatID != nil {
@@ -218,13 +229,13 @@ final class AgentService: AIService {
             inner.cancel()
         }
         running[chatID] = nil
-        return finish(outcome, chatID: chatID, persisted: persisted, principal: principal, group: group,
+        return finish(outcome, chatStore: chatStore, chatID: chatID, persisted: persisted, principal: principal, group: group,
                       mode: readOnly ? .ask : request.mode, jsonOutput: request.jsonOutput, doc: scopeDoc)
     }
 
     /// Stores the answer, emits `ai.turn.finished` and builds the response. A cancelled turn keeps what it did: its
     /// response carries the partial text and the undo group of the changes made so far.
-    private func finish(_ outcome: TurnOutcome, chatID: String, persisted: Bool, principal: Principal, group: String,
+    private func finish(_ outcome: TurnOutcome, chatStore: ChatStore, chatID: String, persisted: Bool, principal: Principal, group: String,
                         mode: AIMode, jsonOutput: Bool, doc: DocumentID?) -> Result<AIResponse, NibError> {
         let text = jsonOutput ? AgentLoop.unfenced(outcome.finalText.isEmpty ? outcome.text : outcome.finalText) : outcome.text
         if persisted {
