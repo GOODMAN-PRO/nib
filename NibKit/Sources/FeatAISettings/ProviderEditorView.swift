@@ -320,7 +320,7 @@ struct ProviderEditorView: View {
                 guard let runtime = app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self) else {
                     throw NibError.unavailable("Provider settings are unavailable. Open Settings again.")
                 }
-                try await runtime.saveFromSettings(config, key: replaceKey || !key.isEmpty ? key : nil, app: app)
+                try await runtime.saveFromSettings(config, key: replaceKey || !key.isEmpty ? key : nil, app: app, expected: savedConfig)
                 savedConfig = config; draft = ProviderDraft(config: config)
                 key = ""; replaceKey = false
                 let result = try await app.bus.execute(CommandIDs.aiProviderList, ["id": .string(config.id.uuidString)])

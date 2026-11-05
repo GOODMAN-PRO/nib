@@ -68,17 +68,26 @@ final class ProviderSettingsRuntime {
     static let serviceKey = "aisettings.runtime"
     struct Pending { let config: AIProviderConfig; let key: String }
     private var pending: [String: Pending] = [:]
+    private var baselines: [String: AIProviderConfig] = [:]
 
-    func saveFromSettings(_ config: AIProviderConfig, key: String?, app: NibApp) async throws {
+    func saveFromSettings(_ config: AIProviderConfig, key: String?, app: NibApp, expected: AIProviderConfig? = nil) async throws {
         let config = try ProviderValidation.validate(config)
         try ProviderValidation.rejectKeyInMetadata(config, key: key ?? Keychain.getString(
             service: AIProviderConfig.keychainService, account: config.keychainAccount))
         let group = UUID().uuidString
         if let key { pending[group] = Pending(config: config, key: key) }
-        defer { pending[group] = nil }
+        baselines[group] = expected
+        defer { pending[group] = nil; baselines[group] = nil }
         _ = try await app.bus.execute(Invocation(command: CommandIDs.aiProviderSave,
                                                 params: try JSONValue.from(ProviderSave.Params(config)),
                                                 principal: .user, session: app.services.sessions.active, group: group))
+    }
+
+    func checkBaseline(for ctx: CommandContext, existing: AIProviderConfig?) throws {
+        guard ctx.principal.isUser, let baseline = baselines[ctx.group] else { return }
+        guard existing == baseline else {
+            throw NibError(.conflict, String(localized: "This provider changed in another window. Reopen it before saving your changes."))
+        }
     }
 
     func key(for ctx: CommandContext, config: AIProviderConfig) throws -> String? {
@@ -200,6 +209,7 @@ struct ProviderSave: NibCommand {
         let existing = store.configs.first { $0.id == id }
         let config = try p.config(existing: existing)
         let runtime = ctx.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self)
+        try runtime?.checkBaseline(for: ctx, existing: existing)
         let key = try runtime?.key(for: ctx, config: config)
         let savedKey = Keychain.getString(service: AIProviderConfig.keychainService, account: config.keychainAccount)
         if !ctx.principal.isUser, let existing, savedKey?.isEmpty == false,

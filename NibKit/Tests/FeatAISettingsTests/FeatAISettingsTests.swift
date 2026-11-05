@@ -192,6 +192,32 @@ final class FeatAISettingsTests: XCTestCase {
         XCTAssertTrue(checked)
         XCTAssertEqual(Keychain.getString(service: AIProviderConfig.keychainService, account: c.keychainAccount), "staged-secret-086")
     }
+    func testNameOnlyDraftRejectsExternallyChangedModelAtCommandCommit() async throws {
+        for changeInHook in [false, true] {
+            let (h, store) = setupStore()
+            let baseline = try config()
+            try store.save(baseline, apiKey: nil)
+            var external = baseline
+            external.model = "new-model"
+            var draft = baseline
+            draft.name = "New name"
+            let runtime = try XCTUnwrap(h.app.services.get(ProviderSettingsRuntime.serviceKey, as: ProviderSettingsRuntime.self))
+            if changeInHook {
+                h.app.bus.hooks.register(.guarding(id: "test.external", owner: "test", commands: [CommandIDs.aiProviderSave]) { _, _, _ in
+                    try store.save(external, apiKey: nil)
+                    return nil
+                })
+            } else {
+                try store.save(external, apiKey: nil)
+            }
+            do {
+                try await runtime.saveFromSettings(draft, key: nil, app: h.app, expected: baseline)
+                XCTFail("A stale editor must not overwrite the external model")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+            XCTAssertEqual(store.configs, [external])
+        }
+    }
+
     func testHookCannotRewriteStagedProvider() async throws {
         let (h, store) = setupStore()
         let c = try config()
