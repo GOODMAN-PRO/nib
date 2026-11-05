@@ -236,7 +236,10 @@ private final class PrivateLessonWrites {
 final class PrivateLessonPersistence: DocumentPersistence {
     let base: DocumentPersistence
     let root: URL
-    private var cache: [DocumentID: LessonSnapshot] = [:]
+    private var cache: [DocumentID: LessonSnapshot] = [:] {
+        didSet { snapshotGeneration &+= 1 }
+    }
+    private var snapshotGeneration: UInt64 = 0
     private let writer = DispatchQueue(label: "app.nib.teacherlessons.private")
     private let log = Logger(subsystem: "app.nib", category: "teacherlessons")
 
@@ -307,6 +310,21 @@ final class PrivateLessonPersistence: DocumentPersistence {
     func loadHead(_ doc: DocumentID) throws -> DocumentContent {
         if LessonManager.isPrivate(doc) { return try snapshot(doc).content }
         return try base.loadHead(doc)
+    }
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent {
+        if LessonManager.isPrivate(doc) { return try snapshot(doc).content }
+        return try base.peekHead(doc)
+    }
+    func headReadStamp(_ doc: DocumentID) -> String? {
+        guard LessonManager.isPrivate(doc) else { return base.headReadStamp(doc) }
+        // Until the snapshot is loaded there is no cheap token. Once loaded, this instance owns its
+        // authoritative value, including unsaved edits; seed and didChange both advance the generation.
+        return cache[doc] == nil ? nil : String(snapshotGeneration)
+    }
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? {
+        guard LessonManager.isPrivate(doc) else { return base.contentFingerprint(doc, page: page) }
+        guard let value = try? snapshot(doc) else { return nil }
+        return LWW.fingerprint(value.items[page] ?? [])
     }
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
         if LessonManager.isPrivate(doc) { return try snapshot(doc).items[page] ?? [] }

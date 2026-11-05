@@ -1,5 +1,12 @@
 # Nib — Contracts (shared source of truth)
 
+**Persistence metadata probes** (additive `DocumentPersistence` requirements with compatible defaults):
+- `peekHead(_ doc: DocumentID) throws -> DocumentContent` reads the merged head without opening the document or replaying WAL page payloads. The default calls `loadHead`; stores with recovery logs override it. `Workspace.peekContent` uses it for closed documents.
+- `headReadStamp(_ doc: DocumentID) -> String?` supplies a cheap validation token for every head input: device files, WAL, queued/pending writes and effective revision ordering. Nil means unknown. Consumers scope cached heads to the persistence instance and validate before and after reading, including after suspension. The default is nil.
+- `contentFingerprint(_ doc: DocumentID, page: PageID) -> String?` supplies `LWW.fingerprint` of all merged items, including tombstones and pending writes, without decoding page payloads when metadata is available. The default is nil; `Workspace.contentFingerprint` then reads items transiently without caching them. A maximum `contentRevision` is never a substitute: edits below that maximum must change the fingerprint.
+
+Persistence wrappers forward all three methods for ordinary documents. `PrivateLessonPersistence` uses its authoritative in-memory snapshot for private heads and fingerprints, and a generation token that advances on snapshot installation or mutation (including unsaved edits); before a private snapshot is loaded its stamp is nil.
+
 This file holds the **exact** source that the scaffold agent creates **verbatim, byte for byte**, before any feature work starts. Every parallel feature agent compiles against it. It targets Swift 5 language mode, iOS 17.0 (deployment target), Xcode 26.6 and the iOS 26 SDK; every API newer than iOS 17.0 sits behind `#available`.
 
 | Part | Contents | Owner after scaffold |
