@@ -146,27 +146,96 @@ final class FeatStudySessionTests: XCTestCase {
             }
             return try XCTUnwrap(image?.pngData())
         }
-        var lightPaper: UIImage?
+        var lightTask: Task<UIImage?, Never>?
         UITraitCollection(userInterfaceStyle: .dark).performAsCurrent {
-            lightPaper = model.picture(face, card: card, back: false)
+            lightTask = Task { await model.picture(face, card: card, back: false) }
         }
+        let lightPaper = await lightTask?.value
         let light = try XCTUnwrap(lightPaper)
         XCTAssertEqual(try XCTUnwrap(light.pngData()), try expected(.light))
         // Theme writes leave the card revision alone: the cache must include paper appearance.
         try await h.run(CommandIDs.studySetTheme, ["doc": .string(docRef), "card": "night"])
         try await model.reload()
         XCTAssertTrue(model.cardIsDark)
-        var darkPaper: UIImage?
+        var darkTask: Task<UIImage?, Never>?
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            darkPaper = model.picture(face, card: card, back: false)
+            darkTask = Task { await model.picture(face, card: card, back: false) }
         }
+        let darkPaper = await darkTask?.value
         let dark = try XCTUnwrap(darkPaper)
         XCTAssertFalse(light === dark)
         XCTAssertEqual(try XCTUnwrap(dark.pngData()), try expected(.dark))
-        XCTAssertTrue(model.picture(face, card: card, back: false) === dark)
+        let cachedDark = await model.picture(face, card: card, back: false)
+        XCTAssertTrue(cachedDark === dark)
+        XCTAssertTrue(model.cachedPicture(model.pictureKey(card: card, back: false)) === dark)
         try await h.run(CommandIDs.studySetTheme, ["doc": .string(docRef), "card": "white"])
         try await model.reload()
-        XCTAssertTrue(model.picture(face, card: card, back: false) === light)
+        XCTAssertTrue(model.cachedPicture(model.pictureKey(card: card, back: false)) === light,
+                      "a cached theme is available synchronously before the view task starts")
+        let cachedLight = await model.picture(face, card: card, back: false)
+        XCTAssertTrue(cachedLight === light)
+    }
+
+    func testArtworkReadsOffMainActorAndDiscardsCancelledRevision() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        try await model.reload()
+        let card = try XCTUnwrap(model.liveCards.first { $0.back.kind == .image })
+        let started = expectation(description: "artwork read started")
+        let store = BlockingStudyArtworkAssets(base: h.assets, started: started)
+        h.app.services.assets = store
+        let key = model.pictureKey(card: card, back: true)
+        let old = Task { await model.picture(card.back, card: card, back: true) }
+        defer { store.release() }
+        await fulfillment(of: [started], timeout: 2)
+        var changed = card
+        changed.rev = h.app.workspace.clock.tick()
+        XCTAssertNotEqual(key, model.pictureKey(card: changed, back: true))
+        XCTAssertNotEqual(key, model.pictureKey(card: card, back: false))
+        old.cancel()
+        store.release()
+        let result = await old.value
+        XCTAssertNil(result, "cancelled artwork must not be cached or displayed by an obsolete view task")
+        XCTAssertNil(model.cachedPicture(key))
+        XCTAssertFalse(store.readOnMain)
+        h.app.services.assets = h.assets
+        let latest = await model.picture(changed.back, card: changed, back: true)
+        XCTAssertNotNil(latest)
+        XCTAssertTrue(model.cachedPicture(model.pictureKey(card: changed, back: true)) === latest)
+    }
+
+    func testInterruptedCardDragResetsPositionWithoutGradingOrMovingNextCard() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": "practice"])
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "flip", "instant": true])
+        let first = try XCTUnwrap(model.current)
+        let before = try h.snapshot(doc)
+        var drag = StudyCardDragState()
+        var gradeCommands = 0
+        drag.changed(CGSize(width: 240, height: 60), reduceMotion: false)
+        XCTAssertNotEqual(drag.offset, .zero)
+        XCTAssertNotEqual(StudyCardDragState.rotation(for: drag.offset, width: 560, reduceMotion: false), 0)
+        // The exact callback used when GestureState resets after interruption (no onEnded).
+        drag.activityChanged(false)
+        XCTAssertEqual(drag.offset, .zero)
+        XCTAssertEqual(StudyCardDragState.rotation(for: drag.offset, width: 560, reduceMotion: false), 0)
+        // A late completion after cancellation must not dispatch the grade command either.
+        drag.ended { gradeCommands += 1; model.grade(.good) }
+        XCTAssertEqual(gradeCommands, 0)
+        XCTAssertEqual(model.current?.id, first.id)
+        XCTAssertTrue(model.reviewed.isEmpty)
+        XCTAssertEqual(try h.snapshot(doc), before)
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "next", "instant": true])
+        XCTAssertNotEqual(model.current?.id, first.id)
+        XCTAssertEqual(drag.offset, .zero)
+        XCTAssertEqual(StudyCardDragState.rotation(for: drag.offset, width: 560, reduceMotion: false), 0)
+        drag.changed(CGSize(width: 12, height: 3), reduceMotion: false)
+        XCTAssertEqual(drag.offset, CGSize(width: 12, height: 3), "the next drag inherits no displacement")
+        var completions = 0
+        drag.ended { completions += 1 }
+        XCTAssertEqual(completions, 1, "ordinary gesture completion still works")
+        XCTAssertEqual(drag.offset, .zero)
     }
 
     func testPracticeNavigationSpeechAndDueOnlySessionSummary() async throws {
@@ -199,6 +268,56 @@ final class FeatStudySessionTests: XCTestCase {
         XCTAssertTrue(model.queue.isEmpty)
         XCTAssertNil(model.current)
         XCTAssertEqual(h.undoDepth(doc), 0)
+    }
+
+    func testLargeSmartLearnQueueUsesReviewedSetAndResetsWithoutRepeats() throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        let keys = FractionalIndex.balanced(count: 5_001)
+        let cards = keys.enumerated().map { i, key in
+            StudyCard(id: NibID("LARGE\(i)"), front: CardFace(), back: CardFace(), order: key)
+        }
+        model.accept(DocumentContent(meta: DocumentMeta(id: doc, kind: .studySet), cards: cards))
+        try model.act("start", mode: "smartLearn", language: nil, instant: true)
+        let order = model.queue
+        for id in order.prefix(5_000) { model.recordGrade(id, rating: .good) }
+        XCTAssertEqual(model.current?.id, order.last)
+        XCTAssertEqual(model.reviewed, Array(order.prefix(5_000)))
+        XCTAssertEqual(model.reviewedIDs, Set(order.prefix(5_000)), "membership is a hash-set lookup, not a scan of the reviewed prefix")
+        model.recordGrade(order[0], rating: .good)
+        XCTAssertEqual(model.reviewed.count, 5_000)
+        XCTAssertEqual(model.current?.id, order.last)
+        try model.act("start", mode: "smartLearn", language: nil, instant: true)
+        XCTAssertTrue(model.reviewedIDs.isEmpty)
+        XCTAssertTrue(model.reviewed.isEmpty)
+        XCTAssertEqual(model.current?.id, order.first)
+    }
+
+    func testCardActionsMatchModeRevealNavigationAndBusyState() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        await model.begin("practice")
+        XCTAssertTrue(model.canFlip)
+        XCTAssertFalse(model.canGoPrevious)
+        XCTAssertTrue(model.canGoNext)
+        XCTAssertFalse(model.canGrade)
+        try model.act("flip", mode: nil, language: nil, instant: true)
+        XCTAssertTrue(model.canGrade)
+        h.session.readOnly = true
+        XCTAssertFalse(model.canGrade)
+        h.session.readOnly = false
+        for _ in 1..<model.queue.count { try model.act("next", mode: nil, language: nil, instant: true) }
+        XCTAssertTrue(model.canGoPrevious)
+        XCTAssertFalse(model.canGoNext)
+        await model.begin("smartLearn")
+        XCTAssertFalse(model.canGoPrevious)
+        XCTAssertFalse(model.canGoNext)
+        try model.act("flip", mode: nil, language: nil, instant: true)
+        model.busy = true
+        XCTAssertFalse(model.canFlip)
+        XCTAssertFalse(model.canGrade)
+        XCTAssertFalse(model.canGoPrevious)
+        XCTAssertFalse(model.canGoNext)
     }
 
     func testSchemasPanelsShortcutsAndConformance() async throws {
@@ -492,4 +611,25 @@ final class FeatStudySessionTests: XCTestCase {
         XCTAssertNil(StudyVoiceLanguages.resolve("de-DE", installed: installed))
     }
 
+}
+
+private final class BlockingStudyArtworkAssets: AssetStore {
+    let base: AssetStore
+    let started: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var onMain = true
+    var readOnMain: Bool { lock.lock(); defer { lock.unlock() }; return onMain }
+    init(base: AssetStore, started: XCTestExpectation) { self.base = base; self.started = started }
+    func release() { gate.signal() }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data {
+        lock.lock(); onMain = Thread.isMainThread; lock.unlock()
+        started.fulfill()
+        guard gate.wait(timeout: .now() + 3) == .success else { throw NibError.unavailable("artwork gate timed out") }
+        return try base.data(ref, doc: doc)
+    }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try base.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }

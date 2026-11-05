@@ -612,6 +612,13 @@ struct CardMoveTo: NibCommand {
                     out.append(NodeRef.card(dest, card.id).description)
                     continue
                 }
+                // The source can change while its original pictures are being copied. Never remove the
+                // only usable card if a current face now depends on an asset absent from that copy.
+                for asset in [card.front.asset, card.back.asset].compactMap({ $0 }) {
+                    guard assets[t.doc.raw + "/" + asset.name] != nil else {
+                        throw NibError(.conflict, String(localized: "This card changed while moving. Try moving it again."))
+                    }
+                }
                 var tombstone = card
                 tombstone.deleted = true
                 if gone[t.doc] == nil { sources.append(t.doc) }

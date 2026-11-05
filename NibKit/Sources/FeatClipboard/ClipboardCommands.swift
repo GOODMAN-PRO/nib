@@ -65,7 +65,7 @@ enum Clipboard {
 
     static let log = Logger(subsystem: "app.nib", category: "clipboard")
     /// Copy itself never waits for OCR. Late text is best-effort, while this is still the same clipboard entry.
-    static let recognitionWindow: TimeInterval = 5
+    static var recognitionWindow: TimeInterval = 5
     private static var recognitionTask: Task<Void, Never>?
     private static var recognitionDeadline: Task<Void, Never>?
 
@@ -77,7 +77,8 @@ enum Clipboard {
         guard !ink.isEmpty, let recognizer else { return nil }
         let board = Clipboard.board
         let revision = board.changeCount
-        let deadline = ProcessInfo.processInfo.systemUptime + recognitionWindow
+        let window = recognitionWindow
+        let deadline = ProcessInfo.processInfo.systemUptime + window
         let task = Task { @MainActor in
             guard !Task.isCancelled else { return }
             guard let lines = try? await recognizer.recognize(strokes: ink, language: language),
@@ -96,7 +97,7 @@ enum Clipboard {
         }
         recognitionTask = task
         recognitionDeadline = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: UInt64(recognitionWindow * 1_000_000_000)) }
+            do { try await Task.sleep(nanoseconds: UInt64(window * 1_000_000_000)) }
             catch { return }
             task.cancel()
         }
@@ -190,13 +191,21 @@ enum ClipboardRender {
 
 /// Everything a copy puts on the pasteboard.
 struct ClipboardExport {
-    var fragment: NibFragment
+    let fragment: NibFragment
+    private let fragmentData: Data?
     var png: Data?
     var text: String
 
+    init(fragment: NibFragment, png: Data?, text: String) {
+        self.fragment = fragment
+        self.fragmentData = fragment.encoded()
+        self.png = png
+        self.text = text
+    }
+
     var representations: [String: Any] {
         var reps: [String: Any] = [:]
-        if let data = fragment.encoded() { reps[NibFragment.typeIdentifier] = data }
+        if let data = fragmentData { reps[NibFragment.typeIdentifier] = data }
         if let png = png { reps[UTType.png.identifier] = png }
         if !text.isEmpty { reps[UTType.utf8PlainText.identifier] = text }
         return reps

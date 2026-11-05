@@ -224,6 +224,17 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     }
 
     func closeDocument(_ doc: DocumentID) {
+        // Flush through the workspace: lessons wrap the package persistence here. Do not
+        // evict the workspace, since another window may still be editing this document.
+        let beforeFlush = app.events.lastSeq
+        app.workspace.persistence.flush(doc)
+        let status = app.events.events(since: beforeFlush, limit: app.events.capacity).last {
+            $0.doc == doc && $0.decode(SyncStatusPayload.self)?.source == "store"
+        }?.decode(SyncStatusPayload.self)
+        if let status, status.state == "error" || status.state == "warning" {
+            toast(status.message ?? String(localized: "Changes could not be saved. Keep Nib open and try closing the document again."))
+            return
+        }
         openDocuments.removeAll { $0 == doc }
         guard activeDocument == doc else {
             refreshTabBar()

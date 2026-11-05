@@ -236,7 +236,95 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertGreaterThan(pages, 1)
         XCTAssertEqual(seen.count, 60)
         XCTAssertEqual(Set(seen).count, 60)
-        XCTAssertEqual(fake.reads, 1, "later pages come from the cache the first page filled")
+        XCTAssertEqual(fake.reads, 1, "later pages come from the first read's retained snapshot")
+    }
+
+    func testPagedCommandKeepsSupersededSnapshotAcrossInsertion() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: true)
+    }
+
+    func testPagedCommandKeepsSupersededSnapshotAcrossDeletion() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: false)
+    }
+
+    func testPagedCommandKeepsSnapshotWhenEventIsInsertedBetweenPages() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: true, publishBeforeFirstPage: false)
+    }
+
+    func testPagedCommandKeepsSnapshotWhenEventIsDeletedBetweenPages() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: false, publishBeforeFirstPage: false)
+    }
+
+    private func assertPagedCommandKeepsSupersededSnapshot(inserting: Bool, publishBeforeFirstPage: Bool = true) async throws {
+        let start = Date().addingTimeInterval(3_600)
+        let oldEvents = (0..<3).map { event("Old \($0)", start.addingTimeInterval(Double($0) * 600)) }
+        let latest = inserting ? [event("Inserted", start.addingTimeInterval(-600))] + oldEvents : Array(oldEvents.dropFirst())
+        let (h, store, _) = harness([])
+        let started = expectation(description: "old calendar.events read blocked")
+        let provider = BlockingCalendarRead(old: oldEvents, latest: latest, started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let params: [String: JSONValue] = ["from": .string(CalendarDates.iso(window.start)),
+                                         "to": .string(CalendarDates.iso(window.end)), "limit": 1]
+        let old = Task { try await h.run("calendar.events", .object(params)) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        if publishBeforeFirstPage {
+            // The newer command publishes before the older command can return its first page.
+            _ = try await h.run("calendar.events", .object(params))
+            XCTAssertEqual(store.cache.events(overlapping: window.start, window.end).map(\.id), latest.map(\.id))
+        }
+        provider.release()
+        var result = try await old.value
+        var seen: [String] = []
+        for _ in 0..<oldEvents.count {
+            seen += (result["events"]?.arrayValue ?? []).compactMap { $0["id"]?.stringValue }
+            guard let cursor = result["cursor"]?.stringValue else { break }
+            // Also publish changes between pages, not just while the first read is suspended.
+            _ = try await store.fetch(from: window.start, to: window.end, principal: .user)
+            var next = params
+            next["cursor"] = .string(cursor)
+            result = try await h.run("calendar.events", .object(next))
+        }
+        XCTAssertEqual(seen, oldEvents.map(\.id), "no duplicates, omissions, or cursor-past-end after a refresh")
+        XCTAssertNil(result["cursor"]?.stringValue)
+    }
+
+    func testPagingSnapshotBoundsExpiryAndRangeValidation() throws {
+        let events = [EventJSON(event("Meeting", date(2026, 9, 30, 9)), note: nil)]
+        let from = date(2026, 9, 30), to = date(2026, 10, 1), now = date(2026, 9, 29)
+        let pages = CalendarEventPages(maxSnapshots: 1, lifetime: 10)
+        let first = try pages.retain(events, from: from, to: to, principal: .user, now: now)
+        let second = try pages.retain(events, from: from, to: to, principal: .user, now: now)
+        XCTAssertThrowsError(try pages.read(first + ":0", from: from, to: to, principal: .user, now: now))
+        XCTAssertEqual(try pages.read(second + ":0", from: from, to: to, principal: .user, now: now).events, events)
+        XCTAssertThrowsError(try pages.read(second + ":0", from: from.addingTimeInterval(1), to: to, principal: .user, now: now))
+        XCTAssertThrowsError(try pages.read(second + ":0", from: from, to: to, principal: .plugin("other"), now: now))
+        XCTAssertThrowsError(try pages.read(second + ":1", from: from, to: to, principal: .user, now: now))
+        XCTAssertThrowsError(try pages.read("1", from: from, to: to, principal: .user, now: now))
+        XCTAssertThrowsError(try pages.read(second + ":0", from: from, to: to, principal: .user, now: now.addingTimeInterval(10)))
+        let bytes = try JSONEncoder().encode(events).count
+        let budget = CalendarEventPages(maxBytes: bytes)
+        let evicted = try budget.retain(events, from: from, to: to, principal: .user)
+        _ = try budget.retain(events, from: from, to: to, principal: .user)
+        XCTAssertThrowsError(try budget.read(evicted + ":0", from: from, to: to, principal: .user))
+        XCTAssertThrowsError(try budget.retain(events + events, from: from, to: to, principal: .user))
+    }
+
+    func testPagingSnapshotIsForgottenWhenCalendarAccessIsLost() async throws {
+        let (h, store, _) = harness([event("A", date(2026, 9, 30, 9)), event("B", date(2026, 9, 30, 10))])
+        let first = try await h.run("calendar.events", ["from": "2026-09-30", "to": "2026-10-01", "limit": 1])
+        let cursor = try XCTUnwrap(first["cursor"]?.stringValue)
+        store.provider = FakeCalendarProvider(access: .denied, events: [])
+        let denied = await code {
+            _ = try await h.run("calendar.events", ["from": "2026-09-30", "to": "2026-10-01", "cursor": .string(cursor)])
+        }
+        XCTAssertEqual(denied, .unavailable)
+        store.provider = FakeCalendarProvider(access: .granted, events: [])
+        let expired = await code {
+            _ = try await h.run("calendar.events", ["from": "2026-09-30", "to": "2026-10-01", "cursor": .string(cursor)])
+        }
+        XCTAssertEqual(expired, .invalidParams)
     }
 
     // MARK: Event notes
@@ -562,6 +650,190 @@ final class FeatCalendarTests: XCTestCase {
                                    calendar: cal).pages.count, PlannerPlan.maxDays)
     }
 
+    func testSharedCalendarCacheRejectsOlderOverlappingFetch() async throws {
+        let oldEvent = event("Old snapshot", Date().addingTimeInterval(3_600))
+        let newEvent = event("New snapshot", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "old read blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [newEvent], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let old = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        let latest = try await store.fetch(from: window.start, to: window.end, principal: .user)
+        let revision = store.revision
+        let sync = store.cache.latestSync
+        XCTAssertTrue(store.isSyncing, "the older read is still running")
+        provider.release()
+        let older = try await old.value
+        XCTAssertEqual(older, [oldEvent], "superseded callers still receive their own successful read")
+        XCTAssertEqual(latest.map(\.id), [newEvent.id])
+        XCTAssertEqual(store.upcoming.map(\.id), [newEvent.id])
+        XCTAssertEqual(store.cache.events(overlapping: window.start, window.end).map(\.id), [newEvent.id], "planner reads the same protected cache")
+        XCTAssertEqual(store.cache.latestSync, sync)
+        XCTAssertEqual(store.revision, revision)
+        XCTAssertFalse(store.isSyncing)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testOlderReadPublishesWhenNewerOverlappingReadFails() async throws {
+        let oldEvent = event("Successful snapshot", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "older successful read blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [], started: started,
+                                            latestError: NibError.unavailable("newer read failed"))
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let old = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        do {
+            _ = try await store.fetch(from: window.start, to: window.end, principal: .user)
+            XCTFail("newer read should fail")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .unavailable) }
+        XCTAssertNotNil(store.lastError)
+        provider.release()
+        _ = try await old.value
+        XCTAssertEqual(store.upcoming, [oldEvent])
+        XCTAssertEqual(store.cache.events(overlapping: window.start, window.end), [oldEvent])
+        XCTAssertNotNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
+        XCTAssertFalse(store.isSyncing)
+    }
+
+    func testOlderReadPublishesWhenNewerOverlappingReadIsCancelled() async throws {
+        let oldEvent = event("Successful snapshot", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "older successful read blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let old = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await store.fetch(from: window.start, to: window.end, principal: .user)
+        }
+        do { _ = try await cancelled.value; XCTFail("newer read should throw cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        provider.release()
+        _ = try await old.value
+        XCTAssertEqual(store.upcoming, [oldEvent])
+        XCTAssertEqual(store.cache.events(overlapping: window.start, window.end), [oldEvent])
+        XCTAssertNil(store.lastError)
+        XCTAssertFalse(store.isSyncing)
+    }
+
+    func testCancelledUpcomingLoadDoesNotShowAnErrorAndCanRetry() async throws {
+        let soon = event("Upcoming", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        let started = expectation(description: "UI read blocked")
+        let provider = BlockingCalendarRead(old: [soon], latest: [soon], started: started)
+        store.provider = provider
+        let read = Task { await store.loadUpcoming(session: h.session, connect: false) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        read.cancel()
+        provider.release()
+        await read.value
+        XCTAssertNil(store.lastError, "leaving the tab must not show a cancellation banner")
+        XCTAssertFalse(store.isSyncing)
+        XCTAssertFalse(store.upcomingLoaded)
+        await store.loadUpcoming(session: h.session, connect: false)
+        XCTAssertEqual(store.upcoming, [soon])
+        XCTAssertTrue(store.upcomingLoaded)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testEventLookupReturnsItsOwnReadWhenBackgroundRefreshSupersedesIt() async throws {
+        let oldEvent = event("Requested event", Date().addingTimeInterval(3_600))
+        let newEvent = event("New snapshot", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "event lookup blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [newEvent], started: started)
+        store.provider = provider
+        let lookup = Task { try await store.event(id: oldEvent.id, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        let window = CalendarDates.upcomingWindow()
+        _ = try await store.fetch(from: window.start, to: window.end, principal: .user)
+        let revision = store.revision
+        provider.release()
+        let found = try await lookup.value
+        XCTAssertEqual(found, oldEvent)
+        XCTAssertEqual(store.upcoming, [newEvent])
+        XCTAssertEqual(store.cache.events(overlapping: window.start, window.end), [newEvent])
+        XCTAssertEqual(store.revision, revision)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testInFlightReadReturnsEmptyAfterAccessLossEvenIfAccessReturns() async throws {
+        let oldEvent = event("Private event", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "private read blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let read = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        store.provider = FakeCalendarProvider(access: .denied, events: [])
+        store.refreshAccess() // forgetEvents invalidates the in-flight read, even with an empty cache.
+        store.provider = FakeCalendarProvider(access: .granted, events: [])
+        provider.release()
+        let result = try await read.value
+        XCTAssertTrue(result.isEmpty)
+        XCTAssertTrue(store.upcoming.isEmpty)
+        XCTAssertNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testProviderSwapReturnsOldReadWithoutPublishingIt() async throws {
+        let oldEvent = event("Old provider", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "old provider blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let read = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        store.provider = FakeCalendarProvider(access: .granted, events: [])
+        provider.release()
+        let result = try await read.value
+        XCTAssertEqual(result, [oldEvent])
+        XCTAssertTrue(store.upcoming.isEmpty)
+        XCTAssertTrue(store.accounts.isEmpty)
+        XCTAssertNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
+    }
+
+    func testExplicitlyCancelledCalendarReadStillThrowsCancellation() async throws {
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "cancelled read blocked")
+        let provider = BlockingCalendarRead(old: [], latest: [], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let read = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        read.cancel()
+        provider.release()
+        do { _ = try await read.value; XCTFail("explicit cancellation must still throw") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(store.cache.latestSync)
+        XCTAssertNil(store.lastError)
+    }
+
     func testOtherEventsIgnoresAnOlderSuccessAfterTheNewDayFinishes() async throws {
         let model = OtherEventsModel()
         model.date = date(2026, 9, 29)
@@ -718,6 +990,114 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertEqual(notifier.replaced, [[soon.id], []], "the later rebuild (off) lands last")
     }
 
+    func testFailedReminderReplacementPreservesOldRequestAndRetryClearsError() async throws {
+        let soon = event("Soon", Date().addingTimeInterval(3 * 3_600))
+        let (h, store, _) = harness([soon])
+        let requests = FailingCalendarRequests()
+        let scheduler = UserNotificationScheduler(requests: requests)
+        let plan = CalendarReminderPlanner.plan([soon], minutesBefore: 10, now: Date())
+        try await scheduler.replace(prefix: CalendarReminderNames.identifierPrefix, with: plan)
+        let id = try XCTUnwrap(plan.first?.identifier)
+        let original = try XCTUnwrap(requests.pending[id])
+        requests.fail = true
+        let notifier = TestCalendarScheduler(scheduler)
+        store.notifier = notifier
+        store.cache.store([soon], from: Date().addingTimeInterval(-3_600), to: Date().addingTimeInterval(Self.day), at: Date())
+        h.app.settings.set(CalendarSettings.reminderMinutes, 30)
+        var reports = 0
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { _ in
+            reports += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        await store.rescheduleReminders()
+        XCTAssertNotNil(store.reminderError)
+        XCTAssertTrue(requests.pending[id] === original)
+        await store.rescheduleReminders()
+        XCTAssertEqual(reports, 1, "the lasting Retry banner does not need another identical toast on every refresh")
+        notifier.status = .denied
+        await store.rescheduleReminders()
+        XCTAssertNil(store.reminderError, "a retry banner is not actionable without notification authorization")
+        notifier.status = .authorized
+        requests.fail = false
+        await store.rescheduleReminders()
+        XCTAssertNil(store.reminderError)
+        XCTAssertFalse(requests.pending[id] === original)
+        XCTAssertEqual(requests.pending.count, 1)
+    }
+
+    func testMovingEventPreservesPreviousReminderUntilReplacementSucceeds() async throws {
+        var original = event("Meeting", Date().addingTimeInterval(3 * 3_600))
+        original.id = CalendarEventID.make(externalID: "meeting", occurrence: original.start, allDay: false, calendar: .current)
+        original.key = CalendarEventID.key(externalID: "meeting", recurrence: nil, allDay: false, calendar: .current)
+        var moved = original
+        moved.start = original.start.addingTimeInterval(3_600)
+        moved.end = original.end.addingTimeInterval(3_600)
+        moved.id = CalendarEventID.make(externalID: "meeting", occurrence: moved.start, allDay: false, calendar: .current)
+        let obsolete = event("Deleted meeting", Date().addingTimeInterval(5 * 3_600))
+        let requests = FailingCalendarRequests()
+        let scheduler = UserNotificationScheduler(requests: requests)
+        let prefix = CalendarReminderNames.identifierPrefix
+        let oldPlan = CalendarReminderPlanner.plan([original, obsolete], minutesBefore: 10, now: Date())
+        let newPlan = CalendarReminderPlanner.plan([moved], minutesBefore: 10, now: Date())
+        let oldID = prefix + original.id
+        let newID = prefix + moved.id
+        XCTAssertNotEqual(oldID, newID)
+        try await scheduler.replace(prefix: prefix, with: oldPlan)
+        let previous = try XCTUnwrap(requests.pending[oldID])
+        requests.fail = true
+        do {
+            try await scheduler.replace(prefix: prefix, with: newPlan)
+            XCTFail("replacement should fail")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .unavailable) }
+        XCTAssertTrue(requests.pending[oldID] === previous)
+        XCTAssertNil(requests.pending[newID])
+        requests.fail = false
+        try await scheduler.replace(prefix: prefix, with: newPlan)
+        XCTAssertNil(requests.pending[oldID])
+        XCTAssertEqual(Set(requests.pending.keys), [newID])
+        XCTAssertEqual(requests.pending[newID]?.content.userInfo[CalendarReminderNames.eventKey] as? String, moved.id)
+        try await scheduler.replace(prefix: prefix, with: newPlan)
+        XCTAssertEqual(Set(requests.pending.keys), [newID], "retries do not duplicate reminders")
+    }
+
+    func testPartialReplacementRollsBackNewRequestsWhenLegacyIdentityIsUnknown() async throws {
+        let now = Date()
+        var original = event("Legacy meeting", now.addingTimeInterval(3 * 3_600))
+        original.id = CalendarEventID.make(externalID: "legacy", occurrence: original.start, allDay: false, calendar: .current)
+        var moved = original
+        moved.start = original.start.addingTimeInterval(3_600)
+        moved.end = original.end.addingTimeInterval(3_600)
+        moved.id = CalendarEventID.make(externalID: "legacy", occurrence: moved.start, allDay: false, calendar: .current)
+        let other = event("New meeting", now.addingTimeInterval(5 * 3_600))
+        let requests = FailingCalendarRequests()
+        let scheduler = UserNotificationScheduler(requests: requests)
+        let prefix = CalendarReminderNames.identifierPrefix
+        var legacyPlan = CalendarReminderPlanner.plan([original], minutesBefore: 10, now: now)
+        legacyPlan[0].eventKey = nil
+        try await scheduler.replace(prefix: prefix, with: legacyPlan)
+        let oldID = prefix + original.id
+        let newID = prefix + moved.id
+        let previous = try XCTUnwrap(requests.pending[oldID])
+        let foreign = UNNotificationRequest(identifier: "study.reminder", content: UNMutableNotificationContent(), trigger: nil)
+        requests.pending[foreign.identifier] = foreign
+        let plan = CalendarReminderPlanner.plan([moved, other], minutesBefore: 10, now: now)
+        requests.failedIdentifiers = [prefix + other.id]
+        do {
+            try await scheduler.replace(prefix: prefix, with: plan)
+            XCTFail("selective addition should fail")
+        } catch { XCTAssertEqual(NibError.wrap(error).code, .unavailable) }
+        XCTAssertTrue(requests.successfulIdentifiers.contains(newID), "the moved replacement succeeded before the other addition failed")
+        XCTAssertTrue(requests.pending[oldID] === previous)
+        XCTAssertTrue(requests.pending[foreign.identifier] === foreign)
+        XCTAssertEqual(Set(requests.pending.keys), [oldID, foreign.identifier], "rollback preserves the legacy request without a duplicate")
+        requests.failedIdentifiers = []
+        try await scheduler.replace(prefix: prefix, with: plan)
+        XCTAssertEqual(Set(requests.pending.keys), [newID, prefix + other.id, foreign.identifier])
+        XCTAssertNil(requests.pending[oldID])
+        try await scheduler.replace(prefix: prefix, with: plan)
+        XCTAssertEqual(requests.pending.count, 3, "retry remains idempotent")
+    }
+
     // MARK: The cache horizon
 
     func testSyncedRangesAreClippedToTheHorizon() {
@@ -760,7 +1140,7 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertGreaterThan(pages, 1)
         XCTAssertEqual(seen.count, 60)
         XCTAssertEqual(Set(seen), Set(many.map { $0.id }), "every event exactly once, none skipped")
-        XCTAssertEqual(fake.reads, pages, "the cache no longer covers the range, so every page reads the calendar")
+        XCTAssertEqual(fake.reads, 1, "paging retains the complete read even when the shared cache trims its horizon")
     }
 
     func testCreateNoteForAnEventBeyondTheHorizon() async throws {
@@ -876,4 +1256,59 @@ final class FeatCalendarTests: XCTestCase {
                                  NibSnapshot.fittingSize(view, width: 640).height, "\(access): AX3 text grows the tab")
         }
     }
+}
+
+@MainActor
+private final class FailingCalendarRequests: CalendarNotificationRequests {
+    var pending: [String: UNNotificationRequest] = [:]
+    var fail = false
+    var failedIdentifiers = Set<String>()
+    var successfulIdentifiers = Set<String>()
+    func pendingRequests() async -> [UNNotificationRequest] { Array(pending.values) }
+    func add(_ request: UNNotificationRequest) async throws {
+        if fail || failedIdentifiers.contains(request.identifier) { throw NibError.unavailable("test scheduling failure") }
+        pending[request.identifier] = request
+        successfulIdentifiers.insert(request.identifier)
+    }
+    func remove(_ identifiers: [String]) { for id in identifiers { pending[id] = nil } }
+}
+
+@MainActor
+private final class TestCalendarScheduler: NotificationScheduling {
+    let scheduler: UserNotificationScheduler
+    var status = NotificationAuthorization.authorized
+    init(_ scheduler: UserNotificationScheduler) { self.scheduler = scheduler }
+    func authorization() async -> NotificationAuthorization { status }
+    func requestAuthorization() async -> Bool { true }
+    func replace(prefix: String, with reminders: [PlannedReminder]) async throws {
+        try await scheduler.replace(prefix: prefix, with: reminders)
+    }
+}
+
+private final class BlockingCalendarRead: CalendarProvider {
+    let access = CalendarAccess.granted
+    let old: [CalendarEvent]
+    let latest: [CalendarEvent]
+    let started: XCTestExpectation
+    let latestError: Error?
+    private let lock = NSLock()
+    private var reads = 0
+    private let gate = DispatchSemaphore(value: 0)
+    init(old: [CalendarEvent], latest: [CalendarEvent], started: XCTestExpectation, latestError: Error? = nil) {
+        self.old = old; self.latest = latest; self.started = started
+        self.latestError = latestError
+    }
+    func release() { gate.signal() }
+    func requestAccess() async -> CalendarAccess { access }
+    func events(from: Date, to: Date) throws -> [CalendarEvent] {
+        lock.lock(); reads += 1; let first = reads == 1; lock.unlock()
+        if first {
+            started.fulfill()
+            guard gate.wait(timeout: .now() + 3) == .success else { throw NibError.unavailable("calendar gate timed out") }
+        }
+        if !first, let latestError { throw latestError }
+        return first ? old : latest
+    }
+    func calendars() -> [CalendarInfo] { latest.map(\.calendar) }
+    func observeChanges(_ handler: @escaping () -> Void) -> AnyObject? { nil }
 }

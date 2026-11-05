@@ -1111,6 +1111,7 @@ final class CollabSession {
     private var app: NibApp { service.app }
 
     private(set) var id: String
+    private(set) var joinInProgress = false
     private(set) var phase: CollabPhase
     private(set) var myRole: CollabRole
     private(set) var remoteDoc: DocumentID?
@@ -1265,6 +1266,8 @@ final class CollabSession {
 
     /// Joins as a guest: connect, say hello, and wait until the host admits us and the document is here.
     func join() async throws {
+        try beginJoin()
+        defer { joinInProgress = false }
         phase = .connecting
         changed()
         try await transport.join(code: code, displayName: myName)
@@ -1273,9 +1276,18 @@ final class CollabSession {
         try await waitUntilReady(timeout: service.timing.approvalTimeout) { _ = transmit(hello, to: nil) }
     }
 
+    private func beginJoin() throws {
+        guard !joinInProgress else {
+            throw NibError(.conflict, String(localized: "Joining this live session is already in progress. Wait for it to finish."))
+        }
+        joinInProgress = true
+    }
+
     /// Re-joins after the connection dropped, presenting the admission secret (no second approval).
     func rejoin() async throws {
         guard side == .guest, !isClosed else { return }
+        try beginJoin()
+        defer { joinInProgress = false }
         phase = .reconnecting
         hostPeer = nil
         changed()
@@ -2780,6 +2792,9 @@ final class CollabService: ObservableObject {
         }
         if let s = session, !s.isClosed {
             if s.side == .guest, s.code == code {
+                guard !s.joinInProgress else {
+                    throw NibError(.conflict, String(localized: "Joining this live session is already in progress. Wait for it to finish."))
+                }
                 if let local = s.localDoc, isLocked(local) {
                     let reason = String(localized: "Your copy is locked, so you left the live session.")
                     let e = NibError(.locked, reason, hint: "remove the password lock first")
@@ -2845,6 +2860,7 @@ final class CollabService: ObservableObject {
         guard let s = session, !s.isClosed else { return }
         switch s.side {
         case .guest:
+            guard !s.joinInProgress else { return }
             guard s.phase == .reconnecting || !s.isConnectedToHost || away >= timing.suspendThreshold else { return }
             rejoinTask?.cancel()
             rejoinTask = nil
@@ -2894,7 +2910,7 @@ final class CollabService: ObservableObject {
             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
             if Task.isCancelled { return }
             guard let s = session, s.side == .guest, !s.isClosed else { return }
-            if s.phase == .active, s.isConnectedToHost { return }
+            if s.joinInProgress || (s.phase == .active && s.isConnectedToHost) { return }
             do {
                 try await s.rejoin()
                 return
