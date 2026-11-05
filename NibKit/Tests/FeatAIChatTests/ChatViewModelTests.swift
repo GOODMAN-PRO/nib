@@ -6,6 +6,41 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testCitationLabelsRefreshAfterPageReorderAndDocumentRename() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let pageRef = "page:FIXTUREDOC01/FIXTUREPG001"
+        let docRef = "doc:FIXTUREDOC01"
+        model.entries = [ChatEntry(id: "CITATIONS", role: "assistant", text: "See \(pageRef) in \(docRef).")]
+        model.refreshCitations()
+        XCTAssertEqual(model.entries[0].citationLabels[pageRef], "Page 1")
+        h.app.commands.register(CommandDescriptor(id: "test.reorder", title: "Reorder", summary: "Swap fixture pages.", effect: .edit)) { _, ctx in
+            var pages = try ctx.workspace.content(Fixtures.docID).livePages
+            let firstOrder = pages[0].order
+            pages[0].order = pages[1].order
+            pages[1].order = firstOrder
+            try ctx.mutate { tx in
+                _ = try tx.put(pages[0], doc: Fixtures.docID)
+                _ = try tx.put(pages[1], doc: Fixtures.docID)
+            }
+            return [:]
+        }
+        _ = try await h.run("test.reorder")
+        try h.library.rename(Fixtures.docID, to: "Renamed notebook")
+        XCTAssertEqual(model.citationLabel(pageRef), "Page 2")
+        model.refreshCitations()
+        XCTAssertEqual(model.entries[0].citationLabels[pageRef], "Page 2")
+        XCTAssertEqual(model.entries[0].citationLabels[docRef], "Renamed notebook")
+        XCTAssertEqual(model.entries[0].displayText, "See Page 2 in Renamed notebook.")
+    }
+
+    func testEntryCitationFallbackIsReplacedWhenResolutionBecomesAvailable() {
+        var entry = ChatEntry(id: "LATECITE", role: "assistant", text: "See page:D/P.")
+        entry.resolveCitations { _ in "Page" }
+        entry.resolveCitations { _ in "Page 3" }
+        XCTAssertEqual(entry.displayText, "See Page 3.")
+    }
+
     func testRecoverableToolErrorsStayWithAIWhileUserErrorsCanBeDismissed() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let model = ChatRuntime.get(h.app).model(for: h.session)

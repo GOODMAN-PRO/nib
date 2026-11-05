@@ -36,7 +36,7 @@ struct ChatEntry: Identifiable {
     }
 
     mutating func resolveCitations(_ label: (String) -> String) {
-        for ref in citationRefs where citationLabels[ref] == nil { citationLabels[ref] = label(ref) }
+        citationLabels = Dictionary(uniqueKeysWithValues: citationRefs.map { ($0, label($0)) })
         displayText = ChatCitations.replacingRefs(in: text, labels: citationLabels, refs: citationRefs)
     }
 }
@@ -177,7 +177,6 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var isLoadingChat = false
     private var loadToken: UUID?
     private var imageTask: Task<Data, Error>?
-    private var citationLabels: [String: String] = [:]
     private var retryImages: [AssetRef] = []
     private var retryEntry: String?
     private var confirmationContinuation: CheckedContinuation<ConfirmationDecision, Never>?
@@ -309,6 +308,7 @@ final class ChatViewModel: ObservableObject {
     func loadContext(principal: Principal = .user) async throws {
         guard let app else { throw NibError.unavailable("assistant is closed") }
         refreshSessionScope()
+        refreshCitations()
         let result = try await app.bus.execute(CommandIDs.queryContext, [:], principal: principal, session: session)
         let value = result
         docKind = value["document"]?["kind"]?.stringValue.flatMap(DocumentKind.init(rawValue:))
@@ -428,6 +428,7 @@ final class ChatViewModel: ObservableObject {
         }
         guard canStartGeneration else { throw NibError(.conflict, "a turn or conversation load is already running") }
         refreshSessionScope()
+        refreshCitations()
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("enter a question or instruction", path: "$.prompt") }
         let images = retry ? retryImages : attachments
@@ -684,7 +685,13 @@ final class ChatViewModel: ObservableObject {
     private func resolveEntryCitations(_ index: Int) {
         var entry = entries[index]
         entry.resolveCitations(citationLabel)
-        entries[index] = entry
+        if entry.citationLabels != entries[index].citationLabels || entry.displayText != entries[index].displayText {
+            entries[index] = entry
+        }
+    }
+
+    func refreshCitations() {
+        for index in entries.indices { resolveEntryCitations(index) }
     }
 
     func confirmationTargetLabel(_ raw: String) -> String {
@@ -696,7 +703,6 @@ final class ChatViewModel: ObservableObject {
     }
 
     func citationLabel(_ raw: String) -> String {
-        if let cached = citationLabels[raw] { return cached }
         guard let ref = NodeRef(raw) else { return String(localized: "Reference") }
         let content = ref.documentID.flatMap { try? app?.workspace.content($0) }
         let label: String
@@ -715,7 +721,6 @@ final class ChatViewModel: ObservableObject {
         case .library: label = String(localized: "Library")
         case .folder: label = String(localized: "Folder")
         }
-        citationLabels[raw] = label
         return label
     }
 

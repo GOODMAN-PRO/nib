@@ -82,6 +82,7 @@ struct ChatPanel: View {
             // this never configures a provider or contacts its endpoint.
             while !Task.isCancelled {
                 model.refreshProviderLabel()
+                model.refreshCitations()
                 do { try await Task.sleep(for: .seconds(2)) } catch { return }
             }
         }
