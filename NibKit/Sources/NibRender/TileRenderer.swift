@@ -474,7 +474,7 @@ final class NibPageRenderer: PageRenderer {
             }
         }
         guard let done = composite, let image = done.image else {
-            throw NibError(.internalError, "could not allocate a \(px.width)×\(px.height) px bitmap")
+            throw NibError(.internalError, String(localized: "Could not render this page. Try again."))
         }
         var marks: [String: String] = [:]
         for m in done.marks { marks[String(m.number)] = m.ref }
@@ -500,6 +500,9 @@ final class NibPageRenderer: PageRenderer {
         if !missing.isEmpty {
             let fresh = await renderTiles(missing, job: job, level: level, variant: variant)
             try Task.checkCancellation()
+            guard fresh.count == missing.count else {
+                throw NibError(.internalError, String(localized: "Could not render this page. Try again."))
+            }
             images.merge(fresh) { $1 }
         }
         if !wantMarks, coords.count == 1, let only = images[coords[0]], TileGrid.scale(level: level) == scale,

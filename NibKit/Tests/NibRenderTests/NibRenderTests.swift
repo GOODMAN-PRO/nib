@@ -196,6 +196,85 @@ final class NibRenderTests: XCTestCase {
 
     // MARK: render.page
 
+    func testUnreadableBackgroundFailsWithoutCachingAndRecoversWhenAssetArrives() async throws {
+        for isPDF in [true, false] {
+            for corrupt in [false, true] {
+                let h = Harness(features: [NibRenderFeature.self])
+                let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+                let asset = AssetRef(isPDF ? "delayed.pdf" : "delayed.png")
+                let background: Background = isPDF ? .ofPDF(asset, page: 0) : .ofImage(asset)
+                let (doc, page) = try makePage(h, items: [], background: background)
+                if corrupt { h.assets.install(Data("incomplete download".utf8), as: asset, doc: doc) }
+                let pageKey = TileCache.pageKey(doc, page)
+                let file = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 160))
+                let probe = try renderer.thumbnailProbe(doc: doc, page: page)
+                let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: 160)
+                // Exercise both the cached tile path and direct compositing (hidden-item requests).
+                for direct in [false, true] {
+                    var request = RenderRequest(doc: doc, page: page, scale: 1)
+                    if direct { request.hidden = [NibID("HIDDENITEM01")] }
+                    do {
+                        _ = try await renderer.render(request)
+                        XCTFail("Unreadable background was returned as a successful render")
+                    } catch let error as NibError {
+                        XCTAssertEqual(error.code, .internalError, "must reach the canvas error banner, which ignores unavailable")
+                    }
+                    XCTAssertEqual(renderer.tiles.count(page: pageKey), 0)
+                }
+                let failedThumbnail = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 160)
+                XCTAssertNil(failedThumbnail)
+                await diskSettled(renderer)
+                XCTAssertNil(renderer.thumbnails.memoryImage(key))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+                // Asset delivery makes no workspace commit and does not invalidate caches.
+                let data: Data
+                if isPDF { data = Fixtures.pdfData() }
+                else { data = try XCTUnwrap(twoColourPNG()) }
+                h.assets.install(data, as: asset, doc: doc)
+                let recovered = try await renderer.render(RenderRequest(doc: doc, page: page, scale: 1))
+                let bmp = bitmap(recovered.image)
+                XCTAssertGreaterThan(darkPixels(bmp, x: 0..<recovered.image.width, y: 0..<recovered.image.height), 0)
+                let thumbnail = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 160)
+                XCTAssertNotNil(thumbnail)
+                await diskSettled(renderer)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+            }
+        }
+    }
+
+    func testRecognitionCanOmitAnUnreadableBackground() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let (doc, page) = try makePage(h, items: [shortStroke()], background: .ofPDF(AssetRef("missing.pdf"), page: 0))
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+        let request = RenderRequest(doc: doc, page: page, scale: 1, background: false)
+        let result = try await renderer.render(request)
+        XCTAssertEqual(result.image.width, 240)
+    }
+
+    func testPDFWithMissingPageIsReopenedOnRetry() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+        let asset = AssetRef("partial.pdf")
+        let (doc, page) = try makePage(h, items: [], background: .ofPDF(asset, page: 1))
+        h.assets.install(Fixtures.pdfData(), as: asset, doc: doc)
+        let request = RenderRequest(doc: doc, page: page, scale: 1)
+        do {
+            _ = try await renderer.render(request)
+            XCTFail("Missing PDF page rendered successfully")
+        } catch let error as NibError { XCTAssertEqual(error.code, .internalError) }
+        let bounds = CGRect(x: 0, y: 0, width: 240, height: 200)
+        let complete = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+            context.beginPage()
+            context.beginPage()
+            context.cgContext.setFillColor(UIColor.black.cgColor)
+            context.cgContext.fill(bounds)
+        }
+        h.assets.install(complete, as: asset, doc: doc)
+        let recovered = bitmap(try await renderer.render(request).image)
+        XCTAssertLessThan(rgb(recovered, 120, 100).r, 20)
+    }
+
     func testRenderPageIncludesOnlySelectedInkAndOmitsBackground() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let selected = Item.makeStroke(Stroke(style: .defaultPen,
