@@ -1994,6 +1994,35 @@ final class FeatLibraryUITests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "lib"], session: h.session)
         XCTAssertNil(LibraryMenus.context(model, location: .libraryNew, rows: []).folder)
     }
+    func testSearchAndFilterPruneHiddenBulkSelection() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.reload()
+        let documents = model.visibleRows.filter { !$0.isFolder }
+        XCTAssertGreaterThan(documents.count, 1)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "all"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["search": "no matching library row"], session: h.session)
+        XCTAssertTrue(model.visibleRows.isEmpty)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+        XCTAssertTrue(model.selectedRows.isEmpty)
+
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["search": "", "selection": "clear"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "all"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["filter": "folders"], session: h.session)
+        XCTAssertFalse(model.selectedRows.isEmpty)
+        XCTAssertTrue(model.selectedRows.allSatisfy(\.isFolder))
+        XCTAssertEqual(model.selection.refs, Set(model.visibleRefs))
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["filter": "documents"], session: h.session)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+        XCTAssertTrue(model.selectedRows.isEmpty)
+
+        // A visible selected row survives sorting, while a stale injected ref cannot reach the menu.
+        let visible = try XCTUnwrap(model.visibleRefs.first)
+        model.selection.refs = [visible, "doc:hidden"]
+        XCTAssertEqual(model.selectedRows.map(\.ref), [visible])
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sort": "name"], session: h.session)
+        XCTAssertEqual(model.selection.refs, [visible])
+    }
+
     func testSelectionThroughCommandAndFloatingToast() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)

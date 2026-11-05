@@ -166,6 +166,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     deinit { eventSubscription?.cancel() }
+    var selectedRows: [LibraryRow] { visibleRows.filter { selection.refs.contains($0.ref) } }
     var folderRef: JSONValue { .string(folder.map { NodeRef.folder($0).description } ?? "lib") }
     var title: String {
         if collection != .documents { return collection.title }
@@ -261,7 +262,7 @@ final class LibraryViewModel: ObservableObject {
         sortedRows = rows; sortInputs = inputs; sortPasses += 1
         visibleRows = LibrarySorting.rows(rows, sort: recentOrder ? .manual : sort, filter: filter, manual: manual, search: search)
         splitSections()
-        selection.retain(rows.map(\.ref))
+        selection.retain(visibleRefs)
     }
     func splitSections() {
         let sections = LibrarySorting.sections(visibleRows)
@@ -869,7 +870,7 @@ struct LibraryRootView: View {
     private var selectionBar: some View {
         NibBarGroup(id: "library.selection") {
             Text(model.selection.statusText).font(NibFont.hud).foregroundStyle(NibColor.label)
-            LibraryMenuEntries(model: model, location: .librarySelection, rows: model.rows.filter { model.selection.refs.contains($0.ref) }, compact: true)
+            LibraryMenuEntries(model: model, location: .librarySelection, rows: model.selectedRows, compact: true)
             NibIconButton(.xmark, label: String(localized: "Finish Selecting")) { model.setView(["selection": "clear"]) }
             .accessibilityIdentifier("cmd.library.setView")
         }
