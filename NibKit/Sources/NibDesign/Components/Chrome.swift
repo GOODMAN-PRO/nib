@@ -1,6 +1,61 @@
 import SwiftUI
 import UIKit
 
+/// Shared by the shell and explicit cancellation owners. Never dismiss a UIKit
+/// controller directly: the owner's closure must update its presentation binding.
+public enum NibEscapePolicy {
+    public static func permitsCancellation(isSystemPrompt: Bool, dismissalDisabled: Bool,
+                                           delegateAllowsDismissal: Bool) -> Bool {
+        !isSystemPrompt && !dismissalDisabled && delegateAllowsDismissal
+    }
+}
+
+@MainActor
+public protocol NibEscapeHandling: AnyObject {
+    @discardableResult func handleEscape() -> Bool
+}
+
+@MainActor
+public enum NibEscapeRouting {
+    /// Only explicit owners participate in the view-tree fallback. It also works
+    /// when a sheet's text field has resigned and focus has returned to the shell.
+    public static func cancel(in view: UIView) -> Bool {
+        guard !view.isHidden, view.alpha > 0.01 else { return false }
+        for child in view.subviews.reversed() {
+            if cancel(in: child) { return true }
+        }
+        return (view as? NibEscapeHandling)?.handleEscape() ?? false
+    }
+}
+
+public extension View {
+    /// Register the very same closure as Cancel. Disabled owners consume Escape
+    /// without cancelling, so an underlying surface cannot handle it instead.
+    func nibEscapeCancellation(isEnabled: Bool = true, onCancel: @escaping () -> Void) -> some View {
+        background(NibEscapeCancellationBridge(isEnabled: isEnabled, onCancel: onCancel))
+    }
+}
+
+private struct NibEscapeCancellationBridge: UIViewRepresentable {
+    let isEnabled: Bool
+    let onCancel: () -> Void
+    func makeUIView(context: Context) -> NibEscapeCancellationView { NibEscapeCancellationView() }
+    func updateUIView(_ view: NibEscapeCancellationView, context: Context) {
+        view.onCancel = isEnabled ? onCancel : {}
+    }
+    static func dismantleUIView(_ view: NibEscapeCancellationView, coordinator: ()) { view.onCancel = nil }
+}
+
+final class NibEscapeCancellationView: UIView, NibEscapeHandling {
+    var onCancel: (() -> Void)?
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+    func handleEscape() -> Bool {
+        guard let onCancel else { return false }
+        onCancel()
+        return true
+    }
+}
+
 /// A top-bar droplet: a Clear capsule of icon buttons (44 pt, up to 52 pt at the Dynamic Type cap).
 public struct NibBarGroup<Content: View>: View {
     let id: String

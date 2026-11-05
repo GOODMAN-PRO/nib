@@ -1977,6 +1977,33 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertTrue(manager.canUndo)
         XCTAssertEqual(h.app.settings.json(LibraryOrder.key(nil)), after)
     }
+    func testNewNotebookEscapeUsesPanelCancelAndClearsPresentationState() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var descriptor = PanelDescriptor(id: "create.newNotebook", title: "New Notebook",
+            icon: NibSymbol.notebook.name, placement: .sheet, order: 0, owner: "test") { _ in
+                AnyView(Text("Unsaved draft"))
+            }
+        descriptor.providesHeader = true
+        h.app.ui.panels.register(descriptor)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView,
+            ["panel": "create.newNotebook"], session: h.session)
+        let panel = try XCTUnwrap(model.modal)
+        let host = UIHostingController(rootView: LibraryPanelView(panel: panel, model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
+        for _ in 0..<30 {
+            if model.modal == nil { break }
+            await Task.yield()
+        }
+        XCTAssertNil(model.modal, "The binding driving the sheet must become nil")
+        XCTAssertFalse(h.session.openPanels.contains(panel.id))
+    }
+
     func testPanelsPreserveParamsSelectTabAndClose() async throws {
         let h = harness()
         h.app.ui.panels.register(PanelDescriptor(id: "test.sheet", title: "Sheet", icon: NibSymbol.folder.name, placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })

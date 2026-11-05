@@ -1186,6 +1186,13 @@ struct LibraryPanelView: View {
                 }
                 descriptor.makeView(model.panelContext(panel))
             }.background(NibColor.background)
+                .background {
+                    // The New Notebook panel's Cancel calls this exact context
+                    // dismissal. Other custom headers register their own handler.
+                    if !descriptor.providesHeader || panel.id == "create.newNotebook" {
+                        Color.clear.nibEscapeCancellation { model.panelContext(panel).dismiss() }
+                    }
+                }
         } else {
             NibEmptyState(symbol: .warningTriangle, title: String(localized: "Panel unavailable"),
                 primary: NibAction(String(localized: "Close"), command: "library.setView") { model.setView(["panel": .string(panel.id), "close": true]) })

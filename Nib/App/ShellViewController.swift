@@ -283,6 +283,10 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0)")
             #endif
             NibUITestKeyLog.note("shell unhandled \(input) flags \(flags.rawValue)")
+            if input == "escape", modifiers.isEmpty, cancelPresentedSurface() {
+                unhandled.remove(press)
+                continue
+            }
             guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
                 descriptors: app.content.keyCommands.all.filter {
                     ShellChromePolicy.permits($0, hasModal: ShellChromePolicy.hasModal(self))
@@ -293,6 +297,27 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             unhandled.remove(press)
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    private func cancelPresentedSurface() -> Bool {
+        guard let modal = topmostModal(in: self) else { return false }
+        let presentation = modal.presentationController
+        let disabled = modal.isModalInPresentation || modal.children.contains { $0.isModalInPresentation }
+        let permitted = NibEscapePolicy.permitsCancellation(isSystemPrompt: modal is UIAlertController,
+            dismissalDisabled: disabled,
+            delegateAllowsDismissal: presentation.map { $0.delegate?.presentationControllerShouldDismiss?($0) ?? true } ?? true)
+        guard permitted else { return false }
+        return NibEscapeRouting.cancel(in: modal.view)
+    }
+
+    private func topmostModal(in controller: UIViewController) -> UIViewController? {
+        if let presented = controller.presentedViewController {
+            return topmostModal(in: presented) ?? presented
+        }
+        for child in controller.children.reversed() {
+            if let modal = topmostModal(in: child) { return modal }
+        }
+        return nil
     }
 
     /// What decides which key commands are live in this window: the document kind it shows, whether text has the
