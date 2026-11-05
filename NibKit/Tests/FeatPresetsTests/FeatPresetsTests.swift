@@ -43,6 +43,7 @@ private struct PresetPopoverTestHost: View {
 final class PaintedRenderer: PageRenderer {
     let rect: Rect
     let colour: UIColor
+    var fail = false
     let scaleFactor: Double
     private(set) var requests: [RenderRequest] = []
 
@@ -54,6 +55,7 @@ final class PaintedRenderer: PageRenderer {
 
     func render(_ request: RenderRequest) async throws -> RenderResult {
         requests.append(request)
+        if fail { throw NibError.invalid("Sample unavailable") }
         let region = request.region ?? Rect(x: 0, y: 0, width: PageSize.a4.width, height: PageSize.a4.height)
         let scale = request.scale * scaleFactor
         let size = CGSize(width: max(1, (region.width * scale).rounded()), height: max(1, (region.height * scale).rounded()))
@@ -1119,6 +1121,44 @@ final class FeatPresetsTests: XCTestCase {
         let capped = PaintedRenderer(rect: Rect(x: 100, y: 100, width: 50, height: 50), colour: .blue, scaleFactor: 0.5)
         let edge = try await EyedropperSampler.sample(capped, doc: Fixtures.docID, page: Fixtures.page1, at: Point(101, 101), scale: 10)
         assertClose(edge.colour, RGBA(0, 0, 255))
+    }
+
+    func testEyedropperFailureKeepsSlotAndPickerOpen() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let renderer = PaintedRenderer(rect: Rect(x: 0, y: 0, width: 500, height: 500), colour: .blue)
+        h.app.services.renderer = renderer
+        let host = FakeCanvasHost(h), picker = EyedropperAttachment()
+        picker.attach(to: host)
+        defer { picker.detach(from: host) }
+        picker.begin(.init(tool: "pen", target: .slot(1)))
+        for _ in 0..<100 where picker.current == nil { await Task.yield() }
+        XCTAssertNotNil(picker.current)
+        let before = presets(h, "pen")
+        renderer.fail = true
+        picker.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(125, 125)), host: host)
+        await picker.commitTask?.value
+        XCTAssertEqual(presets(h, "pen"), before)
+        XCTAssertTrue(picker.isActive)
+        renderer.fail = false
+        picker.loupe.onUse?()
+        await picker.commitTask?.value
+        assertClose(presets(h, "pen").swatches[1].color, RGBA(0, 0, 255))
+        XCTAssertFalse(picker.isActive)
+    }
+
+    func testAccessibleMoveThenImmediateUseSamplesRequestedPosition() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        h.app.services.renderer = PaintedRenderer(rect: Rect(x: 110, y: 100, width: 10, height: 10), colour: .blue)
+        let host = FakeCanvasHost(h), picker = EyedropperAttachment()
+        picker.attach(to: host)
+        defer { picker.detach(from: host) }
+        picker.begin(.init(tool: "pen", target: .slot(1)))
+        picker.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(105, 105)), host: host)
+        let action = try XCTUnwrap(picker.loupe.accessibilityCustomActions?.first { $0.name == String(localized: "Move Right") })
+        XCTAssertEqual(action.actionHandler?(action), true)
+        picker.loupe.onUse?()
+        await picker.commitTask?.value
+        assertClose(presets(h, "pen").swatches[1].color, RGBA(0, 0, 255))
     }
 
     func testEyedropperSetsTheSlotToTheColourUnderTheFinger() async throws {

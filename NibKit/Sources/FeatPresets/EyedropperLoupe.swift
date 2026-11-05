@@ -118,6 +118,8 @@ final class EyedropperAttachment: CanvasAttachment {
     /// The last pick: the final sample and the preset command it runs.
     private(set) var commitTask: Task<Void, Never>?
     let loupe: EyedropperLoupeView
+    private(set) var requested: (page: PageID, point: Point)?
+    private var committing = false
     private var pending: (page: PageID, point: Point)?
     private var sampling: Task<Void, Never>?
     private var generation = 0
@@ -129,6 +131,7 @@ final class EyedropperAttachment: CanvasAttachment {
         loupe = EyedropperLoupeView()
         loupe.onUse = { [weak self] in self?.commit(at: nil) }
         loupe.onCancel = { [weak self] in self?.end() }
+        loupe.onMove = { [weak self] dx, dy in self?.move(dx: dx, dy: dy) }
     }
 
     func attach(to host: CanvasHost) {
@@ -146,8 +149,8 @@ final class EyedropperAttachment: CanvasAttachment {
     }
 
     func canvasDidChange(_ host: CanvasHost) {
-        guard isActive, let s = current else { return }
-        place(page: s.page, point: s.point)
+        guard isActive, let target = requested else { return }
+        place(page: target.page, point: target.point)
     }
 
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool { isActive }
@@ -176,6 +179,7 @@ final class EyedropperAttachment: CanvasAttachment {
         toolWatch = host.session.$tool.dropFirst().sink { [weak self] _ in self?.end() }
         host.canvasView.bringSubviewToFront(loupe)
         loupe.isHidden = false
+        loupe.becomeFirstResponder()
         let bounds = host.canvasView.bounds
         let middle = CGPoint(x: bounds.midX, y: bounds.midY)
         if let hit = host.pagePoint(middle) {
@@ -192,11 +196,14 @@ final class EyedropperAttachment: CanvasAttachment {
         request = nil
         toolWatch = nil
         pending = nil
+        requested = nil
+        committing = false
         current = nil
         generation += 1
         sampling?.cancel()
         sampling = nil
         loupe.isHidden = true
+        loupe.resignFirstResponder()
     }
 
     private var renderScale: Double {
@@ -210,7 +217,9 @@ final class EyedropperAttachment: CanvasAttachment {
 
     /// Moves the loupe at once and renders the newest point; renders never queue up behind a fast finger.
     private func track(page: PageID, point: Point) {
-        guard isActive else { return }
+        guard isActive, !committing else { return }
+        requested = (page, point)
+        loupe.position = point
         place(page: page, point: point)
         pending = (page: page, point: point)
         guard sampling == nil else { return }
@@ -236,26 +245,46 @@ final class EyedropperAttachment: CanvasAttachment {
         }
     }
 
-    /// Samples the release point once more (the last render may be a frame behind) and applies the colour.
+    /// Accessibility and keyboard positioning share the touch sampling path.
+    func move(dx: Double, dy: Double) {
+        guard let target = requested, let host else { return }
+        let viewPoint = host.viewPoint(target.point, page: target.page)
+        let next = CGPoint(x: viewPoint.x + CGFloat(dx), y: viewPoint.y + CGFloat(dy))
+        guard let hit = host.pagePoint(next) else { return }
+        track(page: hit.page, point: hit.point)
+    }
+
+    /// Only a successful sample of the requested point may change a swatch.
     private func commit(at spot: (page: PageID, point: Point)?) {
-        guard let request, let host else { return }
+        guard !committing, let request, let host, let target = spot ?? requested else { return }
         let app = host.app, session = host.session, doc = host.documentID, scale = renderScale
-        let target: (page: PageID, point: Point)? = spot ?? current.map { (page: $0.page, point: $0.point) }
-        let fallback = current?.colour
-        end()
-        commitTask = Task { @MainActor in
-            var colour = fallback
-            if let target, let renderer = app.services.renderer,
-               let s = try? await EyedropperSampler.sample(renderer, doc: doc, page: target.page, at: target.point, scale: scale) {
-                colour = s.colour
+        guard let renderer = app.services.renderer else { return }
+        requested = target
+        committing = true
+        sampling?.cancel()
+        sampling = nil
+        pending = nil
+        generation += 1
+        let gen = generation
+        commitTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.generation == gen { self.committing = false } }
+            do {
+                let sample = try await EyedropperSampler.sample(renderer, doc: doc, page: target.page, at: target.point, scale: scale)
+                guard self.generation == gen else { return }
+                if await EyedropperAttachment.apply(sample.colour, request: request, app: app, session: session),
+                   self.generation == gen { self.end() }
+            } catch {
+                guard self.generation == gen else { return }
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                    userInfo: ["command": "render.page", "error": NibError.wrap(error)])
             }
-            guard let picked = colour else { return }
-            await EyedropperAttachment.apply(picked, request: request, app: app, session: session)
         }
     }
 
     /// The page colour is opaque, so it goes in as #RRGGBB (a highlighter slot then gets its own opacity).
-    static func apply(_ colour: RGBA, request: Request, app: NibApp, session: EditorSession) async {
+    @discardableResult
+    static func apply(_ colour: RGBA, request: Request, app: NibApp, session: EditorSession) async -> Bool {
         let hex = PresetColour.rgbHex(colour)
         let call: PresetActions.Call
         switch request.target {
@@ -265,7 +294,9 @@ final class EyedropperAttachment: CanvasAttachment {
             call = PresetActions.call("preset.addSwatch", request.tool, ["color": .string(hex)])
         }
         // A failed command shows its toast; the select feedback is for a colour that actually landed.
-        if await PresetActions.run(app, session: session, [call]).value { NibHaptics.play(.select) }
+        let applied = await PresetActions.run(app, session: session, [call]).value
+        if applied { NibHaptics.play(.select) }
+        return applied
     }
 }
 
@@ -280,6 +311,32 @@ final class EyedropperLoupeView: UIView {
 
     var onUse: (() -> Void)?
     var onCancel: (() -> Void)?
+    var onMove: ((Double, Double) -> Void)?
+    var position: Point? { didSet { updateAccessibilityValue() } }
+
+    override var canBecomeFirstResponder: Bool { true }
+    override var keyCommands: [UIKeyCommand]? {
+        [UIKeyCommand.inputLeftArrow, UIKeyCommand.inputRightArrow,
+         UIKeyCommand.inputUpArrow, UIKeyCommand.inputDownArrow].map {
+            UIKeyCommand(input: $0, modifierFlags: [], action: #selector(moveKey(_:)))
+        }
+    }
+    @objc private func moveKey(_ command: UIKeyCommand) {
+        switch command.input {
+        case UIKeyCommand.inputLeftArrow: onMove?(-10, 0)
+        case UIKeyCommand.inputRightArrow: onMove?(10, 0)
+        case UIKeyCommand.inputUpArrow: onMove?(0, -10)
+        case UIKeyCommand.inputDownArrow: onMove?(0, 10)
+        default: break
+        }
+    }
+    private func updateAccessibilityValue() {
+        let name = colour.map { PresetColour.name($0) } ?? ""
+        guard let position else { accessibilityValue = name; return }
+        let x = position.x.formatted(.number.precision(.fractionLength(0)))
+        let y = position.y.formatted(.number.precision(.fractionLength(0)))
+        accessibilityValue = String(localized: "\(name), position \(x), \(y)")
+    }
     private(set) var colour: RGBA?
 
     private let lens = CALayer()
@@ -326,8 +383,12 @@ final class EyedropperLoupeView: UIView {
 
         isAccessibilityElement = true
         accessibilityLabel = String(localized: "Colour picker loupe")
-        accessibilityHint = String(localized: "Drag on the page to pick a colour, then lift to use it.")
+        accessibilityHint = String(localized: "Drag or use the movement actions or arrow keys to position the colour picker.")
         accessibilityCustomActions = [
+            UIAccessibilityCustomAction(name: String(localized: "Move Left")) { [weak self] _ in self?.onMove?(-10, 0); return true },
+            UIAccessibilityCustomAction(name: String(localized: "Move Right")) { [weak self] _ in self?.onMove?(10, 0); return true },
+            UIAccessibilityCustomAction(name: String(localized: "Move Up")) { [weak self] _ in self?.onMove?(0, -10); return true },
+            UIAccessibilityCustomAction(name: String(localized: "Move Down")) { [weak self] _ in self?.onMove?(0, 10); return true },
             UIAccessibilityCustomAction(name: String(localized: "Use This Colour")) { [weak self] _ in
                 self?.onUse?()
                 return true
@@ -376,7 +437,7 @@ final class EyedropperLoupeView: UIView {
                                   width: CGFloat(s.region.width) * k, height: CGFloat(s.region.height) * k)
         ring.strokeColor = PresetColour.cgColor(RGBA(s.colour.r, s.colour.g, s.colour.b))
         CATransaction.commit()
-        accessibilityValue = PresetColour.name(s.colour)
+        updateAccessibilityValue()
     }
 
     private func applyColours() {
