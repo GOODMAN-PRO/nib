@@ -31,6 +31,21 @@ public enum FeatLibraryUIFeature: NibFeature {
                 return try await importer.handler(routed, context)
             }
         }
+        // Creation shortcuts have no library folder in EditorSession. Supply it at
+        // the shared command boundary, preserving explicit and document destinations.
+        for id in [CommandIDs.panelOpen, "doc.quickNote"] {
+            guard let creation = app.commands.entry(id) else { continue }
+            app.commands.register(creation.descriptor) { params, context in
+                var routed = params
+                if (id != CommandIDs.panelOpen || params["id"]?.stringValue == "create.newNotebook"),
+                   params["folder"] == nil,
+                   let app = context.app, let session = context.activeSession, session.document == nil,
+                   let model = LibraryModels.get(app).models[session.id], model.collection == .documents {
+                    routed = params.merging(["folder": model.folderRef])
+                }
+                return try await creation.handler(routed, context)
+            }
+        }
     }
     public static func register(_ app: NibApp) {
         app.commands.register(LibrarySetView.self)

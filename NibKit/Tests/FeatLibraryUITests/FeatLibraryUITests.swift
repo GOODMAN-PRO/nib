@@ -588,6 +588,60 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(imported?["doc"], "doc:FIXTUREDOC01")
     }
 
+    func testCreationCommandsUseInvokingLibraryFolderAndPreserveOtherContexts() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.windowShowLibrary, title: "Library",
+            summary: "Show library", effect: .session, target: .app)) { _, _ in [:] }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Panel",
+            summary: "Record panel parameters", effect: .session, target: .app)) { params, _ in params }
+        // Exercise the destination through a creation-service stand-in, without importing a feature.
+        h.app.commands.register(CommandDescriptor(id: "doc.quickNote", title: "QuickNote",
+            summary: "Create a test note", effect: .library, target: .library)) { params, context in
+            guard !context.dryRun else { return params }
+            var content = Fixtures.sampleContent().0
+            content.meta.id = NibID.make()
+            let folder = try LibraryModels.folder(params["folder"]?.stringValue)
+            let id = try h.library.createDocument(content, title: "QuickNote", in: folder)
+            return ["ref": .string(NodeRef.document(id).description)]
+        }
+        await FeatLibraryUIFeature.start(h.app)
+        await FeatLibraryUIFeature.start(h.app)
+        model.folder = Fixtures.folderID
+        let opened = try await h.app.bus.execute(CommandIDs.panelOpen, ["id": "create.newNotebook"], session: h.session)
+        XCTAssertEqual(opened["folder"], "folder:FIXTUREFLD01")
+        let result = try await h.app.bus.execute("doc.quickNote", [:], session: h.session)
+        let ref = try XCTUnwrap(result["ref"]?.stringValue)
+        guard case .document(let id)? = NodeRef(ref) else { return XCTFail("Expected a document") }
+        XCTAssertEqual(h.library.node(id)?.parent, Fixtures.folderID)
+        for command in [CommandIDs.panelOpen, "doc.quickNote"] {
+            let base: JSONValue = command == CommandIDs.panelOpen ? ["id": "create.newNotebook"] : [:]
+            let explicit = try await h.app.bus.execute(Invocation(command: command,
+                params: base.merging(["folder": "lib"]), session: h.session, dryRun: true))
+            XCTAssertEqual(explicit.value["folder"], "lib")
+            for collection in [LibraryCollection.recents, .studySets] {
+                model.collection = collection
+                let unchanged = try await h.app.bus.execute(Invocation(command: command, params: base,
+                    session: h.session, dryRun: true))
+                XCTAssertNil(unchanged.value["folder"])
+            }
+            model.collection = .documents
+            h.session.document = Fixtures.docID
+            let document = try await h.app.bus.execute(Invocation(command: command, params: base,
+                session: h.session, dryRun: true))
+            XCTAssertNil(document.value["folder"])
+            h.session.document = nil
+            let other = EditorSession()
+            h.app.services.sessions.add(other)
+            let otherModel = LibraryModels.get(h.app).model(other)
+            let root = try await h.app.bus.execute(Invocation(command: command, params: base,
+                session: other, dryRun: true))
+            XCTAssertEqual(root.value["folder"], "lib")
+            withExtendedLifetime(otherModel) {}
+        }
+        let unrelated = try await h.app.bus.execute(CommandIDs.panelOpen, ["id": "another.panel"], session: h.session)
+        XCTAssertNil(unrelated["folder"])
+    }
+
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatLibraryUIFeature.self])
         XCTAssertEqual(problems, [])
