@@ -12,6 +12,7 @@ final class PagesUITests: XCTestCase {
     private var fixture: URL!
     private var inputs: URL?
     private var doc = ""
+    private var diagnosePageKeys = false
     private let notebook = "Physics — Motion"
 
     override func setUpWithError() throws {
@@ -81,6 +82,8 @@ final class PagesUITests: XCTestCase {
 
     // sidebar.select: individual toggles, Select All, contextual Cmd-A and swipe are real actions.
     func testSelectToggleAllAndBatchBookmarkScope() throws {
+        diagnosePageKeys = true
+        defer { diagnosePageKeys = false }
         try pages(window: true); try beginSelection()
         try tapThumb(1); try tapThumb(2)
         XCTAssertTrue(thumb(1).isSelected); XCTAssertTrue(thumb(2).isSelected)
@@ -92,6 +95,7 @@ final class PagesUITests: XCTestCase {
         try wait("Select All must check every thumbnail") { self.ui.app.staticTexts["4 Selected"].exists || (1...4).allSatisfy { self.thumb($0).isSelected } }
         try tap("Deselect All")
         XCTAssertFalse(thumb(2).isSelected)
+        logPageKey("Command-A")
         try ui.chord("a", .command) {
             try self.wait("Command-A must check all four thumbnails") { (1...4).allSatisfy { self.thumb($0).isSelected } }
         }
@@ -181,8 +185,6 @@ final class PagesUITests: XCTestCase {
         let photo = try ui.photoAsset(diagnostics: true)
         try require(photo, "Add Page > Image must present selectable Photos assets")
         try ui.tapPhotoAsset(photo)
-        let add = button("Add")
-        if add.exists && add.isHittable { add.tap() }
         try count(5)
         XCTAssertEqual(Set(try ids()).intersection(before).count, 4)
         let newImages = try live().filter { background($0)["kind"] as? String == "image" }
@@ -241,7 +243,7 @@ final class PagesUITests: XCTestCase {
         let before = try ids()
         try pages(window: true)
         let source = try require(thumb(1)), target = try require(thumb(3))
-        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8, thenDragTo: target.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.8)))
+        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.95, dy: 0.8))
         try wait("Dragging thumbnail into a gap must change page order") { (try? self.ids()) != before }
         XCTAssertEqual(Set(try ids()), Set(before))
         try closeNavigator(); try ui.tapCommand("edit.undo")
@@ -272,8 +274,7 @@ final class PagesUITests: XCTestCase {
         let before = try ids()
         try pages(window: true); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let source = try require(thumb(1)), target = try require(thumb(4))
-        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8,
-            thenDragTo: target.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.85)))
+        try dragThumbnail(source, to: target, offset: CGVector(dx: 0.98, dy: 0.85))
         try wait("Dragging a selection must reorder its stack") { (try? self.ids()) != before }
         let after = try ids(), first = try XCTUnwrap(try ids().firstIndex(of: before[0]))
         XCTAssertLessThan(first + 1, after.count)
@@ -330,10 +331,10 @@ final class PagesUITests: XCTestCase {
         let card = ui.app.buttons.matching(identifier: "cmd.doc.open").matching(NSPredicate(format: "label BEGINSWITH %@", notebook)).firstMatch
         try require(card).press(forDuration: 0.8); try tap("Open in New Window")
         try wait("Open in New Window must expose the source document") { self.ui.app.buttons["cmd.sidebar.toggle"].exists }
+        ui.logWindowScenes("after Open in New Window, before Pages chord")
         try pages()
         // iPadOS windowing control places this scene beside the other Nib scene.
-        let multitasking = ui.app.buttons.matching(NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label == 'Window Controls'")).firstMatch
-        ui.diagnoseWindowControls()
+        let multitasking = ui.systemWindowControls()
         try require(multitasking, "Window controls must allow arranging two Nib windows for page drag").tap()
         try tap("Split View", prefix: true)
         let other = XCUIApplication(bundleIdentifier: "com.apple.springboard").icons["Nib"].firstMatch
@@ -482,8 +483,16 @@ final class PagesUITests: XCTestCase {
         try tab("Pages", id: "sidebar.pages"); try navigate(2); try addOutline("Second")
         try tap("Outline Options"); try tap("Sort by Page Number")
         try wait("Sort must follow current page order") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Second", "Third"] }
-        try require(label("Second")).swipeLeft(); try tap("Delete")
+        try require(label("Second")).swipeLeft()
         try wait("Swipe Delete must remove only Second") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Third"] }
+        try count(4)
+        let third = try require(ui.app.tables["Outline"].cells.matching(NSPredicate(format: "label == 'Third'")).firstMatch)
+        try ui.dragWithoutIdle(from: third.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)),
+            to: third.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.5)), duration: 0.4)
+        try require(button("Delete"), "Partial swipe must reveal Delete without deleting Third")
+        XCTAssertEqual(try outline().map { $0["title"] as? String }, ["First", "Third"])
+        try tap("Delete")
+        try wait("Revealed Delete must remove only Third") { (try? self.outline().map { $0["title"] as? String }) == ["First"] }
         try count(4)
     }
 
@@ -571,7 +580,8 @@ final class PagesUITests: XCTestCase {
         try pages(); try navigate(1)
         try ui.waitForState { $0.strokeCountOnPage == source.strokeCountOnPage }
         try closeNavigator(); try manageTemplates(); try tap("Custom")
-        try require(button("Motion master")).press(forDuration: 0.8); try tap("Delete Template"); try confirm("Delete Template")
+        try ui.nativeContextMenu(try require(button("Motion master")), path: ["Delete Template"])
+        try confirm("Delete Template")
         try wait("Delete custom template must remove only chosen catalogue entry") { (try? self.customTemplates().contains { $0["title"] as? String == "Motion master" }) == false }
         try category("Essentials"); try require(button("Blank"))
         try assertAssets(added)
@@ -648,6 +658,7 @@ final class PagesUITests: XCTestCase {
         if !state.openPanels.contains(where: navigatorIDs.contains) {
             // Other page tests use the real navigator shortcut so a HUD regression does not mask them.
             // The sidebar button and HUD have their own direct-tap acceptance tests above.
+            logPageKey("Control-Command-S")
             try ui.chord("s", [.control, .command]) {
                 try self.ui.waitForState { $0.openPanels.contains(where: navigatorIDs.contains) }
             }
@@ -665,11 +676,31 @@ final class PagesUITests: XCTestCase {
     }
     private func closeNavigator() throws {
         if try ui.state().openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) {
+            logPageKey("Control-Command-S")
             try ui.chord("s", [.control, .command]) {
                 try self.ui.waitForState { !$0.openPanels.contains(where: { ["sidebar.pages", "outline.tab", "outline.bookmarks"].contains($0) }) }
             }
         }
     }
+    private func logPageKey(_ chord: String) {
+        guard diagnosePageKeys else { return }
+        let raw = ui.probe.exists ? ui.probe.value : nil
+        ui.logQA("Pages key responder", "before=\(chord) probe=\(String(describing: raw))")
+    }
+
+    private func dragThumbnail(_ source: XCUIElement, to target: XCUIElement, offset: CGVector) throws {
+        // Baseline session startup took 1.7-1.9s after touch-down. Keep the original lift/travel
+        // and add 1.5s of contact at the destination for startup and move-proposal acceptance.
+        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.8,
+            thenDragTo: target.coordinate(withNormalizedOffset: offset),
+            withVelocity: XCUIGestureVelocity(rawValue: 500), thenHoldForDuration: 1.5)
+        let menus = ui.app.menus.count
+        let preview = ui.app.otherElements["Preview"].firstMatch.exists
+        let actions = ui.app.buttons["cmd.page.duplicate"].firstMatch.exists
+        ui.logQA("Thumbnail drag result", "menus=\(menus) preview=\(preview) pageMenuAction=\(actions) contextMenu=\(menus > 0 || preview || actions)")
+        ui.logStateStep("thumbnail drag completed")
+    }
+
     private func thumb(_ number: Int) -> XCUIElement {
         ui.app.collectionViews.matching(NSPredicate(format: "label == 'Page thumbnails'")).buttons.matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", "Page \(number)", "Page \(number),")).firstMatch
     }
@@ -705,7 +736,7 @@ final class PagesUITests: XCTestCase {
         try ui.waitForState { $0.page == target }
     }
     private func pageMenu(_ number: Int, _ action: String) throws {
-        try require(thumb(number)).press(forDuration: 0.8); try tap(action)
+        try ui.nativeContextMenu(try require(thumb(number)), path: [action])
     }
     private func beginSelection() throws {
         try tap("Select")
@@ -756,11 +787,14 @@ final class PagesUITests: XCTestCase {
         try ui.tapCommand("edit.redo"); try count(5)
     }
     private func copyPaste(keyboard: Bool) throws {
+        diagnosePageKeys = keyboard
+        defer { diagnosePageKeys = false }
         try draw()
         let before = try ids(), kinds = try itemKinds(try ids()[0]), content = try contentSignature(try ids()[0])
         try pages(); try beginSelection(); try tapThumb(1); try tapThumb(2)
         let revision = try ui.state().clipboardChangeCount ?? 0
         if keyboard {
+            logPageKey("Command-C")
             try ui.chord("c", .command) { try self.ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision } }
         } else { try selectionAction("Copy") }
         try ui.waitForState { ($0.clipboardChangeCount ?? 0) > revision }
@@ -791,9 +825,7 @@ final class PagesUITests: XCTestCase {
         try wait("Outline entry \(title) must be created") { (try? self.entry(title)) != nil }
     }
     private func outlineMenu(_ title: String, _ action: String, move: Bool = false) throws {
-        try require(label(title)).press(forDuration: 0.8)
-        if move { try tap("Move") }
-        try tap(action)
+        try ui.nativeContextMenu(try require(label(title)), path: move ? ["Move", action] : [action])
     }
     private func openTrash() throws {
         try closeNavigator(); try ui.tapCommand("window.showLibrary"); try tap("Trash", prefix: true)

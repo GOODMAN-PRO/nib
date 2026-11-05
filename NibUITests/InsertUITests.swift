@@ -795,7 +795,6 @@ final class InsertUITests: XCTestCase {
         try menu("Replace Image")
         let photo = try ui.photoAsset(diagnostics: true)
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
-        if visible("Add") { try tap("Add") }
         // F034 replaces an existing item, so its unchanged count is not a completion
         // signal. Let the native picker finish before querying the canvas hierarchy.
         try wait("Replacing an image must dismiss Photos", timeout: 15) { !photo.exists }

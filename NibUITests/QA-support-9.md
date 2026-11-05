@@ -144,3 +144,155 @@ These corrections supersede the round 1 ordinary-container return policy and exp
 Swift compilation and XCUITest execution are unavailable on this Windows host. CI must verify live ancestry, AX latency, native contact delivery and remote-picker timing; no runtime success or additional measured time saving is claimed.
 
 Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. The source audit against the pre-round-2 HEAD preserves all **586 test declarations, 943 XCTAssert lines and 14 allowance lines**, with no skip/sleep lines added. Exactly three files changed: Support/NibUI.swift, InkUITests.swift and this report. Re-read the changed Swift blocks and shared callers, checking optional bindings, XCTest queries/waiters, closure captures, helper signatures and bounded postconditions. No Objective-C changes.
+
+## Round 9b
+
+### H1 - form focus query cost
+
+Confirmed S:selection-timeouts-and-ink#1 and its verdict against the current focus/clear/replace path: Name/Base URL/Chat model consumed 66/25/33 seconds; the success path polled global focus then built debugDescription. After a tap, focus now requires the keyboard and one responder-probe read per observation. Initial field-specific focus checks remain scoped to the presented container (so another focused editor cannot qualify); Attributes inspection remains only the occluded-editor fallback. Native Select All reuses already-verified focus, preserving empty-before-type and exact replacement postconditions. A form batch resolves the container once and each typed field once; Assistant saves with native Command-S before dismissing the keyboard and polls one typed saved-status query. Other native callers keep their signatures and selection-preservation contract.
+
+Should unblock Selection Assistant attribution; next CI must show exact three values, Provider saved and the final provenance assertions, with per-field durations materially below the baseline. A sub-10-second field / sub-100-second test is a target, not measured. Host AX inflation remains possible.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Selection Assistant attribution | Native form field duration | Which scoped field still consumes the allowance? |
+| All native replacements | Native replacement duration | How long do focus, clear, type and exact verification take? |
+
+H1 caller review: the batch also reuses its resolved container for initial field-specific focus checks; absent lazy fields retain the existing bounded reveal path. Public callers retain defaults. Native Select All tries the cheap UIKit probe first and retains the existing field-specific fallback for remote editors whose focus the Nib probe cannot classify, preserving Insert/Chrome native selection behavior.
+
+
+### H2 - native context menu transaction
+
+Confirmed P:pages-outline-templates#0 (including the Move-opening post-event stall correction) and #2. Current pressWithoutIdle/tapWithoutIdle and NibTouchPaths.perform support a stationary contact without element idle waits. Added nativeContextMenu: two equal consecutive visible-frame reads, one 0.8-second centre press, query-only named item waits, synthesized taps for every path component, then a bounded menu-gone wait. Captured item frames distinguish the dismissed menu from a same-labelled Rename alert/Delete confirmation. A missing item logs target facts, raw probe, full hierarchy and screenshot and throws that message; there is no second press. Existing board callers and public synthesis signatures stay compatible; Pages callers follow in C2/C4.
+
+Next CI must show menu opening/item/dismissed in seconds without any 60-second idle wait, including Move, then all original assertions. Stable geometry mitigates the unproven custom-tile timing hypothesis; it does not prove its cause.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Native menu callers (Pages outline/thumbnail/template) | Native menu opening / item / dismissed | Which stable frame and named path received contacts, and how long did dismissal take? |
+| Same, on failure | Native menu missing / dismissal failed | Was the item absent after the single press, and what target/probe/tree remained? |
+
+### H3 - system window control evidence
+
+Confirmed S:selection-timeouts-and-ink#3 and L:#4 with the latter verifier rejecting a proven simulator-capability limit. Current selectors only recognize the old labels. Selection external Safari drag and Library external Files drop now use one bounded lookup, retaining both tests' control/Split View/drag/import expectations. A miss inventories every top-100pt button from snapshots of Nib, SpringBoard and (for Library) Files, logs full trees and per-window raw probes, hovers the visible window's top-leading +16pt point, then inventories again. Pointer support is checked; absence is logged, never skipped. No new window-management flow is guessed.
+
+Current QAStateProbe now exposes keyWindowState.isKey/dimensions/sceneActivation, but no UIScene identifier or authoritative keyboard-focus scene. Multiple probe-bearing AX windows are logged as evidence of multiple scenes; raw window count alone is not scene count. Missing scene ownership is explicit, not manufactured. Next CI must show the actual iOS 26 controls before/after hover and the original transfer/persistence assertions if the expected flow is available. Hover API verified against Apple's [XCUICoordinate documentation](https://developer.apple.com/documentation/xcuiautomation/xcuicoordinate).
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Selection external Safari / Library external Files | Window top controls / Window control hierarchy / Window control hover | What labels and identifiers exist in the top 100pt, and does pointer hover expose controls? |
+| Same | Window scene probe / Window scene count | Which AX windows carry document probes and report isKey, and is more than one scene observable? |
+
+### C1 - thumbnail drag destination contact
+
+Confirmed P:pages-drag-select#0/#1 and corrections: reorder's touch ended before the session replied; stack reached a proposal but never performDrop. The source of the 1.7-1.9s startup latency and operation=0 remains unproven. Both tests now use one helper with the original 0.8s lift and explicit 500pt/s travel, plus 1.5s destination hold (continuous gesture contact, not a sleep or allowance change). Reorder previously lasted about 1.85s, so this leaves about 1.45s after the latest observed startup; stack previously had only 0.55s after startup and now has about 2.05s. This is enough to test the timing hypothesis, not proof of proposal acceptance. Every reorder, adjacent-stack and whole-stack Undo assertion remains.
+
+Next CI must pair the runner result with app dragSessionWillBegin, move proposal and performDrop (two items for stack); operation=0 with the dwell keeps the cause unresolved, and the earlier split-stack symptom must still fail its assertion.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages reorder / selected-stack drag | Thumbnail drag result / State step (thumbnail drag completed) | Did a native context menu survive the gesture, and what selection/page/responder state followed? |
+
+### C2 - outline menu callers
+
+Confirmed the current outlineMenu uses ordinary press, Move tap and action tap while OutlineTableController supplies native context menus (P:pages-outline-templates#0 and correction). Rename, Delete and every Move submenu action now use H2 as one path. The shared thumbnail pageMenu also uses H2 for the diagnosed Add to Outline and Create Template from Page stalls. Kept assertions, Rename alert handling, submenu depth checks and all allowances.
+
+Should unblock Pages OutlineAddRenameNavigateAndDeleteRetainsPage, OutlineMoveNestOutdentAndThreeLevelLimit and remove the observed waits in OutlineThumbnailAndMoreAddTargetCorrectPage / template creation. Next CI must show all submenu contacts without idle waits, then the unchanged page-link, nesting, deletion and Undo checks. Uses the H2 diagnostic table; no separate log family.
+
+### C3 - full and partial outline swipes
+
+P:pages-outline-templates#1 is proven and current OutlineTableController still returns the default full-swipe-enabled action. Removed only the erroneous post-full-swipe Delete tap: the original [First, Third] and four-page checks now observe the immediate deletion of Second. Added a 0.4s synthesized partial drag across 30% of Third's row (85% to 55%), requiring the Delete button while both remaining titles are still present, then tapping it and requiring [First] with four pages intact. No sleeps or allowance changes.
+
+Should unblock OutlineSortByCurrentPageNumberAndSwipeDelete and cover both platform interactions. Next CI must prove full swipe deletes immediately and partial swipe only reveals until the button tap. Existing touch-path logging records delivered coordinates; no new log prefix.
+
+### C4 - custom template menu readiness
+
+P:pages-outline-templates#2 and verdict establish no menu after the Custom switch and long press, but do not distinguish layout movement, button arbitration or a delayed/swallowed touch (gesture-gate timeout). Current custom tile still has its own contextMenu. Template deletion now goes through H2 after switching to Custom, so the tile must have two consecutive stable visible frames before the single press. Confirmation and chosen-template-only, built-in availability, flattened-asset and page-count assertions remain.
+
+Should unblock CreateTemplateFromDrawnPageFlattensAppearanceAndDeleteOnlyChosenTemplate if delivery/readiness was responsible. Otherwise H2 logs the target/probe/tree and screenshot without blindly repressing. Next CI must show Delete Template followed by its separate confirmation and all original results; cause remains unknown until then. Uses H2's diagnostic table.
+
+### C5 - Photos selection and confirmation
+
+P:pages-outline-templates#3 and verdict prove the asset was selected while Add/Done-only readiness failed. Current helper had exactly that postcondition. The baseline tree also exposes the count as Button "1 Photo, Location Included" and the Photos container at (331,196,714,640), above the banner Close at y276. Selection now requires selected/value evidence or a positive photo-count button/text, or an already-dismissed picker. A single app snapshot, clipped to the observed picker bounds, logs every picker button's label, identifier, frame and enabled state. Confirmation must be one enabled inventoried button in the evidenced top-right title-bar region (trailing 80pt, top 60pt), excluding Close/Cancel/Back, or an existing legacy Add/Done. Duplicate remote-tree frames collapse; ambiguity fails with diagnostics. Resolve by identifier when unique, otherwise use that observed button's centre. The helper requires picker disappearance before returning.
+
+Audited all Photos callers: Pages AddImage and Insert ImageReplace/TapeImport select; Insert ImageSaveToPhotos only checks availability then cancels, so its contract stays. Removed redundant caller Add taps; all content/frame/undo/page-count checks remain. Next CI must record the actual confirm identity, selection count and closed picker before Pages reaches five pages or Insert asserts the replaced asset/pattern. No guessed confirm label or hard-coded screen tap.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages AddImage; Insert ImageReplace / TapeImport | Photos asset coordinate selection | Did AX selection state/value or the photo count prove the tap selected an asset? |
+| Same | Photos picker buttons / Photos picker confirm | Which actual control confirms the picker, and which observed frame was pressed? |
+| Same, failures | Photos confirm unresolved / Photos confirmation did not dismiss | Was confirmation ambiguous/absent, or did the chosen control fail to close the picker? |
+
+C5 source-review correction to the diagnosis's inferred label: baseline ui-PagesUITests/ui.log lines 12365-12370 (chunk 24) actually show Button identifier `Add`, label `Done`, frame (995,210,36,36). It is a title-bar sibling of the inner Other labelled Photos, not its descendant. Thus the failed Add/Done lookup was scoped too narrowly; the label itself is not unknown. Inventory and identifier rebinding now include title-bar siblings within the picker frame. The selected-state postcondition and actual-button requirement remain. This current artifact evidence supersedes the summary's missing-label inference.
+
+
+### C6 - cross-window chord attribution
+
+P:pages-drag-select#4's verifier overturns the scene attribution: 5B77B4C2 was original, 0198F6CA new; the missing press log does not prove delivery to no scene or a simulator limitation. Current test calls pages() immediately after Open in New Window. It now logs the AX window list and each window's full raw probe before that chord, including current keyWindowState.isKey/sceneActivation and keyResponder/keyLog. Later control discovery uses H3. All cross-window copy/source/content expectations remain.
+
+The current probe does not identify UIScenes or tie its global responder class to a specific scene; keyboard-focus ownership therefore remains explicitly unavailable under the NibUITests-only scope. Next CI must correlate per-window probe facts with app scene logs to determine which window is key and whether the chord arrives. Authoritative keyboard-focus scene IDs need an app-side probe extension; no focus-reset workaround is added. Uses H3's Window scene probe/count and top-control diagnostics with the unique before-Pages-chord step label.
+
+### C7 - Neaten source diagnostic
+
+Confirmed S:selection-timeouts-and-ink#2's **holds=false** verdict: empty Vision output is established, but straight segments are not a proven cause; the run never demonstrated reading meaningful text. Current test has four two-point strokes. Per the requested input experiment, replaced them with four 16-point cubic pen paths forming gently rounded H/I, 0.18 canvas heights tall (larger than the prior 0.12/0.13-height input), within the existing lasso region. Both glyphs retain four total strokes and all selection, source HI, restyled HI, pixel-change and exact Undo checks. Source screenshot/paths are captured before opening Convert; recognition value and copied source records are logged before and at completion/failure of the unchanged 30-second recognition assertion.
+
+No claim that denser handwriting fixes Vision. Next CI must show source HI and preserve meaning after Neaten, or retain the empty preview with legible source screenshot. The verifier's typed-image control through the app's Vision path and actual InkRender bitmap require app-side work outside this scope; runner screenshots/records cannot substitute for that raster. Raw [Nib QA recognize] bitmap/results remain in app.log.gz, not available to the runner probe.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Selection NeatenHandwriting | Neaten source ink | What 16-point paths and visible source did the test actually draw? |
+| Same | Neaten source recognition and stroke geometry / Neaten source recognition final | What text/placeholder and source records existed before and after the bounded source assertion? |
+
+### C8 - thumbnail key ownership
+
+Confirmed P:pages-drag-select#2/#3 with #2's downgrade: canvas focus takeover is observed, its exact path inferred; Command-C arrived at the grid then shell-routed to canvas copy. Current ThumbnailGridController already has the parallel app job's pressesBegan fallback and drag diagnostics. Added one raw probe read before each chord in SelectToggleAllAndBatchBookmarkScope and ContextualCommandCCopiesSelectedPages, including Control-Command-S in shared navigator helpers. No focus workaround, command rerouting or assertion changes.
+
+Next CI must show ThumbnailGridController before Command-A/C, app key action=selectAll/copy, the correct selection/clipboard change, and unchanged bookmark/paste/Undo content checks. A different responder or missing app key action remains attributable from these logs.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Pages SelectToggleAllAndBatchBookmarkScope / ContextualCommandCCopiesSelectedPages | Pages key responder | Which keyResponder/keyResponderIsText/keyWindowState and prior key log preceded each chord? |
+
+### Round 9b final review and validation
+
+Re-read every changed Swift block with its surrounding callers in Support, Pages, Selection, Library and Insert, and the current NibTouchPaths.h/.m synthesis signatures. Reviewed typed query APIs, snapshot attributes, pointer hover/support API, XCUIGestureVelocity(rawValue:), coordinate conversions, optionals, escaping predicate captures, throwing calls, predicate arguments and string-expression complexity. No Objective-C edits. H2 dismissal additionally requires no native Menu or Preview marker for two consecutive observations; a changed item frame alone cannot qualify as disappearance unless the same-labelled replacement belongs to an alert/confirmation sheet. Existing board press/tap signatures and other gesture behavior are unchanged.
+
+`python Scripts/lint.py`: **0 errors, 25 warnings**. `git diff --check f6bbe0b` and `git diff --check`: pass. Python source audit preserves all **586 test declarations and 14 allowance lines**. Every existing XCTAssert remains, except the equivalent Provider saved assertion now uses the single typed `saved` query; C3 adds one assertion that partial swipe has not yet deleted Third. No sleep/skip calls added. Exactly six paths changed, all under NibUITests. Eleven cluster commits have the required subjects and exact two-line attribution bodies. No push. The supplemental audit first hit Windows' default cp1252 decoding on an unchanged Swift file; rerunning with explicit UTF-8 passed.
+
+Runtime estimate, not measured: the menu paths cover the **11 observed 60-second waits (about 660 seconds)** in the baseline Pages log. The three provider fields consumed 124 seconds; meeting the proposed under-10-seconds-per-field target would save roughly another 94 seconds, but host AX cost remains unmeasured. The two thumbnail gestures add 3 seconds of actual contact in total; diagnostic queries and screenshots add overhead. These are potential avoided costs, not a predicted CI pass or measured net saving.
+
+Windows has no Swift/Objective-C toolchain or simulator, so compilation and every runtime outcome remain unverified. Reviewer/CI should especially verify the new menu dismissal/successor queries, Photos title-bar sibling inventory/remote-tree rebinding, scoped native focus and remote-editor fallback, hover API behavior, drag move acceptance and handwriting recognition. Authoritative scene IDs/keyboard-focus ownership and the typed-text Vision control/InkRender raster remain app-side limitations explicitly explained in H3/C6/C7. All requested clusters have a change or a scope-limited explanation; none is silently deferred.
+
+### Round 9b review fixes (round 1)
+
+Current source confirms the three major findings. The following decisions supersede the earlier descriptions of hover SDK verification, focus fallback coverage and container-restricted menu dismissal. Only NibUITests files change; test expectations, allowances and gesture durations remain intact.
+
+| Review issue | Change / decision | Required CI evidence |
+| --- | --- | --- |
+| H3 hover compilation (major) | Removed both direct `.hover()` and `supportsPointerInteraction` references. The top-leading coordinate checks `responds(to: NSSelectorFromString("hover"))` and invokes `perform` only when supported, otherwise logs unavailability. No iOS declaration of either disputed symbol is required. | Compile all classes; existing before/after inventories and Window control hover logs show runtime selector availability and any revealed controls. |
+| H1 cheap focus identity (minor) | Retain the explicitly permitted cheap keyboard-plus-text-responder signal after tapping. It proves text focus, not which editor owns it when another field already has the keyboard. Initial checks still compare field identity/frame; exact clear/replacement postconditions remain. This is a documented performance trade-off, not field-specific proof. | Exercise transitions between Name/Base URL/Chat model and native editor callers; verify exact values and existing per-field duration logs. |
+| C5 selection count (minor) | Keep asset selected state/value as the first selection check; restrict the fallback label to singular `1 Photo` with its optional metadata suffix. A library footer such as `7 Photos` no longer qualifies. | Photos callers show selected asset or the one-photo count, one enabled confirmation and picker dismissal. A pre-existing one-photo footer remains a possible ambiguity in the fallback. |
+| H2 item discovery (minor) | Search native menus and Preview first. The app-wide fallback excludes same-name controls at frames observed before the press, and enumerates bounded matches so persistent Delete/Move chrome cannot mask a new menu item. Baseline capture precedes the two-read target-frame stability wait. | Outline Rename/Delete/Move and template menus select the actual menu items without idle-waiting taps. |
+| C7 crossbar size (minor) | Clarify the size rule: the minimum 0.12 canvas-height span applies to the vertical letter strokes, which span 0.18. The H crossbar intentionally remains about 0.074 canvas widths with little vertical excursion so the glyph remains an H. No assertion or source path changes. | Source screenshot and recognition logs retain the existing meaningful-HI assertion; recognition remains unproven on this simulator. |
+| H1 remote-editor focus (major) | After the cheap five-second wait fails, run `isKeyboardFocused(field, allowingAttributeFallback: true, in: scope)` before throwing. Debug descriptions stay off the cheap successful path, including anonymous editors when attribute fallback is disabled. | Chrome/Insert GIPHY and LaTeX/native editor routes retain Attributes-only focus and selection; all shared callers retain their signatures. |
+| H2 same-named successors (major) | Dismissal requires no Menu/Preview markers and every activated item absent or at a different frame, for two consecutive observations. A same-named successor may live in an alert, sheet, popover or bare SwiftUI form; its container type no longer gates success. | C2 reaches the Rename alert and C4 reaches Delete Template confirmation before ordinary input; an unchanged item frame or remaining menu marker still prevents success. |
+| H3 existing non-hittable controls (minor) | After the hittable search and diagnostics, return the first existing primary/SpringBoard match even if it reports non-hittable. | Selection/Library/Pages retain their original missing-control and transfer assertions, with SpringBoard matches preserved. |
+| C3 partial swipe geometry (minor) | Resolve the Third cell inside the Outline table by its own label. Current OutlinePanel.swift makes the cell one accessibility element and assigns row.title to accessibilityLabel, so no descendant static text is required. The drag uses 85% to 55% of the full cell width. | Partial swipe reveals Delete, leaves First/Third intact until tapped, then leaves First with four pages. |
+| H1 unrelated form scope (minor) | textEditor searches typed controls in the presented container first, then app-wide on a miss. Field-specific focus checks likewise fall back app-wide with identity/frame matching. This also protects clearNativeText and native key callers. | Main-window editors remain discoverable/focused with unrelated presented surfaces; normal scoped matches return without the global fallback. |
+
+No new diagnostic family was needed: existing Native menu opening/item/dismissed, Window control hover, Photos asset coordinate selection and native duration logs answer the review questions above. Static review covered changed Swift blocks, all shared-helper callers, query types, optional bindings, selector dispatch, predicate arguments and bounded waits. Swift compilation and XCUITest execution remain unavailable on Windows; runtime selector presence does not itself prove successful pointer delivery. Fallback queries and the pre-menu inventory may add AX cost, which must be measured in CI.
+
+Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. A source comparison against the pre-review HEAD preserves all **586 test declarations, 944 XCTAssert lines and 14 allowance lines**, with no sleep/skip calls added. Exactly three files changed, all under NibUITests. This round is one new commit with the requested attribution; no amend or push.
+
+### Round 9b review fixes (round 2)
+
+| Review issue | Change / decision | Required CI evidence |
+| --- | --- | --- |
+| H2 menu item redeclaration (blocker) | Rename the mutable predicate capture to `found`, then bind `let item = found` after the bounded wait. This removes the same-scope redeclaration; activated-item tracking and synthesized taps are unchanged. | Compile the UI test target; Pages outline, thumbnail and template menu paths still open, select and dismiss correctly. |
+| C7 short H crossbar (minor) | Widen the third stroke from x=0.41...0.484 to x=0.40...0.50, with inner controls at 0.43/0.47, retaining the rounded 16-point path and all assertions. This supersedes round 1's decision to retain the short crossbar. The 0.10 canvas-width span is the requested diagnostic input experiment; its fraction of page height depends on the runtime canvas/page geometry. | Source screenshot and recorded paths show the wider crossbar crossing both H uprights; the unchanged source-HI and preservation assertions must pass. Vision recognition remains unproven. |
+| H1 anonymous-field focus (minor) | Accept and explicitly retain the behavior: empty identifier and label return false when `allowingAttributeFallback` is false. The initial focusField check may therefore proceed to a tap; the occluded-field and failed cheap-wait paths still opt into field-specific Attributes fallback. Restoring implicit debugDescription would violate the cheap successful-path requirement. | Anonymous/remote editors still reach their caller postconditions without expensive Attributes queries on the normal success path. |
+| H1 focus postcondition identity (minor) | Accept the documented keyboard-plus-text-responder signal after tapping. It cannot prove this field owns focus if another editor was already focused. replaceNativeText still verifies exact target text after clearing and replacement; nativeKey callers retain their own result checks. No extra success-path query or weaker assertion is added. | Exercise field-to-field transitions and native editor callers; retain exact values, content results and existing duration logs. |
+
+Reviewed both changed Swift blocks, closure capture/binding scopes and all callers of the affected helpers. No signatures, wait bounds, allowances or test assertions changed. Existing diagnostics suffice; no new log family. Swift compilation and simulator execution remain deferred to GitHub Actions because this Windows machine has no Swift toolchain.
+
+Validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `git diff --check` passes. Exactly three files changed, all under NibUITests. This round is one new commit with the requested round-2 subject and exact attribution body; no amend or push.

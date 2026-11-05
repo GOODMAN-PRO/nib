@@ -1257,14 +1257,23 @@ final class NibUI {
         let grid = app.otherElements["photos_sectioned_layout"].firstMatch
         let picker = app.otherElements.matching(NSPredicate(format: "label == 'Photos'")).firstMatch
         let selectionScope = picker.exists ? picker : app
+        func pickerGone() -> Bool { !grid.exists && !asset.exists && !picker.exists }
         app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(dx: frame.midX - origin.x, dy: frame.midY - origin.y)).tap()
         var outcome = "unobserved"
-        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
-            if !grid.exists && !asset.exists { outcome = "picker closed"; return true }
-            for name in ["Add", "Done"] {
-                let button = selectionScope.buttons[name].firstMatch
-                if button.exists && button.isEnabled { outcome = name + " enabled"; return true }
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            if pickerGone() { outcome = "picker closed"; return true }
+            if asset.exists, let snapshot = try? asset.snapshot() {
+                let value = (snapshot.value as? String ?? "").lowercased()
+                if snapshot.isSelected || value == "1" || value == "selected" {
+                    outcome = "asset selected value=\(value)"; return true
+                }
+            }
+            // iOS 26 exposes "1 Photo, Location Included" as a Button, not static text.
+            for kind in [XCUIElement.ElementType.button, .staticText] {
+                let count = selectionScope.descendants(matching: kind).matching(NSPredicate(
+                    format: "label MATCHES[c] '^1 Photo([, ].*)?$'")).firstMatch
+                if count.exists { outcome = "selection count: " + count.label; return true }
             }
             return false
         }, object: nil)
@@ -1273,6 +1282,60 @@ final class NibUI {
         guard result == .completed else {
             recordDiagnostics("Photos asset selection unobserved")
             throw Failure.message("Coordinate tap did not select the Photos asset")
+        }
+        if pickerGone() { return }
+        // The title-bar confirm is a sibling of the inner Other labelled Photos (baseline
+        // id=Add, label=Done), so inventory the app once and clip to the picker's observed frame.
+        let bounds = selectionScope.frame
+        guard let snapshot = try? app.snapshot() else {
+            throw Failure.message("Selected Photos picker has no button inventory")
+        }
+        func buttons(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+            (node.elementType == .button ? [node] : []) + node.children.flatMap { buttons($0) }
+        }
+        let inventory = buttons(snapshot).filter { button in
+            bounds.contains(CGPoint(x: button.frame.midX, y: button.frame.midY))
+        }
+        for button in inventory {
+            let identity = "label=\(button.label) id=\(button.identifier)"
+            logQA("Photos picker buttons", "\(identity) frame=\(button.frame) enabled=\(button.isEnabled)")
+        }
+        // The evidenced iOS 26 checkmark is in the top-right title bar, above the Private Access
+        // banner's Close button. Require an actual inventoried button in that region, never a guessed point.
+        var candidates = inventory.filter { button in
+            let f = button.frame
+            let visible = !f.isEmpty && !f.isNull && !f.isInfinite && bounds.contains(CGPoint(x: f.midX, y: f.midY))
+            let excluded = ["close", "cancel", "back"].contains(button.label.lowercased())
+            let titleBar = f.midX > bounds.maxX - 80 && f.midY < bounds.minY + 60
+            let named = button.label == "Add" || button.label == "Done"
+            return visible && button.isEnabled && !excluded && (titleBar || named)
+        }
+        // Remote trees can expose the same control twice. Geometry, not snapshot ordinal, identifies it.
+        var frames: [CGRect] = []
+        candidates = candidates.filter { button in
+            guard !frames.contains(button.frame) else { return false }
+            frames.append(button.frame); return true
+        }
+        guard candidates.count == 1, let confirm = candidates.first else {
+            recordDiagnostics("Photos confirm unresolved")
+            throw Failure.message("Selected Photos picker must expose one confirmation button; candidates=\(candidates.count)")
+        }
+        logQA("Photos picker confirm", "id=\(confirm.identifier) label=\(confirm.label) frame=\(confirm.frame)")
+        if !confirm.identifier.isEmpty {
+            let identified = app.buttons.matching(identifier: confirm.identifier)
+            let button = identified.firstMatch
+            if identified.count == 1, button.exists, button.frame == confirm.frame {
+                try pressWithoutIdle(at: CGPoint(x: button.frame.midX, y: button.frame.midY), duration: 0.05)
+            } else {
+                try pressWithoutIdle(at: CGPoint(x: confirm.frame.midX, y: confirm.frame.midY), duration: 0.05)
+            }
+        } else {
+            try pressWithoutIdle(at: CGPoint(x: confirm.frame.midX, y: confirm.frame.midY), duration: 0.05)
+        }
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in pickerGone() }, object: nil)
+        guard XCTWaiter.wait(for: [dismissed], timeout: 8) == .completed else {
+            recordDiagnostics("Photos confirmation did not dismiss")
+            throw Failure.message("Photos picker must close after confirmation")
         }
     }
 
@@ -1384,20 +1447,26 @@ final class NibUI {
     }
 
     /// Reads XCTest's native focus diagnostic, allowing input into an already-focused but keyboard-occluded editor.
-    func isKeyboardFocused(_ field: XCUIElement, allowingAttributeFallback: Bool = false) -> Bool {
+    func isKeyboardFocused(_ field: XCUIElement, allowingAttributeFallback: Bool = false,
+                           in container: XCUIElement? = nil) -> Bool {
         guard field.exists else { return false }
         let identifier = field.identifier, label = field.label
         if !identifier.isEmpty || !label.isEmpty {
             let identity = !identifier.isEmpty ? NSPredicate(format: "identifier == %@", identifier)
                 : NSPredicate(format: "label == %@", label)
             // Query the AX snapshot, never KVC-evaluate this SDK-dependent key on XCUIElement itself.
-            let focused = app.descendants(matching: field.elementType).matching(identity)
-                .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
-            if focused.exists && focused.frame == field.frame { return true }
+            let scope = container ?? nativeFormContainer()
+            func focused(in source: XCUIElement) -> Bool {
+                let match = source.descendants(matching: field.elementType).matching(identity)
+                    .matching(NSPredicate(format: "hasKeyboardFocus == true")).firstMatch
+                return match.exists && match.frame == field.frame
+            }
+            if focused(in: scope) { return true }
+            if scope !== app, focused(in: app) { return true }
             // GIPHY and LaTeX expose focus in Attributes but not the predicate on this OS.
             // Only explicit native-editor callers opt in; ordinary discovery stays cheap.
-            if !allowingAttributeFallback { return false }
         }
+        guard allowingAttributeFallback else { return false }
         // debugDescription includes the whole application tree after the Attributes line.
         // A different focused field (Duration) must not qualify this field (Timer name).
         return field.debugDescription.components(separatedBy: "\n").first?.contains("Keyboard Focused") == true
@@ -1535,12 +1604,45 @@ final class NibUI {
         }
     }
 
+    /// Resolve the presented form once for a batch; use typed queries inside it for each editor.
+    private func nativeFormContainer() -> XCUIElement {
+        for surface in [app.alerts.firstMatch, app.sheets.firstMatch, app.popovers.firstMatch] {
+            if surface.exists { return surface }
+        }
+        return app
+    }
+
+    @discardableResult
+    func fillNativeForm(_ values: [(String, String)]) throws -> XCUIElement {
+        let container = nativeFormContainer()
+        var last: XCUIElement?
+        for (name, value) in values {
+            let started = Date()
+            defer { logQA("Native form field duration", "field=\(name) seconds=\(Date().timeIntervalSince(started))") }
+            let field = container.textFields.matching(NSPredicate(
+                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            if !field.exists {
+                revealFormElement { field }
+                if let failure = formRevealFailure { throw Failure.message(failure) }
+            }
+            guard field.waitForExistence(timeout: 8) else { throw Failure.message("Missing form field: " + name) }
+            try replaceNativeText(in: field, with: value, container: container)
+            last = field
+        }
+        guard let last else { throw Failure.message("Native form needs at least one field") }
+        return last
+    }
+
     /// A focused field under a floating keypad can be non-hittable and still be the correct typing target.
     func textEditor(_ name: String, timeout: TimeInterval = 8) throws -> XCUIElement {
+        let container = nativeFormContainer()
         var field: XCUIElement?
         func locate() -> Bool {
-            for type in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
-                if let found = findControl(name, type: type, actionable: false) { field = found; return true }
+            let scopes = container === app ? [app] : [container, app]
+            for scope in scopes {
+                for type in [XCUIElement.ElementType.textField, .textView, .searchField, .secureTextField] {
+                    if let found = findControl(name, type: type, actionable: false, in: scope) { field = found; return true }
+                }
             }
             return false
         }
@@ -1556,32 +1658,42 @@ final class NibUI {
     }
 
     /// Waits for native field focus without retapping an existing selection or moving focus to global chrome.
-    func focusField(_ field: XCUIElement) throws {
-        if isKeyboardFocused(field) { return }
+    func focusField(_ field: XCUIElement, in container: XCUIElement? = nil) throws {
+        let scope = container ?? nativeFormContainer()
+        if isKeyboardFocused(field, in: scope) { return }
         if !hasVisibleFrame(field) || !field.isHittable {
             revealFormElement(field)
             if let failure = formRevealFailure { throw Failure.message(failure) }
         }
         guard hasVisibleFrame(field) && field.isHittable else {
             // Only a keyboard-occluded editor justifies the expensive Attributes-line check (GIPHY, LaTeX).
-            if isKeyboardFocused(field, allowingAttributeFallback: true) { return }
+            if isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) { return }
             throw Failure.message("Native field cannot receive focus: \(field)")
         }
         field.tap()
-        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in isKeyboardFocused(field) }, object: nil)
+        // Cheap evidence establishes text focus, not the identity of the editor. Exact text
+        // postconditions remain with callers; remote editors retain the field-specific fallback.
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            app.keyboards.firstMatch.exists && (try? readState())?.keyResponderIsText == true
+        }, object: nil)
         guard XCTWaiter.wait(for: [focused], timeout: 5) == .completed
-                || isKeyboardFocused(field, allowingAttributeFallback: true) else {
+                || isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) else {
             throw Failure.message("Native field did not gain keyboard focus: \(field.debugDescription)")
         }
     }
 
     /// Delivers modifiers while preserving native focus; callers verify the relevant text or formatting result.
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
+        try focusField(field)
+        try deliverNativeKey(key, modifiers, in: field)
+    }
+
+    private func deliverNativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
+                                  in field: XCUIElement) throws {
         try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
-            try focusField(field)
             if key.lowercased() == "a", modifiers.contains(.command) {
-                guard isKeyboardFocused(field, allowingAttributeFallback: true)
-                        || (try? readState())?.keyResponderIsText == true else {
+                guard (try? readState())?.keyResponderIsText == true
+                        || isKeyboardFocused(field, allowingAttributeFallback: true) else {
                     throw Failure.message("Native Select All rejected: text does not have the keyboard")
                 }
             }
@@ -1599,12 +1711,12 @@ final class NibUI {
     }
 
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
-    func clearNativeText(in field: XCUIElement) throws {
+    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil) throws {
         // focusField taps an unfocused editor and verifies focus before nativeKey can send Select All.
-        try focusField(field)
+        try focusField(field, in: container)
         guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
         if value.isEmpty || value == field.placeholderValue { return }
-        try nativeKey("a", in: field)
+        try deliverNativeKey("a", .command, in: field)
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         field.typeText(XCUIKeyboardKey.delete.rawValue)
         let remainingValue = field.value as? String
@@ -1623,8 +1735,10 @@ final class NibUI {
     }
 
     /// Waits for exact replacement, including empty fields, after proving the old content is gone.
-    func replaceNativeText(in field: XCUIElement, with text: String) throws {
-        try clearNativeText(in: field)
+    func replaceNativeText(in field: XCUIElement, with text: String, container: XCUIElement? = nil) throws {
+        let started = Date()
+        defer { logQA("Native replacement duration", "seconds=\(Date().timeIntervalSince(started))") }
+        try clearNativeText(in: field, container: container)
         if !text.isEmpty {
             timedAction("Native replacement delivery (\(text.count) characters)") { field.typeText(text) }
         }
@@ -1969,6 +2083,93 @@ final class NibUI {
                         [CGPoint(x: from.x + spacing, y: from.y), CGPoint(x: to.x + spacing, y: to.y)]], duration: duration)
     }
 
+    /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.
+    /// A path includes submenu openers, e.g. ["Move", "Move Up"]. Never retry the opening press.
+    func nativeContextMenu(_ element: XCUIElement, path: [String]) throws {
+        guard !path.isEmpty else { throw Failure.message("Context menu needs an action path") }
+        let started = Date()
+        // Native menus may expose only buttons under Preview. Remember existing controls so
+        // an app-wide fallback cannot mistake persistent Delete/Move chrome for a new item.
+        var existingFrames: [String: [CGRect]] = [:]
+        for name in path {
+            var frames: [CGRect] = []
+            for kind in [XCUIElement.ElementType.button, .menuItem] {
+                let matches = app.descendants(matching: kind).matching(NSPredicate(
+                    format: "label == %@ OR identifier == %@", name, name))
+                for candidate in matches.allElementsBoundByIndex.prefix(16) {
+                    if hasVisibleFrame(candidate), candidate.isHittable { frames.append(candidate.frame) }
+                }
+            }
+            existingFrames[name] = frames
+        }
+        var previous: CGRect?
+        var settled: CGRect?
+        let stable = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            guard hasVisibleFrame(element), element.isEnabled, element.isHittable else {
+                previous = nil; return false
+            }
+            let frame = element.frame
+            defer { previous = frame }
+            guard previous == frame else { return false }
+            settled = frame
+            return true
+        }, object: nil)
+        guard XCTWaiter.wait(for: [stable], timeout: 8) == .completed, let frame = settled else {
+            throw Failure.message("Context menu target did not settle: " + elementFacts(element))
+        }
+        logQA("Native menu opening", "path=\(path) frame=\(frame)")
+        try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: 0.8)
+        var activated: [(item: XCUIElement, frame: CGRect)] = []
+        for name in path {
+            var found: XCUIElement?
+            let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+                let menus = Array(app.menus.allElementsBoundByIndex.prefix(8))
+                let preview = app.otherElements["Preview"].firstMatch
+                let scopes = menus + (preview.exists ? [preview] : []) + [app]
+                for scope in scopes {
+                    for kind in [XCUIElement.ElementType.button, .menuItem] {
+                        let matches = scope.descendants(matching: kind).matching(NSPredicate(
+                            format: "label == %@ OR identifier == %@", name, name))
+                        for candidate in matches.allElementsBoundByIndex.prefix(16) {
+                            guard hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable else { continue }
+                            if scope === app, existingFrames[name, default: []].contains(candidate.frame) { continue }
+                            found = candidate; return true
+                        }
+                    }
+                }
+                return false
+            }, object: nil)
+            guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed, let item = found else {
+                let facts = "path=\(path) missing=\(name) target=" + elementFacts(element)
+                let state = " probe=\(String(describing: probe.exists ? probe.value : nil))"
+                let message = "Native context menu item absent: " + facts + state
+                logQA("Native menu missing", message)
+                recordDiagnostics("Native menu missing", includeHierarchy: true)
+                throw Failure.message(message)
+            }
+            activated.append((item, item.frame))
+            logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
+            try tapWithoutIdle(item)
+        }
+        var previouslyGone = false
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            let menuVisible = app.menus.firstMatch.exists || app.otherElements["Preview"].firstMatch.exists
+            let itemsGone = !menuVisible && activated.allSatisfy { action in
+                if !action.item.exists { return true }
+                // Lazy queries may now resolve to a same-named confirmation anywhere in the
+                // app, including an iPad popover or a SwiftUI form with no Sheet AX ancestor.
+                return action.item.frame != action.frame
+            }
+            defer { previouslyGone = itemsGone }
+            return previouslyGone && itemsGone
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 8) == .completed else {
+            recordDiagnostics("Native menu dismissal failed")
+            throw Failure.message("Native menu must disappear before ordinary input: \(path)")
+        }
+        logQA("Native menu dismissed", "path=\(path) seconds=\(Date().timeIntervalSince(started))")
+    }
+
     /// Caller must follow delivery with a bounded UI/state postcondition; completion only proves delivery.
     func pressWithoutIdle(_ element: XCUIElement, duration: TimeInterval) throws {
         guard element.exists, element.isEnabled, element.isHittable else {
@@ -1983,6 +2184,12 @@ final class NibUI {
 
     func tapWithoutIdle(_ element: XCUIElement) throws {
         try pressWithoutIdle(element, duration: 0.05)
+    }
+
+    /// Continuous coordinate path for a partial row swipe; caller verifies the revealed action.
+    func dragWithoutIdle(from start: XCUICoordinate, to end: XCUICoordinate,
+                         duration: TimeInterval) throws {
+        try synthesize(screenPaths: [[start.screenPoint, end.screenPoint]], duration: duration)
     }
 
     private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
@@ -2010,6 +2217,88 @@ final class NibUI {
         for (index, path) in paths.enumerated() {
             logQA("Touch path orientation", "orientation=\(XCUIDevice.shared.orientation.rawValue) path=\(index) first=\(String(describing: path.first?.cgPointValue)) last=\(String(describing: path.last?.cgPointValue))")
         }
+    }
+
+    /// AX windows are not UIScenes (keyboard/overlay windows also appear). Log each probe's own
+    /// keyWindowState, not an inferred key scene from window ordering or the global responder class.
+    func logWindowScenes(_ step: String) {
+        let windows = app.windows.allElementsBoundByIndex
+        var probeWindows = 0
+        for (index, window) in windows.enumerated() {
+            let probes = window.otherElements["nib.qa.state"].allElementsBoundByIndex
+            if !probes.isEmpty { probeWindows += 1 }
+            logQA("Window scene probe", "step=\(step) axWindow=\(index) " + elementFacts(window))
+            for (probeIndex, stateProbe) in probes.enumerated() {
+                let raw = stateProbe.value
+                logQA("Window scene probe", "step=\(step) axWindow=\(index) probe=\(probeIndex) raw=\(String(describing: raw))")
+            }
+        }
+        let evidence = probeWindows > 1 ? "multiple probe-bearing windows observed" : "not established by AX"
+        logQA("Window scene count", "step=\(step) axWindows=\(windows.count) probeWindows=\(probeWindows) moreThanOneScene=\(evidence); scene IDs and keyboard-focus owner scene are not exposed")
+    }
+
+    /// Keep the caller's missing-control assertion. A miss gathers evidence before/after pointer hover.
+    func systemWindowControls(in application: XCUIApplication? = nil) -> XCUIElement {
+        let primary = application ?? app
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let predicate = NSPredicate(format: "label CONTAINS[c] 'multitasking' OR label == 'Window Controls' OR identifier CONTAINS[c] 'window-controls'")
+        func candidate() -> XCUIElement? {
+            for source in [primary, springboard] {
+                let button = source.buttons.matching(predicate).firstMatch
+                if button.exists, button.isHittable { return button }
+            }
+            return nil
+        }
+        var found: XCUIElement?
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            found = candidate(); return found != nil
+        }, object: nil)
+        if XCTWaiter.wait(for: [ready], timeout: 5) == .completed, let found { return found }
+        var sources: [(String, XCUIApplication)] = [("Nib", app), ("SpringBoard", springboard)]
+        if application != nil { sources.append(("Foreground app", primary)) }
+        func inventory(_ stage: String) {
+            for (name, source) in sources {
+                guard let snapshot = try? source.snapshot() else {
+                    logQA("Window top controls", "stage=\(stage) source=\(name) snapshot unavailable"); continue
+                }
+                func visit(_ node: XCUIElementSnapshot, top: CGFloat) {
+                    let windowTop = node.elementType == .window ? node.frame.minY : top
+                    if node.elementType == .button, node.frame.maxY > windowTop, node.frame.minY < windowTop + 100 {
+                        let identity = "id=\(node.identifier) label=\(node.label)"
+                        logQA("Window top controls", "stage=\(stage) source=\(name) \(identity) frame=\(node.frame)")
+                    }
+                    for child in node.children { visit(child, top: windowTop) }
+                }
+                visit(snapshot, top: snapshot.frame.minY)
+                logQA("Window control hierarchy " + name + " " + stage, source.debugDescription)
+            }
+            logWindowScenes(stage)
+        }
+        inventory("before hover")
+        for (name, source) in sources where name != "SpringBoard" {
+            let window = source.windows.firstMatch
+            guard window.exists, window.isHittable, window.frame.width > 24, window.frame.height > 24 else {
+                logQA("Window control hover", "source=\(name) no visible hittable window"); continue
+            }
+            let target = window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 16, dy: 16))
+            let hover = NSSelectorFromString("hover")
+            if target.responds(to: hover) {
+                _ = target.perform(hover)
+                logQA("Window control hover", "source=\(name) top-leading +16pt")
+            } else { logQA("Window control hover", "source=\(name) runtime hover selector unavailable") }
+        }
+        let appeared = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            found = candidate(); return found != nil
+        }, object: nil)
+        _ = XCTWaiter.wait(for: [appeared], timeout: 3)
+        inventory("after hover")
+        recordDiagnostics("Window controls after hover", includeHierarchy: false)
+        if let found { return found }
+        for source in [primary, springboard] {
+            let button = source.buttons.matching(predicate).firstMatch
+            if button.exists { return button }
+        }
+        return primary.buttons.matching(predicate).firstMatch
     }
 
     func diagnoseWindowControls() {
