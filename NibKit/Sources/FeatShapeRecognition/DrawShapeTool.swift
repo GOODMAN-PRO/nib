@@ -270,8 +270,12 @@ enum ShapeCommit {
         } catch {
             DrawShapeTool.log.error("shape commit failed, keeping the stroke: \(String(describing: error), privacy: .public)")
             if merging {
+                let failure = NibError.wrap(error)
+                let reported = failure.code == .conflict
+                    ? NibError(.conflict, String(localized: "A nearby shape changed. Your original stroke was kept."))
+                    : failure
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                    userInfo: ["command": command, "error": NibError.wrap(error)])
+                    userInfo: ["command": command, "error": reported])
             }
             return nil
         }

@@ -594,6 +594,15 @@ final class FeatShapeRecognitionTests: XCTestCase {
     func testDrawShapeJoinRejectsHookConflictsAndNoOpDeletionWithoutHistory() async throws {
         for change in ["edit", "readOnly", "emptyResult"] {
             let h = Harness(features: [FeatShapeRecognitionFeature.self])
+            let notice = expectation(description: "join conflict explains ink recovery")
+            let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+                guard note.userInfo?["command"] as? String == CommandIDs.itemDelete else { return }
+                let error = note.userInfo?["error"] as? NibError
+                XCTAssertEqual(error?.code, .conflict)
+                XCTAssertEqual(error?.message, String(localized: "A nearby shape changed. Your original stroke was kept."))
+                notice.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
             try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
             let calls = Calls()
             standIn(CommandIDs.shapeCreate, h, calls)
@@ -625,6 +634,7 @@ final class FeatShapeRecognitionTests: XCTestCase {
             let afterChange = try h.snapshotAll(), depth = h.undoDepth(Fixtures.docID)
             resume = true
             await settle { !host.committed.isEmpty }
+            await fulfillment(of: [notice], timeout: 1)
             XCTAssertEqual(host.committed.map(\.stroke), [drawn])
             XCTAssertNil(calls.params[CommandIDs.shapeCreate])
             XCTAssertEqual(try h.snapshotAll(), afterChange)

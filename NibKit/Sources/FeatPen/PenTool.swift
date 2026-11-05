@@ -298,9 +298,15 @@ final class PenTool: CanvasTool {
                         Self.report(failure.code == .conflict
                             ? NibError(.conflict, String(localized: "A nearby shape changed. Your original stroke was kept."))
                             : failure, command: command, app: app)
-                        await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
+                        await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session,
+                                            host: host, preview: layer)
+                        return
                     }
-                } else { await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host) }
+                } else {
+                    await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session,
+                                        host: host, preview: layer)
+                    return
+                }
                 if let host { host.afterNextRender(page: state.page) { layer?.removeFromSuperlayer() } }
                 else { layer?.removeFromSuperlayer() }
             }
@@ -411,16 +417,36 @@ final class PenTool: CanvasTool {
     }
 
     private static func preserve(_ stroke: Stroke, page: PageID, doc: DocumentID, app: NibApp,
-                                 session: EditorSession, host: CanvasHost?) async {
-        if let host { host.commitStroke(stroke, page: page); return }
+                                 session: EditorSession, host: CanvasHost?, preview: CALayer?) async {
+        if let host {
+            let outcome = await withCheckedContinuation { (continuation: CheckedContinuation<Result<ElementID?, NibError>, Never>) in
+                host.commitStroke(stroke, page: page) { continuation.resume(returning: $0) }
+            }
+            switch outcome {
+            case .success:
+                host.afterNextRender(page: page) { preview?.removeFromSuperlayer() }
+            case .failure(let error):
+                report(error, command: CommandIDs.inkAddStrokes, app: app)
+                await retainFailed(stroke, page: page, doc: doc, app: app, session: session, preview: preview)
+            }
+            return
+        }
         var processed = stroke
         for entry in app.content.strokeProcessors.all {
-            guard entry.processor.process(&processed, page: page, session: session) else { return }
+            guard entry.processor.process(&processed, page: page, session: session) else {
+                preview?.removeFromSuperlayer()
+                return
+            }
         }
         do {
             _ = try await app.bus.execute(CommandIDs.inkAddStrokes,
                 ["page": .string(NodeRef.page(doc, page).description), "strokes": .array([try JSONValue.from(processed)])], session: session)
-        } catch { report(error, command: CommandIDs.inkAddStrokes, app: app) }
+            preview?.removeFromSuperlayer()
+        } catch {
+            report(error, command: CommandIDs.inkAddStrokes, app: app)
+            await retainFailed(processed, page: page, doc: doc, app: app, session: session,
+                               preview: preview, processed: true)
+        }
     }
 }
 

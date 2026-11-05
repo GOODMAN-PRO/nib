@@ -1151,7 +1151,8 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(probe.attached, 1)
         XCTAssertTrue(probe.marker.superview === vc.scrollView, "its view lives in canvasView")
         XCTAssertEqual(boardOnly.attached, 0, "only for the kinds it asks for")
-        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id])
+        // 23905db added the always-registered recovery attachment; keep its lifecycle order explicit.
+        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id, "canvas.failedInk"])
         XCTAssertTrue(vc.host.attachments.first === probe)
 
         // canvasDidChange on zoom, scroll, selection.
@@ -1173,7 +1174,7 @@ final class FeatCanvasTests: XCTestCase {
         let late = ProbeAttachment()
         h.app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "test.late", owner: "test", order: 1000) { _ in late })
         await waitUntil("the late attachment") { late.attached == 1 }
-        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id, "test.late"])
+        XCTAssertEqual(vc.attachmentHost.entries.map { $0.id }, ["test.probe", DecorationAttachment.id, "canvas.failedInk", "test.late"])
         let replacement = ProbeAttachment()
         h.app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "test.late", owner: "test", order: 1000) { _ in replacement })
         await waitUntil("the replacement") { replacement.attached == 1 }
@@ -2446,7 +2447,11 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertGreaterThan(vc.errorView.frame.height, 0)
         let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
         let visiblePaper = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
-        XCTAssertEqual(vc.errorView.frame, visiblePaper)
+        // UIKit frame storage and coordinate conversion can differ by subpixel rounding.
+        XCTAssertEqual(vc.errorView.frame.minX, visiblePaper.minX, accuracy: 0.1)
+        XCTAssertEqual(vc.errorView.frame.minY, visiblePaper.minY, accuracy: 0.1)
+        XCTAssertEqual(vc.errorView.frame.width, visiblePaper.width, accuracy: 0.1)
+        XCTAssertEqual(vc.errorView.frame.height, visiblePaper.height, accuracy: 0.1)
         XCTAssertTrue(vc.errorView.isOpaque)
         vc.errorView.layoutIfNeeded()
         XCTAssertEqual(vc.errorView.hosting.view.center.x, vc.errorView.bounds.midX, accuracy: 0.5)
@@ -2522,7 +2527,10 @@ final class FeatCanvasTests: XCTestCase {
         }
         let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
         let visiblePaper = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
-        XCTAssertEqual(error.frame, visiblePaper)
+        XCTAssertEqual(error.frame.minX, visiblePaper.minX, accuracy: 0.1)
+        XCTAssertEqual(error.frame.minY, visiblePaper.minY, accuracy: 0.1)
+        XCTAssertEqual(error.frame.width, visiblePaper.width, accuracy: 0.1)
+        XCTAssertEqual(error.frame.height, visiblePaper.height, accuracy: 0.1)
         XCTAssertFalse(error.isHidden)
         XCTAssertLessThanOrEqual(error.bounds.height, 375)
         XCTAssertLessThan(error.bounds.width, 300, "Use fitted portrait paper, not a full-width error panel")
@@ -2599,11 +2607,15 @@ final class FeatCanvasTests: XCTestCase {
 
     func testOneFailedTileStaysReportedWhenPreviewAndSiblingTilesLand() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
         let renderer = OneTileFailureRenderer()
-        h.app.services.renderer = renderer
         let vc = try makeCanvas(h)
         defer { renderer.releaseSuccessfulRenders(); vc.closeCanvas() }
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("initial healthy render") { page.isSettled }
+        // Initial layout can retire requests. Fail only work belonging to the settled coverage.
+        h.app.services.renderer = renderer
+        page.invalidate(nil)
         await waitUntil("one tile to fail") { vc.failedPages.contains(Fixtures.page1) }
         XCTAssertFalse(vc.errorView.isHidden)
         XCTAssertGreaterThan(page.tileKeys.count, 1)
