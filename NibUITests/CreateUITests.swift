@@ -894,7 +894,7 @@ final class CreateUITests: XCTestCase {
         try scrollTo(field, name: field.label, in: application)
         ui.logQA("Stall boundary", "Create replacement field focus tap; field=\(field.label)")
         field.tap()
-        try ui.clearNativeText(in: field)
+        try ui.clearNativeText(in: field, diagnoseClear: field.label.contains("millimetres"))
         if !text.isEmpty { field.typeText(text) }
         try wait("Field must contain the replacement before dismissal: \(text)") {
             guard let actual = field.value as? String else { return false }

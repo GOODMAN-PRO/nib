@@ -233,3 +233,14 @@ Round 10a already added the immediate Finish Editing stall marker. Added pre-ste
 | NamedStyleAndDefault; TapePatternWidthStraightness | Insert stable control / Save Style after tap / Straight tape after tap | Was the actual tap inside the stable target/popover and what AX elements covered it? Did the alert/value change? |
 | GIFLocalInvalidLink | Invalid GIF toast any type / Invalid GIF after dismissal | What AX type/identifier represents the visible toast, and does dismissal change exposure? |
 | CopyTextUsesActualSelectedText | Finish Editing before stall / Stall boundary / Insert failure hierarchy | What overlay/tree and pixels preceded the idle wait, and what survived at teardown? |
+
+### K1 - decimal clearing evidence and disappearing-keyboard diagnostic
+
+Confirmed create#0/#1 corrections. NewNotebookSheet still binds TextField(value:format:) to Double, uses decimalPad, and calls applyCustomSize on change/submit; applyCustomSize clamps draft size without directly assigning customWidth/customHeight. Neither dropped deletion nor numeric-value reassertion is proven. Added opt-in Width/Height clear-stage value, character count, Unicode scalars and raw key log after Select All and each existing Delete delivery (first Delete and fallback batch). The batch remains one action, avoiding an unproven change in event timing. Exact empty-field and numeric replacement/zero-size assertions remain.
+
+The proven diagnostic race is removed: initial keyboard buttons come from one immutable application snapshot; **all post-Hide stages only query keyboard existence**, never a live descendant label/frame. The conditional second Hide and final keyboard-gone wait are unchanged. CI must proceed beyond successful Height dismissal without “No matches found ... Keyboard”, and show whether Select All/first delete/fallback leaves 210 and what the fourth scalar is. Clearing itself is diagnostic-only until that evidence exists.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| CustomSize; InvalidCustomSizePreventsCreation | Decimal clear stage / Decimal clear key log | What exact value/scalars and delivered keys remain after each clear action? |
+| Same | Width keyboard after Hide / after docked Hide / completion / frame | Did the keyboard disappear, without dereferencing a vanished descendant? |

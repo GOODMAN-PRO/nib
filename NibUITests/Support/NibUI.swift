@@ -1588,8 +1588,20 @@ final class NibUI {
         let keyboardBefore = source.keyboards.firstMatch.frame
         func inspect(_ stage: String) {
             guard diagnoseWidth else { return }
-            for button in source.keyboards.buttons.allElementsBoundByIndex {
-                logQA("Width keyboard " + stage, "label=\(button.label) frame=\(button.frame)")
+            // After Hide, only query existence: a retained keyboard/button can disappear mid-read.
+            guard stage == "before Hide" else {
+                logQA("Width keyboard " + stage, "keyboardExists=\(source.keyboards.firstMatch.exists)")
+                return
+            }
+            if let root = try? source.snapshot() {
+                func inspectKeyboard(_ node: XCUIElementSnapshot, insideKeyboard: Bool = false) {
+                    let inside = insideKeyboard || node.elementType == .keyboard
+                    if inside && node.elementType == .button {
+                        logQA("Width keyboard " + stage, "label=\(node.label) frame=\(node.frame)")
+                    }
+                    for child in node.children { inspectKeyboard(child, insideKeyboard: inside) }
+                }
+                inspectKeyboard(root)
             }
             let width = source.textFields["Width in millimetres"].firstMatch
             recordDiagnostics("Width keyboard " + stage,
@@ -1600,8 +1612,7 @@ final class NibUI {
         defer {
             inspect("completion")
             if diagnoseWidth {
-                let after = source.keyboards.firstMatch.exists ? String(describing: source.keyboards.firstMatch.frame) : "absent"
-                logQA("Width keyboard frame", "route=\(route) before=\(keyboardBefore) after=\(after)")
+                logQA("Width keyboard frame", "route=\(route) before=\(keyboardBefore) afterExists=\(source.keyboards.firstMatch.exists)")
             }
         }
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
@@ -1828,15 +1839,24 @@ final class NibUI {
     }
 
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
-    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil) throws {
+    func clearNativeText(in field: XCUIElement, container: XCUIElement? = nil, diagnoseClear: Bool = false) throws {
+        func inspectClear(_ stage: String) {
+            guard diagnoseClear else { return }
+            let value = field.value as? String
+            let scalars = value?.unicodeScalars.map { String($0.value, radix: 16) }.joined(separator: ",") ?? "nil"
+            logQA("Decimal clear stage", "stage=\(stage) value=\(String(reflecting: value)) count=\(value?.count ?? -1) scalars=\(scalars)")
+            logQA("Decimal clear key log", "stage=\(stage) probe=\(String(describing: probe.exists ? probe.value : nil))")
+        }
         // focusField taps an unfocused editor and verifies focus before nativeKey can send Select All.
         try focusField(field, in: container)
         guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
         if value.isEmpty || value == field.placeholderValue { return }
         try deliverNativeKey("a", .command, in: field)
+        inspectClear("after Select All")
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
         logQA("Stall boundary", "clearNativeText typeText Delete after Select All; field=\(field.label)")
         field.typeText(XCUIKeyboardKey.delete.rawValue)
+        inspectClear("after first Delete")
         let remainingValue = field.value as? String
         guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {
             throw Failure.message("Native editor lost its value after deletion")
@@ -1847,7 +1867,10 @@ final class NibUI {
             guard let current = (field.value as? String) ?? (field.elementType == .textView ? "" : nil),
                   current.count <= 4096 else { throw Failure.message("Native clear needs a readable bounded value after caret tap") }
             logQA("Native clear", "field=\(field.identifier) frame=\(field.frame) deleteCount=\(current.count)")
-            if !current.isEmpty { field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count)) }
+            if !current.isEmpty {
+                field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+                inspectClear("after fallback Delete batch count=\(current.count)")
+            }
         }
         try waitForNativeText(in: field, equals: "")
     }
