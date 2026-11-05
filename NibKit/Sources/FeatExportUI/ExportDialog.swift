@@ -244,21 +244,17 @@ struct ExportDialog: View {
                 GeometryReader { geometry in
                     if !typeSize.isAccessibilitySize && geometry.size.height >= 4 * NibMetrics.hitTarget {
                         VStack(alignment: .leading, spacing: NibSpacing.l) {
-                            ScrollView {
+                            NibScrollView {
                                 VStack(alignment: .leading, spacing: NibSpacing.l) { options; secondaryActions }
                                     .padding(.bottom, NibSpacing.l)
                             }
                             .scrollBounceBehavior(.basedOnSize)
-                            .scrollIndicators(.visible)
-                            .nibFadeBottomEdge()
                             primaryActions
                         }
                     } else {
                         // Short windows and large text keep all actions reachable in one scroller.
-                        ScrollView { form.padding(.bottom, NibSpacing.l) }
+                        NibScrollView { form.padding(.bottom, NibSpacing.l) }
                             .scrollBounceBehavior(.basedOnSize)
-                            .scrollIndicators(.visible)
-                            .nibFadeBottomEdge()
                     }
                 }
             } else {
@@ -293,7 +289,9 @@ struct ExportDialog: View {
                             ForEach(selection.pageScopes, id: \.self) { scope in Text(scope.title(board: selection.isBoard)).tag(scope) }
                         }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
                     } else {
-                        NibSegmentedControl(selection: $draft.scope, options: selection.pageScopes) { $0.title(board: selection.isBoard) }
+                        NibSegmentedControl(selection: $draft.scope, options: selection.pageScopes, sizing: .fitting) {
+                            $0.title(board: selection.isBoard)
+                        }
                     }
                 }
             }

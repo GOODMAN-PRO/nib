@@ -225,6 +225,181 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(copyID, page: page).contains { $0.id == secret.id })
     }
 
+    func testSuccessfulPrivateSavesDoNotReportSyncStatus() throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        var reports = 0
+        let store = PrivateLessonPersistence(base: h.persistence, root: h.persistence.root.appendingPathComponent("quiet-private-save"),
+                                             report: { _, _ in reports += 1 })
+        var head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook))
+        try store.seed(LessonSnapshot(content: head, items: [:]))
+        for index in 0..<3 {
+            head.meta.layers[0].name = "Stroke \(index)"
+            store.didChange(doc, head: head, pages: [:])
+            store.flush(doc)
+        }
+        XCTAssertEqual(reports, 0)
+        XCTAssertNil(store.saveError(doc))
+    }
+
+    func testPrivateSaveStatusDoesNotWaitForTheNextWrite() async throws {
+        try await assertPrivateSaveDoesNotWaitForTheNextWrite(failFirst: true)
+    }
+
+    func testSuccessfulPrivateSaveDoesNotWaitForTheNextWrite() async throws {
+        try await assertPrivateSaveDoesNotWaitForTheNextWrite(failFirst: false)
+    }
+
+    private func assertPrivateSaveDoesNotWaitForTheNextWrite(failFirst: Bool) async throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        let blocked = expectation(description: "second save is writing")
+        let reported = failFirst ? expectation(description: "first save reports on main while second is blocked") : nil
+        let writer = BlockingPrivateSave(started: blocked, failFirst: failFirst)
+        defer { writer.release() }
+        let store = PrivateLessonPersistence(base: h.persistence,
+            root: h.persistence.root.appendingPathComponent("blocked-private-save"),
+            write: { try writer.write($0, url: $1) },
+            report: { _, error in if error != nil { reported?.fulfill() } })
+        var head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook))
+        try store.seed(LessonSnapshot(content: head, items: [:]))
+        head.meta.layers[0].name = "First edit"
+        store.didChange(doc, head: head, pages: [:])
+        head.meta.layers[0].name = "Second edit"
+        store.didChange(doc, head: head, pages: [:])
+        var waiting = [blocked]
+        if let reported { waiting.append(reported) }
+        await fulfillment(of: waiting, timeout: 1)
+        let responsive = expectation(description: "main queue responds while second write is blocked")
+        DispatchQueue.main.async { responsive.fulfill() }
+        await fulfillment(of: [responsive], timeout: 1)
+        // With writer.sync in the callback, the main actor cannot reach here until the
+        // writer's bounded gate times out. Do not rely solely on XCTest's timeout timer.
+        XCTAssertFalse(writer.timedOut)
+        writer.release()
+        store.flush(doc)
+        XCTAssertNil(store.saveError(doc))
+        XCTAssertEqual(try store.loadHead(doc), head)
+    }
+
+    func testMissingPrivateSnapshotReportsLoadFailure() {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        var reported: [String] = []
+        let store = PrivateLessonPersistence(base: h.persistence,
+            root: h.persistence.root.appendingPathComponent("missing-private-snapshot"),
+            report: { _, error in if let error { reported.append(error) } })
+        store.didChange(doc, head: nil, pages: [:])
+        XCTAssertEqual(reported, [String(localized: "The existing private notes could not be loaded, so this edit was not saved. Reopen the document and try again.")])
+    }
+
+    func testFailedPrivateSaveRetainsSnapshotReportsAndRetriesOnFlush() throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        let root = h.persistence.root.appendingPathComponent("failing-private-save")
+        let failure = PrivateSaveFailureSwitch()
+        var reported: [String?] = []
+        let store = PrivateLessonPersistence(base: h.persistence, root: root, write: { snapshot, url in
+            try failure.write(snapshot, url: url)
+        }, report: { _, error in reported.append(error) })
+        let initial = LessonSnapshot(content: DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook)), items: [:])
+        try store.seed(initial)
+        failure.setFailing(true)
+        var changed = initial.content
+        changed.meta.layers[0].name = "Unsaved private edit"
+        store.didChange(doc, head: changed, pages: [:])
+        store.flush(doc)
+        XCTAssertNotNil(store.saveError(doc))
+        XCTAssertEqual(store.pendingSnapshot(doc)?.content, changed)
+        XCTAssertTrue(reported.contains { $0 != nil })
+        XCTAssertEqual(reported.count, 1, "repeated failures with the same error report once")
+        failure.setFailing(false)
+        store.flush(doc)
+        XCTAssertNil(store.pendingSnapshot(doc))
+        XCTAssertNil(store.saveError(doc))
+        XCTAssertEqual(reported.count, 2)
+        if reported.count == 2 { XCTAssertNil(reported[1], "one recovery clears the earlier error") }
+        store.flush(doc)
+        XCTAssertEqual(reported.count, 2)
+        let fresh = PrivateLessonPersistence(base: h.persistence, root: root)
+        XCTAssertEqual(try fresh.loadHead(doc), changed)
+    }
+
+    func testCloseFlushReportsRepeatedFailureThenPersistsPrivateAnnotations() throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        let root = h.persistence.root.appendingPathComponent("close-retry-private-save")
+        let failure = PrivateSaveFailureSwitch()
+        let store = PrivateLessonPersistence(base: h.persistence, root: root, write: { snapshot, url in
+            try failure.write(snapshot, url: url)
+        }, report: { [weak app = h.app] doc, error in
+            if let app { PrivateLessonPersistence.reportStatus(doc, message: error, app: app) }
+        })
+        let page = PageRecord(id: "PRIVATEPAGE01", order: "V", size: .a4, background: .ofColor(.white))
+        let head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook), pages: [page])
+        try store.seed(LessonSnapshot(content: head, items: [:]))
+        h.app.workspace.persistence = store
+        _ = try h.app.workspace.content(doc)
+        let annotation = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 200, h: 80),
+                                                   text: RichText(plain: "Private annotation")), layer: 0)
+        failure.setFailing(true)
+        store.didChange(doc, head: nil, pages: [page.id: [annotation]])
+        // ShellViewController.closeDocument uses this workspace-exposed persistence, not the base store.
+        // Each explicit failed close must report synchronously, even if the same error was already shown.
+        for _ in 0..<2 {
+            let before = h.app.events.lastSeq
+            h.app.workspace.persistence.flush(doc)
+            let status = h.app.events.events(since: before).last { $0.doc == doc }?.decode(SyncStatusPayload.self)
+            XCTAssertEqual(status?.state, "error")
+            XCTAssertEqual(status?.source, "store")
+            XCTAssertEqual(store.pendingSnapshot(doc)?.items[page.id], [annotation])
+        }
+        failure.setFailing(false)
+        let before = h.app.events.lastSeq
+        h.app.workspace.persistence.flush(doc)
+        let recovered = h.app.events.events(since: before).last { $0.doc == doc }?.decode(SyncStatusPayload.self)
+        XCTAssertEqual(recovered?.state, "idle")
+        XCTAssertNil(store.pendingSnapshot(doc))
+        XCTAssertNotNil(h.app.workspace.loadedDocuments.first { $0 == doc }, "another window may still use the workspace")
+        let fresh = PrivateLessonPersistence(base: h.persistence, root: root)
+        XCTAssertEqual(try fresh.loadItems(doc, page: page.id), [annotation])
+    }
+
+    func testPresentRefreshPreservesEditsMadeDuringTransfer() async throws {
+        let h = harness()
+        let (doc, page, _, _) = try source(h)
+        let result = try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"])
+        let privateDoc = NodeRef.documentID(from: try XCTUnwrap(result["ref"]?.stringValue))
+        let note = Item(id: "EDITNOTE01", kind: .text, layer: LessonManager.presentLayer,
+                        text: TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "Before")))
+        var removed = note
+        removed.id = "REMOVENOTE01"
+        try await h.insert([note, removed], page: page, doc: privateDoc)
+        let started = expectation(description: "presentation transfer started")
+        let gate = BlockingPresentAssets(base: try XCTUnwrap(h.app.services.assets), started: started)
+        h.app.services.assets = gate
+        let refresh = Task { try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"]) }
+        defer { gate.release() }
+        await fulfillment(of: [started], timeout: 2)
+        var updated = note
+        updated.text?.text = RichText(plain: "After")
+        var added = note
+        added.id = "ADDEDNOTE01"
+        try await h.insert([updated, added], page: page, doc: privateDoc)
+        h.app.commands.register(CommandDescriptor(id: "test.deletePrivate", title: "Delete private note", summary: "Test helper", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(item: removed.id, doc: privateDoc, page: page) }
+            return [:]
+        }
+        try await h.run("test.deletePrivate")
+        gate.release()
+        _ = try await refresh.value
+        h.app.workspace.close(privateDoc)
+        let items = try h.app.workspace.items(privateDoc, page: page)
+        XCTAssertEqual(items.first { $0.id == note.id }?.text?.text.plainText, "After")
+        XCTAssertTrue(items.contains { $0.id == added.id })
+        XCTAssertFalse(items.contains { $0.id == removed.id })
+    }
+
     func testPresentRefreshDoesNotResurrectDeletedSourceItemsOrPages() async throws {
         for legacy in [false, true] {
             let h = harness()
@@ -637,4 +812,56 @@ private final class BlockingLessonAssets: AssetStore {
     func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
     func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
     func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
+private final class BlockingPresentAssets: AssetStore {
+    let base: AssetStore
+    let started: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+    init(base: AssetStore, started: XCTestExpectation) { self.base = base; self.started = started }
+    func release() { gate.signal() }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        started.fulfill()
+        guard gate.wait(timeout: .now() + 3) == .success else { throw NibError.unavailable("presentation gate timed out") }
+        return try base.put(data, ext: ext, doc: doc)
+    }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
+private final class PrivateSaveFailureSwitch {
+    private let lock = NSLock()
+    private var failing = false
+    func setFailing(_ value: Bool) { lock.lock(); failing = value; lock.unlock() }
+    func write(_ snapshot: LessonSnapshot, url: URL) throws {
+        lock.lock(); let fail = failing; lock.unlock()
+        if fail { throw NibError.unavailable("disk full") }
+        try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+    }
+}
+
+private final class BlockingPrivateSave {
+    let started: XCTestExpectation
+    let failFirst: Bool
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var writes = 0
+    private var didTimeOut = false
+    var timedOut: Bool { lock.lock(); defer { lock.unlock() }; return didTimeOut }
+    init(started: XCTestExpectation, failFirst: Bool) { self.started = started; self.failFirst = failFirst }
+    func release() { gate.signal() }
+    func write(_ snapshot: LessonSnapshot, url: URL) throws {
+        // Seed and saves all run on the same serial writer queue.
+        writes += 1
+        if writes == 2 && failFirst { throw NibError.unavailable("first save failed") }
+        if writes == 3 {
+            started.fulfill()
+            if gate.wait(timeout: .now() + 3) != .success {
+                lock.lock(); didTimeOut = true; lock.unlock()
+            }
+        }
+        try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+    }
 }

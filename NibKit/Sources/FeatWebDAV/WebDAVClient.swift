@@ -35,25 +35,25 @@ struct WebDAVConfiguration: Equatable {
     var credentialsMissing: Bool { !user.isEmpty && (password ?? "").isEmpty }
 
     /// Parses and normalises a server URL: http(s) only, a host, no query or fragment, and a trailing slash.
-    static func normalizeServerURL(_ string: String) throws -> URL {
+    static func normalizeServerURL(_ string: String, bundle: Bundle = .main) throws -> URL {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: trimmed), let scheme = components.scheme?.lowercased(),
               scheme == "https" || scheme == "http" else {
-            throw NibError(.invalidParams, "'\(trimmed)' is not an http or https URL", path: "$.url",
-                           hint: "pass the server's WebDAV address, e.g. https://dav.example.com/remote.php/dav/files/alex/")
+            throw NibError(.invalidParams, String(localized: "'\(trimmed)' is not an http or https URL", bundle: bundle), path: "$.url",
+                           hint: String(localized: "Enter the server's WebDAV address, for example https://dav.example.com/remote.php/dav/files/alex/", bundle: bundle))
         }
         guard let host = components.host, !host.isEmpty else {
-            throw NibError(.invalidParams, "the WebDAV URL has no host", path: "$.url")
+            throw NibError(.invalidParams, String(localized: "The WebDAV URL has no host.", bundle: bundle), path: "$.url")
         }
         guard components.user == nil, components.password == nil else {
-            throw NibError(.invalidParams, "put the user name in 'user', not in the URL", path: "$.url",
-                           hint: "the password is entered in Settings › WebDAV and kept in the Keychain")
+            throw NibError(.invalidParams, String(localized: "Enter the user name in the User field.", bundle: bundle), path: "$.url",
+                           hint: String(localized: "Enter the password in Settings › WebDAV. It is kept in the Keychain.", bundle: bundle))
         }
         components.scheme = scheme
         components.query = nil
         components.fragment = nil
         if !components.percentEncodedPath.hasSuffix("/") { components.percentEncodedPath += "/" }
-        guard let url = components.url else { throw NibError(.invalidParams, "invalid WebDAV URL", path: "$.url") }
+        guard let url = components.url else { throw NibError(.invalidParams, String(localized: "Invalid WebDAV URL.", bundle: bundle), path: "$.url") }
         return url
     }
 
@@ -62,11 +62,11 @@ struct WebDAVConfiguration: Equatable {
         let parts = string.replacingOccurrences(of: "\\", with: "/").split(separator: "/")
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard !parts.isEmpty else {
-            throw NibError(.invalidParams, "choose a folder name for the library on the server", path: "$.\(field)",
-                           hint: "for example \"Nib\"")
+            throw NibError(.invalidParams, String(localized: "Choose a folder name for the library on the server."), path: "$.\(field)",
+                           hint: String(localized: "For example, Nib."))
         }
         if parts.contains(where: { $0 == "." || $0 == ".." }) {
-            throw NibError(.invalidParams, "'.' and '..' are not allowed in \(field)", path: "$.\(field)")
+            throw NibError(.invalidParams, String(localized: "Folder names cannot contain '.' or '..' segments."), path: "$.\(field)")
         }
         return parts.joined(separator: "/")
     }

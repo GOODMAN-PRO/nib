@@ -8,6 +8,16 @@ import NibContracts
 /// that can't be imported are reported one by one (`ImportReport`), never dropped silently.
 @MainActor
 enum PackageImporter {
+    /// Mirrors F002's optional service, like catalogue refresh, without importing another feature module.
+    typealias PackageImport = @MainActor (LibraryService, URL, FolderID?) async throws -> DocumentID?
+    static let packageImportKey = "library.importPackage"
+
+    static func place(_ url: URL, into folder: FolderID?, library: LibraryService, ctx: CommandContext) async throws -> DocumentID {
+        try Task.checkCancellation()
+        if let importer = ctx.services.get(packageImportKey, as: PackageImport.self),
+           let id = try await importer(library, url, folder) { return id }
+        return try library.importPackage(at: url, into: folder)
+    }
     static func packageDescriptor(owner: String) -> ImporterDescriptor {
         ImporterDescriptor(id: ImportFormats.packageImporterID, title: String(localized: "Nib documents"),
                            fileExtensions: ImportFormats.packageExtensions, utTypes: [NibFormat.packageUTType],
@@ -48,7 +58,7 @@ enum PackageImporter {
         }
         if ctx.dryRun { return [] }
         let library = try ctx.services.require(ctx.services.library, "the library")
-        return [try library.importPackage(at: url, into: target.folder)]
+        return [try await place(url, into: target.folder, library: library, ctx: ctx)]
     }
 
     static func importArchive(_ url: URL, target: ImportTarget, ctx: CommandContext) async throws -> [DocumentID] {
@@ -114,7 +124,7 @@ enum PackageImporter {
     /// Hands what a zip or folder import did to the engine (`ImportReporting.current`) and returns its documents.
     /// When nothing at all came in (no document, no folder), the first reason is thrown instead.
     private static func deliver(_ docs: [DocumentID], _ report: ImportReport, source: String) throws -> [DocumentID] {
-        if docs.isEmpty, report.folders.isEmpty, let first = report.skipped.first {
+        if !report.cancelled, docs.isEmpty, report.folders.isEmpty, let first = report.skipped.first {
             var e = first.error
             let reason = "\(first.entry): \(e.message)"
             e.message = report.skipped.count == 1 ? reason
@@ -132,16 +142,17 @@ enum PackageImporter {
     /// files through the registry (runs of images become one notebook). Nothing is thrown: every entry that could not
     /// be imported goes into `report` under its path (`prefix` + the path inside `dir`, "Notes.zip › Chemistry/a.key"),
     /// with the folders used (created, or existing ones with the same name; `top` when they sit right in the
-    /// destination) and any conversion.
+    /// destination) and any conversion. Cancellation stops traversal and returns documents already imported.
     static func importContents(of dir: URL, into folder: FolderID?, ctx: CommandContext, library: LibraryService,
                                report: ImportReport, prefix: String, top: Bool, depth: Int = 0) async -> [DocumentID] {
         var docs: [DocumentID] = []
         var files: [(url: URL, isDirectory: Bool)] = []
         for entry in ArchiveIO.visibleEntries(of: dir) {
+            guard !Task.isCancelled, !report.cancelled else { report.cancelled = true; return docs }
             let name = entry.url.lastPathComponent
             do {
                 if entry.isDirectory && isPackage(entry.url) {
-                    docs.append(try library.importPackage(at: entry.url, into: folder))
+                    docs.append(try await place(entry.url, into: folder, library: library, ctx: ctx))
                 } else if entry.isDirectory {
                     guard depth + 1 < maxTreeDepth else {
                         throw NibError(.unsupported, "folders nested more than \(maxTreeDepth) levels deep are not imported",
@@ -155,11 +166,13 @@ enum PackageImporter {
                     files.append(entry)
                 }
             } catch {
+                if error is CancellationError { report.cancelled = true; return docs }
                 report.skip(prefix + name, error)
                 importLog.error("skipped \(name, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
         for group in ImportEngine.groups(files, content: ctx.content) {
+            guard !Task.isCancelled, !report.cancelled else { report.cancelled = true; return docs }
             let urls = group.indices.map { files[$0].url }
             guard group.kind != .unsupported else {
                 for url in urls { report.skip(prefix + url.lastPathComponent, ImportEngine.unsupported(url, content: ctx.content)) }
@@ -173,11 +186,14 @@ enum PackageImporter {
                     try await ImportEngine.run(group, urls: urls, target: target, ctx: ctx)
                 }
                 report.absorb(nested, prefix: prefix, top: top)
+                if report.cancelled { return docs }
             } catch {
+                if error is CancellationError { report.cancelled = true; return docs }
                 for url in urls { report.skip(prefix + url.lastPathComponent, error) }
                 importLog.error("skipped a file: \(error.localizedDescription, privacy: .public)")
             }
         }
+        if Task.isCancelled { report.cancelled = true }
         return docs
     }
 

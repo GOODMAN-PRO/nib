@@ -165,34 +165,71 @@ struct EditingSettingsSheet: View {
 /// Title menu › Rename: a title field that runs `library.rename`.
 struct RenameDocumentSheet: View {
     let context: PanelContext
-    @State private var title: String
+    @State private var draft: RenameDocumentDraft
+    @State private var working = false
+    @State private var error: String?
 
     init(context: PanelContext) {
         self.context = context
-        let doc = context.session?.document
-        _title = State(initialValue: doc.flatMap { context.app.services.library?.node($0)?.title } ?? "")
+        _draft = State(initialValue: RenameDocumentDraft(context: context))
     }
-
-    private var trimmed: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     var body: some View {
         VStack(spacing: 0) {
             NibSheetHeader(String(localized: "Rename Document"), primaryTitle: String(localized: "Rename"),
-                           isPrimaryEnabled: !trimmed.isEmpty, onCancel: { context.dismiss() }, onPrimary: rename)
-            NibField(text: $title, prompt: String(localized: "Title"))
+                           isPrimaryEnabled: !draft.trimmed.isEmpty, onCancel: { context.dismiss() }, onPrimary: rename)
+            NibField(text: $draft.title, prompt: String(localized: "Title"))
                 .onSubmit(rename)
                 .padding(.horizontal, NibSpacing.xl)
                 .padding(.vertical, NibSpacing.l)
+            if let error {
+                NibBanner(error, style: .warning).padding(.horizontal, NibSpacing.xl)
+            }
             Spacer(minLength: 0)
         }
         .presentationDetents([.medium])
+        .disabled(working)
+        .interactiveDismissDisabled(working)
     }
 
     private func rename() {
-        guard !trimmed.isEmpty, let doc = context.session?.document else { return }
-        context.app.perform("library.rename", ["ref": .string(NodeRef.document(doc).description), "title": .string(trimmed)],
-                            session: context.session)
-        context.dismiss()
+        guard !working, !draft.trimmed.isEmpty else { return }
+        working = true
+        error = nil
+        Task { @MainActor in
+            do {
+                try await draft.submit(context: context)
+                working = false
+                context.dismiss()
+            } catch {
+                working = false
+                self.error = NibError.wrap(error).message
+            }
+        }
+    }
+}
+
+/// Keep the target and baseline in the sheet's State, even if its window changes documents.
+struct RenameDocumentDraft {
+    let document: DocumentID?
+    let originalTitle: String
+    var title: String
+    var trimmed: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    @MainActor init(context: PanelContext) {
+        document = context.session?.document
+        originalTitle = document.flatMap { context.app.services.library?.node($0)?.title } ?? ""
+        title = originalTitle
+    }
+
+    @MainActor func submit(context: PanelContext) async throws {
+        guard !trimmed.isEmpty, let document else { return }
+        guard trimmed != originalTitle.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        guard context.app.services.library?.node(document)?.title == originalTitle else {
+            throw NibError.invalid(String(localized: "The document title changed while Rename was open. Cancel and reopen Rename to use its latest title."))
+        }
+        _ = try await context.app.bus.execute(CommandIDs.libraryRename,
+            ["ref": .string(NodeRef.document(document).description), "title": .string(trimmed)], session: context.session)
     }
 }
 

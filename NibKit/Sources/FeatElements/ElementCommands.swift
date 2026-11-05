@@ -282,6 +282,11 @@ struct ElementInsert: NibCommand {
                                                    visible: onPage ? session?.visibleRect : nil, page: record.size)
         let layer = session?.activeLayer ?? 0
         let written = try ctx.mutate { tx -> [Item] in
+            // Loading the fragment and assets suspends; another command may have claimed an ID meanwhile.
+            let current = Set(try tx.items(doc, page: page).map { $0.id })
+            if let clash = ids.first(where: { current.contains($0) }) {
+                throw NibError(.conflict, String(localized: "An item with ID \(clash.raw) already exists on this page."), path: "$.ids")
+            }
             let z = try tx.topZ(doc, page: page)
             let items = ElementFragments.instantiate(fragment, transform: transform, ids: ids, zAfter: z, layer: layer,
                                                      assets: assetMap)

@@ -385,6 +385,36 @@ final class MathAssistWatcherTests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).filter { $0.ext?["test.answer"] != nil }.count, 1)
     }
 
+    func testPopoverRejectsSameIDInkChangedBeforeWriting() async throws {
+        let h = harness()
+        try await h.insert([ink("QUESTION", "2+3=", y: 120)], page: Fixtures.page2)
+        try await enable(h)
+        let watcher = MathAssistWatcher.runtime(h.app)
+        let lines = try await watcher.scan(page)
+        let line = try XCTUnwrap(lines.first(where: \.isQuestion))
+        let params = MathAssistOptions.writeParameters(page: page, index: 0, line: line, latex: line.latex, format: "auto")
+        XCTAssertNil(params["latex"], "unchanged recognition is not a manual correction")
+        let corrected = MathAssistOptions.writeParameters(page: page, index: 0, line: line, latex: "2+8=", format: "auto")
+        XCTAssertEqual(corrected["latex"], "2+8=")
+        _ = try await h.run("test.assistEdit", ["id": "QUESTION", "latex": "2+4="])
+        let depth = h.undoDepth(Fixtures.docID)
+        for captured in [params, corrected] {
+            do {
+                _ = try await h.run(CommandIDs.mathAssist, captured)
+                XCTFail("A stale popover must not write an answer")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+        }
+        XCTAssertTrue(try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).isEmpty)
+        XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).contains { $0.ext?["test.answer"] != nil })
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        let current = try await watcher.scan(page)
+        let fresh = try XCTUnwrap(current.first(where: \.isQuestion))
+        let result = try await h.run(CommandIDs.mathAssist,
+            MathAssistOptions.writeParameters(page: page, index: 0, line: fresh, latex: fresh.latex, format: "auto"))
+        XCTAssertEqual(result["answer"], "6")
+        XCTAssertEqual(try watcher.links(doc: Fixtures.docID, page: Fixtures.page2).values.first?.corrected, false)
+    }
+
     func testBridgeStrokeMergesBothExistingGroups() {
         let left = AssistInk(ref: "LEFT", bounds: Rect(x: 0, y: 10, width: 20, height: 20), revision: "1", layer: 0)
         let right = AssistInk(ref: "RIGHT", bounds: Rect(x: 120, y: 10, width: 20, height: 20), revision: "1", layer: 0)

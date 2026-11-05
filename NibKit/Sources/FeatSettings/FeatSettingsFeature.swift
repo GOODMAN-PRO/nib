@@ -202,7 +202,7 @@ final class SettingsRouter {
         }
         if let root = visibleRoot, let window = root.viewIfLoaded?.window,
            let invokingWindow = ctx.navigator?.rootViewController?.viewIfLoaded?.window,
-           window === invokingWindow || (window.windowScene != nil && window.windowScene === invokingWindow.windowScene) {
+           window === invokingWindow {
             if let id = page { root.show(page: id) }
             return SettingsOpen.Output(opened: "settings", page: page, panel: nil)
         }
