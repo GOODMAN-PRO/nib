@@ -348,7 +348,9 @@ struct LibraryCell: View {
         } }
         .libraryDropTarget(row.isFolder ? row.ref : nil)
         .task(id: row.ref + String(row.modified ?? 0) + ":" + String(cache.revisions[row.nodeID] ?? 0) + ":" + String(isLocked)) {
-            subtitle = cache.subtitle(row, app: model.app)
+            let value = await cache.subtitle(row, app: model.app)
+            guard !Task.isCancelled else { return }
+            subtitle = value
         }
     }
 }

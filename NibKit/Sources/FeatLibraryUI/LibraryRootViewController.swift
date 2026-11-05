@@ -1412,7 +1412,16 @@ final class LibraryCoverCache: ObservableObject {
     @Published private(set) var revisions: [DocumentID: Int] = [:]
     private var keys: [DocumentID: Set<String>] = [:]
     private var subscription: EventSubscription?
-    init() {
+    private struct SubtitleWork {
+        let key: String
+        let task: Task<String, Never>
+    }
+    private var subtitleWork: [DocumentID: SubtitleWork] = [:]
+    private let countSubtitle: @Sendable (LibraryRow, DocumentContent) -> String
+    init(countSubtitle: @escaping @Sendable (LibraryRow, DocumentContent) -> String = { row, content in
+        row.subtitle(content: content)
+    }) {
+        self.countSubtitle = countSubtitle
         images.countLimit = NibMetrics.libraryCoverCacheCount
         images.totalCostLimit = NibMetrics.libraryCoverCacheBytes
         subtitles.countLimit = NibMetrics.libraryCoverCacheCount
@@ -1425,23 +1434,44 @@ final class LibraryCoverCache: ObservableObject {
     }
     deinit { subscription?.cancel() }
     func invalidate(_ doc: DocumentID) {
+        subtitleWork.removeValue(forKey: doc)?.task.cancel()
         for key in keys.removeValue(forKey: doc) ?? [] {
             images.removeObject(forKey: key as NSString)
             subtitles.removeObject(forKey: key as NSString)
         }
         revisions[doc, default: 0] += 1
     }
-    func subtitle(_ row: LibraryRow, app: NibApp) -> String? {
+    func subtitle(_ row: LibraryRow, app: NibApp) async -> String? {
         guard row.kind == "studySet" || row.kind == "textDocument",
               row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }
-        let key = row.ref + String(row.modified ?? 0)
+        let revision = revisions[row.nodeID] ?? 0
+        let key = row.ref + ":" + String(row.modified ?? 0) + ":" + String(revision)
         if let cached = subtitles.object(forKey: key as NSString) { return cached as String }
-        // Read only a visible item's head, without opening it or retaining its content in the workspace.
-        guard let content = try? app.workspace.peekContent(row.nodeID) else { return nil }
-        let subtitle = row.subtitle(content: content)
+        let work: SubtitleWork
+        if let pending = subtitleWork[row.nodeID], pending.key == key {
+            work = pending
+        } else {
+            // DocumentPersistence is main-actor isolated. Take its value snapshot here;
+            // enumerating every block/caption/table cell must not run on the scrolling actor.
+            guard let content = try? app.workspace.peekContent(row.nodeID) else { return nil }
+            let count = countSubtitle
+            let task = Task.detached(priority: .utility) { count(row, content) }
+            work = SubtitleWork(key: key, task: task)
+            subtitleWork[row.nodeID] = work
+        }
+        let subtitle = await work.task.value
+        // A cancelled/replaced revision must never clear newer work or populate its cache.
+        guard revision == revisions[row.nodeID] ?? 0,
+              app.services.lock?.isLocked(row.nodeID) != true else { return nil }
+        // Another cell awaiting the same work may already have published it.
+        if let cached = subtitles.object(forKey: key as NSString) {
+            return Task.isCancelled ? nil : cached as String
+        }
+        guard subtitleWork[row.nodeID]?.key == key else { return nil }
+        subtitleWork[row.nodeID] = nil
         keys[row.nodeID, default: []].insert(key)
         subtitles.setObject(subtitle as NSString, forKey: key as NSString)
-        return subtitle
+        return Task.isCancelled ? nil : subtitle
     }
     func thumbnail(_ row: LibraryRow, app: NibApp) async -> UIImage? {
         guard row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }

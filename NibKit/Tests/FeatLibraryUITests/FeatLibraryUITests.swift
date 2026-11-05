@@ -2265,21 +2265,77 @@ final class FeatLibraryUITests: XCTestCase {
         let other = EditorSession(); h.app.services.sessions.add(other)
         XCTAssertTrue(LibraryModels.get(h.app).model(other).coverCache === model.coverCache)
     }
-    func testDocumentCountsDoNotOpenDocumentsAndInvalidateWithTheirCover() throws {
+    func testSubtitleCountingRunsOffMainAndCoalescesVisibleCells() async throws {
+        let h = harness()
+        var content = try h.persistence.loadHead(Fixtures.textDocID)
+        content.blocks = [TextBlock(kind: .paragraph, text: RichText(plain: String(repeating: "word ", count: 100_000)))]
+        h.persistence.heads[Fixtures.textDocID] = content
+        let counted = expectation(description: "one background count")
+        counted.assertForOverFulfill = true
+        let cache = LibraryCoverCache { row, content in
+            XCTAssertFalse(Thread.isMainThread)
+            counted.fulfill()
+            return row.subtitle(content: content)
+        }
+        let row = LibraryRow.from(try XCTUnwrap(h.library.node(Fixtures.textDocID)))
+        async let first = cache.subtitle(row, app: h.app)
+        async let second = cache.subtitle(row, app: h.app)
+        let values = await (first, second)
+        await fulfillment(of: [counted], timeout: 2)
+        XCTAssertEqual(values.0, String(localized: "\(100_000) words"))
+        XCTAssertEqual(values.0, values.1)
+        let cached = await cache.subtitle(row, app: h.app)
+        XCTAssertEqual(cached, values.0)
+    }
+
+    func testOldSubtitleCannotOverwriteAnInvalidatedRevision() async throws {
+        let h = harness()
+        let started = expectation(description: "old count started")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let cache = LibraryCoverCache { row, content in
+            XCTAssertFalse(Thread.isMainThread)
+            if content.cards.filter({ !$0.deleted }).count == 2 {
+                started.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 3), .success)
+            }
+            return row.subtitle(content: content)
+        }
+        let row = LibraryRow.from(try XCTUnwrap(h.library.node(Fixtures.studySetID)))
+        let old = Task { await cache.subtitle(row, app: h.app) }
+        await fulfillment(of: [started], timeout: 2)
+        var content = try h.persistence.loadHead(Fixtures.studySetID)
+        content.cards[0].deleted = true
+        h.persistence.heads[Fixtures.studySetID] = content
+        cache.invalidate(Fixtures.studySetID)
+        let current = await cache.subtitle(row, app: h.app)
+        XCTAssertEqual(current, "1 card")
+        release.signal()
+        let stale = await old.value
+        XCTAssertNil(stale)
+        let cached = await cache.subtitle(row, app: h.app)
+        XCTAssertEqual(cached, "1 card")
+    }
+
+    func testDocumentCountsDoNotOpenDocumentsAndInvalidateWithTheirCover() async throws {
         let h = harness()
         let cache = LibraryModels.get(h.app).coverCache
         var row = LibraryRow.from(try XCTUnwrap(h.library.node(Fixtures.studySetID)))
         let loaded = h.app.workspace.loadedDocuments
-        XCTAssertEqual(cache.subtitle(row, app: h.app), "2 cards")
+        let subtitle0 = await cache.subtitle(row, app: h.app)
+        XCTAssertEqual(subtitle0, "2 cards")
         XCTAssertEqual(Set(h.app.workspace.loadedDocuments), Set(loaded))
         var content = try h.persistence.loadHead(Fixtures.studySetID)
         content.cards[0].deleted = true
         h.persistence.heads[Fixtures.studySetID] = content
-        XCTAssertEqual(cache.subtitle(row, app: h.app), "2 cards")
+        let subtitle1 = await cache.subtitle(row, app: h.app)
+        XCTAssertEqual(subtitle1, "2 cards")
         cache.invalidate(Fixtures.studySetID)
-        XCTAssertEqual(cache.subtitle(row, app: h.app), "1 card")
+        let subtitle2 = await cache.subtitle(row, app: h.app)
+        XCTAssertEqual(subtitle2, "1 card")
         row.locked = true
-        XCTAssertNil(cache.subtitle(row, app: h.app))
+        let subtitle3 = await cache.subtitle(row, app: h.app)
+        XCTAssertNil(subtitle3)
         XCTAssertEqual(Set(h.app.workspace.loadedDocuments), Set(loaded))
     }
     func testSessionModelReleasedAfterControllerAndSessionRemoval() async throws {
