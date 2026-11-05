@@ -1568,13 +1568,20 @@ extension TextDocViewController: PHPickerViewControllerDelegate, UIDocumentPicke
         guard let id = pendingImageBlock, let provider = results.first?.itemProvider,
               provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) else { return }
         pendingImageBlock = nil
-        _ = provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] url, _ in
+        _ = provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] url, error in
             // The provider's file lives only inside this callback: copy it first.
-            guard let url = url else { return }
-            let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension
-            let copy = TextDocViewController.temporaryFile(ext)
-            guard (try? FileManager.default.copyItem(at: url, to: copy)) != nil else { return }
-            Task { @MainActor in self?.attachImage(copy, to: id, removeAfter: true) }
+            let result = Result { try TextDocPhotoImport.stage(url, error: error) }
+            Task { @MainActor in
+                guard let self else {
+                    if case .success(let copy) = result { try? FileManager.default.removeItem(at: copy) }
+                    return
+                }
+                switch result {
+                case .success(let copy): self.attachImage(copy, to: id, removeAfter: true)
+                case .failure(let error):
+                    self.report(error, command: BlockUpdate.descriptor.id)
+                }
+            }
         }
     }
 
@@ -1586,6 +1593,27 @@ extension TextDocViewController: PHPickerViewControllerDelegate, UIDocumentPicke
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
         pendingImageBlock = nil
+    }
+}
+
+/// Staging must finish before the provider callback returns. Both failures use the editor's command-error route.
+enum TextDocPhotoImport {
+    static func stage(_ url: URL?, error: Error?,
+                      copy: (URL, URL) throws -> Void = { try FileManager.default.copyItem(at: $0, to: $1) }) throws -> URL {
+        if let error { throw error }
+        guard let url else {
+            throw NibError(.notFound, String(localized: "The selected photo could not be loaded. Please choose it again."))
+        }
+        let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nib-textdoc-" + UUID().uuidString + "." + ext)
+        do {
+            try copy(url, destination)
+            return destination
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
     }
 }
 

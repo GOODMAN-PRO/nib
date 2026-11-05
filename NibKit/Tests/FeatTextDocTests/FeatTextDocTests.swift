@@ -47,6 +47,21 @@ final class FeatTextDocTests: XCTestCase {
 
     private func harness() -> Harness { Harness(features: [FeatTextDocFeature.self]) }
 
+    func testPhotoImportReportsProviderAndStagingFailures() throws {
+        let providerError = CocoaError(.fileReadNoPermission)
+        XCTAssertThrowsError(try TextDocPhotoImport.stage(nil, error: providerError)) { error in
+            XCTAssertEqual((error as NSError).code, providerError.errorCode)
+        }
+        XCTAssertThrowsError(try TextDocPhotoImport.stage(nil, error: nil))
+        var destination: URL?
+        XCTAssertThrowsError(try TextDocPhotoImport.stage(URL(fileURLWithPath: "/photo.jpg"), error: nil) { _, output in
+            destination = output
+            try Data([1]).write(to: output)
+            throw CocoaError(.fileWriteNoPermission)
+        })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(destination).path))
+    }
+
     func testImageInsertRechecksIDAfterMediaResolution() async throws {
         let h = harness()
         let descriptor = CommandDescriptor(id: "test.suspendedInsert", title: "Insert", summary: "Interleaved import",
