@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import ImageIO
 import Combine
 import UniformTypeIdentifiers
 import NibContracts
@@ -1319,9 +1320,9 @@ enum ElementRenderer {
                     radius: t.style.cornerRadius, in: cg)
             drawText(t.text, in: r.insetBy(dx: CGFloat(t.style.padding), dy: CGFloat(t.style.padding)), base: t.style.defaults)
         case .image:
-            guard let i = item.image, let data = assets[i.asset.name], let picture = UIImage(data: data) else { return }
+            guard let i = item.image, let data = assets[i.asset.name] else { return }
             rotate(i.frame, cg)
-            drawImage(picture, crop: i.crop, in: i.frame.rect.cg)
+            drawImage(data, item: item, in: cg)
         case .sticky:
             guard let s = item.sticky else { return }
             rotate(s.frame, cg)
@@ -1491,17 +1492,38 @@ enum ElementRenderer {
             .draw(with: r, options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine], context: nil)
     }
 
-    private static func drawImage(_ picture: UIImage, crop: Rect?, in r: CGRect) {
-        var shown = picture
-        if let c = crop, let bitmap = picture.cgImage {
-            let w = CGFloat(bitmap.width)
-            let h = CGFloat(bitmap.height)
-            let px = CGRect(x: CGFloat(c.x) * w, y: CGFloat(c.y) * h, width: CGFloat(c.width) * w, height: CGFloat(c.height) * h)
-            if let cropped = bitmap.cropping(to: px.integral) {
-                shown = UIImage(cgImage: cropped, scale: picture.scale, orientation: picture.imageOrientation)
-            }
+    /// Crop and mask coordinates are in oriented image space, before the item's flips.
+    private static func drawImage(_ data: Data, item: Item, in cg: CGContext) {
+        guard let image = item.image, let source = CGImageSourceCreateWithData(data as CFData, nil) else { return }
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                      kCGImageSourceCreateThumbnailWithTransform: true,
+                                      kCGImageSourceThumbnailMaxPixelSize: 2048]
+        guard let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return }
+        let crop = image.crop ?? Rect(x: 0, y: 0, width: 1, height: 1)
+        guard crop.width > 0, crop.height > 0 else { return }
+        let pixels = CGRect(x: crop.x * Double(bitmap.width), y: crop.y * Double(bitmap.height),
+                            width: crop.width * Double(bitmap.width), height: crop.height * Double(bitmap.height))
+        guard let part = bitmap.cropping(to: pixels.integral) else { return }
+        let r = image.frame.rect.cg
+        let legacy = item.ext?["images"]
+        let flipX = image.flipX ?? legacy?["flipX"]?.boolValue ?? false
+        let flipY = image.flipY ?? legacy?["flipY"]?.boolValue ?? false
+        cg.translateBy(x: r.midX, y: r.midY)
+        cg.scaleBy(x: flipX ? -1 : 1, y: flipY ? -1 : 1)
+        cg.translateBy(x: -r.midX, y: -r.midY)
+        if let mask = image.mask, mask.count >= 3 {
+            let path = CGMutablePath()
+            path.addLines(between: mask.map { p in
+                CGPoint(x: Double(r.minX) + (p.x - crop.x) / crop.width * Double(r.width),
+                        y: Double(r.minY) + (p.y - crop.y) / crop.height * Double(r.height))
+            })
+            path.closeSubpath()
+            cg.addPath(path)
+            cg.clip()
+        } else {
+            cg.clip(to: r)
         }
-        shown.draw(in: r)
+        UIImage(cgImage: part).draw(in: r)
     }
 }
 
