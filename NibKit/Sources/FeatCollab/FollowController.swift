@@ -57,7 +57,7 @@ enum FollowRules {
 /// (S-113: everyone follows you). Driven by `collab.follow` / `collab.followMe` and by the others' presence.
 @MainActor
 final class FollowController {
-    private unowned let hub: PresenceHub
+    private weak var hub: PresenceHub?
     /// Who this device follows.
     private(set) var following: String?
     /// Set when following because they turned on Follow Me.
@@ -76,6 +76,7 @@ final class FollowController {
 
     /// Follows `pid` in `window` (nil stops). Following someone of your own choice ends a Follow Me link.
     func follow(_ pid: String?, window: EditorSession? = nil) {
+        guard let hub else { return }
         if let pid = pid {
             following = pid
             if leader != pid { leader = nil }
@@ -99,6 +100,7 @@ final class FollowController {
     /// Turns this device's Follow Me on or off and tells everyone; a leader follows nobody.
     @discardableResult
     func setLeading(_ on: Bool) -> Bool {
+        guard let hub else { return false }
         isLeading = on
         if on {
             following = nil
@@ -119,6 +121,7 @@ final class FollowController {
 
     /// Host leadership wins a tie; otherwise the lower participant id wins on every device.
     private func wins(_ candidate: CollabParticipant, over id: String) -> Bool {
+        guard let hub else { return false }
         let incumbentIsHost = hub.hooks?.participants.first { $0.id == id }?.isHost ?? false
         if candidate.isHost != incumbentIsHost { return candidate.isHost }
         return candidate.id < id
@@ -126,6 +129,7 @@ final class FollowController {
 
     /// Someone turned Follow Me on or off. Resolve competing leaders before moving anyone's view.
     func remoteFollowMe(on: Bool, from pid: String) {
+        guard let hub else { return }
         if on {
             guard let candidate = hub.state.others.first(where: { $0.id == pid }), candidate.canEdit else { return }
             if isLeading, let me = hub.state.me {
@@ -160,12 +164,14 @@ final class FollowController {
 
     /// A viewport arrived from `pid`: this window follows it when following them.
     func remoteViewport(from pid: String) {
+        guard let hub else { return }
         guard following == pid, let v = hub.presence.people[pid]?.viewport else { return }
         apply(page: v.page, rect: v.rect)
     }
 
     /// This window's view changed: stop following when the user moved away from the leader's view.
     func localViewChanged(_ session: EditorSession) {
+        guard let hub else { return }
         guard let pid = following, session === targetSession() else { return }
         var a = applied
         let moved = FollowRules.isUserMove(page: session.page, rect: session.visibleRect, applied: &a, now: hub.now(),
@@ -179,6 +185,7 @@ final class FollowController {
 
     /// People left: stop following someone who is gone.
     func rosterChanged(active: Set<String>) {
+        guard let hub else { return }
         var changed = false
         if let f = following, !active.contains(f) {
             following = nil
@@ -204,6 +211,7 @@ final class FollowController {
     /// The window that follows: the one following was started from while it shows the shared document, else the
     /// one the hub shares its view from.
     func targetSession() -> EditorSession? {
+        guard let hub else { return nil }
         if let w = window, w.document == hub.sharedDoc { return w }
         return hub.presenceSession()
     }
@@ -212,6 +220,7 @@ final class FollowController {
 
     /// Starts following with what is known of `pid`: their last viewport, else the page the roster says they are on.
     private func catchUp(_ pid: String) {
+        guard let hub else { return }
         if let v = hub.presence.people[pid]?.viewport {
             apply(page: v.page, rect: v.rect)
         } else if let page = hub.rosterPage(pid) {
@@ -220,6 +229,7 @@ final class FollowController {
     }
 
     private func apply(page: PageID, rect: Rect?) {
+        guard let hub else { return }
         guard let doc = hub.sharedDoc else { return }
         guard let session = targetSession() else {
             // No window shows the document (following from the library): open it there once.

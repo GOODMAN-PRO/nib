@@ -95,6 +95,34 @@ func presenceWait(_ what: String, file: StaticString = #filePath, line: UInt = #
 
 @MainActor
 final class PresenceTests: XCTestCase {
+    func testPresenceHelpersAndDelayedSummarySurviveOwnerTeardown() async throws {
+        var harness: Harness? = Harness(features: PresencePair.features)
+        var hub: PresenceHub? = PresenceHub.of(harness!.app)
+        let follow = try XCTUnwrap(hub).follow
+        let shared = try XCTUnwrap(hub).sharedModel
+        let unseen = try XCTUnwrap(hub).unseen
+        weak var app = harness!.app
+        hub?.timing.returnSummaryDelay = 0.02
+        hub?.didEnterBackground()
+        hub?.didBecomeActive()
+        harness = nil
+        XCTAssertNil(app)
+        // A retained panel/hub can outlive its app; a delayed summary must find no app to update.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        hub?.refreshState()
+        shared.refresh(scan: true)
+        unseen.scan(Fixtures.docID)
+        XCTAssertTrue(shared.entries.isEmpty)
+        hub = nil
+        // Retained helper objects must also tolerate the hub disappearing.
+        follow.follow("departed")
+        XCTAssertFalse(follow.setLeading(true))
+        XCTAssertNil(follow.targetSession())
+        shared.refresh(scan: true)
+        XCTAssertTrue(shared.entries.isEmpty)
+        XCTAssertTrue(unseen.trackedDocuments.isEmpty)
+    }
+
     private let doc = Fixtures.docID
     private var page1Ref: String { NodeRef.page(Fixtures.docID, Fixtures.page1).description }
     private var page2Ref: String { NodeRef.page(Fixtures.docID, Fixtures.page2).description }

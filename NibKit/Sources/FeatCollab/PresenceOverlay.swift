@@ -278,6 +278,8 @@ final class PresenceBroadcaster {
     private var pending: [String: JSONValue] = [:]
     private var timers: [String: Task<Void, Never>] = [:]
 
+    deinit { for timer in timers.values { timer.cancel() } }
+
     init(send: @escaping Sender, clock: @escaping () -> TimeInterval) {
         self.send = send
         self.clock = clock
@@ -382,6 +384,11 @@ final class PresenceAttachment: CanvasAttachment {
     private var expiryAt: TimeInterval?
     /// Something changed while the Pencil was down here: drawn when it lifts (nothing moves under the Pencil).
     private var pendingRender = false
+
+    deinit {
+        expiry?.cancel()
+        inking?.cancel()
+    }
 
     init(hub: PresenceHub, host: CanvasHost) {
         self.hub = hub
