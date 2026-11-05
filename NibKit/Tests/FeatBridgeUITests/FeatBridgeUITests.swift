@@ -1065,6 +1065,33 @@ final class FeatBridgeUITests: XCTestCase {
         XCTAssertEqual(navigator.settingsPages, [], "with a floating host the pill never leaves the document")
     }
 
+    func testTurnOffDiagnosticUsesTheInvokingWindowsContext() async throws {
+        let (h, _, monitor) = makeHarness()
+        try await h.run(CommandIDs.bridgeSetEnabled, ["enabled": true])
+        let navigator = FakeNavigator(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: navigator,
+                                    kind: .whiteboard, isCompact: true)
+        var observed: ChromeContext?
+        var item = try XCTUnwrap(h.app.ui.toolbar.get(BridgeUIIDs.statusItem))
+        item.compactStatus = { observed = $0; return nil }
+        h.app.ui.toolbar.register(item)
+        let state = BridgePillState()
+        state.detailsPresented = true
+        let popover = BridgeDetailsPopover(monitor: monitor, state: state, context: context)
+        await popover.turnOff()
+        XCTAssertFalse(state.detailsPresented)
+        XCTAssertNil(state.error)
+        XCTAssertEqual(monitor.snapshot?.enabled, false)
+        #if DEBUG
+        let diagnostic = try XCTUnwrap(observed)
+        XCTAssertTrue(diagnostic.app === h.app)
+        XCTAssertTrue(diagnostic.session === h.session)
+        XCTAssertTrue(diagnostic.navigator === navigator)
+        XCTAssertEqual(diagnostic.kind, .whiteboard)
+        XCTAssertTrue(diagnostic.isCompact)
+        #endif
+    }
+
     func testPillWithoutAFloatingHostOpensBridgeSettings() async throws {
         let (h, _, monitor) = makeHarness()
         let navigator = FakeNavigator(session: h.session)

@@ -67,7 +67,9 @@ enum TabStripLayout {
                              activeTitleWidth: CGFloat = 0) -> Plan {
         let widths = tabWidths(compact: compact)
         let available = max(0, width - 2 * inset)
-        let minimum = max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0)
+        // A long title truncates inside the largest capsule instead of hiding the entire strip.
+        let minimum = min(widths.upperBound,
+                          max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0))
         let slots = min(max(0, count), maxTabs, Int(available / minimum))
         var shown = Array(0..<slots)
         if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }

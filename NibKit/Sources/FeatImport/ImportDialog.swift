@@ -583,10 +583,15 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     private static var active: DocumentPicker?
     private var continuation: CheckedContinuation<[URL], Error>?
     private var finishing = false
+    private weak var controller: UIDocumentPickerViewController?
+    private var presentationTask: Task<Void, Never>?
+    private var disconnectObserver: NSObjectProtocol?
 
     static func pick(types: [UTType], navigator: SceneNavigator,
+                     presentationTimeoutNanoseconds: UInt64 = 3_000_000_000,
                      presentation: ImportUI.Presentation? = nil) async throws -> [URL] {
         await ImportUI.waitUntilPresentable(navigator)
+        try Task.checkCancellation()
         guard active == nil, navigator.rootViewController?.viewIfLoaded?.window != nil else {
             throw NibError(.unavailable,
                 String(localized: "Couldn't open the Files picker. Choose Import Files again."))
@@ -596,17 +601,29 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         picker.shouldShowFileExtensions = true
         let delegate = DocumentPicker()
         picker.delegate = delegate
+        delegate.controller = picker
         active = delegate
-        defer { if active === delegate { active = nil } }
-        let urls = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[URL], Error>) in
-            delegate.continuation = continuation
-            Task { @MainActor in
-                let shown = await ImportUI.present(picker, navigator: navigator, presentation: presentation)
-                if !shown {
-                    delegate.finish(.failure(NibError(.unavailable,
-                        String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+        defer {
+            delegate.stopWatchingScene()
+            delegate.presentationTask?.cancel()
+            if active === delegate { active = nil }
+        }
+        let urls = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[URL], Error>) in
+                delegate.continuation = continuation
+                delegate.watchScene(of: navigator)
+                delegate.presentationTask = Task { @MainActor in
+                    let shown = await ImportUI.present(picker, navigator: navigator,
+                        timeoutNanoseconds: presentationTimeoutNanoseconds, presentation: presentation)
+                    if !shown {
+                        delegate.finish(.failure(NibError(.unavailable,
+                            String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+                    }
                 }
             }
+        } onCancel: {
+            Task { @MainActor in delegate.cancel() }
         }
         await ImportUI.waitUntilPresentable(navigator)             // the picker finishes dismissing first
         return urls
@@ -617,7 +634,7 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         NSLog("%@", "[Nib QA import] didPick count=\(urls.count)")
         #endif
         importLog.info("Files picker delivered \(urls.count) URLs")
-        finish(.success(urls), dismissing: controller)
+        finish(.success(urls))
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
@@ -625,22 +642,47 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         NSLog("%@", "[Nib QA import] picker cancelled")
         #endif
         importLog.info("Files picker cancelled")
-        finish(.success([]), dismissing: controller)
+        finish(.success([]))
     }
 
-    private func finish(_ result: Result<[URL], Error>, dismissing controller: UIViewController? = nil) {
+    private func finish(_ result: Result<[URL], Error>) {
         guard !finishing else { return }
         finishing = true
-        let complete = { [self] in
-            continuation?.resume(with: result)
-            continuation = nil
+        stopWatchingScene()
+        presentationTask?.cancel()
+        presentationTask = nil
+        let pending = continuation
+        continuation = nil
+        // UIKit dismisses on delegate callbacks. The local delegate survives the trailing transition wait;
+        // a second dismiss here can lose its completion and strand every later import.
+        pending?.resume(with: result)
+    }
+
+    private func cancel() {
+        guard !finishing else { return }
+        if let controller, controller.presentingViewController != nil, !controller.isBeingDismissed {
+            controller.dismiss(animated: true)
         }
-        // Retain the delegate until the dismissal completes, including duplicate delegate callbacks.
-        if let controller, controller.presentingViewController != nil {
-            controller.dismiss(animated: true, completion: complete)
-        } else {
-            complete()
+        finish(.failure(CancellationError()))
+    }
+
+    private func watchScene(of navigator: SceneNavigator) {
+        guard let scene = navigator.rootViewController?.viewIfLoaded?.window?.windowScene else { return }
+        disconnectObserver = NotificationCenter.default.addObserver(forName: UIScene.didDisconnectNotification,
+                                                                    object: scene, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.sceneDisconnected() }
         }
+    }
+
+    func sceneDisconnected() {
+        controller = nil
+        finish(.failure(NibError(.unavailable,
+            String(localized: "Couldn't open the Files picker. Choose Import Files again."))))
+    }
+
+    private func stopWatchingScene() {
+        if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
+        disconnectObserver = nil
     }
 }
 
@@ -650,27 +692,71 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
 enum ImportUI {
     typealias Presentation = @MainActor (UIViewController, UIViewController, @escaping @MainActor () -> Void) -> Void
 
-    /// Resolve from UIKit's presentation completion, never from the relationship immediately after `present`.
+    /// Completion, timeout, cancellation and scene loss race through one main-actor outcome.
+    @MainActor
+    private final class PresentationOutcome {
+        var continuation: CheckedContinuation<Bool, Never>?
+        var timeout: Task<Void, Never>?
+        var disconnectObserver: NSObjectProtocol?
+
+        func resolve(_ shown: Bool) {
+            guard let continuation else { return }
+            self.continuation = nil
+            timeout?.cancel()
+            timeout = nil
+            if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
+            disconnectObserver = nil
+            continuation.resume(returning: shown)
+        }
+    }
+
+    /// Prefer UIKit's completion. If it never arrives, inspect the relationship only after a bounded grace period.
     /// All preflight checks and the call run together on the main actor; an ongoing transition is not presented over.
     static func present(_ controller: UIViewController, navigator: SceneNavigator,
+                        timeoutNanoseconds: UInt64 = 3_000_000_000,
                         presentation: Presentation? = nil) async -> Bool {
         await waitUntilPresentable(navigator)
-        guard let root = navigator.rootViewController, root.viewIfLoaded?.window != nil else { return false }
+        guard !Task.isCancelled, let root = navigator.rootViewController,
+              root.viewIfLoaded?.window != nil else { return false }
         var top = root
         while let next = top.presentedViewController { top = next }
         guard !top.isBeingPresented, !top.isBeingDismissed, top.viewIfLoaded?.window != nil else { return false }
         controller.overrideUserInterfaceStyle = root.traitCollection.userInterfaceStyle
-        return await withCheckedContinuation { continuation in
-            let complete: @MainActor () -> Void = {
-                #if DEBUG
-                let presented = String(describing: top.presentedViewController)
-                let presenting = String(describing: controller.presentingViewController)
-                NSLog("%@", "[Nib QA import] presentation completed presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
-                #endif
-                continuation.resume(returning: true)
+        let outcome = PresentationOutcome()
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return false }
+            return await withCheckedContinuation { continuation in
+                outcome.continuation = continuation
+                if let scene = root.viewIfLoaded?.window?.windowScene {
+                    outcome.disconnectObserver = NotificationCenter.default.addObserver(
+                        forName: UIScene.didDisconnectNotification, object: scene, queue: .main) { _ in
+                            Task { @MainActor in outcome.resolve(false) }
+                        }
+                }
+                outcome.timeout = Task { @MainActor in
+                    do { try await Task.sleep(nanoseconds: timeoutNanoseconds) } catch { return }
+                    let shown = controller.presentingViewController != nil
+                        || top.presentedViewController === controller || controller.viewIfLoaded?.window != nil
+                    #if DEBUG
+                    let presented = String(describing: top.presentedViewController)
+                    let presenting = String(describing: controller.presentingViewController)
+                    NSLog("%@", "[Nib QA import] presentation deadline presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
+                    #endif
+                    outcome.resolve(shown)
+                }
+                let complete: @MainActor () -> Void = {
+                    #if DEBUG
+                    let presented = String(describing: top.presentedViewController)
+                    let presenting = String(describing: controller.presentingViewController)
+                    NSLog("%@", "[Nib QA import] presentation completed presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
+                    #endif
+                    outcome.resolve(true)
+                }
+                if let presentation { presentation(top, controller, complete) }
+                else { top.present(controller, animated: true, completion: complete) }
             }
-            if let presentation { presentation(top, controller, complete) }
-            else { top.present(controller, animated: true, completion: complete) }
+        } onCancel: {
+            Task { @MainActor in outcome.resolve(false) }
         }
     }
 
@@ -713,6 +799,7 @@ enum ImportUI {
         defer { NSLog("%@", "[Nib QA import] waitUntilPresentable returned") }
         #endif
         for _ in 0..<30 {
+            if Task.isCancelled { return }
             guard let root = navigator.rootViewController else { return }
             var top = root
             while let presented = top.presentedViewController { top = presented }
