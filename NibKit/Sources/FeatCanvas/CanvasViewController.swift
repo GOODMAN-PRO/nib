@@ -2103,6 +2103,7 @@ struct PageErrorContent: View {
             VStack(spacing: NibSpacing.s) {
                 ForEach(Array(actions.enumerated()), id: \.offset) { index, action in
                     NibButton(action.title, kind: index == 0 ? .primary : .secondary, action: action.handler)
+                        .nibNativeAction(action.handler)
                 }
             }
             .padding(.horizontal, NibSpacing.s)

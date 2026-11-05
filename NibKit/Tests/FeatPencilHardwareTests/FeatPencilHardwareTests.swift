@@ -1,7 +1,9 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
+@testable import NibDesign
 @testable import FeatPencilHardware
 
 /// A document editor stand-in so `session.editor?.canvasHost` finds the fake canvas.
@@ -240,6 +242,72 @@ final class FeatPencilHardwareTests: XCTestCase {
                        CGPoint(x: 116, y: 90))
         XCTAssertEqual(PalettePlacement.centre(size: size, anchor: CGPoint(x: 990, y: 790), bounds: bounds, insets: insets),
                        CGPoint(x: 884, y: 714))
+    }
+
+    func testOverflowingPaletteScrollsFromFirstToolToThicknessAtLargeText() async throws {
+        let h = Harness(features: [FeatPencilHardwareFeature.self])
+        let builtins = ["lasso", "pen", "highlighter", "eraser", "shape", "drawShape", "text"]
+        for (index, id) in builtins.enumerated() {
+            h.app.ui.toolbar.register(item(id, id == "lasso" ? .lasso : .tools, order: index, tool: id))
+        }
+        for index in 0..<30 {
+            let id = "test.plugin.tool\(index)"
+            h.app.ui.toolbar.register(item(id, .tools, order: 100 + index, tool: id, owner: "test.plugin"))
+        }
+        var presets = ToolPresets.defaults(for: "pen")
+        presets.swatches = (0..<12).map { PresetSwatch(color: RGBA(UInt8(20 + $0 * 15), 40, 80)) }
+        h.app.settings.set(NibSettings.presets("pen"), presets)
+        h.session.tool = "pen"
+        let model = PaletteModel(app: h.app, session: h.session, kind: .tools)
+        XCTAssertEqual(model.plan.tools.count, 37)
+        XCTAssertEqual(model.plan.swatches.count, 12)
+        let natural = UIHostingController(rootView: SqueezePaletteView(model: model, dismiss: {}, maximumHeight: 900)
+            .environment(\.dynamicTypeSize, .accessibility5))
+        let naturalSize = natural.sizeThatFits(in: CGSize(width: 852, height: 900))
+        let insets = UIEdgeInsets(top: 0, left: 0, bottom: 21, right: 0)
+        let controller = UIHostingController(rootView: PaletteOverlay(model: model,
+            anchor: CGPoint(x: 426, y: 190), insets: insets, dismiss: {})
+            .environment(\.dynamicTypeSize, .accessibility5))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 852, height: 393))
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+        func targets() -> [UIView] {
+            descendants(controller.view).filter { view in
+                view.gestureRecognizers?.contains { $0 is NibActionTapRecognizer } == true
+            }
+        }
+        for _ in 0..<50 {
+            controller.view.layoutIfNeeded()
+            if targets().count == 40 { break } // 37 tools and three thickness presets
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let scroll = try XCTUnwrap(descendants(controller.view).compactMap { $0 as? UIScrollView }
+            .first { $0.contentSize.height > $0.bounds.height + 1 })
+        XCTAssertTrue(scroll.isScrollEnabled)
+        XCTAssertGreaterThan(scroll.contentSize.height, 492)
+        XCTAssertEqual(scroll.bounds.width, naturalSize.width, accuracy: 1,
+                       "Switching to scrolling must retain the plain palette's width")
+        let safe = window.bounds.inset(by: insets).insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
+        XCTAssertTrue(safe.insetBy(dx: -1, dy: -1).contains(scroll.convert(scroll.bounds, to: window)))
+        let cells = targets().sorted { a, b in
+            let a = a.convert(a.bounds, to: scroll), b = b.convert(b.bounds, to: scroll)
+            return abs(a.minY - b.minY) > 1 ? a.minY < b.minY : a.minX < b.minX
+        }
+        XCTAssertEqual(cells.count, 40)
+        let first = try XCTUnwrap(cells.first), last = try XCTUnwrap(cells.last)
+        XCTAssertGreaterThan(last.convert(last.bounds, to: scroll).maxY, scroll.bounds.maxY)
+        for cell in [first, last, first] {
+            scroll.scrollRectToVisible(cell.convert(cell.bounds, to: scroll), animated: false)
+            for _ in 0..<5 { controller.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let frame = cell.convert(cell.bounds, to: window)
+            XCTAssertTrue(safe.insetBy(dx: -1, dy: -1).contains(frame))
+            let hit = try XCTUnwrap(window.hitTest(CGPoint(x: frame.midX, y: frame.midY), with: nil))
+            XCTAssertTrue(hit === cell || hit.isDescendant(of: cell), "The visible cell must own its touch")
+        }
+        XCTAssertLessThanOrEqual(scroll.contentOffset.y, NibMetrics.paletteEndPadding + 1,
+                                 "The first tool remains reachable after returning")
     }
 
     // MARK: Hover preview

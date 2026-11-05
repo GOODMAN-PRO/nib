@@ -4,7 +4,7 @@ import SwiftUI
 import PencilKit
 import NibContracts
 import NibTesting
-import NibDesign
+@testable import NibDesign
 @testable import FeatCanvas
 
 /// The canvas (F006) end to end on the fixture documents: registration, the view.* and canvas.* commands on a live
@@ -2475,6 +2475,81 @@ final class FeatCanvasTests: XCTestCase {
         vc.errorView.actions[0].handler()
         XCTAssertTrue(vc.errorView.isHidden)
         XCTAssertTrue(vc.failedPages.isEmpty)
+    }
+
+    func testAX5RecoveryButtonsScrollIntoShortFittedPaperAndReceiveTouches() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = FailingRenderer()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel",
+            summary: "Recovery panel fixture.", effect: .session)) { _, _ in .null }
+        h.app.ui.panels.register(PanelDescriptor(id: PanelIDs.cloudBackup, title: "Cloud & Backup", icon: "externaldrive",
+            placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        h.app.commands.register(CommandDescriptor(id: "test.fitHorizontalPaper", title: "Fit Paper",
+            summary: "Short fitted paper fixture.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.scrollDirection = .horizontal
+                try tx.putMeta(meta)
+            }
+            return .null
+        }
+        try await h.run("test.fitHorizontalPaper")
+        let size = CGSize(width: 667, height: 375)
+        let vc = try makeCanvas(h, size: size)
+        let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+        window.rootViewController = vc
+        window.isHidden = false
+        defer { vc.closeCanvas(); window.isHidden = true; window.rootViewController = nil }
+        vc.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+        vc.errorView.hosting.traitOverrides.preferredContentSizeCategory = .accessibilityExtraExtraExtraLarge
+        vc.view.layoutIfNeeded()
+        vc.setZoom(vc.fitZoom, anchor: nil, centreFit: true)
+        vc.pageDidFail(Fixtures.page1)
+        let renderedPage = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("failed fitted tiles to settle") { renderedPage.isSettled }
+        let error = vc.errorView
+        var retried = 0, restored = 0
+        error.onRetry = { retried += 1 }
+        error.onRestore = { restored += 1 }
+        func taps(_ view: UIView) -> [NibActionTapRecognizer] {
+            (view.gestureRecognizers ?? []).compactMap { $0 as? NibActionTapRecognizer }
+                + view.subviews.flatMap(taps)
+        }
+        for _ in 0..<50 {
+            vc.view.layoutIfNeeded(); error.layoutIfNeeded(); error.hosting.view.layoutIfNeeded()
+            if taps(error.hosting.view).count == 2, error.viewport.contentSize.height > error.bounds.height { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
+        let visiblePaper = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
+        XCTAssertEqual(error.frame, visiblePaper)
+        XCTAssertFalse(error.isHidden)
+        XCTAssertLessThanOrEqual(error.bounds.height, 375)
+        XCTAssertLessThan(error.bounds.width, 300, "Use fitted portrait paper, not a full-width error panel")
+        XCTAssertEqual(error.hosting.traitCollection.preferredContentSizeCategory, .accessibilityExtraExtraExtraLarge)
+        XCTAssertTrue(error.viewport.isScrollEnabled)
+        XCTAssertGreaterThan(error.viewport.contentSize.height, error.viewport.bounds.height)
+        let actions = taps(error.hosting.view).sorted { a, b in
+            (a.view?.convert(CGPoint.zero, to: error.viewport).y ?? 0)
+                < (b.view?.convert(CGPoint.zero, to: error.viewport).y ?? 0)
+        }
+        XCTAssertEqual(actions.count, 2)
+        let last = try XCTUnwrap(actions.last?.view)
+        XCTAssertGreaterThan(last.convert(last.bounds, to: error.viewport).maxY, error.viewport.bounds.maxY,
+                             "The regression must start with a recovery control below the visible paper")
+        for action in actions {
+            let target = try XCTUnwrap(action.view)
+            error.viewport.scrollRectToVisible(target.convert(target.bounds, to: error.viewport), animated: false)
+            for _ in 0..<5 { error.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let frame = target.convert(target.bounds, to: error)
+            XCTAssertTrue(error.bounds.insetBy(dx: -1, dy: -1).contains(frame), "Show the whole recovery button")
+            let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: window)
+            let hit = try XCTUnwrap(window.hitTest(point, with: nil))
+            XCTAssertTrue(hit === target || hit.isDescendant(of: target), "Recovery receives the touch instead of the canvas")
+            action.activate()
+        }
+        XCTAssertEqual(retried, 1)
+        XCTAssertEqual(restored, 1)
     }
 
     func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {

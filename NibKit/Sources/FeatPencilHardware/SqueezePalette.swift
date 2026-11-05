@@ -277,7 +277,9 @@ struct SqueezePaletteView: View {
     var body: some View {
         ViewThatFits(in: .vertical) {
             rows
-            ScrollView(.vertical) { rows }
+            ScrollView(.vertical) {
+                rows.fixedSize(horizontal: true, vertical: false)
+            }
         }
         .frame(maxHeight: maximumHeight)
         .fixedSize(horizontal: true, vertical: false)

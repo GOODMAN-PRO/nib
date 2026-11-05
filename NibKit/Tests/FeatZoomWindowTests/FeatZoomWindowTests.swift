@@ -4,7 +4,7 @@ import SwiftUI
 import PencilKit
 import Combine
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatZoomWindow
 
@@ -1260,6 +1260,61 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(ZoomWindowController.writingHeight(width: 800, box: Rect(x: 0, y: 0, width: 100, height: 400),
                                                           maxHeight: 300), 300, "never taller than the screen allows")
         overlay.detach(from: host)
+    }
+
+    func testHostedPaneShrinksWritingContentToTheRemainingChromeHeight() async throws {
+        let h = harness()
+        let (host, overlay) = try await openWindow(h)
+        let c = overlay.controller, writing = c.writingView()
+        let pane = UIHostingController(rootView: ZoomPane(controller: c, state: state(h), writing: writing))
+        pane.safeAreaRegions = []
+        let root = UIViewController()
+        root.addChild(pane)
+        root.view.addSubview(pane.view)
+        pane.didMove(toParent: root)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 667, height: 375))
+        window.rootViewController = root
+        window.isHidden = false
+        defer { overlay.detach(from: host); window.isHidden = true; window.rootViewController = nil }
+        func taps(_ view: UIView) -> [NibActionTapRecognizer] {
+            (view.gestureRecognizers ?? []).compactMap { $0 as? NibActionTapRecognizer }
+                + view.subviews.flatMap(taps)
+        }
+        // The full chrome budget, then the smaller space after reserving the page HUD.
+        for budget in [CGFloat(184), CGFloat(128)] {
+            pane.view.frame = CGRect(x: 16, y: 68, width: 635, height: budget)
+            pane.view.setNeedsLayout()
+            for _ in 0..<50 {
+                root.view.layoutIfNeeded(); pane.view.layoutIfNeeded(); writing.layoutIfNeeded()
+                if taps(pane.view).count == 2,
+                   abs(writing.bounds.height - (budget - ZoomWindowController.paneChrome)) < 1 { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertGreaterThan(c.writingSize.height, budget - ZoomWindowController.paneChrome,
+                                 "The natural writing height must exceed the actual proposal")
+            XCTAssertEqual(writing.bounds.height, budget - ZoomWindowController.paneChrome, accuracy: 0.5)
+            XCTAssertEqual(writing.canvas.frame, writing.bounds, "Constrain the actual input surface, not just the outer frame")
+            let writingFrame = writing.convert(writing.bounds, to: root.view)
+            XCTAssertTrue(pane.view.frame.insetBy(dx: -1, dy: -1).contains(writingFrame))
+            let controls = taps(pane.view).sorted { a, b in
+                (a.view?.convert(CGPoint.zero, to: root.view).x ?? 0)
+                    < (b.view?.convert(CGPoint.zero, to: root.view).x ?? 0)
+            }
+            XCTAssertEqual(controls.count, 2, "Close and New Line must both be hosted")
+            for tap in controls {
+                let target = try XCTUnwrap(tap.view)
+                let frame = target.convert(target.bounds, to: root.view)
+                XCTAssertGreaterThanOrEqual(frame.minY, 68)
+                XCTAssertLessThanOrEqual(frame.maxY, writingFrame.minY)
+                XCTAssertTrue(pane.view.frame.contains(frame))
+                let hit = try XCTUnwrap(root.view.hitTest(CGPoint(x: frame.midX, y: frame.midY), with: nil))
+                XCTAssertTrue(hit === target || hit.isDescendant(of: target))
+            }
+            let before = state(h).rect
+            try XCTUnwrap(controls.last).activate()
+            await c.pending?.value
+            XCTAssertGreaterThan(state(h).rect.y, before.y, "The reachable New Line control must still work")
+        }
     }
 
     func testDeletingTheBoxPageHidesTheWindowAndRefusesItsStrokes() async throws {
