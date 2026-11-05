@@ -157,13 +157,13 @@ enum Edits {
             try Shapes.rejectProtected(fields, keys: Shapes.protectedFields, path: path, ctx)
             var patch = fields
             Shapes.normalizeSize(&patch)
-            return try setRecord(ctx.workspace.content(doc).pages, id, patch, path: path, what: "page", ctx) { tx, r in
+            return try setRecord(ctx.workspace.content(doc).pages, id, patch, path: path, what: "page", allowDeleted: true, ctx) { tx, r in
                 try tx.put(r, doc: doc)
             }
         case let .item(doc, page, id):
             try Shapes.rejectProtected(fields, keys: Shapes.protectedFields, path: path, ctx)
             if let stroke = fields["stroke"]?.objectValue { try Shapes.checkStrokePoints(stroke, path: path + ".stroke") }
-            guard let old = try ctx.workspace.allItems(doc, page: page).first(where: { $0.id == id }) else {
+            guard let old = try ctx.workspace.allItems(doc, page: page).first(where: { $0.id == id && !$0.deleted }) else {
                 throw NibError.notFound("item \(id) on page \(page)")
             }
             var patch = fields
@@ -197,9 +197,11 @@ enum Edits {
     }
 
     static func setRecord<T: LWWRecord>(_ records: [T], _ id: NibID, _ fields: [String: JSONValue], path: String,
-                                        what: String, _ ctx: CommandContext,
+                                        what: String, allowDeleted: Bool = false, _ ctx: CommandContext,
                                         put: (DocTransaction, T) throws -> T) throws -> Bool {
-        guard let old = records.first(where: { $0.id == id }) else { throw NibError.notFound("\(what) \(id)") }
+        guard let old = records.first(where: { $0.id == id && (allowDeleted || !$0.deleted) }) else {
+            throw NibError.notFound("\(what) \(id)")
+        }
         let new = try Shapes.decode(T.self, Shapes.compactJSON(old).merging(.object(fields)), at: path)
         try sameID(new.id, old.id, path: path)
         guard new != old else { return false }
