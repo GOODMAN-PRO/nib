@@ -99,6 +99,7 @@ public enum CommandIDs {
     public static let aiChatRename = "ai.chat.rename"  // F084
     public static let aiChatDelete = "ai.chat.delete"  // F084
     public static let aiChatFeedback = "ai.chat.feedback"  // F084
+    public static let aiChatSave = "ai.chat.save"  // F084
     public static let aiProviderList = "ai.provider.list"  // F086
     public static let aiProviderSave = "ai.provider.save"  // F086
     public static let aiProviderActivate = "ai.provider.activate"  // F086

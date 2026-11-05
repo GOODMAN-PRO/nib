@@ -455,6 +455,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `ai.chat.rename` | session | chat, title | F084 | Rename an AI conversation. |
 | `ai.chat.delete` | session, destructive | chat | F084 | Delete an AI conversation. |
 | `ai.chat.feedback` | session | chat, message, rating | F084 | Rate an AI answer (thumbs up/down). |
+| `ai.chat.save` | session | chat | F084 | Save a retained answer after a conversation write failed, without asking the provider again. |
 | `ai.provider.list` | read |  | F086 | Configured AI providers (never their keys). |
 | `ai.provider.save` | session, sensitive | id?, name, kind, baseURL, model, extraHeaders?, supportsVision?, supportsTools?, maxOutputTokens?, transcriptionModel?, imageModel? | F086 | Add or edit an AI provider (API keys are entered in Settings only). |
 | `ai.provider.activate` | session, sensitive | id | F086 | Make an AI provider the active one. |
