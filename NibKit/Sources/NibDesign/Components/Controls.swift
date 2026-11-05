@@ -277,8 +277,11 @@ public struct NibSegmentedControl<Value: Hashable>: View {
     public enum Sizing: Sendable {
         /// Preserve full labels, stacking when their intrinsic widths do not fit.
         case intrinsic
-        /// Share the proposed width equally, truncating labels without reducing their font size.
+        /// Share the proposed width equally, reducing padding and scaling to 85% before truncating.
         case fitting
+
+        var labelPadding: CGFloat { self == .fitting ? NibSpacing.xs : NibSpacing.m }
+        var minimumLabelScale: CGFloat { self == .fitting ? 0.85 : 1 }
     }
 
     @Binding var selection: Value
@@ -355,6 +358,7 @@ public struct NibSegmentedControl<Value: Hashable>: View {
                 Text(title(option))
                     .font(selected ? NibFont.footnoteEmphasis : NibFont.footnote)
                     .lineLimit(vertical ? nil : 1)
+                    .minimumScaleFactor(vertical ? 1 : sizing.minimumLabelScale)
                     .fixedSize(horizontal: false, vertical: true)
                 if vertical {
                     Spacer(minLength: 0)
@@ -363,7 +367,7 @@ public struct NibSegmentedControl<Value: Hashable>: View {
                 }
             }
             .foregroundStyle(NibColor.label)
-            .padding(.horizontal, NibSpacing.m)
+            .padding(.horizontal, vertical ? NibSpacing.m : sizing.labelPadding)
             .padding(.vertical, vertical ? NibSpacing.s : 0)
             .frame(minWidth: NibMetrics.hitTarget, maxWidth: .infinity, minHeight: 28)
             .background {

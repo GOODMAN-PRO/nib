@@ -58,19 +58,8 @@ struct SidebarPanelView: View {
     private var tabStrip: some View {
         let primary = SidebarNavigation.primary(tabs)
         if primary.count > 1 {
-            ViewThatFits(in: .horizontal) {
-                NibSegmentedControl(selection: selection, options: primary.map { $0.id }) { id in
-                    primary.first(where: { $0.id == id })?.title ?? id
-                }
-                .fixedSize(horizontal: true, vertical: false)
-                VStack(spacing: 0) {
-                    ForEach(primary, id: \.id) { tab in
-                        NibButton(tab.title, kind: tab.id == selected.id ? .secondary : .plain, expands: true) {
-                            selection.wrappedValue = tab.id
-                        }
-                        .accessibilityAddTraits(tab.id == selected.id ? .isSelected : [])
-                    }
-                }
+            NibSegmentedControl(selection: selection, options: primary.map { $0.id }, sizing: .fitting) { id in
+                primary.first(where: { $0.id == id })?.title ?? id
             }
             .padding(.horizontal, NibSpacing.xs)
             .padding(.bottom, NibSpacing.xs)
