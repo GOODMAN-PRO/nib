@@ -451,6 +451,26 @@ final class NibRenderTests: XCTestCase {
                       "another page's invalidation does not outdate this page")
     }
 
+    func testGenerationTrackingIsBoundedAndRolloverRejectsOldWorkers() throws {
+        let cache = TileCache(costLimit: 64 << 20)
+        let image = try XCTUnwrap(PageCompositor.makeContext(width: 4, height: 4)?.makeImage())
+        let rect = Rect(x: 0, y: 0, width: 4, height: 4)
+        let old = cache.generation("BROWSE/OLD")
+        XCTAssertTrue(cache.insert(image, key: "retained", page: "BROWSE/OLD", rect: rect, generation: old))
+        for i in 0..<(TileCache.generationLimit * 3) { _ = cache.generation("BROWSE/P\(i)") }
+        XCTAssertFalse(cache.insert(image, key: "stale", page: "BROWSE/OLD", rect: rect, generation: old))
+        XCTAssertNotNil(cache.image("retained"), "Rollover does not evict useful cached tiles")
+        let current = cache.generation("BROWSE/CURRENT")
+        let tracked = cache.removeDocument(DocumentID("BROWSE"))
+        XCTAssertLessThanOrEqual(tracked.count, TileCache.generationLimit + 1, "Includes the retained tile's page")
+        XCTAssertNil(cache.image("retained"), "Close also removes tiles whose counters rolled over")
+        XCTAssertFalse(cache.insert(image, key: "closed", page: "BROWSE/CURRENT", rect: rect, generation: current))
+
+        cache.removeAll()
+        for i in 0..<(TileCache.generationLimit * 3) { cache.invalidate(page: "BROWSE/P\(i)", rect: nil) }
+        XCTAssertLessThanOrEqual(cache.removeDocument(DocumentID("BROWSE")).count, TileCache.generationLimit)
+    }
+
     func testCancelledRenderSkipsItsQueuedTiles() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
@@ -565,6 +585,7 @@ final class NibRenderTests: XCTestCase {
         h.app.workspace.close(doc)
         let counting = CountingPersistence(base: h.persistence)
         counting.knowsFingerprints = false
+        counting.knowsRevisions = false
         h.app.workspace.persistence = counting
         let fromDisk = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
         XCTAssertNotNil(fromDisk)
@@ -586,7 +607,25 @@ final class NibRenderTests: XCTestCase {
         XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
     }
 
+    func testCloseDropsThumbnailsAfterTheirGenerationCountersRollOver() throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let (doc, page) = try makePage(h, items: [])
+        _ = try h.app.workspace.content(doc)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: .zero, size: 100)
+        let other = ThumbnailCache.Key(doc: "OTHERDOC", page: "OTHERPAGE", rev: .zero, size: 100)
+        let image = try XCTUnwrap(PageCompositor.makeContext(width: 4, height: 4)?.makeImage())
+        renderer.thumbnails.remember(image, key)
+        renderer.thumbnails.remember(image, other)
+        _ = renderer.tiles.generation(key.pageKey)
+        for i in 0..<TileCache.generationLimit { _ = renderer.tiles.generation("BROWSE/P\(i)") }
+        h.app.workspace.close(doc)
+        XCTAssertNil(renderer.thumbnails.memoryImage(key))
+        XCTAssertNotNil(renderer.thumbnails.memoryImage(other))
+    }
+
     func testClosedDocumentThumbnailDetectsOfflineEditsWithoutGenerationChange() async throws {
+        // Full metadata or no cheap metadata: both paths must detect edits below the maximum revision.
         for knowsFingerprints in [true, false] {
             let h = Harness(features: [NibRenderFeature.self])
             let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
@@ -602,6 +641,7 @@ final class NibRenderTests: XCTestCase {
             h.app.workspace.close(doc)
             let counting = CountingPersistence(base: h.persistence)
             counting.knowsFingerprints = knowsFingerprints
+            counting.knowsRevisions = knowsFingerprints
             h.app.workspace.persistence = counting
 
             // Restore the memory thumbnail from disk while the document and its items remain closed.
@@ -620,7 +660,7 @@ final class NibRenderTests: XCTestCase {
             let after = try renderer.thumbnailProbe(doc: doc, page: page)
             XCTAssertEqual(before.rev, after.rev)
             XCTAssertEqual(before.generation, after.generation)
-            XCTAssertEqual(h.app.workspace.contentRevision(doc, page: page), high.rev)
+            XCTAssertEqual(h.persistence.pageItems[doc]?[page]?.map(\.rev).max(), high.rev)
             XCTAssertNotEqual(before.fingerprint, after.fingerprint)
             XCTAssertFalse(h.app.workspace.isLoaded(doc))
             if knowsFingerprints { XCTAssertEqual(counting.itemLoads, 0) }
@@ -629,6 +669,35 @@ final class NibRenderTests: XCTestCase {
             XCTAssertNotEqual(bitmap(refreshed).bytes, bitmap(original).bytes)
             await diskSettled(renderer)
         }
+    }
+
+    func testRevisionOnlyWrapperValidatesDiskAndMemoryThumbnailsWithoutLoadingItems() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let (doc, page) = try makePage(h, items: [shortStroke()])
+        h.app.workspace.close(doc)
+        let counting = CountingPersistence(base: h.persistence)
+        h.app.workspace.persistence = RevisionOnlyPersistence(base: counting)
+        let probe = try renderer.thumbnailProbe(doc: doc, page: page)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: 100, fingerprint: probe.fingerprint)
+        let image = try XCTUnwrap(PageCompositor.makeContext(width: 4, height: 4)?.makeImage())
+        renderer.disk.addOperation { renderer.thumbnails.write(image, key, looks: []) }
+        await diskSettled(renderer)
+        XCTAssertNotNil(renderer.thumbnails.fileURL(key).flatMap { try? Data(contentsOf: $0) })
+        for _ in 0..<8 {
+            let thumbnail = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+            XCTAssertNotNil(thumbnail)
+        }
+        XCTAssertEqual(counting.itemLoads, 0)
+        XCTAssertEqual(counting.fingerprintReads, 0, "The legacy wrapper does not forward the new method")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
+        var changed = try XCTUnwrap(h.persistence.pageItems[doc]?[page]?.first)
+        changed.rev = Rev(wallMs: changed.rev.wallMs + 1, counter: 0, device: 8)
+        h.persistence.pageItems[doc]?[page] = [changed]
+        let updated = try renderer.thumbnailProbe(doc: doc, page: page)
+        XCTAssertNotEqual(updated.fingerprint, probe.fingerprint)
+        XCTAssertEqual(counting.itemLoads, 0)
     }
 
     func testThumbnailDiskHitDoesNotLoadThePageWhenPersistenceKnowsItsRevision() async throws {
@@ -1106,4 +1175,21 @@ private final class CountingPersistence: DocumentPersistence {
         guard knowsRevisions, knowsFingerprints, let items = base.pageItems[doc]?[page] else { return nil }
         return LWW.fingerprint(items)
     }
+}
+
+/// Models wrappers written before the metadata probe requirements were added to DocumentPersistence.
+@MainActor
+private final class RevisionOnlyPersistence: DocumentPersistence {
+    let base: DocumentPersistence
+    init(base: DocumentPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+    func isReadOnly(_ doc: DocumentID) -> Bool { base.isReadOnly(doc) }
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { base.contentRevision(doc, page: page) }
 }

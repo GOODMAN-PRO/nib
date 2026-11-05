@@ -182,6 +182,9 @@ public final class Workspace {
     public func contentFingerprint(_ doc: DocumentID, page: PageID) throws -> String {
         if let items = pageItems[doc]?[page] { return LWW.fingerprint(items) }
         if let fingerprint = persistence.contentFingerprint(doc, page: page) { return fingerprint }
+        // Legacy wrappers may forward only the cheap revision probe. Avoid decoding an entire ink page
+        // in that case; providers must forward contentFingerprint to detect edits below the maximum rev.
+        if let revision = persistence.contentRevision(doc, page: page) { return "revision_" + revision.description }
         // Validation of an unopened page must not populate the workspace item cache or sort by z.
         return LWW.fingerprint(try persistence.loadItems(doc, page: page))
     }

@@ -133,6 +133,15 @@ final class ThumbnailCache {
         lock.unlock()
         memory.removeAllObjects()
     }
+
+    /// Closing a document also forgets thumbnails whose tile-generation counters have rolled over.
+    func forgetDocument(_ doc: DocumentID) {
+        lock.lock()
+        let pages = index.keys.filter { $0.hasPrefix(doc.raw + "/") }
+        let keys = pages.flatMap { index.removeValue(forKey: $0) ?? [] }
+        lock.unlock()
+        for key in keys { memory.removeObject(forKey: key as NSString) }
+    }
 }
 
 /// The registry entries each page's renders depend on: its background template and the drawers of its items. A

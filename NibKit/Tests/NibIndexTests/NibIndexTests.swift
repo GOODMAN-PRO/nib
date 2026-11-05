@@ -315,6 +315,49 @@ final class NibIndexTests: XCTestCase {
         XCTAssertFalse(h.app.workspace.isLoaded(doc))
     }
 
+    func testUnstampedWrapperReusesHeadUntilAnActualSuspension() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        head.pages = (0..<96).map { i in
+            PageRecord(id: NibID("LEGACYPAGE" + String(i)), order: String(format: "%04d", i), size: .a4)
+        }
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = LegacyIndexPersistence(base: counting)
+        // Exercise the deterministic 32-page bound independently of machine speed.
+        indexer.pageBatchTimeLimit = .infinity
+        let indexed = await indexer.indexDocument(doc)
+        XCTAssertEqual(indexed, 0)
+        XCTAssertEqual(counting.itemLoads, 96)
+        XCTAssertLessThanOrEqual(counting.headLoads, 5, "Two initial reads and one per batch suspension")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
+    func testUnstampedHeadCacheRereadsAfterSuspensionAndPersistenceReplacement() throws {
+        let (h, _) = harness()
+        let doc = Fixtures.docID
+        let counting = CountingIndexPersistence(base: h.persistence)
+        counting.knowsHeadStamps = false
+        h.app.workspace.persistence = counting
+        let reader = DocReader(workspace: h.app.workspace)
+        var cache = DocReader.HeadCache()
+        let original = try reader.head(doc, cache: &cache, afterSuspension: false)
+        for _ in 0..<96 { XCTAssertEqual(try reader.head(doc, cache: &cache, afterSuspension: false), original) }
+        XCTAssertEqual(counting.headLoads, 1)
+        var changed = original
+        changed.pages[0].deleted = true
+        h.persistence.heads[doc] = changed
+        XCTAssertEqual(try reader.head(doc, cache: &cache, afterSuspension: true), changed)
+        XCTAssertEqual(counting.headLoads, 2)
+        let replacement = CountingIndexPersistence(base: h.persistence)
+        replacement.knowsHeadStamps = false
+        h.app.workspace.persistence = replacement
+        XCTAssertEqual(try reader.head(doc, cache: &cache, afterSuspension: false), changed)
+        XCTAssertEqual(replacement.headLoads, 1)
+    }
+
     func testCompletedDeletionDuringUnchangedPageYieldCannotRestoreRowsOrPositions() async throws {
         // First yield: the old pass must not re-extract the now-deleted later page. Final yield: it must not
         // overwrite the remaining pages' positions using its old head. Also exercise providers without stamps.
@@ -353,7 +396,7 @@ final class NibIndexTests: XCTestCase {
                     XCTAssertEqual(units, 0, "Every live page was already indexed before the yield")
                     finished.fulfill()
                 }
-                defer { sweep.cancel(); indexer.yieldAfterPage = { _, _ in await Task.yield() } }
+                defer { sweep.cancel(); indexer.yieldAfterPage = nil }
                 await fulfillment(of: [entered], timeout: 2)
                 head.pages[1].deleted = true
                 head.pages[1].rev = Rev(wallMs: 10, counter: 0, device: 8)
@@ -1281,4 +1324,19 @@ private final class CountingIndexPersistence: DocumentPersistence {
         try base.fileURL(doc, relativePath: relativePath)
     }
     func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+}
+
+@MainActor
+private final class LegacyIndexPersistence: DocumentPersistence {
+    let base: DocumentPersistence
+    init(base: DocumentPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { base.contentRevision(doc, page: page) }
 }

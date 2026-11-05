@@ -684,8 +684,7 @@ struct ItemUpdate: NibCommand {
         }
         try Shapes.requireUnlocked(doc, ctx)
         try Shapes.rejectProtected(patch, keys: Shapes.protectedFields, path: "$.patch", ctx)
-        return try ctx.mutate { tx in
-            let old = try tx.item(doc, page: page, id: id)
+        @MainActor func patched(_ old: Item) throws -> Item {
             if let expected = p.expectedText, (old.text?.text ?? old.sticky?.text) != expected {
                 throw NibError(.conflict, String(localized: "This text changed elsewhere. Reopen the editor to review the latest text before saving."))
             }
@@ -694,7 +693,16 @@ struct ItemUpdate: NibCommand {
             if let stroke = routed["stroke"]?.objectValue {
                 try Shapes.checkStrokePoints(stroke, path: patch["pts"] != nil ? "$.patch" : "$.patch.stroke")
             }
-            let new = try Edits.patchItem(old, routed, path: "$.patch")
+            return try Edits.patchItem(old, routed, path: "$.patch")
+        }
+        let existing = try ctx.workspace.item(doc, page: page, id: id)
+        if try patched(existing) == existing {
+            return Output(ref: NodeRef.item(doc, page, id).description, changed: false, bbox: existing.bounds)
+        }
+        return try ctx.mutate { tx in
+            let old = try tx.item(doc, page: page, id: id)
+            // Recheck the baseline and apply the patch to the transaction's current item.
+            let new = try patched(old)
             let changed = new != old
             if changed { try tx.put(new, doc: doc, page: page) }
             return Output(ref: NodeRef.item(doc, page, id).description, changed: changed, bbox: new.bounds)

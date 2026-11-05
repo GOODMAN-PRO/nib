@@ -53,7 +53,8 @@ struct DocReader {
         try workspace.peekContent(doc)
     }
 
-    func head(_ doc: DocumentID, cache: inout HeadCache) throws -> DocumentContent {
+    /// A nil stamp certifies only this synchronous actor turn; callers must flag every intervening suspension.
+    func head(_ doc: DocumentID, cache: inout HeadCache, afterSuspension: Bool) throws -> DocumentContent {
         if workspace.isLoaded(doc) {
             cache = HeadCache()
             return try head(doc)
@@ -61,12 +62,12 @@ struct DocReader {
         let persistence = workspace.persistence
         let identity = ObjectIdentifier(persistence)
         let stamp = persistence.headReadStamp(doc)
-        if let stamp, cache.doc == doc, cache.stamp == stamp, cache.persistence == identity,
+        if (stamp != nil || !afterSuspension), cache.doc == doc, cache.stamp == stamp, cache.persistence == identity,
            let head = cache.head { return head }
         cache = HeadCache()
         let fresh = try head(doc)
         // A background writer can replace files during the read. Never certify that snapshot with a later stamp.
-        if let stamp, persistence.headReadStamp(doc) == stamp {
+        if persistence.headReadStamp(doc) == stamp {
             cache = HeadCache(doc: doc, head: fresh, stamp: stamp, persistence: identity)
         }
         return fresh
@@ -550,8 +551,8 @@ final class SweepProgress {
 ///   so unchanged pages are never recognised twice.
 /// - Each document carries a stamp (settings + head revs + package files), so a sweep skips an unchanged document
 ///   after reading only its head; open documents and documents committed to are always checked page by page.
-/// - Walks yield after every page and document and check for cancellation / pause per page, so they never hold the
-///   main actor.
+/// - Walks yield between pages (in bounded batches for legacy persistence without head stamps) and documents,
+///   and check for cancellation / pause per page.
 /// - A unit is extracted by one caller at a time (`inFlight`), so an older extraction never overwrites a newer one
 ///   and a removed unit never comes back.
 @MainActor
@@ -560,7 +561,9 @@ final class Indexer {
     /// Quiet period after the last commit before dirty pages are indexed.
     var debounce: TimeInterval = 5
     /// Injectable cooperative suspension for deterministic tests of changes between unchanged pages.
-    var yieldAfterPage: @MainActor (DocumentID, PageID) async -> Void = { _, _ in await Task.yield() }
+    var yieldAfterPage: (@MainActor (DocumentID, PageID) async -> Void)?
+    /// Elapsed synchronous work before yielding even when a legacy provider has no cheap head stamp.
+    var pageBatchTimeLimit: TimeInterval = 0.008
     private var database: SearchDatabase?
     private var databaseFailed = false
     private var dirtyPages: [DocumentID: Set<PageID>] = [:]
@@ -751,9 +754,11 @@ final class Indexer {
         return blocks
     }
 
-    private func removeUnit(_ doc: DocumentID, key: String) async {
-        await waitForUnit(unitKey(doc, key))
+    @discardableResult
+    private func removeUnit(_ doc: DocumentID, key: String) async -> Bool {
+        let waited = await waitForUnit(unitKey(doc, key))
         try? db?.removeUnit(doc: doc, key: key)
+        return waited
     }
 
     private func removeDocument(_ doc: DocumentID) async throws {
@@ -771,10 +776,12 @@ final class Indexer {
     }
 
     @discardableResult
-    private func indexPage(_ doc: DocumentID, _ page: PageID, currentHead: inout DocumentContent, force: Bool = false) async -> Bool {
+    private func indexPage(_ doc: DocumentID, _ page: PageID, currentHead: inout DocumentContent, force: Bool = false,
+                           onSuspension: () -> Void = {}) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, page.raw)
         if await waitForUnit(key) {
+            onSuspension()
             guard let fresh = try? reader.head(doc) else { return false }
             currentHead = fresh
         }
@@ -790,6 +797,7 @@ final class Indexer {
             Indexer.store(snapshot, blocks, db)
             return blocks
         }
+        onSuspension()
         return true
     }
 
@@ -810,10 +818,12 @@ final class Indexer {
     }
 
     @discardableResult
-    private func indexDocUnit(_ doc: DocumentID, currentHead: inout DocumentContent, force: Bool = false) async -> Bool {
+    private func indexDocUnit(_ doc: DocumentID, currentHead: inout DocumentContent, force: Bool = false,
+                              onSuspension: () -> Void = {}) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, IndexKeys.docUnit)
         if await waitForUnit(key) {
+            onSuspension()
             guard let fresh = try? reader.head(doc) else { return false }
             currentHead = fresh
         }
@@ -831,6 +841,7 @@ final class Indexer {
             }
             return blocks
         }
+        onSuspension()
         return true
     }
 
@@ -867,8 +878,10 @@ final class Indexer {
         guard let db = db else { return pass }
         var headCache = DocReader.HeadCache()
         var currentHead = head
+        var suspended = false
         @MainActor func refreshHead() -> Bool {
-            guard let fresh = try? reader.head(doc, cache: &headCache) else {
+            defer { suspended = false }
+            guard let fresh = try? reader.head(doc, cache: &headCache, afterSuspension: suspended) else {
                 pass.completed = false
                 return false
             }
@@ -877,7 +890,7 @@ final class Indexer {
         }
         guard refreshHead() else { return pass }
         indexTitle(doc, kind: currentHead.meta.kind)
-        if await indexDocUnit(doc, currentHead: &currentHead, force: force) {
+        if await indexDocUnit(doc, currentHead: &currentHead, force: force, onSuspension: { suspended = true }) {
             pass.units += 1
             progress?.unitIndexed()
         }
@@ -887,22 +900,31 @@ final class Indexer {
         // Pages that are gone, including ones whose extraction is still running (it finishes before the removal).
         let stale = Set(db.keys(doc: doc)).union(inFlightKeys(doc)).filter { !$0.hasPrefix("#") && !liveKeys.contains($0) }
         for key in stale.sorted() {
-            await removeUnit(doc, key: key)
+            if await removeUnit(doc, key: key) { suspended = true }
         }
         if !stale.isEmpty, !refreshHead() { return pass }
-        for page in live {
+        var batchStart = Date()
+        for (position, page) in live.enumerated() {
             if shouldStop(pausable: pausable) {
                 pass.completed = false
                 break
             }
-            if await indexPage(doc, page.id, currentHead: &currentHead, force: force) {
+            if await indexPage(doc, page.id, currentHead: &currentHead, force: force, onSuspension: { suspended = true }) {
                 pass.units += 1
                 progress?.unitIndexed()
             }
-            // A deletion can finish indexing during ANY yield, even when this page needed no extraction.
-            // Revalidate after the final yield too, before writing page positions. Reliable persistence stamps
-            // make unchanged reads cheap; a provider without a stamp must be read again rather than trusted.
-            await yieldAfterPage(doc, page.id)
+            // Without stamps, batch only synchronous unchanged pages: reusing a head is safe until suspension.
+            // Bound both batch size and elapsed work. Test hooks can suspend after any individual page.
+            if let yieldAfterPage {
+                await yieldAfterPage(doc, page.id)
+                suspended = true
+            } else if headCache.stamp != nil || (position + 1) % 32 == 0 || position == live.count - 1 ||
+                        Date().timeIntervalSince(batchStart) >= pageBatchTimeLimit {
+                await Task.yield()
+                suspended = true
+            }
+            if suspended { batchStart = Date() }
+            // Also revalidate after the final suspension before updating positions.
             guard refreshHead() else { return pass }
         }
         updatePageIndexes(doc, head: currentHead)

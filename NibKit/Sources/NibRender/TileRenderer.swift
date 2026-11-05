@@ -67,6 +67,15 @@ final class TileCache {
     private var index: [String: [String: Rect]] = [:]
     private var generations: [String: Int] = [:]
     private var epoch = 0
+    static let generationLimit = 1024
+
+    /// Called under lock before tracking a new page. The epoch rejects workers holding discarded counters.
+    private func reserveGeneration(_ page: String) {
+        if generations[page] == nil, generations.count >= Self.generationLimit {
+            epoch += 1
+            generations.removeAll(keepingCapacity: true)
+        }
+    }
 
     init(costLimit: Int) {
         cache.totalCostLimit = costLimit
@@ -88,6 +97,7 @@ final class TileCache {
         lock.lock()
         defer { lock.unlock() }
         // Track snapshots before their workers finish, so closing a document invalidates in-flight pages too.
+        reserveGeneration(page)
         let value = generations[page, default: 0]
         generations[page] = value
         return Generation(epoch: epoch, page: value)
@@ -111,6 +121,7 @@ final class TileCache {
     func invalidate(page: String, rect: Rect?) {
         lock.lock()
         defer { lock.unlock() }
+        reserveGeneration(page)
         generations[page, default: 0] += 1
         guard let keys = index[page] else { return }
         var kept: [String: Rect] = [:]
@@ -129,14 +140,15 @@ final class TileCache {
         lock.lock()
         defer { lock.unlock() }
         let prefix = doc.raw + "/"
-        let pages = generations.keys.filter { $0.hasPrefix(prefix) }
+        // A counter rollover preserves cached tiles, so include the tile index as well.
+        let pages = Set(generations.keys).union(index.keys).filter { $0.hasPrefix(prefix) }
         for page in pages {
-            generations[page, default: 0] += 1
+            if let value = generations[page] { generations[page] = value + 1 }
             for key in (index.removeValue(forKey: page) ?? [:]).keys {
                 cache.removeObject(forKey: key as NSString)
             }
         }
-        return pages
+        return Array(pages)
     }
 
     /// Outdates every render already running (they cannot cache their tiles) without dropping cached tiles.
@@ -340,10 +352,9 @@ final class NibPageRenderer: PageRenderer {
 
     @MainActor
     private func closeDocument(_ doc: DocumentID) {
-        for key in tiles.removeDocument(doc) {
-            thumbnails.forget(pageKey: key)
-            thumbnailProbes[key] = nil
-        }
+        _ = tiles.removeDocument(doc)
+        thumbnails.forgetDocument(doc)
+        thumbnailProbes = thumbnailProbes.filter { !$0.key.hasPrefix(doc.raw + "/") }
         looks.removeDocument(doc)
         // Immutable assets/ink remain in their bounded caches; a library-root change purges those too.
     }
@@ -415,7 +426,7 @@ final class NibPageRenderer: PageRenderer {
     // MARK: Snapshot (main actor)
 
     /// The key combines the record revision and every item revision. Persistence may supply the fingerprint;
-    /// otherwise loading items is necessary to detect offline changes below the maximum revision.
+    /// legacy revision-only providers use a cheaper, weaker key until they forward the full fingerprint.
     @MainActor
     func thumbnailProbe(doc: DocumentID, page: PageID) throws -> ThumbnailProbe {
         guard let app = app else { throw NibError.unavailable("page renderer") }
