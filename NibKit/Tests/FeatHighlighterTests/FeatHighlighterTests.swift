@@ -445,6 +445,28 @@ final class FeatHighlighterTests: XCTestCase {
         XCTAssertEqual(host.wetStrokeCancels, 0)
     }
 
+    func testLongHeldPreviewTransformsOnlyNewPointsUntilViewportChanges() {
+        let preview = HighlighterPreviewPath()
+        var samples = (0..<10_000).map { StrokePoint(x: Float($0), y: 10) }
+        var visits = 0
+        func view(_ point: Point) -> CGPoint { visits += 1; return point.cg }
+        _ = preview.extend(samples, transform: .identity, view: view)
+        XCTAssertEqual(visits, 10_000)
+        for i in 10_000..<10_100 {
+            samples.append(StrokePoint(x: Float(i), y: 20))
+            let path = preview.extend(samples, transform: .identity, view: view)
+            XCTAssertEqual(path.currentPoint, CGPoint(x: i, y: 20))
+        }
+        XCTAssertEqual(visits, 10_100, "Each move must process only the appended samples")
+        let zoom = CGAffineTransform(scaleX: 2, y: 2)
+        let path = preview.extend(samples, transform: zoom) { point in
+            visits += 1
+            return point.cg.applying(zoom)
+        }
+        XCTAssertEqual(visits, 20_200)
+        XCTAssertEqual(path.currentPoint, CGPoint(x: 20_198, y: 40))
+    }
+
     func testAHoldThatSnapsToNothingKeepsTheStroke() async throws {
         let h = Harness(features: [FeatHighlighterFeature.self])
         h.app.commands.register(CommandDescriptor(id: "shape.recognize", title: "Recognise Shape", summary: "Stand-in.",
