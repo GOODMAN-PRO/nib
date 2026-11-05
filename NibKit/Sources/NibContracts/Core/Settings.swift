@@ -359,7 +359,13 @@ public final class SystemKeychainStore: SecretStore {
         var add = query
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+        let status = SecItemAdd(add as CFDictionary, nil)
+        #if DEBUG
+        if status != errSecSuccess {
+            NSLog("%@", "[Nib QA secrets] SecItemAdd failed status=\(status)")
+        }
+        #endif
+        return status == errSecSuccess
     }
 
     public func get(service: String, account: String) -> Data? {
