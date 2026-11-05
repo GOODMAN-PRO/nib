@@ -574,11 +574,13 @@ final class FeatOutlineTests: XCTestCase {
                     let header = UIHostingController(rootView: OutlinePanelHeader(model: model, dismiss: {}, title: title)
                         .environment(\.dynamicTypeSize, typeSize))
                     let fitted = header.sizeThatFits(in: CGSize(width: width, height: 1_000))
-                    let fitsInline = idealTitle.width + NibSpacing.s + 2 * NibMetrics.hitTarget
-                        + 2 * NibSpacing.m <= width
+                    // NibPanelHeader: 30 pt glyph, three 10 pt gaps, the spacer's minimum,
+                    // two 44 pt controls and the shared leading/trailing insets. AX always stacks.
+                    let fitsInline = !typeSize.isAccessibilitySize && idealTitle.width + 30 + 30 + NibSpacing.s
+                        + 2 * NibMetrics.hitTarget + NibSpacing.l + NibSpacing.xs <= width
                     let expectedHeight = fitsInline
-                        ? max(idealTitle.height, NibMetrics.hitTarget) + 2 * NibSpacing.s
-                        : idealTitle.height + NibSpacing.xs + NibMetrics.hitTarget + 2 * NibSpacing.s
+                        ? max(60, max(idealTitle.height, NibMetrics.hitTarget) + 2 * NibSpacing.s)
+                        : max(60, idealTitle.height + NibMetrics.hitTarget + 3 * NibSpacing.s)
                     XCTAssertLessThanOrEqual(fitted.width, width + 1, "\(title), \(typeSize)")
                     XCTAssertEqual(fitted.height, expectedHeight, accuracy: 1,
                                    "Keep the full heading on one line; put accessories below when needed")

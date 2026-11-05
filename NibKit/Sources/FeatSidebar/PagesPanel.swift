@@ -690,7 +690,7 @@ struct PagesPanelHeader: View {
                 }
             }
         }
-        .padding(.horizontal, NibSpacing.m)
+        .padding(.horizontal, NibSpacing.l)
         .padding(.vertical, NibSpacing.xs)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -706,7 +706,13 @@ struct PagesPanelHeader: View {
     }
 
     private var selectButton: some View {
-        NibButton(String(localized: "Select"), kind: .plain, size: .compact) { model.setSelecting(true) }
+        Button { model.setSelecting(true) } label: {
+            Text(String(localized: "Select"))
+                .font(NibFont.button)
+                .foregroundStyle(NibColor.accent)
+                .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget, alignment: .leading)
+        }
+            .buttonStyle(NibPressStyle())
             .disabled(model.rows.isEmpty)
             .accessibilityHint(String(localized: "Choose pages to copy, move, export or trash together"))
     }

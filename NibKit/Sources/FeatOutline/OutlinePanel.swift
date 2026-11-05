@@ -536,38 +536,9 @@ struct OutlinePanelHeader: View {
     var title = String(localized: "Outline")
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: NibSpacing.s) {
-                heading.fixedSize(horizontal: true, vertical: true)
-                Spacer(minLength: 0)
-                accessories
-            }
-            VStack(alignment: .leading, spacing: NibSpacing.xs) {
-                heading.fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Spacer(minLength: 0)
-                    accessories
-                }
-            }
-        }
-        .padding(.horizontal, NibSpacing.m)
-        .padding(.vertical, NibSpacing.s)
-    }
-
-    private var heading: some View {
-        Text(title)
-            .font(NibFont.headline)
-            .foregroundStyle(NibColor.label)
-            .layoutPriority(1)
-            .accessibilityAddTraits(.isHeader)
-    }
-
-    private var accessories: some View {
-        HStack(spacing: 0) {
+        NibPanelHeader(title: title, symbol: .outline, onClose: dismiss) {
             OutlineOptionsMenu(model: model)
-            NibIconButton(.xmark, label: String(localized: "Close Outline"), size: .round, action: dismiss)
         }
-        .fixedSize()
     }
 }
 
