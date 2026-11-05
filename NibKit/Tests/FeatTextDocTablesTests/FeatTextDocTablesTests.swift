@@ -20,6 +20,21 @@ final class FeatTextDocTablesTests: XCTestCase {
         let b = try XCTUnwrap(h.app.workspace.content(doc).liveBlocks.first { $0.id == Fixtures.tableBlockID })
         return try XCTUnwrap(b.table)
     }
+
+    func testCutKeepsContentSelectionAndUndoWhenCopyFails() async throws {
+        let h = harness(), v = try view(h)
+        let descriptor = CommandDescriptor(id: "clipboard.copyText", title: "Copy", summary: "Fail copying",
+                                           params: .obj(["text": .str("text")]), effect: .read)
+        h.app.commands.register(descriptor) { _, _ in throw NibError.invalid("Clipboard unavailable") }
+        v.select(.rows(0...0))
+        let before = try h.snapshot()
+        let depth = h.undoDepth(doc)
+        v.keyAction(.cut)
+        await v.flushEdits()
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(v.selection, .rows(0...0))
+        XCTAssertEqual(h.undoDepth(doc), depth)
+    }
     private func view(_ h: Harness, heightChanged: @escaping @MainActor (CGFloat) -> Void = { _ in }) throws -> TableBlockView {
         let b = try XCTUnwrap(h.app.workspace.content(doc).liveBlocks.first { $0.id == Fixtures.tableBlockID })
         return TableBlockView(context: BlockViewContext(app: h.app, session: h.session, doc: doc,

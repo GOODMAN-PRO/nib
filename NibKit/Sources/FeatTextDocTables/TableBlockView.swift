@@ -1853,7 +1853,7 @@ final class TableBlockView: UIView {
     }
 
     /// Puts text on the pasteboard through clipboard.copyText (F014).
-    private func copyToPasteboard(_ text: String) {
+    private func copyToPasteboard(_ text: String, afterCopy: (@MainActor () -> Void)? = nil) {
         let params: JSONValue = ["text": .string(text)]
         let session = self.session
         let app = self.app
@@ -1861,6 +1861,7 @@ final class TableBlockView: UIView {
             do {
                 _ = try await app.bus.execute(Invocation(command: "clipboard.copyText", params: params, principal: .user,
                                                          session: session))
+                afterCopy?()
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                 userInfo: ["command": "clipboard.copyText", "error": NibError.wrap(error)])
@@ -2197,8 +2198,11 @@ final class TableBlockView: UIView {
         case .copy:
             run(.copy, on: target)
         case .cut:
-            run(.copy, on: target)
-            deleteSelection(target)
+            guard !isReadOnly, let range = target.range(in: table) else { return }
+            flushTyping()
+            copyToPasteboard(TableOps.tabSeparated(table, range)) { [weak self] in
+                self?.deleteSelection(target)
+            }
         }
     }
 
