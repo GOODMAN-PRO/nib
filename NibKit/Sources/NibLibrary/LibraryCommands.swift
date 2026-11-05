@@ -701,6 +701,9 @@ enum DocumentMerger {
             }
         }
 
+        // Capture compensation's baseline after the copy awaits, so it never removes content another window
+        // added while the files were transferring.
+        let beforeMerge = try ctx.workspace.content(target)
         var result = Result()
         let pageMap = Dictionary(uniqueKeysWithValues: moves.map { ($0.old.id, $0.newID) })
         try ctx.mutate(String(localized: "Merge Documents"), undoable: false) { tx in
@@ -765,7 +768,43 @@ enum DocumentMerger {
                 result.cards = cards.count
             }
         }
-        if !ctx.dryRun { try library.trash(source) }
+        if !ctx.dryRun {
+            do {
+                try library.trash(source)
+            } catch {
+                // There is no suspension between commit and trash. Compensate only records this merge added;
+                // existing destination content keeps its revisions, and a retry cannot append a second live copy.
+                try ctx.mutate(String(localized: "Cancel Merge Documents"), undoable: false) { tx in
+                    let after = try tx.content(target)
+                    let pages = Set(beforeMerge.pages.map(\.id))
+                    let outline = Set(beforeMerge.outline.map(\.id))
+                    let audio = Set(beforeMerge.audio.map(\.id))
+                    let blocks = Set(beforeMerge.blocks.map(\.id))
+                    let cards = Set(beforeMerge.cards.map(\.id))
+                    for var record in after.pages where !pages.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.outline where !outline.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.audio where !audio.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.blocks where !blocks.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.cards where !cards.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                }
+                throw error
+            }
+        }
         LibraryEvents.changed(ctx, library, [NodeRef.document(target).description, NodeRef.document(source).description])
         return result
     }

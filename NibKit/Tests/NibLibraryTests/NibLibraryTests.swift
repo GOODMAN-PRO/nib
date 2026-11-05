@@ -643,6 +643,29 @@ final class NibLibraryTests: XCTestCase {
 
     // MARK: Merge
 
+    func testMergeTrashFailureCompensatesAndRetryAppendsOnlyOnce() async throws {
+        let lib = try await makeLibrary()
+        let source = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Source", "cover": false]))
+        let target = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Target", "cover": false]))
+        let before = try lib.h.app.workspace.content(target)
+        let sourcePages = try lib.h.app.workspace.content(source).livePages.count
+        let trash = lib.library.metadataURL.appendingPathComponent("trash", isDirectory: true)
+        if FileManager.default.fileExists(atPath: trash.path) { try FileManager.default.removeItem(at: trash) }
+        try Data("blocked trash".utf8).write(to: trash)
+        let params: JSONValue = ["source": .string("doc:\(source.raw)"), "into": .string("doc:\(target.raw)")]
+        do {
+            try await lib.run("doc.merge", params)
+            XCTFail("The failed trash move must be reported")
+        } catch {}
+        XCTAssertEqual(try lib.h.app.workspace.content(target).livePages, before.livePages)
+        XCTAssertNil(lib.library.node(source)?.trashedAt)
+        try FileManager.default.removeItem(at: trash)
+        try await lib.run("doc.merge", params)
+        XCTAssertEqual(try lib.h.app.workspace.content(target).livePages.count, before.livePages.count + sourcePages)
+        XCTAssertNotNil(lib.library.node(source)?.trashedAt)
+        XCTAssertEqual(lib.h.undoDepth(target), 0)
+    }
+
     func testMergeAppendsPagesItemsAssetsAndTrashesTheSource() async throws {
         let h = Harness(features: [NibLibraryFeature.self])
         let recording = try h.app.workspace.persistence.fileURL(Fixtures.docID, relativePath: "audio/FIXTUREAUD01.caf")
