@@ -39,6 +39,49 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testSearchPresentationAndKeyboardHeightKeepLibraryChromeInsets() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        model.liquidMode = .off
+        for size in [CGSize(width: 1032, height: 1376), CGSize(width: 1376, height: 1032)] {
+            for scheme in [ColorScheme.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                let host = UIHostingController(rootView: LibraryRootView(model: model, idiom: .pad)
+                    .environment(\.colorScheme, scheme)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 })
+                model.controller = host
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                func settle() async throws {
+                    for _ in 0..<5 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                }
+                try await settle()
+                let before = frames.filter { $0.key.hasPrefix("top.") }
+                XCTAssertFalse(before.isEmpty)
+                // F056 uses this floating-host boundary. Its content must never negotiate new chrome margins.
+                model.floating.present("searchui.libraryOverlay") {
+                    TextField("Search Library", text: .constant("Physics"))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                host.view.frame.size.height = size.height / 2
+                try await settle()
+                for (key, old) in before {
+                    let current = try XCTUnwrap(frames[key])
+                    XCTAssertEqual(current.minX, old.minX, accuracy: 0.5, key)
+                    XCTAssertEqual(current.maxX, old.maxX, accuracy: 0.5, key)
+                }
+                model.floating.dismiss("searchui.libraryOverlay")
+            }
+        }
+    }
+
     func testGridWidthUsesCurrentViewportAcrossRotationAndSidebarTransitions() {
         for (size, inline) in [(CGSize(width: 1376, height: 1032), true),
                                (CGSize(width: 1032, height: 1376), false),
