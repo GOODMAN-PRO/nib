@@ -10,8 +10,8 @@ final class FeatMathTests: XCTestCase {
     private let math = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"
 
     @discardableResult
-    private func registerRenderPage(_ h: Harness) throws -> MathRenderPageDouble {
-        let render = MathRenderPageDouble(asset: try h.assets.putTemporary(Fixtures.pngData, ext: "png"))
+    private func registerRenderPage(_ h: Harness, data: Data = Fixtures.pngData) throws -> MathRenderPageDouble {
+        let render = MathRenderPageDouble(asset: try h.assets.putTemporary(data, ext: "png"))
         h.app.commands.register(CommandDescriptor(id: CommandIDs.renderPage, title: "Render Page", summary: "Test selection render",
             params: .obj(["page": .ref, "region": .rect, "background": .bool(), "layers": .arr(.int(min: 0, max: 4)), "refs": .arr(.ref)], required: ["page"]),
             effect: .read)) { params, _ in
@@ -19,6 +19,33 @@ final class FeatMathTests: XCTestCase {
             return ["asset": .string("tmp:" + render.asset.name), "pxPerPt": 1, "region": params["region"] ?? .null]
         }
         return render
+    }
+
+    private func transparentInkPNG() throws -> Data {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 6), format: format).image { ctx in
+            UIColor.black.setFill()
+            ctx.fill(CGRect(x: 2, y: 2, width: 4, height: 2))
+        }
+        return try XCTUnwrap(image.pngData())
+    }
+
+    private func assertOpaqueRecognitionImage(_ image: CGImage, file: StaticString = #filePath, line: UInt = #line) throws {
+        XCTAssertEqual(image.width, 8, file: file, line: line)
+        XCTAssertEqual(image.height, 6, file: file, line: line)
+        let bitmap = try XCTUnwrap(CGContext(data: nil, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue), file: file, line: line)
+        bitmap.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        let bytes = try XCTUnwrap(bitmap.data, file: file, line: line).assumingMemoryBound(to: UInt8.self)
+        for pixel in 0..<(image.width * image.height) {
+            XCTAssertEqual(bytes[pixel * 4 + 3], 255, "Every recognition pixel must be opaque", file: file, line: line)
+        }
+        XCTAssertEqual(Array(UnsafeBufferPointer(start: bytes, count: 3)), [255, 255, 255], "Empty paper must be white", file: file, line: line)
+        let center = (image.width * (image.height / 2) + image.width / 2) * 4
+        XCTAssertEqual(Array(UnsafeBufferPointer(start: bytes + center, count: 3)), [0, 0, 0], "Selected ink must remain black", file: file, line: line)
     }
 
     func testExplicitConversionPreservesSourceAndUndoRedo() async throws {
@@ -57,7 +84,7 @@ final class FeatMathTests: XCTestCase {
     func testVisionProviderGetsSelectionImageAndNoTools() async throws {
         let h = Harness(features: [FeatMathFeature.self])
         let ai = FakeAIService(responses: [.init(text: #"{"lines":["\\frac{a}{b}","x^{2}"]}"#)])
-        let render = try registerRenderPage(h)
+        let render = try registerRenderPage(h, data: transparentInkPNG())
         h.app.services.ai = ai
         let before = try h.snapshot()
         let result = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink)]])
@@ -69,7 +96,10 @@ final class FeatMathTests: XCTestCase {
         XCTAssertEqual(ai.requests.first?.scope?.refs, [ink])
         XCTAssertEqual(ai.requests.first?.messages.first?.images?.count, 1)
         XCTAssertTrue(ai.requests.first?.jsonOutput == true)
-        XCTAssertEqual(ai.requests.first?.messages.first?.images?.first, render.asset)
+        let asset = try XCTUnwrap(ai.requests.first?.messages.first?.images?.first)
+        XCTAssertNotEqual(asset, render.asset, "The provider must receive the flattened PNG")
+        let url = try XCTUnwrap(h.assets.temporaryURL(asset))
+        try assertOpaqueRecognitionImage(XCTUnwrap(UIImage(contentsOfFile: url.path)?.cgImage))
         XCTAssertEqual(render.requests.count, 1)
         let bounds = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID).bounds
         XCTAssertEqual(render.requests.first?["page"], .string(NodeRef.page(Fixtures.docID, Fixtures.page1).description))
@@ -79,6 +109,19 @@ final class FeatMathTests: XCTestCase {
         XCTAssertEqual(render.requests.first?["layers"], [0])
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testTextRecognizerGetsOpaqueWhiteImageWithAndWithoutProviderFallback() async throws {
+        for useProvider in [false, true] {
+            let h = Harness(features: [FeatMathFeature.self])
+            try registerRenderPage(h, data: transparentInkPNG())
+            if useProvider { h.app.services.ai = FakeAIService(responses: [.init(text: "not JSON")]) }
+            let recognizer = MathImageRecognizerDouble()
+            h.app.services.recognizer = recognizer
+            let result = try await h.run(CommandIDs.mathRecognize, ["refs": [.string(ink)]])
+            XCTAssertEqual(result["source"]?.stringValue, "offline")
+            try assertOpaqueRecognitionImage(XCTUnwrap(recognizer.image))
+        }
     }
 
     func testMalformedProviderAnswerFallsBackToTextRecognition() async throws {
@@ -428,6 +471,18 @@ private final class MathRenderPageDouble {
     let asset: AssetRef
     var requests: [JSONValue] = []
     init(asset: AssetRef) { self.asset = asset }
+}
+
+private final class MathImageRecognizerDouble: TextRecognizer {
+    var image: CGImage?
+    func recognize(strokes: [Item], language: String) async throws -> [TextRecognition] {
+        XCTFail("Expected image recognition")
+        return []
+    }
+    func recognize(image: CGImage, language: String) async throws -> [TextRecognition] {
+        self.image = image
+        return [TextRecognition(text: "x", bbox: .zero, source: "ink")]
+    }
 }
 
 /// A deterministic suspension around the shared FakeAIService, so the test can edit ink mid-request.

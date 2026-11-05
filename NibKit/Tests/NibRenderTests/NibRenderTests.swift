@@ -203,7 +203,8 @@ final class NibRenderTests: XCTestCase {
                 let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
                 let asset = AssetRef(isPDF ? "delayed.pdf" : "delayed.png")
                 let background: Background = isPDF ? .ofPDF(asset, page: 0) : .ofImage(asset)
-                let (doc, page) = try makePage(h, items: [], background: background)
+                let size = isPDF ? PageSize(595.28, 841.89) : PageSize(240, 200)
+                let (doc, page) = try makePage(h, items: [], size: size, background: background)
                 if corrupt { h.assets.install(Data("incomplete download".utf8), as: asset, doc: doc) }
                 let pageKey = TileCache.pageKey(doc, page)
                 let file = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 160))
