@@ -213,7 +213,7 @@ final class SearchState: ObservableObject {
     }
     var canStepMatches: Bool {
         !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !loading && !refreshPending && error == nil && !visibleMatches.isEmpty
+            && !loading && error == nil && !visibleMatches.isEmpty
     }
     var remainingPages: Int { max(0, progress?.pending ?? 0) }
     var isIndexing: Bool { progress?.running == true || remainingPages > 0 }
@@ -341,6 +341,11 @@ final class SearchRuntime {
         state.loading = false
         state.refreshPending = true
         refreshTasks[session.id] = Task { @MainActor [weak self, weak session, weak state] in
+            defer {
+                // A cancelled task may have been replaced by a newer queued refresh.
+                // Its owner clears the flag in cancelPending or keeps it for the replacement.
+                if !Task.isCancelled { state?.refreshPending = false }
+            }
             do {
                 try await Task.sleep(nanoseconds: delay)
                 while session?.inking.isInking == true {

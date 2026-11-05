@@ -1222,11 +1222,12 @@ struct NewNotebookSheet: View {
                 NibChip(String(localized: "Use cover's colour"), style: .filter(isSelected: draft.cloth == nil),
                         action: { model.selectCloth(nil) })
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: NibMetrics.hitTarget), spacing: 0),
-                                        count: swatchColumns(count: NibCoverCloth.allCases.count)), spacing: 0) {
+                                        count: swatchColumns(count: NibCoverCloth.allCases.count)), alignment: .leading, spacing: 0) {
                     ForEach(NibCoverCloth.allCases, id: \.self) { cloth in
                         CoverColourSwatch(cloth: cloth, isSelected: draft.cloth == cloth) { model.selectCloth(cloth) }
                     }
                 }
+                .accessibilityElement(children: .contain)
             }
         }
     }

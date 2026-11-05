@@ -132,7 +132,7 @@ enum FileNames {
                        reservedNames: Set<String> = []) -> String {
         // A folder must never acquire a document-package extension, including on recovery.
         let suffix = (base as NSString).pathExtension.lowercased()
-        let base = ext == nil && [NibFormat.packageExtension, NibFormat.legacyPackageExtension].contains(suffix)
+        let folderSafeBase = ext == nil && [NibFormat.packageExtension, NibFormat.legacyPackageExtension].contains(suffix)
             ? String(localized: "\(base) folder") : base
         let fm = FileManager.default
         let ignored = ignoring?.standardizedFileURL.path.lowercased()
@@ -144,10 +144,10 @@ enum FileNames {
             if fm.fileExists(atPath: url.path) { return true }
             return fm.fileExists(atPath: dir.appendingPathComponent("." + file + LibraryLayout.placeholderSuffix).path)
         }
-        if !taken(base) { return base }
+        if !taken(folderSafeBase) { return folderSafeBase }
         var n = 2
-        while taken("\(base) \(n)") { n += 1 }
-        return "\(base) \(n)"
+        while taken("\(folderSafeBase) \(n)") { n += 1 }
+        return "\(folderSafeBase) \(n)"
     }
 
     static func fileName(_ base: String, ext: String?) -> String { ext.map { base + "." + $0 } ?? base }
@@ -253,7 +253,7 @@ final class FolderLibrary: LibraryService {
     }
 
     private func uniqueName(_ base: String, ext: String?, in dir: URL, ignoring: URL? = nil) -> String {
-        let isRoot = dir.resolvingSymlinksInPath().standardizedFileURL == rootURL.resolvingSymlinksInPath().standardizedFileURL
+        let isRoot = dir.resolvingSymlinksInPath().standardizedFileURL.path == rootURL.resolvingSymlinksInPath().standardizedFileURL.path
         let reserved: Set<String> = isDefaultRoot && isRoot ? [LibraryLayout.inboxName.lowercased()] : []
         return FileNames.unique(base, ext: ext, in: dir, ignoring: ignoring, reservedNames: reserved)
     }

@@ -70,7 +70,10 @@ final class ReservedFolderNameTests: XCTestCase {
     }
 
     func testDefaultRootReservesInboxAcrossCreateRenameMoveAndRestore() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        // The saved root has no directory slash; rename derives a directory URL from its child.
+        // Both URL forms must reserve Inbox at the same filesystem path.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: false)
+        XCTAssertFalse(root.hasDirectoryPath)
         let cache = root.appendingPathComponent(".cache")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

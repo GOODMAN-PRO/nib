@@ -139,7 +139,7 @@ struct LibrarySearchFloatingContent: View {
             ZStack(alignment: .top) {
                 // Search owns this surface while open. An invisible catcher left fragments
                 // of the banner and title around the field, especially in landscape.
-                NibColor.background
+                (belowBars ? Color.clear : NibColor.background)
                     .contentShape(Rectangle())
                     .onTapGesture { close() }
                     .accessibilityHidden(true)
@@ -216,10 +216,10 @@ struct SearchResults: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @Namespace private var scrollSpace
-    @State private var contentBottom: CGFloat = 0
+    @State private var overflows = false
     @State private var viewportHeight: CGFloat = 0
     private var showsContinuation: Bool {
-        SearchScrollContinuation.isVisible(contentBottom: contentBottom, viewportHeight: viewportHeight)
+        overflows
     }
     var body: some View {
         VStack(spacing: 0) {
@@ -294,8 +294,11 @@ struct SearchResults: View {
                     }
                     .foregroundStyle(NibColor.label)
                     .padding(NibSpacing.l)
-                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(scrollSpace)).maxY } action: {
-                        contentBottom = $0
+                    .onGeometryChange(for: Bool.self) {
+                        SearchScrollContinuation.isVisible(
+                            contentBottom: $0.frame(in: .named(scrollSpace)).maxY, viewportHeight: viewportHeight)
+                    } action: {
+                        overflows = $0
                     }
                 }
                 .coordinateSpace(name: scrollSpace)
