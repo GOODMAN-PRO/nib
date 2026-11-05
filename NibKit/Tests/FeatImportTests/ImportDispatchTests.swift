@@ -266,7 +266,7 @@ final class ImportDispatchTests: XCTestCase {
         XCTAssertEqual(ImportNaming.sanitize("  Notes.pdf  "), "Notes.pdf")
         XCTAssertEqual(ImportNaming.sanitize("..."), "Imported")
         let long = ImportNaming.sanitize(String(repeating: "a", count: 300) + ".pdf")
-        XCTAssertLessThanOrEqual(long.count, 200)
+        XCTAssertLessThanOrEqual((long + " \(Int.max)").utf8.count, 255)
         XCTAssertTrue(long.hasSuffix(".pdf"))
         XCTAssertFalse(ImportNaming.sanitize("a/b\\c").contains("/"))
         XCTAssertFalse(ImportNaming.sanitize("a/b\\c").contains("\\"))
@@ -282,6 +282,54 @@ final class ImportDispatchTests: XCTestCase {
         try Data().write(to: second)
         XCTAssertEqual(ImportNaming.unique("a.pdf", in: dir).lastPathComponent, "a 3.pdf")
         XCTAssertEqual(ImportNaming.unique("Scan", in: dir).lastPathComponent, "Scan")
+    }
+
+    func testSanitisedUnicodeNamesPreserveGraphemesAndExtensionsWithinByteBudget() {
+        let modifiedEmoji = "\u{1F469}\u{1F3FD}\u{200D}\u{1F4BB}"
+        let combiningSequence = "e\u{301}"
+        let longExtension = String(repeating: "界", count: 40)
+        for (grapheme, ext) in [("界", "pdf"), (modifiedEmoji, "pdf"),
+                                (combiningSequence, "pdf"), ("界", longExtension)] {
+            let originalBase = String(repeating: grapheme, count: 200)
+            let name = ImportNaming.sanitize(originalBase + "." + ext)
+            let base = (name as NSString).deletingPathExtension
+            XCTAssertEqual((name as NSString).pathExtension, ext)
+            XCTAssertFalse(base.isEmpty)
+            XCTAssertLessThan(base.count, originalBase.count)
+            XCTAssertTrue(base.allSatisfy { String($0) == grapheme }, "Never split a grapheme")
+            XCTAssertLessThanOrEqual((name + " \(Int.max)").utf8.count, 255)
+            XCTAssertEqual(ImportNaming.sanitize(name), name)
+        }
+        for short in ["Notes.pdf", "界.pdf", modifiedEmoji + ".pdf", combiningSequence + ".txt", "Scan"] {
+            XCTAssertEqual(ImportNaming.sanitize(short), short)
+        }
+    }
+
+    func testOversizedExtensionAndSingleGraphemeStillProduceSafeNames() {
+        let oversizedGrapheme = "e" + String(repeating: "\u{301}", count: 300)
+        for original in ["Notes." + String(repeating: "界", count: 200),
+                         oversizedGrapheme + ".pdf", "Notes." + oversizedGrapheme] {
+            let name = ImportNaming.sanitize(original)
+            XCTAssertFalse(name.isEmpty)
+            XCTAssertFalse(name.hasPrefix("."))
+            XCTAssertLessThanOrEqual((name + " \(Int.max)").utf8.count, 255)
+            XCTAssertEqual(ImportNaming.sanitize(name), name)
+        }
+        XCTAssertEqual(ImportNaming.sanitize(oversizedGrapheme + ".pdf"), "_.pdf")
+    }
+
+    func testUniqueUnicodeNamesFitWithMultipleDigitSuffixesAndAppendedExtensions() throws {
+        let dir = try tempDir()
+        // OfficeConverter and content sniffing can append an extension after sanitizing a title.
+        let input = ImportNaming.sanitize(String(repeating: "界", count: 200)) + ".pdf"
+        let safeName = ImportNaming.sanitize(input)
+        let base = (safeName as NSString).deletingPathExtension
+        for n in 1...12 {
+            let url = ImportNaming.unique(input, in: dir)
+            XCTAssertEqual(url.lastPathComponent, n == 1 ? safeName : "\(base) \(n).pdf")
+            XCTAssertLessThanOrEqual(url.lastPathComponent.utf8.count, 255)
+            try Data().write(to: url)
+        }
     }
 
     func testSnifferRecognisesCommonFormats() {

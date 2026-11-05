@@ -265,26 +265,44 @@ enum ImportNaming {
         return base.isEmpty ? String(localized: "Imported") : base
     }
 
-    /// A single safe path component: no separators, no leading dots, at most 200 characters.
+    // Reserve a space and every digit of Int.max for unique's collision suffix.
+    private static let nameByteLimit = 255 - 1 - String(Int.max).utf8.count
+
+    /// A single safe path component, with room for a collision suffix within 255 UTF-8 bytes.
     static func sanitize(_ name: String) -> String {
         var s = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
             .replacingOccurrences(of: "\\", with: "-").replacingOccurrences(of: "\0", with: "")
         s = s.trimmingCharacters(in: .whitespacesAndNewlines)
         while s.hasPrefix(".") { s.removeFirst() }
-        if s.count > 200 {
-            let ext = (s as NSString).pathExtension
-            let base = String((s as NSString).deletingPathExtension.prefix(190))
-            s = ext.isEmpty || ext.count > 9 ? String(s.prefix(200)) : base + "." + ext
+        if s.utf8.count > nameByteLimit {
+            // Keep the full extension whenever it fits. An extension that alone exceeds the
+            // budget must also be shortened, leaving a dot and at least one byte for the stem.
+            let ext = utf8Prefix((s as NSString).pathExtension, maxBytes: nameByteLimit - 2)
+            let suffix = ext.isEmpty ? "" : "." + ext
+            let base = utf8Prefix((s as NSString).deletingPathExtension,
+                                  maxBytes: nameByteLimit - suffix.utf8.count)
+            s = (base.isEmpty ? "_" : base) + suffix
         }
         return s.isEmpty ? String(localized: "Imported") : s
+    }
+
+    /// Iterate Characters, never scalars or bytes: combining sequences and modified emoji stay whole.
+    private static func utf8Prefix(_ string: String, maxBytes: Int) -> String {
+        var bytes = 0
+        return String(string.prefix { character in
+            bytes += String(character).utf8.count
+            return bytes <= maxBytes
+        })
     }
 
     /// `name` inside `dir`, with " 2", " 3"… before the extension when it is taken.
     static func unique(_ name: String, in dir: URL) -> URL {
         let fm = FileManager.default
-        var candidate = dir.appendingPathComponent(name)
-        let base = (name as NSString).deletingPathExtension
-        let ext = (name as NSString).pathExtension
+        // Some callers append a detected/converted extension after sanitizing the display name.
+        let safeName = sanitize(name)
+        var candidate = dir.appendingPathComponent(safeName)
+        let base = (safeName as NSString).deletingPathExtension
+        let ext = (safeName as NSString).pathExtension
         var n = 2
         while fm.fileExists(atPath: candidate.path) {
             candidate = dir.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
