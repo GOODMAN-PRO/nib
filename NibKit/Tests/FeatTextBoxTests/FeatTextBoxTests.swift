@@ -495,13 +495,15 @@ final class FeatTextBoxTests: XCTestCase {
             XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
             let tv = try XCTUnwrap(editor.editingTextView)
             tv.attributedText = NSAttributedString(string: "Local draft", attributes: tv.typingAttributes)
-            let entered = expectation(description: "Save suspended")
-            let release = expectation(description: "Resume save")
+            var release: XCTestExpectation?
             if suspended {
+                let entered = expectation(description: "Save suspended")
+                let gate = expectation(description: "Resume save")
+                release = gate
                 h.app.bus.hooks.register(.guarding(id: "test.suspend", owner: "test", commands: [CommandIDs.textSetText]) { _, params, _ in
                     if params["expectedText"] != nil {
                         entered.fulfill()
-                        await self.fulfillment(of: [release], timeout: 1)
+                        await self.fulfillment(of: [gate], timeout: 1)
                     }
                     return nil
                 })
@@ -511,7 +513,7 @@ final class FeatTextBoxTests: XCTestCase {
             try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "Other window"])
             XCTAssertEqual(tv.text, "Local draft")
             if suspended {
-                release.fulfill()
+                release?.fulfill()
                 await editor.flush()
                 h.app.bus.hooks.unregister(id: "test.suspend")
             }
@@ -689,12 +691,12 @@ final class FeatTextBoxTests: XCTestCase {
                 XCTAssertFalse(editor.isEditing)
                 release.fulfill()
                 await editor.flush()
-                if rejectCreate {
+                if rejectCreate || canDelete {
                     XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: page, id: id))
                 } else {
                     XCTAssertTrue(try box(h, id, page: page).text.isEmpty)
                 }
-                XCTAssertEqual(calls.params.count, 0, "Legacy deletion cannot safely follow the guarded empty write")
+                XCTAssertEqual(calls.params.count, canDelete && !rejectCreate ? 1 : 0)
                 XCTAssertNil(host.hidden[page])
                 editor.detach(from: host)
             }
@@ -981,7 +983,7 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
-    func testEmptyCloseRetainsBoxWithoutGuardedDeletionAndRejectsStaleText() async throws {
+    func testEmptyCloseDeletesInSessionUndoGroupAndRejectsStaleText() async throws {
         for conflict in [false, true] {
             let h = Harness(features: [FeatTextBoxFeature.self])
             let calls = Calls()
@@ -998,18 +1000,39 @@ final class FeatTextBoxTests: XCTestCase {
             editor.endEditing()
             await editor.flush()
             subscription.cancel()
-            XCTAssertEqual(calls.params.count, 0)
+            XCTAssertEqual(calls.params.count, conflict ? 0 : 1)
             if conflict {
                 XCTAssertEqual(try box(h).text.plainText, "Other window")
             } else {
-                XCTAssertEqual(groups.count, 1)
+                XCTAssertEqual(groups.count, 2)
                 XCTAssertEqual(Set(groups).count, 1)
-                XCTAssertTrue(try box(h).text.isEmpty)
+                XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
                 XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
                 XCTAssertEqual(try box(h).text, item.text?.text)
             }
             editor.detach(from: host)
         }
+    }
+
+    func testClosingAnAlreadyAutosavedEmptyBoxDeletesItInTheSameUndoStep() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let calls = Calls()
+        installDeleteStandIn(h, calls: calls)
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        editor.editingTextView?.attributedText = NSAttributedString(string: "")
+        editor.commitNow()
+        await editor.flush()
+        XCTAssertTrue(try box(h).text.isEmpty)
+        XCTAssertTrue(calls.params.isEmpty, "Autosave must not delete a box while the user is typing")
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertEqual(calls.params.count, 1)
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try box(h).text, item.text?.text)
+        editor.detach(from: host)
     }
 
     func testEmptyCloseCannotDeleteNewTextDuringSuspendedDeletion() async throws {
@@ -1021,7 +1044,7 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
         editor.editingTextView?.attributedText = NSAttributedString(string: "")
         let boundary = expectation(description: "Deletion suspended or safe close completed")
-        let resume = expectation(description: "Resume unsafe deletion if attempted")
+        let resume = XCTestExpectation(description: "Resume deletion if attempted")
         let finished = expectation(description: "Close drained")
         var deletionSuspended = false
         h.app.bus.hooks.register(.guarding(id: "test.suspendDelete", owner: "test", commands: [CommandIDs.itemDelete]) { _, _, _ in
@@ -1036,13 +1059,13 @@ final class FeatTextBoxTests: XCTestCase {
             if !deletionSuspended { boundary.fulfill() }
             finished.fulfill()
         }
-        // The fixed path finishes without calling delete; the old path pauses inside its hook.
+        // The final guard must run after this suspending hook and veto the stale deletion.
         await fulfillment(of: [boundary], timeout: 1)
         try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "Newer window text"])
         resume.fulfill()
         await fulfillment(of: [finished], timeout: 1)
         XCTAssertEqual(try box(h).text.plainText, "Newer window text")
-        XCTAssertFalse(deletionSuspended, "Until guarded deletion exists, leave the safely emptied box")
+        XCTAssertTrue(deletionSuspended, "Closing an empty box must attempt deletion")
         XCTAssertTrue(calls.params.isEmpty)
         editor.detach(from: host)
     }

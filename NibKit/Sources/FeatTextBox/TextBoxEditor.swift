@@ -340,7 +340,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         removeKeyboardInset()
         if commit, st.stagingError == nil {
             // Reconcile even an empty new draft: a preceding create may still be suspended.
-            submit(text, for: st)
+            submit(text, for: st, deleteEmptyBox: true)
             if text.plainText != st.openedText { autodetectLinks(text, for: st) }
         }
         if detaching {
@@ -408,7 +408,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         submit(text, for: st)
     }
 
-    private func submit(_ text: RichText, for st: EditState) {
+    private func submit(_ text: RichText, for st: EditState, deleteEmptyBox: Bool = false) {
         let epoch = st.epoch
         enqueue { [self] in
             guard st.stagingError == nil else { return }
@@ -418,7 +418,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                 report(NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept.")))
                 return
             }
-            guard text != st.lastCommitted else { return }
+            if text == st.lastCommitted {
+                if deleteEmptyBox, text.isEmpty { await deleteEmptyBoxIfCurrent(st) }
+                return
+            }
             let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
             let command: String
             let params: JSONValue
@@ -443,9 +446,49 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                     st.persisted = stored.text
                     st.box.text = stored.text
                 }
+                if deleteEmptyBox, text.isEmpty { await deleteEmptyBoxIfCurrent(st) }
                 if state === st { hide(st.id, page: st.page); publishFocus() }
             }
         }
+    }
+
+    private func deleteEmptyBoxIfCurrent(_ st: EditState) async {
+        guard app.commands.descriptor(CommandIDs.itemDelete) != nil else { return }
+        guard let stored = try? app.workspace.item(st.doc, page: st.page, id: st.id),
+              stored.text?.text == st.persisted, st.persisted.isEmpty else {
+            report(NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept.")))
+            return
+        }
+        // item.delete owns dependent-item cleanup. Its handler and the user gateway are synchronous
+        // on MainActor, but earlier hooks may suspend. Check again as the final hook, after those waits.
+        let hookID = "text.emptyClose." + NibID.make().raw
+        var changed = false
+        let subscription = app.bus.observeCommits { changes in
+            for mutation in changes.mutations {
+                if case let .item(doc, page, _, after) = mutation,
+                   doc == st.doc, page == st.page, after.id == st.id { changed = true }
+            }
+        }
+        app.bus.hooks.register(.guarding(id: hookID, owner: FeatTextBoxFeature.id,
+                                        commands: [CommandIDs.itemDelete], order: Int.max) { _, params, ctx in
+            guard ctx.group == st.group else { return nil }
+            guard !changed, params["refs"] == .array([.string(st.ref)]),
+                  let current = try? ctx.workspace.item(st.doc, page: st.page, id: st.id),
+                  current == stored else {
+                throw NibError(.conflict, String(localized: "Text changed elsewhere. Your draft has been kept."))
+            }
+            return nil
+        })
+        defer {
+            subscription.cancel()
+            app.bus.hooks.unregister(id: hookID)
+        }
+        // Do not promise atomicity if another hook would run after our check.
+        guard app.bus.hooks.all.last(where: { $0.matches(CommandIDs.itemDelete) })?.id == hookID else {
+            report(NibError(.unavailable, String(localized: "Could not remove the empty text box. Try again.")))
+            return
+        }
+        await execute(CommandIDs.itemDelete, ["refs": .array([.string(st.ref)])], group: st.group, session: st.session)
     }
 
     private func report(_ error: Error) {
@@ -598,7 +641,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         isRendering = false
     }
 
-    // MARK: Text view ⇄ model
+    // MARK: Text view â‡„ model
 
     /// The text view's content as rich text (model offsets, markers dropped).
     func currentRichText() -> RichText {
