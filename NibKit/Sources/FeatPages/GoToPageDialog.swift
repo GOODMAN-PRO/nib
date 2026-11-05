@@ -78,14 +78,20 @@ enum GoToPageResolver {
 @MainActor
 struct GoToPageDialog: View {
     let context: PanelContext
+    private let focusesField: Bool
+    private let onJumpFrames: (([String: CGRect]) -> Void)?
     private let doc: DocumentID?
     private let pages: [PageRecord]
     private let current: Int?
     @State private var input = ""
     @FocusState private var fieldFocused: Bool
 
-    init(context: PanelContext) {
+    init(context: PanelContext, initialInput: String = "", focusesField: Bool = true,
+         onJumpFrames: (([String: CGRect]) -> Void)? = nil) {
         self.context = context
+        self.focusesField = focusesField
+        self.onJumpFrames = onJumpFrames
+        _input = State(initialValue: initialInput)
         let doc = context.session?.document
         let pages = doc.flatMap { try? context.app.workspace.content($0) }?.livePages ?? []
         self.doc = doc
@@ -132,8 +138,8 @@ struct GoToPageDialog: View {
                             .multilineTextAlignment(.center)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack(spacing: NibSpacing.s) {
-                            NibButton(String(localized: "First Page"), size: .compact) { jump(to: 0) }
-                            NibButton(String(localized: "Last Page"), size: .compact) { jump(to: pages.count - 1) }
+                            jumpButton(String(localized: "First Page"), id: "first", index: 0)
+                            jumpButton(String(localized: "Last Page"), id: "last", index: pages.count - 1)
                         }
                     }
                     .padding(NibSpacing.xl)
@@ -142,7 +148,20 @@ struct GoToPageDialog: View {
             Spacer(minLength: 0)
         }
         .presentationDetents([.medium, .large])
-        .onAppear { fieldFocused = true }
+        .onPreferenceChange(PageJumpFrames.self) { onJumpFrames?($0) }
+        .onAppear { fieldFocused = focusesField }
+    }
+
+    private func jumpButton(_ title: String, id: String, index: Int) -> some View {
+        NibButton(title, size: .compact) { jump(to: index) }
+            .background {
+                if onJumpFrames != nil {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: PageJumpFrames.self, value: [id: proxy.frame(in: .global)])
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
     }
 
     private func message(_ outcome: GoToPageResolver.Outcome) -> String {
@@ -173,6 +192,13 @@ struct GoToPageDialog: View {
         context.app.perform(CommandIDs.viewGoToPage, ["page": .string(NodeRef.page(doc, pages[index].id).description)],
                             session: context.session)
         context.dismiss()
+    }
+}
+
+private struct PageJumpFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

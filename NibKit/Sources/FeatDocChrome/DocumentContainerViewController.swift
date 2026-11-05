@@ -989,7 +989,7 @@ struct ChromeRootView: View {
 
     // MARK: Layout
 
-    private var currentLayout: ChromeLayout {
+    var currentLayout: ChromeLayout {
         var layout = ChromeLayout(size: geometry.size, safeArea: geometry.safeArea, left: sidebarWidth(.left),
                                   right: sidebarWidth(.right), mode: state.mode, idiom: geometry.idiom,
                                   verticalSizeClass: geometry.verticalSizeClass,
@@ -1122,7 +1122,7 @@ struct ChromeRootView: View {
         }
     }
 
-    private func panelFrame(_ frame: CGRect, id: String) -> CGRect {
+    func panelFrame(_ frame: CGRect, id: String) -> CGRect {
         // Any sidebar can contain an editor/search field (including Transcript and plugin panels).
         // Shorten only its viewport; the canvas and search-field overlay keep their existing geometry.
         ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: frame)

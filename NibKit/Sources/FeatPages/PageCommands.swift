@@ -62,25 +62,31 @@ struct PageAdd: NibCommand {
         try! JSONValue.parse(#"{"doc": "doc:FIXTUREDOC04", "position": "end", "source": "blank"}"#)
     ]
 
-    static let descriptor = CommandDescriptor(
-        id: "page.add", title: String(localized: "Add Page"),
-        summary: "Add pages before/after a page or at the start/end: current template, blank, a template, a PDF or image asset, or the page clipboard. Returns the new page refs.",
-        params: .obj([
-            "doc": .ref,
-            "position": PageCommands.positionSchema,
-            "anchor": .ref,
-            "count": .int("number of pages (default 1); with source pdf, consecutive PDF pages from pdfPage", min: 1,
-                          max: PageCommands.maxNewPages),
-            "source": .str("current (default: the open page's paper) | blank | template | pdf | image | clipboard | choose (shows the template picker, user only)",
-                           choices: PageAdd.sources),
-            "template": .anything("source template: a template id (\"builtin.grid\"), {id, params}, or a Background {kind, template?, asset?, pdfPage?, color?}"),
-            "size": .anything("page size: preset name (A4, A5, Letter, Standard…, optionally ' landscape'), [width, height] or {width, height} in points; default: the open page's size"),
-            "asset": .str("source pdf or image: an asset name in this document (from asset.put)"),
-            "pdfPage": .int("source pdf: 0-based first PDF page (default 0)", min: 0),
-            "id": .str("caller-chosen id of the (first) new page"),
-            "ids": PageCommands.idsSchema
-        ]),
-        examples: PageAdd.examples, effect: .edit)
+    static var descriptor: CommandDescriptor { localizedDescriptor() }
+
+    /// Explicit bundle/locale lets package tests exercise app-catalogue localization without changing
+    /// process-wide language preferences or relying on the hostless runner's English main bundle.
+    static func localizedDescriptor(bundle: Bundle = .main, locale: Locale = .current) -> CommandDescriptor {
+        CommandDescriptor(
+            id: "page.add", title: String(localized: "Add Page", bundle: bundle, locale: locale),
+            summary: "Add pages before/after a page or at the start/end: current template, blank, a template, a PDF or image asset, or the page clipboard. Returns the new page refs.",
+            params: .obj([
+                "doc": .ref,
+                "position": PageCommands.positionSchema,
+                "anchor": .ref,
+                "count": .int("number of pages (default 1); with source pdf, consecutive PDF pages from pdfPage", min: 1,
+                              max: PageCommands.maxNewPages),
+                "source": .str("current (default: the open page's paper) | blank | template | pdf | image | clipboard | choose (shows the template picker, user only)",
+                               choices: PageAdd.sources),
+                "template": .anything("source template: a template id (\"builtin.grid\"), {id, params}, or a Background {kind, template?, asset?, pdfPage?, color?}"),
+                "size": .anything("page size: preset name (A4, A5, Letter, Standard…, optionally ' landscape'), [width, height] or {width, height} in points; default: the open page's size"),
+                "asset": .str("source pdf or image: an asset name in this document (from asset.put)"),
+                "pdfPage": .int("source pdf: 0-based first PDF page (default 0)", min: 0),
+                "id": .str("caller-chosen id of the (first) new page"),
+                "ids": PageCommands.idsSchema
+            ]),
+            examples: PageAdd.examples, effect: .edit)
+    }
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let doc = try PageArgs.document(p.doc, ctx)

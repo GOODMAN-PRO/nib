@@ -417,6 +417,49 @@ final class PageCommandTests: XCTestCase {
         XCTAssertFalse(PageClipboard.hasPages)
     }
 
+    func testExternalClipboardReadCannotAuthorizeAnOlderEncodingWrite() async throws {
+        let h = harness()
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1))
+        let older = PagesPayload(source: nil, pages: [.init(page: page, items: [])], assets: [])
+        var newer = older
+        newer.pages[0].page.title = "External replacement"
+        let olderBytes = try JSONEncoder().encode(older)
+        let newerBytes = try JSONEncoder().encode(newer)
+        var boardBytes = olderBytes
+        var count = 10
+        var publications = 0
+        let started = expectation(description: "older encoding started")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let write = Task {
+            try await PageClipboard.write(older, changeCount: { count }, publish: {
+                publications += 1
+                boardBytes = $0
+                count += 1
+            }, encode: {
+                started.fulfill()
+                guard release.wait(timeout: .now() + 2) == .success else {
+                    throw CocoaError(.fileReadUnknown)
+                }
+                return olderBytes
+            })
+        }
+        await fulfillment(of: [started], timeout: 1)
+        count += 1
+        boardBytes = newerBytes
+        let replacement = await PageClipboard.read(changeCount: { count }, data: { boardBytes })
+        XCTAssertEqual(replacement, newer, "the replacement read must finish before releasing the older writer")
+        release.signal()
+        try await write.value
+        XCTAssertEqual(publications, 0)
+        XCTAssertEqual(boardBytes, newerBytes)
+        let cached = await PageClipboard.read(changeCount: { count }, data: {
+            XCTFail("the newer payload should still be cached")
+            return boardBytes
+        })
+        XCTAssertEqual(cached, newer)
+    }
+
     func testPasteAcceptsAPayloadAndAddPageCanPasteToo() async throws {
         let h = harness()
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])

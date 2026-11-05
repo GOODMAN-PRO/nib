@@ -172,20 +172,33 @@ enum PageClipboard {
     /// Keeps `payload` for pastes in this process, then puts it with its asset bytes on the system pasteboard. Reading
     /// the assets, cutting PDFs and encoding run off the main actor (ARCHITECTURE §14).
     static func write(_ payload: PagesPayload, store: AssetStore?) async throws {
+        guard usesSystemPasteboard else {
+            memory = payload
+            generation += 1
+            return
+        }
+        let board = UIPasteboard.general
+        try await write(payload, changeCount: { board.changeCount }, publish: {
+            board.setData($0, forPasteboardType: typeIdentifier)
+        }, encode: {
+            try payload.encodedWithBytes(store: store, pdfUse: payload.pdfUse)
+        })
+    }
+
+    /// The same publication path with an injectable board and worker for deterministic race tests.
+    static func write(_ payload: PagesPayload, changeCount: () -> Int, publish: (Data) -> Void,
+                      encode: @escaping @Sendable () throws -> Data) async throws {
         memory = payload
         generation += 1
-        guard usesSystemPasteboard else { return }
-        let board = UIPasteboard.general
-        writtenChangeCount = board.changeCount
+        let startingChangeCount = changeCount()
+        writtenChangeCount = startingChangeCount
         let mine = generation
-        let pdfUse = payload.pdfUse
-        let data = try await Task.detached(priority: .userInitiated) {
-            try payload.encodedWithBytes(store: store, pdfUse: pdfUse)
-        }.value
+        let data = try await Task.detached(priority: .userInitiated) { try encode() }.value
         // A newer copy, ours or another app's, replaced this one while it was being encoded.
-        guard mine == generation, board.changeCount == writtenChangeCount else { return }
-        board.setData(data, forPasteboardType: typeIdentifier)
-        writtenChangeCount = board.changeCount
+        // Reads may update the cache count while encoding, so it cannot be the overwrite guard.
+        guard mine == generation, changeCount() == startingChangeCount else { return }
+        publish(data)
+        writtenChangeCount = changeCount()
     }
 
     /// Cheap check for menus: it never reads the pasteboard's contents, so it never prompts.
