@@ -283,7 +283,7 @@ struct CollabDigest: Codable, Equatable {
     static func delta(content: DocumentContent, items: [PageID: [Item]], against other: CollabDigest,
                       doc: DocumentID) -> DocumentPatch {
         var patch = DocumentPatch(doc: doc)
-        if isNewer(content.meta.rev, than: other.meta) { patch.meta = content.meta }
+        if isNewer(content.meta.rev, than: other.meta) { patch.meta = CollabPrivacy.meta(content.meta) }
         patch.pages = content.pages.filter { isNewer($0.rev, than: other.pages[$0.id.raw]) }
         patch.outline = content.outline.filter { isNewer($0.rev, than: other.outline[$0.id.raw]) }
         patch.blocks = content.blocks.filter { isNewer($0.rev, than: other.blocks[$0.id.raw]) }
@@ -457,7 +457,13 @@ enum CollabFrames {
     static func damaged() -> NibError { NibError.invalid("damaged collaboration frame") }
 
     static func frames(for message: CollabMessage) throws -> [Data] {
-        let json = try makeEncoder().encode(message)
+        // The wire boundary covers initial sync, live commits and forwarding another peer's patch.
+        var outgoing = message
+        if let meta = outgoing.patch?.meta { outgoing.patch?.meta = CollabPrivacy.meta(meta) }
+        if let meta = outgoing.snapshot?.content?.content.meta {
+            outgoing.snapshot?.content?.content.meta = CollabPrivacy.meta(meta)
+        }
+        let json = try makeEncoder().encode(outgoing)
         guard json.count <= maxMessageBytes else { throw tooLarge() }
         var body = json
         var flags: UInt8 = 0
@@ -885,6 +891,35 @@ enum CollabBlobIO {
 
 // MARK: - Package snapshots
 
+enum CollabPrivacy {
+    static func meta(_ incoming: DocumentMeta) -> DocumentMeta {
+        var clean = incoming
+        clean.sourceBookmark = nil
+        clean.trashedFrom = nil
+        clean.favorite = false
+        clean.locked = false
+        return clean
+    }
+
+    /// Preserve unknown fields and revisions in every device head, including provider conflict copies.
+    /// Some library implementations wrap the head in `content`; never ship that wrapper's private meta either.
+    static func headData(_ data: Data) throws -> Data {
+        guard var head = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+        let keys = ["sourceBookmark", "trashedFrom", "favorite", "locked"]
+        var changed = false
+        if var meta = head["meta"] as? [String: Any] {
+            for key in keys { if meta.removeValue(forKey: key) != nil { changed = true } }
+            head["meta"] = meta
+        }
+        if var content = head["content"] as? [String: Any], var meta = content["meta"] as? [String: Any] {
+            for key in keys { if meta.removeValue(forKey: key) != nil { changed = true } }
+            content["meta"] = meta
+            head["content"] = content
+        }
+        return changed ? try JSONSerialization.data(withJSONObject: head, options: [.sortedKeys]) : data
+    }
+}
+
 /// Zips a document package for a joiner and unpacks one safely. Runs off the main actor (file I/O only).
 enum CollabPackageIO {
     /// Largest expanded snapshot accepted (1 GB).
@@ -898,7 +933,30 @@ enum CollabPackageIO {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let zipURL = dir.appendingPathComponent("snapshot.zip")
         do {
-            try fm.zipItem(at: package, to: zipURL, shouldKeepParent: true, compressionMethod: .deflate)
+            let heads = dir.appendingPathComponent("heads", isDirectory: true)
+            try fm.createDirectory(at: heads, withIntermediateDirectories: true)
+            let archive = try Archive(url: zipURL, accessMode: .create)
+            func add(_ file: URL, path: String, topLevel: Bool = false) throws {
+                let values = try file.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                var source = file
+                if topLevel, file.pathExtension == "json",
+                   file.lastPathComponent.hasPrefix("doc.") || file.lastPathComponent == "document.json" {
+                    let data = try Data(contentsOf: file)
+                    // A damaged conflict head must neither block a valid snapshot nor leak unparsed private meta.
+                    guard let clean = try? CollabPrivacy.headData(data) else { return }
+                    source = heads.appendingPathComponent(file.lastPathComponent)
+                    try clean.write(to: source)
+                }
+                try archive.addEntry(with: path, fileURL: source, compressionMethod: .deflate)
+                if values.isDirectory == true, values.isSymbolicLink != true {
+                    for child in try fm.contentsOfDirectory(at: file, includingPropertiesForKeys: nil) {
+                        try add(child, path: path + "/" + child.lastPathComponent, topLevel: file == package)
+                    }
+                }
+            }
+            // Only sanitized heads need scratch copies; stream assets and page files directly into the archive.
+            try add(package, path: package.lastPathComponent)
+            try fm.removeItem(at: heads)
         } catch {
             try? fm.removeItem(at: dir)
             throw error
@@ -1031,6 +1089,8 @@ final class CollabSession {
     enum Route: Hashable {
         case host
         case participant(String)
+        case peers([String])
+        case broadcast
     }
 
     /// `applyRemote` origin of merged collaborator changes ("collab:<participant>"), so they are never echoed back.
@@ -1094,6 +1154,8 @@ final class CollabSession {
     /// before their bytes, and the host relays a patch only once it holds the files the patch needs.
     private var holds = 0
     private var outbox: [Route: Task<Void, Never>] = [:]
+    /// Every link of each route's chain, so rehosting cancels a busy send as well as the patch waiting behind it.
+    private var pendingOutbox: [UUID: Task<Void, Never>] = [:]
     private var commitSubscription: EventSubscription?
     private var eventSubscription: EventSubscription?
     private var registryObserver: NSObjectProtocol?
@@ -2181,12 +2243,31 @@ final class CollabSession {
 
     // MARK: Sending
 
-    /// Sends now, to explicit transport peers (hello, denials, ended); not ordered behind files.
+    /// Sends now unless this destination already has queued frames. A nil destination remains a broadcast.
     @discardableResult
     private func transmit(_ m: CollabMessage, to peers: [CollabPeer]?) -> Bool {
         do {
-            for frame in try CollabFrames.frames(for: m) { try transport.send(frame, to: peers) }
-            return true
+            let frames = try CollabFrames.frames(for: m)
+            let route: Route
+            if let peers {
+                // A denial/revocation outlives the participant binding that its caller is about to remove.
+                let removesPeer = m.kind == .denied || m.kind == .revoked || m.kind == .ended || m.kind == .bye
+                if !removesPeer, peers.count == 1, side == .guest, peers[0].id == hostPeer?.id {
+                    route = .host
+                } else if !removesPeer, peers.count == 1, let pid = participantOf[peers[0].id] {
+                    route = .participant(pid)
+                } else {
+                    // Multi-peer and terminal control messages can interleave with individual routes.
+                    route = .peers(peers.map(\.id))
+                }
+            } else {
+                route = .broadcast
+            }
+            // End/bye must still go out immediately when end() has already marked the session closed.
+            if !isClosed, outbox[route] != nil { return post(frames: frames, to: route) }
+            var next = 0
+            if try sendAvailable(frames, to: peers, next: &next) { return true }
+            return post(frames: Array(frames.dropFirst(next)), to: route)
         } catch {
             log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
             return false
@@ -2218,6 +2299,11 @@ final class CollabSession {
         switch route {
         case .host: return hostPeer.map { [$0] }
         case .participant(let pid): return peerOf[pid].map { [$0] }
+        case .peers(let targets):
+            let current = transport.peers
+            let resolved = targets.compactMap { id in current.first { $0.id == id } }
+            return resolved.count == targets.count ? resolved : nil
+        case .broadcast: return [] // The transport resolves broadcast recipients, even before its roster is known.
         }
     }
 
@@ -2234,11 +2320,23 @@ final class CollabSession {
 
     @discardableResult
     private func post(frames: [Data], to route: Route) -> Bool {
-        guard let previous = outbox[route] else { return deliver(frames, to: route) }
-        guard peers(for: route) != nil else { return false }
+        guard !isClosed, let targets = peers(for: route) else { return false }
+        let previous = outbox[route]
+        var next = 0
+        if previous == nil {
+            do {
+                if try sendAvailable(frames, to: route == .broadcast ? nil : targets, next: &next) { return true }
+            } catch {
+                log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
+                hasUnsentChanges = true
+                return false
+            }
+        }
+        let remaining = Array(frames.dropFirst(next))
         let task = Task { [weak self] in
-            await previous.value
-            _ = self?.deliver(frames, to: route)
+            await previous?.value
+            guard let self = self, self.peers(for: route)?.map(\.id) == targets.map(\.id) else { return }
+            _ = await self.deliver(remaining, to: route)
         }
         enqueue(task, on: route)
         return true
@@ -2252,34 +2350,61 @@ final class CollabSession {
                 if let c = cleanup { try? FileManager.default.removeItem(at: c) }
                 return
             }
-            _ = await self.streamBlob(header, source: source, copy: copy, cleanup: cleanup, to: route)
+            let sent = await self.streamBlob(header, source: source, copy: copy, cleanup: cleanup, to: route)
+            if !sent, !Task.isCancelled, !self.isClosed {
+                self.hasUnsentChanges = true
+                self.log.error("collab: the shared file couldn't be sent")
+            }
         }
         enqueue(task, on: route)
     }
 
     private func enqueue(_ task: Task<Void, Never>, on route: Route) {
+        let token = UUID()
+        pendingOutbox[token] = task
         outbox[route] = task
         Task { [weak self] in
             await task.value
-            guard let self = self, self.outbox[route] == task else { return }
-            self.outbox[route] = nil
+            guard let self = self else { return }
+            self.pendingOutbox[token] = nil
+            if self.outbox[route] == task { self.outbox[route] = nil }
         }
     }
 
     private func cancelOutbox() {
-        for task in outbox.values { task.cancel() }
+        for task in pendingOutbox.values { task.cancel() }
+        pendingOutbox = [:]
         outbox = [:]
     }
 
-    private func deliver(_ frames: [Data], to route: Route) -> Bool {
-        guard !isClosed, let targets = peers(for: route) else { return false }
-        do {
-            for frame in frames { try transport.send(frame, to: targets) }
-            return true
-        } catch {
-            log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
-            return false
+    /// A busy relay has accepted every frame before `next`, and none from `next` onward.
+    private func sendAvailable(_ frames: [Data], to targets: [CollabPeer]?, next: inout Int) throws -> Bool {
+        while next < frames.count {
+            do {
+                try transport.send(frames[next], to: targets)
+                next += 1
+            } catch let error as NibError where error.code == .timeout && error.hint == "relay-busy" {
+                return false
+            }
         }
+        return true
+    }
+
+    private func deliver(_ frames: [Data], to route: Route) async -> Bool {
+        guard !isClosed, let targets = peers(for: route) else { return false }
+        var next = 0
+        do {
+            while !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == targets.map(\.id) {
+                if try sendAvailable(frames, to: route == .broadcast ? nil : targets, next: &next) { return true }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+        } catch {
+            if !Task.isCancelled {
+                log.error("collab: send failed: \(NibError.wrap(error).message, privacy: .public)")
+                hasUnsentChanges = true
+            }
+        }
+        return false
     }
 
     /// Streams a file as a blob: measured and hashed off the main actor, then the header, then its frames read from
@@ -2306,7 +2431,7 @@ final class CollabSession {
         } catch {
             return false
         }
-        guard !isClosed, peers(for: route) == first, deliver(headerFrames, to: route) else { return false }
+        guard !isClosed, peers(for: route)?.map(\.id) == first.map(\.id), await deliver(headerFrames, to: route) else { return false }
         let count = CollabFrames.blobPartCount(prepared.bytes)
         var next = 0
         while next < count {
@@ -2322,7 +2447,7 @@ final class CollabSession {
                 log.error("collab: couldn't read a file to send: \(NibError.wrap(error).message, privacy: .public)")
                 return false
             }
-            guard !isClosed, !Task.isCancelled, peers(for: route) == first, deliver(frames, to: route) else { return false }
+            guard !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == first.map(\.id), await deliver(frames, to: route) else { return false }
             next = range.upperBound
         }
         return true
@@ -2459,6 +2584,7 @@ final class CollabSession {
     static func rewrite(_ patch: DocumentPatch, to doc: DocumentID) -> DocumentPatch {
         var p = patch
         p.doc = doc
+        p.meta = p.meta.map { CollabPrivacy.meta($0) }
         p.meta?.id = doc
         return p
     }
@@ -2476,12 +2602,7 @@ final class CollabSession {
 
     /// The same for a document arriving in this library for the first time.
     static func receivedMeta(_ incoming: DocumentMeta) -> DocumentMeta {
-        var m = incoming
-        m.favorite = false
-        m.locked = false
-        m.trashedFrom = nil
-        m.sourceBookmark = nil
-        return m
+        CollabPrivacy.meta(incoming)
     }
 
     static func makeSecret() -> String {
@@ -2731,13 +2852,30 @@ final class CollabService: ObservableObject {
             await runRejoin([0] + timing.retryDelays)
         case .host:
             guard away >= timing.suspendThreshold || (s.transport.peers.isEmpty && s.hasAdmittedGuests) else { return }
+            rejoinTask?.cancel()
+            let task = Task<Void, Never> { [weak self] in
+                await self?.runRehost(s, delays: [0] + (self?.timing.retryDelays ?? []))
+            }
+            rejoinTask = task
+            await task.value
+            if rejoinTask == task { rejoinTask = nil }
+        }
+    }
+
+    private func runRehost(_ s: CollabSession, delays: [TimeInterval]) async {
+        var lastError: NibError?
+        for delay in delays {
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            guard !Task.isCancelled, session === s, !s.isClosed else { return }
             do {
                 try await s.rehost()
+                return
             } catch {
-                let e = NibError.wrap(error)
-                s.end(reason: String(localized: "The live session couldn't restart: \(e.message)"), notify: false)
+                lastError = NibError.wrap(error)
             }
         }
+        guard !Task.isCancelled, session === s, !s.isClosed, let error = lastError else { return }
+        s.end(reason: String(localized: "The live session couldn't restart: \(error.message)"), notify: false)
     }
 
     func scheduleRejoin() {

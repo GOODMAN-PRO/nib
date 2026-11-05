@@ -262,6 +262,7 @@ struct SharedEntry: Identifiable, Equatable {
     var at: Double
     /// The join code of the last session (a guest joins again with it).
     var code: String?
+    var transport: String? = nil
     var isLive: Bool
     var isLocked: Bool
     var unseen: Int
@@ -300,7 +301,7 @@ enum SharedList {
             if let existing = byDoc[r.local], existing.at >= r.at { continue }
             byDoc[r.local] = SharedEntry(local: r.local, remote: r.remote, isHost: r.role == "host",
                                          title: n.title.isEmpty ? r.title : n.title, kind: n.documentKind, at: r.at,
-                                         code: r.code, isLive: r.local == liveDoc, isLocked: n.locked,
+                                         code: r.code, transport: r.transport, isLive: r.local == liveDoc, isLocked: n.locked,
                                          unseen: unseen(r.local))
         }
         return byDoc.values.sorted { a, b in
@@ -555,7 +556,9 @@ struct SharedPanel: View {
     /// A guest joins the session of its last code again (the host may have started a new one; then it asks again).
     func join(_ e: SharedEntry) {
         guard let code = e.code else { return }
-        hub.run(CommandIDs.collabJoin, ["code": .string(code)], session: context.session)
+        var params: [String: JSONValue] = ["code": .string(code)]
+        if let transport = e.transport { params["transport"] = .string(transport) }
+        hub.run(CommandIDs.collabJoin, .object(params), session: context.session)
     }
 
     /// The host opens the document and the Share Live panel.

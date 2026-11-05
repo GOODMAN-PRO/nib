@@ -158,12 +158,14 @@ struct CollabSharedDocument: Codable, Equatable {
     /// Unix seconds of the last session.
     var at: Double
     var code: String?
+    /// Missing in older records, which retain the Nearby default.
+    var transport: String?
     /// A guest's admission secret for the session under `code`: after the app is relaunched it re-joins without a
     /// second approval. Device-local (the store is never synced).
     var secret: String?
 
     init(local: DocumentID, remote: DocumentID, role: String, title: String, at: Double, code: String?,
-         secret: String? = nil) {
+         secret: String? = nil, transport: String? = nil) {
         self.local = local
         self.remote = remote
         self.role = role
@@ -171,6 +173,7 @@ struct CollabSharedDocument: Codable, Equatable {
         self.at = at
         self.code = code
         self.secret = secret
+        self.transport = transport
     }
 }
 

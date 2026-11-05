@@ -51,11 +51,18 @@ struct LessonSnapshot: Codable, Equatable {
     var items: [PageID: [Item]]
 }
 
+/// Provenance of the source records copied into Present, distinct from notes made only in the private copy.
+struct LessonPresentSource: Codable {
+    var pages: Set<PageID>
+    var items: Set<ElementID>
+}
+
 @MainActor
 enum LessonManager {
     static let assignmentKey = "nib.lesson"
     static let rosterKey = "nib.roster"
     static let privateSourceKey = "nib.lesson.privateSource"
+    static let presentSourceKey = "nib.lesson.presentSourceRecords"
     static let returnReadOnlyKey = "nib.lesson.returnReadOnly"
     static let managedKey = "nib.lesson.managed"
     nonisolated static let privatePrefix = "PRESENT_"

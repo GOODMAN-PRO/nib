@@ -225,6 +225,68 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(copyID, page: page).contains { $0.id == secret.id })
     }
 
+    func testPresentRefreshDoesNotResurrectDeletedSourceItemsOrPages() async throws {
+        for legacy in [false, true] {
+            let h = harness()
+            let (doc, page, sourceItem, _) = try source(h)
+            let removedPage = PageRecord(id: "REMOVEDPAGE01", order: "k")
+            h.app.commands.register(CommandDescriptor(id: "test.addSourcePage", title: "Add page", summary: "Test helper.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in try tx.put(removedPage, doc: doc) }
+                return [:]
+            }
+            try await h.run("test.addSourcePage")
+            let result = try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"])
+            let privateDoc = NodeRef.documentID(from: try XCTUnwrap(result["ref"]?.stringValue))
+            let note = Item(id: "KEEPNOTE0001", kind: .text, layer: 0,
+                            text: TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "Private note")))
+            try await h.insert([note], page: page, doc: privateDoc)
+            let hiddenNote = Item(id: "HIDDENNOTE01", kind: .text, layer: LessonManager.presentLayer,
+                                  text: TextBoxItem(frame: Frame(x: 0, y: 0, w: 100, h: 30), text: RichText(plain: "Recoverable note")))
+            try await h.insert([hiddenNote], page: removedPage.id, doc: privateDoc)
+            let privatePage = PageRecord(id: "PRIVATEPAGE01", order: "t")
+            h.app.commands.register(CommandDescriptor(id: "test.preparePrivateCopy", title: "Prepare private copy", summary: "Test helper.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    try tx.put(privatePage, doc: privateDoc)
+                    if legacy {
+                        var meta = try tx.content(privateDoc).meta
+                        meta.ext?[LessonManager.presentSourceKey] = nil
+                        try tx.putMeta(meta)
+                    }
+                }
+                return [:]
+            }
+            try await h.run("test.preparePrivateCopy")
+            try await h.run(CommandIDs.lessonSetState, ["doc": .string(privateDoc.raw), "state": "prep"])
+            h.app.commands.register(CommandDescriptor(id: "test.removeSourceContent", title: "Remove source content", summary: "Test helper.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    try tx.delete(item: sourceItem, doc: doc, page: page)
+                    var deleted = removedPage
+                    deleted.deleted = true
+                    try tx.put(deleted, doc: doc)
+                }
+                return [:]
+            }
+            try await h.run("test.removeSourceContent")
+            if !legacy {
+                // Provenance must still work after the source store prunes its tombstones.
+                h.app.workspace.close(doc)
+                h.persistence.heads[doc]?.pages.removeAll { $0.id == removedPage.id }
+                h.persistence.pageItems[doc]?[page]?.removeAll { $0.id == sourceItem }
+            }
+            for _ in 0..<2 {
+                try await h.run(CommandIDs.lessonSetState, ["doc": .string(doc.raw), "state": "present"])
+                let items = try h.app.workspace.items(privateDoc, page: page)
+                XCTAssertFalse(items.contains { $0.id == sourceItem }, "deleted source item returned")
+                XCTAssertTrue(items.contains { $0.id == note.id }, "private additions on other layers survive")
+                let pages = try h.app.workspace.content(privateDoc).livePages.map(\.id)
+                XCTAssertFalse(pages.contains(removedPage.id), "deleted source page returned")
+                XCTAssertTrue(pages.contains(privatePage.id))
+                XCTAssertTrue(try h.app.workspace.allItems(privateDoc, page: removedPage.id).contains { $0.id == hiddenNote.id })
+                h.app.workspace.close(privateDoc)
+            }
+        }
+    }
+
     func testLibraryWindowUndoRedoForCopiesAndSingleHistoryForRosterReplacement() async throws {
         let h = harness()
         let (doc, _, _, _) = try source(h)
@@ -373,6 +435,22 @@ final class LessonManagerTests: XCTestCase {
             XCTFail("leading presentation must stay on the shared document")
         } catch { XCTAssertEqual((error as? NibError)?.code, .conflict) }
         XCTAssertEqual(h.session.document, Fixtures.docID)
+    }
+
+    func testQuickLessonInviteFollowsCurrentSessionInsteadOfLastHostResult() {
+        let active: JSONValue = ["active": true, "side": "host", "code": "K7M2QX"]
+        var state = LessonLiveSessionState(active)
+        XCTAssertTrue(state.hosted)
+        XCTAssertEqual(state.code, "K7M2QX", "reopening an active lesson restores its invite")
+        XCTAssertEqual(state.url, "nib://collab/join?code=K7M2QX")
+        let endedStates: [JSONValue?] = [["active": false, "phase": "idle"],
+                                       ["active": true, "side": "guest", "code": "K7M2QX"], nil]
+        for value in endedStates {
+            state = LessonLiveSessionState(value)
+            XCTAssertFalse(state.hosted)
+            XCTAssertNil(state.code, "the code also controls Manage Participants visibility")
+            XCTAssertNil(state.url, "a dead session must not leave a scannable QR")
+        }
     }
 
     func testRosterEmailsAreNotSavedAndTrashedRosterIsIgnored() async throws {

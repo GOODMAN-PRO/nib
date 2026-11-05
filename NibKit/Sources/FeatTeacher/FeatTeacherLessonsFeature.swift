@@ -132,6 +132,26 @@ private struct LessonPanelEntry: Identifiable {
     var unreadable = false
 }
 
+/// The invite is derived from the current roster, never retained from a completed host command.
+struct LessonLiveSessionState: Equatable {
+    var hosted: Bool
+    var code: String?
+    var url: String?
+
+    init(_ value: JSONValue? = nil) {
+        hosted = value?["active"]?.boolValue == true && value?["side"]?.stringValue == "host"
+        code = hosted ? value?["code"]?.stringValue : nil
+        if let code {
+            var components = URLComponents()
+            components.scheme = NibFormat.urlScheme
+            components.host = "collab"
+            components.path = "/join"
+            components.queryItems = [URLQueryItem(name: "code", value: code)]
+            url = components.string
+        } else { url = nil }
+    }
+}
+
 /// Opaque sheet content: the host owns the floating droplet container. Lists and fields never draw glass over ink.
 @MainActor
 private struct LessonPanel: View {
@@ -150,9 +170,10 @@ private struct LessonPanel: View {
     @State private var error: String?
     @State private var receipt: String?
     @State private var loading = false
-    @State private var liveHosted = false
-    @State private var liveCode: String?
-    @State private var liveURL: String?
+    @State private var liveSession = LessonLiveSessionState()
+    private var liveHosted: Bool { liveSession.hosted }
+    private var liveCode: String? { liveSession.code }
+    private var liveURL: String? { liveSession.url }
     @Environment(\.horizontalSizeClass) private var widthClass
     @Environment(\.dynamicTypeSize) private var typeSize
     @State private var liveSubscription: EventSubscription?
@@ -328,8 +349,6 @@ private struct LessonPanel: View {
             NibButton(String(localized: "Start Quick Lesson"), symbol: .lesson) {
                 run(CommandIDs.collabHost, ["doc": .string(doc)]) { value in
                     Task { await loadLiveSession() }
-                    liveCode = value["code"]?.stringValue
-                    liveURL = value["url"]?.stringValue
                     receipt = String(localized: "Quick Lesson started. Approve students in Manage Participants.")
                 }
             }
@@ -345,7 +364,7 @@ private struct LessonPanel: View {
     }
     private func loadLiveSession() async {
         let value = try? await context.app.bus.execute(CommandIDs.collabParticipants, [:], session: context.session)
-        liveHosted = value?["active"]?.boolValue == true && value?["side"]?.stringValue == "host"
+        liveSession = LessonLiveSessionState(value)
     }
     private var visibleEntries: [LessonPanelEntry] {
         entries.filter { ($0.state != nil || $0.unreadable) && (filter == "all" || $0.state?.rawValue == filter) }.sorted {

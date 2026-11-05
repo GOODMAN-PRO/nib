@@ -633,6 +633,43 @@ final class PresenceTests: XCTestCase {
 
     // MARK: Shared tab, UI and registration
 
+    func testSharedTabRemembersRelayAndPassesItToJoinAfterRelaunch() async throws {
+        let pair = PresencePair()
+        let relay = InMemoryCollabTransport.Hub()
+        pair.host.app.services.set(InMemoryCollabTransport(hub: relay, peerID: "relay-host"), for: ServiceKeys.collabRelay)
+        pair.guest.app.services.set(InMemoryCollabTransport(hub: relay, peerID: "relay-guest"), for: ServiceKeys.collabRelay)
+        let hosted = try await pair.host.run("collab.host", ["doc": "doc:FIXTUREDOC01", "transport": "relay"])
+        let code = try XCTUnwrap(hosted["code"]?.stringValue)
+        let joining = Task { try await pair.guest.run("collab.join", ["code": .string(code), "transport": "relay"]) }
+        let hostService = try XCTUnwrap(CollabService.of(pair.host.app))
+        try await presenceWait("relay join request") { !hostService.state.pending.isEmpty }
+        try await pair.host.run("collab.approve", ["participant": .string(PresencePair.guestID), "allow": true])
+        _ = try await joining.value
+        let guestService = try XCTUnwrap(CollabService.of(pair.guest.app))
+        let saved = try XCTUnwrap(guestService.sharedDocuments().first)
+        XCTAssertEqual(saved.transport, "relay")
+        // A new service reads the persisted record, independent of the old session's in-memory transport.
+        try await pair.guest.run("collab.leave")
+        let fresh = CollabService(app: pair.guest.app, hooks: try XCTUnwrap(CollabHooks.of(pair.guest.app)), notifier: SilentCollabNotifier())
+        let restored = try XCTUnwrap(fresh.sharedDocuments().first)
+        XCTAssertEqual(restored.transport, "relay")
+        let entries = SharedList.make([restored], node: { pair.guest.library.node($0) }, liveDoc: nil, unseen: { _ in 0 })
+        let entry = try XCTUnwrap(entries.first)
+        var invocation: JSONValue?
+        pair.guest.app.commands.register(CommandDescriptor(id: CommandIDs.collabJoin, title: "Join", summary: "Record test invocation.", effect: .library)) { params, _ in
+            invocation = params
+            return [:]
+        }
+        let context = PanelContext(app: pair.guest.app, session: pair.guest.session, navigator: nil, dismiss: {})
+        SharedPanel(hub: pair.guestHub, context: context).join(entry)
+        try await presenceWait("Shared tab join command") { invocation != nil }
+        XCTAssertEqual(invocation?["transport"]?.stringValue, "relay")
+        XCTAssertEqual(invocation?["code"]?.stringValue, code)
+
+        let legacy: JSONValue = ["local": "FIXTUREDOC01", "remote": "FIXTUREDOC01", "role": "guest", "title": "Old", "at": 1, "code": "K7M2QX"]
+        XCTAssertNil(try legacy.decode(CollabSharedDocument.self).transport, "old records remain readable")
+    }
+
     func testSharedTabListsWhatYouSharedAndWhatWasSharedWithYou() async throws {
         let pair = PresencePair()
         try await pair.start()

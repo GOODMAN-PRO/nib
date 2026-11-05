@@ -448,9 +448,26 @@ struct LessonSetState: NibCommand {
             let store = try LessonRuntime.privateStore(ctx)
             let old: LessonSnapshot?
             if (try? store.loadHead(target)) != nil {
-                old = try LessonManager.capture(target, workspace: ctx.workspace)
+                var previous = try LessonManager.capture(target, workspace: ctx.workspace)
+                // Keep private annotations on deleted pages recoverable without displaying those pages again.
+                for page in previous.content.pages where page.deleted {
+                    previous.items[page.id] = try ctx.workspace.allItems(target, page: page.id)
+                }
+                old = previous
             } else { old = nil }
             var value = try LessonManager.capture(doc, workspace: ctx.workspace)
+            // Include source tombstones when upgrading a private copy made before provenance was recorded.
+            var copied = LessonPresentSource(pages: Set(value.content.pages.map(\.id)), items: [])
+            let cached = ctx.workspace.cachedPages(doc)
+            defer { ctx.workspace.evictPages(doc, keeping: cached) }
+            for page in value.content.pages {
+                copied.items.formUnion(try ctx.workspace.allItems(doc, page: page.id).map(\.id))
+            }
+            if let saved = old?.content.meta.ext?[LessonManager.presentSourceKey] {
+                let previous = try saved.decode(LessonPresentSource.self)
+                copied.pages.formUnion(previous.pages)
+                copied.items.formUnion(previous.items)
+            }
             guard !value.items.values.joined().contains(where: { $0.layer == LessonManager.presentLayer }) else {
                 throw NibError(.unsupported, "The source uses the private Present layer. Move its contents to another layer first.")
             }
@@ -459,19 +476,23 @@ struct LessonSetState: NibCommand {
             value.content.meta.sourceBookmark = nil
             value.content.meta.ext = value.content.meta.ext ?? [:]
             value.content.meta.ext?[LessonManager.privateSourceKey] = .string(doc.raw)
+            value.content.meta.ext?[LessonManager.presentSourceKey] = try JSONValue.from(copied)
             value.content.meta.layers[LessonManager.presentLayer].name = String(localized: "Present, private")
             let inputs = try LessonCreate.copyInputs(value, source: doc, ctx: ctx)
             try FileManager.default.createDirectory(at: store.package(target), withIntermediateDirectories: true)
             value = try await LessonCreate.transfer(value, to: [target], inputs: inputs, ctx: ctx)
             if let old {
-                let sourceItems = Set(value.items.values.joined().map(\.id))
-                let sourcePages = Set(value.content.livePages.map(\.id))
                 for page in old.content.pages {
-                    if !sourcePages.contains(page.id) {
+                    if !copied.pages.contains(page.id) {
                         value.content.pages.removeAll { $0.id == page.id }
                         value.content.pages.append(page)
+                    } else if !value.content.pages.contains(where: { $0.id == page.id }) {
+                        // The source may already have pruned its tombstone. Keep a hidden page for private notes.
+                        var deleted = page
+                        deleted.deleted = true
+                        value.content.pages.append(deleted)
                     }
-                    value.items[page.id, default: []] += (old.items[page.id] ?? []).filter { !sourceItems.contains($0.id) }
+                    value.items[page.id, default: []] += (old.items[page.id] ?? []).filter { !copied.items.contains($0.id) }
                 }
                 // Legacy private copies could contain blocks/cards; never drop their independent records.
                 let blocks = Set(value.content.blocks.map(\.id)), cards = Set(value.content.cards.map(\.id))

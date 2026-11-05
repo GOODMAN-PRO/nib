@@ -358,6 +358,30 @@ final class FeatPresentationTests: XCTestCase {
 
     // MARK: Review fixes
 
+    func testLockEventsHideAndRestoreTheLivePageWithoutNavigation() async throws {
+        let h = Harness(features: [FeatPresentationFeature.self])
+        let lock = FakeLockService()
+        h.app.services.lock = lock
+        h.app.services.renderer = FakeRenderer()
+        for mode in [ExternalDisplayMode.presenter, .fullPage] {
+            let model = PresentationViewModel(source: LivePageSource(app: h.app), mode: mode)
+            await model.update(detailDelay: 0)
+            guard case .page = model.display else { return XCTFail("expected the unlocked page") }
+
+            lock.locked.insert(Fixtures.docID)
+            // Relock-all has no event.doc; the service, not the payload, is the source of truth.
+            h.app.events.emit("lock.changed")
+            await waitUntil { if case .idle = model.display { return true }; return false }
+            guard case .idle = model.display else { return XCTFail("the locked page remained on the display") }
+
+            lock.locked.remove(Fixtures.docID)
+            h.app.events.emit("lock.changed", doc: Fixtures.docID)
+            await waitUntil { if case .page = model.display { return true }; return false }
+            guard case .page = model.display else { return XCTFail("unlock did not restore the page") }
+            model.stop()
+        }
+    }
+
     func testSetModeSwitchesTheConnectedDisplayInPlace() async throws {
         let h = Harness(features: [FeatPresentationFeature.self])
         let controller = try XCTUnwrap(h.app.services.get(PresentationController.serviceKey, as: PresentationController.self))

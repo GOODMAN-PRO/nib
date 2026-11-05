@@ -358,7 +358,8 @@ extension CollabService {
     func rememberShared(local: DocumentID, remote: DocumentID, role: String, title: String, code: String?,
                         secret: String? = nil) {
         let record = CollabSharedDocument(local: local, remote: remote, role: role, title: title,
-                                          at: Date().timeIntervalSince1970, code: code, secret: secret)
+                                          at: Date().timeIntervalSince1970, code: code, secret: secret,
+                                          transport: session?.transportKey ?? sharedRecord(remote)?.transport)
         guard let json = try? JSONValue.from(record) else { return }
         app.settings.setJSON(CollabSharedStore.prefix + remote.raw, json)
     }

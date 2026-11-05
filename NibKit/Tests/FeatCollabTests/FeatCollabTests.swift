@@ -110,6 +110,65 @@ final class CollabPair {
     }
 }
 
+/// Injects transient relay failures without changing the in-memory transport's synchronous delivery semantics.
+@MainActor
+final class InterruptedCollabTransport: CollabTransport {
+    let base: InMemoryCollabTransport
+    var busyAt: Set<Int> = []
+    var alwaysBusy = false
+    var busyCount = 0
+    var accepted = 0
+    var hostFailures = 0
+    var hostAttempts = 0
+    var hidePeers = false
+    var peerName: String?
+    var broadcastSends = 0
+    var busyRemaining = 0
+    var failAt: Set<Int> = []
+    var failedCount = 0
+    init(_ base: InMemoryCollabTransport) { self.base = base }
+    var id: String { base.id }
+    var displayName: String { base.displayName }
+    var peers: [CollabPeer] {
+        hidePeers ? [] : base.peers.map { CollabPeer(id: $0.id, name: peerName ?? $0.name) }
+    }
+    var maxPeers: Int { base.maxPeers }
+    var onMessage: ((CollabPeer, Data) -> Void)? {
+        get { base.onMessage }
+        set { base.onMessage = newValue }
+    }
+    var onPeersChanged: (([CollabPeer]) -> Void)? {
+        get { base.onPeersChanged }
+        set { base.onPeersChanged = newValue }
+    }
+    func host(code: String, displayName: String) async throws {
+        hostAttempts += 1
+        if hostFailures > 0 {
+            hostFailures -= 1
+            throw NibError(.unavailable, "Network is reconnecting")
+        }
+        try await base.host(code: code, displayName: displayName)
+    }
+    func join(code: String, displayName: String) async throws { try await base.join(code: code, displayName: displayName) }
+    func send(_ data: Data, to peers: [CollabPeer]?) throws {
+        if alwaysBusy || busyAt.remove(accepted) != nil || busyRemaining > 0 {
+            if busyRemaining > 0 { busyRemaining -= 1 }
+            busyCount += 1
+            throw NibError(.timeout, "Relay queue is full", hint: "relay-busy")
+        }
+        if failAt.remove(accepted) != nil {
+            failedCount += 1
+            throw NibError(.unavailable, "Connection interrupted")
+        }
+        // Production transports address peers by id, independently of the current display name.
+        let targets = peers.map { requested in base.peers.filter { peer in requested.contains { $0.id == peer.id } } }
+        try base.send(data, to: targets)
+        if peers == nil { broadcastSends += 1 }
+        accepted += 1
+    }
+    func leave() { base.leave() }
+}
+
 /// A library that keeps packages on disk, so the host sends the zipped package (the production snapshot path): a
 /// package is a folder holding the document as JSON, and `importPackage` reads one back.
 @MainActor
@@ -612,6 +671,132 @@ final class FeatCollabTests: XCTestCase {
 
     // MARK: Files travel with their records
 
+    func testJoinAndRejoinBroadcastHelloBeforeTransportPublishesPeers() async throws {
+        for busy in [false, true] {
+            let pair = CollabPair()
+            let transport = InterruptedCollabTransport(pair.guestTransport)
+            transport.hidePeers = true
+            transport.busyRemaining = busy ? 2 : 0
+            pair.guest.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+            let code = try await pair.share()
+            let join = pair.startJoin(code)
+            defer { join.cancel(); pair.guestService.leave(); pair.hostService.leave() }
+            try await waitUntil { !pair.hostService.state.pending.isEmpty }
+            try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+            _ = try await join.value
+            XCTAssertEqual(pair.guestService.session?.phase, .active)
+            XCTAssertEqual(transport.broadcastSends, 1)
+
+            pair.guestService.didEnterBackground()
+            pair.guestTransport.leave()
+            transport.busyRemaining = busy ? 2 : 0
+            await pair.guestService.resumeAfterSuspend()
+            XCTAssertEqual(pair.guestService.session?.phase, .active)
+            XCTAssertEqual(transport.broadcastSends, 2)
+        }
+    }
+
+    func testBusyDenialSurvivesTransportPeerDisplayNameChange() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        let code = try await pair.share()
+        let join = pair.startJoin(code)
+        defer { join.cancel(); pair.guestService.leave(); pair.hostService.leave() }
+        try await pair.waitForRequest()
+        transport.peerName = "Updated name"
+        transport.busyRemaining = 2
+        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": false])
+        do {
+            _ = try await join.value
+            XCTFail("a denied guest must not join")
+        } catch {
+            XCTAssertEqual(NibError.wrap(error).code, .userDenied, "the queued denial must reach the guest")
+        }
+        XCTAssertEqual(transport.busyCount, 2)
+        XCTAssertEqual(pair.hostService.session?.phase, .active)
+    }
+
+    func testBusyControlMessageStaysAheadOfPatchToSameParticipant() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        let code = try await pair.share()
+        try await pair.join(code)
+        defer { pair.guestService.leave(); pair.hostService.leave() }
+        let start = pair.hostTransport.sent.count
+        transport.busyRemaining = 2
+        XCTAssertEqual(pair.hostService.session?.sendPresence(["test": "queued"], to: CollabPair.guestID), true)
+        try await pair.host.insert([CollabPair.stroke("ORDERED00001", x: 90)])
+        try await waitUntil { CollabPair.hasItem(pair.guest, "ORDERED00001") }
+        let kinds = try CollabPair.kinds(Array(pair.hostTransport.sent.dropFirst(start)))
+        XCTAssertEqual(kinds.filter { $0 == .presence || $0 == .patch }, [.presence, .patch])
+    }
+
+    func testTransientBlobHeaderAndFrameFailuresKeepHostSessionAlive() async throws {
+        for offset in [0, 1] {
+            let pair = CollabPair()
+            let transport = InterruptedCollabTransport(pair.hostTransport)
+            pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+            let code = try await pair.share()
+            try await pair.join(code)
+            defer { pair.guestService.leave(); pair.hostService.leave() }
+            transport.failAt = [transport.accepted + offset]
+            let bytes = Data(repeating: 7, count: 128_000)
+            let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
+            try await pair.host.insert([CollabPair.image("FAILBLOB0001", asset: ref)])
+            try await waitUntil { transport.failedCount == 1 }
+            XCTAssertEqual(pair.hostService.session?.phase, .active)
+            XCTAssertEqual(pair.hostService.session?.hasUnsentChanges, true)
+            XCTAssertEqual(try pair.host.assets.data(ref, doc: Fixtures.docID), bytes)
+            try await pair.host.insert([CollabPair.stroke("AFTERFAIL001", x: 90)])
+            try await waitUntil { CollabPair.hasItem(pair.guest, "AFTERFAIL001") }
+        }
+    }
+
+    func testRelayBackpressureRetriesOnlyUnacceptedFramesOfTwentyMiBAsset() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        let code = try await pair.share()
+        try await pair.join(code)
+        let start = pair.hostTransport.sent.count
+        // Fail at the header and in the middle of several batches, after earlier frames were accepted.
+        transport.busyAt = Set([0, 7, 41, 109, 207].map { transport.accepted + $0 })
+        let bytes = Data(repeating: 0xA7, count: 20 * 1024 * 1024)
+        let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
+        try await pair.host.insert([CollabPair.image("LARGERELAY01", asset: ref)])
+        try await waitUntil(timeout: 20) { CollabPair.hasItem(pair.guest, "LARGERELAY01") }
+        XCTAssertEqual(try pair.guest.assets.data(ref, doc: Fixtures.docID), bytes)
+        XCTAssertEqual(transport.busyCount, 5)
+        let frames = Array(pair.hostTransport.sent.dropFirst(start))
+        let blobs = frames.filter { $0.count >= 3 && $0[2] == CollabFrames.blobFlag }
+        XCTAssertEqual(blobs.count, CollabFrames.blobPartCount(bytes.count))
+        XCTAssertEqual(Set(blobs).count, blobs.count, "accepted blob frames must never be resent")
+        XCTAssertEqual(try CollabPair.kinds(frames).filter { $0 == .asset || $0 == .patch }, [.asset, .patch])
+        XCTAssertEqual(pair.guestService.session?.phase, .active)
+    }
+
+    func testLeavingCancelsBusyTransfersAndTheirQueuedPatches() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        let code = try await pair.share()
+        try await pair.join(code)
+        transport.alwaysBusy = true
+        let bytes = Data(repeating: 7, count: 128_000)
+        let ref = try pair.host.assets.put(bytes, ext: "png", doc: Fixtures.docID)
+        try await pair.host.insert([CollabPair.image("CANCELRELAY1", asset: ref)])
+        try await waitUntil { transport.busyCount > 0 }
+        pair.hostService.leave()
+        let attempts = transport.busyCount
+        try await Task.sleep(nanoseconds: 120_000_000)
+        XCTAssertEqual(transport.busyCount, attempts, "no retries after leaving")
+        XCTAssertEqual(try pair.host.assets.data(ref, doc: Fixtures.docID), bytes)
+        XCTAssertTrue(CollabPair.hasItem(pair.host, "CANCELRELAY1"))
+        XCTAssertNil(pair.hostService.state.message, "explicit leave must not report a failed transfer")
+    }
+
     func testAssetBytesTravelWithTheRecordsThatNeedThem() async throws {
         let pair = CollabPair()
         let code = try await pair.share()
@@ -728,6 +913,43 @@ final class FeatCollabTests: XCTestCase {
 
     // MARK: Re-joining
 
+    func testHostResumeRetriesUntilTheNetworkReturns() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        pair.hostService.timing.suspendThreshold = 0
+        pair.hostService.timing.retryDelays = [0, 0]
+        let code = try await pair.share()
+        let original = try XCTUnwrap(pair.hostService.session)
+        transport.hostFailures = 2
+        transport.leave()
+        pair.hostService.didEnterBackground()
+        await pair.hostService.resumeAfterSuspend()
+        XCTAssertEqual(transport.hostAttempts, 4, "initial host plus three resume attempts")
+        XCTAssertTrue(pair.hostService.session === original)
+        XCTAssertFalse(original.isClosed)
+        XCTAssertEqual(original.code, code)
+        try await pair.join(code)
+        XCTAssertEqual(pair.guestService.session?.phase, .active)
+    }
+
+    func testHostResumeEndsOnlyAfterAllRetriesFail() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        pair.hostService.timing.suspendThreshold = 0
+        pair.hostService.timing.retryDelays = [0, 0]
+        _ = try await pair.share()
+        transport.hostFailures = 3
+        transport.leave()
+        pair.hostService.didEnterBackground()
+        await pair.hostService.resumeAfterSuspend()
+        XCTAssertEqual(transport.hostAttempts, 4)
+        XCTAssertNil(pair.hostService.session)
+        XCTAssertNotNil(pair.hostService.state.message)
+        XCTAssertNoThrow(try pair.host.app.workspace.content(Fixtures.docID))
+    }
+
     func testHostSuspendThenGuestsRejoinWithoutApproval() async throws {
         let pair = CollabPair()
         pair.guestService.timing.retryDelays = [0.2, 0.4, 0.8, 1.6, 3.2]
@@ -739,6 +961,8 @@ final class FeatCollabTests: XCTestCase {
         pair.hostTransport.leave()
         XCTAssertEqual(pair.guestService.session?.phase, .reconnecting)
         try await pair.host.insert([CollabPair.stroke("HOSTAWAY0001", x: 90)])
+        XCTAssertEqual(pair.hostService.session?.phase, .active)
+        XCTAssertEqual(pair.hostService.session?.hasUnsentChanges, true)
 
         // Back in the foreground the host advertises again, and the guest re-joins with its secret.
         await pair.hostService.resumeAfterSuspend()
