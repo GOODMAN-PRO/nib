@@ -166,6 +166,108 @@ final class NibContractsTests: XCTestCase {
                 }
             }
         }
+
+        // Persistence and sync can supply legacy keys: retaining one must not lock the record against edits/deletion.
+        for key in ["0", "00", "_", "V0", "V00000", "W000010", "A-B", "é"] {
+            for batch in [false, true] {
+                let legacy = Harness()
+                var content = try XCTUnwrap(legacy.persistence.heads[Fixtures.docID])
+                var page = try XCTUnwrap(content.pages.first { $0.id == Fixtures.page2 })
+                page.order = key
+                content.pages = content.pages.map { $0.id == page.id ? page : $0 }
+                var block = TextBlock(kind: .paragraph, order: key)
+                var card = StudyCard(front: CardFace(), back: CardFace(), order: key)
+                var entry = OutlineEntry(title: "Legacy", page: nil, order: key)
+                content.blocks.append(block)
+                content.cards.append(card)
+                content.outline.append(entry)
+                legacy.persistence.heads[Fixtures.docID] = content
+                var items = try XCTUnwrap(legacy.persistence.pageItems[Fixtures.docID]?[Fixtures.page1])
+                let index = try XCTUnwrap(items.firstIndex { $0.id == Fixtures.textID })
+                items[index].z = key
+                var item = items[index]
+                legacy.persistence.pageItems[Fixtures.docID, default: [:]][Fixtures.page1] = items
+                let legacyContext = try await probeContext(legacy)
+
+                item.locked = true
+                try legacyContext.mutate { tx in
+                    if batch {
+                        try tx.put([item], doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put([page], doc: Fixtures.docID)
+                        try tx.put([block], doc: Fixtures.docID)
+                        try tx.put([card], doc: Fixtures.docID)
+                        try tx.put([entry], doc: Fixtures.docID)
+                    } else {
+                        try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put(page, doc: Fixtures.docID)
+                        try tx.put(block, doc: Fixtures.docID)
+                        try tx.put(card, doc: Fixtures.docID)
+                        try tx.put(entry, doc: Fixtures.docID)
+                    }
+                }
+                XCTAssertTrue(try legacy.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: item.id).locked)
+                XCTAssertEqual(try legacy.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: item.id).z, key)
+
+                let unchanged = try legacy.snapshot()
+                for kind in 0..<5 {
+                    XCTAssertThrowsError(try legacyContext.mutate { tx -> Void in
+                        switch kind {
+                        case 0:
+                            var changed = item; changed.z = "bad-key"
+                            if batch { try tx.put([item, changed], doc: Fixtures.docID, page: Fixtures.page1) }
+                            else { try tx.put(changed, doc: Fixtures.docID, page: Fixtures.page1) }
+                        case 1:
+                            var changed = page; changed.order = "bad-key"
+                            if batch { try tx.put([page, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        case 2:
+                            var changed = block; changed.order = "bad-key"
+                            if batch { try tx.put([block, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        case 3:
+                            var changed = card; changed.order = "bad-key"
+                            if batch { try tx.put([card, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        default:
+                            var changed = entry; changed.order = "bad-key"
+                            if batch { try tx.put([entry, changed], doc: Fixtures.docID) }
+                            else { try tx.put(changed, doc: Fixtures.docID) }
+                        }
+                    }) { error in
+                        XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+                    }
+                    XCTAssertEqual(try legacy.snapshot(), unchanged)
+                }
+
+                page.deleted = true
+                block.deleted = true
+                card.deleted = true
+                entry.deleted = true
+                try legacyContext.mutate { tx in
+                    if batch {
+                        try tx.delete(items: [item.id], doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put([page], doc: Fixtures.docID)
+                        try tx.put([block], doc: Fixtures.docID)
+                        try tx.put([card], doc: Fixtures.docID)
+                        try tx.put([entry], doc: Fixtures.docID)
+                    } else {
+                        try tx.delete(item: item.id, doc: Fixtures.docID, page: Fixtures.page1)
+                        try tx.put(page, doc: Fixtures.docID)
+                        try tx.put(block, doc: Fixtures.docID)
+                        try tx.put(card, doc: Fixtures.docID)
+                        try tx.put(entry, doc: Fixtures.docID)
+                    }
+                }
+                let storedItems = try legacy.app.workspace.allItems(Fixtures.docID, page: Fixtures.page1)
+                XCTAssertEqual(storedItems.first { $0.id == item.id }?.deleted, true)
+                XCTAssertEqual(storedItems.first { $0.id == item.id }?.z, key)
+                let stored = try legacy.app.workspace.content(Fixtures.docID)
+                XCTAssertEqual(stored.pages.first { $0.id == page.id }?.deleted, true)
+                XCTAssertEqual(stored.blocks.first { $0.id == block.id }?.deleted, true)
+                XCTAssertEqual(stored.cards.first { $0.id == card.id }?.deleted, true)
+                XCTAssertEqual(stored.outline.first { $0.id == entry.id }?.deleted, true)
+            }
+        }
     }
 
     func testSelectiveRevertSkipsLaterEdits() async throws {
