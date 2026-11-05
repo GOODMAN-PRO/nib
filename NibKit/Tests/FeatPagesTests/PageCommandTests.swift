@@ -105,6 +105,23 @@ final class PageCommandTests: XCTestCase {
         }
     }
 
+    func testAddInsideATieRunWithDuplicateLegacyIDsDoesNotTrap() async throws {
+        let h = harness()
+        let content = DocumentContent(meta: DocumentMeta(id: "LEGACY", kind: .notebook), pages: [
+            PageRecord(id: "A", order: "A"), PageRecord(id: "B", order: "V"),
+            PageRecord(id: "B", order: "V"), PageRecord(id: "C", order: "V"),
+            PageRecord(id: "D", order: "V1")
+        ])
+        _ = try h.library.createDocument(content, title: "Legacy duplicate ids", in: nil)
+        let result = try await h.run("page.add", ["doc": "doc:LEGACY", "position": "after",
+            "anchor": "page:LEGACY/B", "id": "NEW"])
+        XCTAssertEqual(refs(result), ["page:LEGACY/NEW"])
+        let pages = try h.app.workspace.content("LEGACY").livePages
+        XCTAssertEqual(pages.count, content.pages.count + 1)
+        XCTAssertEqual(pages.filter { $0.id == "B" }.count, 2)
+        XCTAssertEqual(pages.filter { $0.id == "NEW" }.count, 1)
+    }
+
     func testDuplicatePasteAndReorderAlsoSplitTiedNeighbours() async throws {
         for command in ["page.duplicate", "page.paste", "page.reorder"] {
             let h = harness()
@@ -267,6 +284,31 @@ final class PageCommandTests: XCTestCase {
         XCTAssertTrue(copied.contains(try XCTUnwrap(connector.to.item)))
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try livePageIDs(h), ["FIXTUREPG001", "FIXTUREPG002", "FIXTUREPG003"])
+    }
+
+    func testBatchDuplicateKeepsEachDocumentsPlacementAfterRekeying() async throws {
+        let h = harness()
+        try makeTiedNotebook(h)
+        try makeNotebook(h, id: "OTHER", page: "ONLY")
+        let before = try h.snapshot("TIES")
+        let otherBefore = try h.snapshot("OTHER")
+        let params: JSONValue = ["pages": ["page:TIES/B", "page:OTHER/ONLY", "page:TIES/C", "page:TIES/A"],
+                                 "ids": ["COPYB", "COPYONLY", "COPYC", "COPYA"]]
+        _ = try await h.app.bus.execute(Invocation(command: "page.duplicate", params: params, dryRun: true))
+        XCTAssertEqual(try h.snapshot("TIES"), before)
+        XCTAssertEqual(try h.snapshot("OTHER"), otherBefore)
+        XCTAssertEqual(h.undoDepth("TIES"), 0)
+        XCTAssertEqual(h.undoDepth("OTHER"), 0)
+        _ = try await h.run("page.duplicate", params)
+        let expected = ["A", "COPYA", "B", "COPYB", "C", "COPYC", "D"]
+        XCTAssertEqual(try livePageIDs(h, "TIES"), expected)
+        XCTAssertEqual(try livePageIDs(h, "OTHER"), ["ONLY", "COPYONLY"])
+        let pages = try h.app.workspace.content("TIES").livePages
+        XCTAssertEqual(Set(pages.map { $0.order }).count, pages.count)
+        XCTAssertTrue(h.app.bus.undo("TIES"))
+        XCTAssertEqual(try h.snapshot("TIES"), before)
+        XCTAssertTrue(h.app.bus.redo("TIES"))
+        XCTAssertEqual(try livePageIDs(h, "TIES"), expected)
     }
 
     // MARK: page.copy / page.paste

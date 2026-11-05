@@ -138,7 +138,7 @@ struct PageAdd: NibCommand {
         try NewPageIDs.checkUnused(ids, in: current)
         let placement = OrderKeys.plan(position, anchor: anchor, count: specs.count, in: current.livePages)
         let keys = placement.keys
-        let rekeyed = Dictionary(uniqueKeysWithValues: placement.rekeyed.map { ($0.id, $0) })
+        let rekeyed = Dictionary(placement.rekeyed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let placedPages = current.livePages.map { rekeyed[$0.id] ?? $0 }
         var records: [PageRecord] = []
         for (i, spec) in specs.enumerated() {
@@ -287,11 +287,13 @@ struct PageDuplicate: NibCommand {
         let ids = try NewPageIDs.parse(id: nil, ids: p.ids, count: targets.count)
         var plan: [(doc: DocumentID, source: PageRecord, copy: PageRecord)] = []
         var contents: [DocumentID: DocumentContent] = [:]
+        var liveByDocument: [DocumentID: [PageRecord]] = [:]
         for (i, t) in targets.enumerated() {
             let content = try contents[t.doc] ?? PageArgs.pagedContent(t.doc, ctx, path: "$.pages[\(i)]")
             contents[t.doc] = content
             try NewPageIDs.checkUnused([ids[i]], in: content, path: "$.ids[\(i)]")
-            let live = content.livePages
+            let live = liveByDocument[t.doc] ?? content.livePages
+            liveByDocument[t.doc] = live
             guard let at = live.firstIndex(where: { $0.id == t.page }) else { throw PageArgs.notLive(t.page, path: "$.pages[\(i)]") }
             // Resolve the order inside the transaction, after any preceding copies/re-keying.
             let copy = PageFactory.copy(of: live[at], id: ids[i] ?? NibID.make(), order: "")
@@ -299,13 +301,21 @@ struct PageDuplicate: NibCommand {
         }
         try ctx.mutate { tx in
             for entry in plan {
-                let placement = OrderKeys.plan(.after, anchor: entry.source.id, count: 1,
-                                               in: try tx.content(entry.doc).livePages)
-                try tx.put(placement.rekeyed, doc: entry.doc)
+                var live = liveByDocument[entry.doc] ?? []
+                let placement = OrderKeys.plan(.after, anchor: entry.source.id, count: 1, in: live)
+                if !placement.rekeyed.isEmpty {
+                    let rekeyed = try tx.put(placement.rekeyed, doc: entry.doc)
+                    let byID = Dictionary(rekeyed.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                    live = live.map { byID[$0.id] ?? $0 }
+                }
                 var copy = entry.copy
                 copy.order = placement.keys[0]
                 let original = try tx.items(entry.doc, page: entry.source.id)
                 try PageWriter.insert([(copy, ItemCloner.clone(original, freshIDs: true))], doc: entry.doc, tx: tx)
+                // Preserve the sorted snapshot for the next copy without sorting every page again.
+                let at = live.firstIndex(where: { $0.id == entry.source.id }).map { $0 + 1 } ?? live.count
+                live.insert(copy, at: at)
+                liveByDocument[entry.doc] = live
             }
         }
         return Output(refs: plan.map { NodeRef.page($0.doc, $0.copy.id).description })
@@ -747,11 +757,14 @@ struct PageRestore: NibCommand {
         try ctx.mutate { tx in
             for r in records {
                 var page = r.page
-                let live = try tx.content(r.doc).livePages
-                if let collision = live.last(where: { $0.order == page.order }) {
+                let content = try tx.content(r.doc)
+                // Only sort when a collision needs neighbouring keys; match livePages' id tie-break.
+                if let collision = content.pages.lazy.filter({ !$0.deleted && $0.order == page.order })
+                    .max(by: { $0.id.raw < $1.id.raw }) {
+                    let live = content.livePages
                     // Earlier restores in this same transaction also occupy their new keys.
                     let placement = OrderKeys.plan(.after, anchor: collision.id, count: 1, in: live)
-                    try tx.put(placement.rekeyed, doc: r.doc)
+                    if !placement.rekeyed.isEmpty { try tx.put(placement.rekeyed, doc: r.doc) }
                     page.order = placement.keys[0]
                 }
                 try tx.put(page, doc: r.doc)
@@ -1130,11 +1143,11 @@ enum OrderKeys {
                 at = position == .before ? i : i + 1
             } else { at = pages.count }
         }
-        let low = at > 0 ? pages[at - 1].order : nil
-        let high = at < pages.count ? pages[at].order : nil
-        guard let low, let high, low == high else {
-            let keys = count == 1 ? [FractionalIndex.between(low, high)]
-                : FractionalIndex.balanced(count: count, after: low, before: high)
+        let lowKey = at > 0 ? pages[at - 1].order : nil
+        let highKey = at < pages.count ? pages[at].order : nil
+        guard let low = lowKey, let high = highKey, low == high else {
+            let keys = count == 1 ? [FractionalIndex.between(lowKey, highKey)]
+                : FractionalIndex.balanced(count: count, after: lowKey, before: highKey)
             return (keys, [])
         }
         var start = at - 1
