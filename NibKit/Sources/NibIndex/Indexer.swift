@@ -970,6 +970,8 @@ final class Indexer {
         rebuildGeneration &+= 1
         sweepTask?.cancel()
         while let key = inFlight.keys.first { await waitForUnit(key) }
+        // An explicit rebuild is also the retry path for unchanged packages that previously failed to read.
+        unreadableDocuments.removeAll()
         try db.removeAll()
         itemCache.removeAll()
         itemCacheOrder.removeAll()
