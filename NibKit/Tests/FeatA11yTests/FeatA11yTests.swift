@@ -2,6 +2,7 @@ import XCTest
 import SwiftUI
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatA11y
 
 @MainActor
@@ -62,7 +63,7 @@ final class FeatA11yTests: XCTestCase {
         XCTAssertEqual(key?.shortcut, KeyShortcut("i", [.command, .option]))
         XCTAssertEqual(key?.params["id"]?.stringValue, PageContentsChrome.panelID)
         XCTAssertEqual(key?.docKinds, [.notebook, .whiteboard])
-        XCTAssertNotNil(h.app.ui.settingsPages.get(PageContentsChrome.settingsID))
+        XCTAssertEqual(h.app.ui.settingsPages.get(PageContentsChrome.settingsID)?.icon, NibSymbol.accessibility.name)
         XCTAssertEqual(h.app.settings.descriptor(A11ySettings.pageContentsTab.name)?.synced, false)
     }
 

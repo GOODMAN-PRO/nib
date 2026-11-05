@@ -82,6 +82,33 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertTrue(presenter.filesExistedDuringDelivery)
     }
 
+    func testExportRunOwnsOmissionToastForShareAndFiles() async throws {
+        for destination in ["share", "files"] {
+            for completed in [false, true] {
+                let (h, presenter, probe) = harness()
+                let host = AttachingExportHost()
+                h.session.floatingHost = host
+                let warning = "Export completed with omitted assets."
+                probe.warning = warning
+                probe.onExport = { host.postToast(warning, actionTitle: nil, action: nil) }
+                presenter.onDelivery = { _ in completed }
+                let result = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"],
+                    "destination": .string(destination)])
+                XCTAssertEqual(result["completed"], .bool(completed))
+                XCTAssertEqual(result["warning"], .string(warning))
+                XCTAssertEqual(host.toasts, [warning], "Delivery must not repeat or overwrite export.run's warning")
+            }
+        }
+    }
+
+    func testCompletedExportWithoutOmissionsStillPostsSuccess() async throws {
+        let (h, _, _) = harness()
+        let host = AttachingExportHost()
+        h.session.floatingHost = host
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"], "destination": "files"])
+        XCTAssertEqual(host.toasts.count, 1)
+    }
+
     func testOptionKeysAndExporterKindsCSVAndFolderZip() async throws {
         let (h, presenter, probe) = harness()
         _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC03"]])
@@ -145,6 +172,33 @@ final class FeatExportUITests: XCTestCase {
             XCTAssertLessThanOrEqual(size.height, NibMetrics.hitTarget + 1,
                                      "Format choices must not push selected boards below the popover viewport")
         }
+    }
+
+    func testPopoverDialogPinsPrimaryActionsBelowItsSingleOptionsScroller() async throws {
+        let (h, presenter, _) = harness()
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        let content = ExportDialog(selection: selection, printing: false, app: h.app, session: h.session,
+                                   dismiss: {}, draft: draft, scrollsOptions: true)
+            .environment(\.dynamicTypeSize, .large)
+            .ignoresSafeArea()
+        let host = UIHostingController(rootView: content)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 280, height: 432))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrolls(in view: UIView) -> [UIScrollView] {
+            ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrolls(in: $0) }
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let views = scrolls(in: host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
+        XCTAssertEqual(views.count, 1, "The popover must have exactly one vertical scroll owner")
+        let scroll = try XCTUnwrap(views.first)
+        let frame = scroll.convert(scroll.bounds, to: host.view)
+        XCTAssertGreaterThan(frame.height, NibMetrics.hitTarget)
+        XCTAssertLessThanOrEqual(frame.maxY, host.view.bounds.height - 2 * NibMetrics.hitTarget - NibSpacing.s,
+                                 "Share and Save to Files must remain below the options viewport")
     }
 
     func testBoardOptionsPresentBeforeFloatingAnchorAttaches() async throws {
@@ -628,6 +682,7 @@ final class FeatExportUITests: XCTestCase {
 
 @MainActor
 private final class AttachingExportHost: FloatingHosting {
+    var toasts: [String] = []
     var convertedRect: CGRect?
     var anchorID: String?
     private var contents: [String: AnyView] = [:]
@@ -641,7 +696,7 @@ private final class AttachingExportHost: FloatingHosting {
         return true
     }
     func removeAnchor(_ id: String) { if anchorID == id { anchorID = nil } }
-    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
 }
 
 @MainActor

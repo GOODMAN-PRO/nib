@@ -19,6 +19,7 @@ final class NibDesignV2Tests: XCTestCase {
         for symbol in NibSymbol.all {
             XCTAssertNotNil(NibSymbol(systemName: symbol.name), "\(symbol.name) is banned or missing on this OS")
             XCTAssertNotNil(UIImage(nib: symbol), symbol.name)
+            XCTAssertNotNil(UIImage(systemName: symbol.name), "Tokens must resolve without UIImage(nib:) fallback")
         }
     }
 
@@ -36,7 +37,7 @@ final class NibDesignV2Tests: XCTestCase {
 
     func testSettingsAndLessonTokensUseTheirOwnSemanticGlyphs() {
         let tokens: [(NibSymbol, String)] = [(.accessibility, "figure.stand"),
-                                            (.recordingSettings, "waveform.circle"), (.lesson, "play.rectangle")]
+                                            (.recordingSettings, "waveform.circle"), (.lesson, "graduationcap")]
         for (token, name) in tokens {
             XCTAssertEqual(token.name, name)
             XCTAssertTrue(NibSymbol.all.contains(token), "Include new tokens in the OS symbol-resolution test")
@@ -46,6 +47,7 @@ final class NibDesignV2Tests: XCTestCase {
         XCTAssertNotEqual(NibSymbol.recordingSettings, .transcript)
         XCTAssertNotEqual(NibSymbol.recordingSettings, .record)
         XCTAssertNotEqual(NibSymbol.lesson, .share)
+        XCTAssertNotEqual(NibSymbol.lesson, .present)
     }
 
     // MARK: Swatches

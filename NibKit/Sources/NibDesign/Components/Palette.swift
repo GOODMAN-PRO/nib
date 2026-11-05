@@ -6,8 +6,10 @@ import NibContracts
 enum NibPalettePresentation {
     static let anchorPrefix = "nib.palette.bounds."
 
-    static func showsOptions(settings: Bool, more: Bool, modal: Bool, optionsPopover: Bool) -> Bool {
-        !settings && !more && (!modal || optionsPopover)
+    static func showsOptions(settings: Bool, more: Bool, paletteID: String,
+                             openBudOwners: Set<String>, optionsPopover: Bool) -> Bool {
+        let paletteBud = openBudOwners.contains(paletteID) || openBudOwners.contains(paletteID + ".options")
+        return !settings && !more && (!paletteBud || optionsPopover)
     }
 }
 
@@ -503,6 +505,10 @@ public struct NibToolPalette<Settings: View>: View {
             let paletteFrame = CGRect(origin: CGPoint(x: c.x - size(d, a).width / 2 + origin.x,
                                                        y: c.y - size(d, a).height / 2 + origin.y), size: size(d, a))
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
+            let options = resolvedOptions(selection)
+            let showsOptions = NibPalettePresentation.showsOptions(settings: settingsOpen, more: moreOpen,
+                paletteID: id, openBudOwners: field?.openBudOwners ?? [],
+                optionsPopover: options?.popover?.isPresented.wrappedValue ?? false)
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
                     #if DEBUG
@@ -529,18 +535,18 @@ public struct NibToolPalette<Settings: View>: View {
                     moreGrid(a.more, anchor: slotAt(along), placement: placement(d), bounds: bounds)
                         .zIndex(moreOpen ? 1 : 0)
                 }
-                if let opts = resolvedOptions(selection), let along = map[selection] {
+                if let opts = options, let along = map[selection] {
                     // Share the palette's safe horizontal region, including a reserved trailing panel.
                     // Placement adds chromeInset itself, so expand that region by the inset first.
                     let optionsBounds = CGRect(x: r.minX - NibMetrics.chromeInset, y: bounds.minY,
                                                width: r.width + 2 * NibMetrics.chromeInset, height: bounds.height)
                     let available = placement(d).availableSize(beside: slotAt(along), gap: 0, in: optionsBounds)
-                    if NibPalettePresentation.showsOptions(settings: settingsOpen, more: moreOpen,
-                        modal: field?.hasOpenBud ?? false, optionsPopover: opts.popover?.isPresented.wrappedValue ?? false) {
+                    if showsOptions {
                         NibToolOptionsPlacement(containerSize: proxy.size, bounds: optionsBounds,
                                             anchor: slotAt(along), placement: placement(d)) {
                             NibToolOptionsBar(id: id + ".options", availableWidth: available.width) { opts.bar }
                         }
+                        .transition(.opacity)
                     }
                     if let pop = opts.popover {
                         // NibBudPopover works in container coordinates; this layer starts at `origin` in them.
@@ -553,6 +559,8 @@ public struct NibToolPalette<Settings: View>: View {
                 }
             }
             .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
+            .animation(reduceMotion || liquidMode == .off ? nil : NibMotion.fade,
+                       value: showsOptions)
             .onChange(of: paletteFrame, initial: true) { _, frame in
                 field?.setWorldAnchor(NibPalettePresentation.anchorPrefix + id, frame)
             }

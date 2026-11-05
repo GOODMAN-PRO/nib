@@ -11,34 +11,68 @@ public struct NibPopoverPanel<Content: View>: View {
     let width: CGFloat
     let content: Content
     let maxHeight: CGFloat
+    let onClose: (() -> Void)?
+    let scrollsContent: Bool
     @State private var contentHeight: CGFloat = NibMetrics.popoverMaxHeight
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.nibBud) private var bud
 
     public init(title: String, subtitle: String? = nil, width: CGFloat = NibMetrics.popoverWidth,
-                maxHeight: CGFloat = NibMetrics.popoverMaxHeight, @ViewBuilder content: () -> Content) {
+                maxHeight: CGFloat = NibMetrics.popoverMaxHeight, onClose: (() -> Void)? = nil,
+                scrollsContent: Bool = true, @ViewBuilder content: () -> Content) {
         self.title = title
         self.subtitle = subtitle
         self.width = width
         self.maxHeight = maxHeight
+        self.onClose = onClose
+        self.scrollsContent = scrollsContent
         self.content = content()
     }
 
     public var body: some View {
         let isPresented = bud?.isPresented.wrappedValue ?? true
+        Group {
+            if scrollsContent {
+                scrollingContent(isPresented: isPresented)
+            } else {
+                // The caller owns one bounded scroller and may pin actions below it.
+                VStack(alignment: .leading, spacing: NibSpacing.m) {
+                    header
+                    content
+                }
+                .padding(NibSpacing.l)
+                .frame(width: min(width, viewport.width))
+                .frame(height: min(maxHeight, NibMetrics.popoverMaxHeight, viewport.height))
+            }
+        }
+        .scrollDisabled(!isPresented)
+        .allowsHitTesting(isPresented)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
+        .accessibilityHidden(!isPresented)
+    }
+
+    private var header: some View {
+        HStack(alignment: onClose == nil ? .firstTextBaseline : .center) {
+            Text(title)
+                .font(NibFont.headline)
+                .foregroundStyle(NibColor.label)
+            Spacer(minLength: NibSpacing.s)
+            if let subtitle {
+                Text(subtitle)
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.labelSecondary)
+            }
+            if let onClose {
+                NibIconButton(.xmark, label: String(localized: "Close", bundle: .module), size: .round, action: onClose)
+            }
+        }
+    }
+
+    private func scrollingContent(isPresented: Bool) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.m) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(title)
-                        .font(NibFont.headline)
-                        .foregroundStyle(NibColor.label)
-                    Spacer(minLength: NibSpacing.s)
-                    if let subtitle {
-                        Text(subtitle)
-                            .font(NibFont.footnote)
-                            .foregroundStyle(NibColor.labelSecondary)
-                    }
-                }
+                header
                 content
             }
             .padding(NibSpacing.l)
@@ -66,9 +100,6 @@ public struct NibPopoverPanel<Content: View>: View {
         .nibFadeBottomEdge()
         .scrollIndicators(.visible)
         .scrollIndicatorsFlash(trigger: isPresented)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(title)
-        .accessibilityHidden(!isPresented)
     }
 
     private var viewport: CGSize {
@@ -235,6 +266,11 @@ public struct NibBudPopover<Content: View>: View {
     let subtitle: String?
     let width: CGFloat
     let placement: NibBudPlacement
+    let sourceRect: CGRect?
+    let fallbackSourceRect: CGRect?
+    let instant: Bool
+    let onClose: (() -> Void)?
+    let scrollsContent: Bool
     let content: Content
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -242,6 +278,8 @@ public struct NibBudPopover<Content: View>: View {
 
     public init(id: String, source: String, isPresented: Binding<Bool>, title: String, subtitle: String? = nil,
                 width: CGFloat = NibMetrics.popoverWidth, placement: NibBudPlacement = .below,
+                sourceRect: CGRect? = nil, fallbackSourceRect: CGRect? = nil, instant: Bool = false,
+                onClose: (() -> Void)? = nil, scrollsContent: Bool = true,
                 @ViewBuilder content: () -> Content) {
         self.id = id
         self.source = source
@@ -250,13 +288,19 @@ public struct NibBudPopover<Content: View>: View {
         self.subtitle = subtitle
         self.width = width
         self.placement = placement
+        self.sourceRect = sourceRect
+        self.fallbackSourceRect = fallbackSourceRect
+        self.instant = instant
+        self.onClose = onClose
+        self.scrollsContent = scrollsContent
         self.content = content()
     }
 
     public var body: some View {
         GeometryReader { proxy in
             let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
-            let sourceAnchor = field?.anchorRect(source) ?? .zero
+            let sourceAnchor = NibBudSource.resolve(explicit: sourceRect, registered: field?.anchorRect(source),
+                                                   fallback: fallbackSourceRect)
             let frame = proxy.frame(in: NibLiquid.space)
             let safe = proxy.safeAreaInsets
             let bounds = CGRect(x: frame.minX + safe.leading, y: frame.minY + safe.top,
@@ -269,14 +313,21 @@ public struct NibBudPopover<Content: View>: View {
                                 height: min(size.height, layout.available.height))
             let centre = placement.centre(size: fitted, beside: layout.anchor, gap: gap, in: bounds)
             NibPopoverPanel(title: title, subtitle: subtitle, width: layout.available.width,
-                            maxHeight: layout.available.height) { content }
+                            maxHeight: layout.available.height, onClose: onClose, scrollsContent: scrollsContent) { content }
                 .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
                 .droplet(id, style: .popover)
-                .budsFrom(source, isPresented: $isPresented)
+                .budsFrom(source, isPresented: $isPresented, instant: instant)
                 .position(x: centre.x - frame.minX, y: centre.y - frame.minY)
         }
         .allowsHitTesting(isPresented)
         .accessibilityHidden(!isPresented)
+    }
+}
+
+enum NibBudSource {
+    /// Explicit and fallback rectangles use NibLiquid.space, just like registered anchors.
+    static func resolve(explicit: CGRect?, registered: CGRect?, fallback: CGRect?) -> CGRect {
+        explicit ?? registered ?? fallback ?? .zero
     }
 }
 

@@ -183,6 +183,25 @@ final class ShippingPolishTests: XCTestCase {
         }
     }
 
+    func testPageSwitcherLabelsFitAt240PointsBeforeTruncation() {
+        let sizing = NibSegmentedControl<String>.Sizing.fitting
+        // SidebarHost has 4 pt outer insets; the track has 2 pt inner insets.
+        let labelWidth = (240 - 2 * NibSpacing.xs - 4) / 3 - 2 * sizing.labelPadding
+        let font = UIFont.preferredFont(forTextStyle: .footnote,
+                                       compatibleWith: UITraitCollection(preferredContentSizeCategory: .large))
+        let selected = UIFont(descriptor: font.fontDescriptor.withSymbolicTraits(.traitBold)!, size: font.pointSize)
+        for label in ["Pages", "Outline", "Bookmarks"] {
+            for face in [font, selected] {
+                let width = (label as NSString).size(withAttributes: [.font: face]).width
+                XCTAssertLessThanOrEqual(width * sizing.minimumLabelScale, labelWidth,
+                                         "\(label) must fit even when selected")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(sizing.minimumLabelScale, 0.85)
+        XCTAssertEqual(NibSegmentedControl<String>.Sizing.intrinsic.labelPadding, NibSpacing.m)
+        XCTAssertEqual(NibSegmentedControl<String>.Sizing.intrinsic.minimumLabelScale, 1)
+    }
+
     func testPanelHeaderPreservesLongProviderAndKeyInformation() {
         let header = NibPanelHeader(title: "Assistant",
             subtitle: "OpenAI-compatible provider · Local language model · API key is not configured",

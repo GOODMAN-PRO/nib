@@ -38,7 +38,7 @@ enum PageContentsChrome {
         app.content.keyCommands.register(key)
 
         var page = SettingsPageDescriptor(
-            id: settingsID, title: String(localized: "Accessibility"), icon: NibSymbol.speak.name, section: .general,
+            id: settingsID, title: String(localized: "Accessibility"), icon: NibSymbol.accessibility.name, section: .general,
             order: 250, owner: owner, makeView: { app in AnyView(A11ySettingsPage(app: app)) })
         page.keywords = [String(localized: "VoiceOver"), String(localized: "Page Contents"), String(localized: "Language"),
                          String(localized: "Localisation"), String(localized: "Larger Text"),

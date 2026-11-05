@@ -2,10 +2,17 @@ import XCTest
 import AVFoundation
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatTranscription
 
 @MainActor
 final class FeatTranscriptionTests: XCTestCase {
+    func testRecordingSettingsUsesRecordingGlyphWhileTranscriptKeepsCaptions() {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        XCTAssertEqual(h.app.ui.settingsPages.get("transcription.recording")?.icon, NibSymbol.recordingSettings.name)
+        XCTAssertEqual(h.app.ui.panels.get(FeatTranscriptionFeature.panelID)?.icon, NibSymbol.transcript.name)
+    }
+
     private let ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
     func testDeletingRecordingClearsPreviouslyReportedErrorForSubscribers() async throws {
