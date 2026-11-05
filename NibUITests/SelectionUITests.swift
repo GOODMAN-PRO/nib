@@ -142,7 +142,7 @@ final class SelectionUITests: XCTestCase {
         try XCTUnwrap(candidates.min { abs($0.frame.midX - copy.frame.midX) < abs($1.frame.midX - copy.frame.midX) },
                       "F013: selection must offer More extensions").tap()
     }
-    private func menu(_ path: String...) throws { try objectMore(); for label in path { try tap(label) } }
+    private func menu(_ path: String...) throws { try objectMore(); for label in path { try tap(label, scroll: true) } }
     private func pageMenu(at point: CGPoint = CGPoint(x: 0.65, y: 0.82)) throws {
         try ui.selectTool("lasso")
         ui.coordinate(point).press(forDuration: 1.0)
@@ -1126,7 +1126,7 @@ final class SelectionUITests: XCTestCase {
         defer { provider.stop() }
         try wait("The local Assistant provider fixture must start") { provider.port != nil }
         try settings(); try tap("AI", scroll: true); try tap("Add provider", scroll: true)
-        try tap("Preset"); try tap("Custom OpenAI-compatible")
+        try tap("Preset", scroll: true); try tap("Custom OpenAI-compatible", scroll: true)
         for (label, value) in [("Name", "Selection fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider.port))/v1"),
                                ("Chat model", "selection-fixture")] {

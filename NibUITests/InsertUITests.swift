@@ -183,9 +183,9 @@ final class InsertUITests: XCTestCase {
         }
         try XCTUnwrap(buttons.min { abs($0.frame.midX - copy.frame.midX) < abs($1.frame.midX - copy.frame.midX) }, "Object menu must expose More").tap()
     }
-    private func menu(_ path: String...) throws { try more(); for name in path { try tap(name) } }
+    private func menu(_ path: String...) throws { try more(); for name in path { try tap(name, scroll: true) } }
     private func pageMenu() throws { try ui.selectTool("lasso"); ui.coordinate(point).press(forDuration: 1) }
-    private func documentMenu(_ name: String) throws { try tap("menu.more"); try tap(name) }
+    private func documentMenu(_ name: String) throws { try tap("menu.more"); try tap(name, scroll: true) }
     private func goToSecondPage() throws {
         let original = try ui.state().page
         try ui.chord("g", [.command, .option]) { try self.ui.waitForState { $0.openPanels.contains("pages.goToPage") } }
@@ -425,8 +425,8 @@ final class InsertUITests: XCTestCase {
     }
     func testNamedStyleAndDefaultAffectNewText() throws {
         try beginText("First"); try key("a"); try tap("Larger Text"); try tap("More Formatting")
-        try tap("Save Style…"); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
-        try tap("Lab Caption"); try tap("Set as Default for New Text"); outside(); try finish()
+        try tap("Save Style…", scroll: true); try replace(try control("Name", .textField), with: "Lab Caption"); try tap("Save")
+        try tap("Lab Caption", scroll: true); try tap("Set as Default for New Text", scroll: true); outside(); try finish()
         let first = try snapshot("text")
         outside(); try ui.selectTool("text"); ui.coordinate(CGPoint(x: 0.58, y: 0.82)).tap()
         try control("Text box", .textView).typeText("Second"); try finish()
@@ -670,7 +670,7 @@ final class InsertUITests: XCTestCase {
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
         try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("AI", scroll: true); try tap("Add provider", scroll: true)
-        try tap("Preset"); try tap("Custom OpenAI-compatible")
+        try tap("Preset", scroll: true); try tap("Custom OpenAI-compatible", scroll: true)
         for (label, value) in [("Name", "Insert fixture"),
                                ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
                                ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")] {
@@ -1335,7 +1335,7 @@ final class InsertUITests: XCTestCase {
             try self.wait("Seek reaches one quarter") { guard let t = try? self.playbackTimes() else { return false }; return abs(t.position - t.duration * 0.25) < 1.5 }
         }
         for speed in ["0.5×", "2×", "1×"] {
-            try tap("Playback Options"); try tap("Speed"); try tap(speed)
+            try tap("Playback Options"); try tap("Speed", scroll: true); try tap(speed, scroll: true)
             XCTAssertTrue((try control("Playback Options").value as? String)?.contains(speed) == true)
         }
         try tap("Playback Options"); try tap("Skip Silence")
