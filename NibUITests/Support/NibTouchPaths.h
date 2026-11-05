@@ -2,6 +2,9 @@
 NS_ASSUME_NONNULL_BEGIN
 /// XCTest runner SPI, isolated here because the public API has no continuous polyline or two-finger pan.
 @interface NibTouchPaths : NSObject
++ (NSArray<NSString *> *)selectorNamesForClassNamed:(NSString *)name NS_SWIFT_NAME(selectorNames(forClassNamed:));
++ (void)sendKey:(NSString *)key modifiers:(NSUInteger)flags route:(NSInteger)route
+     completion:(void (^)(NSError * _Nullable))completion NS_SWIFT_NAME(sendKey(_:modifiers:route:completion:));
 + (void)typeKey:(NSString *)key modifiers:(NSUInteger)flags
      completion:(void (^)(NSError * _Nullable))completion NS_SWIFT_NAME(typeKey(_:modifiers:completion:));
 + (void)perform:(NSArray<NSArray<NSValue *> *> *)paths duration:(NSTimeInterval)duration

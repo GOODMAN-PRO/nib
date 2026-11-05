@@ -53,6 +53,7 @@ final class QAStateProbe: UIView {
                 "keyResponder": keyResponder,
                 "keyResponderIsText": keyResponderIsText,
                 "keyLog": .array(NibUITestKeyLog.recent.map(JSONValue.string)),
+                "keyLogTotal": .number(Double(NibUITestKeyLog.total)),
                 "screen": .string(UITestFixture.failure != nil ? "fixtureError" : !UITestFixture.isReady ? "loading" : doc == nil ? "library" : "document"),
                 "document": doc.map { .string($0.raw) } ?? .null,
                 "page": doc == nil ? .null : session.page.map { .string($0.raw) } ?? .null,
@@ -206,10 +207,19 @@ final class QAClipboardProbe: UIView {
 /// responder or key command sees it.
 final class QAKeyLogWindow: UIWindow {
     override func sendEvent(_ event: UIEvent) {
-        if let presses = event as? UIPressesEvent {
+        if NibUITestMode.isEnabled, let presses = event as? UIPressesEvent {
+            // Keep began events only: release chatter would halve the useful 24-note history.
             for press in presses.allPresses where press.phase == .began {
-                guard let key = press.key else { continue }
-                NibUITestKeyLog.note("window press '\(key.charactersIgnoringModifiers)' code \(key.keyCode.rawValue) flags \(key.modifierFlags.rawValue) keyWindow \(isKeyWindow)")
+                let note: String
+                if let key = press.key {
+                    note = "window press '\(key.charactersIgnoringModifiers)' code \(key.keyCode.rawValue) flags \(key.modifierFlags.rawValue) keyWindow \(isKeyWindow)"
+                } else {
+                    note = "window press nil type \(press.type.rawValue) phase began"
+                }
+                NibUITestKeyLog.note(note)
+                #if DEBUG
+                NSLog("%@", "[Nib QA key] " + note)
+                #endif
             }
         }
         super.sendEvent(event)
