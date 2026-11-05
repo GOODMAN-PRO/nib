@@ -35,25 +35,25 @@ struct WebDAVConfiguration: Equatable {
     var credentialsMissing: Bool { !user.isEmpty && (password ?? "").isEmpty }
 
     /// Parses and normalises a server URL: http(s) only, a host, no query or fragment, and a trailing slash.
-    static func normalizeServerURL(_ string: String) throws -> URL {
+    static func normalizeServerURL(_ string: String, bundle: Bundle = .main) throws -> URL {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: trimmed), let scheme = components.scheme?.lowercased(),
               scheme == "https" || scheme == "http" else {
-            throw NibError(.invalidParams, String(localized: "'\(trimmed)' is not an http or https URL"), path: "$.url",
-                           hint: String(localized: "Enter the server's WebDAV address, for example https://dav.example.com/remote.php/dav/files/alex/"))
+            throw NibError(.invalidParams, String(localized: "'\(trimmed)' is not an http or https URL", bundle: bundle), path: "$.url",
+                           hint: String(localized: "Enter the server's WebDAV address, for example https://dav.example.com/remote.php/dav/files/alex/", bundle: bundle))
         }
         guard let host = components.host, !host.isEmpty else {
-            throw NibError(.invalidParams, String(localized: "The WebDAV URL has no host."), path: "$.url")
+            throw NibError(.invalidParams, String(localized: "The WebDAV URL has no host.", bundle: bundle), path: "$.url")
         }
         guard components.user == nil, components.password == nil else {
-            throw NibError(.invalidParams, String(localized: "Enter the user name in the User field."), path: "$.url",
-                           hint: String(localized: "Enter the password in Settings › WebDAV. It is kept in the Keychain."))
+            throw NibError(.invalidParams, String(localized: "Enter the user name in the User field.", bundle: bundle), path: "$.url",
+                           hint: String(localized: "Enter the password in Settings › WebDAV. It is kept in the Keychain.", bundle: bundle))
         }
         components.scheme = scheme
         components.query = nil
         components.fragment = nil
         if !components.percentEncodedPath.hasSuffix("/") { components.percentEncodedPath += "/" }
-        guard let url = components.url else { throw NibError(.invalidParams, String(localized: "Invalid WebDAV URL."), path: "$.url") }
+        guard let url = components.url else { throw NibError(.invalidParams, String(localized: "Invalid WebDAV URL.", bundle: bundle), path: "$.url") }
         return url
     }
 

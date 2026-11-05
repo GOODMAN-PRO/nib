@@ -5,6 +5,33 @@ import NibTesting
 
 @MainActor
 final class PackageImportServiceTests: XCTestCase {
+    func testTreeCancellationKeepsCompletedImportsAndStopsWithoutSkippedEntries() async throws {
+        let h = Harness(features: [FeatImportFeature.self])
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for name in ["1.nibnote", "2.nibnote", "3.nibnote"] {
+            try FileManager.default.createDirectory(at: directory.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        var calls = 0
+        let importer: PackageImporter.PackageImport = { _, _, _ in
+            calls += 1
+            if calls == 2 { throw CancellationError() }
+            return "IMPORTED"
+        }
+        h.app.services.set(importer as AnyObject, for: PackageImporter.packageImportKey)
+        h.app.commands.register(CommandDescriptor(id: "test.packageCancellation", title: "Import", summary: "Exercise cancelled tree imports.",
+            effect: .library, target: .library)) { _, ctx in
+            let report = ImportReport()
+            let contents = await PackageImporter.importContents(of: directory, into: nil, ctx: ctx,
+                library: h.library, report: report, prefix: "", top: true)
+            XCTAssertEqual(contents, ["IMPORTED"])
+            XCTAssertEqual(calls, 2, "cancellation must not attempt the remaining package")
+            XCTAssertTrue(report.skipped.isEmpty, "cancellation is not a damaged or unsupported entry")
+            return .null
+        }
+        _ = try await h.run("test.packageCancellation")
+    }
+
     func testPackageAndArchiveContentsUseTheAwaitedLibraryService() async throws {
         let h = Harness(features: [FeatImportFeature.self])
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

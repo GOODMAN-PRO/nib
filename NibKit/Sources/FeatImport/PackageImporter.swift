@@ -142,12 +142,13 @@ enum PackageImporter {
     /// files through the registry (runs of images become one notebook). Nothing is thrown: every entry that could not
     /// be imported goes into `report` under its path (`prefix` + the path inside `dir`, "Notes.zip › Chemistry/a.key"),
     /// with the folders used (created, or existing ones with the same name; `top` when they sit right in the
-    /// destination) and any conversion.
+    /// destination) and any conversion. Cancellation stops traversal and returns documents already imported.
     static func importContents(of dir: URL, into folder: FolderID?, ctx: CommandContext, library: LibraryService,
                                report: ImportReport, prefix: String, top: Bool, depth: Int = 0) async -> [DocumentID] {
         var docs: [DocumentID] = []
         var files: [(url: URL, isDirectory: Bool)] = []
         for entry in ArchiveIO.visibleEntries(of: dir) {
+            guard !Task.isCancelled else { return docs }
             let name = entry.url.lastPathComponent
             do {
                 if entry.isDirectory && isPackage(entry.url) {
@@ -165,11 +166,13 @@ enum PackageImporter {
                     files.append(entry)
                 }
             } catch {
+                if error is CancellationError { return docs }
                 report.skip(prefix + name, error)
                 importLog.error("skipped \(name, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
         for group in ImportEngine.groups(files, content: ctx.content) {
+            guard !Task.isCancelled else { return docs }
             let urls = group.indices.map { files[$0].url }
             guard group.kind != .unsupported else {
                 for url in urls { report.skip(prefix + url.lastPathComponent, ImportEngine.unsupported(url, content: ctx.content)) }
@@ -184,6 +187,7 @@ enum PackageImporter {
                 }
                 report.absorb(nested, prefix: prefix, top: top)
             } catch {
+                if error is CancellationError { return docs }
                 for url in urls { report.skip(prefix + url.lastPathComponent, error) }
                 importLog.error("skipped a file: \(error.localizedDescription, privacy: .public)")
             }
