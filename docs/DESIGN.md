@@ -114,7 +114,9 @@ UI neutrals are Apple's semantic colours. In code they are `NibColor` / `NibUICo
 | `fill4` | `#747480` 8 % | `#767680` 18 % | Proposal block, composer, search field |
 | `background` | `#FFFFFF` | `#000000` | Library content |
 | `backgroundSecondary` | `#F2F2F7` | `#1C1C1E` | Sidebar, folder tiles, sheets, Reduce Transparency Deep |
-| `backgroundTertiary` | `#FFFFFF` | `#2C2C2E` | Segment knob, grouped cells |
+| `backgroundTertiary` | `#FFFFFF` | `#2C2C2E` | Grouped cells |
+| `selectedSegment` | System `tertiarySystemBackground` (same as `backgroundTertiary`) | System `systemGray2`, opaque | Selected segmented-control knob; distinct from the `fill3` track in dark chrome |
+| `selectedCell` | System `tertiarySystemFill` (same as `fill3`) | System `systemGray2`, opaque | Selected option tiles and width presets; preserves the light selection fill and separates dark selections from Deep |
 | `desk` | `#E7E7EC` | `#121214` | Behind pages (never pure white or black: the page edge must read) |
 | `chromeOpaque` | `#F4F4F6` | `#2C2C2E` | Reduce Transparency droplet fill |
 | `scrim` | `#000000` 18 % | `#000000` 45 % | Behind sheets |
@@ -814,7 +816,7 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibSlider`** | 4 pt `fill1` track, `label` fill, 28 pt white bead thumb | 44 pt tall | Thumb stretches up to **0.10** with speed (`thumb` spring, about its grab side) and settles in one small undershoot; detent haptics |
 | **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3`. `init(width:range:presets:title:unit:)` titles it and measures in `.millimetres` ("0.50 mm") or `.points` ("12 pt", the eraser's Size) |
 | **`NibWidthPresetButton`** | One preset: a `label` dot (`NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt) in a 44 × 40 cell | 44 pt hit | Selected on `fill3` (radius 12). The slider's presets, the Pencil palette's widths, options bars: a thickness looks the same everywhere. A hover outline of a width is a `NibStroke.hairline` circle |
-| **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `backgroundTertiary` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold. `sizing: .intrinsic` (default) preserves full labels and stacks when needed. Opt-in `sizing: .fitting` shares the available width equally (including RTL); labels use one line with tail truncation at the existing footnote size, never scale down. The full label remains available to accessibility. Fitting needs 44 pt per segment plus the 4 pt track inset; narrower rows and accessibility Dynamic Type sizes stack with full labels. Use for the 240 pt page switcher and equal-width paragraph controls |
+| **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `selectedSegment` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold. `sizing: .intrinsic` (default) preserves full labels and stacks when needed. Opt-in `sizing: .fitting` shares the available width equally (including RTL); labels use one line with tail truncation at the existing footnote size, never scale down. The full label remains available to accessibility. Fitting needs 44 pt per segment plus the 4 pt track inset; narrower rows and accessibility Dynamic Type sizes stack with full labels. Use for the 240 pt page switcher and equal-width paragraph controls |
 
 ### 13.4 Controls and text
 
