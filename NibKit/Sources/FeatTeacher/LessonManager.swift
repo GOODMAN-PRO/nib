@@ -189,6 +189,22 @@ enum LessonManager {
     }
 }
 
+/// Accessed only on the persistence writer queue. A failed write never consumes its snapshot.
+private final class PrivateLessonWrites {
+    var pending: [DocumentID: LessonSnapshot] = [:]
+    var errors: [DocumentID: String] = [:]
+    let write: (LessonSnapshot, URL) throws -> Void
+    init(write: @escaping (LessonSnapshot, URL) throws -> Void) { self.write = write }
+    func retry(_ doc: DocumentID, at url: URL) {
+        guard let snapshot = pending[doc] else { return }
+        do {
+            try write(snapshot, url)
+            pending[doc] = nil
+            errors[doc] = nil
+        } catch { errors[doc] = error.localizedDescription }
+    }
+}
+
 /// The private Present workspace lives in Application Support, outside every class/library sync folder. It uses
 /// ordinary document transactions and undo. No layer is merely hidden and then accidentally shared on disk.
 @MainActor
@@ -199,12 +215,39 @@ final class PrivateLessonPersistence: DocumentPersistence {
     private let writer = DispatchQueue(label: "app.nib.teacherlessons.private")
     private let log = Logger(subsystem: "app.nib", category: "teacherlessons")
 
-    init(base: DocumentPersistence, root: URL) { self.base = base; self.root = root }
+    private let writes: PrivateLessonWrites
+    private let report: (DocumentID, String?) -> Void
+
+    init(base: DocumentPersistence, root: URL,
+         write: @escaping (LessonSnapshot, URL) throws -> Void = { snapshot, url in
+             try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+         }, report: @escaping (DocumentID, String?) -> Void = { _, _ in }) {
+        self.base = base; self.root = root
+        self.writes = PrivateLessonWrites(write: write); self.report = report
+    }
+    func pendingSnapshot(_ doc: DocumentID) -> LessonSnapshot? { writer.sync { writes.pending[doc] } }
+    func saveError(_ doc: DocumentID) -> String? { writer.sync { writes.errors[doc] } }
+    private func reportStatus(_ doc: DocumentID) { report(doc, saveError(doc)) }
+
+    static func reportStatus(_ doc: DocumentID, message: String?, app: NibApp) {
+        let text = message.map { String(localized: "Private notes could not be saved. Keep Nib open, free storage, then close the document to retry. \($0)") }
+        app.events.emit(SyncStatusPayload(state: text == nil ? "idle" : "error", source: "store",
+                                         reason: text == nil ? nil : "writeFailed", message: text), doc: doc)
+        if let text {
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                            userInfo: ["command": CommandIDs.lessonSetState, "error": NibError(.internalError, text)])
+        }
+    }
     func package(_ doc: DocumentID) -> URL { root.appendingPathComponent(doc.raw, isDirectory: true) }
     func seed(_ snapshot: LessonSnapshot) throws {
         let doc = snapshot.content.meta.id
         try FileManager.default.createDirectory(at: package(doc), withIntermediateDirectories: true)
-        try JSONEncoder().encode(snapshot).write(to: package(doc).appendingPathComponent("presentation.json"), options: .atomic)
+        let url = package(doc).appendingPathComponent("presentation.json")
+        try writer.sync {
+            try writes.write(snapshot, url)
+            writes.pending[doc] = nil
+            writes.errors[doc] = nil
+        }
         cache[doc] = snapshot
     }
     private func snapshot(_ doc: DocumentID) throws -> LessonSnapshot {
@@ -231,14 +274,23 @@ final class PrivateLessonPersistence: DocumentPersistence {
             if let head { value.content = head }
             for (page, items) in pages { value.items[page] = items }
             cache[doc] = value
-            let url = package(doc).appendingPathComponent("presentation.json"), log = self.log
-            writer.async {
-                do { try JSONEncoder().encode(value).write(to: url, options: .atomic) }
-                catch { log.error("Could not save private presentation: \(error.localizedDescription, privacy: .public)") }
+            let url = package(doc).appendingPathComponent("presentation.json"), writes = self.writes
+            writer.async { [weak self] in
+                writes.pending[doc] = value
+                writes.retry(doc, at: url)
+                Task { @MainActor [weak self] in self?.reportStatus(doc) }
             }
-        } catch { log.error("Could not load private presentation: \(error.localizedDescription, privacy: .public)") }
+        } catch {
+            log.error("Could not load private presentation: \(error.localizedDescription, privacy: .public)")
+            report(doc, error.localizedDescription)
+        }
     }
-    func flush(_ doc: DocumentID) { if LessonManager.isPrivate(doc) { writer.sync {} } else { base.flush(doc) } }
+    func flush(_ doc: DocumentID) {
+        guard LessonManager.isPrivate(doc) else { base.flush(doc); return }
+        let url = package(doc).appendingPathComponent("presentation.json")
+        writer.sync { writes.retry(doc, at: url) }
+        reportStatus(doc)
+    }
     func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
         guard LessonManager.isPrivate(doc) else { return try base.fileURL(doc, relativePath: relativePath) }
         guard !relativePath.hasPrefix("/"), !relativePath.split(separator: "/").contains("..") else { throw NibError.invalid("invalid private file path") }

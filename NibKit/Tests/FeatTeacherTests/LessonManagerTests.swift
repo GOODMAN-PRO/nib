@@ -225,6 +225,33 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(copyID, page: page).contains { $0.id == secret.id })
     }
 
+    func testFailedPrivateSaveRetainsSnapshotReportsAndRetriesOnFlush() throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        let root = h.persistence.root.appendingPathComponent("failing-private-save")
+        let failure = PrivateSaveFailureSwitch()
+        var reported: [String?] = []
+        let store = PrivateLessonPersistence(base: h.persistence, root: root, write: { snapshot, url in
+            try failure.write(snapshot, url: url)
+        }, report: { _, error in reported.append(error) })
+        let initial = LessonSnapshot(content: DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook)), items: [:])
+        try store.seed(initial)
+        failure.setFailing(true)
+        var changed = initial.content
+        changed.meta.layers[0].name = "Unsaved private edit"
+        store.didChange(doc, head: changed, pages: [:])
+        store.flush(doc)
+        XCTAssertNotNil(store.saveError(doc))
+        XCTAssertEqual(store.pendingSnapshot(doc)?.content, changed)
+        XCTAssertTrue(reported.contains { $0 != nil })
+        failure.setFailing(false)
+        store.flush(doc)
+        XCTAssertNil(store.pendingSnapshot(doc))
+        XCTAssertNil(store.saveError(doc))
+        let fresh = PrivateLessonPersistence(base: h.persistence, root: root)
+        XCTAssertEqual(try fresh.loadHead(doc), changed)
+    }
+
     func testPresentRefreshPreservesEditsMadeDuringTransfer() async throws {
         let h = harness()
         let (doc, page, _, _) = try source(h)
@@ -689,4 +716,15 @@ private final class BlockingPresentAssets: AssetStore {
     func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
     func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
     func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
+private final class PrivateSaveFailureSwitch {
+    private let lock = NSLock()
+    private var failing = false
+    func setFailing(_ value: Bool) { lock.lock(); failing = value; lock.unlock() }
+    func write(_ snapshot: LessonSnapshot, url: URL) throws {
+        lock.lock(); let fail = failing; lock.unlock()
+        if fail { throw NibError.unavailable("disk full") }
+        try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+    }
 }

@@ -26,7 +26,9 @@ final class LessonRuntime {
                                                appropriateFor: nil, create: true)
                 .appendingPathComponent("Nib/PrivateLessons", isDirectory: true)
         }
-        let store = PrivateLessonPersistence(base: ctx.workspace.persistence, root: root)
+        let store = PrivateLessonPersistence(base: ctx.workspace.persistence, root: root, report: { [weak app = ctx.app] doc, message in
+            if let app { PrivateLessonPersistence.reportStatus(doc, message: message, app: app) }
+        })
         let assets = try ctx.services.require(ctx.services.assets, "asset store")
         ctx.workspace.persistence = store
         ctx.services.assets = PrivateLessonAssets(base: assets, root: root)
