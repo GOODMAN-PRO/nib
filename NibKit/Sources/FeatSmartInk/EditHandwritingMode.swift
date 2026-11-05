@@ -183,7 +183,7 @@ final class EditHandwritingModel: ObservableObject {
         guard isActive, let app, let session else { return }
         selectionSink = nil
         if restoreSelection, let t = target, !layout.isEmpty {
-            session.selection = Selection(doc: t.doc, page: t.page, items: t.ids, bounds: layout.pageBounds(layout.box))
+            session.selection = Selection(doc: t.doc, page: t.page, items: layout.ids, bounds: layout.pageBounds(layout.box))
         }
         // Once per use: the canvas deactivates the tool a moment later, and a second Done must not switch back to it.
         guard session.tool == FeatSmartInkFeature.toolID else { return }
@@ -221,7 +221,6 @@ final class EditHandwritingModel: ObservableObject {
             preview = nil
             return
         }
-        if ids != t.ids { target = Target(doc: t.doc, page: t.page, ids: ids) }
         strokes = current
         if let p = preview, !next.columns.indices.contains(p.column) { preview = nil }
         layout = next
@@ -474,13 +473,13 @@ final class EditHandwritingModel: ObservableObject {
     // MARK: Lines
 
     func straighten() {
-        guard let t = target else { return }
-        perform(CommandIDs.handwritingStraighten, ["refs": refs(t.ids)])
+        guard target != nil, !layout.isEmpty else { return }
+        perform(CommandIDs.handwritingStraighten, ["refs": refs(layout.ids)])
     }
 
     func align(_ alignment: InkAlignment) {
-        guard let t = target else { return }
-        perform(CommandIDs.handwritingAlign, ["refs": refs(t.ids), "align": .string(alignment.rawValue)])
+        guard target != nil, !layout.isEmpty else { return }
+        perform(CommandIDs.handwritingAlign, ["refs": refs(layout.ids), "align": .string(alignment.rawValue)])
     }
 
     // MARK: Words
