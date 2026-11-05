@@ -709,7 +709,6 @@ final class LibraryUITests: XCTestCase {
             .press(forDuration: 0.4, thenDragTo: item(folder, folder: true).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)),
                    withVelocity: .slow, thenHoldForDuration: 0.6)
         try eventually("Completed folder move must expose its Undo toast", timeout: 5) { undo.exists && !self.item(self.physics).exists }
-        ui.recordDiagnostics("Toast Undo before stability", facts: "Awaiting two equal frames", includeHierarchy: false)
         defer { ui.recordDiagnostics("Toast Undo completion", facts: ui.elementFacts(undo), includeHierarchy: false) }
         var previous: CGRect?
         try eventually("Toast Undo must have two equal frames", timeout: 3) {

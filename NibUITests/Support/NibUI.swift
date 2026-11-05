@@ -121,7 +121,9 @@ final class NibUI {
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
-        let identity = initial.exists ? (try? initial.snapshot()) : nil
+        let initialSnapshot = initial.exists ? (try? initial.snapshot()) : nil
+        // Unlabelled native thumbs are not unique identities; keep the caller's scoped query.
+        let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
             if let form, form.exists, hasVisibleFrame(form) { return form }
             guard let root = try? app.snapshot() else { return nil }
@@ -158,25 +160,33 @@ final class NibUI {
             }
             visit(root, element: app, surface: 0)
             let foremost = surfaceOrder
-            let presented = candidates.filter { $0.surface == foremost }
-            let live = presented.filter { candidate in
-                candidate.node.label.isEmpty || !presented.contains {
-                    $0.node.label == candidate.node.label
-                        && $0.node.frame.width * $0.node.frame.height > candidate.node.frame.width * candidate.node.frame.height
+            // Surface traversal is a preference, not z-order. Rank from the snapshot, then probe
+            // only successive winners; retained modal copies must not hide the live form.
+            // Keeping all candidates also covers a foremost popover with no scrolling content.
+            func smallerNamedCopy(_ node: XCUIElementSnapshot, surface: Int) -> Bool {
+                !node.label.isEmpty && candidates.contains {
+                    $0.surface == surface && $0.node.label == node.label
+                        && $0.node.frame.width * $0.node.frame.height > node.frame.width * node.frame.height
                 }
             }
-            let containing = live.filter { $0.contains }
-            if !containing.isEmpty {
-                return containing.min { $0.node.frame.width * $0.node.frame.height < $1.node.frame.width * $1.node.frame.height }?.element
-            }
-            // Lazy rows are absent: overflow wins, then the native detail pane, then area (never narrowest).
-            return live.sorted {
+            let ranked = candidates.sorted {
+                if ($0.surface == foremost) != ($1.surface == foremost) { return $0.surface == foremost }
+                if $0.surface != $1.surface { return $0.surface > $1.surface }
+                let firstArea = $0.node.frame.width * $0.node.frame.height
+                let secondArea = $1.node.frame.width * $1.node.frame.height
+                let firstCopy = smallerNamedCopy($0.node, surface: $0.surface)
+                let secondCopy = smallerNamedCopy($1.node, surface: $1.surface)
+                if firstCopy != secondCopy { return !firstCopy }
+                if $0.contains != $1.contains { return $0.contains }
+                if $0.contains { return firstArea < secondArea }
+                // Lazy rows are absent: overflow, native detail type, then area (never narrowest).
                 if $0.overflow != $1.overflow { return $0.overflow }
                 let firstNative = [.collectionView, .table].contains($0.node.elementType)
                 let secondNative = [.collectionView, .table].contains($1.node.elementType)
                 if firstNative != secondNative { return firstNative }
-                return $0.node.frame.width * $0.node.frame.height > $1.node.frame.width * $1.node.frame.height
-            }.first?.element
+                return firstArea > secondArea
+            }
+            return ranked.first { $0.element.exists && $0.element.isHittable }?.element
         }
         guard var list = liveList(), let firstSnapshot = try? list.snapshot() else {
             logQA("Form reveal unavailable", "No live container snapshot; caller retains its wait/fallback")
@@ -237,7 +247,11 @@ final class NibUI {
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
             snapshot = after // Reuse this post-drag snapshot as the next iteration's before state.
             let afterValues = formControlValues(after)
-            let changed = values.keys.filter { afterValues[$0] != nil && afterValues[$0] != values[$0] }
+            // Virtualization can renumber repeated identities. Compare only unchanged-size groups.
+            let changed = values.keys.filter {
+                guard let before = values[$0], let after = afterValues[$0], before.count == after.count else { return false }
+                return before != after
+            }
             guard changed.isEmpty else {
                 logQA("Form drag changed controls", "before=\(values) after=\(afterValues)")
                 XCTFail("Reveal drag changed slider/switch values: \(changed)"); return
@@ -257,17 +271,13 @@ final class NibUI {
         return own + snapshot.children.flatMap { formVisibleRange($0, viewport: viewport) }
     }
 
-    private func formControlValues(_ snapshot: XCUIElementSnapshot) -> [String: String] {
-        var result: [String: String] = [:]
-        var occurrences: [String: Int] = [:]
+    private func formControlValues(_ snapshot: XCUIElementSnapshot) -> [String: [String]] {
+        var result: [String: [String]] = [:]
         func visit(_ node: XCUIElementSnapshot, parent: String) {
             let identity = "\(node.elementType.rawValue)|\(node.identifier)|\(node.label)"
             let path = parent + "/" + identity
             if [.slider, .switch].contains(node.elementType) {
-                let key = path
-                let occurrence = occurrences[key, default: 0]
-                occurrences[key] = occurrence + 1
-                result["\(key)|\(occurrence)"] = String(describing: node.value)
+                result[path, default: []].append(String(describing: node.value))
             }
             // A native row exposes a labelled switch plus an unlabelled thumb. Keep its parent identity,
             // so virtualizing another row cannot renumber unrelated thumbs and report a false mutation.
@@ -278,7 +288,7 @@ final class NibUI {
         return result
     }
 
-    /// Prefer 32pt vertical clearance, with a small horizontal inset exclusion for dense forms.
+    /// Search real row gaps before considering the leading inset of a dense form.
     private func formDragStart(_ snapshot: XCUIElementSnapshot, viewport: CGRect, down: Bool) -> CGPoint? {
         let interactive: [XCUIElement.ElementType] = [.slider, .switch, .button, .textField, .textView,
             .secureTextField, .searchField, .stepper, .segmentedControl, .picker, .pickerWheel, .link]
@@ -291,28 +301,35 @@ final class NibUI {
         let ys = stride(from: viewport.minY + 24, through: viewport.maxY - 24, by: 4).sorted {
             abs($0 - preferredY) < abs($1 - preferredY)
         }
-        // Leading inset first, then gaps across the row; all candidates must pass the same exclusion.
-        let xs = [viewport.minX + 6] + Array(stride(from: viewport.minX + 12, through: viewport.maxX - 6, by: 8))
+        let endY = down ? viewport.maxY - 24 : viewport.minY + 24
+        // First pass ignores x: every interactive frame must be at least 32pt away vertically.
+        for y in ys where abs(endY - y) >= 24 {
+            let clearance = blocked.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
+            if clearance >= 32 {
+                let point = CGPoint(x: viewport.midX, y: y)
+                logQA("Form drag point", "pass=row-gap point=\(point) verticalMargin=\(clearance) viewport=\(viewport)")
+                return point
+            }
+        }
+        // Second pass: only the leading inset, retaining the 4pt horizontal exclusion.
+        let x = viewport.minX + 6
         var best: (point: CGPoint, clearance: CGFloat)?
         for y in ys {
-            let endY = down ? viewport.maxY - 24 : viewport.minY + 24
             guard abs(endY - y) >= 24 else { continue }
-            for x in xs {
-                let point = CGPoint(x: x, y: y)
-                // The observed slider capture was 16pt ABOVE its frame. Expanding horizontally
-                // by 32pt also blocked the entire leading inset; 4pt preserves that usable gutter.
-                let relevant = blocked.filter { x >= $0.1.minX - 4 && x <= $0.1.maxX + 4 }
-                let clearance = relevant.map { max($0.1.minY - y, y - $0.1.maxY) }.min()
-                    ?? viewport.height
-                if clearance >= 32 { return point }
-                // Never start inside an interactive frame, even in the best-effort fallback.
-                if clearance > 0, clearance > (best?.clearance ?? 0) {
-                    best = (point, clearance)
-                }
+            let point = CGPoint(x: x, y: y)
+            let relevant = blocked.filter { x >= $0.1.minX - 4 && x <= $0.1.maxX + 4 }
+            let clearance = relevant.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
+            if clearance >= 32 {
+                logQA("Form drag point", "pass=leading-inset point=\(point) verticalMargin=\(clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
+                return point
+            }
+            // Never start inside an interactive frame, even in the best-effort fallback.
+            if clearance > 0, clearance > (best?.clearance ?? 0) {
+                best = (point, clearance)
             }
         }
         if let best {
-            logQA("Form best clearance", "point=\(best.point) verticalMargin=\(best.clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
+            logQA("Form best clearance", "pass=leading-inset point=\(best.point) verticalMargin=\(best.clearance) horizontalMargin=4 viewport=\(viewport) controls=\(blocked)")
             return best.point
         }
         logQA("Form no safe point", "container=\(snapshot.frame) viewport=\(viewport) controls=\(blocked)")
@@ -325,7 +342,7 @@ final class NibUI {
         if characters.isEmpty { NSLog("[Nib QA] %@", prefix); return }
         for start in stride(from: 0, to: characters.count, by: 1200) {
             let chunk = String(characters[start..<min(start + 1200, characters.count)])
-            NSLog("[Nib QA] %@ [%d] %@", prefix, start / 1200, chunk)
+            NSLog("[Nib QA] %@ [%ld] %@", prefix, start / 1200, chunk)
         }
     }
 

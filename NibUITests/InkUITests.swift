@@ -58,7 +58,9 @@ final class InkUITests: XCTestCase {
     /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
     private func squeezePaletteBinding() throws -> XCUIElement {
         let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
-        let pencilDetail = ui.app.collectionViews.containing(.button, identifier: "Switch between current tool and eraser").firstMatch
+        let pencilDetail = ui.app.collectionViews.containing(NSPredicate(
+            format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
+            "Switch between current tool and eraser")).firstMatch
         ui.revealFormElement(in: pencilDetail) { heading }
         try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
         let detail = try XCTUnwrap(scrollPanels.filter {
@@ -158,7 +160,7 @@ final class InkUITests: XCTestCase {
                 // Scroll the actual tap point into view before exercising the switch.
                 let centre = CGPoint(x: target.frame.midX, y: target.frame.midY)
                 if target.isHittable && panel.frame.insetBy(dx: 2, dy: 2).contains(centre) { break }
-                ui.revealFormElement(in: panel) { target }
+                ui.revealFormElement(in: panel) { element }
             }
             XCTAssertTrue(target.isHittable, "\(label) switch thumb must be visible")
             target.coordinate(withNormalizedOffset: CGVector(dx: native.exists ? 0.5 : 0.92, dy: 0.5)).tap()
@@ -1292,20 +1294,23 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try draw()
         try draw([CGPoint(x: 0.4, y: 0.72), CGPoint(x: 0.6, y: 0.72)])
-        let page = try XCTUnwrap(ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 1 of 4'"))
-            .allElementsBoundByIndex.first { $0.frame.height > 100 })
-        let originalPage = page.frame, originalCanvas = ui.canvas.frame
+        func pageFrame() throws -> CGRect {
+            let page = try XCTUnwrap(ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 1 of 4'"))
+                .allElementsBoundByIndex.first { $0.frame.height > 100 })
+            return page.frame
+        }
+        let originalPage = try pageFrame(), originalCanvas = ui.canvas.frame
         ui.recordDiagnostics("History page before sidebar", facts: "page=\(originalPage) canvas=\(originalCanvas)", includeHierarchy: false)
-        defer { ui.recordDiagnostics("History page completion", facts: "page=\(page.frame)", includeHierarchy: false) }
+        defer { ui.recordDiagnostics("History page completion", facts: "page=\(String(describing: try? pageFrame()))", includeHierarchy: false) }
         try ui.tapCommand("sidebar.toggle"); try tap("Panel Options"); try tap("History")
         _ = try ui.waitForState { $0.openPanels.contains("undo.history") }
         let reverts = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Revert '"))
         try wait("History must offer a Revert action for each stroke") { reverts.count == 2 }
-        ui.recordDiagnostics("History before revert", facts: "page=\(page.frame)", includeHierarchy: false)
+        ui.recordDiagnostics("History before revert", facts: "page=\(try pageFrame())", includeHierarchy: false)
         reverts.element(boundBy: 1).tap() // newest first: choose the older stroke
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try ui.tapCommand("sidebar.toggle")
-        let currentPage = page.frame, currentCanvas = ui.canvas.frame
+        let currentPage = try pageFrame(), currentCanvas = ui.canvas.frame
         ui.recordDiagnostics("History page after sidebar", facts: "page=\(currentPage) canvas=\(currentCanvas)", includeHierarchy: false)
         // Preserve both bands in page coordinates, including scale changes, rather than a fixed window y.
         func band(_ y: CGFloat) -> CGRect {

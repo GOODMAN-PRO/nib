@@ -812,7 +812,7 @@ final class CreateUITests: XCTestCase {
             if exists && element.elementType != .textField && element.isHittable { return }
             let target = exists ? element.frame : nil
             let keyboards = app.keyboards.allElementsBoundByIndex.map(\.frame)
-            if exists, element.elementType == .textField, element.isHittable, let target,
+            if name != "Title", exists, element.elementType == .textField, element.isHittable, let target,
                let usable = NibUITestScrollGeometry.viewport(scroll: app.windows.firstMatch.frame,
                    window: app.windows.firstMatch.frame, obstructions: keyboards), usable.contains(target) { return }
             let candidates = (app.collectionViews.allElementsBoundByIndex + app.scrollViews.allElementsBoundByIndex)

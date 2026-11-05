@@ -1120,9 +1120,13 @@ final class ChromeUITests: XCTestCase {
     // disposable Files subfolder; importing, selecting and annotating it all use the actual UI.
     // No document package, settings, probe, app command or selection is injected.
     private func filesDiagnostics(_ stage: String) {
-        ui.recordDiagnostics("Files picker " + stage, facts: ui.elementFacts(ui.app.buttons["Cancel"].firstMatch, includeOverlaps: true))
-        ui.logQA("Files DocumentsApp " + stage, XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp").debugDescription)
-        ui.logQA("Files SpringBoard " + stage, XCUIApplication(bundleIdentifier: "com.apple.springboard").debugDescription)
+        let includeTrees = ["opened", "before folder", "image opened"].contains(stage)
+        ui.recordDiagnostics("Files picker " + stage,
+            facts: ui.elementFacts(ui.app.buttons["Cancel"].firstMatch, includeOverlaps: true), includeHierarchy: includeTrees)
+        if includeTrees {
+            ui.logQA("Files DocumentsApp " + stage, XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp").debugDescription)
+            ui.logQA("Files SpringBoard " + stage, XCUIApplication(bundleIdentifier: "com.apple.springboard").debugDescription)
+        }
     }
 
     private func importTextPDF() throws {
