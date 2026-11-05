@@ -625,8 +625,8 @@ final class NibRenderTests: XCTestCase {
     }
 
     func testClosedDocumentThumbnailDetectsOfflineEditsWithoutGenerationChange() async throws {
-        // Full metadata or no cheap metadata: both paths must detect edits below the maximum revision.
-        for knowsFingerprints in [true, false] {
+        // Both metadata and revision-only providers must reject stale memory AND disk thumbnails.
+        for (knowsFingerprints, memoryHit) in [(true, true), (true, false), (false, true), (false, false)] {
             let h = Harness(features: [NibRenderFeature.self])
             let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
             var high = shortStroke()
@@ -641,7 +641,7 @@ final class NibRenderTests: XCTestCase {
             h.app.workspace.close(doc)
             let counting = CountingPersistence(base: h.persistence)
             counting.knowsFingerprints = knowsFingerprints
-            counting.knowsRevisions = knowsFingerprints
+            counting.knowsRevisions = true
             h.app.workspace.persistence = counting
 
             // Restore the memory thumbnail from disk while the document and its items remain closed.
@@ -650,6 +650,9 @@ final class NibRenderTests: XCTestCase {
             let before = try renderer.thumbnailProbe(doc: doc, page: page)
             let oldKey = ThumbnailCache.Key(doc: doc, page: page, rev: before.rev, size: 120, fingerprint: before.fingerprint)
             XCTAssertNotNil(renderer.thumbnails.memoryImage(oldKey))
+            let oldFile = try XCTUnwrap(renderer.thumbnails.fileURL(oldKey))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: oldFile.path))
+            if !memoryHit { renderer.thumbnails.purgeMemory() }
             XCTAssertFalse(h.app.workspace.isLoaded(doc))
             XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
 
@@ -671,7 +674,7 @@ final class NibRenderTests: XCTestCase {
         }
     }
 
-    func testRevisionOnlyWrapperValidatesDiskAndMemoryThumbnailsWithoutLoadingItems() async throws {
+    func testRevisionOnlyWrapperValidatesDiskAndMemoryThumbnailsWithTransientItemReads() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
         let (doc, page) = try makePage(h, items: [shortStroke()])
@@ -688,7 +691,7 @@ final class NibRenderTests: XCTestCase {
             let thumbnail = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
             XCTAssertNotNil(thumbnail)
         }
-        XCTAssertEqual(counting.itemLoads, 0)
+        XCTAssertEqual(counting.itemLoads, 9, "One transient read per probe, including each cache hit")
         XCTAssertEqual(counting.fingerprintReads, 0, "The legacy wrapper does not forward the new method")
         XCTAssertFalse(h.app.workspace.isLoaded(doc))
         XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
@@ -697,7 +700,7 @@ final class NibRenderTests: XCTestCase {
         h.persistence.pageItems[doc]?[page] = [changed]
         let updated = try renderer.thumbnailProbe(doc: doc, page: page)
         XCTAssertNotEqual(updated.fingerprint, probe.fingerprint)
-        XCTAssertEqual(counting.itemLoads, 0)
+        XCTAssertEqual(counting.itemLoads, 10)
     }
 
     func testThumbnailDiskHitDoesNotLoadThePageWhenPersistenceKnowsItsRevision() async throws {
