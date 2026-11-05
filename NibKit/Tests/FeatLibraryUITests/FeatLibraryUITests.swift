@@ -9,6 +9,18 @@ import NibTesting
 
 @MainActor
 final class FeatLibraryUITests: XCTestCase {
+    func testRecognizedLiftRejectsNativeMenuUntilTheNextTouch() {
+        let card = LibraryItemTouchView()
+        let interaction = UIContextMenuInteraction(delegate: card)
+        card.reflowTouchBegan()
+        XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        card.reflowLiftBegan()
+        XCTAssertTrue(card.liftRecognized)
+        XCTAssertNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        card.reflowTouchBegan()
+        XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+    }
+
     func testEscapeClosesOneTransientSurfaceAndLeavesRenameToItsOwner() {
         XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: true, isRenaming: false,
             hasSearch: true, isSelecting: true), .menu)

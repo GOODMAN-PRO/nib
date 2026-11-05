@@ -355,6 +355,7 @@ struct LibraryItemTapTarget: UIViewRepresentable {
         view.menu = menu
         view.preview = preview
         let tap = LibraryItemTapRecognizer(target: nil, action: nil)
+        tap.touchBegan = { [weak view] in view?.reflowTouchBegan() }
         tap.action = action
         tap.pressed = pressed
         tap.addTarget(tap, action: #selector(LibraryItemTapRecognizer.activate))
@@ -382,10 +383,16 @@ struct LibraryItemTapTarget: UIViewRepresentable {
 
 /// One native touch surface owns both opening and the context menu. A SwiftUI
 /// contextMenu wrapper above a separate tap overlay can consume the opening tap.
-final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
+final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibReflowTouchOwner {
     var menu: (() -> UIMenu)?
     var preview: (() -> UIViewController)?
     var activate: (() -> Void)?
+    private(set) var liftRecognized = false
+    func reflowTouchBegan() { liftRecognized = false }
+    func reflowLiftBegan() {
+        liftRecognized = true
+        for interaction in interactions.compactMap({ $0 as? UIContextMenuInteraction }) { interaction.dismissMenu() }
+    }
     override func accessibilityActivate() -> Bool { activate?(); return activate != nil }
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -396,19 +403,23 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
     required init?(coder: NSCoder) { nil }
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        guard NibReflowArbitration.permitsContextMenu(liftRecognized: liftRecognized) else { return nil }
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] winner=native-menu view=\(ObjectIdentifier(self)) location=\(location)")
         #endif
         return UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
                                    actionProvider: { [weak self] _ in self?.menu?() })
     }
-    #if DEBUG
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willDisplayMenuFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
+        if !NibReflowArbitration.permitsContextMenu(liftRecognized: liftRecognized) { interaction.dismissMenu() }
+        #if DEBUG
         NibQAIdleDiagnostics.schedule(reason: "library-context-menu")
+        #endif
     }
 
+    #if DEBUG
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willEndFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
@@ -422,10 +433,12 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
 }
 
 final class LibraryItemTapRecognizer: UITapGestureRecognizer {
+    var touchBegan: (() -> Void)?
     var action: () -> Void = {}
     var pressed: (Bool) -> Void = { _ in }
     @objc func activate() { action() }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        touchBegan?()
         super.touchesBegan(touches, with: event)
         pressed(true)
     }

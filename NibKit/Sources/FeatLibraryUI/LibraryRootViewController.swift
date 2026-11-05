@@ -496,6 +496,7 @@ final class LibraryFloatingAdapter: FloatingHosting {
 @MainActor
 final class LibraryRootViewController: UIViewController {
     let model: LibraryViewModel
+    private var warmedLiftRendering = false
     init(app: NibApp, navigator: SceneNavigator) {
         model = LibraryModels.get(app).model(navigator.session)
         super.init(nibName: nil, bundle: nil)
@@ -535,6 +536,41 @@ final class LibraryRootViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
+    }
+    func warmLiftedCardRendering() async {
+        guard !warmedLiftRendering, viewIfLoaded?.window != nil,
+              let row = model.documentRows.first ?? model.folderRows.first else { return }
+        warmedLiftRendering = true
+        let size = NibMetrics.coverSize
+        let warmup = NibReflowRenderingWarmup(size: size) {
+            LibraryStackedCarrier(ref: row.ref, model: model)
+        }.nibLiquidMode(model.liquidMode)
+        let host = UIHostingController(rootView: warmup)
+        addChild(host)
+        // Behind the opaque library, but attached to its real window so native
+        // glass participates in rendering. A hidden/zero-alpha host is culled.
+        host.view.frame = CGRect(origin: .zero, size: CGSize(width: size.width + 32, height: size.height + 32))
+        host.view.isUserInteractionEnabled = false
+        host.view.accessibilityElementsHidden = true
+        view.insertSubview(host.view, at: 0)
+        host.didMove(toParent: self)
+        defer {
+            host.willMove(toParent: nil)
+            host.view.removeFromSuperview()
+            host.removeFromParent()
+        }
+        host.view.layoutIfNeeded()
+        await Task.yield()
+        guard !Task.isCancelled, view.window != nil else { warmedLiftRendering = false; return }
+        host.view.layoutIfNeeded()
+        var rendered = false
+        _ = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
+            rendered = host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+        }
+        warmedLiftRendering = rendered
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] lifted card warmup snapshotRendered=\(rendered)")
+        #endif
     }
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
@@ -750,7 +786,10 @@ struct LibraryRootView: View {
                 catch { return }
                 model.setView(["search": .string(searchText)])
             }
-            .task { await model.appear() }
+            .task {
+                await model.appear()
+                await (model.controller as? LibraryRootViewController)?.warmLiftedCardRendering()
+            }
             .onDisappear { model.isVisible = false }
         }
     }

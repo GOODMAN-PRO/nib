@@ -216,6 +216,30 @@ final class NibReflowTests: XCTestCase {
         XCTAssertEqual(reflow.carrierFrame, layout.slot(1))
     }
 
+    func testRecognizedLiftKeepsMenuOwnershipEvenAfterMovementStops() {
+        XCTAssertTrue(NibReflowArbitration.permitsContextMenu(liftRecognized: false))
+        XCTAssertFalse(NibReflowArbitration.permitsContextMenu(liftRecognized: true))
+    }
+
+    func testCancelledLiftRestoresGridAndSourceWithoutDropping() {
+        let reflow = NibReflow<String>(layout: layout, combines: true)
+        reflow.begin("b", order: ids, at: centre(1))
+        reflow.move(to: centre(3))
+        reflow.isPaused = true
+        reflow.isCondensed = true
+        reflow.cancel()
+        XCTAssertFalse(reflow.isDragging)
+        XCTAssertFalse(reflow.isPaused)
+        XCTAssertFalse(reflow.isCondensed)
+        XCTAssertNil(reflow.armed)
+        XCTAssertEqual(reflow.offset(for: "c"), .zero)
+        XCTAssertEqual(reflow.carrierFrame, layout.slot(1))
+        reflow.landed()
+        XCTAssertNil(reflow.carried)
+        XCTAssertFalse(reflow.hidesSource("b"))
+        XCTAssertEqual(reflow.end(), .none)
+    }
+
     func testMeasuredFramesMapTheMoveToTheFullOrder() {
         // Only c…f are on screen (a lazy grid): the move still comes back in the caller's order.
         let reflow = NibReflow<String>(combines: false)
