@@ -2143,7 +2143,8 @@ final class NibUI {
 
     /// Native context menus do not reliably let XCTest reach idle. Every menu contact is synthesized.
     /// A path includes submenu openers, e.g. ["Move", "Move Up"]. Never retry the opening press.
-    func nativeContextMenu(_ element: XCUIElement, path: [String]) throws {
+    func nativeContextMenu(_ element: XCUIElement, path: [String], at point: CGPoint = CGPoint(x: 0.5, y: 0.5),
+                           dismissAt: CGPoint? = nil) throws {
         guard !path.isEmpty else { throw Failure.message("Context menu needs an action path") }
         let started = Date()
         // Native menus may expose only buttons under Preview. Remember existing controls so
@@ -2176,7 +2177,8 @@ final class NibUI {
             throw Failure.message("Context menu target did not settle: " + elementFacts(element))
         }
         logQA("Native menu opening", "path=\(path) frame=\(frame)")
-        try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: 0.8)
+        try pressWithoutIdle(at: CGPoint(x: frame.minX + frame.width * point.x,
+                                         y: frame.minY + frame.height * point.y), duration: 0.8)
         var activated: [(item: XCUIElement, frame: CGRect)] = []
         for name in path {
             var found: XCUIElement?
@@ -2207,6 +2209,7 @@ final class NibUI {
             }
             activated.append((item, item.frame))
             logQA("Native menu item", "path=\(path) item=" + elementFacts(item))
+            if let dismissAt { try pressWithoutIdle(at: dismissAt, duration: 0.05); break }
             try tapWithoutIdle(item)
         }
         var previouslyGone = false

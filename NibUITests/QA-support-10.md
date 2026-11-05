@@ -137,3 +137,16 @@ Re-read the changed Swift blocks and surrounding callers in Chrome, Create, Inse
 No Swift/Objective-C compilation or simulator run is possible on this PC. CI must verify native AX container types (especially Customise collection, Time Keeper and droplet menus), fast edge detection/default paging, retained popover copies and disappearance, scoped remote editors, gesture synthesis and the held reorder. The tests still fail honestly for unproven app/host problems. The Files app fix is not present at this worktree; Bridge rebuild/census instrumentation and an earlier CI sample cadence remain app/CI-owned, as explained above. Every H1–H6/C1–C9 cluster has a committed implementation or explicit evidence-limited explanation; none is deferred.
 
 Runtime saving is **estimated, not measured**: typed row probes could save roughly **50–70 seconds per affected layout test**, overlapping the navigation and text-entry savings. Tabs removes eight UI creation flows (observed 26–46 seconds each), replacing them with real library opens; no net saving can be claimed until their reveal/navigation cost is measured. Timer setup previously cost 74–80 seconds per call; plain-K/scoped-entry savings remain unquantified. New query-only closure checks and diagnostics also cost time. No allowance was raised and no idle-stall removal is claimed.
+
+
+## Round 10b
+
+Base: bc4a146 (Round 10a), on work/ui-round-10. Read Round 9a/9b, README, all four Insert/Create diagnosis families and paired verdicts. Only NibUITests changes; no local Swift compiler/simulator. Verdict corrections override speculative fixes.
+
+### I1 - native context menus
+
+Confirmed insert-timeouts-state#0 against current raw press/action pairs and Elements contextMenu: two observed 60-second waits. Migrated Elements, patterns, comments, recordings, transcript and page menus to the existing nativeContextMenu transaction. Added default-compatible normalized press position and explicit outside-dismiss point for the comment cancellation coverage; every menu action uses synthesized delivery and the existing bounded closure check. Separate confirmation dialogs retain their actions. Should unblock CreateElementSourceRemainsRenameDeleteAndReuse and prevent the same menu-idle route in the remaining callers. CI must show Native menu opening/item/dismissed and all original content/undo assertions, with no menu idle waits.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Insert native context-menu callers | Native menu opening / item / dismissed | Which target and action were delivered and did the menu close? |

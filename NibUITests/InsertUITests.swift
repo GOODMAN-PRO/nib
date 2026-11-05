@@ -193,7 +193,10 @@ final class InsertUITests: XCTestCase {
         try XCTUnwrap(buttons.min { abs($0.frame.midX - copy.frame.midX) < abs($1.frame.midX - copy.frame.midX) }, "Object menu must expose More").tap()
     }
     private func menu(_ path: String...) throws { try more(); for name in path { try tap(name, scroll: true) } }
-    private func pageMenu() throws { try ui.selectTool("lasso"); ui.coordinate(point).press(forDuration: 1) }
+    private func pageMenu(_ action: String) throws {
+        try ui.selectTool("lasso")
+        try ui.nativeContextMenu(ui.canvas, path: [action], at: point)
+    }
     private func documentMenu(_ name: String) throws { try tap("menu.more"); try tap(name, scroll: true) }
     private func goToSecondPage() throws {
         let original = try ui.state().page
@@ -515,7 +518,7 @@ final class InsertUITests: XCTestCase {
             XCTAssertEqual(boxes.count, 1, "Only one full-page text box may exist on the page")
             return try XCTUnwrap(boxes.first)
         }
-        try pageMenu(); try tap("Start Typing")
+        try pageMenu("Start Typing")
         let editor = try control("Page text", .textView)
         editor.typeText("Full page report")
         try tap("Text Style"); try tap("Heading")
@@ -899,13 +902,13 @@ final class InsertUITests: XCTestCase {
         try tap("Create Element from Selection")
         let cells = ui.app.buttons.matching(NSPredicate(format: "label == 'Element' OR label == 'Rectangle' OR label == 'Untitled Element' OR label == 'Element 1'"))
         let element = try XCTUnwrap(cells.allElementsBoundByIndex.first { $0.isHittable }, "Created element must expose its title")
-        element.press(forDuration: 0.8); try tap("Rename")
+        try ui.nativeContextMenu(element, path: ["Rename"])
         try collectionPrompt("Lab Node", fieldName: "Element name", action: "Rename")
         try tap("Lab Node"); try counts(6)
         try elements(); try tap("My Objects", scroll: true)
-        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try ui.cancelConfirmation(action: "Delete Element")
+        try ui.nativeContextMenu(try control("Lab Node"), path: ["Delete"]); try ui.cancelConfirmation(action: "Delete Element")
         XCTAssertTrue(query("Lab Node").firstMatch.exists)
-        try ui.timedAction("Element Lab Node context menu") { try self.control("Lab Node").press(forDuration: 0.8) }; try tap("Delete"); try tap("Delete Element")
+        try ui.nativeContextMenu(try control("Lab Node"), path: ["Delete"]); try tap("Delete Element")
         try wait("Only confirmed element is removed") { !self.query("Lab Node").firstMatch.exists }
         try counts(6)
     }
@@ -1122,7 +1125,7 @@ final class InsertUITests: XCTestCase {
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])
         try ui.openToolSettings("tape")
-        try control("Image 1", scroll: true).press(forDuration: 0.8); try tap("Delete Pattern")
+        try ui.nativeContextMenu(try control("Image 1", scroll: true), path: ["Delete Pattern"])
         try wait("Deleting a custom pattern removes that tile") { !self.query("Image 1").firstMatch.exists }
         XCTAssertTrue(query("Stripes").firstMatch.exists); try counts(6)
     }
@@ -1168,7 +1171,7 @@ final class InsertUITests: XCTestCase {
     // MARK: comments
 
     private func comment(_ text: String = "Check the units") throws {
-        try pageMenu(); try tap("Add Comment")
+        try pageMenu("Add Comment")
         let input = try ui.textEditor("Add a comment")
         try ui.focusField(input); input.typeText(text); try tap("Send")
         try counts(5)
@@ -1189,7 +1192,7 @@ final class InsertUITests: XCTestCase {
         let posted = try message("Use metres per second")
         XCTAssertTrue(posted.label.contains("Anonymous"), "Reply retains the current author")
         XCTAssertTrue(posted.label.contains(":"), "Reply displays its timestamp")
-        posted.press(forDuration: 0.8); try tap("Copy Text")
+        try ui.nativeContextMenu(posted, path: ["Copy Text"])
         let composer = try control("Reply")
         XCTAssertEqual(try pasteText(into: composer), "Use metres per second", "Comment Copy Text returns the chosen reply")
         try clearText(composer)
@@ -1222,14 +1225,14 @@ final class InsertUITests: XCTestCase {
         return panel.textFields.matching(NSPredicate(format: "identifier == %@ AND label == %@", field.identifier, field.label)).firstMatch
     }
     func testCommentEditCancelSaveAndDeleteFinalMessageRemovesAnchor() throws {
-        try comment(); try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
+        try comment(); try ui.nativeContextMenu(try message("Check the units"), path: ["Edit Message"])
         try replace(try commentEditor("Check the units"), with: "Cancelled edit"); try tap("Cancel")
         XCTAssertTrue(try message("Check the units").exists)
-        try message("Check the units").press(forDuration: 0.8); try tap("Edit Message")
+        try ui.nativeContextMenu(try message("Check the units"), path: ["Edit Message"])
         try replace(try commentEditor("Check the units"), with: "Confirmed edit"); try tap("Save")
-        try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try ui.cancelConfirmation(action: "Delete Thread")
+        try ui.nativeContextMenu(try message("Confirmed edit"), path: ["Delete Message"]); try ui.cancelConfirmation(action: "Delete Thread")
         XCTAssertTrue(try message("Confirmed edit").exists)
-        try message("Confirmed edit").press(forDuration: 0.8); try tap("Delete Message"); try tap("Delete Thread")
+        try ui.nativeContextMenu(try message("Confirmed edit"), path: ["Delete Message"]); try tap("Delete Thread")
         try counts(4); try ui.tapCommand("edit.undo"); try counts(5)
     }
     func testCommentResolveFilterReopenAndShowOnPage() throws {
@@ -1240,15 +1243,16 @@ final class InsertUITests: XCTestCase {
         XCTAssertTrue(query("No open comments").firstMatch.waitForExistence(timeout: 8))
         try toggle("Show Resolved", to: true)
         try message("Check the units").tap(); try tap("Reopen Thread")
-        try message("Check the units").press(forDuration: 0.8)
-        outside()
+        let dismissPoint = CGPoint(x: ui.canvas.frame.minX + ui.canvas.frame.width * 0.93,
+                                   y: ui.canvas.frame.minY + ui.canvas.frame.height * 0.83)
+        try ui.nativeContextMenu(try message("Check the units"), path: ["Show on Page"], dismissAt: dismissPoint)
         try wait("Thread context menu must dismiss before panel controls") { !self.ui.app.buttons["Show on Page"].exists }
         let threadClose = ui.app.buttons.matching(NSPredicate(
             format: "identifier == %@ AND label == %@", "cmd.panel.close", "Close Comment")).firstMatch
         try wait("Thread panel close must be available") { threadClose.exists && threadClose.isHittable }
         threadClose.tap()
         try goToSecondPage(); try panel("Comments")
-        try message("Check the units").press(forDuration: 0.8); try tap("Show on Page")
+        try ui.nativeContextMenu(try message("Check the units"), path: ["Show on Page"])
         _ = try ui.waitForState(timeout: 8) { $0.page == original.page }
         XCTAssertTrue(try message("Check the units").exists)
     }
@@ -1395,17 +1399,17 @@ final class InsertUITests: XCTestCase {
         try wait("Close Player unloads playback bar") { !self.query("Playback position").firstMatch.exists }
     }
     func testAudioRenameExportDeleteCancelAndConfirm() throws {
-        try recordClip(); try clipRow().press(forDuration: 0.8); try tap("Rename")
+        try recordClip(); try ui.nativeContextMenu(try clipRow(), path: ["Rename"])
         try replace(try control("Name", .textField), with: "Motion lecture"); try tap("Rename")
         let row = try control("Motion lecture")
         let duration = row.value as? String
-        row.press(forDuration: 0.8); try tap("Share Audio File")
+        try ui.nativeContextMenu(row, path: ["Share Audio File"])
         XCTAssertTrue(query("Save to Files").firstMatch.waitForExistence(timeout: 10), "Share must expose a real audio file")
         try ui.dismissSheets(); try control("Motion lecture").tap(); try tap("Pause")
-        try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try ui.cancelConfirmation(action: "Delete Recording")
+        try ui.nativeContextMenu(try control("Motion lecture"), path: ["Delete Recording"]); try ui.cancelConfirmation(action: "Delete Recording")
         XCTAssertTrue(query("Playback position").firstMatch.exists)
         XCTAssertEqual(try control("Motion lecture").value as? String, duration)
-        try control("Motion lecture").press(forDuration: 0.8); try tap("Delete Recording"); try tap("Delete Recording")
+        try ui.nativeContextMenu(try control("Motion lecture"), path: ["Delete Recording"]); try tap("Delete Recording")
         try wait("Confirmed delete removes recording and unloads player") {
             !self.query("Motion lecture").firstMatch.exists && !self.query("Playback position").firstMatch.exists
         }
@@ -1487,19 +1491,19 @@ final class InsertUITests: XCTestCase {
         try goToSecondPage()
         timestamp.tap(); XCTAssertTrue(query("Playback position").firstMatch.waitForExistence(timeout: 8))
         _ = try ui.waitForState(timeout: 8) { $0.page == recordedPage }
-        timestamp.press(forDuration: 0.8); try tap("Edit")
+        try ui.nativeContextMenu(timestamp, path: ["Edit"])
         try replace(try control("Transcript text"), with: "Cancelled correction"); try tap("Cancel")
         XCTAssertFalse(query("Cancelled correction").firstMatch.exists)
-        timestamp.press(forDuration: 0.8); try tap("Edit")
+        try ui.nativeContextMenu(timestamp, path: ["Edit"])
         try replace(try control("Transcript text"), with: "Corrected motion lecture"); try tap("Save")
         let line = try control("Corrected motion lecture")
         XCTAssertTrue(query("Measure distance and time.").firstMatch.exists, "Correcting one segment must retain the other segment")
-        line.press(forDuration: 0.8); try tap("Copy")
+        try ui.nativeContextMenu(line, path: ["Copy"])
         let search = try control("Search transcript", .textField)
         XCTAssertEqual(try pasteText(into: search), "Corrected motion lecture", "Transcript Copy preserves corrected text")
         try clearText(search)
         let count = try ui.state().itemCountOnPage
-        line.press(forDuration: 0.8); try tap("Insert on Page"); try counts(count + 1)
+        try ui.nativeContextMenu(line, path: ["Insert on Page"]); try counts(count + 1)
         XCTAssertTrue(query("Corrected motion lecture").firstMatch.exists, "Inserting text must retain source transcript")
         try ui.tapCommand("edit.undo"); try counts(count)
     }
