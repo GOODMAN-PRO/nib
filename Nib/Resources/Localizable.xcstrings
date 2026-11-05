@@ -87721,6 +87721,95 @@
         }
       }
     },
+    "Couldn't open the Files picker. Choose Import Files again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Dateiauswahl konnte nicht geöffnet werden. Wähle erneut „Dateien importieren“."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se ha podido abrir el selector de Archivos. Vuelve a elegir Importar archivos."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible d’ouvrir le sélecteur Fichiers. Choisissez à nouveau Importer des fichiers."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile aprire il selettore di File. Scegli di nuovo Importa file."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ファイルピッカーを開けませんでした。もう一度「ファイルを読み込む」を選択してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 선택기를 열 수 없습니다. 파일 가져오기를 다시 선택하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kan de bestandskiezer niet openen. Kies opnieuw Importeer bestanden."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można otworzyć wyboru plików. Wybierz ponownie Importuj pliki."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível abrir o seletor de Arquivos. Escolha Importar Arquivos novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось открыть выбор файлов. Выберите «Импортировать файлы» еще раз."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kunde inte öppna filväljaren. Välj Importera filer igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dosya seçici açılamadı. Dosyaları İçe Aktar’ı yeniden seçin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法打开文件选择器。请再次选取“导入文件”。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法打開檔案選擇器。請再次選擇「輸入檔案」。"
+          }
+        }
+      }
+    },
     "Couldn't open the template picker: %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -88607,6 +88696,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "無法儲存中繼權杖。請再試一次。"
+          }
+        }
+      }
+    },
+    "Couldn't securely store the bridge token. Try again." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Bridge-Token konnte nicht sicher gespeichert werden. Versuche es erneut."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se ha podido almacenar de forma segura el token del puente. Inténtalo de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible de stocker le jeton de la passerelle en toute sécurité. Réessayez."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile archiviare in modo sicuro il token del bridge. Riprova."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ブリッジのトークンを安全に保存できませんでした。もう一度お試しください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "브리지 토큰을 안전하게 저장할 수 없습니다. 다시 시도하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kan het bridgetoken niet veilig bewaren. Probeer het opnieuw."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie udało się bezpiecznie zapisać tokenu mostka. Spróbuj ponownie."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível armazenar o token da ponte com segurança. Tente novamente."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось безопасно сохранить токен моста. Повторите попытку."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det gick inte att lagra bryggans token säkert. Försök igen."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Köprü belirteci güvenli bir şekilde saklanamadı. Yeniden deneyin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法安全存储桥接令牌。请重试。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法安全儲存橋接權杖。請再試一次。"
           }
         }
       }
@@ -129304,6 +129482,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "「檔案」資料夾可搭配 Google Drive、Dropbox、OneDrive 和 iCloud Drive 使用。請選擇資料庫以外的位置。WebDAV 會使用你已儲存的伺服器設定。"
+          }
+        }
+      }
+    },
+    "Files were imported, but couldn't be opened. Open them from the library." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Dateien wurden importiert, konnten aber nicht geöffnet werden. Öffne sie in der Bibliothek."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Los archivos se han importado, pero no se han podido abrir. Ábrelos desde la biblioteca."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les fichiers ont été importés, mais n’ont pas pu être ouverts. Ouvrez-les depuis la bibliothèque."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I file sono stati importati, ma non è stato possibile aprirli. Aprili dalla libreria."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ファイルは読み込まれましたが、開けませんでした。ライブラリから開いてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일을 가져왔지만 열 수 없습니다. 라이브러리에서 여십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De bestanden zijn geïmporteerd, maar kunnen niet worden geopend. Open ze vanuit de bibliotheek."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pliki zostały zaimportowane, ale nie można ich otworzyć. Otwórz je z biblioteki."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Os arquivos foram importados, mas não foi possível abri-los. Abra-os na biblioteca."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файлы импортированы, но их не удалось открыть. Откройте их из библиотеки."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Filerna importerades men kunde inte öppnas. Öppna dem från biblioteket."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dosyalar içe aktarıldı ancak açılamadı. Onları kitaplıktan açın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "文件已导入，但无法打开。请从资料库中打开。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "檔案已輸入，但無法打開。請從資料庫打開。"
           }
         }
       }
@@ -343037,6 +343304,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "來源格式無法保留此文件。"
+          }
+        }
+      }
+    },
+    "The stored template asset is missing its name." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der gespeicherten Vorlagenressource fehlt der Name."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Al recurso de plantilla almacenado le falta el nombre."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le nom de la ressource de modèle enregistrée est manquant."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alla risorsa del modello archiviata manca il nome."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保存されたテンプレートアセットに名前がありません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장된 템플릿 에셋에 이름이 없습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De naam van het bewaarde sjabloonbestand ontbreekt."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zapisany zasób szablonu nie ma nazwy."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O recurso de modelo armazenado está sem nome."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "У сохраненного ресурса шаблона отсутствует имя."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den lagrade mallresursen saknar namn."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Saklanan şablon varlığının adı eksik."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "存储的模板素材缺少名称。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "儲存的範本素材缺少名稱。"
           }
         }
       }
