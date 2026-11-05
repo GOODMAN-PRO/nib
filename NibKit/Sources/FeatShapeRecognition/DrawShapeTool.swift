@@ -241,16 +241,11 @@ enum ShapeCommit {
         return .object(o)
     }
 
-    /// Creates the shape, then deletes the merged neighbours, in one undo group. Creating comes first so that nothing
-    /// has been removed when it fails: the caller then keeps the stroke as ink. A failed delete leaves the neighbours
-    /// beside the new shape (nothing is lost). Returns the shape made, or nil when none was.
+    /// A join replaces its revision-checked neighbours in one transaction. Failure creates no shape or
+    /// undo entry; the caller keeps the stroke as ink. Returns the shape made, or nil when none was.
     @MainActor
     static func create(_ result: SnapResult, plain: ShapeItem, doc: DocumentID, page: PageID, app: NibApp,
                        session: EditorSession) async -> ShapeItem? {
-        guard app.commands.entry(CommandIDs.shapeCreate) != nil else {
-            DrawShapeTool.log.error("shape.create is not installed; keeping the stroke as ink")
-            return nil
-        }
         let group = NibID.make().raw
         func call(_ command: String, _ params: JSONValue) async throws -> JSONValue {
             try await app.bus.execute(Invocation(command: command, params: params, principal: .user, session: session,
@@ -259,20 +254,26 @@ enum ShapeCommit {
         // Without item.delete the neighbours cannot be merged away, so the shape is made as drawn.
         let merging = !result.mergeWith.isEmpty && app.commands.entry(CommandIDs.itemDelete) != nil
         let shape = result.mergeWith.isEmpty || merging ? result.shape : plain
+        let command = merging ? CommandIDs.itemDelete : CommandIDs.shapeCreate
         do {
-            _ = try await call(CommandIDs.shapeCreate, createParams(shape, page: NodeRef.page(doc, page).description))
-        } catch {
-            DrawShapeTool.log.error("shape.create failed, keeping the stroke: \(String(describing: error), privacy: .public)")
-            return nil
-        }
-        if merging {
-            do {
-                _ = try await call(CommandIDs.itemDelete, ["refs": .array(result.mergeWith.map { JSONValue.string($0) })])
-            } catch {
-                DrawShapeTool.log.error("removing merged shapes failed, keeping them: \(String(describing: error), privacy: .public)")
-                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                    userInfo: ["command": CommandIDs.itemDelete, "error": NibError.wrap(error)])
+            if merging {
+                let joined = try await call(command, ["refs": .array(result.mergeWith.map(JSONValue.string)),
+                    "expectedRevisions": try JSONValue.from(result.mergeRevisions),
+                    "replacementShape": try JSONValue.from(shape)])
+                let deleted = Set((joined["deleted"]?.arrayValue ?? []).compactMap(\.stringValue))
+                guard Set(result.mergeWith).isSubset(of: deleted), joined["replacementRef"]?.stringValue != nil else {
+                    throw NibError(.conflict, String(localized: "Could not join nearby shapes. Your original stroke was kept."))
+                }
+            } else {
+                _ = try await call(command, createParams(shape, page: NodeRef.page(doc, page).description))
             }
+        } catch {
+            DrawShapeTool.log.error("shape commit failed, keeping the stroke: \(String(describing: error), privacy: .public)")
+            if merging {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                    userInfo: ["command": command, "error": NibError.wrap(error)])
+            }
+            return nil
         }
         return shape
     }

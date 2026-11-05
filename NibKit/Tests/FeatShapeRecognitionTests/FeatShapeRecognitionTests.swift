@@ -37,6 +37,24 @@ final class FeatShapeRecognitionTests: XCTestCase {
             calls.groups[id] = ctx.group
             done?.fulfill()
             if fails { throw NibError.unavailable("the test's \(id)") }
+            if id == CommandIDs.itemDelete, let value = json["replacementShape"] {
+                let refs = try XCTUnwrap(json["refs"]?.arrayValue).compactMap(\.stringValue)
+                let revisions = try XCTUnwrap(json["expectedRevisions"]).decode([String: Rev].self)
+                let shape = try value.decode(ShapeItem.self)
+                let written = try ctx.mutate { tx -> Item in
+                    guard ctx.session?.readOnly != true else { throw NibError(.conflict, "read-only") }
+                    for ref in refs {
+                        guard case let .item(doc, page, item)? = NodeRef(ref),
+                              let expected = revisions[ref], try tx.item(doc, page: page, id: item).rev == expected else {
+                            throw NibError(.conflict, "neighbour changed")
+                        }
+                        try tx.delete(item: item, doc: doc, page: page)
+                    }
+                    return try tx.put(Item.makeShape(shape), doc: Fixtures.docID, page: Fixtures.page1)
+                }
+                return ["deleted": .array(refs.map(JSONValue.string)),
+                        "replacementRef": .string(NodeRef.item(Fixtures.docID, Fixtures.page1, written.id).description)]
+            }
             return result
         }
     }
@@ -362,19 +380,27 @@ final class FeatShapeRecognitionTests: XCTestCase {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
         let calls = Calls()
-        let created = expectation(description: "shape.create")
         let deleted = expectation(description: "item.delete")
-        standIn(CommandIDs.shapeCreate, h, calls, created)
+        standIn(CommandIDs.shapeCreate, h, calls)
         standIn(CommandIDs.itemDelete, h, calls, deleted)
+        let before = try h.snapshotAll(), depth = h.undoDepth(Fixtures.docID)
+        let neighbour = try h.app.workspace.item(Fixtures.docID, page: page, id: "OLDLINE00001")
         let host = FakeCanvasHost(h)
         DrawShapeTool().strokeFinished(stroke(Geo.resample([Point(402, 305), Point(402, 400)], count: 30), h), page: page, host: host)
-        await fulfillment(of: [created, deleted], timeout: 5, enforceOrder: true)
+        await fulfillment(of: [deleted], timeout: 5)
         XCTAssertEqual(calls.params[CommandIDs.itemDelete]?["refs"], [.string(itemRef("OLDLINE00001"))])
-        let p = try XCTUnwrap(calls.params[CommandIDs.shapeCreate])
+        let p = try XCTUnwrap(calls.params[CommandIDs.itemDelete]?["replacementShape"])
         XCTAssertEqual(p["shape"], "polyline")
         assertPoints(p["points"], [Point(300, 300), Point(400, 300), Point(402, 400)])
-        XCTAssertNotNil(calls.groups[CommandIDs.shapeCreate])
-        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
+        XCTAssertNil(calls.params[CommandIDs.shapeCreate], "The join must have no speculative create")
+        XCTAssertEqual(calls.params[CommandIDs.itemDelete]?["expectedRevisions"],
+                       try JSONValue.from([itemRef("OLDLINE00001"): neighbour.rev]))
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+        let joined = try h.snapshotAll()
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshotAll(), joined)
     }
 
     /// A box drawn as four separate lines: the fourth side joins the far side too (through the top and bottom), so the
@@ -385,23 +411,24 @@ final class FeatShapeRecognitionTests: XCTestCase {
                                 (id: "BOXRIGHT0001", from: Point(560, 600), to: Point(560, 760), layer: 0),
                                 (id: "BOXBOTTOM001", from: Point(560, 760), to: Point(400, 760), layer: 0)])
         let calls = Calls()
-        let created = expectation(description: "shape.create")
         let deleted = expectation(description: "item.delete")
-        standIn(CommandIDs.shapeCreate, h, calls, created)
+        standIn(CommandIDs.shapeCreate, h, calls)
         standIn(CommandIDs.itemDelete, h, calls, deleted)
         let host = FakeCanvasHost(h)
         DrawShapeTool().strokeFinished(stroke(Geo.resample([Point(400, 758), Point(400, 602)], count: 40), h), page: page, host: host)
-        await fulfillment(of: [created, deleted], timeout: 5, enforceOrder: true)
+        await fulfillment(of: [deleted], timeout: 5)
         let refs = (calls.params[CommandIDs.itemDelete]?["refs"]?.arrayValue ?? []).compactMap(\.stringValue)
         XCTAssertEqual(Set(refs), Set(["BOXTOP000001", "BOXRIGHT0001", "BOXBOTTOM001"].map { itemRef($0) }))
-        let p = try XCTUnwrap(calls.params[CommandIDs.shapeCreate])
+        let p = try XCTUnwrap(calls.params[CommandIDs.itemDelete]?["replacementShape"])
         XCTAssertEqual(p["shape"], "polygon")
         let corners = (p["points"]?.arrayValue ?? []).map { Point($0[0]?.doubleValue ?? .nan, $0[1]?.doubleValue ?? .nan) }
         XCTAssertEqual(corners.count, 4, "\(corners)")
         for expected in [Point(400, 600), Point(560, 600), Point(560, 760), Point(400, 760)] {
             XCTAssertLessThan(corners.map { $0.distance(to: expected) }.min() ?? 99, 0.01, "\(corners)")
         }
-        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
+        XCTAssertNil(calls.params[CommandIDs.shapeCreate])
+        let revisions = try XCTUnwrap(calls.params[CommandIDs.itemDelete]?["expectedRevisions"]).decode([String: Rev].self)
+        XCTAssertEqual(Set(revisions.keys), Set(refs))
         XCTAssertTrue(host.committed.isEmpty)
     }
 
@@ -523,25 +550,25 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(params["processed"], false)
     }
 
-    /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
-    func testFailedCreateKeepsTheNeighboursAndTheInk() async throws {
+    /// A failed atomic replacement keeps every neighbour and requests preservation of the original ink.
+    func testFailedJoinKeepsTheNeighboursAndTheInk() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
         let calls = Calls()
-        standIn(CommandIDs.shapeCreate, h, calls, fails: true)
-        standIn(CommandIDs.itemDelete, h, calls)
+        standIn(CommandIDs.shapeCreate, h, calls)
+        standIn(CommandIDs.itemDelete, h, calls, fails: true)
         let depth = h.undoDepth(Fixtures.docID)
         let host = FakeCanvasHost(h)
         DrawShapeTool().strokeFinished(stroke(Geo.resample([Point(402, 305), Point(402, 400)], count: 30), h), page: page, host: host)
         await settle { !host.committed.isEmpty }
-        XCTAssertNotNil(calls.params[CommandIDs.shapeCreate], "the merged polyline was tried")
-        XCTAssertNil(calls.params[CommandIDs.itemDelete], "nothing was deleted")
+        XCTAssertNotNil(calls.params[CommandIDs.itemDelete]?["replacementShape"], "the atomic join was tried")
+        XCTAssertNil(calls.params[CommandIDs.shapeCreate], "no speculative shape was created")
         XCTAssertEqual(host.committed.count, 1)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "no revert step on the undo stack")
         XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
     }
 
-    func testFailedNeighbourDeleteReportsFailureAndKeepsBothShapes() async throws {
+    func testFailedNeighbourDeleteReportsFailureWithoutCreatingTheJoinedShape() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
         let calls = Calls()
@@ -559,9 +586,54 @@ final class FeatShapeRecognitionTests: XCTestCase {
         let made = await ShapeCommit.create(SnapResult(shape: joined, mergeWith: [itemRef("OLDLINE00001")]),
             plain: plain, doc: Fixtures.docID, page: page, app: h.app, session: h.session)
         await fulfillment(of: [notice], timeout: 1)
-        XCTAssertEqual(made, joined)
-        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
+        XCTAssertNil(made)
+        XCTAssertNil(calls.params[CommandIDs.shapeCreate])
         XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
+    }
+
+    func testDrawShapeJoinRejectsHookConflictsAndNoOpDeletionWithoutHistory() async throws {
+        for change in ["edit", "readOnly", "emptyResult"] {
+            let h = Harness(features: [FeatShapeRecognitionFeature.self])
+            try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
+            let calls = Calls()
+            standIn(CommandIDs.shapeCreate, h, calls)
+            standIn(CommandIDs.itemDelete, h, calls)
+            if change == "emptyResult" {
+                h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete",
+                    summary: "Legacy no-op deletion.", effect: .edit)) { _, _ in ["deleted": [], "detached": []] }
+            }
+            var entered = false, resume = false
+            h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "test.pauseJoin", owner: "test",
+                commands: [CommandIDs.itemDelete]) { _, _, _ in
+                entered = true
+                let deadline = Date().addingTimeInterval(3)
+                while !resume, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
+                guard resume else { throw NibError(.unavailable, "join hook timed out") }
+                return nil
+            })
+            defer { resume = true }
+            let host = FakeCanvasHost(h)
+            let drawn = stroke(Geo.resample([Point(402, 305), Point(402, 400)], count: 30), h)
+            let before = try h.snapshotAll()
+            DrawShapeTool().strokeFinished(drawn, page: page, host: host)
+            await settle { entered }
+            XCTAssertTrue(entered)
+            XCTAssertEqual(try h.snapshotAll(), before, "Suspended joins create no speculative shape")
+            if change == "edit" {
+                try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 350), to: Point(400, 350), layer: 0)])
+            } else if change == "readOnly" { h.session.readOnly = true }
+            let afterChange = try h.snapshotAll(), depth = h.undoDepth(Fixtures.docID)
+            resume = true
+            await settle { !host.committed.isEmpty }
+            XCTAssertEqual(host.committed.map(\.stroke), [drawn])
+            XCTAssertNil(calls.params[CommandIDs.shapeCreate])
+            XCTAssertEqual(try h.snapshotAll(), afterChange)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+            h.session.readOnly = false
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshotAll(), afterChange, "Redo never introduces the rejected join")
+        }
     }
 
     /// When the canvas closes before the shape could be made, the stroke is still kept, through ink.addStrokes.

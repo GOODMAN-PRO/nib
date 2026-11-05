@@ -19,8 +19,8 @@ enum ShapeSettings {
 /// `shape.recognize {points, neighbors?}` (read): the recogniser behind Draw and Hold, AutoShape and the AI.
 /// Returns `{shape: ShapeItem?, confidence?, mergeWith?: [ref], mergeRevisions?: [ref: Rev]}`: `shape` is the whole ShapeItem
 /// (control points, frame, style) or null when the stroke is not a shape. With neighbours and Snap to Other Shapes on,
-/// line ends join or snap to them, and `mergeWith` lists the neighbours joined in, which the caller deletes in the
-/// same undo group as its `shape.create`, passing `mergeRevisions` as `item.delete.expectedRevisions`.
+/// line ends join or snap to them. Pass `mergeWith`, `mergeRevisions` and the shape to `item.delete` as
+/// `refs`, `expectedRevisions` and `replacementShape` to commit the join atomically.
 struct ShapeRecognizeCommand: NibCommand {
     struct Params: Codable {
         var points: [Point]

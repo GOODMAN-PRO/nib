@@ -184,6 +184,9 @@ struct ItemDelete: NibCommand {
         var refs: [String]?
         /// When supplied, every target must still have its recognition-time revision.
         var expectedRevisions: [String: Rev]? = nil
+        /// Atomic Draw and Hold join: insert this shape only if all neighbours can be deleted.
+        var replacementShape: ShapeItem? = nil
+        var replacementID: String? = nil
     }
 
     struct Output: Codable {
@@ -191,6 +194,7 @@ struct ItemDelete: NibCommand {
         var deleted: [String]
         /// Items kept but changed: connectors with a detached end, unpinned comment threads.
         var detached: [String]
+        var replacementRef: String? = nil
     }
 
     static let exampleShape: JSONValue = ["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"]]
@@ -202,19 +206,39 @@ struct ItemDelete: NibCommand {
         id: CommandIDs.itemDelete, title: "Delete",
         summary: "Delete items; attached contents go too, connectors to them are detached (or deleted when both ends go).",
         params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I (any pages; locked items are refused)"),
-                      "expectedRevisions": .anything("optional map of every target item ref to its expected revision; changed or missing items cause a conflict")],
+                      "expectedRevisions": .anything("optional map of every target item ref to its expected revision; changed or missing items cause a conflict"),
+                      "replacementShape": .anything("optional joined polyline or polygon ShapeItem; requires expectedRevisions and shape targets on one page and layer; inserted atomically with deletion"),
+                      "replacementID": .str("optional caller-chosen id for replacementShape, [A-Za-z0-9_-]{1,64}")],
                      required: ["refs"]),
         examples: [exampleShape, exampleMany],
         effect: .edit, destructive: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        guard let targets = try ItemTargets.resolve(p.refs, ctx) else { return Output(deleted: [], detached: []) }
+        guard let targets = try ItemTargets.resolve(p.refs, ctx) else {
+            // Keyboard deletion keeps its historical no-op behaviour. Conditional callers must not
+            // mistake an empty selection or a mode change during a hook for a completed deletion.
+            if p.expectedRevisions != nil || p.replacementShape != nil {
+                throw NibError(.conflict, String(localized: "The selected items can no longer be edited. Try again."))
+            }
+            return Output(deleted: [], detached: [])
+        }
         let groups = ItemTargets.byPage(targets)
-        try ItemTargets.ensureWritable(groups, ctx)
+        if p.replacementShape != nil {
+            guard p.expectedRevisions != nil, groups.count == 1 else {
+                throw NibError.invalid("a shape join requires revisions and targets on one page", path: "$.replacementShape")
+            }
+        } else if p.replacementID != nil {
+            throw NibError.invalid("replacementID requires replacementShape", path: "$.replacementID")
+        }
         var deleted: [(doc: DocumentID, page: PageID, ids: [ElementID])] = []
         var detached: [String] = []
+        var replacementRef: String?
         var hiddenAffected = 0
         try ctx.mutate { tx in
+            try ItemTargets.ensureWritable(groups, ctx)
+            if ctx.principal.isUser, ctx.session?.readOnly == true {
+                throw NibError(.conflict, String(localized: "The selected items can no longer be edited. Try again."))
+            }
             for g in groups {
                 let items = try tx.items(g.doc, page: g.page)
                 if let expected = p.expectedRevisions {
@@ -227,6 +251,20 @@ struct ItemDelete: NibCommand {
                     }
                 }
                 _ = try ItemTargets.check(g.targets, items: items, allowLocked: false)
+                var replacement: Item?
+                if let shape = p.replacementShape {
+                    let selected = Set(g.targets.map(\.id))
+                    let neighbours = items.filter { selected.contains($0.id) }
+                    guard let layer = neighbours.first?.layer,
+                          neighbours.allSatisfy({ $0.shape != nil && $0.layer == layer }),
+                          (ctx.activeSession.map { $0.document != g.doc || $0.activeLayer == layer } ?? true) else {
+                        throw NibError(.conflict, String(localized: "The nearby shapes are no longer on the active layer. Try again."))
+                    }
+                    replacement = try joinedItem(shape, id: p.replacementID, layer: layer)
+                    if let replacement, try ctx.workspace.allItems(g.doc, page: g.page).contains(where: { $0.id == replacement.id }) {
+                        throw NibError(.conflict, "replacement id already exists", path: "$.replacementID")
+                    }
+                }
                 let plan = DeletePlan.make(targets: g.targets.map { $0.id }, items: items)
                 if ctx.principal.isUser, let session = ctx.activeSession, session.document == g.doc,
                    !session.hiddenLayers.isEmpty {
@@ -240,6 +278,10 @@ struct ItemDelete: NibCommand {
                 }
                 try tx.put(plan.updated, doc: g.doc, page: g.page)
                 try tx.delete(items: plan.deleted, doc: g.doc, page: g.page)
+                if let replacement {
+                    let written = try tx.put(replacement, doc: g.doc, page: g.page)
+                    replacementRef = NodeRef.item(g.doc, g.page, written.id).description
+                }
                 deleted.append((doc: g.doc, page: g.page, ids: plan.deleted))
                 detached += plan.updated.map { NodeRef.item(g.doc, g.page, $0.id).description }
             }
@@ -254,7 +296,29 @@ struct ItemDelete: NibCommand {
             }
         }
         let refs = deleted.flatMap { d in d.ids.map { NodeRef.item(d.doc, d.page, $0).description } }
-        return Output(deleted: refs, detached: detached)
+        return Output(deleted: refs, detached: detached, replacementRef: replacementRef)
+    }
+
+    /// This option creates only the point-based shapes produced by joining lines. Validate new geometry
+    /// here without imposing stricter rules on deletion of existing/legacy shapes.
+    private static func joinedItem(_ shape: ShapeItem, id: String?, layer: Int) throws -> Item {
+        guard shape.shape == .polyline || shape.shape == .polygon,
+              shape.points.count >= (shape.shape == .polygon ? 3 : 2), shape.points.count <= 50_000,
+              shape.points.allSatisfy({ $0.x.isFinite && $0.y.isFinite && abs($0.x) <= 100_000 && abs($0.y) <= 100_000 }),
+              let bounds = Rect.bounding(shape.points), max(bounds.width, bounds.height) >= 0.5,
+              shape.style.strokeWidth > 0, shape.style.strokeWidth <= 100,
+              shape.style.cornerRadius.isFinite, shape.style.cornerRadius >= 0,
+              (shape.style.strokeColor?.a ?? 0) > 0 || (shape.shape == .polygon && (shape.style.fillColor?.a ?? 0) > 0) else {
+            throw NibError.invalid("expected a visible joined polyline or polygon with finite points and style", path: "$.replacementShape")
+        }
+        var clean = shape
+        clean.frame = Frame(bounds)
+        var item = Item.makeShape(clean, layer: layer)
+        if let id {
+            guard NibID.isValid(id) else { throw NibError.invalid("invalid replacement id", path: "$.replacementID") }
+            item.id = NibID(id)
+        }
+        return item
     }
 }
 

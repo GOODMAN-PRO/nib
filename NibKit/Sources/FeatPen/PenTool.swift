@@ -262,11 +262,10 @@ final class PenTool: CanvasTool {
                 if let result = state.result {
                     let shape = PenShapeAdjustment.adjust(result.shape, grab: state.grab, current: state.current)
                     let group = NibID.make().raw
-                    var created = false
                     var command = CommandIDs.shapeRecognize
                     do {
                         // Avoid creating obsolete geometry at all when the hold's snapshot is already stale.
-                        // The delete transaction checks again after any suspending command hooks.
+                        // The atomic replacement checks again after any suspending command hooks.
                         guard result.mergeWith.allSatisfy({ ref in
                             guard let expected = result.mergeRevisions[ref],
                                   case let .item(d, p, id)? = NodeRef(ref),
@@ -278,33 +277,27 @@ final class PenTool: CanvasTool {
                         if !result.mergeWith.isEmpty, app.commands.entry(CommandIDs.itemDelete) == nil {
                             throw NibError(.unavailable, String(localized: "Could not join nearby shapes. Your original stroke was kept."))
                         }
-                        command = CommandIDs.shapeCreate
-                        _ = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
-                            params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
-                        created = true
-                        if !result.mergeWith.isEmpty {
-                            command = CommandIDs.itemDelete
+                        if result.mergeWith.isEmpty {
+                            command = CommandIDs.shapeCreate
                             _ = try await app.bus.execute(Invocation(command: command,
+                                params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
+                        } else {
+                            command = CommandIDs.itemDelete
+                            let joined = try await app.bus.execute(Invocation(command: command,
                                 params: ["refs": .array(result.mergeWith.map(JSONValue.string)),
-                                         "expectedRevisions": try JSONValue.from(result.mergeRevisions)],
+                                         "expectedRevisions": try JSONValue.from(result.mergeRevisions),
+                                         "replacementShape": try JSONValue.from(shape)],
                                 session: session, group: group))
+                            let deleted = Set((joined.value["deleted"]?.arrayValue ?? []).compactMap(\.stringValue))
+                            guard Set(result.mergeWith).isSubset(of: deleted), joined.value["replacementRef"]?.stringValue != nil else {
+                                throw NibError(.conflict, String(localized: "Could not join nearby shapes. Your original stroke was kept."))
+                            }
                         }
                     } catch {
                         let failure = NibError.wrap(error)
                         Self.report(failure.code == .conflict
                             ? NibError(.conflict, String(localized: "A nearby shape changed. Your original stroke was kept."))
                             : failure, command: command, app: app)
-                        if created {
-                            // Revert only our creation, never the newer neighbour edit or deletion.
-                            // Selective undo also refuses to overwrite a later edit to the new shape.
-                            do {
-                                let rollback = try await app.bus.execute(CommandIDs.revertGroup,
-                                    ["doc": .string(NodeRef.document(doc).description), "group": .string(group)], session: session)
-                                if (rollback["skipped"]?.intValue ?? 0) > 0 {
-                                    throw NibError(.conflict, String(localized: "The new shape was edited and could not be removed. Your original stroke was kept."))
-                                }
-                            } catch { Self.report(error, command: CommandIDs.revertGroup, app: app) }
-                        }
                         await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
                     }
                 } else { await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host) }
