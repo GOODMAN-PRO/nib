@@ -3,6 +3,16 @@ import SwiftUI
 @testable import NibDesign
 
 final class PalettePopoverQualityTests: XCTestCase {
+    func testExplicitRegisteredAndFallbackBudSourcesHaveStablePrecedence() {
+        let explicit = CGRect(x: 900, y: 32, width: 44, height: 44)
+        let registered = CGRect(x: 800, y: 40, width: 44, height: 44)
+        let fallback = CGRect(x: 700, y: 40, width: 44, height: 44)
+        XCTAssertEqual(NibBudSource.resolve(explicit: explicit, registered: registered, fallback: fallback), explicit)
+        XCTAssertEqual(NibBudSource.resolve(explicit: nil, registered: registered, fallback: fallback), registered)
+        XCTAssertEqual(NibBudSource.resolve(explicit: nil, registered: nil, fallback: fallback), fallback)
+        XCTAssertEqual(NibBudSource.resolve(explicit: nil, registered: nil, fallback: nil), .zero)
+    }
+
     func testShortWindowPlacementDoesNotOscillateWhenContentShrinksOrGrows() {
         let bounds = CGRect(x: 0, y: 0, width: 600, height: 400)
         let source = CGRect(x: 450, y: 32, width: 44, height: 44)

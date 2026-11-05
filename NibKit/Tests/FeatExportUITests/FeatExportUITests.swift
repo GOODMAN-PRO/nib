@@ -174,6 +174,33 @@ final class FeatExportUITests: XCTestCase {
         }
     }
 
+    func testPopoverDialogPinsPrimaryActionsBelowItsSingleOptionsScroller() async throws {
+        let (h, presenter, _) = harness()
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        let content = ExportDialog(selection: selection, printing: false, app: h.app, session: h.session,
+                                   dismiss: {}, draft: draft, scrollsOptions: true)
+            .environment(\.dynamicTypeSize, .large)
+            .ignoresSafeArea()
+        let host = UIHostingController(rootView: content)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 280, height: 432))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        func scrolls(in view: UIView) -> [UIScrollView] {
+            ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap { scrolls(in: $0) }
+        }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        let views = scrolls(in: host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
+        XCTAssertEqual(views.count, 1, "The popover must have exactly one vertical scroll owner")
+        let scroll = try XCTUnwrap(views.first)
+        let frame = scroll.convert(scroll.bounds, to: host.view)
+        XCTAssertGreaterThan(frame.height, NibMetrics.hitTarget)
+        XCTAssertLessThanOrEqual(frame.maxY, host.view.bounds.height - 2 * NibMetrics.hitTarget - NibSpacing.s,
+                                 "Share and Save to Files must remain below the options viewport")
+    }
+
     func testBoardOptionsPresentBeforeFloatingAnchorAttaches() async throws {
         let (h, presenter, probe) = harness()
         h.session.document = Fixtures.whiteboardID

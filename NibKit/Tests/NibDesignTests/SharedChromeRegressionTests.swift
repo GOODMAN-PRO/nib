@@ -8,6 +8,45 @@ import NibContracts
 
 @MainActor
 final class SharedChromeRegressionTests: XCTestCase {
+    func testExplicitAndFallbackPopoversClearPaletteAndUseAvailableHeight() async throws {
+        let heights: [CGFloat] = [400, 1376]
+        for explicit in [false, true] {
+            for height in heights {
+                let bounds = CGRect(x: 0, y: 0, width: 1032, height: height)
+                let source = CGRect(x: 900, y: 32, width: 44, height: 44)
+                let palette = CGRect(x: 280, y: 100, width: 469, height: 56)
+                let field = DropletField()
+                field.bounds = bounds
+                field.mode = .off
+                field.setWorldAnchor(NibPalettePresentation.anchorPrefix + "palette", palette)
+                let popover = NibBudPopover(id: "export", source: "unregistered", isPresented: .constant(true),
+                    title: "Share & Export", sourceRect: explicit ? source : nil,
+                    fallbackSourceRect: source, instant: true, onClose: {}, scrollsContent: false) {
+                    ScrollView { Color.clear.frame(height: 900) }
+                }
+                XCTAssertTrue(popover.instant)
+                let content = popover.environment(field)
+                    .environment(\.horizontalSizeClass, .regular)
+                    .environment(\.dynamicTypeSize, .large)
+                    .coordinateSpace(NibLiquid.space).ignoresSafeArea()
+                    .transaction { $0.disablesAnimations = true; $0.animation = nil }
+                let host = UIHostingController(rootView: content)
+                let window = UIWindow(frame: bounds)
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil; field.setActive(false) }
+                host.view.frame = bounds
+                for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+                let frame = try XCTUnwrap(field.anchorRect("export"))
+                XCTAssertEqual(frame.height, min(520, height - 16 - palette.maxY - 20), accuracy: 1)
+                XCTAssertGreaterThanOrEqual(frame.minY, palette.maxY + 20 - 1)
+                XCTAssertLessThanOrEqual(frame.maxY, bounds.maxY - 16 + 1)
+                XCTAssertFalse(frame.intersects(palette))
+                XCTAssertTrue(field.node("export").presentation.revealed, "Keyboard presentation reveals content immediately")
+            }
+        }
+    }
+
     func testBudPopoverUsesMeasuredHeightBeforeFlippingSide() async throws {
         let bounds = CGRect(x: 0, y: 0, width: 700, height: 700)
         let source = CGRect(x: 328, y: 400, width: 44, height: 44)

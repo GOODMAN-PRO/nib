@@ -226,11 +226,49 @@ struct ExportDialog: View {
     let session: EditorSession?
     let dismiss: () -> Void
     @State var draft: ExportDraft
+    var scrollsOptions = false
     @State private var working = false
     @State private var error: String?
     @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
+        Group {
+            if scrollsOptions {
+                GeometryReader { geometry in
+                    if !typeSize.isAccessibilitySize && geometry.size.height >= 4 * NibMetrics.hitTarget {
+                        VStack(alignment: .leading, spacing: NibSpacing.l) {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: NibSpacing.l) { options; secondaryActions }
+                                    .padding(.bottom, NibSpacing.l)
+                            }
+                            .scrollBounceBehavior(.basedOnSize)
+                            .scrollIndicators(.visible)
+                            .nibFadeBottomEdge()
+                            primaryActions
+                        }
+                    } else {
+                        // Short windows and large text keep all actions reachable in one scroller.
+                        ScrollView { form.padding(.bottom, NibSpacing.l) }
+                            .scrollBounceBehavior(.basedOnSize)
+                            .scrollIndicators(.visible)
+                            .nibFadeBottomEdge()
+                    }
+                }
+            } else {
+                form
+            }
+        }
+        .foregroundStyle(NibColor.label)
+        .tint(NibColor.accent)
+        .disabled(working)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var form: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.l) { options; primaryActions; secondaryActions }
+    }
+
+    private var options: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             if !printing {
                 NibInspectorSection(String(localized: "Format")) {
@@ -304,6 +342,11 @@ struct ExportDialog: View {
                 NibToggle(String(localized: "Tile board onto paper pages"), isOn: Binding(get: { draft.options["board"]?.stringValue == "tiled" },
                     set: { draft.options.set("board", .string($0 ? "tiled" : "single")) }))
             }
+        }
+    }
+
+    private var primaryActions: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.s) {
             if let error { NibBanner(error, style: .warning) }
             if working { ExportProgress() }
             if printing {
@@ -311,6 +354,13 @@ struct ExportDialog: View {
             } else {
                 NibButton(String(localized: "Share…"), symbol: .share, kind: .primary, expands: true, shortcut: .defaultAction) { submit("share") }
                 NibButton(String(localized: "Save to Files"), symbol: .saveToFiles, expands: true) { submit("files") }
+            }
+        }
+    }
+
+    private var secondaryActions: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.l) {
+            if !printing {
                 Text(String(localized: "For multiple files in cloud storage, use Save to Files."))
                     .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary).fixedSize(horizontal: false, vertical: true)
                 if selection.documents.count == 1 && selection.formats.contains(where: { $0.fileExtension == "pdf" }) {
@@ -331,10 +381,6 @@ struct ExportDialog: View {
                 }
             }
         }
-        .foregroundStyle(NibColor.label)
-        .tint(NibColor.accent)
-        .disabled(working)
-        .accessibilityElement(children: .contain)
     }
     private func field(_ label: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
@@ -494,8 +540,6 @@ struct ExportPopover: View {
     let instant: Bool
     @State private var presented = true
     @State private var currentSourceRect: CGRect?
-    @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 200)
-    @Environment(\.horizontalSizeClass) private var sizeClass
     var body: some View {
         ZStack {
             // Capture outside touches before they reach the canvas.
@@ -505,19 +549,10 @@ struct ExportPopover: View {
                 let bounds = geometry.frame(in: NibLiquid.space)
                 // The floating layer may attach after the command runs. Keep the options
                 // visible while its UIKit reference view becomes available.
-                let anchor = currentSourceRect ?? sourceRect ?? ExportPopover.fallbackAnchor(in: bounds)
-                let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
-                // NibBudPopover's .below rule: retain the source gap and clamp only horizontally.
-                let inset = bounds.insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
-                let halfWidth = popoverSize.width / 2
-                let centreX = min(max(anchor.midX, inset.minX + halfWidth),
-                                  max(inset.minX + halfWidth, inset.maxX - halfWidth))
-                NibPopoverPanel(title: title, width: NibMetrics.popoverWidth) { contents }
-                    .onGeometryChange(for: CGSize.self) { $0.size } action: { popoverSize = $0 }
-                    .droplet("exportui.popover", style: .popover)
-                    .budsFrom(source, isPresented: $presented, instant: instant)
-                    .position(x: centreX - bounds.minX,
-                              y: anchor.maxY + gap + popoverSize.height / 2 - bounds.minY)
+                NibBudPopover(id: "exportui.popover", source: source, isPresented: $presented, title: title,
+                              sourceRect: currentSourceRect ?? sourceRect,
+                              fallbackSourceRect: Self.fallbackAnchor(in: bounds), instant: instant,
+                              onClose: close, scrollsContent: false) { contents }
                     .onGeometryChange(for: CGRect.self) { _ in bounds } action: { _ in
                         currentSourceRect = updateSourceRect()
                     }
@@ -536,9 +571,8 @@ struct ExportPopover: View {
     }
     private var title: String { printing ? String(localized: "Print") : String(localized: "Share & Export") }
     @ViewBuilder private var contents: some View {
-        // NibPopoverPanel owns the title row. Bud dismissal handles Escape and VoiceOver;
-        // the outside-touch shield also closes the popover without an extra header row.
-        ExportDialog(selection: selection, printing: printing, app: app, session: session, dismiss: close, draft: draft)
+        ExportDialog(selection: selection, printing: printing, app: app, session: session, dismiss: close,
+                     draft: draft, scrollsOptions: true)
     }
     private func close() { host.dismiss("exportui.dialog"); host.removeAnchor("exportui.source") }
 }
