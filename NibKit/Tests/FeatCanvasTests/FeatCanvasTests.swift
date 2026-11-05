@@ -2039,6 +2039,18 @@ final class FeatCanvasTests: XCTestCase {
 
     // MARK: HUD
 
+    func testCancelledScrubStartsAtTheCurrentPage() {
+        var state = PageScrubState()
+        state.begin(at: 2)
+        XCTAssertEqual(state.destination(current: 2, translation: 30, step: 10), 5)
+        state.begin(at: 5)
+        XCTAssertEqual(state.destination(current: 5, translation: 30, step: 10), 5)
+        // GestureState restores this value on cancellation as well as normal completion.
+        state = PageScrubState()
+        state.begin(at: 5)
+        XCTAssertEqual(state.destination(current: 5, translation: 10, step: 10), 6)
+    }
+
     func testPageAndZoomHUDs() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)

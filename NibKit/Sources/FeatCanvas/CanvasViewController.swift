@@ -1755,9 +1755,17 @@ final class CanvasHUDModel: ObservableObject {
 /// The page HUD (DESIGN.md §14.2, D-125): the navigator glyph and "3 / 12", bottom-right, clear of the palette (the
 /// chrome places it). Tap the glyph for the page navigator; drag along the HUD to scrub pages. On a board it shows the
 /// zoom instead (§14.17). The chrome gives it its Clear droplet.
+struct PageScrubState {
+    private(set) var origin: Int?
+    mutating func begin(at page: Int) { if origin == nil { origin = page } }
+    func destination(current: Int, translation: CGFloat, step: CGFloat) -> Int {
+        (origin ?? current) + Int((translation / step).rounded(.towardZero))
+    }
+}
+
 struct CanvasPageHUD: View {
     @ObservedObject var model: CanvasHUDModel
-    @State private var scrubStart: Int?
+    @GestureState private var scrub = PageScrubState()
     /// Points of drag per page when scrubbing along the HUD.
     private static let scrubStep = NibSpacing.xxl
     /// Movement before a press on the HUD becomes a scrub (a tap on the glyph stays a tap).
@@ -1782,14 +1790,12 @@ struct CanvasPageHUD: View {
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: CanvasPageHUD.scrubSlop)
+                .updating($scrub) { _, state, _ in state.begin(at: model.pageIndex ?? 0) }
                 .onChanged { value in
                     guard !model.isBoard else { return }
-                    let start = scrubStart ?? (model.pageIndex ?? 0)
-                    if scrubStart == nil { scrubStart = start }
-                    let delta = Int((value.translation.width / CanvasPageHUD.scrubStep).rounded(.towardZero))
-                    model.go(to: start + delta)
+                    model.go(to: scrub.destination(current: model.pageIndex ?? 0,
+                        translation: value.translation.width, step: CanvasPageHUD.scrubStep))
                 }
-                .onEnded { _ in scrubStart = nil }
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(model.accessibilityLabel)
