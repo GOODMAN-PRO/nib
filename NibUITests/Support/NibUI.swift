@@ -458,7 +458,8 @@ final class NibUI {
     }
 
     func logStateStep(_ step: String) {
-        let value = (try? probe.snapshot())?.value
+        // The attribute, not a snapshot: snapshots truncate the probe's long JSON value.
+        let value = probe.exists ? probe.value : nil
         logQA("State step", "\(step) probe=\(String(describing: value))")
     }
 
@@ -1544,8 +1545,11 @@ final class NibUI {
     }
 
     private func readState() throws -> QAState? {
-        guard let snapshot = try? probe.snapshot(),
-              let state = try NibUITestSnapshot.decode(snapshot.value, as: QAState.self) else { return nil }
+        // Read the attribute itself: an XCUIElementSnapshot truncates long values, and the probe's JSON is long.
+        // The snapshot-based read of round 8 failed the first decode of the smoke gate (run 41996886696,
+        // "The given data was not valid JSON ... Unexpected end of file").
+        guard probe.exists,
+              let state = try NibUITestSnapshot.decode(probe.value, as: QAState.self) else { return nil }
         if let failure = state.fixtureError { throw Failure.message("Fixture failed: \(failure)") }
         return state
     }

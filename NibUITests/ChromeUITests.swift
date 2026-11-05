@@ -337,7 +337,8 @@ final class ChromeUITests: XCTestCase {
     // chrome.options; chrome.moreTools; chrome.scrubTools
     private func assertToolSettings(_ expected: String?, obsolete label: String) throws {
         try wait("Tool settings must match the current presentation") {
-            guard let snapshot = try? self.ui.probe.snapshot(), let value = snapshot.value as? String,
+            // The attribute, not a snapshot: snapshots truncate the probe's long JSON value.
+            guard self.ui.probe.exists, let value = self.ui.probe.value as? String,
                   let data = value.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let state = try? JSONDecoder().decode(QAState.self, from: data) else { return false }
