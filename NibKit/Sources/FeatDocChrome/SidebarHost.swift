@@ -19,11 +19,11 @@ struct SidebarPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             // §14.4: tabs lead every navigator, including panels that embed their own header.
-            if selected.id != PanelIDs.assistant {
+            // The host menu rides in the tab row only when that row exists: a self-headed panel on its own
+            // keeps its single header (no second, untitled More row).
+            if selected.id != PanelIDs.assistant, SidebarNavigation.primary(tabs).count > 1 {
                 HStack(spacing: 0) {
                     tabStrip.frame(maxWidth: .infinity)
-                    // Keep host controls in the navigation strip when the feature
-                    // supplies its own header, without adding a second header row.
                     if !chrome.drawsHeader(selected) { placementMenu }
                 }
             }
