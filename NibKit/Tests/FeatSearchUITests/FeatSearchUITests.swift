@@ -559,6 +559,45 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertEqual(state.selectedID, second.id)
     }
 
+    func testMatchPaginationStopsWhenDismissedReplacedOrCancelled() async throws {
+        for interruption in ["dismiss", "replace", "cancel"] {
+            let h = Harness(features: [FeatSearchUIFeature.self])
+            installDependencies(h, hits: [])
+            let first = hit()
+            var release: CheckedContinuation<Void, Never>?
+            var calls = 0
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.searchText, title: "Search",
+                summary: "Suspend the next result page.", params: .anything(), effect: .read)) { params, _ in
+                calls += 1
+                if params["cursor"] != nil { await withCheckedContinuation { release = $0 } }
+                return try JSONValue.from(SearchResponse(results: [first], total: 501, truncated: true, cursor: "next"))
+            }
+            try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+            try await h.run(CommandIDs.panelOpen, ["id": .string(SearchOpen.documentPanel)])
+            let state = SearchRuntime.from(h.app).state(h.session)
+            let pending = Task { try await h.run(CommandIDs.searchOpen, ["scope": "document", "match": 500]) }
+            for _ in 0..<100 where release == nil { await Task.yield() }
+            guard let release else { XCTFail("Pagination did not suspend"); pending.cancel(); return }
+            switch interruption {
+            case "dismiss":
+                h.session.openPanels.remove(SearchOpen.documentPanel)
+                XCTAssertFalse(state.isPresented)
+                XCTAssertNotNil(state.cursor, "Exercise dismissal with a retained cursor")
+            case "replace":
+                // Same scope and text, but a newer search owns the visible results.
+                state.generation += 1
+                state.loading = false
+            default:
+                pending.cancel()
+            }
+            release.resume()
+            _ = try await pending.value
+            XCTAssertEqual(calls, 2, "The abandoned match must not request another page")
+            XCTAssertEqual(state.matches, [first])
+            XCTAssertNil(state.flashID, "The abandoned match must not navigate")
+        }
+    }
+
     func testLateQueryResponseCannotReplaceNewResults() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         installDependencies(h, hits: [])
