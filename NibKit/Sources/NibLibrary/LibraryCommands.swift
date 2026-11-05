@@ -684,17 +684,18 @@ enum DocumentMerger {
         // Copy asset and audio bytes off the main actor (a dry run copies nothing).
         var names: [String: AssetRef] = [:]
         if !ctx.dryRun {
-            if let store = ctx.services.assets, !assets.isEmpty {
+            if !assets.isEmpty {
+                let store = try ctx.services.require(ctx.services.assets, "the asset store")
                 let refs = Array(assets)
                 names = try await Task.detached(priority: .userInitiated) {
                     try AssetRemap.copy(refs, from: source, to: target, store: store)
                 }.value
             }
-            let files = audioFiles(clips, from: source, to: target, ctx)
+            let files = try audioFiles(clips, from: source, to: target, ctx)
             if !files.isEmpty {
-                await Task.detached(priority: .userInitiated) {
+                try await Task.detached(priority: .userInitiated) {
                     for f in files where !FileManager.default.fileExists(atPath: f.to.path) {
-                        try? FileManager.default.copyItem(at: f.from, to: f.to)
+                        try FileManager.default.copyItem(at: f.from, to: f.to)
                     }
                 }.value
             }
@@ -789,24 +790,26 @@ enum DocumentMerger {
 
     /// Audio files (and per-device transcript files) of `clips` to copy into the target package.
     private static func audioFiles(_ clips: [AudioClip], from source: DocumentID, to target: DocumentID,
-                                   _ ctx: CommandContext) -> [(from: URL, to: URL)] {
+                                   _ ctx: CommandContext) throws -> [(from: URL, to: URL)] {
         let persistence = ctx.workspace.persistence
         let fm = FileManager.default
         var out: [(from: URL, to: URL)] = []
         for clip in clips {
-            if let from = try? persistence.fileURL(source, relativePath: clip.file), fm.fileExists(atPath: from.path),
-               let to = try? persistence.fileURL(target, relativePath: clip.file) {
-                out.append((from, to))
+            let from = try persistence.fileURL(source, relativePath: clip.file)
+            guard fm.fileExists(atPath: from.path) else {
+                throw NibError(.notFound, String(localized: "A recording could not be read. Download it before combining notebooks."))
             }
-            guard let base = clip.transcriptFile, let fromBase = try? persistence.fileURL(source, relativePath: base) else { continue }
+            let to = try persistence.fileURL(target, relativePath: clip.file)
+            out.append((from, to))
+            guard let base = clip.transcriptFile else { continue }
+            let fromBase = try persistence.fileURL(source, relativePath: base)
             let dir = fromBase.deletingLastPathComponent()
             let stem = fromBase.lastPathComponent + "."
             let relativeDir = (base as NSString).deletingLastPathComponent
-            for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] where name.hasPrefix(stem) && name.hasSuffix(".json") {
+            for name in try fm.contentsOfDirectory(atPath: dir.path) where name.hasPrefix(stem) && name.hasSuffix(".json") {
                 let rel = relativeDir.isEmpty ? name : relativeDir + "/" + name
-                if let to = try? persistence.fileURL(target, relativePath: rel) {
-                    out.append((dir.appendingPathComponent(name), to))
-                }
+                let to = try persistence.fileURL(target, relativePath: rel)
+                out.append((dir.appendingPathComponent(name), to))
             }
         }
         return out
@@ -822,7 +825,7 @@ enum AssetRemap {
         var out: [String: AssetRef] = [:]
         for ref in refs {
             if store.url(ref, doc: target) != nil { continue }
-            guard let data = try? store.data(ref, doc: source) else { continue }
+            let data = try store.data(ref, doc: source)
             let stored = try store.put(data, ext: ref.ext.isEmpty ? "bin" : ref.ext, doc: target)
             if stored != ref { out[ref.name] = stored }
         }

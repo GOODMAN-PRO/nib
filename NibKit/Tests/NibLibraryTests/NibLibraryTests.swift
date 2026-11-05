@@ -625,6 +625,8 @@ final class NibLibraryTests: XCTestCase {
 
     func testMergeAppendsPagesItemsAssetsAndTrashesTheSource() async throws {
         let h = Harness(features: [NibLibraryFeature.self])
+        let recording = try h.app.workspace.persistence.fileURL(Fixtures.docID, relativePath: "audio/FIXTUREAUD01.caf")
+        try Data("fixture recording bytes".utf8).write(to: recording)
         let target = docID(try await h.run("doc.create", ["kind": "notebook", "title": "Combined", "cover": false]))
         let before = try h.app.workspace.content(target).livePages.count
         let r = try await h.run("doc.merge", ["source": .string("doc:\(Fixtures.docID.raw)"), "into": .string("doc:\(target.raw)")])
@@ -640,8 +642,44 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertNoThrow(try h.assets.data(pdf, doc: target))
         XCTAssertEqual(merged.liveOutline.map { $0.page }, [Fixtures.page1])
         XCTAssertEqual(merged.liveAudio.map { $0.id }, [Fixtures.audioID])
+        let copied = try h.app.workspace.persistence.fileURL(target, relativePath: "audio/FIXTUREAUD01.caf")
+        XCTAssertEqual(try Data(contentsOf: copied), try Data(contentsOf: recording))
         XCTAssertNotNil(h.library.node(Fixtures.docID)?.trashedAt, "the source goes to the Trash")
         XCTAssertEqual(h.undoDepth(target), 0, "a library operation is not on the undo stack")
+    }
+
+    func testMergeMissingAssetLeavesDestinationAndSourceUnchanged() async throws {
+        let h = Harness(features: [NibLibraryFeature.self])
+        h.app.services.assets = InMemoryAssetStore(root: h.persistence.root)
+        let target = docID(try await h.run("doc.create", ["kind": "notebook", "title": "Target", "cover": false]))
+        let before = try h.app.workspace.content(target)
+        do {
+            try await h.run("doc.merge", ["source": .string("doc:\(Fixtures.docID.raw)"), "into": .string("doc:\(target.raw)")])
+            XCTFail("A missing required asset must stop Combine")
+        } catch {}
+        XCTAssertEqual(try h.app.workspace.content(target), before)
+        XCTAssertNil(h.library.node(Fixtures.docID)?.trashedAt)
+    }
+
+    func testMergeMissingOrUncopyableRecordingLeavesDestinationAndSourceUnchanged() async throws {
+        for blockDestination in [false, true] {
+            let h = Harness(features: [NibLibraryFeature.self])
+            let target = docID(try await h.run("doc.create", ["kind": "notebook", "title": "Target", "cover": false]))
+            let before = try h.app.workspace.content(target)
+            if blockDestination {
+                let recording = try h.app.workspace.persistence.fileURL(Fixtures.docID, relativePath: "audio/FIXTUREAUD01.caf")
+                try Data("recording".utf8).write(to: recording)
+                let destination = try h.app.workspace.persistence.fileURL(target, relativePath: "audio/FIXTUREAUD01.caf")
+                try FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+                try Data("blocks audio directory".utf8).write(to: destination.deletingLastPathComponent())
+            }
+            do {
+                try await h.run("doc.merge", ["source": .string("doc:\(Fixtures.docID.raw)"), "into": .string("doc:\(target.raw)")])
+                XCTFail("A missing or uncopyable recording must stop Combine")
+            } catch {}
+            XCTAssertEqual(try h.app.workspace.content(target), before)
+            XCTAssertNil(h.library.node(Fixtures.docID)?.trashedAt)
+        }
     }
 
     func testMergingAWhiteboardIntoANotebookGivesItsBoardsAPageSize() async throws {
