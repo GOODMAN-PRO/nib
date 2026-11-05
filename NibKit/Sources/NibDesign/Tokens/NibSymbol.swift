@@ -212,10 +212,10 @@ public struct NibSymbol: Hashable, Sendable {
     public static let history = NibSymbol("clock.arrow.circlepath")
 
     // Settings and places
-    /// The Accessibility settings page, distinct from the Speak action (SF Symbols 5, iOS 17).
-    public static let accessibility = NibSymbol("accessibility")
-    /// Recording preferences, distinct from the transcript's captions bubble.
-    public static let recordingSettings = NibSymbol("waveform")
+    /// The Accessibility settings page, using the iOS 17-compatible standing figure.
+    public static let accessibility = NibSymbol("figure.stand")
+    /// Recording preferences, distinct from Record and the transcript's captions bubble.
+    public static let recordingSettings = NibSymbol("waveform.circle")
     /// Start Quick Lesson, distinct from exporting or sharing a document.
     public static let lesson = NibSymbol("play.rectangle")
     public static let profile = NibSymbol("person.crop.circle")

@@ -174,21 +174,17 @@ public enum NibBudPlacement: Sendable {
         return result
     }
 
-    /// Resolve obstruction and side before measuring content. Never feed the resulting
+    /// Resolve obstruction and available space before measuring content. Never feed the resulting
     /// viewport back into this decision: a short viewport can otherwise undo its own avoidance.
     func layout(beside source: CGRect, width: CGFloat, gap: CGFloat, in bounds: CGRect,
-                avoiding obstacles: [CGRect]) -> (anchor: CGRect, side: Self, available: CGSize) {
+                avoiding obstacles: [CGRect]) -> (anchor: CGRect, available: CGSize) {
         let ideal = CGSize(width: max(0, NibGeometry.finite(width)), height: NibMetrics.popoverMaxHeight)
         let anchor = unobstructedAnchor(source, size: ideal, gap: gap, in: bounds, avoiding: obstacles)
         let available = availableSize(beside: anchor, gap: gap, in: bounds)
-        let b = insetBounds(bounds)
-        let gap = max(0, NibGeometry.finite(gap))
-        let preferred = room(beside: anchor, gap: gap, in: b)
-        let alternate = opposite.room(beside: anchor, gap: gap, in: b)
-        let extent = (self == .below || self == .above) ? ideal.height : ideal.width
-        let side = preferred < extent && alternate > preferred ? opposite : self
-        return (anchor, side, CGSize(width: min(ideal.width, available.width),
-                                     height: min(ideal.height, available.height)))
+        // Only centre() chooses the final side, using measured content. A short popover
+        // should keep its requested side even when the ideal 520 pt viewport would not fit.
+        return (anchor, CGSize(width: min(ideal.width, available.width),
+                               height: min(ideal.height, available.height)))
     }
 
     /// Constrain the scrolling viewport before measuring it, choosing the larger side if necessary.
@@ -271,7 +267,7 @@ public struct NibBudPopover<Content: View>: View {
             let layout = placement.layout(beside: sourceAnchor, width: width, gap: gap, in: bounds, avoiding: palettes)
             let fitted = CGSize(width: min(size.width, layout.available.width),
                                 height: min(size.height, layout.available.height))
-            let centre = layout.side.centre(size: fitted, beside: layout.anchor, gap: gap, in: bounds)
+            let centre = placement.centre(size: fitted, beside: layout.anchor, gap: gap, in: bounds)
             NibPopoverPanel(title: title, subtitle: subtitle, width: layout.available.width,
                             maxHeight: layout.available.height) { content }
                 .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
