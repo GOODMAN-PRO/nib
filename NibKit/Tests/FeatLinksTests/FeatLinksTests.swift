@@ -386,6 +386,40 @@ final class FeatLinksTests: XCTestCase {
         XCTAssertEqual(try fixtureText(h).plainText, target.excerpt)
     }
 
+    func testOpenLinkEditorRejectsChangedTextForSaveAndRemove() async throws {
+        for removing in [false, true] {
+            let h = harness()
+            try await h.run("link.set", ["ref": .string(textRef), "range": [6, 3], "link": ["url": "https://original.example"]])
+            let target = try LinkEditorPresenter.makeTarget(ref: textRef, range: [6, 3], editing: nil,
+                workspace: h.app.workspace, content: h.app.content)
+            let model = LinkEditorModel(app: h.app, session: h.session, target: target)
+            model.url = "https://new.example"
+            h.app.commands.register(CommandDescriptor(id: "test.prepend", title: "Prepend", summary: "Change linked text.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                    item.text?.text = RichText(plain: "Extra Hello Nib")
+                    try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+                }
+                return [:]
+            }
+            try await h.run("test.prepend")
+            // The stale numeric range now covers different text, with a link that removal must preserve.
+            try await h.run("link.set", ["ref": .string(textRef), "range": [6, 3], "link": ["url": "https://elsewhere.example"]])
+            let before = try h.snapshot()
+            let depth = h.undoDepth(Fixtures.docID)
+            var dismissed = false
+            model.dismiss = { dismissed = true }
+            if removing { model.remove() } else { model.save() }
+            for _ in 0..<100 where model.isSaving { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertFalse(model.isSaving)
+            XCTAssertNotNil(model.errorMessage)
+            XCTAssertFalse(dismissed)
+            XCTAssertEqual(model.url, "https://new.example")
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        }
+    }
+
     func testEditorTargetsTheLinkAroundACaretOrTheWholeText() async throws {
         let h = harness()
         try await h.run("link.set", ["ref": .string(textRef), "range": [6, 3], "link": ["url": "https://nib.example"]])

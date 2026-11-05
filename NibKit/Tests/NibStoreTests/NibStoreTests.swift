@@ -64,6 +64,155 @@ final class NibStoreTests: XCTestCase {
         }
     }
 
+    func testUnreadableOwnPageIsNotCachedAndRecoveredInkSurvivesEditing() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        let url = pageFile(pkg, Fixtures.page1)
+        let original = try Data(contentsOf: url)
+        try Data("temporarily unreadable".utf8).write(to: url)
+        let workspace = Workspace(clock: HLCClock(device: 10), persistence: store, events: EventBus())
+        XCTAssertThrowsError(try workspace.allItems(doc, page: Fixtures.page1))
+        XCTAssertFalse(workspace.isPageCached(doc, page: Fixtures.page1))
+        store.flush(doc)
+        XCTAssertEqual(try Data(contentsOf: url), Data("temporarily unreadable".utf8))
+
+        try original.write(to: url)
+        var recovered = try workspace.allItems(doc, page: Fixtures.page1)
+        let added = walStroke("AFTERREADRECOVERY")
+        recovered.append(added)
+        store.didChange(doc, head: nil, pages: [Fixtures.page1: recovered])
+        store.flush(doc)
+        let saved = try lib.store("0000000a").loadItems(doc, page: Fixtures.page1)
+        XCTAssertEqual(Set(saved.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
+    }
+
+    func testPageEnumerationFailureIsNotCachedAndRecoveredInkSurvivesEditing() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        let dir = pageFile(pkg, Fixtures.page1).deletingLastPathComponent()
+        let backup = pkg.appendingPathComponent("saved-page", isDirectory: true)
+        try FileManager.default.moveItem(at: dir, to: backup)
+        // A plain file deterministically fails directory enumeration without relying on simulator permissions.
+        try Data("directory unavailable".utf8).write(to: dir)
+        let workspace = Workspace(clock: HLCClock(device: 10), persistence: store, events: EventBus())
+        XCTAssertThrowsError(try workspace.allItems(doc, page: Fixtures.page1))
+        XCTAssertFalse(workspace.isPageCached(doc, page: Fixtures.page1))
+        XCTAssertNil(store.contentRevision(doc, page: Fixtures.page1))
+        store.flush(doc)
+        try FileManager.default.removeItem(at: dir)
+        try FileManager.default.moveItem(at: backup, to: dir)
+        var recovered = try workspace.allItems(doc, page: Fixtures.page1)
+        let added = walStroke("AFTERLISTRECOVERY")
+        recovered.append(added)
+        store.didChange(doc, head: nil, pages: [Fixtures.page1: recovered])
+        try store.checkpoint(doc)
+        let saved = try lib.store("0000000a").loadItems(doc, page: Fixtures.page1)
+        XCTAssertEqual(Set(saved.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
+    }
+
+    func testEvictedOwnPageFileIsNotCachedAndOriginalInkSurvivesCommandEdit() async throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        let file = pageFile(pkg, Fixtures.page1)
+        let original = try Data(contentsOf: file)
+        let placeholder = file.deletingLastPathComponent().appendingPathComponent(".0000000a.nibpage.icloud")
+        try FileManager.default.removeItem(at: file)
+        try Data().write(to: placeholder)
+
+        let h = Harness(deviceID: 10)
+        h.app.workspace.persistence = store
+        XCTAssertThrowsError(try h.app.workspace.allItems(doc, page: Fixtures.page1))
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: Fixtures.page1))
+        XCTAssertNil(store.contentRevision(doc, page: Fixtures.page1))
+        let added = walStroke("AFTERDOWNLOAD")
+        do {
+            try await h.insert([added], page: Fixtures.page1, doc: doc)
+            XCTFail("an ink command must refuse an incomplete page")
+        } catch {}
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: Fixtures.page1))
+        store.flush(doc)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+        try original.write(to: file)
+        try FileManager.default.removeItem(at: placeholder)
+        let written = try await h.insert([added], page: Fixtures.page1, doc: doc)
+        store.flush(doc)
+        let saved = try lib.store("0000000a").loadItems(doc, page: Fixtures.page1)
+        let expected = try XCTUnwrap(items[Fixtures.page1]) + written
+        XCTAssertEqual(saved.count, expected.count)
+        for item in expected { XCTAssertTrue(saved.contains(item), "all original ink and the edit survive") }
+    }
+
+    func testUnwrittenPageIsEmptyButMissingPackageIsNot() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let doc = Fixtures.docID
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page1), [])
+        try FileManager.default.createDirectory(at: pkg.appendingPathComponent("pages"), withIntermediateDirectories: true)
+        XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page1), [])
+        let placeholder = pkg.appendingPathComponent("pages/." + Fixtures.page1.raw + ".icloud")
+        try Data().write(to: placeholder)
+        XCTAssertThrowsError(try store.loadItems(doc, page: Fixtures.page1),
+                             "an evicted page directory is not an unwritten page")
+        try FileManager.default.removeItem(at: placeholder)
+        try FileManager.default.removeItem(at: pkg)
+        XCTAssertThrowsError(try store.loadItems(doc, page: Fixtures.page1))
+    }
+
+    func testIndexSweepDoesNotRetainClosedPackageSnapshots() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let writer = lib.store("0000000a")
+        var heads: [DocumentContent] = []
+        let (fixture, items) = Fixtures.sampleContent()
+        for index in 0..<(PackagePersistence.closedReadCacheLimit + 16) {
+            var head = fixture
+            head.meta.id = NibID("INDEXED\(index)")
+            heads.append(head)
+            lib.package(head.meta.id)
+            writer.didChange(head.meta.id, head: head, pages: items)
+            writer.flush(head.meta.id)
+        }
+        let pinned = try XCTUnwrap(heads.first).meta.id
+        let reader = PackagePersistence(device: "0000000a", locator: lib.locator, events: nil, gate: ReadOnlyGate(),
+                                        walDirectory: writer.wal.directory, debounce: 3600,
+                                        isDocumentOpen: { $0 == pinned })
+        for head in heads {
+            XCTAssertEqual(try reader.loadHead(head.meta.id), head)
+            for (page, expected) in items {
+                XCTAssertEqual(try reader.loadItems(head.meta.id, page: page), expected)
+                _ = reader.contentRevision(head.meta.id, page: page)
+            }
+            XCTAssertLessThanOrEqual(reader.retainedReadDocuments.count, PackagePersistence.closedReadCacheLimit + 1)
+            if head.meta.id == heads[23].meta.id {
+                XCTAssertTrue(reader.retainedReadDocuments.contains(heads[1].meta.id),
+                              "a library with 24 mounted covers keeps its revision working set")
+            }
+        }
+        XCTAssertTrue(reader.retainedReadDocuments.contains(pinned), "open documents retain remote-change baselines")
+        XCTAssertFalse(reader.retainedReadDocuments.contains(heads[1].meta.id))
+        XCTAssertEqual(try reader.loadHead(heads[1].meta.id), heads[1], "evicted snapshots remain readable")
+    }
+
     func testCompactPointsAreLossless() throws {
         var points: [StrokePoint] = []
         for i in 0..<50 {
@@ -183,6 +332,8 @@ final class NibStoreTests: XCTestCase {
         lib.package(other.meta.id)
         store.didChange(other.meta.id, head: other, pages: items)
         store.flush(other.meta.id)
+        let workspace = Workspace(clock: HLCClock(device: 10), persistence: store, events: EventBus())
+        _ = try workspace.allItems(other.meta.id, page: Fixtures.page1)
 
         // Simulate a provider holding the head until the UI has finished reading. The watchdog prevents a broken
         // implementation from hanging the test process; waiting for it is a failure, not the synchronization path.
@@ -214,6 +365,10 @@ final class NibStoreTests: XCTestCase {
         store.didChange(doc, head: head, pages: [Fixtures.page2: [nudged]])
         store.write(doc, synchronously: false)
 
+        // This clean document has no durability obligation. Eviction must finish before releasing the held
+        // writer above; draining the shared queue here would hit that writer's bounded watchdog.
+        workspace.evictPages(other.meta.id, keeping: [])
+        XCTAssertFalse(workspace.isPageCached(other.meta.id, page: Fixtures.page1))
         XCTAssertEqual(try store.loadHead(doc), head)
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [nudged])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), nudged.rev)
@@ -271,10 +426,14 @@ final class NibStoreTests: XCTestCase {
         store.write(doc, synchronously: false)
         store.waitForIO()
         XCTAssertTrue(store.wal.read(doc).isEmpty)
+        XCTAssertThrowsError(try store.loadItems(doc, page: Fixtures.page2))
+        XCTAssertNil(store.contentRevision(doc, page: Fixtures.page2))
+        try FileManager.default.removeItem(at: blocked)
+        // The directory is readable again, but neither the package write nor WAL append has succeeded.
+        // The complete retained snapshot is still the only copy of this stroke.
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [stroke])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), stroke.rev)
 
-        try FileManager.default.removeItem(at: blocked)
         try FileManager.default.removeItem(at: store.wal.directory)
         store.flush(doc)
         XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [stroke])
@@ -361,6 +520,125 @@ final class NibStoreTests: XCTestCase {
 
     /// Same interleaving, but the failed page still cannot be written. The flush then fails as a whole and truncates
     /// nothing, so every logged change is recovered from the log after a crash.
+    func testCheckpointThrowsUntilFailedPageWriteIsDurable() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        try store.checkpoint(doc)
+        let blocked = try blockPageFolder(pkg, Fixtures.page2)
+        let stroke = walStroke("CHECKPOINTINK")
+        store.didChange(doc, head: nil, pages: [Fixtures.page2: [stroke]])
+        XCTAssertThrowsError(try store.checkpoint(doc))
+        XCTAssertFalse(store.wal.read(doc).isEmpty)
+        try FileManager.default.removeItem(at: blocked)
+        try store.checkpoint(doc)
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+        XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [stroke])
+    }
+
+    func testCheckpointAllowsCleanReadOnlyPackagesBeforeAndAfterWALReplay() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        var (content, _) = Fixtures.sampleContent()
+        content.meta.format = NibFormat.version + 1
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let file = pkg.appendingPathComponent("doc.0000000b.json")
+        let original = try PackageCodec.encodeHead(content)
+        try original.write(to: file)
+        let store = lib.store("0000000a")
+        _ = try store.loadHead(doc)
+        XCTAssertTrue(store.isReadOnly(doc))
+        XCTAssertNoThrow(try store.checkpoint(doc))
+        XCTAssertEqual(try Data(contentsOf: file), original)
+
+        // A fresh store learns the format gate during checkpoint's WAL replay.
+        try store.wal.append(WriteAheadLog.Entry(head: content, pages: [:]), doc: doc)
+        let relaunched = lib.store("0000000a")
+        XCTAssertNoThrow(try relaunched.checkpoint(doc))
+        XCTAssertTrue(relaunched.isReadOnly(doc))
+        XCTAssertFalse(relaunched.wal.read(doc).isEmpty, "read-only recovery bytes are not discarded")
+        let duplicate = lib.root.appendingPathComponent("Duplicate.nibnote", isDirectory: true)
+        try FileManager.default.copyItem(at: pkg, to: duplicate)
+        XCTAssertEqual(try Data(contentsOf: duplicate.appendingPathComponent(file.lastPathComponent)), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pkg.appendingPathComponent("doc.0000000a.json").path))
+    }
+
+    func testCheckpointReadOnlyGateStillRefusesPendingAndFailedWrites() throws {
+        for failedWrite in [false, true] {
+            let lib = TestLibrary()
+            defer { try? FileManager.default.removeItem(at: lib.root) }
+            let (content, items) = Fixtures.sampleContent()
+            let doc = content.meta.id
+            let pkg = lib.package(doc)
+            let gate = ReadOnlyGate()
+            let store = lib.store("0000000a", gate: gate)
+            store.didChange(doc, head: content, pages: items)
+            store.flush(doc)
+            let blocked = try blockPageFolder(pkg, Fixtures.page2)
+            let added = walStroke("GATEDWRITE")
+            store.didChange(doc, head: nil, pages: [Fixtures.page2: [added]])
+            if failedWrite { store.flush(doc) }
+            gate.set(doc, readOnly: true)
+            XCTAssertThrowsError(try store.checkpoint(doc))
+            store.waitForIO()
+            XCTAssertFalse(store.wal.read(doc).isEmpty)
+            gate.set(doc, readOnly: false)
+            try FileManager.default.removeItem(at: blocked)
+            try store.checkpoint(doc)
+            XCTAssertEqual(try lib.store("0000000a").loadItems(doc, page: Fixtures.page2), [added])
+        }
+    }
+
+    func testCheckpointRecoversWALBeforeCopyingAnUnopenedPackage() throws {
+        let lib = TestLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let writer = lib.store("0000000a")
+        writer.didChange(doc, head: content, pages: items)
+        writer.flush(doc)
+        var head = content
+        head.meta.favorite = true
+        head.meta.rev = HLCClock(device: 10).tick()
+        let added = walStroke("UNOPENEDWALINK")
+        // A terminated process leaves only a delta in the WAL and stale package files.
+        try writer.wal.append(WriteAheadLog.Entry(head: head, pages: [Fixtures.page1.raw: [added]]), doc: doc)
+        let relaunched = lib.store("0000000a")
+        XCTAssertTrue(relaunched.retainedReadDocuments.isEmpty)
+        let own = pageFile(pkg, Fixtures.page1)
+        let original = try Data(contentsOf: own)
+        try Data("temporary read failure".utf8).write(to: own)
+        XCTAssertThrowsError(try relaunched.checkpoint(doc))
+        XCTAssertFalse(relaunched.wal.read(doc).isEmpty)
+        try original.write(to: own)
+        // Recovery can now read every page, but acknowledging the checkpoint still requires a durable head.
+        let headURL = pkg.appendingPathComponent("doc.0000000a.json")
+        let originalHead = try Data(contentsOf: headURL)
+        try FileManager.default.removeItem(at: headURL)
+        try FileManager.default.createDirectory(at: headURL, withIntermediateDirectories: false)
+        try Data("blocks head replacement".utf8).write(to: headURL.appendingPathComponent("blocked"))
+        XCTAssertThrowsError(try relaunched.checkpoint(doc))
+        XCTAssertFalse(relaunched.wal.read(doc).isEmpty, "failed recovery writes must retain the WAL")
+        try FileManager.default.removeItem(at: headURL)
+        try originalHead.write(to: headURL)
+        try relaunched.checkpoint(doc)
+        XCTAssertTrue(relaunched.wal.read(doc).isEmpty)
+        XCTAssertTrue(relaunched.retainedReadDocuments.isEmpty, "checkpoint does not open or consume remote state")
+        // The library's duplicate path checkpoints then copies package bytes. Keep that boundary here: this
+        // module's test target intentionally does not depend on NibLibrary.
+        let duplicate = lib.root.appendingPathComponent("Duplicate.nibnote", isDirectory: true)
+        try FileManager.default.copyItem(at: pkg, to: duplicate)
+        let copiedHead = try PackageCodec.decodeHead(Data(contentsOf: duplicate.appendingPathComponent("doc.0000000a.json")))
+        let copiedItems = try PackageCodec.decodeItems(Data(contentsOf: pageFile(duplicate, Fixtures.page1)))
+        XCTAssertTrue(copiedHead.meta.favorite)
+        XCTAssertEqual(Set(copiedItems.map(\.id)), Set((items[Fixtures.page1] ?? []).map(\.id) + [added.id]))
+    }
+
     func testLogIsNotTruncatedWhileFailedChangesAreNotOnDisk() throws {
         let lib = TestLibrary()
         let (content, items) = Fixtures.sampleContent()
@@ -382,11 +660,15 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(store.wal.read(doc).count, 2, "nothing is truncated while the failed page is not on disk")
 
         let relaunched = lib.store("0000000a")
+        XCTAssertThrowsError(try relaunched.loadHead(doc), "WAL deltas cannot replace an unreadable page snapshot")
+        XCTAssertThrowsError(try relaunched.loadItems(doc, page: Fixtures.page2))
+        XCTAssertEqual(relaunched.wal.read(doc).count, 2)
+        XCTAssertTrue(relaunched.retainedReadDocuments.isEmpty)
+        try FileManager.default.removeItem(at: blocked)
         XCTAssertTrue(try relaunched.loadHead(doc).meta.favorite)
         XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["FAILEDWRITE2"])
 
         // Once the page can be written, the replayed changes reach the disk and the log is truncated.
-        try FileManager.default.removeItem(at: blocked)
         relaunched.flush(doc)
         XCTAssertTrue(relaunched.wal.read(doc).isEmpty)
         XCTAssertEqual(try PackageCodec.decodeItems(Data(contentsOf: pageFile(pkg, Fixtures.page2))).map(\.id),
@@ -452,6 +734,22 @@ final class NibStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.fileURL(doc, relativePath: "audio/new.caf")) { error in
             XCTAssertEqual((error as? NibError)?.code, .unsupported)
         }
+    }
+
+    func testAssetWriteRejectsCapturedPackageAfterRelocation() throws {
+        let lib = TestLibrary()
+        let doc = Fixtures.docID
+        let old = lib.package(doc)
+        let moved = lib.root.appendingPathComponent("Renamed.nibnote", isDirectory: true)
+        let assets = lib.assets()
+        let ref = try PackageAssetStore.ref(for: Fixtures.pngData, ext: "png")
+        try FileManager.default.moveItem(at: old, to: moved)
+        lib.locator.set(moved, for: doc)
+        XCTAssertThrowsError(try assets.write(Fixtures.pngData, ref: ref, doc: doc, package: old))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
+        XCTAssertEqual(try assets.put(Fixtures.pngData, ext: "png", doc: doc), ref)
+        XCTAssertEqual(try assets.data(ref, doc: doc), Fixtures.pngData)
+        XCTAssertEqual(assets.url(ref, doc: doc)?.deletingLastPathComponent().deletingLastPathComponent(), moved)
     }
 
     func testAssetsAreDeduplicatedAndTemporaryAssetsExpire() throws {

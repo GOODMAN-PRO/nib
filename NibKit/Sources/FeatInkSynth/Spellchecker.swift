@@ -824,22 +824,22 @@ final class SpellcheckEngine {
 enum PersonalDictionary {
     /// A word as the dictionary stores it, or `invalid_params`: surrounding punctuation and spaces trimmed, one word
     /// (no spaces), at most 64 characters, at least one letter.
-    static func normalise(_ raw: String, path: String = "$.word") throws -> String {
+    static func normalise(_ raw: String, path: String = "$.word", bundle: Bundle = .main) throws -> String {
         let text = Spellchecker.normaliseApostrophes(raw.precomposedStringWithCanonicalMapping)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmed = text.trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.symbols)
             .subtracting(CharacterSet(charactersIn: "'")).union(.whitespacesAndNewlines))
             .trimmingCharacters(in: CharacterSet(charactersIn: "'"))
         guard !trimmed.isEmpty, trimmed.contains(where: { $0.isLetter }) else {
-            throw NibError(.invalidParams, "the word is empty or has no letters", path: path,
-                           hint: "pass one word, such as \"Nibnote\"")
+            throw NibError(.invalidParams, String(localized: "the word is empty or has no letters", bundle: bundle), path: path,
+                           hint: String(localized: "pass one word, such as \"Nibnote\"", bundle: bundle))
         }
         guard !trimmed.contains(where: { $0.isWhitespace }) else {
-            throw NibError(.invalidParams, "add one word at a time (no spaces)", path: path,
-                           hint: "call dictionary.add once for each word")
+            throw NibError(.invalidParams, String(localized: "add one word at a time (no spaces)", bundle: bundle), path: path,
+                           hint: String(localized: "call dictionary.add once for each word", bundle: bundle))
         }
         guard trimmed.count <= Spellchecker.maximumWordLength else {
-            throw NibError.invalid("the word is longer than \(Spellchecker.maximumWordLength) characters", path: path)
+            throw NibError.invalid(String(localized: "the word is longer than \(Spellchecker.maximumWordLength) characters", bundle: bundle), path: path)
         }
         return Spellchecker.dictionaryKey(trimmed)
     }

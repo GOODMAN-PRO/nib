@@ -246,15 +246,48 @@ enum MathTutor {
     }
 
     static func spoken(_ latex: String) -> String {
-        var text = latex
-        let replacements = [(#"\frac"#, " fraction "), (#"\sqrt"#, " square root "),
-                            (#"\times"#, " times "), (#"\cdot"#, " times "), (#"\div"#, " divided by "),
-                            (#"\int"#, " integral "), (#"\pi"#, " pi "), (#"\infty"#, " infinity "),
-                            (#"\approx"#, " approximately equals "), ("=", " equals "),
-                            ("^", " to the power of "), ("+", " plus "), ("-", " minus ")]
-        for (command, phrase) in replacements { text = text.replacingOccurrences(of: command, with: phrase) }
-        text = text.replacingOccurrences(of: #"\\[a-zA-Z]+"#, with: " ", options: .regularExpression)
-        for delimiter in ["{", "}", "$", #"\("#, #"\)"#] { text = text.replacingOccurrences(of: delimiter, with: " ") }
+        var commands: [String: String] = [:]
+        commands["frac"] = String(localized: "fraction")
+        commands["sqrt"] = String(localized: "square root")
+        commands["times"] = String(localized: "times")
+        commands["cdot"] = String(localized: "times")
+        commands["div"] = String(localized: "divided by")
+        commands["int"] = String(localized: "integral")
+        commands["pi"] = String(localized: "pi")
+        commands["infty"] = String(localized: "infinity")
+        commands["approx"] = String(localized: "approximately equals")
+        commands["sin"] = String(localized: "sine")
+        commands["cos"] = String(localized: "cosine")
+        commands["tan"] = String(localized: "tangent")
+        commands["ln"] = String(localized: "natural logarithm")
+        commands["log"] = String(localized: "logarithm")
+        commands["neq"] = String(localized: "not equal to")
+        commands["ne"] = String(localized: "not equal to")
+        commands["leq"] = String(localized: "less than or equal to")
+        commands["le"] = String(localized: "less than or equal to")
+        commands["geq"] = String(localized: "greater than or equal to")
+        commands["ge"] = String(localized: "greater than or equal to")
+        commands["pm"] = String(localized: "plus or minus")
+        commands["left"] = ""
+        commands["right"] = ""
+        let regex = try! NSRegularExpression(pattern: #"\\([a-zA-Z]+)"#)
+        // A single exponent atom needs no spoken group boundary.
+        let ungrouped = latex.replacingOccurrences(of: #"(\^)\{([0-9]+|[a-zA-Z])\}"#,
+                                                   with: "$1 $2 ", options: .regularExpression)
+        let source = ungrouped as NSString
+        let result = NSMutableString(string: ungrouped)
+        for match in regex.matches(in: ungrouped, range: NSRange(location: 0, length: source.length)).reversed() {
+            let name = source.substring(with: match.range(at: 1))
+            // Match whole commands: unknown functions/relations retain their name and therefore meaning.
+            result.replaceCharacters(in: match.range, with: " " + (commands[name] ?? name) + " ")
+        }
+        var text = result as String
+        let symbols: [(String, String)] = [("=", String(localized: "equals")), ("^", String(localized: "to the power of")),
+                       ("+", String(localized: "plus")), ("-", String(localized: "minus")),
+                       ("<", String(localized: "less than")), (">", String(localized: "greater than")),
+                       ("{", String(localized: "open group")), ("}", String(localized: "close group"))]
+        for (symbol, phrase) in symbols { text = text.replacingOccurrences(of: symbol, with: " " + phrase + " ") }
+        for delimiter in ["$", #"\("#, #"\)"#] { text = text.replacingOccurrences(of: delimiter, with: " ") }
         return text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }

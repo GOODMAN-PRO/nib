@@ -320,6 +320,25 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertEqual(probe.calls.last?["options"]?[ExportOptionKeys.visibleLayersOnly], false)
     }
 
+    func testLargeFolderDialogDoesNotLoadDocumentHeads() async throws {
+        let (h, presenter, _) = harness()
+        let folder = try h.library.createFolder(title: "Large", in: nil, style: nil)
+        let base = try h.persistence.loadHead(Fixtures.docID)
+        for index in 0..<2_000 {
+            var content = base
+            content.meta.id = NibID.make()
+            _ = try h.library.createDocument(content, title: "Notebook \(index)", in: folder)
+            // Leave catalog metadata but no readable head: any preparation read would throw.
+            h.persistence.heads[content.meta.id] = nil
+        }
+        _ = try await h.run("export.present", ["docs": [.string(NodeRef.folder(folder).description)]])
+        let selection = try XCTUnwrap(presenter.selection)
+        XCTAssertEqual(selection.documents.count, 2_000)
+        XCTAssertEqual(selection.pageScopes, [.all])
+        XCTAssertTrue(selection.documents.allSatisfy { $0.pages.isEmpty && !$0.hasSource })
+        XCTAssertTrue(selection.formats.contains { $0.id == "pdf" })
+    }
+
     func testNestedFolderAndMixedLibraryUseTypedFixtures() async throws {
         let (h, presenter, probe) = harness()
         let nested = try h.library.createFolder(title: "Nested", in: Fixtures.folderID, style: nil)

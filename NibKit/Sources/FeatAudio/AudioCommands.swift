@@ -18,7 +18,8 @@ enum AudioRefs {
     }
 
     /// A live clip from "audio:D/A" (or a bare clip id in the active window's document).
-    static func clip(_ string: String, _ ctx: CommandContext, path: String = "$.clip") throws -> (doc: DocumentID, clip: AudioClip) {
+    static func clip(_ string: String, _ ctx: CommandContext, path: String = "$.clip",
+                     includingDeleted: Bool = false) throws -> (doc: DocumentID, clip: AudioClip) {
         let doc: DocumentID
         let id: NibID
         if case let .audio(d, a)? = NodeRef(string) {
@@ -31,7 +32,7 @@ enum AudioRefs {
             throw NibError(.invalidParams, "expected an audio clip ref like audio:D/A", path: path,
                            hint: "clip refs are audio:<document id>/<clip id>")
         }
-        guard let clip = try ctx.workspace.content(doc).audio.first(where: { $0.id == id && !$0.deleted }) else {
+        guard let clip = try ctx.workspace.content(doc).audio.first(where: { $0.id == id && (includingDeleted || !$0.deleted) }) else {
             throw NibError(.notFound, "audio clip \(id) not found in document \(doc)", path: path)
         }
         return (doc, clip)
@@ -484,7 +485,17 @@ struct AudioDelete: NibCommand {
         effect: .irreversible)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let (doc, clip) = try AudioRefs.clip(p.clip, ctx)
+        try await delete(p, ctx, files: .default)
+    }
+
+    static func delete(_ p: Params, _ ctx: CommandContext, files: FileManager) async throws -> Output {
+        let (doc, clip) = try AudioRefs.clip(p.clip, ctx, includingDeleted: true)
+        guard !ctx.readOnly, !ctx.isReadOnly(doc) else {
+            throw NibError(.permissionDenied, String(localized: "This document is read-only."))
+        }
+        if ctx.services.lock?.isLocked(doc) == true {
+            throw NibError(.locked, String(localized: "Unlock the document before deleting its recording."))
+        }
         let audio = AudioController.of(ctx.services)
         // A record whose file is not its own (`audio/<clip id>.<ext>`) is tombstoned and no file is touched.
         let url: URL?
@@ -500,6 +511,8 @@ struct AudioDelete: NibCommand {
             }
             audio.stopPlayback(doc: doc, clip: clip.id)
         }
+        // Keep the entry available for retry until every file is gone. Partial cleanup is idempotent.
+        if !ctx.dryRun, let url { try removeFiles(url, clip, files: files) }
         // Not on the undo stack: the file is gone, so an undo could only bring back an empty record.
         try ctx.mutate(undoable: false) { tx in
             var gone = clip
@@ -507,7 +520,6 @@ struct AudioDelete: NibCommand {
             try tx.put(gone, doc: doc)
         }
         if !ctx.dryRun {
-            if let url { removeFiles(url, clip) }
             LiveRecordings.remove(doc: doc, clip: clip.id)
             audio?.forgetSilence(doc: doc, clip: clip.id)
         }
@@ -516,13 +528,21 @@ struct AudioDelete: NibCommand {
 
     /// The audio file and the clip's side files next to it in `audio/` ("<clip id>.*": the live recording and
     /// transcripts from every device). `url` is the canonical `audio/<clip id>.<ext>`.
-    private static func removeFiles(_ url: URL, _ clip: AudioClip) {
-        let fm = FileManager.default
-        try? fm.removeItem(at: url)
+    static func removeFiles(_ url: URL, _ clip: AudioClip, files: FileManager = .default) throws {
         let folder = url.deletingLastPathComponent()
         let prefix = clip.id.raw + "."
-        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where name.hasPrefix(prefix) {
-            try? fm.removeItem(at: folder.appendingPathComponent(name))
+        let names: [String]
+        do {
+            names = try files.contentsOfDirectory(atPath: folder.path)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return // A previously completed cleanup, or a recording that never created its directory.
+        }
+        for name in names where name.hasPrefix(prefix) {
+            do {
+                try files.removeItem(at: folder.appendingPathComponent(name))
+            } catch let error as CocoaError where error.code == .fileNoSuchFile {
+                continue // Another cleanup removed it after enumeration.
+            }
         }
     }
 }

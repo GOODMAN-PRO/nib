@@ -314,6 +314,7 @@ struct RecognitionLanguageSheet: View {
                             NibRow(Locale.current.localizedString(forIdentifier: language) ?? language, subtitle: language) {
                                 if model.selected == language { Image(nib: .checkmark).foregroundStyle(NibColor.accent) }
                             }
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .accessibilityValue(model.selected == language ? String(localized: "Selected") : "")

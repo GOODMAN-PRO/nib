@@ -231,12 +231,16 @@ public struct NibBanner: View {
 
     @ViewBuilder private var actionButton: some View {
         if let action {
-            Button(action.title, action: action.handler).nibCommand(action.command)
+            Button(action: action.handler) {
+                Text(action.title)
+                    .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                    .contentShape(Rectangle())
+            }
+                .nibCommand(action.command)
                 .font(NibFont.button)
                 .foregroundStyle(NibColor.accent)
                 .buttonStyle(.plain)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(minHeight: NibMetrics.hitTarget)
         }
     }
 }

@@ -408,14 +408,15 @@ enum DropLoader {
     }
 
     /// Copies the dropped item into `dir` (the provider deletes its own copy when the handler returns).
-    static func load(_ provider: NSItemProvider, plan: DropPlan, into dir: URL) async -> URL? {
+    static func load(_ provider: NSItemProvider, plan: DropPlan, into dir: URL) async throws -> URL {
         switch plan {
         case .file(let typeID):
             let suggested = provider.suggestedName
-            return await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
-                _ = provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, _ in
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+                _ = provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, error in
                     guard let url = url else {
-                        continuation.resume(returning: nil)
+                        continuation.resume(throwing: error ?? NibError(.unavailable,
+                            String(localized: "Download the file in Files, then try dropping it again.")))
                         return
                     }
                     let name = fileName(suggested: suggested, fallback: url.lastPathComponent, type: typeID)
@@ -424,20 +425,21 @@ enum DropLoader {
                         try FileManager.default.copyItem(at: url, to: dest)
                         continuation.resume(returning: dest)
                     } catch {
-                        continuation.resume(returning: nil)
+                        continuation.resume(throwing: error)
                     }
                 }
             }
         case .webLink:
-            let link: URL? = await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
-                _ = provider.loadObject(ofClass: NSURL.self) { object, _ in
-                    continuation.resume(returning: (object as? NSURL).map { $0 as URL })
+            let link: URL? = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL?, Error>) in
+                _ = provider.loadObject(ofClass: NSURL.self) { object, error in
+                    if let error { continuation.resume(throwing: error) }
+                    else { continuation.resume(returning: (object as? NSURL).map { $0 as URL }) }
                 }
             }
             guard let page = link, let scheme = page.scheme?.lowercased(), scheme == "https" || scheme == "http",
-                  page.host != nil else { return nil }
+                  page.host != nil else { throw NibError(.unsupported, String(localized: "Drop an HTTP or HTTPS web link.")) }
             let title = provider.suggestedName ?? page.host ?? String(localized: "Web page")
-            return try? WebLocation.write(page, title: title, in: dir)
+            return try WebLocation.write(page, title: title, in: dir)
         }
     }
 
@@ -496,15 +498,30 @@ final class ImportDropTarget: NSObject, UIDropInteractionDelegate {
 
     static func importDrop(_ providers: [NSItemProvider], app: NibApp, navigator: SceneNavigator?) async {
         let dir = ImportLocations.scratch.appendingPathComponent("drop-" + UUID().uuidString, isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+        catch { ImportUI.report(NibError.wrap(error), navigator: navigator, app: app); return }
         defer { try? FileManager.default.removeItem(at: dir) }
+        var failures: [String] = []
+        defer {
+            if !failures.isEmpty {
+                let names = failures.joined(separator: "\n")
+                ImportUI.report(NibError(.unavailable, String(localized: "Some dropped files couldn't be read. Download them in Files and try again.\n\(names)")),
+                                navigator: navigator, app: app)
+            }
+        }
         var urls: [JSONValue] = []
         for provider in providers {
-            guard let plan = DropLoader.plan(for: provider.registeredTypeIdentifiers, content: app.content),
-                  let url = await DropLoader.load(provider, plan: plan, into: dir) else { continue }
-            urls.append(.string(url.absoluteString))
+            guard let plan = DropLoader.plan(for: provider.registeredTypeIdentifiers, content: app.content) else { continue }
+            do {
+                let url = try await DropLoader.load(provider, plan: plan, into: dir)
+                urls.append(.string(url.absoluteString))
+            } catch {
+                let name = provider.suggestedName ?? String(localized: "Dropped item")
+                failures.append(name + ": " + NibError.wrap(error).message)
+            }
         }
         guard !urls.isEmpty else {
+            if !failures.isEmpty { return }
             ImportUI.report(NibError(.unsupported, String(localized: "Nib couldn't read what was dropped.")),
                             navigator: navigator, app: app)
             return

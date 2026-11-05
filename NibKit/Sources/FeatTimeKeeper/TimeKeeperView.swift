@@ -42,18 +42,15 @@ struct TimeKeeperPanel: View {
     }
 
     @State private var kind: TimerKind = .timer
-    @State private var durationText = ""
+    @State private var durationInput = TimerDurationInput()
     @State private var name = ""
     @State private var modeName = ""
-    @State private var writing = false
     @State private var padHasInk = false
     @State private var padClear = 0
     @State private var reading: Reading = .idle
-    /// Bumped by every read, so an older recognition that finishes late never overwrites a newer one.
-    @State private var readGeneration = 0
     @State private var pendingDelete: TimerPreset?
 
-    private var seconds: Int? { DurationParser.seconds(from: durationText) }
+    private var seconds: Int? { DurationParser.seconds(from: durationInput.text) }
 
     var body: some View {
         ScrollView {
@@ -76,7 +73,10 @@ struct TimeKeeperPanel: View {
             keeper.panelOpen = true
             keeper.refreshStored()
         }
-        .onDisappear { keeper.panelOpen = false }
+        .onDisappear {
+            keeper.panelOpen = false
+            durationInput.generation += 1
+        }
         .onChange(of: name) { _, value in
             let clean = TimeKeeperPanel.oneLine(value, limit: 60)
             if clean != value { name = clean }
@@ -140,19 +140,19 @@ struct TimeKeeperPanel: View {
     private var durationSection: some View {
         NibInspectorSection(String(localized: "Duration"), value: seconds.map { TimerFormat.clock(Double($0)) }) {
             HStack(alignment: .top, spacing: NibSpacing.s) {
-                if writing {
+                if durationInput.writing {
                     handwritingPad
                 } else {
-                    NibField(text: $durationText, prompt: String(localized: "25, 1:30 or 1h 15m"))
+                    NibField(text: $durationInput.text, prompt: String(localized: "25, 1:30 or 1h 15m"))
                         .keyboardType(.numbersAndPunctuation)
                         .accessibilityLabel(String(localized: "Duration"))
                 }
-                NibIconButton(writing ? NibSymbol.keyboard : NibSymbol.pen,
-                              label: writing ? String(localized: "Type the Duration") : String(localized: "Write the Duration"),
+                NibIconButton(durationInput.writing ? NibSymbol.keyboard : NibSymbol.pen,
+                              label: durationInput.writing ? String(localized: "Type the Duration") : String(localized: "Write the Duration"),
                               size: .panel) {
-                    writing.toggle()
+                    durationInput.writing.toggle()
                     reading = .idle
-                    readGeneration += 1
+                    durationInput.generation += 1
                 }
             }
             Text(durationHint)
@@ -173,7 +173,7 @@ struct TimeKeeperPanel: View {
         case .recognised(let text):
             return String(localized: "Read as \(text)")
         case .idle:
-            if durationText.trimmingCharacters(in: .whitespaces).isEmpty {
+            if durationInput.text.trimmingCharacters(in: .whitespaces).isEmpty {
                 return String(localized: "Minutes by default. Use 1:30 for minutes and seconds.")
             }
             return seconds.map { TimerFormat.spoken(Double($0)) }
@@ -204,16 +204,16 @@ struct TimeKeeperPanel: View {
                     padClear += 1
                     padHasInk = false
                     reading = .idle
-                    readGeneration += 1
-                    durationText = ""
+                    durationInput.generation += 1
+                    durationInput.text = ""
                 }
             }
         }
     }
 
     private func recognise(_ strokes: [PKStroke]) {
-        readGeneration += 1
-        let generation = readGeneration
+        durationInput.generation += 1
+        let generation = durationInput.generation
         guard let recognizer = context.app.services.recognizer else {
             reading = .unavailable
             return
@@ -224,9 +224,9 @@ struct TimeKeeperPanel: View {
         reading = .reading
         Task { @MainActor in
             let lines = try? await recognizer.recognize(strokes: items, language: language)
-            guard generation == readGeneration else { return }
-            if let best = TimerRecognition.bestDuration(lines ?? []) {
-                durationText = best.text
+            let best = TimerRecognition.bestDuration(lines ?? [])
+            guard durationInput.complete(best?.text, generation: generation) else { return }
+            if let best {
                 reading = .recognised(best.text)
             } else {
                 reading = .failed
@@ -240,8 +240,7 @@ struct TimeKeeperPanel: View {
                       alignment: .leading, spacing: NibSpacing.s) {
                 ForEach(TimerPreset.builtIn, id: \.self) { s in
                     NibChip(TimerFormat.short(s), style: .filter(isSelected: seconds == s), action: {
-                        durationText = TimerFormat.clock(Double(s))
-                        writing = false
+                        durationInput.select(s)
                         reading = .idle
                     })
                     .accessibilityAddTraits(seconds == s ? .isSelected : [])
@@ -261,9 +260,8 @@ struct TimeKeeperPanel: View {
             ForEach(keeper.modes) { mode in
                 HStack(spacing: NibSpacing.s) {
                     Button {
-                        durationText = TimerFormat.clock(Double(mode.seconds))
+                        durationInput.select(mode.seconds)
                         name = mode.name
-                        writing = false
                         reading = .idle
                     } label: {
                         NibInspectorRow(mode.name, subtitle: TimerFormat.short(mode.seconds), symbol: NibSymbol.timer)

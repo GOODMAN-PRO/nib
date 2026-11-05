@@ -198,15 +198,21 @@ struct TranscriptSeek: NibCommand {
             throw NibError(.invalidParams, "Pass a transcript index or a timestamp in seconds", path: "$.t", hint: "call transcript.get")
         }
         let cached = ctx.workspace.cachedPages(clip.doc)
-        var keeping = cached
-        defer { ctx.workspace.evictPages(clip.doc, keeping: keeping) }
         let lowerMs = (clip.record.start + line.start) * 1000
-        let pages = try ctx.workspace.content(clip.doc).livePages.compactMap { page -> (PageID, [Item])? in
-            if let revision = ctx.workspace.contentRevision(clip.doc, page: page.id), Double(revision.wallMs) < lowerMs { return nil }
-            return (page.id, try ctx.workspace.items(clip.doc, page: page.id))
+        var scan = TranscriptPageLink.Scan(clip: clip.record, segment: line)
+        for page in try ctx.workspace.content(clip.doc).livePages {
+            if let revision = ctx.workspace.contentRevision(clip.doc, page: page.id), Double(revision.wallMs) < lowerMs { continue }
+            // Reduce one page at a time. Cold reads must not populate the shared editing cache.
+            let items: [Item]
+            if cached.contains(page.id) {
+                items = try ctx.workspace.items(clip.doc, page: page.id)
+            } else {
+                items = try ctx.workspace.persistence.loadItems(clip.doc, page: page.id)
+            }
+            scan.include(page.id, items: items)
         }
-        let page = TranscriptPageLink.mostEditedPage(clip: clip.record, segment: line, pages: pages)
-        if let page { keeping.insert(page) }
+        let page = scan.winner
+        if let page { _ = try ctx.workspace.items(clip.doc, page: page) }
         if !ctx.dryRun {
             _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(p.clip), "t": .number(line.start)])
             if let page {
