@@ -221,6 +221,18 @@ final class CanvasUITests: XCTestCase {
                       width: box.width / zoom, height: box.height / zoom)
     }
 
+    /// No nested waits: a missing page, box or probe means this outer poll is not ready.
+    private func boxRectNow() -> CGRect? {
+        let pages = ui.app.otherElements.matching(NSPredicate(format: "label == %@", "Page 1 of 4"))
+        guard let paper = pages.allElementsBoundByIndex.first(where: { $0.exists && $0.frame.height > 100 })?.frame,
+              let box = try? element("Zoom box").snapshot() else { return nil }
+        var zoom: Double?
+        _ = ui.matchesState { zoom = $0.zoom; return true }
+        guard let zoom, zoom > 0 else { return nil }
+        return CGRect(x: (box.frame.minX - paper.minX) / zoom, y: (box.frame.minY - paper.minY) / zoom,
+                      width: box.frame.width / zoom, height: box.frame.height / zoom)
+    }
+
     // canvas.scroll; F006/F101
     func testFingerScrollInPencilOnlyModeDoesNotDraw() throws {
         try pencilOnly()
@@ -769,7 +781,7 @@ final class CanvasUITests: XCTestCase {
         XCTAssertGreaterThan(next.minY, before.minY)
         XCTAssertEqual(next.minX, before.minX, accuracy: 2)
         try key(XCUIKeyboardKey.return.rawValue, .option) {
-            self.eventually("Option-Return advances writing line") { ((try? self.boxRect().minY) ?? next.minY) > next.minY }
+            self.eventually("Option-Return advances writing line") { (self.boxRectNow()?.minY ?? next.minY) > next.minY }
         }
         let keyboardNext = try boxRect()
         XCTAssertEqual(keyboardNext.minY - next.minY, next.minY - before.minY, accuracy: 2)

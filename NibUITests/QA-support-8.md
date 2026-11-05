@@ -190,3 +190,7 @@ D:keyboard-and-state#3 correction proves the fixed clear tap is inside the comme
 ## C11 - settle deselection before page-text chord
 
 D:keyboard-and-state#4 proves selectionCount changed 5->0 during chord focus preparation after outside. Added the bounded zero-selection wait at that exact PageTypingUsesMarginsAndReusesItsBoxWithPresets transition. Chord invariants remain strict. CI must send Cmd-Option-T after deselection and retain the single-box/content/frame assertions.
+
+## C12 - nonwaiting zoom-box predicate
+
+D:keyboard-and-state#2 correction identifies the inner page waiter only on a transient miss in the final outer poll. Added boxRectNow for predicates: one page/box/probe read, nil when unavailable, no require/page/state waiting helper. The Option-Return predicate uses it; other boxRect calls keep readiness. CI must report the actual Option-Return timeout or pass, never interrupted waiter rawValue5. Return non-arrival remains owned by the separate key probe job.
