@@ -281,7 +281,7 @@ final class PageIndex: ObservableObject {
     private var isAttached = false
     private var syncTask: Task<Void, Never>?
     /// Heads read between yields to the main run loop while the library is read.
-    private static let chunk = 16
+    private static let chunk = 1
 
     init(app: NibApp) {
         self.app = app
@@ -317,7 +317,13 @@ final class PageIndex: ObservableObject {
     /// Reads one document's head again. False when it cannot be read (then its last known pages stay).
     @discardableResult
     func read(_ doc: DocumentID) -> Bool {
-        guard let app, let content = try? app.workspace.peekContent(doc) else { return false }
+        guard let app else { return false }
+        guard let node = app.services.library?.node(doc), Self.includesPages(node) else {
+            documents[doc] = nil
+            readAt[doc] = nil
+            return true
+        }
+        guard let content = try? app.workspace.peekContent(doc) else { return false }
         let pages = PageIndex.pages(of: content)
         let value: DocumentPages? = pages.bookmarked.isEmpty && pages.trashed.isEmpty ? nil : pages
         if documents[doc] != value { documents[doc] = value }
@@ -330,12 +336,12 @@ final class PageIndex: ObservableObject {
     }
 
     /// Drops documents that left the library (trashed, deleted, another library folder) and reads the heads of
-    /// documents that are new or modified since they were read, yielding every few documents so a large library never
-    /// stalls the main thread.
+    /// documents that are new or modified since they were read, yielding after each head. A single unopened
+    /// head still requires the synchronous DocumentPersistence API; it needs an async contracts/store reader.
     func sync() async {
         guard let app, let library = app.services.library else { return }
         var live: [DocumentID: Double] = [:]
-        for node in library.allNodes() where node.kind == .document && node.trashedAt == nil {
+        for node in library.allNodes() where Self.includesPages(node) {
             live[node.id] = node.modified
         }
         let gone = documents.keys.filter { live[$0] == nil }
@@ -344,11 +350,16 @@ final class PageIndex: ObservableObject {
         var count = 0
         for (doc, modified) in live where readAt[doc] != modified {
             if Task.isCancelled { return }
-            readAt[doc] = modified
-            read(doc)
+            if read(doc) { readAt[doc] = modified }
             count += 1
             if count % PageIndex.chunk == 0 { await Task.yield() }
         }
+    }
+
+    /// Unknown legacy kinds are still inspected; known page-less kinds never need a head read.
+    static func includesPages(_ node: LibraryNode) -> Bool {
+        node.kind == .document && node.trashedAt == nil
+            && node.documentKind != .textDocument && node.documentKind != .studySet
     }
 
     /// Bookmarked live pages and trashed pages of one document head.

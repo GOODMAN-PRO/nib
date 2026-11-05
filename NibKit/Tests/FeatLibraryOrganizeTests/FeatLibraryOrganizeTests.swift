@@ -471,6 +471,29 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         model.stop()
     }
 
+    func testPageIndexSkipsPagelessHeadsInAMixedTwoThousandDocumentLibrary() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let paragraph = TextBlock(kind: .paragraph, text: RichText(plain: String(repeating: "word ", count: 10_000)))
+        for number in 0..<2_000 {
+            let kind: DocumentKind = number < 1_800 ? .textDocument : number < 1_900 ? .studySet : .notebook
+            let content = DocumentContent(meta: DocumentMeta(id: NibID("MIXED\(number)"), kind: kind),
+                blocks: kind == .textDocument ? [paragraph] : [])
+            _ = try h.library.createDocument(content, title: "Mixed \(number)", in: nil)
+        }
+        let index = PageIndex(app: h.app)
+        let before = persistence.headReads
+        await index.sync()
+        // 100 generated notebooks plus the fixture notebook and whiteboard.
+        XCTAssertEqual(persistence.headReads - before, 102)
+        await index.sync()
+        XCTAssertEqual(persistence.headReads - before, 102, "Unchanged heads must not be rescanned")
+        XCTAssertTrue(index.read(Fixtures.textDocID))
+        XCTAssertTrue(index.read(Fixtures.studySetID))
+        XCTAssertEqual(persistence.headReads - before, 102, "Commit/open callbacks use the same kind gate")
+    }
+
     func testPageIndexFollowsCommitsAndUndo() async throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         h.app.commands.register(BookmarkStandIn.self)
