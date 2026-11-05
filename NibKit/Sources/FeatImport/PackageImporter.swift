@@ -8,6 +8,16 @@ import NibContracts
 /// that can't be imported are reported one by one (`ImportReport`), never dropped silently.
 @MainActor
 enum PackageImporter {
+    /// Mirrors F002's optional service, like catalogue refresh, without importing another feature module.
+    typealias PackageImport = @MainActor (LibraryService, URL, FolderID?) async throws -> DocumentID?
+    static let packageImportKey = "library.importPackage"
+
+    static func place(_ url: URL, into folder: FolderID?, library: LibraryService, ctx: CommandContext) async throws -> DocumentID {
+        try Task.checkCancellation()
+        if let importer = ctx.services.get(packageImportKey, as: PackageImport.self),
+           let id = try await importer(library, url, folder) { return id }
+        return try library.importPackage(at: url, into: folder)
+    }
     static func packageDescriptor(owner: String) -> ImporterDescriptor {
         ImporterDescriptor(id: ImportFormats.packageImporterID, title: String(localized: "Nib documents"),
                            fileExtensions: ImportFormats.packageExtensions, utTypes: [NibFormat.packageUTType],
@@ -48,7 +58,7 @@ enum PackageImporter {
         }
         if ctx.dryRun { return [] }
         let library = try ctx.services.require(ctx.services.library, "the library")
-        return [try library.importPackage(at: url, into: target.folder)]
+        return [try await place(url, into: target.folder, library: library, ctx: ctx)]
     }
 
     static func importArchive(_ url: URL, target: ImportTarget, ctx: CommandContext) async throws -> [DocumentID] {
@@ -141,7 +151,7 @@ enum PackageImporter {
             let name = entry.url.lastPathComponent
             do {
                 if entry.isDirectory && isPackage(entry.url) {
-                    docs.append(try library.importPackage(at: entry.url, into: folder))
+                    docs.append(try await place(entry.url, into: folder, library: library, ctx: ctx))
                 } else if entry.isDirectory {
                     guard depth + 1 < maxTreeDepth else {
                         throw NibError(.unsupported, "folders nested more than \(maxTreeDepth) levels deep are not imported",
