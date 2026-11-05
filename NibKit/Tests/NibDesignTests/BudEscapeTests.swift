@@ -85,6 +85,35 @@ final class BudEscapeTests: XCTestCase {
         XCTAssertFalse(NibEscapeRouting.cancel(in: host.view), "No stale owner during retraction")
     }
 
+    func testStackedAttachedBudHostsCancelFrontmostThenLower() async throws {
+        let field = DropletField()
+        var lowerOpen = true
+        var upperOpen = true
+        let lower = UIHostingController(rootView:
+            bud("lower", field: field, presented: Binding(get: { lowerOpen }, set: { lowerOpen = $0 })))
+        let upper = UIHostingController(rootView:
+            bud("upper", field: field, presented: Binding(get: { upperOpen }, set: { upperOpen = $0 })))
+        let root = UIViewController()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 600))
+        window.rootViewController = root
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil; field.setActive(false) }
+        for host in [lower, upper] {
+            root.addChild(host)
+            host.view.frame = root.view.bounds
+            root.view.addSubview(host.view)
+            host.didMove(toParent: root)
+        }
+        for _ in 0..<5 { root.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+
+        XCTAssertTrue(NibEscapeRouting.cancel(in: root.view))
+        XCTAssertFalse(upperOpen, "The frontmost real bud host owns the first Escape")
+        XCTAssertTrue(lowerOpen)
+        XCTAssertTrue(NibEscapeRouting.cancel(in: root.view))
+        XCTAssertFalse(lowerOpen)
+        XCTAssertFalse(NibEscapeRouting.cancel(in: root.view))
+    }
+
     private func bud(_ id: String, field: DropletField, presented: Binding<Bool>,
                      style: DropletStyle = .popover) -> AttachedDroplet<Text> {
         field.mode = .off

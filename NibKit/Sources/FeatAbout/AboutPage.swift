@@ -591,7 +591,7 @@ struct AboutPanel: View {
                 }
         }
         .tint(NibColor.accent)
-        .nibEscapeCancellation(onCancel: dismiss)
+        .nibEscapeCancellation { dismiss() }
     }
 }
 

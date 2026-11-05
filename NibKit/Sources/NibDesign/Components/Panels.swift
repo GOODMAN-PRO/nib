@@ -608,14 +608,18 @@ public struct NibPanelHeader<Trailing: View>: View {
     let badge: NibBadgeKind?
     let menu: Trailing
     let onClose: () -> Void
+    let handlesEscape: Bool
 
+    /// Only presented or overlay panels should opt in. Persistent sidebars and
+    /// floating panels leave Escape to the focused editor or canvas selection.
     public init(title: String, subtitle: String? = nil, symbol: NibSymbol, badge: NibBadgeKind? = nil,
-                onClose: @escaping () -> Void, @ViewBuilder menu: () -> Trailing) {
+                handlesEscape: Bool = false, onClose: @escaping () -> Void, @ViewBuilder menu: () -> Trailing) {
         self.title = title
         self.subtitle = subtitle
         self.symbol = symbol
         self.badge = badge
         self.onClose = onClose
+        self.handlesEscape = handlesEscape
         self.menu = menu()
     }
 
@@ -641,7 +645,11 @@ public struct NibPanelHeader<Trailing: View>: View {
         .padding(.trailing, NibSpacing.xs)
         .padding(.vertical, NibSpacing.s)
         .frame(minHeight: 60)
-        .nibEscapeCancellation(isEnabled: isEnabled, onCancel: onClose)
+        .nibEscapeHandler {
+            guard handlesEscape else { return false }
+            if isEnabled { onClose() }
+            return true
+        }
     }
 
     private var stacked: some View {
@@ -696,8 +704,9 @@ public struct NibPanelHeader<Trailing: View>: View {
 
 public extension NibPanelHeader where Trailing == EmptyView {
     init(title: String, subtitle: String? = nil, symbol: NibSymbol, badge: NibBadgeKind? = nil,
-         onClose: @escaping () -> Void) {
-        self.init(title: title, subtitle: subtitle, symbol: symbol, badge: badge, onClose: onClose) { EmptyView() }
+         handlesEscape: Bool = false, onClose: @escaping () -> Void) {
+        self.init(title: title, subtitle: subtitle, symbol: symbol, badge: badge,
+                  handlesEscape: handlesEscape, onClose: onClose) { EmptyView() }
     }
 }
 
