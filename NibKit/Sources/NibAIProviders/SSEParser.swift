@@ -325,12 +325,14 @@ enum ProviderErrors {
         }
     }
 
-    static func http(_ e: HTTPStatusError, _ ctx: ProviderCallContext) -> NibError {
+    static func http(_ e: HTTPStatusError, _ ctx: ProviderCallContext,
+                     bundle: Bundle = .main, locale: Locale = .current) -> NibError {
         let detail = message(from: e.body).map { "\n" + $0 } ?? ""
-        let prefix = String(localized: "\(ctx.providerName) answered HTTP \(e.status).")
+        let prefix = String(localized: "\(ctx.providerName) answered HTTP \(e.status).", bundle: bundle, locale: locale)
         switch e.status {
         case 401, 403:
-            return NibError(.permissionDenied, prefix + detail, hint: checkKeyHint)
+            return NibError(.permissionDenied, prefix + detail,
+                            hint: String(localized: "check the API key in Settings › AI", bundle: bundle, locale: locale))
         case 404:
             let hint: String
             if ctx.call == .chat && e.mentions("model") { hint = pickModelHint } else { hint = checkBaseURLHint }
@@ -341,10 +343,11 @@ enum ProviderErrors {
             return NibError(.unsupported, prefix + detail,
                             hint: ctx.call == .transcription ? String(localized: "use a shorter recording") : String(localized: "use a smaller scope or fewer images"))
         case 429:
-            let wait = e.retryAfter.flatMap { retryDuration($0) }.map {
-                "\n" + String(localized: "Retry after \($0).")
+            let wait = e.retryAfter.flatMap { retryDuration($0, locale: locale) }.map {
+                "\n" + String(localized: "Retry after \($0).", bundle: bundle, locale: locale)
             } ?? ""
-            return NibError(.unavailable, prefix + detail + wait, hint: rateLimitedHint)
+            return NibError(.unavailable, prefix + detail + wait,
+                            hint: String(localized: "rate limited — retry later", bundle: bundle, locale: locale))
         case 500...599:
             return NibError(.unavailable, prefix + detail, hint: String(localized: "the provider is having problems — retry later"))
         default:
@@ -356,13 +359,14 @@ enum ProviderErrors {
         }
     }
 
-    static func transport(_ e: URLError, _ ctx: ProviderCallContext) -> NibError {
+    static func transport(_ e: URLError, _ ctx: ProviderCallContext,
+                          bundle: Bundle = .main, locale: Locale = .current) -> NibError {
         switch e.code {
         case .timedOut:
-            let hint = ctx.isLocal ? String(localized: "the model may still be loading — retry, or check that the server is running")
-                : String(localized: "check the network and the base URL, then retry")
-            let duration = duration(ctx.timeout)
-            return NibError(.timeout, String(localized: "\(ctx.providerName) did not answer within \(duration)."), hint: hint)
+            let hint = ctx.isLocal ? String(localized: "the model may still be loading — retry, or check that the server is running", bundle: bundle, locale: locale)
+                : String(localized: "check the network and the base URL, then retry", bundle: bundle, locale: locale)
+            let waited = duration(ctx.timeout, locale: locale)
+            return NibError(.timeout, String(localized: "\(ctx.providerName) did not answer within \(waited).", bundle: bundle, locale: locale), hint: hint)
         case .cancelled:
             return NibError(.userDenied, String(localized: "The request to \(ctx.providerName) was cancelled."))
         case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff,
