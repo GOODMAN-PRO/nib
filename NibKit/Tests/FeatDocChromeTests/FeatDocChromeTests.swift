@@ -8,6 +8,28 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testModalBlocksCanvasAndPlainKeysButKeepsGlobalCommandKeys() {
+        let delete = KeyCommandDescriptor(id: "delete", title: "Delete", shortcut: KeyShortcut("delete", []),
+                                          command: "keyboard.delete", scope: .canvas, owner: "tests")
+        let select = KeyCommandDescriptor(id: "select", title: "Select", shortcut: KeyShortcut("a", [.command]),
+                                          command: "keyboard.selectAll", scope: .canvas, owner: "tests")
+        let plain = KeyCommandDescriptor(id: "plain", title: "Plain", shortcut: KeyShortcut("e", []),
+                                         command: "toolbar.key.e", scope: .global, owner: "tests")
+        let global = KeyCommandDescriptor(id: "global", title: "Search", shortcut: KeyShortcut("f", [.command]),
+                                          command: "search.open", scope: .global, owner: "tests")
+        for key in [delete, select, plain] {
+            XCTAssertFalse(ShellChromePolicy.permits(key, hasModal: true))
+            XCTAssertTrue(ShellChromePolicy.permits(key, hasModal: false))
+        }
+        XCTAssertTrue(ShellChromePolicy.permits(global, hasModal: true))
+        let root = UIViewController()
+        let child = ModalControllerProbe()
+        root.addChild(child)
+        XCTAssertFalse(ShellChromePolicy.hasModal(root))
+        child.modal = UIViewController()
+        XCTAssertTrue(ShellChromePolicy.hasModal(root))
+    }
+
     func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
         let h = Harness(features: [FeatDocChromeFeature.self])
         var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]
@@ -1693,4 +1715,10 @@ private final class TestNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) { shownLibrary.append(folder) }
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+
+@MainActor
+private final class ModalControllerProbe: UIViewController {
+    var modal: UIViewController?
+    override var presentedViewController: UIViewController? { modal }
 }

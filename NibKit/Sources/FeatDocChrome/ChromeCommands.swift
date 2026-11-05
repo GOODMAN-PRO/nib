@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Combine
+import UIKit
 import NibContracts
 import NibDesign
 
@@ -624,5 +625,24 @@ struct DocSetScrollDirection: NibCommand {
             try tx.putMeta(meta)
         }
         return NoResult()
+    }
+}
+
+/// Shared with the app shell so its presentation decisions are covered by package tests.
+@MainActor
+public enum ShellChromePolicy {
+    public static func hasModal(_ controller: UIViewController) -> Bool {
+        controller.presentedViewController != nil || controller.children.contains { hasModal($0) }
+    }
+
+    public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool) -> Bool {
+        guard hasModal else { return true }
+        return descriptor.scope != .canvas
+            && !descriptor.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+    }
+
+    public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {
+        guard !openDocuments.isEmpty else { return nil }
+        return make()
     }
 }

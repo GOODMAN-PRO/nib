@@ -21,7 +21,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     private var showsDocument = false
     private var shownKind: DocumentKind?
     /// The UIKeyCommands last handed to UIKit, rebuilt when the registry or the window's context changes.
-    private var keyCommandCache: (generation: UInt64, context: KeyCommandContext, commands: [UIKeyCommand])?
+    private var keyCommandCache: (generation: UInt64, context: KeyCommandContext, hasModal: Bool, commands: [UIKeyCommand])?
 
     init(app: NibApp) {
         self.app = app
@@ -284,7 +284,9 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             #endif
             NibUITestKeyLog.note("shell unhandled \(input) flags \(flags.rawValue)")
             guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
-                descriptors: app.content.keyCommands.all, in: keyCommandContext),
+                descriptors: app.content.keyCommands.all.filter {
+                    ShellChromePolicy.permits($0, hasModal: ShellChromePolicy.hasModal(self))
+                }, in: keyCommandContext),
                   let command = keyCommands?.first(where: { $0.propertyList as? String == descriptor.id }),
                   let action = command.action, canPerformAction(action, withSender: command) else { continue }
             runKeyCommand(command)
@@ -307,9 +309,12 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// specific winning a shared shortcut (`KeyCommandRouting`), in registry order.
     override var keyCommands: [UIKeyCommand]? {
         let context = keyCommandContext
+        let hasModal = ShellChromePolicy.hasModal(self)
         let generation = app.content.keyCommands.generation
-        if let cache = keyCommandCache, cache.generation == generation, cache.context == context { return cache.commands }
-        let commands = KeyCommandRouting.active(app.content.keyCommands.all, in: context).map { d -> UIKeyCommand in
+        if let cache = keyCommandCache, cache.generation == generation, cache.context == context,
+           cache.hasModal == hasModal { return cache.commands }
+        let descriptors = app.content.keyCommands.all.filter { ShellChromePolicy.permits($0, hasModal: hasModal) }
+        let commands = KeyCommandRouting.active(descriptors, in: context).map { d -> UIKeyCommand in
             let command = UIKeyCommand(title: d.title, action: #selector(runKeyCommand(_:)),
                                        input: ShellViewController.keyInput(d.shortcut.key),
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
@@ -317,7 +322,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
             return command.nibCommand(d.command)
         }
-        keyCommandCache = (generation, context, commands)
+        keyCommandCache = (generation, context, hasModal, commands)
         return commands
     }
 
@@ -346,7 +351,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         // UIKit also probes a selector with a nil/non-command sender when building
         // the hardware-key routing table. Rejecting that probe disables every shortcut.
         guard let command = sender as? UIKeyCommand else {
-            return !KeyCommandRouting.active(app.content.keyCommands.all, in: keyCommandContext).isEmpty
+            return !(keyCommands ?? []).isEmpty
         }
         guard let d = liveKeyCommand(command) else { return false }
         return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
@@ -366,6 +371,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// The descriptor behind a UIKeyCommand this shell built, when it is still registered and live in this window.
     private func liveKeyCommand(_ command: UIKeyCommand) -> KeyCommandDescriptor? {
         guard let id = command.propertyList as? String, let d = app.content.keyCommands.get(id),
+              ShellChromePolicy.permits(d, hasModal: ShellChromePolicy.hasModal(self)),
               d.isActive(in: keyCommandContext) else { return nil }
         return d
     }
