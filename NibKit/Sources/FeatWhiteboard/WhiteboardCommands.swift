@@ -474,6 +474,7 @@ struct BoardRename: NibCommand {
     struct Params: Codable {
         var page: String
         var title: String
+        var expectedTitle: String? = nil
     }
 
     struct Output: Codable {
@@ -484,7 +485,8 @@ struct BoardRename: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "board.rename", title: "Rename Board",
         summary: "Rename a whiteboard board (the name shown in the Boards sidebar and on exports).",
-        params: .obj(["page": .ref, "title": .str("new board name")], required: ["page", "title"]),
+        params: .obj(["page": .ref, "title": .str("new board name"),
+                      "expectedTitle": .str("name when editing began; empty for an unnamed board")], required: ["page", "title"]),
         examples: [["page": "page:FIXTUREDOC04/FIXTUREBRD01", "title": "Roadmap"]],
         effect: .edit)
 
@@ -496,6 +498,9 @@ struct BoardRename: NibCommand {
             let content = try tx.content(doc)
             try WhiteboardSupport.requireWhiteboard(content, path: "$.page")
             var board = try WhiteboardSupport.liveBoard(content, pageID)
+            if let expected = p.expectedTitle, (board.title ?? "") != expected {
+                throw NibError.invalid(String(localized: "This board was renamed elsewhere. Reopen Rename and try again."))
+            }
             guard board.title != title else { return }
             board.title = title
             try tx.put(board, doc: doc)
