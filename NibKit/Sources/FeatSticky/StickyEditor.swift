@@ -485,7 +485,11 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
             if await StickyActions.setText(app, ref: e.ref, text: text, session: session, group: e.group,
                                            expectedText: e.persisted) {
                 e.saved = text
-                e.persisted = text
+                // text.setText may normalise the submitted font sizes and paragraph attributes.
+                // Read its stored baseline in this actor turn; saved still describes the text view.
+                if let stored = try? app.workspace.item(e.doc, page: e.page, id: e.id).sticky {
+                    e.persisted = stored.text
+                }
             }
         }
     }

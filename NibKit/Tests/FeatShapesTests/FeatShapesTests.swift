@@ -724,6 +724,28 @@ final class FeatShapesTests: XCTestCase {
         }
     }
 
+    func testNormalisedLabelSaveUsesStoredBaselineForNextSaveAndClose() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTextStandIn(h.app)
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(overlay.beginTextEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+        let tv = try XCTUnwrap(overlay.text?.textView)
+        for value in ["Pasted", "Edited again", "Closed"] {
+            tv.attributedText = NSAttributedString(string: value, attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            let rich = ShapeTextStyle.richText(tv.attributedText, shape: try shape(h, Fixtures.shapeID), scale: 1)
+            XCTAssertEqual(rich.paragraphs.first?.runs.first?.attrs.size, 500)
+            if value == "Closed" { overlay.endTextEditing(commit: true) } else { overlay.saveTextNow() }
+            await overlay.pendingFlush?.value
+            XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, value)
+            XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.paragraphs.first?.runs.first?.attrs.size, 400)
+        }
+        XCTAssertNil(overlay.text)
+        overlay.detach(from: host)
+    }
+
     func testShapeLabelFollowsExternalTextAndPreservesDirtyConflict() async throws {
         let h = Harness(features: [FeatShapesFeature.self])
         Self.registerTextStandIn(h.app)
@@ -1327,7 +1349,15 @@ final class FeatShapesTests: XCTestCase {
                                                 params: .obj(["ref": .ref, "text": .anything()], required: ["ref", "text"]),
                                                 effect: .edit)) { json, ctx in
             guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
-            let text = try (json["text"] ?? .null).decode(RichText.self)
+            var text = try (json["text"] ?? .null).decode(RichText.self)
+            // Model the text feature's canonical font-size cap instead of echoing the submission.
+            for p in text.paragraphs.indices {
+                for r in text.paragraphs[p].runs.indices {
+                    if let size = text.paragraphs[p].runs[r].attrs.size {
+                        text.paragraphs[p].runs[r].attrs.size = min(max(1, size), 400)
+                    }
+                }
+            }
             try ctx.mutate { tx in
                 var item = try tx.item(doc, page: page, id: id)
                 if let value = json["expectedText"], (item.shape?.text ?? .empty) != (try value.decode(RichText.self)) {

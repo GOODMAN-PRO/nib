@@ -50,7 +50,15 @@ final class FeatStickyTests: XCTestCase {
                                   params: .obj(["ref": .ref, "text": .anything()], required: ["ref", "text"]), effect: .edit)
         h.app.commands.register(d) { json, ctx in
             guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
-            let text = try (json["text"] ?? .null).decode(RichText.self)
+            var text = try (json["text"] ?? .null).decode(RichText.self)
+            // Model F026's normalisation boundary, including pasted font sizes above its cap.
+            for p in text.paragraphs.indices {
+                for r in text.paragraphs[p].runs.indices {
+                    if let size = text.paragraphs[p].runs[r].attrs.size {
+                        text.paragraphs[p].runs[r].attrs.size = min(max(1, size), 400)
+                    }
+                }
+            }
             try ctx.mutate { tx -> Item in
                 var it = try tx.item(doc, page: page, id: id)
                 if let value = json["expectedText"], it.sticky?.text != (try value.decode(RichText.self)) {
@@ -332,6 +340,25 @@ final class FeatStickyTests: XCTestCase {
             }
             XCTAssertEqual(text(h), "Local draft")
         }
+    }
+
+    func testNormalisedSaveUsesStoredBaselineForNextSaveAndClose() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        let host = FakeCanvasHost(h)
+        let editor = StickyEditor.editor(for: host)
+        editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        let view = try XCTUnwrap(host.canvasView.subviews.compactMap { $0 as? StickyNoteView }.last)
+        for value in ["Pasted", "Edited again", "Closed"] {
+            view.textView.attributedText = NSAttributedString(string: value, attributes: [.font: UIFont.systemFont(ofSize: 500)])
+            XCTAssertEqual(StickyText.richText(view.textView.attributedText, zoom: 1).paragraphs.first?.runs.first?.attrs.size, 500)
+            if value == "Closed" { editor.endEditing(save: true) } else { editor.saveTyping() }
+            await editor.flush()
+            XCTAssertEqual(try note(h).text.plainText, value)
+            XCTAssertEqual(try note(h).text.paragraphs.first?.runs.first?.attrs.size, 400)
+        }
+        XCTAssertNil(editor.editingItem)
+        editor.detach(from: host)
     }
 
     func testExternalTextReloadsCleanEditorAndRetainsDirtyConflict() async throws {

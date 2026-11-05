@@ -940,6 +940,32 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testNormalisedSaveAndCreationUseStoredBaselineForNextSaveAndClose() async throws {
+        for creating in [false, true] {
+            let h = Harness(features: [FeatTextBoxFeature.self])
+            let (host, editor) = self.editor(h)
+            if creating {
+                editor.beginNewBox(page: Fixtures.page1, at: Point(100, 100))
+            } else {
+                let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+            }
+            let (page, id) = try editingID(editor)
+            let tv = try XCTUnwrap(editor.editingTextView)
+            for value in ["Pasted", "Edited again", "Closed"] {
+                tv.attributedText = NSAttributedString(string: value, attributes: [.font: UIFont.systemFont(ofSize: 500)])
+                XCTAssertEqual(editor.currentRichText().paragraphs.first?.runs.first?.attrs.size, 500)
+                if value == "Closed" { editor.endEditing() } else { editor.commitNow() }
+                await editor.flush()
+                let stored = try box(h, id, page: page).text
+                XCTAssertEqual(stored.plainText, value)
+                XCTAssertEqual(stored.paragraphs.first?.runs.first?.attrs.size, 400)
+            }
+            XCTAssertFalse(editor.isEditing)
+            editor.detach(from: host)
+        }
+    }
+
     func testEmptyingABoxDeletesItOrKeepsItEmpty() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let host = FakeCanvasHost(h)

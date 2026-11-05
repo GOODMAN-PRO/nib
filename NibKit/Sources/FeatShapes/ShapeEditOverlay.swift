@@ -742,7 +742,10 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             defer { t.pending = nil }
             if await ShapesUI.run(app, ShapeTapAt.textCommand, params, session: session, group: group) != nil {
                 t.committed = rich
-                t.persisted = rich
+                // Keep the dirty comparison separate from text.setText's canonical stored value.
+                if let stored = try? app.workspace.item(t.doc, page: t.page, id: t.id).shape {
+                    t.persisted = stored.text ?? .empty
+                }
                 let current = ShapeTextStyle.richText(t.textView.attributedText ?? NSAttributedString(), shape: shape, scale: t.scale)
                 if current == rich, Self.drafts[t.recoveryKey] === t { Self.drafts[t.recoveryKey] = nil }
             }

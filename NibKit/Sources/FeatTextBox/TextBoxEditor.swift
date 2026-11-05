@@ -437,11 +437,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             if await execute(command, params, group: st.group, session: st.session) {
                 st.exists = true
                 st.lastCommitted = text
-                st.persisted = text
-                st.box.text = text
-                // Retain empty boxes until item.delete supports a mutation-time precondition.
-                // A separate unguarded delete can suspend in hooks and erase a newer writer's text
-                // and attached contents. Deletion's dependent-item cleanup belongs to that command.
+                // The command normalises text (and creation applies paragraph defaults). Keep the
+                // UI comparison baseline separate from the exact stored precondition, without yielding.
+                if let stored = try? app.workspace.item(st.doc, page: st.page, id: st.id).text {
+                    st.persisted = stored.text
+                    st.box.text = stored.text
+                }
                 if state === st { hide(st.id, page: st.page); publishFocus() }
             }
         }
