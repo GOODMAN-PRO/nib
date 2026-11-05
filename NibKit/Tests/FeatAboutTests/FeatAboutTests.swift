@@ -88,6 +88,19 @@ final class Flag {
     var value = false
 }
 
+@MainActor
+final class DeletionPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    var onFlush: (DocumentID) -> Void = { _ in }
+    init(base: InMemoryPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) { base.didChange(doc, head: head, pages: pages) }
+    func flush(_ doc: DocumentID) { onFlush(doc); base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+}
+
 final class DictionarySyncedBackend: SyncedSettingsBackend {
     var values: [String: JSONValue] = [:]
     func value(_ name: String) -> JSONValue? { values[name] }
@@ -224,6 +237,46 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertFalse(c.exists("Library/Caches/written-after.bin"), "Close Nib erases once more")
         XCTAssertEqual(rig.wiper.calls, 2)
         XCTAssertTrue(rig.terminated.value)
+    }
+
+    func testKeepingLibraryFlushesBeforeBothErasePassesAndPreservesRecoveryLog() async throws {
+        let h = Harness(features: [FeatAboutFeature.self])
+        let rig = try DeletionRig(h)
+        defer { try? FileManager.default.removeItem(at: rig.container.root) }
+        let c = rig.container
+        let wal = "Library/Application Support/Nib/wal/crashed-document.jsonl"
+        c.write(wal)
+        let original = try Data(contentsOf: c.url(wal))
+        let persistence = DeletionPersistence(base: h.persistence)
+        h.app.workspace.persistence = persistence
+        _ = try h.app.workspace.content(Fixtures.docID)
+        var flushed: [DocumentID] = []
+        persistence.onFlush = { doc in
+            XCTAssertTrue(c.exists("Library/Caches/before-erase"), "flush must precede erasure")
+            flushed.append(doc)
+        }
+        c.write("Library/Caches/before-erase")
+        _ = try await h.run(CommandIDs.appDeleteAllData, ["includeLibrary": false])
+        XCTAssertEqual(flushed, [Fixtures.docID])
+        XCTAssertEqual(try Data(contentsOf: c.url(wal)), original)
+        c.write("Library/Caches/before-erase")
+        await rig.prompter?.close?()
+        XCTAssertEqual(flushed, [Fixtures.docID, Fixtures.docID])
+        XCTAssertEqual(try Data(contentsOf: c.url(wal)), original)
+        XCTAssertTrue(rig.terminated.value)
+    }
+
+    func testRecoveryLogIsKeptWithoutAConnectedLibraryAndErasedWithLibrary() throws {
+        for includeLibrary in [false, true] {
+            let c = try TempContainer()
+            defer { try? FileManager.default.removeItem(at: c.root) }
+            let wal = "Library/Application Support/Nib/wal/offline.jsonl"
+            c.write(wal)
+            let plan = DeletionPlanner.plan(includeLibrary: includeLibrary, libraryRoot: nil, locations: c.locations)
+            let report = DataEraser(fileManager: .default, coordinatesFiles: false).erase(plan)
+            XCTAssertEqual(report.failures, [])
+            XCTAssertEqual(c.exists(wal), !includeLibrary)
+        }
     }
 
     func testDecliningEitherStepKeepsEverything() async throws {
