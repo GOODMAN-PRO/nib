@@ -182,3 +182,7 @@ D:controls-menus#4 correction / D:app-round-4#7 show Size stopped at y869.5 belo
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Create scrolling, especially B5 | Creation scroll unchanged | Did target and visible rows remain unchanged twice, or was one drag a no-op? |
+
+## C10 - clear outside selected content
+
+D:keyboard-and-state#3 correction proves the fixed clear tap is inside the comment-extended selection, not on its pin. Selection clear now obtains current selection bounds and chooses a canvas point outside them with a 12pt margin; no candidate fails explicitly. The selectionCount==0 wait remains. Expected FilterCommentsIndependently; CI must reach its filter loop with a real cleared selection and retain all other filter results.

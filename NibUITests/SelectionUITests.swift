@@ -128,7 +128,15 @@ final class SelectionUITests: XCTestCase {
     private func centre(_ r: CGRect) -> CGPoint { CGPoint(x: r.midX, y: r.midY) }
     private func clear() throws {
         try ui.selectTool("lasso")
-        ui.coordinate(CGPoint(x: 0.68, y: 0.82)).tap()
+        let selectionCount = try ui.state().selectionCount
+        let selected: CGRect
+        if selectionCount > 0 { selected = try bounds() } else { selected = .null }
+        let candidates = [CGPoint(x: 0.68, y: 0.82), CGPoint(x: 0.9, y: 0.9),
+                          CGPoint(x: 0.35, y: 0.9), CGPoint(x: 0.9, y: 0.3)]
+        guard let point = candidates.first(where: { !selected.insetBy(dx: -12, dy: -12).contains(ui.interfacePoint($0)) }) else {
+            throw NibUI.Failure.message("No canvas point outside the current selection")
+        }
+        ui.coordinate(point).tap()
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
     }
     private func selectAll(_ count: Int) throws {
