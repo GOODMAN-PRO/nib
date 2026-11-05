@@ -32,6 +32,7 @@ final class ProviderStore: AIProviderStore {
     private let timeouts: ProviderTimeouts
     private var entries: [Entry] = []
     private var active: UUID?
+    private var credentialRecovery = Set<UUID>()
     private var isLoaded = false
     private var httpStorage: ProviderHTTP?
     var bridgeIsEnabled: (() -> Bool)?
@@ -108,23 +109,31 @@ final class ProviderStore: AIProviderStore {
         let config = try ProviderStore.validated(config)
         let index = entries.firstIndex { $0.config.id == config.id }
         var hasKey = index.map { entries[$0].hasKey } ?? false
+        let previousKey = secrets.get(service: AIProviderConfig.keychainService, account: config.keychainAccount)
         var wroteKey = false
+        func changeKey(_ data: Data?) throws {
+            guard secrets.set(data, service: AIProviderConfig.keychainService, account: config.keychainAccount) else {
+                // SecretStore implementations can remove the old item before failing to add its replacement.
+                if !secrets.set(previousKey, service: AIProviderConfig.keychainService, account: config.keychainAccount) {
+                    credentialRecovery.insert(config.id)
+                }
+                throw NibError(.unavailable, String(localized: "Nib could not update the API key in the Keychain."),
+                               hint: String(localized: "Unlock the device and re-enter the API key before trying again."))
+            }
+            wroteKey = true
+        }
         if let apiKey = apiKey {
             let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if key.isEmpty {
-                _ = secrets.set(nil, service: AIProviderConfig.keychainService, account: config.keychainAccount)
+                try changeKey(nil)
                 hasKey = false
             } else {
                 guard key.unicodeScalars.allSatisfy({ $0.value >= 0x21 && $0.value <= 0x7E }) else {
                     throw NibError(.invalidParams, "The API key contains spaces or characters that cannot be sent to the provider.",
                                    path: "$.apiKey", hint: "paste the key again without quotes or spaces")
                 }
-                guard secrets.set(Data(key.utf8), service: AIProviderConfig.keychainService, account: config.keychainAccount) else {
-                    throw NibError(.unavailable, "Nib could not save the API key to the Keychain.",
-                                   hint: "unlock the device and try again")
-                }
+                try changeKey(Data(key.utf8))
                 hasKey = true
-                wroteKey = true
             }
         }
         let before = (entries, active)
@@ -135,11 +144,14 @@ final class ProviderStore: AIProviderStore {
             try persist()
         } catch {
             (entries, active) = before
-            if wroteKey && index == nil {
-                _ = secrets.set(nil, service: AIProviderConfig.keychainService, account: config.keychainAccount)
+            if wroteKey && !secrets.set(previousKey, service: AIProviderConfig.keychainService, account: config.keychainAccount) {
+                credentialRecovery.insert(config.id)
+                throw NibError(.unavailable, String(localized: "The provider could not be saved and its previous API key could not be restored."),
+                               hint: String(localized: "Re-enter the API key in Settings before using this provider."))
             }
             throw NibError.wrap(error)
         }
+        if wroteKey { credentialRecovery.remove(config.id) }
     }
 
     func delete(_ id: UUID) {
@@ -183,6 +195,7 @@ final class ProviderStore: AIProviderStore {
     }
 
     private func credential(for entry: Entry) -> ProviderCredential {
+        guard !credentialRecovery.contains(entry.config.id) else { return .missing }
         let data = secrets.get(service: AIProviderConfig.keychainService, account: entry.config.keychainAccount)
         if let key = data.map({ String(decoding: $0, as: UTF8.self) })?.trimmingCharacters(in: .whitespacesAndNewlines),
            !key.isEmpty {

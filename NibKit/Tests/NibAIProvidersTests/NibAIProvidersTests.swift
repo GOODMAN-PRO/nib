@@ -53,6 +53,44 @@ final class NibAIProvidersTests: XCTestCase {
 
     // MARK: Store
 
+    func testFailedKeyMutationRestoresPreviousCredential() throws {
+        let secrets = FailingProviderSecrets()
+        let store = ProviderStore(fileURL: nil, secrets: secrets)
+        let original = anthropicConfig()
+        try store.save(original, apiKey: "original-key")
+        for replacement in ["replacement-key", ""] {
+            secrets.failNext = true
+            XCTAssertThrowsError(try store.save(original, apiKey: replacement))
+            XCTAssertEqual(secrets.get(service: AIProviderConfig.keychainService, account: original.keychainAccount),
+                           Data("original-key".utf8))
+            XCTAssertEqual(store.configs, [original])
+        }
+    }
+
+    func testFailedSaveRestoresExistingKeyForReplacementAndRemoval() throws {
+        for replacement in ["replacement-key", ""] {
+            let url = tempFile()
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let secrets = InMemorySecretStore()
+            let store = ProviderStore(fileURL: url, secrets: secrets)
+            let original = anthropicConfig()
+            try store.save(original, apiKey: "original-key")
+            let saved = try Data(contentsOf: url)
+            try FileManager.default.removeItem(at: url)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+            var changed = original
+            changed.baseURL = URL(string: "https://another.example")!
+            XCTAssertThrowsError(try store.save(changed, apiKey: replacement))
+            XCTAssertEqual(store.configs, [original])
+            XCTAssertEqual(store.activeID, original.id)
+            XCTAssertEqual(secrets.get(service: AIProviderConfig.keychainService, account: original.keychainAccount),
+                           Data("original-key".utf8))
+            try FileManager.default.removeItem(at: url)
+            try saved.write(to: url)
+            XCTAssertEqual(ProviderStore(fileURL: url, secrets: secrets).configs, [original])
+        }
+    }
+
     func testFailedDeletePreservesProviderActiveIDAndKeyAndCanRetry() throws {
         let url = tempFile()
         let secrets = InMemorySecretStore()
@@ -445,4 +483,20 @@ final class NibAIProvidersTests: XCTestCase {
         XCTAssertEqual(ProviderErrors.transport(URLError(.cannotConnectToHost), ctx).code, .unavailable)
         XCTAssertEqual(ProviderErrors.map(CancellationError(), ctx).code, .userDenied)
     }
+}
+
+private final class FailingProviderSecrets: SecretStore {
+    private let memory = InMemorySecretStore()
+    var failNext = false
+
+    func set(_ data: Data?, service: String, account: String) -> Bool {
+        if failNext {
+            failNext = false
+            _ = memory.set(nil, service: service, account: account)
+            return false
+        }
+        return memory.set(data, service: service, account: account)
+    }
+
+    func get(service: String, account: String) -> Data? { memory.get(service: service, account: account) }
 }
