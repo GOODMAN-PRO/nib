@@ -13,11 +13,11 @@ struct GraphViewport: Codable, Equatable {
     func validate() throws {
         for (name, value) in [("x", x), ("y", y)] {
             guard value.isFinite, abs(value) <= 1e12 else {
-                throw GraphBuilder.invalid("The graph centre must be finite and within ±10¹².", path: "$." + name)
+                throw GraphBuilder.invalid(String(localized: "The graph centre must be finite and within ±10¹²."), path: "$." + name)
             }
         }
         guard scale.isFinite, Self.scaleRange.contains(scale) else {
-            throw GraphBuilder.invalid("Scale must be between 0.000001 and 1000000 points per unit.", path: "$.scale")
+            throw GraphBuilder.invalid(String(localized: "Scale must be between 0.000001 and 1000000 points per unit."), path: "$.scale")
         }
     }
 }
@@ -53,7 +53,7 @@ enum GraphBuilder {
     static let drawKey = "custom." + owner + "." + type
     static let timeBudget = 2.0
     static var tooSlow: NibError {
-        NibError(.unsupported, "This graph takes too long to draw", hint: "Use simpler expressions or a smaller range.")
+        NibError(.unsupported, String(localized: "This graph takes too long to draw"), hint: String(localized: "Use simpler expressions or a smaller range."))
     }
     static let maxExpressions = 8
     static let maxExpressionLength = 2048
@@ -61,7 +61,7 @@ enum GraphBuilder {
 
     static func invalid(_ message: String, path: String) -> NibError {
         NibError(.invalidParams, message, path: path,
-                 hint: "Call math.graph.create with one explicit function per expression, e.g. y = x^2, or math.graph.setViewport with ref, x, y and scale.")
+                 hint: String(localized: "Call math.graph.create with one explicit function per expression, e.g. y = x^2, or math.graph.setViewport with ref, x, y and scale."))
     }
 
     static func validate(frame: Frame) throws {
@@ -69,19 +69,20 @@ enum GraphBuilder {
               abs(frame.x) <= 1e12, abs(frame.y) <= 1e12,
               frame.w >= Double(NibMetrics.hitTarget), frame.h >= Double(NibMetrics.hitTarget),
               frame.w <= 4096, frame.h <= 4096 else {
-            throw invalid("Use a finite graph frame, 44–4096 points wide and high.", path: "$.rect")
+            throw invalid(String(localized: "Use a finite graph frame, 44–4096 points wide and high."), path: "$.rect")
         }
     }
 
-    static func build(expressions: [String], frame: Frame, viewport: GraphViewport, cancellation: MathCancellation? = nil) throws -> DisplayList {
+    static func build(expressions: [String], frame: Frame, viewport: GraphViewport, cancellation: MathCancellation? = nil,
+                      bundle: Bundle = .main) throws -> DisplayList {
         let deadline = ProcessInfo.processInfo.systemUptime + timeBudget
         try validate(frame: frame)
         try viewport.validate()
         guard !expressions.isEmpty, expressions.count <= maxExpressions else {
-            throw invalid("Add between one and eight expressions.", path: "$.expressions")
+            throw invalid(String(localized: "Add between one and eight expressions.", bundle: bundle), path: "$.expressions")
         }
         guard JSONValue.array(expressions.map(JSONValue.string)).jsonString().utf8.count <= NibLimits.aiToolResultBytes / 2 else {
-            throw invalid("The expressions are too large to edit through the query API. Use shorter functions.", path: "$.expressions")
+            throw invalid(String(localized: "The expressions are too large to edit through the query API. Use shorter functions.", bundle: bundle), path: "$.expressions")
         }
         if cancellation?.isCancelled == true { throw CancellationError() }
         let engine = MathEngine(context: expressions)
@@ -93,7 +94,7 @@ enum GraphBuilder {
             let path = "$.expressions[\(index)]"
             guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   source.utf8.count <= maxExpressionLength, source.rangeOfCharacter(from: .newlines) == nil else {
-                throw invalid("Each expression needs 1–2048 bytes of maths.", path: path)
+                throw invalid(String(localized: "Each expression needs 1–2048 bytes of maths.", bundle: bundle), path: path)
             }
             do {
                 _ = try engine.function(source)
@@ -102,10 +103,10 @@ enum GraphBuilder {
                 let body = statement.rhs ?? statement.lhs
                 let names = try MathStack.run { engine.definitions.freeNames(body, symbolic: ["x"]).subtracting(["x"]) }
                 guard names.isEmpty else {
-                    throw invalid("Undefined names: \(names.sorted().joined(separator: ", ")). Use x as the independent variable.", path: path)
+                    throw invalid(String(localized: "Undefined names: \(names.sorted().joined(separator: ", ")). Use x as the independent variable.", bundle: bundle), path: path)
                 }
                 try MathStack.run { try validateCalls(body, definitions: engine.definitions, bound: ["x"]) }
-                if case .matrix = body { throw invalid("A graph needs a scalar function of x, not a matrix.", path: path) }
+                if case .matrix = body { throw invalid(String(localized: "A graph needs a scalar function of x, not a matrix.", bundle: bundle), path: path) }
                 return { x in
                     do { return try evaluator.sample(body, variable: "x", at: x) }
                     catch is CancellationError { throw CancellationError() }

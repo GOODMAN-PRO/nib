@@ -7,6 +7,25 @@ import NibContracts
 /// The clipboard, drag-and-drop and element format is the contract's `NibFragment` ("nib-fragment/1", UTI
 /// `app.nib.fragment`). What only the clipboard needs lives here.
 extension NibFragment {
+    /// Export must be self-contained before the clipboard or any source items change.
+    static func complete(items: [Item], store: AssetStore?, doc: DocumentID) throws -> NibFragment {
+        var failure: Error?
+        let fragment = make(items: items) { ref in
+            do {
+                guard let store else { throw NibError.notFound("asset store") }
+                return try store.data(ref, doc: doc)
+            } catch {
+                failure = error
+                return nil
+            }
+        }
+        guard failure == nil else {
+            throw NibError(.notFound, String(localized: "Some selection assets could not be copied. Nothing was changed."),
+                           hint: String(localized: "Make sure the original content is available, then try again."))
+        }
+        return fragment
+    }
+
     /// Several fragments side by side (left to right, `gap` apart, top-aligned at the origin) as one fragment with
     /// fresh ids, so the same fragment dropped twice never collides with itself.
     static func combine(_ list: [NibFragment], gap: Double = 16) -> NibFragment? {
