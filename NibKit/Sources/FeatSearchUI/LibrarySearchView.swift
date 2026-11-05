@@ -137,7 +137,9 @@ struct LibrarySearchFloatingContent: View {
             let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,
                 (viewport?.availableHeight ?? geometry.size.height) - bounds.minY) - top, reservesNavigation: false)
             ZStack(alignment: .top) {
-                NibColor.scrim.opacity(0)
+                // Search owns this surface while open. An invisible catcher left fragments
+                // of the banner and title around the field, especially in landscape.
+                NibColor.background
                     .contentShape(Rectangle())
                     .onTapGesture { close() }
                     .accessibilityHidden(true)
