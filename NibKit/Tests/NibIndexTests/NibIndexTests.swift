@@ -46,6 +46,47 @@ private final class SlowRecognizer: TextRecognizer {
 
 @MainActor
 final class NibIndexTests: XCTestCase {
+    func testMissingDocumentUnitAfterCompletedPassDoesNotRestartUntilPackageChanges() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let package = try XCTUnwrap(h.app.services.packages.url(doc))
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: package) }
+        let headFile = package.appendingPathComponent("doc.00000007.json")
+        try Data("head".utf8).write(to: headFile)
+        let db = try XCTUnwrap(indexer.db)
+        // Make this document the first extraction notification regardless of library iteration order.
+        for other in Fixtures.allDocuments where other != doc { await indexer.indexDocument(other) }
+        // Leave the same database state as a failed replaceUnit, while allowing the rest of the pass to finish.
+        var removed = false
+        let subscription = h.app.events.subscribe { event in
+            guard !removed, event.decode(IndexProgressPayload.self)?.running == true,
+                  db.keys(doc: doc).contains(IndexKeys.docUnit) else { return }
+            do {
+                try db.removeUnit(doc: doc, key: IndexKeys.docUnit)
+                removed = true
+            } catch { XCTFail("\(error)") }
+        }
+        let completed = await indexer.sweep(foreground: false)
+        subscription.cancel()
+        XCTAssertTrue(completed)
+        XCTAssertTrue(removed)
+        XCTAssertFalse(db.keys(doc: doc).contains(IndexKeys.docUnit))
+        XCTAssertNil(db.stamp(doc: doc), "a pass with a missing document unit must not be certified")
+        await indexer.refreshTitles()
+        XCTAssertNil(indexer.sweepTask, "a completed pass must not schedule endless retries for the same package")
+        _ = await indexer.sweep(foreground: false)
+        XCTAssertFalse(db.keys(doc: doc).contains(IndexKeys.docUnit), "unchanged failures stay handled")
+
+        try Data("changed head".utf8).write(to: headFile)
+        await indexer.refreshTitles()
+        XCTAssertNotNil(indexer.sweepTask, "changed packages must become eligible again")
+        _ = await indexer.runBackgroundTask()
+        XCTAssertTrue(db.keys(doc: doc).contains(IndexKeys.docUnit))
+        await indexer.refreshTitles()
+        XCTAssertNil(indexer.sweepTask)
+    }
+
     func testUnreadableDocumentDoesNotRestartSweepAndRetriesChangedPackage() async throws {
         let (h, indexer) = harness()
         let doc = Fixtures.docID

@@ -546,7 +546,7 @@ final class Indexer {
     private var debounceTask: Task<Void, Never>?
     private var processing = false
     private(set) var sweepTask: Task<Void, Never>?
-    /// Failed heads are retried only after their library metadata or package files change.
+    /// Failed heads or missing document units are retried after their library metadata or package files change.
     private var unreadableDocuments: [DocumentID: String] = [:]
     private var rebuildGeneration: UInt64 = 0
     private var subscriptions: [EventSubscription] = []
@@ -1179,10 +1179,14 @@ final class Indexer {
     private func sweepDocument(_ doc: DocumentID, db: SearchDatabase, pausable: Bool,
                                progress: SweepProgress) async -> DocumentPass {
         let generation = rebuildGeneration
-        let attemptedStamp = await unreadableStamp(doc)
-        if !app.workspace.isLoaded(doc), !committedDocs.contains(doc),
-           unreadableDocuments[doc] == attemptedStamp { return DocumentPass() }
+        var attemptedStamp: String?
+        if let failed = unreadableDocuments[doc],
+           !app.workspace.isLoaded(doc), !committedDocs.contains(doc) {
+            attemptedStamp = await unreadableStamp(doc)
+            if failed == attemptedStamp { return DocumentPass() }
+        }
         guard let head = await loadHead(doc) else {
+            if attemptedStamp == nil { attemptedStamp = await unreadableStamp(doc) }
             unreadableDocuments[doc] = attemptedStamp
             return DocumentPass()
         }
@@ -1190,7 +1194,7 @@ final class Indexer {
         // Open documents can hold unsaved state; committed ones changed since their last pass.
         let checkPages = app.workspace.isLoaded(doc) || committedDocs.contains(doc)
         let stamp = checkPages ? nil : await documentStamp(doc, head: head)
-        if let stamp = stamp, db.stamp(doc: doc) == stamp {
+        if let stamp = stamp, db.stamp(doc: doc) == stamp, db.keys(doc: doc).contains(IndexKeys.docUnit) {
             indexTitle(doc, kind: head.meta.kind)
             return DocumentPass()
         }
@@ -1201,6 +1205,11 @@ final class Indexer {
         if Task.isCancelled || generation != rebuildGeneration { pass.completed = false }
         if !pass.completed {
             if committed { committedDocs.insert(doc) }
+        } else if !db.keys(doc: doc).contains(IndexKeys.docUnit) {
+            // A readable head can still fail to reach the database (e.g. a disk error).
+            // Do not certify it or let refreshTitles retry this same package every two seconds.
+            if attemptedStamp == nil { attemptedStamp = await unreadableStamp(doc) }
+            unreadableDocuments[doc] = attemptedStamp
         } else if let stamp = stamp {
             do {
                 try db.setStamp(doc: doc, stamp)

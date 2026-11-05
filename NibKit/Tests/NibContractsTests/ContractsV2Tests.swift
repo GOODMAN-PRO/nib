@@ -40,6 +40,36 @@ final class ContractsV2Tests: XCTestCase {
 
     // MARK: Undo / revert regressions
 
+    func testNonUndoableAudioDeletionAfterRenameDoesNotResurrectClip() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        let clip = try XCTUnwrap(try ctx.workspace.content(doc).liveAudio.first { $0.id == Fixtures.audioID })
+        let audio = try h.persistence.fileURL(doc, relativePath: clip.file)
+        try FileManager.default.createDirectory(at: audio.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("recording".utf8).write(to: audio)
+        // Exercise AudioRename / AudioDelete's transactions at the shared bus boundary;
+        // this target cannot import feature modules.
+        try ctx.mutate { tx in
+            var renamed = clip
+            renamed.name = "Renamed recording"
+            try tx.put(renamed, doc: self.doc)
+        }
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        try ctx.mutate(undoable: false) { tx in
+            var gone = try XCTUnwrap(try tx.content(self.doc).liveAudio.first { $0.id == clip.id })
+            gone.deleted = true
+            try tx.put(gone, doc: self.doc)
+        }
+        try FileManager.default.removeItem(at: audio)
+
+        XCTAssertFalse(h.app.bus.undo(doc))
+        let gone = try XCTUnwrap(try h.app.workspace.content(doc).audio.first { $0.id == clip.id })
+        XCTAssertTrue(gone.deleted, "undo must not resurrect a recording whose file was permanently deleted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audio.path))
+        XCTAssertEqual(h.undoDepth(doc), 0, "the skipped rename must not leave a ghost undo step")
+        XCTAssertFalse(h.app.bus.history.canRedo(doc), "a skipped undo must not create a ghost redo step")
+    }
+
     func testNonUndoableLocalRestampsPreserveCreateUndoAndRedo() async throws {
         for writes in [1, 2] {
             let h = Harness()

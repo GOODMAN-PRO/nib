@@ -473,9 +473,9 @@ public final class CommandBus {
         if record && !cs.principal.isSync { history.record(cs) }
         if !record && !cs.principal.isSync {
             // Local view state and grading follow the existing undo step. Remote writes
-            // must still conflict. Walk backwards to include repeated writes in one tx.
+            // and irreversible removals must still conflict. Walk backwards to include repeated writes in one tx.
             var rebase = RevRebase()
-            for mutation in cs.mutations.reversed() {
+            for mutation in cs.mutations.reversed() where !mutation.change.removed {
                 if let old = mutation.beforeRev {
                     let key = mutation.recordKey
                     rebase.record(key, old: old, new: rebase.current(key, mutation.afterRev))

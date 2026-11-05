@@ -8,6 +8,45 @@ import NibTesting
 final class FeatTranscriptionTests: XCTestCase {
     private let ref = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
+    func testDeletingRecordingClearsPreviouslyReportedErrorForSubscribers() async throws {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        try writeAudio(h, duration: 61)
+        let live = try XCTUnwrap(h.app.services.get(LiveTranscriber.serviceKey, as: LiveTranscriber.self))
+        let speech = TestSpeechBackend()
+        speech.completeImmediately = true
+        speech.failures[0] = NibError(.unavailable, "Recognition failed")
+        live.speech = speech
+        var statuses: [JSONValue] = []
+        let subscription = h.app.events.subscribe { event in
+            if event.type == LiveTranscriber.statusEvent, let payload = event.payload,
+               payload["clip"]?.stringValue == self.ref { statuses.append(payload) }
+        }
+        defer { subscription.cancel() }
+        h.app.commands.register(CommandDescriptor(id: "test.deleteRecording", title: "Delete", summary: "Tombstone recording", effect: .edit)) { _, ctx in
+            var clip = try XCTUnwrap(ctx.workspace.content(Fixtures.docID).liveAudio.first)
+            clip.deleted = true
+            try ctx.mutate(undoable: false) { tx in _ = try tx.put(clip, doc: Fixtures.docID) }
+            return [:]
+        }
+        live.emptyWindowDelay = {
+            XCTAssertNotNil(live.errors[self.ref], "the job must have reported an error before deletion")
+            _ = try await h.run("test.deleteRecording")
+            let audio = try h.persistence.fileURL(Fixtures.docID, relativePath: "audio/FIXTUREAUD01.caf")
+            try FileManager.default.removeItem(at: audio)
+        }
+        h.app.settings.set(TranscriptSettings.live, true)
+        live.recording(AudioRecordingPayload(clip: ref, state: "recording", duration: 61))
+        let deadline = Date().addingTimeInterval(5)
+        while live.jobs[ref] != nil && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertNil(live.jobs[ref])
+        live.jobs[ref]?.cancel()
+        await live.waitForRecording(ref)
+        live.emptyWindowDelay = { }
+        XCTAssertTrue(statuses.contains { $0["error"] != nil })
+        XCTAssertEqual(statuses.last, ["clip": .string(ref)], "subscribers must receive the cleared status")
+        XCTAssertNil(live.errors[ref])
+    }
+
     func testTerminalEmptyWindowsDoNotBackOff() async throws {
         for disabled in [false, true] {
             for complete in [false, true] {

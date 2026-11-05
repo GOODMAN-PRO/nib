@@ -312,7 +312,7 @@ final class LiveTranscriber {
             } catch is CancellationError { }
             catch {
                 if self.recordingWasRemoved(payload.clip) {
-                    self.errors[payload.clip] = nil
+                    self.clearError(for: payload.clip)
                 } else {
                     self.report(error, clip: payload.clip)
                 }
