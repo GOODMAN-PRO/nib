@@ -1123,8 +1123,9 @@ struct ChromeRootView: View {
     }
 
     private func panelFrame(_ frame: CGRect, id: String) -> CGRect {
-        // F027's document results panel scrolls above the keyboard; its search-field overlay stays below the bars.
-        id == "searchui.document" ? ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: frame) : frame
+        // Any sidebar can contain an editor/search field (including Transcript and plugin panels).
+        // Shorten only its viewport; the canvas and search-field overlay keep their existing geometry.
+        ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: frame)
     }
 
     /// The side window mode shows: the preferred side when it is open.
