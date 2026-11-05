@@ -1869,6 +1869,37 @@ final class FeatLibraryUITests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.libraryReorder, result["undo"] ?? [:], session: h.session)
         XCTAssertEqual(model.visibleRows.map(\.ref), previous)
     }
+    func testRootReorderAndUndoLeaveCollectionWindowsUnchanged() async throws {
+        let h = harness(), root = LibraryModels.get(h.app).model(h.session)
+        await root.reload()
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sort": "name"], session: h.session)
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        let collection = LibraryModels.get(h.app).model(other)
+        for place in [LibraryCollection.recents, .studySets] {
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView,
+                ["collection": .string(place.rawValue)], session: other)
+            await collection.reload()
+            let rows = collection.visibleRefs
+            let result = try await h.app.bus.execute(CommandIDs.libraryReorder,
+                ["refs": ["doc:FIXTUREDOC01"]], session: h.session)
+            XCTAssertEqual(root.sort, .manual)
+            XCTAssertEqual(collection.sort, .modified)
+            XCTAssertEqual(collection.visibleRefs, rows)
+            // Undo after navigating, or from another window, must restore only the folder view.
+            _ = try await h.app.bus.execute(CommandIDs.libraryReorder, result["undo"] ?? [:], session: other)
+            XCTAssertEqual(root.sort, .name)
+            XCTAssertEqual(collection.sort, .modified)
+            XCTAssertEqual(collection.visibleRefs, rows)
+            // A command invoked in a collection takes the folder's saved sort for its undo payload.
+            let fromCollection = try await h.app.bus.execute(CommandIDs.libraryReorder,
+                ["refs": ["doc:FIXTUREDOC01"]], session: other)
+            XCTAssertEqual(fromCollection["previousSort"], "name")
+            _ = try await h.app.bus.execute(CommandIDs.libraryReorder, fromCollection["undo"] ?? [:], session: other)
+            XCTAssertEqual(collection.sort, .modified)
+        }
+    }
+
     func testReorderUndoManagerRegistersRedoSynchronously() async throws {
         let h = harness(), manager = UndoManager()
         manager.groupsByEvent = false
