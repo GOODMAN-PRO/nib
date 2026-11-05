@@ -80,11 +80,13 @@ public enum NibUITestScenario: String, CaseIterable {
 public enum NibUITestKeyLog {
     private static let lock = NSLock()
     private static var entries: [String] = []
+    private static var count = 0
 
     public static func note(_ entry: @autoclosure () -> String) {
         guard NibUITestMode.isEnabled else { return }
         let text = entry()
         lock.lock(); defer { lock.unlock() }
+        count += 1
         entries.append(text)
         if entries.count > 24 { entries.removeFirst(entries.count - 24) }
     }
@@ -92,5 +94,11 @@ public enum NibUITestKeyLog {
     public static var recent: [String] {
         lock.lock(); defer { lock.unlock() }
         return entries
+    }
+
+    /// All notes since launch, including entries evicted from the bounded recent log.
+    public static var total: Int {
+        lock.lock(); defer { lock.unlock() }
+        return count
     }
 }

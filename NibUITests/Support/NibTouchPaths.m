@@ -21,6 +21,79 @@
 @end
 
 @implementation NibTouchPaths
++ (NSArray<NSString *> *)selectorNamesForClassNamed:(NSString *)name {
+    NSMutableArray<NSString *> *selectors = [NSMutableArray array];
+    for (Class cls = NSClassFromString(name); cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            [selectors addObject:NSStringFromSelector(method_getName(methods[i]))];
+        }
+        free(methods);
+    }
+    return [selectors sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// Diagnostic only: force exactly one branch, without changing typeKey's fallback policy or timings.
++ (void)sendKey:(NSString *)key modifiers:(NSUInteger)flags route:(NSInteger)route
+     completion:(void (^)(NSError *))completion {
+    void (^unavailable)(NSString *) = ^(NSString *missing) {
+        completion([NSError errorWithDomain:@"NibUITests" code:7 userInfo:@{NSLocalizedDescriptionKey:
+            [NSString stringWithFormat:@"Key probe route %ld unavailable: %@", (long)route, missing]}]);
+    };
+    Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
+    Class pathClass = NSClassFromString(@"XCPointerEventPath");
+    XCUIDevice *device = XCUIDevice.sharedDevice;
+    if (!recordClass) { unavailable(@"class XCSynthesizedEventRecord"); return; }
+    if (!pathClass) { unavailable(@"class XCPointerEventPath"); return; }
+    if (![device respondsToSelector:@selector(eventSynthesizer)]) { unavailable(@"eventSynthesizer"); return; }
+    for (NSString *name in @[@"initWithName:interfaceOrientation:", @"addPointerEventPath:"]) {
+        if (![recordClass instancesRespondToSelector:NSSelectorFromString(name)]) { unavailable(name); return; }
+    }
+    if (![pathClass instancesRespondToSelector:@selector(initForTextInput)]) { unavailable(@"initForTextInput"); return; }
+    id synthesizer = [device eventSynthesizer];
+    if (![synthesizer respondsToSelector:@selector(synthesizeEvent:completion:)]) {
+        unavailable(@"synthesizeEvent:completion:"); return;
+    }
+    NSArray<NSString *> *required;
+    switch (route) {
+        case 1: required = @[@"typeKey:modifiers:atOffset:"]; break;
+        case 2: required = @[@"pressKey:modifiers:atOffset:", @"releaseKey:modifiers:atOffset:"]; break;
+        case 3: required = @[@"setModifiers:mergeWithCurrentModifierFlags:atOffset:",
+                             @"typeText:atOffset:typingSpeed:shouldRedact:"]; break;
+        default: unavailable(@"unknown route (expected 1, 2 or 3)"); return;
+    }
+    for (NSString *name in required) {
+        if (![pathClass instancesRespondToSelector:NSSelectorFromString(name)]) { unavailable(name); return; }
+    }
+    id path = [[pathClass alloc] initForTextInput];
+    if (!path) { unavailable(@"initForTextInput returned nil"); return; }
+    switch (route) {
+        case 1:
+            [path typeKey:key modifiers:flags atOffset:0];
+            break;
+        case 2:
+            [path pressKey:key modifiers:flags atOffset:0];
+            [path releaseKey:key modifiers:flags atOffset:0.05];
+            break;
+        case 3:
+            [path setModifiers:flags mergeWithCurrentModifierFlags:NO atOffset:0];
+            [path typeText:key atOffset:0.01 typingSpeed:60 shouldRedact:NO];
+            [path setModifiers:0 mergeWithCurrentModifierFlags:NO atOffset:0.1 + key.length / 60.0];
+            break;
+    }
+    NSInteger orientation = device.orientation == UIDeviceOrientationLandscapeLeft ? UIInterfaceOrientationLandscapeRight :
+        device.orientation == UIDeviceOrientationLandscapeRight ? UIInterfaceOrientationLandscapeLeft : UIInterfaceOrientationPortrait;
+    id record = [[recordClass alloc] initWithName:[NSString stringWithFormat:@"Nib key probe route %ld", (long)route]
+                           interfaceOrientation:orientation];
+    if (!record) { unavailable(@"initWithName:interfaceOrientation: returned nil"); return; }
+    [record addPointerEventPath:path];
+    [synthesizer synthesizeEvent:record completion:^(BOOL success, NSError *error) {
+        completion(error ?: (success ? nil : [NSError errorWithDomain:@"NibUITests" code:8
+            userInfo:@{NSLocalizedDescriptionKey: @"Key probe synthesis failed"}]));
+    }];
+}
+
 + (void)typeKey:(NSString *)key modifiers:(NSUInteger)flags completion:(void (^)(NSError *))completion {
     Class recordClass = NSClassFromString(@"XCSynthesizedEventRecord");
     Class pathClass = NSClassFromString(@"XCPointerEventPath");
