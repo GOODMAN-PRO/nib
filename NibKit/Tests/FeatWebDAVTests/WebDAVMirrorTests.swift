@@ -421,6 +421,25 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(r.downloaded, 1)
     }
 
+    func testConcurrentWriteAfterPutIsNotRecordedAsSynced() async throws {
+        let server = FakeDAVServer.install()
+        let root = DAVTest.tempDir("put-race"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "a.json", "ours")
+        server.intercept = { [unowned server] method, path in
+            if method == "PROPFIND", path == "/dav/Nib/a.json", server.text(path) == "ours" {
+                server.put(path, "theirs")
+            }
+            return nil
+        }
+        _ = try await sync(server, root, state, dev)
+        server.intercept = nil
+        let saved = MirrorStateStore(directory: state, key: dev).load()
+        XCTAssertEqual(saved.entries["a.json"]?.remote, "")
+        let next = try await sync(server, root, state, dev)
+        XCTAssertEqual(next.downloaded, 1)
+        XCTAssertEqual(DAVTest.read(root, "a.json"), "theirs")
+    }
+
     func testServerWithoutPutETagsStaysStable() async throws {
         let server = FakeDAVServer.install()
         server.omitPutETag = true
