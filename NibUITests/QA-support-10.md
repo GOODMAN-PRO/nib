@@ -19,3 +19,13 @@ Confirmed chrome-timeouts#1 and correction: 55 Any existence probes cost 52.3 se
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Chrome setup | Typed probe estimate | What baseline estimate is being tested, without claiming measured savings? |
+
+### H3 - scoped modal text and ruler confirmation
+
+Confirmed chrome-timeouts#2 and chrome-singles#0 correction. Round 9b already scopes textEditor and focusField: lack of scope is NOT the isolated cause of alert cancellation. Chrome replace now uses fillNativeForm, resolving one container, supporting typed text views/search/secure editors as well as fields so existing Graph/Search callers remain valid. Optional explicit container enables the Time Keeper batch. Save Layout disabled checks use the alert's button. Ruler confirming actions require an enabled/hittable button, log its facts and the post-tap alert count, and require disappearance before the next action. The logging-only interruption monitor returns false; it never claims to handle the app alert. Layout-name, rename, timer and ruler tests retain exact text/action expectations. CI must show reduced field durations and either actual ruler dismissal or the interruption/confirmation evidence; the cancellation trigger remains unknown.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Chrome native forms | Native form field duration | What did one scoped field cost? |
+| Chrome interruptions | Chrome interruption | Which element did XCTest report before its default handler? |
+| Ruler angle/position tests | Ruler alert confirm / Ruler alert after tap | Was confirmation enabled/hittable at which frame, and did the alert remain? |

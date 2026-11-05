@@ -19,6 +19,10 @@ final class ChromeUITests: XCTestCase {
         continueAfterFailure = false
         ui = NibUI()
         ui.logIdleSelectors(for: String(describing: type(of: self)))
+        addUIInterruptionMonitor(withDescription: "Log Chrome interruptions without handling app alerts") { [weak self] element in
+            self?.ui.logQA("Chrome interruption", self?.ui.elementFacts(element) ?? "test released")
+            return false
+        }
         try ui.launchFixture()
         ui.logQA("Typed probe estimate", "Chrome toolbar/More rows use buttons; baseline Any probes ~0.99s vs present typed ~0.16s. Potential 50-70s/layout test, unmeasured; modal typed queries may remain slow.")
     }
@@ -152,9 +156,7 @@ final class ChromeUITests: XCTestCase {
         _ = try ui.waitForState(timeout: 12) { $0.strokeCountOnPage == before.strokeCountOnPage + 1 && $0.undoAvailable }
     }
     private func replace(_ name: String, _ text: String) throws {
-        // Duration has a separate StaticText caption; only the native editor can accept key synthesis.
-        let target = try ui.textEditor(name)
-        try ui.replaceNativeText(in: target, with: text)
+        try ui.fillNativeForm([(name, text)])
     }
 
     private func toggle(_ name: String, to on: Bool) throws {
@@ -650,8 +652,14 @@ final class ChromeUITests: XCTestCase {
     }
     private func customize() throws { try more("Customise Toolbar"); try panel("toolbar.customize") }
     private func doneCustomizing() throws { try tap("sheet.dismiss"); try panel("toolbar.customize", shown: false) }
+    private func confirmLayoutSave() throws {
+        let alert = ui.app.alerts.firstMatch
+        let save = try ui.requireControl("cmd.toolbar.saveLayout", type: .button, in: alert)
+        guard save.isEnabled else { throw NibUI.Failure.message("Named layout save must be enabled") }
+        save.tap()
+    }
     private func saveLayout(_ name: String) throws {
-        try tap("Save current layout"); try replace("Layout name", name); try tap("cmd.toolbar.saveLayout")
+        try tap("Save current layout"); try replace("Layout name", name); try confirmLayoutSave()
         _ = try reachable("Apply " + name)
     }
     private func reorderHighlighterAbovePen(_ handle: XCUIElement) throws {
@@ -676,9 +684,11 @@ final class ChromeUITests: XCTestCase {
     }
     func testSaveLayoutRejectsBlankAndNamedLayoutAppears() throws {
         try open(); try customize(); try tap("Save current layout")
-        XCTAssertFalse(try require("cmd.toolbar.saveLayout").isEnabled)
-        try replace("Layout name", "   "); XCTAssertFalse(query("cmd.toolbar.saveLayout").firstMatch.isEnabled)
-        try replace("Layout name", "Chrome layout"); try tap("cmd.toolbar.saveLayout")
+        let save = ui.app.alerts.firstMatch.buttons["cmd.toolbar.saveLayout"].firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 8))
+        XCTAssertFalse(save.isEnabled)
+        try replace("Layout name", "   "); XCTAssertFalse(save.isEnabled)
+        try replace("Layout name", "Chrome layout"); try confirmLayoutSave()
         _ = try reachable("Apply Chrome layout")
         try doneCustomizing(); try customize(); _ = try reachable("Apply Chrome layout")
     }
@@ -981,6 +991,17 @@ final class ChromeUITests: XCTestCase {
         XCTAssertTrue(ruler.waitForExistence(timeout: 8), "Ruler must appear on canvas")
     }
     private func rulerMenu(_ action: String) throws { ruler.doubleTap(); try tap(action) }
+    private func confirmRulerAlert(_ title: String) throws {
+        try ui.prepareCoveredControl(title)
+        let alert = ui.app.alerts.firstMatch
+        let button = alert.buttons[title].firstMatch
+        try wait("Ruler confirmation must be enabled and hittable") { button.exists && button.isEnabled && button.isHittable }
+        ui.logQA("Ruler alert confirm", "action=\(title) " + ui.elementFacts(button))
+        button.tap()
+        ui.logQA("Ruler alert after tap", "action=\(title) alerts=\(ui.app.alerts.count)")
+        try wait("Ruler alert must close before another action") { !alert.exists }
+    }
+
     func testRulerPaletteAndKeyboardToggleWithoutDocumentItems() throws {
         try open(); let before = try ui.state()
         try tap("tool.more"); try tap("cmd.ruler.set")
@@ -996,7 +1017,7 @@ final class ChromeUITests: XCTestCase {
         start.press(forDuration: 0.1, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 65)))
         XCTAssertGreaterThan(ruler.frame.midY, old.midY + 30)
         for angle in [0, 45, 90] {
-            try rulerMenu("Set Angle…"); try replace("Angle in degrees", String(angle)); try tap("Set Angle")
+            try rulerMenu("Set Angle…"); try replace("Angle in degrees", String(angle)); try confirmRulerAlert("Set Angle")
             try wait("Ruler angle must be \(angle) degrees") { (self.ruler.value as? String ?? "").hasPrefix("\(angle) degrees") }
         }
         try sameContent(before)
@@ -1004,7 +1025,7 @@ final class ChromeUITests: XCTestCase {
 
     func testRulerTwoFingerRotationSnapsToFortyFiveWithoutEditing() throws {
         try showRuler(); let before = try ui.state()
-        try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try tap("Set Angle")
+        try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try confirmRulerAlert("Set Angle")
         defer { ui.recordDiagnostics("Ruler rotation completion", facts: ui.elementFacts(ruler), includeHierarchy: false) }
         try wait("Set Angle panel must be gone before rotation") { !self.ui.app.textFields["Angle in degrees"].exists }
         ui.recordDiagnostics("Ruler rotation before", facts: ui.elementFacts(ruler), includeHierarchy: false)
@@ -1036,14 +1057,14 @@ final class ChromeUITests: XCTestCase {
         try rulerMenu("Options"); try tap("Hide Digits")
         XCTAssertNotEqual(ui.canvas.screenshot().pngRepresentation, withDigits, "Hide Digits must change the rendered ruler")
         try rulerMenu("Set Position…")
-        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try ui.prepareCoveredControl("Move Ruler"); try tap("Move Ruler")
+        try replace("Horizontal position", "4"); try replace("Vertical position", "5"); try confirmRulerAlert("Move Ruler")
         try rulerMenu("Set Position…")
         XCTAssertEqual(try require("Horizontal position").value as? String, "4")
         XCTAssertEqual(try require("Vertical position").value as? String, "5")
         try tap("Cancel"); try sameContent(before)
     }
     func testRulerEdgeConstrainsRealInkAndStrokeIsUndoable() throws {
-        try showRuler(); try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try tap("Set Angle")
+        try showRuler(); try rulerMenu("Set Angle…"); try replace("Angle in degrees", "0"); try confirmRulerAlert("Set Angle")
         try ui.selectTool("pen"); let before = try ui.state(), frame = ruler.frame, canvas = ui.canvas.frame
         // Finger just outside the body, within the 20-page-point projection band.
         let y = (frame.maxY + 5 - canvas.minY) / canvas.height

@@ -1646,14 +1646,20 @@ final class NibUI {
     }
 
     @discardableResult
-    func fillNativeForm(_ values: [(String, String)]) throws -> XCUIElement {
-        let container = nativeFormContainer()
+    func fillNativeForm(_ values: [(String, String)], in scope: XCUIElement? = nil) throws -> XCUIElement {
+        let container = scope ?? nativeFormContainer()
         var last: XCUIElement?
         for (name, value) in values {
             let started = Date()
             defer { logQA("Native form field duration", "field=\(name) seconds=\(Date().timeIntervalSince(started))") }
-            let field = container.textFields.matching(NSPredicate(
-                format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)).firstMatch
+            let predicate = NSPredicate(format: "identifier == %@ OR label == %@ OR placeholderValue == %@", name, name, name)
+            var field = container.textFields.matching(predicate).firstMatch
+            if !field.exists {
+                for kind in [XCUIElement.ElementType.textView, .searchField, .secureTextField] {
+                    let candidate = container.descendants(matching: kind).matching(predicate).firstMatch
+                    if candidate.exists { field = candidate; break }
+                }
+            }
             if !field.exists {
                 revealFormElement { field }
                 if let failure = formRevealFailure { throw Failure.message(failure) }
