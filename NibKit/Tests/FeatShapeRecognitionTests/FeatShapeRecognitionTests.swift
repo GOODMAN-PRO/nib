@@ -415,8 +415,8 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertNil(calls.params[CommandIDs.itemTransform], "the rotation travels with the frame")
     }
 
-    /// Failed shape creation keeps its preview until the fallback ink commit succeeds.
-    func testFailedShapeFallbackKeepsPreviewUntilInkCommitSucceeds() async throws {
+    /// The preview lasts until ink is committed, or is retired with an error when neither write succeeds.
+    func testFailedShapeFallbackRetiresPreviewOnSuccessAndFailure() async throws {
         for succeeds in [false, true] {
             let h = Harness(features: [FeatShapeRecognitionFeature.self])
             let host = ControlledInkHost(h)
@@ -436,7 +436,7 @@ final class FeatShapeRecognitionTests: XCTestCase {
             await fulfillment(of: [notice], timeout: 0.1)
             NotificationCenter.default.removeObserver(token)
             XCTAssertEqual(host.base.committed.count, 1)
-            XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, succeeds ? 0 : 1)
+            XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, 0)
             XCTAssertEqual(host.base.renderWaits.count, succeeds ? 1 : 0)
         }
     }

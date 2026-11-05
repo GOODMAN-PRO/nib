@@ -159,14 +159,14 @@ final class DrawShapeTool: CanvasTool {
                     case .success:
                         host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
                     case .failure(let error):
+                        layer?.removeFromSuperlayer()
                         NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                             userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
                     }
                 }
             } else {
-                if await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session) {
-                    layer?.removeFromSuperlayer()
-                }
+                _ = await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session)
+                layer?.removeFromSuperlayer()
             }
         }
     }
