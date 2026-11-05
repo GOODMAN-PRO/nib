@@ -23,11 +23,11 @@ public enum FeatTextBoxFeature: NibFeature {
             TextLayout.layoutInfo(item)
         })
 
-        // Preserve tape, comment and link precedence; also dismiss an editor on unclaimed outside taps.
+        // Keep the normal item-filtered ordering; an open editor adds its outside-tap handler.
         for gesture in [CanvasGesture.tap, CanvasGesture.doubleTap] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
                 id: CommandIDs.textTapAt + "." + gesture.rawValue, owner: id, gesture: gesture, command: CommandIDs.textTapAt,
-                order: 340))
+                order: 350, itemKinds: [.text]))
         }
 
         let settings = app.settings

@@ -293,6 +293,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         st.session = host.session
         st.layer = host.session.activeLayer
         state = st
+        updateTapHandlers()
         remember(st.group)
         applyInsets(st)
         render(box.text, selection: nil)
@@ -334,6 +335,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
         if commit { retainDraft(st) }
         state = nil
+        updateTapHandlers()
         st.textView.delegate = nil
         dismissFloatingInspector(st)
         if st.textView.isFirstResponder { st.textView.resignFirstResponder() }
@@ -363,6 +365,19 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
         revertTool(st)
         changes.send()
+    }
+
+    private func updateTapHandlers() {
+        let editing = Self.live.contains { $0.editor?.app === app && $0.editor?.isEditing == true }
+        for gesture in [CanvasGesture.tap, CanvasGesture.doubleTap] {
+            let id = CommandIDs.textTapAt + ".editing." + gesture.rawValue
+            if editing {
+                app.content.tapHandlers.register(TapHandlerDescriptor(
+                    id: id, owner: FeatTextBoxFeature.id, gesture: gesture, command: CommandIDs.textTapAt, order: 340))
+            } else {
+                app.content.tapHandlers.unregister(id: id)
+            }
+        }
     }
 
     private func retainDraft(_ st: EditState) {
@@ -648,7 +663,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         isRendering = false
     }
 
-    // MARK: Text view â‡„ model
+    // MARK: Text view ⇄ model
 
     /// The text view's content as rich text (model offsets, markers dropped).
     func currentRichText() -> RichText {

@@ -166,7 +166,9 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertEqual(h.app.ui.toolbar.get("text")?.shortcut, KeyShortcut("t"))
         XCTAssertNotNil(h.app.content.drawers.get("text"))
         XCTAssertEqual(h.app.content.tapHandlers.all.filter { $0.command == "text.tapAt" }.count, 2)
-        XCTAssertTrue(h.app.content.tapHandlers.all.filter { $0.command == "text.tapAt" }.allSatisfy { $0.order == 340 })
+        XCTAssertTrue(h.app.content.tapHandlers.all.filter { $0.command == "text.tapAt" }.allSatisfy {
+            $0.order == 350 && $0.itemKinds == [.text]
+        })
     }
 
     func testCreateBoxHonoursIdAndUndoes() async throws {
@@ -653,6 +655,28 @@ final class FeatTextBoxTests: XCTestCase {
         let asset = try XCTUnwrap(try box(h).text.paragraphs.first?.runs.first?.attrs.attachment)
         XCTAssertEqual(try h.assets.data(asset, doc: Fixtures.docID), bytes)
         editor.detach(from: host)
+    }
+
+    func testOutsideTapHandlersExistOnlyWhileAnEditorIsOpen() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let (otherHost, otherEditor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        func outsideCount() -> Int {
+            h.app.content.tapHandlers.all.filter { $0.command == CommandIDs.textTapAt && $0.itemKinds == nil }.count
+        }
+        XCTAssertEqual(outsideCount(), 0)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        XCTAssertTrue(otherEditor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        XCTAssertEqual(outsideCount(), 2)
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertEqual(outsideCount(), 2)
+        otherEditor.endEditing()
+        await otherEditor.flush()
+        XCTAssertEqual(outsideCount(), 0)
+        editor.detach(from: host)
+        otherEditor.detach(from: otherHost)
     }
 
     func testAttachmentWithoutDataDoesNotTrapTheEditor() async throws {
