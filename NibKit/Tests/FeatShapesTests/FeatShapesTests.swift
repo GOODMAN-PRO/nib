@@ -357,6 +357,28 @@ final class FeatShapesTests: XCTestCase {
 
     // MARK: Tool
 
+    func testSelectingShapesDoesNotAutomaticallyOpenADuplicateLibrary() async {
+        let h = Harness(features: [FeatShapesFeature.self])
+        var panelCalls: [String] = []
+        for command in [CommandIDs.panelOpen, CommandIDs.panelClose] {
+            h.app.commands.register(CommandDescriptor(id: command, title: "Panel",
+                summary: "Test panel routing.", params: .anything(), effect: .session)) { _, _ in
+                panelCalls.append(command)
+                return [:]
+            }
+        }
+        let host = FakeCanvasHost(h)
+        host.canvasView.traitOverrides.horizontalSizeClass = .regular
+        let tool = ShapeTool()
+        tool.activate(host)
+        tool.deactivate(host)
+        // NibApp.perform dispatches asynchronously; allow any accidental panel command to run.
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(panelCalls.isEmpty)
+        XCTAssertNotNil(h.app.ui.panels.get(ShapeLibraryMenu.panelID), "Explicit panel opening stays available")
+        XCTAssertNotNil(h.app.ui.toolbar.get(ShapeTool.toolID)?.settings)
+    }
+
     func testToolDragCreatesTheChosenShapeAndATapLeavesItReady() async throws {
         let h = Harness(features: [FeatShapesFeature.self])
         h.app.settings.set(ShapeSettings.kind, ShapeLibraryEntry.ellipse.rawValue)
