@@ -43,7 +43,9 @@ final class InsertUITests: XCTestCase {
         var attachments = [XCTAttachment(screenshot: XCUIScreen.main.screenshot()),
                            XCTAttachment(string: String(describing: ui.probe.value))]
         if (testRun?.totalFailureCount ?? 0) > 0 {
-            attachments.append(XCTAttachment(string: ui.app.debugDescription))
+            let tree = ui.app.debugDescription
+            ui.logQA("Insert failure hierarchy", tree)
+            attachments.append(XCTAttachment(string: tree))
         }
         for (index, attachment) in attachments.enumerated() {
             attachment.name = "Insert-\(name)-\(["screen", "nib.qa.state", "accessibility"][index])"
@@ -110,13 +112,34 @@ final class InsertUITests: XCTestCase {
     private func tap(_ name: String, scroll: Bool = false) throws {
         try ui.timedAction("Insert tap \(name)") { try self.performTap(name, scroll: scroll) }
     }
+    private func stableControl(_ target: XCUIElement, name: String) throws {
+        var previous: [CGRect]?
+        try wait("Diagnostic target must have two stable frame observations: " + name) {
+            guard target.exists, target.isEnabled, self.ui.hasVisibleFrame(target) else { previous = nil; return false }
+            let frames = [target.frame] + self.ui.app.popovers.allElementsBoundByIndex.map(\.frame)
+            defer { previous = frames }
+            return previous == frames
+        }
+        ui.logQA("Insert stable control", "name=\(name) frames=\(String(describing: previous)) " + ui.elementFacts(target, includeOverlaps: true))
+    }
     private func performTap(_ name: String, scroll: Bool = false) throws {
         let target = try control(name, scroll: scroll)
         if [.textField, .secureTextField, .textView, .searchField].contains(target.elementType) {
             try ui.focusField(target)
         } else {
-            if name == "Finish Editing" { ui.logQA("Stall boundary", "Insert Finish Editing tap after native clipboard actions") }
-            target.tap()
+            if name == "Save Style…" {
+                try stableControl(target, name: name)
+                defer { ui.logQA("Save Style after tap", ui.elementFacts(target, includeOverlaps: true) + " alertExists=\(ui.app.alerts["Save Text Style"].exists)") }
+                target.tap()
+            } else {
+                if name == "Finish Editing" {
+                    if self.name.contains("testCopyTextUsesActualSelectedText") {
+                        ui.recordDiagnostics("Finish Editing before stall", facts: ui.elementFacts(target, includeOverlaps: true))
+                    }
+                    ui.logQA("Stall boundary", "Insert Finish Editing tap after native clipboard actions")
+                }
+                target.tap()
+            }
         }
     }
     /// Samples typed controls in the active presentation without retaining mixed-type ordinals during transitions.
@@ -183,7 +206,12 @@ final class InsertUITests: XCTestCase {
         // as a switch as well as its actual switch child; the row's centre is text.
         let nativeSwitch = element.descendants(matching: .switch).firstMatch
         if (element.value as? String == "1") != value {
-            (nativeSwitch.exists ? nativeSwitch : element).tap()
+            let target = nativeSwitch.exists ? nativeSwitch : element
+            if name == "Straight tape" {
+                try stableControl(target, name: name)
+                defer { ui.logQA("Straight tape after tap", ui.elementFacts(target, includeOverlaps: true) + " labelledValue=\(String(describing: element.value))") }
+                target.tap()
+            } else { target.tap() }
         }
         try wait("\(name) must change to \(value)") { (element.value as? String == "1") == value }
     }
@@ -1013,15 +1041,23 @@ final class InsertUITests: XCTestCase {
         try tap("Add GIF")
         if let root = try? ui.app.snapshot() {
             func texts(_ node: XCUIElementSnapshot) -> [String] {
-                let own = node.elementType == .staticText ? ["\(node.label) frame=\(node.frame)"] : []
+                let matches = node.identifier == "nib.toast" || node.label.localizedCaseInsensitiveContains("web address")
+                let own = matches ? ["type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"] : []
                 return own + node.children.flatMap { texts($0) }
             }
-            ui.recordDiagnostics("Invalid GIF immediately after Add", facts: texts(root).joined(separator: "\n"))
+            let facts = texts(root).joined(separator: "\n")
+            ui.logQA("Invalid GIF toast any type", facts.isEmpty ? "no matching toast node in snapshot" : facts)
+            ui.recordDiagnostics("Invalid GIF immediately after Add", facts: facts)
         } else { ui.recordDiagnostics("Invalid GIF immediately after Add", facts: "snapshot unavailable") }
         let errors = ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'URL' OR label CONTAINS[c] 'address' OR label CONTAINS[c] 'invalid'"))
         // Keep the original error oracle; the immediate diagnostic above investigates its missing presentation.
         let errorAppeared = errors.firstMatch.waitForExistence(timeout: 10)
         ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test", includeHierarchy: false)
+        if !errorAppeared {
+            do { try ui.dismissSheets() }
+            catch { ui.logQA("Invalid GIF dismissal diagnostic", String(describing: error)) }
+            ui.recordDiagnostics("Invalid GIF after dismissal", includeHierarchy: true)
+        }
         XCTAssertTrue(errorAppeared, "Invalid GIF link must give an actionable error")
         if visible("Cancel") { try tap("Cancel") }
         try tap("Add GIF from Files"); try ui.cancelRemotePicker(.files); try counts(4)
@@ -1098,9 +1134,8 @@ final class InsertUITests: XCTestCase {
         defer {
             if !completed {
                 ui.recordDiagnostics("Tape final command and undo state", facts: "Expected edit sequence: pen stroke, tape stroke, reveal, hide, undo tape, redo tape, removeAll, undo removeAll; reveal/hide are non-undoable")
-                // Read the user-visible history after the scenario, including when its strict count check throws.
-                do { try panel("History"); ui.recordDiagnostics("Tape actual history groups") }
-                catch { ui.recordDiagnostics("Tape history unavailable", facts: String(describing: error)) }
+                // Preserve the first failure; opening History under a confirmation creates a second failure.
+                ui.logStateStep("Tape failure without further navigation")
             }
         }
         try ui.selectTool("pen"); try ui.drawStroke([point, end]); try counts(5, strokes: 2)
@@ -1128,7 +1163,7 @@ final class InsertUITests: XCTestCase {
         try counts(5, strokes: 2)
         try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
         ui.logStateStep("Tape visibility redo")
-        try ui.openToolSettings("tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
+        try ui.openToolSettings("tape"); try tap("Remove All Tape", scroll: true); try ui.cancelConfirmation(action: "Remove All Tape")
         ui.logStateStep("Tape visibility cancel remove")
         try counts(6, strokes: 3)
         try tap("Remove All Tape", scroll: true); try tap("Remove All Tape")

@@ -219,3 +219,17 @@ Confirmed insert-singles#0 against SelectionOverlay/HandleAccessView (non-intera
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | ConnectorDragAnchorRoutesBendsAndUndo; TextInsertCommitEditAndUndo | Insert covered target | Which Selection/other AX frames cover the visible target that receives the coordinate contact? |
+
+### I10 - singles and unproven hit/stall evidence
+
+Confirmed insert-singles#4: TapeTool uses a destructive-only iPad confirmation. Replaced the Cancel lookup with existing cancelConfirmation; count 6/strokes 3 after cancel remains. Failure diagnostics no longer open History behind the modal and mask the first failure.
+
+For #1/#2/#5 and insert-timeouts-state#1, corrections win: Save Style and Straight tape touches were at the correct positions inside stable popovers; no moving-frame cause is claimed. Per this job's requested observation, these two targets require two equal target/popover frames, then log target facts and overlapping AX elements before/after the unchanged tap. This is diagnostic preparation, not a proven fix. Public XCUITest cannot report UIKit hosting-layer hitTest; app viewport/contentHeight/hit-test instrumentation remains outside scope. The invalid-GIF immediate snapshot now inventories matching toast identifiers/text across **all** types, keeping the original StaticText error oracle. Failure additionally captures the hierarchy after dismissal.
+
+Round 10a already added the immediate Finish Editing stall marker. Added pre-step screenshot/hierarchy for CopyTextUsesActualSelectedText and runner-log failure hierarchy before termination; screenshots retain keepAlways. Timeout screenshot extraction/sample cadence is CI-owned and cannot be changed under NibUITests-only scope. CI must pass original Tape cancel/remove/undo, style, switch, toast and clipboard outcomes or correlate these observations with app contacts/idle samples.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NamedStyleAndDefault; TapePatternWidthStraightness | Insert stable control / Save Style after tap / Straight tape after tap | Was the actual tap inside the stable target/popover and what AX elements covered it? Did the alert/value change? |
+| GIFLocalInvalidLink | Invalid GIF toast any type / Invalid GIF after dismissal | What AX type/identifier represents the visible toast, and does dismissal change exposure? |
+| CopyTextUsesActualSelectedText | Finish Editing before stall / Stall boundary / Insert failure hierarchy | What overlay/tree and pixels preceded the idle wait, and what survived at teardown? |
