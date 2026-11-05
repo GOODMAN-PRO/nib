@@ -256,6 +256,11 @@ final class ReplayController: NSObject, ObservableObject {
                 }
             }
             tick()
+            // Pause and unload share the same event. Coalesce a status read to distinguish them: a paused
+            // clip keeps replay at its position; Close Player, deletion and recording unload it entirely.
+            if !payload.playing {
+                Task { @MainActor [weak self] in await self?.refresh() }
+            }
         } else if event.type == NibEventType.committed, event.doc == NodeRef(clipRef ?? "")?.documentID {
             for ref in event.changes?.all ?? [] {
                 if let page = NodeRef(ref)?.pageID { dirtyPages.insert(page) }
