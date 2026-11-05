@@ -700,24 +700,31 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             return otherGestureRecognizer is UILongPressGestureRecognizer || otherGestureRecognizer is UIPanGestureRecognizer
         }
         @objc func handle() {
+            handle(state: gesture.state, location: gesture.point, start: gesture.start,
+                   velocity: gesture.velocity, cancellationReason: gesture.cancellationReason)
+        }
+        // The recognizer and interaction tests enter the same delivery boundary.
+        func handle(state: UIGestureRecognizer.State, location: CGPoint, start: CGPoint,
+                    velocity: CGVector = .zero, cancellationReason: String? = nil) {
             let reflow = target.reflow
-            let point = CGPoint(x: gesture.point.x - reflow.spaceOrigin.x, y: gesture.point.y - reflow.spaceOrigin.y)
+            let point = CGPoint(x: location.x - reflow.spaceOrigin.x, y: location.y - reflow.spaceOrigin.y)
             #if DEBUG
             if gesture.state != .changed { NSLog("%@", "[Reflow diagnostic] state \(gesture.state.rawValue) point \(point) origin \(reflow.spaceOrigin)") }
             #endif
-            switch gesture.state {
+            switch state {
             case .began:
                 #if DEBUG
                 NSLog("%@", "[Reflow diagnostic] measured \(reflow.frames.count) ordered \(target.order.count)")
                 #endif
                 reflow.begin(target.id, order: target.order,
-                    at: CGPoint(x: gesture.start.x - reflow.spaceOrigin.x, y: gesture.start.y - reflow.spaceOrigin.y))
+                    at: CGPoint(x: start.x - reflow.spaceOrigin.x, y: start.y - reflow.spaceOrigin.y))
                 reflow.move(to: point)
             case .changed: reflow.move(to: point)
             case .ended:
+                guard reflow.isDragging else { return }
                 reflow.move(to: point)
-                target.onDrop(reflow.end(velocity: gesture.velocity))
-            case .cancelled, .failed: reflow.cancel(reason: gesture.cancellationReason ?? "recognizer ended without drop")
+                target.onDrop(reflow.end(velocity: velocity))
+            case .cancelled, .failed: reflow.cancel(reason: cancellationReason ?? "recognizer ended without drop")
             default: break
             }
         }

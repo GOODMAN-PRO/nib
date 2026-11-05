@@ -494,6 +494,48 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         XCTAssertEqual(persistence.headReads - before, 102, "Commit/open callbacks use the same kind gate")
     }
 
+    func testPageIndexStopsAfterLastConsumerAndRejectsQueuedEvents() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        h.app.commands.register(BookmarkStandIn.self)
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let index = PageIndex(app: h.app)
+        let first = index.attach(), second = index.attach()
+        await index.sync()
+        index.detach(first)
+        try await h.run("test.bookmark", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertFalse(index.bookmarked.isEmpty)
+        h.app.events.emit(NibEventType.docOpened, doc: Fixtures.docID)
+        h.app.events.emit(NibEventType.libraryChanged)
+        index.detach(second)
+        let reads = persistence.headReads
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(persistence.headReads, reads, "The last departure cancels queued scans and callbacks")
+        XCTAssertFalse(index.bookmarked.isEmpty, "Detached commits must not mutate the index")
+        let resumed = index.attach()
+        await index.sync()
+        XCTAssertTrue(index.bookmarked.isEmpty, "Reattachment refreshes commits missed while hidden")
+        index.detach(resumed)
+    }
+
+    func testUnreadablePageHeadIsAttemptedOncePerCatalogueRevision() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let missing: DocumentID = "MISSINGHEAD"
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: missing, kind: .notebook)),
+                                         title: "Missing", in: nil)
+        h.persistence.heads[missing] = nil
+        let index = PageIndex(app: h.app)
+        await index.sync()
+        let reads = persistence.headReads
+        await index.sync()
+        XCTAssertEqual(persistence.headReads, reads)
+        index.read(missing)
+        XCTAssertEqual(persistence.headReads, reads + 1, "Explicit commit/open reads can retry")
+    }
+
     func testPageIndexFollowsCommitsAndUndo() async throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         h.app.commands.register(BookmarkStandIn.self)

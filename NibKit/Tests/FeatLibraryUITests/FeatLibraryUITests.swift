@@ -130,6 +130,61 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
     }
 
+    func testQueuedMenuCompletionPreservesLiftAndDeliversDropExactlyOnce() async throws {
+        let card = LibraryItemTouchView()
+        let interaction = try XCTUnwrap(card.interactions.compactMap { $0 as? UIContextMenuInteraction }.first)
+        var dismissals = 0
+        card.dismissContextMenu = { _ in dismissals += 1 }
+        card.reflowTouchBegan()
+        let configuration = try XCTUnwrap(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        let animation = QueuedMenuAnimation()
+        card.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animation)
+        XCTAssertEqual(dismissals, 0)
+        card.reflowLiftBegan()
+        XCTAssertEqual(dismissals, 1)
+        let layout = NibReflowLayout(columns: 2, cell: CGSize(width: 140, height: 182))
+        let reflow = NibReflow<String>(layout: layout, combines: true)
+        var drops: [NibReflowDrop<String>] = []
+        let target = NibReflowTouchTarget(id: "a", reflow: reflow, order: ["a", "b"], onDrop: { drops.append($0) })
+        let coordinator = target.makeCoordinator()
+        let start = CGPoint(x: layout.slot(0).midX, y: layout.slot(0).midY)
+        let end = CGPoint(x: layout.slot(1).midX, y: layout.slot(1).midY)
+        coordinator.handle(state: .began, location: start, start: start)
+        animation.complete()
+        XCTAssertEqual(dismissals, 2, "Completion must retire presentation queued before lift recognition")
+        XCTAssertTrue(reflow.isDragging)
+        XCTAssertNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        coordinator.handle(state: .changed, location: end, start: start)
+        try await Task.sleep(for: .seconds(NibMotion.combineHold + 0.1))
+        coordinator.handle(state: .ended, location: end, start: start)
+        coordinator.handle(state: .ended, location: end, start: start)
+        XCTAssertEqual(drops, [.combine("a", into: "b")])
+        reflow.landed()
+        let oldAnimation = QueuedMenuAnimation()
+        card.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: oldAnimation)
+        card.reflowTouchBegan()
+        let stationary = try XCTUnwrap(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        let stationaryAnimation = QueuedMenuAnimation()
+        card.contextMenuInteraction(interaction, willDisplayMenuFor: stationary, animator: stationaryAnimation)
+        let before = dismissals
+        oldAnimation.complete()
+        stationaryAnimation.complete()
+        XCTAssertEqual(dismissals, before, "Old completions must not dismiss a subsequent stationary menu")
+    }
+
+    func testSidebarSelectsOnePlaceInsideListedAndNestedFolders() throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let folder = LibraryRow(ref: "folder:PINNED", kind: "folder", title: "Pinned")
+        model.allFolders = [folder]
+        model.collection = .documents
+        let documents = try XCTUnwrap(model.sidebarPlaces.first { $0.collection == .documents })
+        XCTAssertTrue(model.isSidebarPlaceSelected(documents))
+        model.folder = folder.nodeID
+        XCTAssertFalse(model.isSidebarPlaceSelected(documents))
+        model.folder = "NESTED"
+        XCTAssertTrue(model.isSidebarPlaceSelected(documents))
+    }
+
     func testEscapeClosesOneTransientSurfaceAndLeavesRenameToItsOwner() {
         XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: true, isRenaming: false,
             hasSearch: true, isSelecting: true), .menu)
@@ -982,7 +1037,8 @@ final class FeatLibraryUITests: XCTestCase {
 
                         let frame = try XCTUnwrap(presentedFrames[popover], name)
                         XCTAssertTrue(menuIsDrawn, name)
-                        XCTAssertEqual(frame.width, NibMetrics.popoverWidth, accuracy: 0.5, name)
+                        let expectedWidth = menu == "new" ? NibMetrics.panelWidth : NibMetrics.popoverWidth
+                        XCTAssertEqual(frame.width, expectedWidth, accuracy: 0.5, name)
                         XCTAssertGreaterThan(frame.height, 0, name)
                         XCTAssertEqual(frame.minY - anchor.maxY, NibMetrics.popoverGap, accuracy: 0.5, name)
                         let inset = NibMetrics.chromeInset
@@ -994,6 +1050,141 @@ final class FeatLibraryUITests: XCTestCase {
                         XCTAssertLessThanOrEqual(frame.maxY, size.height - inset + 0.5, name)
                     }
                 }
+            }
+        }
+    }
+
+    func testNewMenuJoinSessionLabelFitsOneLineAtProductionWidth() async throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+                let title = "Join Live Session…"
+                var entry = MenuItemDescriptor(id: "test.join", title: title,
+                    icon: NibSymbol.invite.name, location: .libraryNew, order: 0, owner: "test", command: CommandIDs.panelOpen)
+                entry.shortcut = KeyShortcut("j", [.control, .command])
+                h.app.ui.menus.register(entry)
+                model.menu = "new"
+                model.liquidMode = .off
+                model.sidebarVisible = false
+                var frames: [String: CGRect] = [:]
+                let image = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad)
+                    .environment(\.libraryLayoutDiagnostics, true)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 },
+                    size: size, variant: variant, settlePasses: 15)
+                let label = try XCTUnwrap(frames["menu.label." + title])
+                // Include the production shortcut and checkmark, which caused the original wrap.
+                let accessory = try XCTUnwrap(frames["menu.accessory." + title])
+                let textWidth = accessory.minX - NibSpacing.s - label.minX
+                let font = UIFont.preferredFont(forTextStyle: .body,
+                    compatibleWith: UITraitCollection(preferredContentSizeCategory: .large))
+                XCTAssertGreaterThanOrEqual(textWidth, (title as NSString).size(withAttributes: [.font: font]).width)
+                // Measure actual text ink, excluding the decorative glyph/checkmark columns.
+                var inkRows: [Int] = []
+                for y in Int(ceil(label.minY))..<Int(floor(label.maxY)) {
+                    let hasInk = (Int(ceil(label.minX))..<Int(floor(label.minX + textWidth))).contains { x in
+                        guard let pixel = NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))) else { return false }
+                        return variant == .light ? max(pixel.r, max(pixel.g, pixel.b)) < 100
+                            : min(pixel.r, min(pixel.g, pixel.b)) > 180
+                    }
+                    if hasInk { inkRows.append(y) }
+                }
+                let top = try XCTUnwrap(inkRows.first), bottom = try XCTUnwrap(inkRows.last)
+                XCTAssertLessThanOrEqual(CGFloat(bottom - top + 1), ceil(font.lineHeight) + 2,
+                    "The actual menu label must render on one line")
+            }
+        }
+    }
+
+    func testProductionListAlignsFolderGlyphAndThumbnailWithoutShadowHalos() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let folder = LibraryRow(ref: "folder:REVIEW", kind: "folder", title: "Folder")
+        let document = LibraryRow(ref: "doc:REVIEW", kind: "notebook", title: "Notebook")
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                let view = VStack(spacing: NibSpacing.xl) {
+                    LibraryListRow(row: folder, model: model)
+                    LibraryListRow(row: document, model: model)
+                }
+                .padding(NibSpacing.xl)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color.white)
+                .environment(\.libraryLayoutDiagnostics, true)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 }
+                let image = try await hostlessLayoutImage(view, size: size, variant: variant)
+                let glyph = try XCTUnwrap(frames["row.thumbnail." + folder.ref])
+                let cover = try XCTUnwrap(frames["row.thumbnail." + document.ref])
+                let folderTitle = try XCTUnwrap(frames["row.title." + folder.ref])
+                let documentTitle = try XCTUnwrap(frames["row.title." + document.ref])
+                XCTAssertEqual(glyph.size, cover.size)
+                XCTAssertEqual(glyph.minX, cover.minX, accuracy: 0.5)
+                XCTAssertEqual(folderTitle.minX, documentTitle.minX, accuracy: 0.5)
+                for rect in [glyph, cover] {
+                    // Sample just outside the flat thumbnail on both sides; cover elevation paints here.
+                    for x in [rect.minX - 3, rect.maxX + 3] {
+                        let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: x, y: rect.midY)))
+                        XCTAssertGreaterThanOrEqual(min(pixel.r, min(pixel.g, pixel.b)), 254,
+                            "List thumbnails must not cast a halo onto their background")
+                    }
+                }
+            }
+        }
+    }
+
+    func testProductionFolderBreadcrumbStartsAtGridEdge() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.folder = Fixtures.folderID
+        model.liquidMode = .off
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                let image = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad)
+                    .environment(\.libraryLayoutDiagnostics, true)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 }, size: size, variant: variant)
+                let back = try XCTUnwrap(frames["parent.navigation"])
+                let grid = try XCTUnwrap(frames["content.grid"])
+                XCTAssertEqual(back.minX, grid.minX, accuracy: 0.5)
+                var firstInkX: Int?
+                for x in Int(floor(grid.minX))..<Int(ceil(back.maxX)) {
+                    let hasAccent = (Int(ceil(back.minY))..<Int(floor(back.maxY))).contains { y in
+                        guard let pixel = NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))) else { return false }
+                        return Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30
+                    }
+                    if hasAccent { firstInkX = x; break }
+                }
+                XCTAssertLessThanOrEqual(CGFloat(try XCTUnwrap(firstInkX)) - grid.minX, 4,
+                    "The visible back glyph, not only its hit area, must align to the content edge")
+                XCTAssertGreaterThanOrEqual(back.height, NibMetrics.hitTarget)
+                let documents = try XCTUnwrap(model.sidebarPlaces.first { $0.collection == .documents })
+                let hasFolderRow = model.allFolders.contains { $0.nodeID == model.folder }
+                XCTAssertEqual(model.isSidebarPlaceSelected(documents), !hasFolderRow)
+            }
+        }
+    }
+
+    func testProductionSidebarShowsDocumentsSelectionOnlyForAnUnlistedFolder() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        model.liquidMode = .off
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            for listed in [false, true] {
+                model.folder = listed ? Fixtures.folderID : "UNLISTED"
+                var frames: [String: CGRect] = [:]
+                let image = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: .pad)
+                    .environment(\.libraryLayoutDiagnostics, true)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 },
+                    size: CGSize(width: 1194, height: 834), variant: variant)
+                let row = try XCTUnwrap(frames["sidebar.place.documents"])
+                var accentPixels = 0
+                // NibSidebarRow's leading glyph is accent only when the actual row is selected.
+                for x in Int(ceil(row.minX))..<Int(floor(row.minX + 50)) {
+                    for y in Int(ceil(row.minY))..<Int(floor(row.maxY)) {
+                        guard let pixel = NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))) else { continue }
+                        if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { accentPixels += 1 }
+                    }
+                }
+                if listed { XCTAssertEqual(accentPixels, 0, "The listed folder owns the selection") }
+                else { XCTAssertGreaterThan(accentPixels, 5, "Documents must stay visibly selected inside an unlisted folder") }
             }
         }
     }
@@ -2349,6 +2540,27 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(cached, values.0)
     }
 
+    func testCoalescedSubtitleSurvivesCacheEvictionBeforeSecondWaiterResumes() async throws {
+        let h = harness()
+        let started = expectation(description: "one count for both cells")
+        started.assertForOverFulfill = true
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let cache = LibraryCoverCache(subtitleCache: EvictingSubtitleCache()) { row, content in
+            started.fulfill()
+            XCTAssertEqual(release.wait(timeout: .now() + 3), .success)
+            return row.subtitle(content: content)
+        }
+        let row = LibraryRow.from(try XCTUnwrap(h.library.node(Fixtures.studySetID)))
+        let first = Task { await cache.subtitle(row, app: h.app) }
+        let second = Task { await cache.subtitle(row, app: h.app) }
+        await fulfillment(of: [started], timeout: 2)
+        release.signal()
+        let values = await (first.value, second.value)
+        XCTAssertEqual(values.0, "2 cards")
+        XCTAssertEqual(values.1, "2 cards", "A valid local result survives immediate NSCache eviction")
+    }
+
     func testOldSubtitleCannotOverwriteAnInvalidatedRevision() async throws {
         let h = harness()
         let started = expectation(description: "old count started")
@@ -2618,4 +2830,22 @@ private final class LibraryTestRenderer: PageRenderer {
     }
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
+}
+
+@MainActor
+private final class QueuedMenuAnimation: NSObject, UIContextMenuInteractionAnimating {
+    var previewViewController: UIViewController? { nil }
+    private var completions: [() -> Void] = []
+    func addAnimations(_ animations: @escaping () -> Void) { animations() }
+    func addCompletion(_ completion: @escaping () -> Void) { completions.append(completion) }
+    func complete() {
+        let queued = completions
+        completions.removeAll()
+        queued.forEach { $0() }
+    }
+}
+
+/// Model memory pressure deterministically: publication succeeds but the entry is immediately evicted.
+private final class EvictingSubtitleCache: NSCache<NSString, NSString> {
+    override func setObject(_ obj: NSString, forKey key: NSString) {}
 }

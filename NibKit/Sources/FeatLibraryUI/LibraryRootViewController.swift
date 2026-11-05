@@ -73,6 +73,13 @@ final class LibraryViewModel: ObservableObject {
     @Published var rows: [LibraryRow] = []
     @Published var visibleRows: [LibraryRow] = []
     @Published var allFolders: [LibraryRow] = []
+    func isSidebarPlaceSelected(_ place: LibrarySidebarPlace) -> Bool {
+        guard let collection = place.collection else { return tab?.id == place.id }
+        guard tab == nil, self.collection == collection else { return false }
+        // A folder with its own sidebar row owns the selection. Nested/unlisted
+        // folders still belong to Documents, so navigation never loses its place.
+        return collection != .documents || !allFolders.contains { $0.nodeID == folder }
+    }
     @Published var selection = LibrarySelection()
     @Published var tab: LibraryPanel?
     @Published var modal: LibraryPanel?
@@ -862,7 +869,8 @@ struct LibraryRootView: View {
                             } else { model.setView(["panel": .string(place.id)]) }
                         } label: {
                             NibSidebarRow(place.title, symbol: place.symbol, count: model.sidebarCounts[place.id],
-                                          isSelected: place.collection.map { model.tab == nil && model.collection == $0 } ?? (model.tab?.id == place.id))
+                                          isSelected: model.isSidebarPlaceSelected(place))
+                                .libraryLayoutFrame("sidebar.place." + place.id, space: .global)
                         }
                         .accessibilityIdentifier("cmd.library.setView")
                         .libraryDropTarget(place.id == PanelIDs.trash ? "trash" : "card:tab:" + place.id)
@@ -1095,6 +1103,33 @@ extension View {
                 Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: space)])
             }
         }
+    }
+}
+
+private struct LibraryLayoutDiagnosticsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var libraryLayoutDiagnostics: Bool {
+        get { self[LibraryLayoutDiagnosticsKey.self] }
+        set { self[LibraryLayoutDiagnosticsKey.self] = newValue }
+    }
+}
+
+extension View {
+    func libraryLayoutFrame(_ id: String, space: CoordinateSpace) -> some View {
+        modifier(LibraryLayoutProbe(id: id, space: space))
+    }
+}
+
+private struct LibraryLayoutProbe: ViewModifier {
+    let id: String
+    let space: CoordinateSpace
+    @Environment(\.libraryLayoutDiagnostics) private var enabled
+    func body(content: Content) -> some View {
+        if enabled { content.libraryChromeFrame(id, space: space) }
+        else { content }
     }
 }
 
@@ -1422,7 +1457,7 @@ enum LibrarySyncPresentation {
 @MainActor
 final class LibraryCoverCache: ObservableObject {
     let images = NSCache<NSString, UIImage>()
-    private let subtitles = NSCache<NSString, NSString>()
+    private let subtitles: NSCache<NSString, NSString>
     @Published private(set) var revisions: [DocumentID: Int] = [:]
     private var keys: [DocumentID: Set<String>] = [:]
     private var subscription: EventSubscription?
@@ -1432,10 +1467,12 @@ final class LibraryCoverCache: ObservableObject {
     }
     private var subtitleWork: [DocumentID: SubtitleWork] = [:]
     private let countSubtitle: @Sendable (LibraryRow, DocumentContent) -> String
-    init(countSubtitle: @escaping @Sendable (LibraryRow, DocumentContent) -> String = { row, content in
+    init(subtitleCache: NSCache<NSString, NSString> = NSCache(),
+         countSubtitle: @escaping @Sendable (LibraryRow, DocumentContent) -> String = { row, content in
         row.subtitle(content: content)
     }) {
         self.countSubtitle = countSubtitle
+        self.subtitles = subtitleCache
         images.countLimit = NibMetrics.libraryCoverCacheCount
         images.totalCostLimit = NibMetrics.libraryCoverCacheBytes
         subtitles.countLimit = NibMetrics.libraryCoverCacheCount
@@ -1481,8 +1518,9 @@ final class LibraryCoverCache: ObservableObject {
         if let cached = subtitles.object(forKey: key as NSString) {
             return Task.isCancelled ? nil : cached as String
         }
-        guard subtitleWork[row.nodeID]?.key == key else { return nil }
-        subtitleWork[row.nodeID] = nil
+        // A coalesced waiter may resume after publication and cache eviction. Its
+        // revision-validated local result is still valid; never clear newer work.
+        if subtitleWork[row.nodeID]?.key == key { subtitleWork[row.nodeID] = nil }
         keys[row.nodeID, default: []].insert(key)
         subtitles.setObject(subtitle as NSString, forKey: key as NSString)
         return Task.isCancelled ? nil : subtitle

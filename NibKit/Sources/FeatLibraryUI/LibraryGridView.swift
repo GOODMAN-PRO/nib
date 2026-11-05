@@ -406,6 +406,7 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
     var menu: (() -> UIMenu)?
     var preview: (() -> UIViewController)?
     var activate: (() -> Void)?
+    var dismissContextMenu: (UIContextMenuInteraction) -> Void = { $0.dismissMenu() }
     private(set) var liftRecognized = false
     private var touchSequence = 0
     func reflowTouchBegan() {
@@ -423,7 +424,7 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] menu dismissal requested phase=\(phase) view=\(ObjectIdentifier(self)) sequence=\(touchSequence)")
         #endif
-        interaction.dismissMenu()
+        dismissContextMenu(interaction)
     }
     override func accessibilityActivate() -> Bool { activate?(); return activate != nil }
     override init(frame: CGRect) {
@@ -621,14 +622,17 @@ struct LibraryListRow: View {
                     }
                 }
                 .frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                .libraryLayoutFrame("row.thumbnail." + row.ref, space: .global)
                 .accessibilityHidden(true)
             }
             else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
-                .libraryCoverFrame(row.ref) }
+                .libraryCoverFrame(row.ref)
+                .libraryLayoutFrame("row.thumbnail." + row.ref, space: .global) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label).lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
+                    .libraryLayoutFrame("row.title." + row.ref, space: .global)
                 Text(row.isFolder ? LibraryRow.itemCount(row.items ?? 0) : subtitle ?? row.subtitle())
                     .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                     .lineLimit(nil).fixedSize(horizontal: false, vertical: true)

@@ -123,6 +123,7 @@ struct LibrarySearchOverlay: View {
 
 @MainActor
 struct LibrarySearchFloatingContent: View {
+    @Environment(\.horizontalSizeClass) private var sizeClass
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
@@ -144,7 +145,8 @@ struct LibrarySearchFloatingContent: View {
                 hostOrigin: geometry.frame(in: .global).origin)
             // This surface replaces the library column, so use its content gutter in either orientation.
             // The document search HUD keeps SearchViewport.panelWidth's floating 560 pt cap.
-            let width = max(0, bounds.width - 2 * NibMetrics.libraryGutter)
+            let gutter = sizeClass == .compact ? NibSpacing.l : NibMetrics.libraryGutter
+            let width = max(0, bounds.width - 2 * gutter)
             let top = belowBars || measuredColumn != nil ? 0
                 : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
             let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,

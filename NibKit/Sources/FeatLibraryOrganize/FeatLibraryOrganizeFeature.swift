@@ -16,18 +16,16 @@ public enum FeatLibraryOrganizeFeature: NibFeature {
                              summary: "Sort order of the Trash tab in the library: date (newest first), name or type.",
                              owner: id, schema: .str(choices: TrashSort.allCases.map { $0.rawValue }))
         // One index of bookmarked and trashed pages per app, shared by both tabs. It reads the library the first time
-        // a tab is shown and follows it from then on.
+        // a tab is visible, and stops when the final visible consumer leaves.
         let index = PageIndex(app: app)
         app.ui.panels.register(PanelDescriptor(
             id: PanelIDs.favourites, title: String(localized: "Favourites"), icon: NibSymbol.favorites.name,
             placement: .libraryTab, order: 100, owner: id) { ctx in
-                index.attach()
                 return AnyView(FavoritesPanel(window: OrganizeWindow(ctx), index: index))
             })
         app.ui.panels.register(PanelDescriptor(
             id: PanelIDs.trash, title: String(localized: "Trash"), icon: NibSymbol.trash.name,
             placement: .libraryTab, order: 900, owner: id) { ctx in
-                index.attach()
                 return AnyView(TrashPanel(window: OrganizeWindow(ctx), index: index))
             })
         FolderStyleSheet.register(app)
@@ -278,7 +276,8 @@ final class PageIndex: ObservableObject {
     private var readAt: [DocumentID: Double] = [:]
     private weak var app: NibApp?
     private let bag = SubscriptionBag()
-    private var isAttached = false
+    private var consumers: Set<UUID> = []
+    private var attachment = UUID()
     private var syncTask: Task<Void, Never>?
     /// Heads read between yields to the main run loop while the library is read.
     private static let chunk = 1
@@ -287,12 +286,14 @@ final class PageIndex: ObservableObject {
         self.app = app
     }
 
-    /// Starts following commits, document opens and library changes (once), and reads the library.
-    func attach() {
-        guard !isAttached, let app else { return }
-        isAttached = true
+    /// Each visible tab/window holds a token. Repeated appearances of the same view are idempotent.
+    @discardableResult
+    func attach(_ consumer: UUID = UUID()) -> UUID {
+        guard consumers.insert(consumer).inserted, consumers.count == 1, let app else { return consumer }
+        attachment = UUID()
+        let generation = attachment
         bag.items.append(app.bus.observeCommits { [weak self] changes in
-            guard let self else { return }
+            guard let self, self.attachment == generation, !self.consumers.isEmpty else { return }
             for doc in changes.documents where changes.headChanged(doc) { self.read(doc) }
         })
         bag.items.append(app.events.subscribe { [weak self] event in
@@ -300,7 +301,7 @@ final class PageIndex: ObservableObject {
             let doc = event.doc
             guard type == NibEventType.libraryChanged || type == NibEventType.docOpened else { return }
             Task { @MainActor in
-                guard let index = self else { return }
+                guard let index = self, index.attachment == generation, !index.consumers.isEmpty else { return }
                 if type == NibEventType.libraryChanged {
                     index.scheduleSync()
                 } else if let doc {
@@ -309,6 +310,17 @@ final class PageIndex: ObservableObject {
             }
         })
         scheduleSync()
+        return consumer
+    }
+
+    func detach(_ consumer: UUID) {
+        guard consumers.remove(consumer) != nil, consumers.isEmpty else { return }
+        attachment = UUID() // Reject event callbacks already queued on the main actor.
+        syncTask?.cancel()
+        syncTask = nil
+        bag.items.forEach { $0.cancel() }
+        bag.items.removeAll()
+        readAt.removeAll() // Commits while detached must be read on the next appearance.
     }
 
     var bookmarked: [PageEntry] { documents.values.flatMap { $0.bookmarked } }
@@ -331,6 +343,7 @@ final class PageIndex: ObservableObject {
     }
 
     func scheduleSync() {
+        guard !consumers.isEmpty else { return }
         syncTask?.cancel()
         syncTask = Task { [weak self] in await self?.sync() }
     }
@@ -339,7 +352,8 @@ final class PageIndex: ObservableObject {
     /// documents that are new or modified since they were read, yielding after each head. A single unopened
     /// head still requires the synchronous DocumentPersistence API; it needs an async contracts/store reader.
     func sync() async {
-        guard let app, let library = app.services.library else { return }
+        guard !Task.isCancelled, let app, let library = app.services.library else { return }
+        let generation = attachment
         var live: [DocumentID: Double] = [:]
         for node in library.allNodes() where Self.includesPages(node) {
             live[node.id] = node.modified
@@ -349,8 +363,9 @@ final class PageIndex: ObservableObject {
         readAt = readAt.filter { live[$0.key] != nil }
         var count = 0
         for (doc, modified) in live where readAt[doc] != modified {
-            if Task.isCancelled { return }
-            if read(doc) { readAt[doc] = modified }
+            if Task.isCancelled || generation != attachment { return }
+            read(doc)
+            readAt[doc] = modified // Failed heads retry only after modification, commit or open.
             count += 1
             if count % PageIndex.chunk == 0 { await Task.yield() }
         }

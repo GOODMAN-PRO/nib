@@ -969,7 +969,7 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .onPreferenceChange(NotebookFormContinuation.self) { hasMoreBelow = $0 }
         .scrollIndicators(.visible)
         .scrollIndicatorsFlash(onAppear: true)
-        .safeAreaInset(edge: .top, spacing: 0) {
+        .overlay(alignment: .top) {
             if hasMoreBelow {
                 Label(String(localized: "Scroll for more options"), systemImage: NibSymbol.chevronDown.name)
                     .font(NibFont.footnote)
@@ -977,6 +977,9 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, NibSpacing.s)
                     .background(NibColor.backgroundSecondary)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("create.scrollCue")
+                    .notebookLayoutFrame("cue")
             }
         }
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
@@ -984,6 +987,7 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         .nibFadeBottomEdge()
         // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
         .contentShape(Rectangle())
+        .notebookLayoutFrame("viewport")
     }
 }
 
@@ -1049,6 +1053,7 @@ struct NewNotebookPaperChooser<Groups: View, Chips: View, Papers: View>: View {
 struct NewNotebookSheet: View {
     @StateObject private var model: NewNotebookModel
     let onDone: () -> Void
+    let idiom: UIUserInterfaceIdiom
     @State private var measuredWidth = NibMetrics.newDocumentSheetSize.width
     @State private var windowSize: CGSize?
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -1056,7 +1061,8 @@ struct NewNotebookSheet: View {
     @FocusState private var focusedDimension: CustomDimension?
 
     init(app: NibApp, folder: FolderID?, kind: NewDocumentKind, session: EditorSession?, navigator: SceneNavigator?,
-         onDone: @escaping () -> Void) {
+         idiom: UIUserInterfaceIdiom? = nil, onDone: @escaping () -> Void) {
+        self.idiom = idiom ?? UIDevice.current.userInterfaceIdiom
         _model = StateObject(wrappedValue: NewNotebookModel(app: app, folder: folder, kind: kind, session: session,
                                                             navigator: navigator))
         self.onDone = onDone
@@ -1065,7 +1071,7 @@ struct NewNotebookSheet: View {
 
     // A form sheet can be narrower than its presenting window. Its width must not turn an iPad into a phone layout.
     private var compact: Bool {
-        UIDevice.current.userInterfaceIdiom == .phone
+        idiom == .phone
             || (windowSize?.width ?? NibMetrics.newDocumentSheetSize.width) < NibMetrics.compactBreakpoint
     }
     private var contentInset: CGFloat { compact ? NibSpacing.l : NibSpacing.xl }
@@ -1158,6 +1164,7 @@ struct NewNotebookSheet: View {
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredWidth = $0 }
         .interactiveDismissDisabled(model.isWorking)
+        .notebookLayoutFrame("sheet")
     }
 
     private func create() {
@@ -1210,6 +1217,7 @@ struct NewNotebookSheet: View {
         layout {
             DocumentPreview(model: model)
                 .frame(width: NibMetrics.coverPreviewSize.width, height: NibMetrics.coverPreviewSize.height)
+                .notebookLayoutFrame("preview")
             TextField(draft.kind.untitled, text: $model.draft.title)
                 .font(NibFont.body)
                 .focused($titleFocused)
@@ -1242,6 +1250,7 @@ struct NewNotebookSheet: View {
                                          params: draft.cover.id == option.id ? draft.coverRef(option.definition).params : [:],
                                          page: draft.pageSize, cloth: draft.cover.id == option.id ? draft.cloth : nil)
                         }
+                        .notebookLayoutFrame("cover." + option.id)
                     }
                 }
                 .scrollTargetLayout()
@@ -1256,6 +1265,7 @@ struct NewNotebookSheet: View {
                         .frame(width: NibSpacing.l)
                 }
             }
+            .notebookLayoutFrame("coverStrip")
             .scrollTargetBehavior(.viewAligned)
             .scrollIndicators(.visible)
             .scrollIndicatorsFlash(onAppear: true)
@@ -1348,6 +1358,7 @@ struct NewNotebookSheet: View {
                                 params: draft.paperRef(option.definition).params,
                                 page: draft.pageSize, paper: draft.paperColour ?? .white)
             }
+            .notebookLayoutFrame("paper." + option.id)
         }
     }
 
@@ -1695,5 +1706,44 @@ enum TemplateThumbnails {
             cg.scaleBy(x: fill, y: fill)
             ops.display.draw(in: cg)
         }
+    }
+}
+
+/// Geometry from the production form, used by layout regressions without rebuilding its contents.
+struct NotebookLayoutFrames: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private extension View {
+    func notebookLayoutFrame(_ id: String) -> some View {
+        modifier(NotebookLayoutProbe(id: id))
+    }
+}
+
+private struct NotebookLayoutDiagnosticsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var notebookLayoutDiagnostics: Bool {
+        get { self[NotebookLayoutDiagnosticsKey.self] }
+        set { self[NotebookLayoutDiagnosticsKey.self] = newValue }
+    }
+}
+
+private struct NotebookLayoutProbe: ViewModifier {
+    let id: String
+    @Environment(\.notebookLayoutDiagnostics) private var enabled
+    func body(content: Content) -> some View {
+        if enabled {
+            content.background {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: NotebookLayoutFrames.self, value: [id: geometry.frame(in: .global)])
+                }
+            }
+        } else { content }
     }
 }

@@ -204,7 +204,9 @@ struct LibraryMenuRow: View {
                         .frame(width: NibSpacing.xxl)
                         .accessibilityHidden(true)
                 }
+                .libraryLayoutFrame("menu.accessory." + title, space: .global)
             }
+            .libraryLayoutFrame("menu.label." + title, space: .global)
         }
         .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
         .contentShape(Rectangle())

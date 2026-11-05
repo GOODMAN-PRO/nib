@@ -1887,6 +1887,83 @@ final class FeatCreateTests: XCTestCase {
         }
     }
 
+    func testProductionNotebookSheetShowsPaperAndCueAndClearsFinalCoverLabel() async throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let h = harness()
+                for index in 0..<8 {
+                    h.app.content.templates.register(TemplateDefinition(id: "cover.review.\(index)",
+                        title: index == 7 ? "Oxblood" : "Cover \(index)", category: "Covers", isCover: true,
+                        owner: "builtin") { _, _, _ in TemplateRender(paper: .white) })
+                }
+                let options = NewNotebookModel(app: h.app, folder: nil, kind: .notebook,
+                                               session: h.session, navigator: nil)
+                let lastCover = try XCTUnwrap(options.covers.last)
+                let firstPaper = try XCTUnwrap(options.papersInGroup.first)
+                var frames: [String: CGRect] = [:]
+                let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook,
+                    session: h.session, navigator: nil, idiom: .pad, onDone: {})
+                    .onPreferenceChange(NotebookLayoutFrames.self) { frames = $0 }
+                    .environment(\.notebookLayoutDiagnostics, true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .environment(\.colorScheme, variant.colorScheme)
+                    .environment(\.dynamicTypeSize, .large)
+                    .ignoresSafeArea()
+                let host = UIHostingController(rootView: sheet)
+                let window = UIWindow(frame: CGRect(origin: .zero, size: size))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                func settle() async throws {
+                    for _ in 0..<10 {
+                        host.view.setNeedsLayout()
+                        host.view.layoutIfNeeded()
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                }
+                func scrollViews(_ view: UIView) -> [UIScrollView] {
+                    ((view as? UIScrollView).map { [$0] } ?? []) + view.subviews.flatMap(scrollViews)
+                }
+                try await settle()
+                let sheetFrame = try XCTUnwrap(frames["sheet"])
+                let viewport = try XCTUnwrap(frames["viewport"])
+                let paper = try XCTUnwrap(frames["paper." + firstPaper.id])
+                let preview = try XCTUnwrap(frames["preview"])
+                let cue = try XCTUnwrap(frames["cue"], "Overflow must announce more options")
+                XCTAssertGreaterThan(sheetFrame.height, NibMetrics.newDocumentSheetSize.height)
+                XCTAssertGreaterThan(paper.height, NibMetrics.paperTileSize.height)
+                XCTAssertLessThanOrEqual(paper.maxY, viewport.maxY - NibSpacing.l + 1,
+                    "The first paper tile and label must clear the bottom fade on opening")
+                XCTAssertGreaterThan(paper.minY, preview.maxY)
+                XCTAssertTrue(viewport.contains(cue))
+                let verticals = scrollViews(host.view).filter { $0.contentSize.height > $0.bounds.height + 1 }
+                XCTAssertEqual(verticals.count, 1, "The production sheet has one vertical form scroll")
+                let vertical = try XCTUnwrap(verticals.first)
+                XCTAssertEqual(vertical.contentOffset.y, 0, accuracy: 1,
+                    "The continuation cue must not add a changing top inset")
+                let strip = try XCTUnwrap(frames["coverStrip"])
+                let horizontal = try XCTUnwrap(scrollViews(host.view).first {
+                    $0.contentSize.width > $0.bounds.width + 1
+                        && abs($0.convert($0.bounds, to: window).minY - strip.minY) < 2
+                })
+                horizontal.setContentOffset(CGPoint(x: horizontal.contentSize.width - horizontal.bounds.width
+                    + horizontal.adjustedContentInset.right, y: horizontal.contentOffset.y), animated: false)
+                try await settle()
+                let finalCover = try XCTUnwrap(frames["cover." + lastCover.id])
+                let finalStrip = try XCTUnwrap(frames["coverStrip"])
+                XCTAssertGreaterThanOrEqual(finalCover.minX, finalStrip.minX)
+                XCTAssertLessThanOrEqual(finalCover.maxX, finalStrip.maxX - NibSpacing.l + 0.5,
+                    "The final cover name must clear the entire trailing fade")
+                XCTAssertGreaterThan(finalCover.height, NibMetrics.coverStripSize.height)
+                let resting = vertical.contentOffset.y
+                vertical.setContentOffset(CGPoint(x: vertical.contentOffset.x, y: resting + 100), animated: false)
+                try await settle()
+                XCTAssertEqual(preview.minY - (try XCTUnwrap(frames["preview"])).minY, 100, accuracy: 1)
+            }
+        }
+    }
+
     func testFormViewportShowsPreviewThenCoverChoicesBeforePaper() async throws {
         for size in [CGSize(width: 720, height: 560), CGSize(width: 720, height: 520),
                      CGSize(width: 402, height: 720), CGSize(width: 320, height: 520)] {
