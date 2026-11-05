@@ -138,8 +138,16 @@ final class ChromeUITests: XCTestCase {
     }
     private func more(_ action: String) throws {
         try openMenu("more")
-        try tap(action, type: .button)
-        try ui.waitForMenuClosed(ui.app.scrollViews["More"].firstMatch, named: "More after " + action)
+        try selectMoreRow(action)
+    }
+    private func selectMoreRow(_ action: String) throws {
+        let menu = ui.app.scrollViews["More"].firstMatch
+        XCTAssertTrue(menu.waitForExistence(timeout: 8), "More must expose its own row container")
+        let row = try ui.requireControl(action, type: .button, scroll: true, timeout: 8, in: menu)
+        ui.logQA("More scoped row", "action=\(action) row=\(row.frame) menu=\(menu.frame)")
+        guard row.isEnabled else { throw NibUI.Failure.message("More row disabled: " + action) }
+        row.tap()
+        try ui.waitForMenuClosed(menu, named: "More after " + action)
     }
     private func panel(_ id: String, shown: Bool = true) throws {
         _ = try ui.waitForState(timeout: 12) { $0.openPanels.contains(id) == shown }
@@ -292,7 +300,7 @@ final class ChromeUITests: XCTestCase {
                 ui.recordDiagnostics("Rotated More failed", facts: ui.elementFacts(ui.app.buttons["menu.more"].firstMatch))
                 throw error
             }
-            try tap("Go to Page…")
+            try selectMoreRow("Go to Page…")
             try panel("pages.goToPage"); try ui.dismissSheets()
             try more("Hide Tools")
             try wait("More Hide Tools must retract palette") { !self.query("tool.pen").firstMatch.exists }

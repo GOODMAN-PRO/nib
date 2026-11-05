@@ -69,3 +69,11 @@ Confirmed chrome-timeouts#6 correction and chrome-singles#6–9 corrections agai
 | --- | --- | --- |
 | TimerPresetStartsCountdownAndCustomNameAdvances | Timer preset selection | Does the typed chip acquire Selected during the bounded observation? |
 | Stopwatch deliberate More reopen | Menu remained open / State step | Did the menu actually disappear even if the panel was already open? |
+
+### C3 - scoped Hide/Show Tools rows
+
+Confirmed chrome-state-pdf#1 correction against current More row actions: the open More/swallowed stroke is proven; selection of the separate Show Tools droplet remains inferred. More now resolves the button exclusively inside its labelled ScrollView, including the rotated Go to Page action, logs both frames and uses H4 before returning. HideShowTools retains all palette, content and ink assertions. CI must show the row inside More, disappearance before drawing, and stroke count +1/undo available without a chrome.popover.more dismiss-cover rejection.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| HideShowTools; every Chrome More action | More scoped row | Did the selected button belong to More rather than the palette's same-labelled reveal droplet? |
