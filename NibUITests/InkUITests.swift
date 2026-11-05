@@ -269,18 +269,19 @@ final class InkUITests: XCTestCase {
     private func closeColourPicker() throws {
         let picker = colourPicker
         guard picker.exists else { throw NibUI.Failure.message("Native colour picker is not presented") }
-        // This simulator exposes lowercase close; SwiftUI's colour popover can hide that button entirely.
-        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close' OR label ==[c] 'done'")).firstMatch
-        if ui.hasVisibleFrame(close) && close.isHittable { close.tap() }
-        else {
-            // Dismiss the observed popover from outside its content, never by tapping a similarly named app control.
-            let content = picker.scrollViews.firstMatch
-            let point = ui.coordinate(CGPoint(x: 0.95, y: 0.85))
-            guard content.exists && !content.frame.contains(ui.interfacePoint(CGPoint(x: 0.95, y: 0.85))) else {
-                throw NibUI.Failure.message("No outside dismissal point for native colour picker")
+        let done = picker.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
+        if let candidate = try? done.snapshot(), let root = try? picker.snapshot() {
+            func parent(_ node: XCUIElementSnapshot) -> String? {
+                if node.children.contains(where: { $0.elementType == .button && $0.label == candidate.label && $0.frame == candidate.frame }) {
+                    return "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame)"
+                }
+                return node.children.compactMap { parent($0) }.first
             }
-            point.tap()
-        }
+            ui.logQA("Colour picker Done candidate", "frame=\(candidate.frame) parent=\(parent(root) ?? "unobserved")")
+        } else { ui.logQA("Colour picker Done candidate", "Done or parent snapshot absent") }
+        let close = picker.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
+        try wait("Native colour picker must expose its close control") { self.ui.hasVisibleFrame(close) && close.isHittable }
+        close.tap()
         try wait("Native colour picker must dismiss") { !picker.exists }
     }
 

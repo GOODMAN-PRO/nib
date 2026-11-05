@@ -220,3 +220,11 @@ S:#7: Replay records minimumSeconds30 and uses one direct Pause predicate/tap. S
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | QuickDiagramEachSide | Quick Diagram added shape | Does the destination shape differ geometrically from the source in the requested direction? |
+
+## C17 - explicit colour picker close
+
+S:singles-rest#12 correction proves Done was tapped while the picker remained, but not Done's ownership. closeColourPicker records that candidate frame and its snapshot parent, then explicitly waits for/taps the picker-scoped close button and retains picker-disappearance assertion. The old OR-Done selection and outside fallback are removed. Expected valid/invalid HEX and other picker-close paths. CI must show Done ownership, a close tap, picker disappearance and exact retained swatch colours.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Ink colour picker close callers | Colour picker Done candidate | What frame and parent did the ambiguous Done have? |
