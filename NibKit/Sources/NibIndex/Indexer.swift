@@ -1112,10 +1112,16 @@ final class Indexer {
 
     private func refreshTitles() async {
         guard let library = app.services.library else { return }
+        var needsSweep = false
         for node in library.allNodes() + library.trashedNodes() where node.kind == .document {
             indexTitle(node.id, kind: node.documentKind)
+            if node.trashedAt == nil, let db, !db.keys(doc: node.id).contains(IndexKeys.docUnit) {
+                needsSweep = true
+            }
         }
         await prune()
+        // Copies and synced packages can arrive without a document transaction.
+        if needsSweep { startSweep(after: 2) }
     }
 
     /// Drops documents the library no longer knows (deleted permanently, or another library folder).

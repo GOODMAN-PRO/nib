@@ -46,6 +46,26 @@ private final class SlowRecognizer: TextRecognizer {
 
 @MainActor
 final class NibIndexTests: XCTestCase {
+    func testLibraryChangeIndexesDuplicateContentWithoutACommit() async throws {
+        let (h, indexer) = harness()
+        _ = await indexer.sweep(foreground: false)
+        indexer.debounce = 0.01
+        indexer.start()
+        let copy = try h.library.duplicate(Fixtures.docID)
+        XCTAssertFalse(h.app.workspace.isLoaded(copy))
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["refs": [.string(NodeRef.document(copy).description)]])
+        var found: [JSONValue] = []
+        let deadline = Date().addingTimeInterval(8)
+        repeat {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            found = results(try await h.run("search.text", ["query": "Remember"]))
+                .filter { $0["doc"]?.stringValue == NodeRef.document(copy).description }
+        } while found.isEmpty && Date() < deadline
+        XCTAssertFalse(found.isEmpty)
+        XCTAssertTrue(indexer.db?.keys(doc: copy).contains(IndexKeys.docUnit) == true)
+        XCTAssertFalse(h.app.workspace.isLoaded(copy), "Background indexing must not open the copy")
+    }
+
     private var strokeRef: String { NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.strokeID).description }
 
     private func harness(_ script: [TextRecognition] = []) -> (Harness, Indexer) {
