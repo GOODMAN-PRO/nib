@@ -122,7 +122,20 @@ enum BridgeCalls {
     static func setEnabled(_ app: NibApp, enabled: Bool, rotateToken: Bool = false) async throws {
         var params: [String: JSONValue] = ["enabled": .bool(enabled)]
         if rotateToken { params["rotateToken"] = .bool(true) }
-        try await run(app, setEnabledID, .object(params))
+        #if DEBUG
+        NSLog("%@", "[Nib QA bridge] setEnabled flag=\(enabled) rotateToken=\(rotateToken)")
+        #endif
+        do {
+            let result = try await run(app, setEnabledID, .object(params))
+            #if DEBUG
+            NSLog("%@", "[Nib QA bridge] setEnabled returned enabled=\(String(describing: result["enabled"]?.boolValue)) state=\(result["state"]?.stringValue ?? "missing")")
+            #endif
+        } catch {
+            #if DEBUG
+            NSLog("%@", String("[Nib QA bridge] setEnabled error=\(error.localizedDescription)".prefix(890)))
+            #endif
+            throw error
+        }
     }
 
     /// `settings.set {name, value}`; `.null` resets the setting to its default.
@@ -410,6 +423,11 @@ final class BridgeMonitor: ObservableObject {
     /// refresh reads it), so a poll reads the Keychain only when the bridge's `tokenMissing` disagrees with the token
     /// on hand.
     func refresh(readToken: Bool = true) async {
+        #if DEBUG
+        defer {
+            NSLog("%@", "[Nib QA bridge] refresh enabled=\(String(describing: snapshot?.enabled)) state=\(String(describing: snapshot?.state)) available=\(isAvailable) error=\(refreshError != nil)")
+        }
+        #endif
         guard let app = app else { return }
         if readToken { reloadToken() }
         guard app.commands.entry(BridgeCalls.statusID) != nil else {

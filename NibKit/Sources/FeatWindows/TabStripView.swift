@@ -199,6 +199,9 @@ final class TabStripModel: ObservableObject {
         activeIndex = navigator.activeDocument.flatMap { docs.firstIndex(of: $0) }
         showsLibrary = navigator.session.document == nil
         isVisible = TabStripLayout.showsStrip(tabCount: docs.count, enabled: app.settings.get(WindowSettings.showTabs))
+        #if DEBUG
+        NSLog("%@", "[Nib QA tabs] reload openDocuments=\(docs.count) showTabs=\(app.settings.get(WindowSettings.showTabs)) shown=\(isVisible)")
+        #endif
     }
 
     func select(_ index: Int) {
