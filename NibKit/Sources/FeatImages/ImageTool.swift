@@ -67,6 +67,23 @@ final class ImageNavigationTracker {
     private let page: PageID?
     private var navigated: Bool
     private var watches: [AnyCancellable] = []
+    var selectionTask: Task<JSONValue, Error>? {
+        didSet { if navigated { selectionTask?.cancel() } }
+    }
+
+    /// selection.set's optional snapshot uses the session baseline, not the tapped insertion page.
+    var expectedSession: JSONValue {
+        var value: [String: JSONValue] = [:]
+        if let document { value["document"] = .string(document.raw) }
+        if let page { value["page"] = .string(page.raw) }
+        return .object(value)
+    }
+
+    private func didNavigate() {
+        navigated = true
+        // Cancellation survives returning to the original page while a selection hook is suspended.
+        selectionTask?.cancel()
+    }
 
     init(session: EditorSession?) {
         // The tapped page can differ from the page at the viewport centre. Only changes to the
@@ -78,11 +95,11 @@ final class ImageNavigationTracker {
             watches = [
                 session.$document.dropFirst().sink { [weak self] value in
                     guard let self else { return }
-                    if value != self.document { self.navigated = true }
+                    if value != self.document { self.didNavigate() }
                 },
                 session.$page.dropFirst().sink { [weak self] value in
                     guard let self else { return }
-                    if value != self.page { self.navigated = true }
+                    if value != self.page { self.didNavigate() }
                 }
             ]
         }
@@ -124,12 +141,15 @@ enum ImageUI {
         }
         guard !created.isEmpty, let session = session, navigation.canUpdate(session) else { return created }
         finishToolUse(session, target: target)
-        // T4:concurrency-canvas#6 follow-up for the NibContracts/FeatLasso owners: selection.set
-        // needs an invocation-local precondition capturing this tracker, checked after all async
-        // hooks/authorization immediately before applying selection. A pre-call check cannot close
-        // that race (including A -> B -> A); rejecting selection must preserve the completed insert.
-        _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
-                                       session: session)
+        let params: JSONValue = ["refs": .array(created.map { .string($0) }),
+                                 "expectedSession": navigation.expectedSession]
+        // Isolate cancellation to selection: insertion has committed and must remain undoable.
+        let selection = Task { @MainActor in
+            try await app.bus.execute(CommandIDs.selectionSet, params, session: session)
+        }
+        navigation.selectionTask = selection
+        defer { navigation.selectionTask = nil }
+        _ = try? await selection.value
         return created
     }
 

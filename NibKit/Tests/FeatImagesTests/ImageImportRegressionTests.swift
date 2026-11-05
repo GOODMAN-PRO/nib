@@ -129,6 +129,9 @@ final class ImageImportRegressionTests: XCTestCase {
         // FeatLasso owns selection.set; record the image UI's request without importing another feature.
         h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select", summary: "Test selection.",
                                                   effect: .session)) { params, _ in
+            XCTAssertEqual(params["expectedSession"], ["document": .string(Fixtures.docID.raw),
+                                                       "page": .string(Fixtures.page1.raw)])
+            XCTAssertFalse(Task.isCancelled)
             selected = params["refs"]?.arrayValue?.compactMap { $0.stringValue } ?? []
             return .null
         }
@@ -139,6 +142,64 @@ final class ImageImportRegressionTests: XCTestCase {
         XCTAssertEqual(selected, refs)
         XCTAssertEqual(h.session.tool, "lasso")
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testNavigationDuringSelectionHookCancelsOnlySelectionAndPreservesInsertion() async throws {
+        for changeDocument in [false, true] {
+            for returnToOrigin in [false, true] {
+                let h = Harness(features: [FeatImagesFeature.self])
+                h.session.page = Fixtures.page1
+                h.session.tool = "image"
+                let paused = expectation(description: "Selection hook entered")
+                let release = expectation(description: "Selection hook released")
+                let finished = expectation(description: "Import finished")
+                var selectionCancelled = false
+                var selectionsApplied = 0
+                // This target cannot import FeatLasso. Its tests exercise the real command's conflict;
+                // this stand-in checks that ImageUI delivers the snapshot and cancels the actual invocation.
+                h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select",
+                    summary: "Test selection cancellation.", effect: .session)) { params, _ in
+                    XCTAssertEqual(params["expectedSession"], ["document": .string(Fixtures.docID.raw),
+                                                               "page": .string(Fixtures.page1.raw)])
+                    selectionCancelled = Task.isCancelled
+                    if Task.isCancelled { throw NibError(.conflict, "test navigation") }
+                    selectionsApplied += 1
+                    return .null
+                }
+                h.app.bus.hooks.register(CommandHookDescriptor(id: "test.selectionGate", owner: "test",
+                    commands: [CommandIDs.selectionSet]) { _, _ in
+                    paused.fulfill()
+                    await self.fulfillment(of: [release], timeout: 2)
+                    return nil
+                })
+                var created: [String] = []
+                let pending = Task { @MainActor in
+                    defer { finished.fulfill() }
+                    created = await ImageUI.perform(h.app, [("image.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG001",
+                        "asset": "fixture-image.png", "id": "HOOKIMAGE"])], session: h.session)
+                    XCTAssertFalse(Task.isCancelled, "Navigation cancels selection, not the import task")
+                }
+                defer { pending.cancel() }
+                await fulfillment(of: [paused], timeout: 2)
+                if changeDocument { h.session.document = "FIXTUREDOC04" }
+                else { h.session.page = Fixtures.page2 }
+                if returnToOrigin {
+                    h.session.document = Fixtures.docID
+                    h.session.page = Fixtures.page1
+                }
+                let selection = h.session.selection
+                release.fulfill()
+                await fulfillment(of: [finished], timeout: 2)
+                XCTAssertTrue(selectionCancelled)
+                XCTAssertEqual(selectionsApplied, 0)
+                XCTAssertEqual(h.session.selection, selection)
+                XCTAssertEqual(created, ["item:FIXTUREDOC01/FIXTUREPG001/HOOKIMAGE"])
+                XCTAssertNotNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "HOOKIMAGE").image)
+                XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+                XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+                XCTAssertNil(try? h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "HOOKIMAGE"))
+            }
+        }
     }
 
     func testTrackerRemembersPageNavigationEvenAfterReturningToOrigin() {
