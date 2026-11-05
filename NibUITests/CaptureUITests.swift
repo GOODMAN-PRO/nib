@@ -1,8 +1,8 @@
 import XCTest
 import UIKit
 
-/// Real-app review captures. Reachability is the only assertion: no pixel, colour,
-/// spacing or typography expectations. Each test launches one disposable fixture for
+/// Real-app review captures. Reachability and rendered-content readiness are the only assertions;
+/// there are no styling, colour, spacing or typography expectations. Each test launches one disposable fixture for
 /// one group/appearance/orientation: 24 groups x 4 variants = 96 independent tests.
 /// UITestFixture pins appearance at launch (including new windows); FeatAppearance
 /// follows the system and has no live light/dark command, so variants require relaunches.
@@ -138,6 +138,62 @@ final class CaptureUITests: XCTestCase {
         try ui.openDocument(notebook)
         _ = try ui.waitForState { $0.screen == "document" && $0.pageCount == 4 && $0.itemCountOnPage > 0 }
         _ = try require("nib.canvas")
+    }
+
+    /// Panel state is published before the canvas resize/tiles and palette re-form finish. In particular,
+    /// opening the portrait assistant can temporarily show only paper and the palette's glass body.
+    /// Require the actual note ink and pen glyph, not just their already-populated accessibility records.
+    /// The note sits clear of the floating options strip in all four fixture variants.
+    private func settledNotebookWithAssistant() throws {
+        let pen = ui.app.buttons["tool.pen"]
+        let note = ui.app.staticTexts.matching(NSPredicate(
+            format: "label == %@ AND value == %@", "Sticky note", "Remember F = ma")).firstMatch
+        let assistant = ui.app.buttons.matching(NSPredicate(format: "label == %@", "Other providers")).firstMatch
+        var previous: [CGRect] = []
+        var stableSince: Date?
+        try wait("Assistant, page note and palette glyph must finish presenting", timeout: 20) {
+            guard pen.exists, note.exists, assistant.exists, pen.isHittable, assistant.isHittable else {
+                stableSince = nil
+                return false
+            }
+            let frames = [pen.frame, note.frame, assistant.frame, self.ui.canvas.frame]
+            let window = self.ui.app.windows.firstMatch.frame
+            guard frames.allSatisfy({ !$0.isEmpty && window.contains($0) }) else {
+                stableSince = nil
+                return false
+            }
+            guard frames == previous else {
+                previous = frames
+                stableSince = nil
+                return false
+            }
+            guard self.hasRenderedDetail(pen), self.hasRenderedDetail(note) else {
+                stableSince = nil
+                return false
+            }
+            if let stableSince { return Date().timeIntervalSince(stableSince) >= 0.5 }
+            stableSince = Date()
+            return false
+        }
+    }
+
+    /// A blank paper tile or empty glass capsule has no foreground detail. This deliberately loose contrast
+    /// gate checks presence only, in either appearance, rather than comparing a screenshot to a golden image.
+    private func hasRenderedDetail(_ element: XCUIElement) -> Bool {
+        let image = element.screenshot().image
+        let width = 128, height = 32
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        guard let cgImage = image.cgImage else { return false }
+        let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                                          bitsPerComponent: 8, bytesPerRow: width,
+                                          space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+            else { return false }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            return true
+        }
+        guard drawn, let low = pixels.min(), let high = pixels.max() else { return false }
+        return Int(high) - Int(low) > 40
     }
 
     private func folder(_ title: String) throws {
@@ -312,7 +368,12 @@ final class CaptureUITests: XCTestCase {
         variants {
             try self.openNotebook()
             try self.tap("Assistant")
-            try self.capture(21, "ai-assistant") { $0.openPanels.contains("aichat.panel") }
+            _ = try self.ui.waitForState { $0.openPanels.contains("aichat.panel") }
+            try self.settledNotebookWithAssistant()
+            try self.capture(21, "ai-assistant") {
+                $0.screen == "document" && $0.document != nil && $0.itemCountOnPage > 0
+                    && $0.openPanels.contains("aichat.panel")
+            }
         }
     }
 
