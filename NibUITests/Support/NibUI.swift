@@ -2040,7 +2040,7 @@ final class NibUI {
 /// fixture contract; an unlabeled toolbar symbol must not prevent ordinary input.
 @MainActor
 extension NibUI {
-    static func openCalendarEvent(in calendar: XCUIApplication) throws {
+    static func openCalendarEvent(in calendar: XCUIApplication, log: ((String, String) -> Void)? = nil) throws {
         let title = calendar.textFields["Title"]
         // iPadOS 26 exposes the toolbar action as add-plus-button / lowercase "add".
         // Prefer its stable identifier; localized display casing is not a command contract.
@@ -2052,10 +2052,30 @@ extension NibUI {
             return (identified + labelled).first { $0.isEnabled && $0.isHittable }
         }
         func editorIsReady() -> Bool { title.exists && title.isEnabled && title.isHittable }
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            editorIsReady() || addButton() != nil
+            let alerts = springboard.alerts
+            let count = alerts.count
+            let add = calendar.buttons["add-plus-button"].firstMatch
+            let facts = add.exists ? "enabled=\(add.isEnabled) hittable=\(add.isHittable) frame=\(add.frame)" : "absent"
+            log?("Calendar readiness", "springboardAlerts=\(count) Add=\(facts)")
+            if count > 0 {
+                let alert = alerts.firstMatch
+                let allow = alert.buttons.matching(NSPredicate(
+                    format: "label IN {'Allow While Using App', 'Allow', 'OK'} OR label CONTAINS 'Allow Full Access'")).firstMatch
+                if allow.exists && allow.isHittable { allow.tap() }
+                return false // Re-observe after dismissal before resolving Add.
+            }
+            return editorIsReady() || addButton() != nil
         }, object: nil)
-        _ = XCTWaiter.wait(for: [ready], timeout: 15)
+        let readiness = XCTWaiter.wait(for: [ready], timeout: 15)
+        if readiness != .completed {
+            log?("Calendar readiness failed", springboard.debugDescription + "\n" + calendar.debugDescription)
+            if springboard.alerts.firstMatch.exists {
+                throw NibUI.Failure.message("Calendar permission alert did not dismiss")
+            }
+            // Preserve the native Command-N fallback when Calendar omits a usable Add control.
+        }
         if editorIsReady() { return }
         addButton()?.tap()
         let opened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorIsReady() }, object: nil)
@@ -2064,6 +2084,7 @@ extension NibUI {
         // Calendar's New Event keyboard command also reaches the native editor when
         // iPadOS omits the visible + symbol's accessibility label. Unlike a screen
         // coordinate this remains valid across orientation and toolbar layouts.
+        log?("Calendar Command-N", "Add did not open editor; delivering native key to Calendar")
         calendar.typeKey("n", modifierFlags: [.command])
         let shortcutOpened = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in editorIsReady() }, object: nil)
         guard XCTWaiter.wait(for: [shortcutOpened], timeout: 10) == .completed else {

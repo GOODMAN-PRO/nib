@@ -49,3 +49,12 @@ D:escape-and-keyboard#2 and verdict: the inert-header contact removes the floati
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Create CustomSize / InvalidCustomSizePreventsCreation | Decimal keyboard remaining / Width keyboard after docked Hide | Was a docked keyboard still present and did the second observed-state contact remove it? |
+
+## C4 - Calendar permissions and event readiness
+
+D:create-calendar#0/#1 and verdicts: the first early interaction missed late system alerts; query-only polling could not invoke the monitor. The second test created its event but the test monitor declined the later full-access prompt, allowing XCTest's default denial. openCalendarEvent now explicitly dismisses observed SpringBoard permission alerts during its bounded readiness poll, logs alert count and actual Add facts each poll, and resolves/taps Add after that state clears. Retain Calendar's own XCUIApplication.typeKey Command-N fallback (the finding establishes that foreign-app route, not Nib's hardware route); its earlier loss remains unexplained. A readiness timeout with no remaining alert retains the original fallback when Add is absent; a remaining system alert fails explicitly. eventNote's monitor accepts Allow Full Access variants, and each test waits up to 15s to accept a late prompt and observe its unique event before scrolling. Existing grants take the same event-readiness path, so no test-order grant dependency remains. CI must show Add/editor, full-access acceptance with no default denial, linked note path/count, and reuse without duplication.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Both Create Calendar tests | Calendar readiness / readiness failed / Command-N | Which alert state and Add enabled/hittable/frame preceded the editor route? |
+| Both Create Calendar tests | Calendar full access | Was the late full-access prompt explicitly accepted before event scrolling? |
