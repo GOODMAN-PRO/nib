@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import UniformTypeIdentifiers
+import VisionKit
 import NibContracts
 import NibTesting
 @testable import FeatImages
@@ -40,6 +41,86 @@ final class ImageAssetSpy: AssetStore {
 
 @MainActor
 final class ImageImportRegressionTests: XCTestCase {
+    func testProviderFailureRejectsTheWholeSelection() async {
+        let good = NSItemProvider()
+        good.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            completion(Fixtures.pngData, nil)
+            return nil
+        }
+        let bad = NSItemProvider()
+        bad.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            completion(nil, URLError(.cannotDecodeContentData))
+            return nil
+        }
+        for providers in [[bad], [good, bad], [NSItemProvider()]] {
+            let finished = expectation(description: "Provider failure delivered")
+            var failed = false
+            Task { @MainActor in
+                defer { finished.fulfill() }
+                do { _ = try await ImageProviders.load(providers) }
+                catch { failed = true }
+            }
+            await fulfillment(of: [finished], timeout: 2)
+            XCTAssertTrue(failed, "failed and partial selections must not appear cancelled or successful")
+        }
+        do {
+            let cancelled = try await ImageProviders.load([])
+            XCTAssertTrue(cancelled.isEmpty)
+        } catch { XCTFail("Cancellation must succeed: \(error)") }
+    }
+
+    func testFilesReadOffMainAndRejectUnreadableSelections() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".png")
+        try Fixtures.pngData.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let images = try await ImageFiles.load([file], reader: { url in
+            XCTAssertFalse(Thread.isMainThread)
+            return try Data(contentsOf: url)
+        })
+        XCTAssertEqual(images, [Fixtures.pngData])
+        do {
+            _ = try await ImageFiles.load([file, file.appendingPathExtension("missing")])
+            XCTFail("One unreadable file must reject the selection before insertion")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+    }
+
+    func testScannerFailureIsNotCancellationAndCompletesOnlyOnce() throws {
+        let session = ScanSession()
+        var results: [Result<[Data], Error>] = []
+        session.receive = { results.append($0) }
+        let scanner = VNDocumentCameraViewController()
+        session.documentCameraViewController(scanner, didFailWithError: URLError(.unknown))
+        session.documentCameraViewControllerDidCancel(scanner)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertThrowsError(try XCTUnwrap(results.first).get()) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+    }
+
+    func testTemporaryStorageFailureRejectsBatchAndReportsError() async throws {
+        let h = Harness(features: [FeatImagesFeature.self])
+        var writes = 0
+        h.app.services.assets = ImageAssetSpy(h.assets, onTemporary: {
+            writes += 1
+            if writes == 2 { throw CocoaError(.fileWriteOutOfSpace) }
+        })
+        let reported = expectation(description: "Staging error reported")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            XCTAssertEqual((note.userInfo?["error"] as? NibError)?.code, .unavailable)
+            reported.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        let before = try h.snapshot()
+        do {
+            _ = try await ImageUI.insertCalls([Fixtures.pngData, Fixtures.pngData],
+                target: ImageMenuTarget(doc: Fixtures.docID, page: Fixtures.page2, point: nil), app: h.app, session: h.session)
+            XCTFail("Staging must not return a shortened command list")
+        } catch { ImageLoading.report(error, app: h.app) }
+        await fulfillment(of: [reported], timeout: 2)
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
     func testInsertRejectsIDClaimedDuringAssetRead() async throws {
         let h = Harness(features: [FeatImagesFeature.self])
         let reading = expectation(description: "Asset read suspended")
