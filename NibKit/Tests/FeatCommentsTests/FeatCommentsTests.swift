@@ -246,6 +246,20 @@ final class FeatCommentsTests: XCTestCase {
         XCTAssertEqual(try item(h, threadRef).comment?.messages.map(\.id.raw), [replyID])
     }
 
+    func testStaleMessageDraftConflictsButUnrelatedReplyDoesNot() async throws {
+        let h = harness()
+        let baseline = try XCTUnwrap(try item(h, threadRef).comment?.messages.first)
+        var draft: JSONValue = ["ref": .string(threadRef), "message": .string(baseline.id.raw),
+            "text": "First correction", "baseline": try JSONValue.from(baseline)]
+        _ = try await h.run("comment.reply", ["ref": .string(threadRef), "text": "Unrelated reply"])
+        _ = try await h.run("comment.edit", draft)
+        let depth = h.undoDepth(Fixtures.docID)
+        draft["text"] = "Stale correction"
+        await assertError(.conflict) { _ = try await h.run("comment.edit", draft) }
+        XCTAssertEqual(try item(h, threadRef).comment?.messages.map(\.text), ["First correction", "Unrelated reply"])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+    }
+
     func testTapOpensThePinUnderTheFingerAndSkipsHiddenResolvedThreads() async throws {
         let h = harness()
         let panels = installPanelHost(h)
