@@ -1359,24 +1359,55 @@ final class ChromeUITests: XCTestCase {
                 withAttributes: [.font: UIFont.systemFont(ofSize: 22), .foregroundColor: UIColor.black])
         }
         try data.write(to: folder.appendingPathComponent("Chrome selection.pdf"))
+        func pickerFacts(_ element: XCUIElement) -> String {
+            guard element.exists else { return "exists=false" }
+            guard let snapshot = try? element.snapshot() else { return "exists=true snapshot unavailable" }
+            let identity = "type=\(snapshot.elementType) label=\(snapshot.label) frame=\(snapshot.frame)"
+            let readiness = "enabled=\(snapshot.isEnabled) selected=\(snapshot.isSelected) hittable=\(element.isHittable)"
+            return identity + " " + readiness
+        }
+        func step(_ stage: String, _ element: XCUIElement? = nil) {
+            ui.logStateStep("PDF import " + stage)
+            let cancel = ui.app.buttons["Cancel"].firstMatch
+            let open = ui.app.buttons["Open"].firstMatch
+            var facts = "Cancel: " + pickerFacts(cancel) + "\nOpen: " + pickerFacts(open)
+            if let element { facts += "\ntarget: " + pickerFacts(element) }
+            ui.logQA("PDF picker " + stage, facts)
+        }
+        step("before New")
         ui.recordDiagnostics("Files picker before import", includeHierarchy: false)
-        try tap("New"); try tap("Import Files")
+        try tap("New")
+        step("before Import Files")
+        try tap("Import Files")
+        step("presented")
         filesDiagnostics("opened")
-        defer { filesDiagnostics("PDF completion") }
+        defer { step("completion"); filesDiagnostics("PDF completion") }
         let local = ui.app.cells["DOC.sidebar.item.On My iPad"]
+        step("before local provider", local)
         if local.waitForExistence(timeout: 5), local.isHittable { local.tap() }
+        step("after local provider")
         let nib = ui.app.cells["Nib, Container"]
+        step("before Nib container", nib)
         if nib.waitForExistence(timeout: 3), nib.isHittable { nib.tap() }
+        step("after Nib container")
         filesDiagnostics("before folder")
         let directory = ui.app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", folderName)).firstMatch
         XCTAssertTrue(directory.waitForExistence(timeout: 10), "Files must show external PDF input folder")
+        step("before folder tap", directory)
         directory.tap()
+        step("after folder tap")
         let pdf = ui.app.cells.matching(NSPredicate(format: "label CONTAINS 'Chrome selection'")).firstMatch
-        XCTAssertTrue(pdf.waitForExistence(timeout: 10)); pdf.tap()
+        XCTAssertTrue(pdf.waitForExistence(timeout: 10))
+        step("before PDF selection", pdf)
+        pdf.tap()
+        step("after PDF selection", pdf)
         filesDiagnostics("before Open")
         let pick = ui.app.buttons["Open"]
+        step("before Open", pick)
         if pick.waitForExistence(timeout: 2), pick.isHittable { pick.tap() }
+        step("after Open")
         _ = try ui.waitForState { $0.screen == "document" && $0.pageCount == 1 }
+        step("imported document")
         try ui.selectTool("lasso")
     }
     private func selectPDFText() throws {
