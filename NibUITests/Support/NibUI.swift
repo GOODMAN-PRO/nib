@@ -750,10 +750,21 @@ final class NibUI {
     }
 
     /// Photos on iOS 26 exposes assets as Images under photos_sectioned_layout, not collection cells.
-    func photoAsset() throws -> XCUIElement {
+    func photoAsset(diagnostics: Bool = false) throws -> XCUIElement {
         let assets = app.otherElements["photos_sectioned_layout"].images.matching(
             NSPredicate(format: "identifier == 'PXGGridLayout-Info' AND label BEGINSWITH 'Photo,'"))
         let legacy = app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Photo,'"))
+        func inspect(_ stage: String) {
+            guard diagnostics else { return }
+            let first = assets.firstMatch
+            logQA("Photos assets " + stage, "first.exists=\(first.exists)")
+            for asset in assets.allElementsBoundByIndex.prefix(8) {
+                logQA("Photos assets " + stage, elementFacts(asset))
+            }
+            recordDiagnostics("Photos assets " + stage, includeHierarchy: false)
+        }
+        inspect("before lookup")
+        defer { inspect("after lookup") }
         func candidate() -> XCUIElement? {
             for query in [assets, legacy] {
                 let first = query.firstMatch
@@ -870,7 +881,7 @@ final class NibUI {
 
     /// Prefer the native dismissal control; floating number pads can expose an unusable AX frame.
     /// Escape is a fallback only. Synthesis completion is not proof that the keyboard disappeared.
-    func dismissNativeKeyboard(in application: XCUIApplication? = nil) throws {
+    func dismissNativeKeyboard(in application: XCUIApplication? = nil, diagnoseWidth: Bool = false) throws {
         let source = application ?? app
         guard source.keyboards.firstMatch.exists else { return }
         let viewport = source.windows.firstMatch.frame
@@ -879,6 +890,18 @@ final class NibUI {
                 hasVisibleFrame($0, in: viewport)
             }
         let route = hide == nil ? "hardware Escape (no hittable dismissal control)" : "native Hide/Dismiss keyboard button"
+        func inspect(_ stage: String) {
+            guard diagnoseWidth else { return }
+            for button in source.keyboards.buttons.allElementsBoundByIndex {
+                logQA("Width keyboard " + stage, "label=\(button.label) frame=\(button.frame)")
+            }
+            let width = source.textFields["Width in millimetres"].firstMatch
+            recordDiagnostics("Width keyboard " + stage,
+                facts: "route=\(route) width.exists=\(width.exists) focused=\(width.exists && isKeyboardFocused(width, allowingAttributeFallback: true))",
+                includeHierarchy: false)
+        }
+        inspect("before Hide")
+        defer { inspect("completion") }
         try XCTContext.runActivity(named: "Dismiss native keyboard") { activity in
             let attachment = XCTAttachment(string: "route=\(route)")
             attachment.lifetime = .keepAlways; activity.add(attachment)
@@ -890,6 +913,7 @@ final class NibUI {
                     .withOffset(CGVector(dx: centre.x - source.frame.minX, dy: centre.y - source.frame.minY)).tap()
             } else { try hardwareKey(XCUIKeyboardKey.escape.rawValue) }
         }
+        inspect("after Hide")
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in !source.keyboards.firstMatch.exists }, object: nil)
         guard !source.keyboards.firstMatch.exists || XCTWaiter.wait(for: [gone], timeout: 5) == .completed else {
             throw Failure.message("Keyboard did not dismiss after \(route)")
@@ -1206,10 +1230,33 @@ final class NibUI {
             let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             screen.name = name + "-screen"; screen.lifetime = .keepAlways; activity.add(screen)
             let hierarchy = includeHierarchy ? "\n" + app.debugDescription : ""
+            logQA(name, "uptime=\(ProcessInfo.processInfo.systemUptime) \(facts) probe=\(probe.value ?? "missing")\(hierarchy)")
             let tree = XCTAttachment(string: "uptime=\(ProcessInfo.processInfo.systemUptime)\n\(facts)\n"
                 + "probe=\(probe.value ?? "missing")\(hierarchy)")
             tree.name = name + "-state-and-tree"; tree.lifetime = .keepAlways; activity.add(tree)
         }
+    }
+
+    func elementFacts(_ element: XCUIElement, includeOverlaps: Bool = false) -> String {
+        guard element.exists else { return "exists=false popovers=\(app.popovers.count) menus=\(app.menus.count) window=\(app.windows.firstMatch.frame)" }
+        guard let snapshot = try? element.snapshot() else { return "exists=true snapshot unavailable" }
+        let frame = snapshot.frame
+        let centre = CGPoint(x: frame.midX, y: frame.midY)
+        func covering(_ node: XCUIElementSnapshot) -> [String] {
+            guard node.frame.contains(centre) else { return [] }
+            let own = "\(node.elementType.rawValue):\(node.identifier):\(node.label):\(node.frame)"
+            return [own] + node.children.flatMap { covering($0) }
+        }
+        // XCUITest has no public UIKit hitTest API. Report overlapping AX frames, not an invented hit result.
+        let overlaps = includeOverlaps ? ((try? app.snapshot()).map { covering($0) } ?? []) : []
+        return "exists=true id=\(snapshot.identifier) label=\(snapshot.label) frame=\(frame) enabled=\(snapshot.isEnabled) hittable=\(element.isHittable) value=\(String(describing: snapshot.value)) popovers=\(app.popovers.count) menus=\(app.menus.count) window=\(app.windows.firstMatch.frame) centreOverlaps=\(overlaps)"
+    }
+
+    /// Observe the same decisive action on success or failure; no retry, alternate tap or softened oracle.
+    func diagnoseAction<T>(_ name: String, facts: () -> String, action: () throws -> T) rethrows -> T {
+        recordDiagnostics(name + " before", facts: facts(), includeHierarchy: false)
+        defer { recordDiagnostics(name + " after", facts: facts(), includeHierarchy: false) }
+        return try action()
     }
 
     /// Two points use the public coordinate press-and-drag API. Longer polylines keep one finger down using

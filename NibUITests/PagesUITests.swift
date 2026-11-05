@@ -177,7 +177,7 @@ final class PagesUITests: XCTestCase {
         ui.coordinate(CGPoint(x: 0.38, y: 0.85)).tap()
         let before = try ids()
         try more("Image")
-        let photo = try ui.photoAsset()
+        let photo = try ui.photoAsset(diagnostics: true)
         try require(photo, "Add Page > Image must present selectable Photos assets")
         photo.tap()
         let add = button("Add")
@@ -193,10 +193,18 @@ final class PagesUITests: XCTestCase {
         try draw()
         let original = try ui.state()
         let source = try XCTUnwrap(live().first), beforeIDs = try ids()
+        ui.recordDiagnostics("Duplicate page before action", includeHierarchy: false)
+        defer { ui.recordDiagnostics("Duplicate page completion", includeHierarchy: false) }
         try more("Duplicate"); try count(5)
         let copy = try XCTUnwrap(live().first { !beforeIDs.contains($0["id"] as? String ?? "") })
         XCTAssertEqual(canonical(background(copy)), canonical(background(source)))
         let copyID = try XCTUnwrap(copy["id"] as? String)
+        ui.recordDiagnostics("Duplicate page before items", facts: "copy=\(copyID) kinds=\(String(describing: try? itemKinds(copyID)))", includeHierarchy: false)
+        try wait("Copy page file must list persisted items", timeout: 8) {
+            let kinds = try? self.itemKinds(copyID)
+            self.ui.logQA("Duplicate page items", "copy=\(copyID) kinds=\(String(describing: kinds))")
+            return kinds?.isEmpty == false
+        }
         XCTAssertEqual(try itemKinds(copyID), try itemKinds(try XCTUnwrap(original.page)))
         XCTAssertEqual(try contentSignature(copyID), try contentSignature(try XCTUnwrap(original.page)), "Duplicate must preserve ink data, text, geometry and style")
         try pages(); try navigate(2)

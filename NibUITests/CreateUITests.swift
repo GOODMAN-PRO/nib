@@ -224,9 +224,9 @@ final class CreateUITests: XCTestCase {
         try tap("No cover")
         try chooseSize("Custom")
         try replace(ui.app.textFields["Width in millimetres"], with: "100", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         try replace(ui.app.textFields["Height in millimetres"], with: "150", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         try assertSize(try create(), width: 100 * 72 / 25.4, height: 150 * 72 / 25.4)
     }
 
@@ -235,9 +235,9 @@ final class CreateUITests: XCTestCase {
         try notebook("Invalid dimensions")
         try chooseSize("Custom")
         try replace(ui.app.textFields["Width in millimetres"], with: "0", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         try replace(ui.app.textFields["Height in millimetres"], with: "0", matching: numericValueMatches)
-        try dismissKeyboard()
+        try ui.dismissNativeKeyboard(diagnoseWidth: true)
         let create = ui.app.buttons["cmd.doc.create"]
         if create.isEnabled { create.tap() }
         let created = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in

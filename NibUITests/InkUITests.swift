@@ -738,7 +738,9 @@ final class InkUITests: XCTestCase {
 
     func testCustomColourValidHexUpdatesSlotAndInvalidHexIsRejected() throws {
         try swatchMenu("Change Colour"); try tap("Custom Colour")
-        try tap("Sliders")
+        try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
+            try tap("Sliders")
+        }
         let hex = try hexField()
         let selection = try ui.state().selectionCount
         hex.tap()
@@ -754,7 +756,9 @@ final class InkUITests: XCTestCase {
         closePopover()
         XCTAssertTrue(swatches[0].label.uppercased().contains("D03080"), "Valid HEX must update the edited slot")
         let valid = swatches[0].label
-        try swatchMenu("Change Colour"); try tap("Custom Colour"); try tap("Sliders")
+        try swatchMenu("Change Colour"); try tap("Custom Colour"); try ui.diagnoseAction("Colour Sliders", facts: { self.ui.elementFacts(self.ui.app.buttons["Sliders"].firstMatch, includeOverlaps: true) }) {
+            try tap("Sliders")
+        }
         let invalid = try hexField()
         invalid.tap()
         try wait("Invalid HEX attempt must retain field focus") { invalid.isHittable && self.ui.app.keyboards.firstMatch.exists }
@@ -1288,15 +1292,32 @@ final class InkUITests: XCTestCase {
         let before = try ui.state()
         try draw()
         try draw([CGPoint(x: 0.4, y: 0.72), CGPoint(x: 0.6, y: 0.72)])
+        let page = try XCTUnwrap(ui.app.otherElements.matching(NSPredicate(format: "label == 'Page 1 of 4'"))
+            .allElementsBoundByIndex.first { $0.frame.height > 100 })
+        let originalPage = page.frame, originalCanvas = ui.canvas.frame
+        ui.recordDiagnostics("History page before sidebar", facts: "page=\(originalPage) canvas=\(originalCanvas)", includeHierarchy: false)
+        defer { ui.recordDiagnostics("History page completion", facts: "page=\(page.frame)", includeHierarchy: false) }
         try ui.tapCommand("sidebar.toggle"); try tap("Panel Options"); try tap("History")
         _ = try ui.waitForState { $0.openPanels.contains("undo.history") }
         let reverts = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Revert '"))
         try wait("History must offer a Revert action for each stroke") { reverts.count == 2 }
+        ui.recordDiagnostics("History before revert", facts: "page=\(page.frame)", includeHierarchy: false)
         reverts.element(boundBy: 1).tap() // newest first: choose the older stroke
         _ = try ui.waitForState { $0.strokeCountOnPage == before.strokeCountOnPage + 1 }
         try ui.tapCommand("sidebar.toggle")
-        XCTAssertGreaterThan(try raster(CGRect(x: 0.42, y: 0.71, width: 0.16, height: 0.02)).darkPixels, 10, "Later unrelated stroke must survive selective revert")
-        XCTAssertEqual(try raster(CGRect(x: 0.42, y: 0.61, width: 0.16, height: 0.02)).darkPixels, 0, "Chosen earlier stroke must disappear")
+        let currentPage = page.frame, currentCanvas = ui.canvas.frame
+        ui.recordDiagnostics("History page after sidebar", facts: "page=\(currentPage) canvas=\(currentCanvas)", includeHierarchy: false)
+        // Preserve both bands in page coordinates, including scale changes, rather than a fixed window y.
+        func band(_ y: CGFloat) -> CGRect {
+            let x = (originalCanvas.minX + 0.42 * originalCanvas.width - originalPage.minX) / originalPage.width
+            let localY = (originalCanvas.minY + y * originalCanvas.height - originalPage.minY) / originalPage.height
+            return CGRect(x: (currentPage.minX + x * currentPage.width - currentCanvas.minX) / currentCanvas.width,
+                y: (currentPage.minY + localY * currentPage.height - currentCanvas.minY) / currentCanvas.height,
+                width: 0.16 * originalCanvas.width / originalPage.width * currentPage.width / currentCanvas.width,
+                height: 0.02 * originalCanvas.height / originalPage.height * currentPage.height / currentCanvas.height)
+        }
+        XCTAssertGreaterThan(try raster(band(0.71)).darkPixels, 10, "Later unrelated stroke must survive selective revert")
+        XCTAssertEqual(try raster(band(0.61)).darkPixels, 0, "Chosen earlier stroke must disappear")
     }
 
     // MARK: Pencil palette and simulator-testable Pencil preferences
