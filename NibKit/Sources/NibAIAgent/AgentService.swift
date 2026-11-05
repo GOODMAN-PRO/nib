@@ -24,15 +24,27 @@ final class AgentService: AIService {
     var historyCharacters = 80_000
 
     weak var app: NibApp?
-    let chatStore: ChatStore
+    // Retained per visited library for this process lifetime: failed writes and security-scoped
+    // access must survive a switch. Growth is bounded by the libraries visited during this run.
+    private var chatStores: [URL?: ChatStore] = [:]
+    private(set) var pendingSaves: [ObjectIdentifier: [String: AIResponse]] = [:]
+    var chatStore: ChatStore {
+        let library = app?.services.library
+        let directory = library?.metadataURL.appendingPathComponent("ai", isDirectory: true)
+        if let store = chatStores[directory] { return store }
+        let store = ChatStore(directory: { directory }, deviceHex: deviceHex, clock: clock,
+                              accessURL: library?.rootURL)
+        chatStores[directory] = store
+        return store
+    }
+    private let deviceHex: String
+    private let clock: HLCClock
     private var running: [String: Task<TurnOutcome, Never>] = [:]
 
     init(app: NibApp) {
         self.app = app
-        let services = app.services
-        chatStore = ChatStore(directory: { [weak services] in
-            services?.library?.metadataURL.appendingPathComponent("ai", isDirectory: true)
-        }, deviceHex: app.deviceHex, clock: app.clock)
+        deviceHex = app.deviceHex
+        clock = app.clock
     }
 
     // MARK: Provider
@@ -93,6 +105,35 @@ final class AgentService: AIService {
         running[chatID]?.cancel()
     }
 
+    /// Stable discriminator for callers: this is save recovery, not another provider request.
+    static func saveFailure(_ chat: String) -> NibError {
+        NibError(.unavailable, String(localized: "The answer is ready, but the conversation could not be saved."),
+                 path: "$.chat.persistence",
+                 hint: String(localized: "Free some storage, then retry saving the conversation.")
+                    + " ai.chat.save {\"chat\":\"\(chat)\"}")
+    }
+
+    /// The exposed save action flushes the original records and returns the retained receipt.
+    /// It never appends messages or contacts the provider, even when the provider was removed.
+    func retrySave(chatID: String, principal: Principal, dryRun: Bool = false) async throws -> AIResponse {
+        guard let app else { throw NibError.unavailable("the AI agent") }
+        let store = chatStore
+        let key = ObjectIdentifier(store)
+        try store.checkAccess(chatID, principal: principal, gateway: app.gateway)
+        guard !store.isDeleted(chatID), let response = pendingSaves[key]?[chatID] else {
+            throw NibError(.notFound, String(localized: "There is no unsaved answer in this conversation."))
+        }
+        if dryRun { return response }
+        if await store.flushAsync() != nil { throw Self.saveFailure(chatID) }
+        guard chatStore === store else {
+            throw NibError(.conflict, String(localized: "The library changed while saving the conversation."))
+        }
+        try store.checkAccess(chatID, principal: principal, gateway: app.gateway)
+        guard !store.isDeleted(chatID) else { throw ChatStore.unknownChat(chatID) }
+        pendingSaves[key]?[chatID] = nil
+        return response
+    }
+
     func chats(doc: DocumentID?) -> [AIChatSummary] { chatStore.summaries(doc: doc) }
 
     func messages(chatID: String) -> [AIMessage] {
@@ -100,12 +141,24 @@ final class AgentService: AIService {
     }
 
     func deleteChat(_ chatID: String) {
-        cancel(chatID: chatID)
         do {
-            try chatStore.delete(chatID)
+            let store = chatStore
+            try deleteChat(chatID, from: store)
+            Task { @MainActor in
+                if let error = await store.flushAsync() {
+                    agentLog.error("chat not deleted: \(error.description, privacy: .public)")
+                }
+            }
         } catch {
             agentLog.error("chat not deleted: \(NibError.wrap(error).description, privacy: .public)")
         }
+    }
+
+    func deleteChat(_ chatID: String, from store: ChatStore) throws {
+        cancel(chatID: chatID)
+        try store.delete(chatID)
+        // The tombstone now owns recovery, including when its durable write must retry.
+        pendingSaves[ObjectIdentifier(store)]?[chatID] = nil
     }
 
     func transcribe(audio: URL, language: String?) async throws -> [TranscriptSegment] {
@@ -154,6 +207,8 @@ final class AgentService: AIService {
         guard incoming.contains(where: { !$0.text.isEmpty || !($0.images ?? []).isEmpty }) else {
             return .failure(NibError(.invalidParams, "the request has no message", path: "$.messages"))
         }
+        // Keep the originating destination through completion and cancellation.
+        let chatStore = self.chatStore
         let chatID = request.chatID ?? NibID.make().raw
         let basePrincipal = caller?.principal ?? request.principal
         if request.chatID != nil {
@@ -163,6 +218,32 @@ final class AgentService: AIService {
         if request.chatID != nil && chatStore.isDeleted(chatID) {
             return .failure(NibError(.notFound, "conversation '\(chatID)' was deleted", path: "$.chat",
                                      hint: "start a new conversation"))
+        }
+        let storeKey = ObjectIdentifier(chatStore)
+        if let pending = pendingSaves[storeKey]?[chatID] {
+            // Also recover through older clients' generation Retry, including after another
+            // write has already flushed this store's pinned queue.
+            if await chatStore.flushAsync() != nil { return .failure(Self.saveFailure(chatID)) }
+            guard self.chatStore === chatStore else {
+                return .failure(NibError(.conflict, String(localized: "The library changed while saving the conversation.")))
+            }
+            do { try chatStore.checkAccess(chatID, principal: basePrincipal, gateway: app.gateway) }
+            catch { return .failure(NibError.wrap(error)) }
+            guard !chatStore.isDeleted(chatID) else { return .failure(ChatStore.unknownChat(chatID)) }
+            pendingSaves[storeKey]?[chatID] = nil
+            let shown = chatStore.visibleMessages(chatID)
+            // A retry can contain just the last prompt, or history ending in that prompt
+            // (or the completed answer). Match the suffix, including image identities.
+            func matchesSuffix(_ records: [ChatRecord]) -> Bool {
+                guard incoming.count <= records.count else { return false }
+                return zip(records.suffix(incoming.count), incoming).allSatisfy { s, m in
+                    (s.role ?? "user") == m.role && (s.text ?? "") == m.text
+                        && (s.images ?? []) == (m.images ?? []).map(\.name)
+                }
+            }
+            if matchesSuffix(shown) || (shown.last?.role == "assistant" && matchesSuffix(Array(shown.dropLast()))) {
+                return .success(pending)
+            }
         }
         guard running[chatID] == nil else {
             return .failure(NibError(.conflict, "this conversation is already answering",
@@ -212,20 +293,20 @@ final class AgentService: AIService {
         // The loop runs in its own task so `cancel(chatID:)` can stop it; cancelling the caller stops it too.
         let inner = Task { @MainActor () -> TurnOutcome in await loop.run(sink) }
         running[chatID] = inner
+        defer { running[chatID] = nil }
         let outcome = await withTaskCancellationHandler {
             await inner.value
         } onCancel: {
             inner.cancel()
         }
-        running[chatID] = nil
-        return finish(outcome, chatID: chatID, persisted: persisted, principal: principal, group: group,
+        return await finish(outcome, chatStore: chatStore, chatID: chatID, persisted: persisted, principal: principal, group: group,
                       mode: readOnly ? .ask : request.mode, jsonOutput: request.jsonOutput, doc: scopeDoc)
     }
 
     /// Stores the answer, emits `ai.turn.finished` and builds the response. A cancelled turn keeps what it did: its
     /// response carries the partial text and the undo group of the changes made so far.
-    private func finish(_ outcome: TurnOutcome, chatID: String, persisted: Bool, principal: Principal, group: String,
-                        mode: AIMode, jsonOutput: Bool, doc: DocumentID?) -> Result<AIResponse, NibError> {
+    private func finish(_ outcome: TurnOutcome, chatStore: ChatStore, chatID: String, persisted: Bool, principal: Principal, group: String,
+                        mode: AIMode, jsonOutput: Bool, doc: DocumentID?) async -> Result<AIResponse, NibError> {
         let text = jsonOutput ? AgentLoop.unfenced(outcome.finalText.isEmpty ? outcome.text : outcome.finalText) : outcome.text
         if persisted {
             var r = chatStore.makeMessage(role: "assistant", text: text)
@@ -238,6 +319,15 @@ final class AgentService: AIService {
             r.error = outcome.error
             chatStore.append([r], chat: chatID)
         }
+        let persistenceError = persisted ? await chatStore.flushAsync() : nil
+        let response = AIResponse(text: text, changes: outcome.changes, group: group, usage: outcome.usage,
+                                  chatID: persisted ? chatID : nil)
+        if persistenceError != nil && outcome.error == nil && !chatStore.isDeleted(chatID) {
+            pendingSaves[ObjectIdentifier(chatStore), default: [:]][chatID] = response
+        }
+        // Preserve provider errors and successful cancellation receipts. Save failures carry a
+        // separate event field so callers can offer save-only recovery without losing that result.
+        let reportedError = outcome.error ?? (outcome.cancelled || persistenceError == nil ? nil : Self.saveFailure(chatID))
         var payload: [String: JSONValue] = [
             "group": .string(group), "chat": .string(chatID), "mode": .string(mode.rawValue),
             "steps": .number(Double(outcome.steps)),
@@ -246,12 +336,17 @@ final class AgentService: AIService {
         if outcome.cancelled { payload["cancelled"] = true }
         if outcome.stepLimitReached { payload["stepLimitReached"] = true }
         if let reason = outcome.stopReason { payload["stop_reason"] = .string(reason) }
-        if let e = outcome.error { payload["error"] = e.json["error"] ?? .null }
+        if let e = reportedError { payload["error"] = e.json["error"] ?? .null }
+        if let e = persistenceError {
+            payload["persistenceError"] = e.json["error"] ?? .null
+            if outcome.error == nil {
+                payload["recovery"] = ["command": "ai.chat.save", "params": ["chat": .string(chatID)]]
+            }
+        }
         app?.events.emit(NibEventType.aiTurnFinished, principal: principal, doc: doc, changes: outcome.changes,
                          payload: .object(payload))
-        if let e = outcome.error { return .failure(e) }
-        return .success(AIResponse(text: text, changes: outcome.changes, group: group, usage: outcome.usage,
-                                   chatID: persisted ? chatID : nil))
+        if let e = reportedError { return .failure(e) }
+        return .success(response)
     }
 
     // MARK: Conversation

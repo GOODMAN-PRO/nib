@@ -17,6 +17,7 @@ final class ScriptedProvider: AIProvider {
     /// Round index → seconds to wait before streaming (cancellation tests).
     var delays: [Int: Double] = [:]
     var failures: [Int: NibError] = [:]
+    var beforeEvents: (@MainActor () async throws -> Void)?
 
     init(vision: Bool = true, tools: Bool = true, _ rounds: [Round]) {
         config = AIProviderConfig(name: "Scripted", kind: .openAICompatible, baseURL: URL(string: "http://127.0.0.1:9/v1")!,
@@ -34,8 +35,11 @@ final class ScriptedProvider: AIProvider {
         let events = rounds.isEmpty ? [.textDelta("(end of script)"), .stop(reason: "end_turn")] : rounds.removeFirst()(request)
         let delay = delays[index] ?? 0
         let failure = failures[index]
+        let beforeEvents = self.beforeEvents
         return AsyncThrowingStream { continuation in
             let task = Task {
+                do { try await beforeEvents?() }
+                catch { continuation.finish(throwing: error); return }
                 if delay > 0 {
                     do {
                         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -180,6 +184,34 @@ enum AgentFixture {
 @MainActor
 final class AgentLoopTests: XCTestCase {
     typealias P = ScriptedProvider
+
+    func testTurnKeepsOriginatingLibraryAfterSwitch() async throws {
+        for cancel in [false, true] {
+            let provider = P(events: [P.answer("Private answer")])
+            var released = false
+            provider.beforeEvents = {
+                for _ in 0..<500 where !released { try await Task.sleep(nanoseconds: 1_000_000) }
+                guard released else { throw NibError(.timeout, "Test provider was not released") }
+            }
+            let (h, agent) = AgentFixture.make(provider)
+            let other = Harness(features: [])
+            let directory = h.library.metadataURL.appendingPathComponent("ai")
+            let task = Task { try await agent.complete(AgentFixture.request("Private question")) }
+            for _ in 0..<100 where provider.requests.isEmpty { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertFalse(provider.requests.isEmpty)
+            h.app.services.library = other.library
+            if cancel { agent.cancel(chatID: "CHATTEST0001") }
+            else { released = true }
+            let response = try await task.value
+            let chat = try XCTUnwrap(response.chatID)
+            let reopened = ChatStore(directory: { directory }, deviceHex: "000000ff", clock: HLCClock(device: 255))
+            XCTAssertEqual(reopened.messages(chat).map(\.text), ["Private question", cancel ? "" : "Private answer"])
+            XCTAssertEqual(reopened.messages(chat).last?.cancelled == true, cancel)
+            XCTAssertEqual(reopened.ownerDoc(chat), Fixtures.docID)
+            XCTAssertTrue(agent.chatStore.summaries(doc: nil, all: true).isEmpty)
+            XCTAssertTrue(agent.chatStore.messages(chat).isEmpty)
+        }
+    }
 
     func testSilentEditRemainsListedRateableAndDoesNotDuplicateResentHistory() async throws {
         let provider = P(events: [

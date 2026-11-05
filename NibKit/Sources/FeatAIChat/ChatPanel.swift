@@ -14,6 +14,7 @@ struct ChatPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             NibPanelHeader(title: String(localized: "Assistant"), subtitle: model.providerLabel, symbol: .assistant,
+                           handlesEscape: context.presentation == .sheet || context.presentation == .fullScreen,
                            onClose: { model.perform(ChatCommand.close) }) {
                 Menu {
                     Button(String(localized: "New conversation")) { model.perform(ChatCommand.new) }
@@ -33,7 +34,7 @@ struct ChatPanel: View {
                 .accessibilityLabel(String(localized: "Assistant options"))
             }
             if model.showsConversations { conversationList }
-            else if !model.isConfigured { connectionBody }
+            else if !model.isConfigured && model.entries.isEmpty { connectionBody }
             else { configuredBody }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -183,6 +184,21 @@ struct ChatPanel: View {
 
     private var threadContent: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xl) {
+            if !model.isConfigured && !model.entries.isEmpty {
+                Menu {
+                    ForEach(ChatViewModel.connectionActions, id: \.self) { provider in
+                        Button(provider) {
+                            model.perform(CommandIDs.settingsOpen, ["page": .string(ChatViewModel.connectionPage(for: provider))])
+                        }
+                    }
+                } label: {
+                    Label { Text(String(localized: "Connect a model")) } icon: { Image(nib: .link) }
+                        .font(NibFont.button)
+                        .foregroundStyle(NibColor.accent)
+                        .frame(minHeight: NibMetrics.hitTarget)
+                }
+                .accessibilityIdentifier("aichat.connect")
+            }
             if model.entries.isEmpty {
                 Text(String(localized: "Ask about your notes, or switch to Edit to change them."))
                     .font(NibFont.chat).foregroundStyle(NibColor.labelSecondary)
@@ -198,7 +214,7 @@ struct ChatPanel: View {
             if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
             if let error = model.error {
                 NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
-                          action: model.retryPrompt != nil && model.canSend ? NibAction(String(localized: "Retry")) {
+                          action: model.canRetry ? NibAction(String(localized: "Retry")) {
                     model.perform(ChatCommand.send, ["retry": true])
                 } : nil)
                 NibButton(String(localized: "Dismiss error"), kind: .plain, size: .compact) {

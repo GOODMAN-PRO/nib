@@ -6,6 +6,296 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testSuccessfulTurnAfterLibrarySwitchRetriesFromReceiptWithoutSavingAgain() async throws {
+        for proposal in [false, true] {
+            let h = Harness(features: [FeatAIChatFeature.self])
+            let other = Harness()
+            installProposalEdits(h)
+            let edit: JSONValue = ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Kept edit"]
+            let calls: [(command: String, params: JSONValue)] = proposal
+                ? [(ChatCommand.propose, ["changes": [["command": "test.proposedEdit", "params": edit]]])]
+                : [("test.proposedEdit", edit)]
+            let provider = FakeAIService(responses: [.init(text: "Final saved answer", toolCalls: calls)], bus: h.app.bus)
+            let destination = h.library.metadataURL.appendingPathComponent("successful-switch.jsonl")
+            try FileManager.default.createDirectory(at: h.library.metadataURL, withIntermediateDirectories: true)
+            let service = SaveFailingChatService(provider: provider, destination: destination)
+            service.streamedText = "Partial answer"
+            service.beforeFinish = {
+                await Task.yield()
+                h.app.services.library = other.library
+            }
+            h.app.services.ai = service
+            var saveCommands = 0
+            h.app.commands.register(CommandDescriptor(id: "ai.chat.save", title: "Save conversation",
+                summary: "No pending save exists after success.", effect: .session)) { _, _ in
+                saveCommands += 1
+                throw NibError(.notFound, "There is no unsaved answer")
+            }
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatList, title: "List conversation",
+                summary: "Return the saved canonical records.", effect: .read)) { _, _ in
+                XCTAssertTrue(h.app.services.library === h.library)
+                return ["chats": [], "messages": .array(service.records)]
+            }
+            let model = ChatRuntime.get(h.app).model(for: h.session)
+            model.mode = .edit
+            do {
+                _ = try await h.run(ChatCommand.send, ["prompt": "Keep my question"])
+                XCTFail("A finished answer must still reject presentation in another library")
+            } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+            XCTAssertEqual(service.saveAttempts, 1, "The agent already persisted the answer in A")
+            XCTAssertTrue(model.canRetry)
+            h.app.services.library = h.library
+            var receipt: ChatEntry?
+            if proposal {
+                _ = try await h.run(ChatCommand.accept)
+                receipt = try XCTUnwrap(model.entries.last)
+                XCTAssertTrue(receipt?.isReceipt == true)
+            }
+            provider.isConfigured = false
+            let result = try await h.run(ChatCommand.send, ["retry": true])
+            XCTAssertEqual(result["text"]?.stringValue, "Final saved answer")
+            let answer = try XCTUnwrap(model.entries.first(where: { $0.id == "SAVEANSWER01" }))
+            XCTAssertEqual(answer.text, "Final saved answer")
+            XCTAssertEqual(answer.usage.input + answer.usage.output, 20)
+            XCTAssertEqual(answer.changes, service.response?.changes)
+            XCTAssertEqual(answer.group, service.response?.group)
+            XCTAssertEqual(model.tokenCount, 20)
+            XCTAssertNil(model.error)
+            XCTAssertFalse(model.canRetry)
+            if let receipt {
+                let retained = try XCTUnwrap(model.entries.first(where: { $0.id == receipt.id }))
+                XCTAssertEqual(retained.group, receipt.group)
+                XCTAssertEqual(retained.changes, receipt.changes)
+                XCTAssertEqual(retained.usage.input + retained.usage.output, 0)
+            }
+            XCTAssertEqual(provider.requests.count, 1)
+            XCTAssertEqual(saveCommands, 0)
+            XCTAssertEqual(service.saveAttempts, 1)
+            let reopened = try Data(contentsOf: destination).split(separator: 0x0A).map {
+                try JSONDecoder().decode(JSONValue.self, from: Data($0))
+            }
+            XCTAssertEqual(reopened.compactMap { $0["role"]?.stringValue }, ["user", "assistant"])
+            XCTAssertEqual(reopened.compactMap { $0["text"]?.stringValue }, ["Keep my question", "Final saved answer"])
+            XCTAssertEqual(model.entries.filter { !$0.isReceipt }.map(\.id),
+                           reopened.compactMap { $0["id"]?.stringValue })
+            XCTAssertFalse(FileManager.default.fileExists(atPath: other.library.metadataURL.appendingPathComponent("ai").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: other.library.metadataURL.appendingPathComponent("successful-switch.jsonl").path))
+        }
+    }
+
+    func testCatalogueFailureAfterSuccessfulAnswerUsesReceiptRetry() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let provider = FakeAIService(responses: [.init(text: "Saved answer")], bus: h.app.bus)
+        let destination = h.library.metadataURL.appendingPathComponent("catalogue-failure.jsonl")
+        try FileManager.default.createDirectory(at: h.library.metadataURL, withIntermediateDirectories: true)
+        let service = SaveFailingChatService(provider: provider, destination: destination)
+        h.app.services.ai = service
+        var reads = 0
+        var unavailable = true
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatList, title: "List conversation",
+            summary: "Fail the supplemental catalogue read.", effect: .read)) { _, _ in
+            reads += 1
+            if reads > 1 && unavailable { throw NibError.unavailable("Catalogue") }
+            return ["chats": [], "messages": .array(service.records)]
+        }
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        do {
+            _ = try await h.run(ChatCommand.send, ["prompt": "Question"])
+            XCTFail("The failed presentation save must remain recoverable")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        XCTAssertEqual(model.entries.last?.id, "SAVEANSWER01")
+        XCTAssertTrue(model.canRetry)
+        unavailable = false
+        provider.isConfigured = false
+        _ = try await h.run(ChatCommand.send, ["retry": true])
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.entries.map(\.id), ["SAVEUSER0001", "SAVEANSWER01"])
+        XCTAssertEqual(model.entries.last?.text, "Saved answer")
+        XCTAssertEqual(model.tokenCount, 20)
+        XCTAssertEqual(provider.requests.count, 1)
+        XCTAssertEqual(service.saveAttempts, 1)
+        XCTAssertEqual(try Data(contentsOf: destination).split(separator: 0x0A).count, 2)
+    }
+
+    func testSaveRetryActionPreservesCompletedTextAndEditsWithoutProvider() async throws {
+        for edits in [false, true] {
+            let h = Harness(features: [FeatAIChatFeature.self])
+            let other = Harness()
+            var switchLibraryDuringList = false
+            installProposalEdits(h)
+            let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
+            let calls: [(command: String, params: JSONValue)] = edits
+                ? [("test.proposedEdit", ["ref": .string(ref), "text": "Kept edit"])] : []
+            let provider = FakeAIService(responses: [.init(text: "Completed answer", toolCalls: calls)], bus: h.app.bus)
+            let destination = h.library.metadataURL.appendingPathComponent("retry-fixture.jsonl")
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            let service = SaveFailingChatService(provider: provider, destination: destination)
+            h.app.services.ai = service
+            h.app.commands.register(CommandDescriptor(id: "ai.chat.save", title: "Save conversation",
+                summary: "Retry the file-backed service save.", params: .obj(["chat": .str()], required: ["chat"]),
+                effect: .session)) { p, _ in
+                XCTAssertEqual(p["chat"]?.stringValue, service.response?.chatID)
+                return try JSONValue.from(service.save())
+            }
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatList, title: "List conversation",
+                summary: "Return canonical retained records.", effect: .read)) { _, _ in
+                guard h.app.services.library === h.library else { throw NibError(.conflict, "Wrong library") }
+                if switchLibraryDuringList {
+                    switchLibraryDuringList = false
+                    await Task.yield()
+                    h.app.services.library = other.library
+                }
+                return ["chats": [], "messages": .array(service.records)]
+            }
+            let model = ChatRuntime.get(h.app).model(for: h.session)
+            model.mode = edits ? .edit : .ask
+            do {
+                _ = try await h.run(ChatCommand.send, ["prompt": "Keep my question"])
+                XCTFail("The completed turn must report the blocked save")
+            } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+            let receipt = try XCTUnwrap(model.entries.last)
+            let changed = try h.snapshotAll()
+            XCTAssertEqual(receipt.text, "Completed answer")
+            XCTAssertEqual(receipt.changes.isEmpty, !edits)
+            XCTAssertFalse(receipt.reverted)
+            if edits {
+                XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1,
+                    id: Fixtures.textID).ext?["revision"], "Kept edit")
+            }
+            // Exercise the registered action used by the banner, including the still-blocked case.
+            // First keep the provider configured, then remove it. Neither retry may regenerate.
+            for configured in [true, false] {
+                provider.isConfigured = configured
+                XCTAssertTrue(model.canRetry)
+                XCTAssertEqual(model.canSend, configured)
+                do {
+                    _ = try await h.run(ChatCommand.send, ["retry": true])
+                    XCTFail("Storage is still blocked")
+                } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+                XCTAssertEqual(model.entries.last?.text, receipt.text)
+                XCTAssertEqual(model.entries.last?.group, receipt.group)
+                XCTAssertEqual(model.entries.last?.changes, receipt.changes)
+                XCTAssertEqual(model.entries.last?.tools.map(\.name), receipt.tools.map(\.name))
+                XCTAssertEqual(try h.snapshotAll(), changed)
+                XCTAssertEqual(provider.requests.count, 1)
+            }
+            try FileManager.default.removeItem(at: destination)
+            if edits {
+                // If the agent saves but the supplemental receipt archive fails, the next
+                // Retry must reuse that saved response rather than request another agent save.
+                let chat = try XCTUnwrap(model.chatID)
+                let archive = h.library.metadataURL.appendingPathComponent("ai/presentation")
+                    .appendingPathComponent(chat + "." + h.app.deviceHex + ".jsonl")
+                try FileManager.default.removeItem(at: archive)
+                try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+                do {
+                    _ = try await h.run(ChatCommand.send, ["retry": true])
+                    XCTFail("The receipt archive is still blocked")
+                } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+                XCTAssertEqual(model.entries.last?.text, receipt.text)
+                XCTAssertEqual(model.entries.last?.changes, receipt.changes)
+                XCTAssertEqual(model.tokenCount, 20)
+                try FileManager.default.removeItem(at: archive)
+
+                // The agent has already saved in A, so Retry will use the cached response.
+                // It must reject B both before starting and if the library changes during list.
+                for duringList in [false, true] {
+                    h.app.services.library = duringList ? h.library : other.library
+                    switchLibraryDuringList = duringList
+                    do {
+                        _ = try await h.run(ChatCommand.send, ["retry": true])
+                        XCTFail("A's cached response must never be archived in B")
+                    } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+                    XCTAssertTrue(model.canRetry, "A's recovery must remain available")
+                    XCTAssertEqual(model.entries.last?.group, receipt.group)
+                    XCTAssertEqual(model.entries.last?.text, receipt.text)
+                    XCTAssertEqual(service.saveAttempts, 4)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath:
+                        other.library.metadataURL.appendingPathComponent("ai").path))
+                }
+                h.app.services.library = h.library
+            }
+            let saved = try await h.run(ChatCommand.send, ["retry": true])
+            XCTAssertEqual(saved["text"]?.stringValue, receipt.text)
+            XCTAssertNil(model.error)
+            XCTAssertFalse(model.canRetry)
+            XCTAssertFalse(model.isSavingConversation)
+            XCTAssertEqual(model.tokenCount, 20)
+            XCTAssertEqual(model.entries.map(\.text), ["Keep my question", "Completed answer"])
+            XCTAssertEqual(model.entries.last?.group, receipt.group)
+            XCTAssertEqual(model.entries.last?.changes, receipt.changes)
+            XCTAssertEqual(try h.snapshotAll(), changed)
+            XCTAssertEqual(provider.requests.count, 1)
+            XCTAssertEqual(service.saveAttempts, 4)
+            let reopened = try Data(contentsOf: destination).split(separator: 0x0A).map {
+                try JSONDecoder().decode(JSONValue.self, from: Data($0))
+            }
+            XCTAssertEqual(reopened.compactMap { $0["role"]?.stringValue }, ["user", "assistant"])
+            XCTAssertEqual(reopened.compactMap { $0["text"]?.stringValue }, ["Keep my question", "Completed answer"])
+            XCTAssertEqual(model.entries.map(\.id), reopened.compactMap { $0["id"]?.stringValue })
+        }
+    }
+
+    func testSaveRetryKeepsAcceptedProposalReceiptAndItsUndoGroup() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        installProposalEdits(h)
+        let changes: JSONValue = ["changes": [["command": "test.proposedEdit",
+            "params": ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "text": "Accepted"]]]]
+        let provider = FakeAIService(responses: [.init(text: "Review this change",
+            toolCalls: [(ChatCommand.propose, changes)])], bus: h.app.bus)
+        let destination = h.library.metadataURL.appendingPathComponent("proposal-retry.jsonl")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let service = SaveFailingChatService(provider: provider, destination: destination)
+        h.app.services.ai = service
+        h.app.commands.register(CommandDescriptor(id: "ai.chat.save", title: "Save conversation",
+            summary: "Retry the retained save.", effect: .session)) { _, _ in
+            try JSONValue.from(service.save())
+        }
+        // Reveal canonical IDs only after proposal acceptance, so recovery must survive
+        // reconciliation while a newer assistant receipt is already present.
+        var revealIDs = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.aiChatList, title: "List conversation",
+            summary: "Return canonical records.", effect: .read)) { _, _ in
+            ["chats": [], "messages": .array(revealIDs ? service.records : [])]
+        }
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        let before = try h.snapshotAll()
+        do {
+            _ = try await h.run(ChatCommand.send, ["prompt": "Proofread"])
+            XCTFail("The completed turn must report its failed save")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        let answer = try XCTUnwrap(model.entries.last)
+        XCTAssertEqual(model.proposals.count, 1)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        revealIDs = true
+        _ = try await h.run(ChatCommand.accept)
+        let receipt = try XCTUnwrap(model.entries.last)
+        XCTAssertTrue(receipt.isReceipt)
+        XCTAssertNotEqual(receipt.group, answer.group)
+        XCTAssertEqual(model.entries.first(where: { $0.text == answer.text })?.id, "SAVEANSWER01")
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1,
+            id: Fixtures.textID).ext?["revision"], "Accepted")
+        try FileManager.default.removeItem(at: destination)
+        _ = try await h.run(ChatCommand.send, ["retry": true])
+        let savedReceipt = try XCTUnwrap(model.entries.first(where: { $0.id == receipt.id }))
+        XCTAssertEqual(savedReceipt.group, receipt.group)
+        XCTAssertEqual(savedReceipt.changes, receipt.changes)
+        XCTAssertEqual(savedReceipt.usage.input + savedReceipt.usage.output, 0)
+        let savedAnswer = try XCTUnwrap(model.entries.first(where: { $0.id == "SAVEANSWER01" }))
+        XCTAssertEqual(savedAnswer.group, answer.group)
+        XCTAssertTrue(savedAnswer.changes.isEmpty)
+        XCTAssertEqual(savedAnswer.usage.input + savedAnswer.usage.output, 20)
+        XCTAssertEqual(provider.requests.count, 1)
+        XCTAssertEqual(try Data(contentsOf: destination).split(separator: 0x0A).count, 2)
+        let chat = try XCTUnwrap(model.chatID)
+        let listed = try service.records.map { try $0.decode(StoredChatEntry.self) }
+        let archived = try await ChatArchive.restore(chat: chat, listed: listed, metadata: h.library.metadataURL)
+        XCTAssertEqual(archived.first(where: { $0.id == receipt.id })?.group, receipt.group)
+        _ = try await h.run(ChatCommand.undo, ["message": .string(receipt.id)])
+        XCTAssertEqual(try h.snapshotAll(), before, "Receipt Undo must revert the accepted proposal")
+    }
+
     func testLongStreamParsesEachCompletedTokenOnceAndReusesPageIndex() throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let template = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
@@ -1159,6 +1449,63 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertFalse(model.showsProposalsOnPage)
     }
 
+}
+
+@MainActor
+private final class SaveFailingChatService: AIService {
+    // FeatAIChat depends only on contracts. This fixture models the agent's retained-save
+    // boundary with real file failures; NibAIAgentTests covers the production implementation.
+    let provider: FakeAIService
+    let destination: URL
+    var response: AIResponse?
+    var records: [JSONValue] = []
+    var saveAttempts = 0
+    var streamedText: String?
+    var beforeFinish: (() async -> Void)?
+    var isConfigured: Bool { provider.isConfigured }
+    var supportsVision: Bool { provider.supportsVision }
+
+    init(provider: FakeAIService, destination: URL) {
+        self.provider = provider
+        self.destination = destination
+    }
+
+    func save() throws -> AIResponse {
+        saveAttempts += 1
+        let response = try XCTUnwrap(response)
+        let data = Data((records.map { $0.jsonString() }.joined(separator: "\n") + "\n").utf8)
+        do { try data.write(to: destination, options: .atomic) }
+        catch { throw NibError(.unavailable, "Answer ready; save failed", path: "$.chat.persistence") }
+        return response
+    }
+
+    func stream(_ request: AIRequest) -> AsyncThrowingStream<AIStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task { @MainActor in
+                do {
+                    var result = try await provider.complete(request)
+                    result.usage = AIUsage(input: 12, output: 8)
+                    response = result
+                    records = [
+                        ["id": "SAVEUSER0001", "role": "user", "text": .string(request.messages.last?.text ?? "")],
+                        ["id": "SAVEANSWER01", "role": "assistant", "text": .string(result.text),
+                         "group": result.group.map(JSONValue.string) ?? .null, "changes": try JSONValue.from(result.changes)]
+                    ]
+                    continuation.yield(.text(streamedText ?? result.text))
+                    await beforeFinish?()
+                    continuation.yield(.finished(try save()))
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+        }
+    }
+    func complete(_ request: AIRequest) async throws -> AIResponse { try await provider.complete(request) }
+    func cancel(chatID: String) {}
+    func chats(doc: DocumentID?) -> [AIChatSummary] { [] }
+    func messages(chatID: String) -> [AIMessage] { [] }
+    func deleteChat(_ chatID: String) {}
+    func transcribe(audio: URL, language: String?) async throws -> [TranscriptSegment] { [] }
+    func generateImage(prompt: String) async throws -> Data { Fixtures.pngData }
 }
 
 @MainActor

@@ -86,6 +86,7 @@ final class PluginCanvasTool: CanvasTool {
     let spec: PluginToolSpec
     private var gesture: ToolGesture?
     private var preview: CAShapeLayer?
+    private var generation = UUID()
 
     init(_ spec: PluginToolSpec) {
         self.spec = spec
@@ -96,12 +97,15 @@ final class PluginCanvasTool: CanvasTool {
     var inputMode: CanvasInputMode { spec.input == .tap ? .taps : .samples }
 
     func deactivate(_ host: CanvasHost) {
+        generation = UUID()
         gesture = nil
         clearPreview()
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
         guard spec.input != .tap else { return }
+        generation = UUID()
+        clearPreview()
         gesture = ToolGesture(page: sample.page, start: sample.location)
         drawPreview(host)
     }
@@ -131,12 +135,14 @@ final class PluginCanvasTool: CanvasTool {
     }
 
     func touchesCancelled(host: CanvasHost) {
+        generation = UUID()
         gesture = nil
         clearPreview()
     }
 
     func tap(_ sample: CanvasSample, host: CanvasHost) {
         guard spec.input == .tap else { return }
+        generation = UUID()
         let g = ToolGesture(page: sample.page, start: sample.location)
         guard let params = g.params(for: .tap, doc: host.documentID) else { return }
         run(params, host: host)
@@ -148,6 +154,9 @@ final class PluginCanvasTool: CanvasTool {
         let session = host.session
         let command = spec.command
         let page = gestureParamsPage(params) ?? session.page
+        let completedGeneration = generation
+        let completedPreview = preview
+        preview = nil
         Task { @MainActor [weak self] in
             do {
                 _ = try await app.bus.execute(Invocation(command: command, params: params, principal: .user, session: session))
@@ -155,12 +164,12 @@ final class PluginCanvasTool: CanvasTool {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                 userInfo: ["command": command, "error": NibError.wrap(error)])
             }
-            guard let self = self else { return }
             if let p = page {
-                host.afterNextRender(page: p) { [weak self] in self?.clearPreview() }
+                host.afterNextRender(page: p) { completedPreview?.removeFromSuperlayer() }
             } else {
-                self.clearPreview()
+                completedPreview?.removeFromSuperlayer()
             }
+            guard let self = self, self.generation == completedGeneration else { return }
             host.finishToolUse(self)
         }
     }

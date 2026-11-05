@@ -23,7 +23,7 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(NibAIAgentFeature.id, "aiagent")
         let h = Harness(features: [NibAIAgentFeature.self])
         XCTAssertTrue(h.app.services.ai is AgentService)
-        for id in ["ai.ask", "ai.chat.list", "ai.chat.rename", "ai.chat.delete", "ai.chat.feedback"] {
+        for id in ["ai.ask", "ai.chat.list", "ai.chat.save", "ai.chat.rename", "ai.chat.delete", "ai.chat.feedback"] {
             XCTAssertEqual(h.app.commands.descriptor(id)?.owner, "aiagent", id)
         }
         let ask = try XCTUnwrap(h.app.commands.descriptor("ai.ask"))
@@ -76,7 +76,441 @@ final class NibAIAgentTests: XCTestCase {
 
     // MARK: Conversations
 
-    /// Acceptance: chat files written by two devices merge by message id.
+    func testHistoryCommandRejectsLibrarySwitchDuringEitherLoad() async throws {
+        for selectedStage in [false, true] {
+            let (h, agent) = AgentFixture.make(P(events: []))
+            let other = Harness(features: [])
+            let original = agent.chatStore
+            original.ensureChat("PRIVATECHAT", title: "Private title", doc: nil)
+            original.append([original.makeMessage(role: "user", text: "Private question")], chat: "PRIVATECHAT")
+            XCTAssertNil(original.flush())
+            var entered = false
+            var release = false
+            original.beforeHistoryRead = { chat in
+                guard (chat != nil) == selectedStage else { return }
+                entered = true
+                for _ in 0..<1000 where !release { try? await Task.sleep(nanoseconds: 1_000_000) }
+            }
+            defer { original.beforeHistoryRead = nil }
+            let task = Task { try await h.run("ai.chat.list", ["all": true, "chat": "PRIVATECHAT"]) }
+            for _ in 0..<500 where !entered { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertTrue(entered, "The requested history stage must suspend")
+            h.app.services.library = other.library
+            release = true
+            do {
+                _ = try await task.value
+                XCTFail("No summary or message from the old library may be delivered")
+            } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+            let fresh = try await h.run("ai.chat.list", ["all": true])
+            XCTAssertEqual(fresh["chats"]?.arrayValue?.count, 0)
+        }
+    }
+
+    func testHistoryExcludesDocumentLockedDuringSelectedChatLoad() async throws {
+        for principal in [Principal.ai("READER"), .bridge("READER")] {
+            let (h, agent) = AgentFixture.make(P(events: []))
+            let original = agent.chatStore
+            original.ensureChat("PUBLICCHAT", title: "Public title", doc: nil)
+            original.ensureChat("PRIVATECHAT", title: "Private title", doc: Fixtures.docID)
+            original.append([original.makeMessage(role: "user", text: "Private question")], chat: "PRIVATECHAT")
+            XCTAssertNil(original.flush())
+            var entered = false
+            var release = false
+            original.beforeHistoryRead = { chat in
+                guard chat == "PUBLICCHAT" else { return }
+                entered = true
+                for _ in 0..<1000 where !release { try? await Task.sleep(nanoseconds: 1_000_000) }
+            }
+            defer { original.beforeHistoryRead = nil }
+            let task = Task { try await h.run("ai.chat.list", ["all": true, "chat": "PUBLICCHAT"], as: principal) }
+            for _ in 0..<500 where !entered { try await Task.sleep(nanoseconds: 1_000_000) }
+            XCTAssertTrue(entered, "Selected chat load must suspend after summaries have loaded")
+            h.app.gateway.isLocked = { $0 == Fixtures.docID }
+            release = true
+            let result = try await task.value
+            let output = try result.decode(AIChatList.Output.self)
+            XCTAssertEqual(output.chats.map(\.id), ["PUBLICCHAT"])
+            XCTAssertFalse(result.jsonString().contains("Private title"))
+            XCTAssertFalse(result.jsonString().contains("PRIVATECHAT"))
+        }
+    }
+
+    func testFailedDeletionCommandRetriesUntilTombstoneIsDurable() async throws {
+        let (h, agent) = AgentFixture.make(P(events: []))
+        let chat = "DELETEFAILURE"
+        let original = agent.chatStore
+        original.ensureChat(chat, title: "Delete me", doc: Fixtures.docID)
+        original.append([original.makeMessage(role: "user", text: "Saved question")], chat: chat)
+        XCTAssertNil(original.flush())
+        let directory = h.library.metadataURL.appendingPathComponent("ai")
+        let destination = directory.appendingPathComponent(original.ownFileName(chat))
+        let backup = try Data(contentsOf: destination)
+        try FileManager.default.removeItem(at: destination)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        for _ in 0..<2 {
+            do {
+                _ = try await h.run("ai.chat.delete", ["chat": .string(chat)])
+                XCTFail("Deletion must not succeed before the tombstone is durable")
+            } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        }
+        h.app.gateway.isLocked = { $0 == Fixtures.docID }
+        do {
+            _ = try await h.run("ai.chat.delete", ["chat": .string(chat)], as: .ai("OTHER"))
+            XCTFail("Retry must retain the deleted conversation's lock check")
+        } catch let error as NibError { XCTAssertEqual(error.code, .locked) }
+        try FileManager.default.removeItem(at: destination)
+        try backup.write(to: destination)
+        _ = try await h.run("ai.chat.delete", ["chat": .string(chat)])
+        let fresh = store(directory, device: 0x0B)
+        XCTAssertTrue(fresh.isDeleted(chat))
+        XCTAssertTrue(fresh.messages(chat).isEmpty)
+        XCTAssertTrue(fresh.summaries(doc: nil, all: true).isEmpty)
+    }
+
+    func testRenameAndFeedbackCommandsAwaitDurabilityAndRetryFailures() async throws {
+        for command in ["ai.chat.rename", "ai.chat.feedback"] {
+            let (h, agent) = AgentFixture.make(P(events: []))
+            let chat = "MUTATIONSAVE"
+            let original = agent.chatStore
+            original.ensureChat(chat, title: "Original", doc: nil)
+            original.append([original.makeMessage(role: "assistant", text: "Answer")], chat: chat)
+            XCTAssertNil(original.flush())
+            let directory = h.library.metadataURL.appendingPathComponent("ai")
+            let destination = directory.appendingPathComponent(original.ownFileName(chat))
+            let backup = try Data(contentsOf: destination)
+            try FileManager.default.removeItem(at: destination)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            let params: JSONValue = command == "ai.chat.rename"
+                ? ["chat": .string(chat), "title": "Renamed"]
+                : ["chat": .string(chat), "message": "last", "rating": "up"]
+            do {
+                _ = try await h.run(command, params)
+                XCTFail("Commands must await their queued writes and report persistence failures")
+            } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+            try FileManager.default.removeItem(at: destination)
+            try backup.write(to: destination)
+            _ = try await h.run(command, params)
+            let fresh = store(directory, device: 0x0B)
+            if command == "ai.chat.rename" {
+                XCTAssertEqual(fresh.summaries(doc: nil).first?.title, "Renamed")
+            } else {
+                XCTAssertEqual(fresh.messages(chat).first?.rating, "up")
+            }
+        }
+    }
+
+    func testFailedTurnWriteRecoversThroughSaveCommandWithoutRegeneration() async throws {
+        let provider = P(events: [P.answer("Saved on retry")])
+        let (h, agent) = AgentFixture.make(provider)
+        let chat = "CHATTEST0001"
+        let destination = h.library.metadataURL.appendingPathComponent("ai")
+            .appendingPathComponent(agent.chatStore.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        do {
+            _ = try await agent.complete(AgentFixture.request("Keep my question"))
+            XCTFail("A completed turn must report its persistence failure")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unavailable)
+            XCTAssertEqual(error.path, "$.chat.persistence")
+            XCTAssertNotNil(error.hint)
+        }
+        XCTAssertNotNil(agent.chatStore.flush())
+        // The old chat UI's generation Retry cannot duplicate the completed question/answer.
+        do {
+            _ = try await agent.complete(AgentFixture.request("Keep my question"))
+            XCTFail("Retry must report the still-blocked destination")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        do {
+            _ = try await h.run("ai.chat.save", ["chat": .string(chat)])
+            XCTFail("Save retry must report the still-blocked destination")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        XCTAssertEqual(provider.requests.count, 1)
+        let preview = try await h.app.bus.execute(Invocation(command: "ai.chat.save", params: ["chat": .string(chat)],
+                                                            principal: .user, dryRun: true))
+        XCTAssertEqual(preview.value["text"]?.stringValue, "Saved on retry")
+        XCTAssertNotNil(agent.chatStore.flush(), "A dry run must not acknowledge the blocked save")
+        let other = Harness(features: [])
+        h.app.services.library = other.library
+        do {
+            _ = try await h.run("ai.chat.save", ["chat": .string(chat)])
+            XCTFail("Another library cannot recover this answer")
+        } catch let error as NibError { XCTAssertEqual(error.code, .notFound) }
+        h.app.services.library = h.library
+        h.app.gateway.isLocked = { $0 == Fixtures.docID }
+        do {
+            _ = try await h.run("ai.chat.save", ["chat": .string(chat)], as: .ai("OTHER"))
+            XCTFail("Save recovery must respect document locks")
+        } catch let error as NibError { XCTAssertEqual(error.code, .locked) }
+        let providers = try XCTUnwrap(agent.providerStore as? ScriptedProviderStore)
+        providers.activeID = nil
+        try FileManager.default.removeItem(at: destination)
+        let result = try await h.run("ai.chat.save", ["chat": .string(chat)])
+        let response = try result.decode(AIResponse.self)
+        XCTAssertEqual(response.text, "Saved on retry")
+        XCTAssertEqual(response.chatID, chat)
+        XCTAssertEqual(response.usage.output, 10)
+        XCTAssertEqual(provider.requests.count, 1)
+        XCTAssertNil(agent.chatStore.flush())
+        XCTAssertNil(agent.chatStore.flush())
+        let reopened = store(destination.deletingLastPathComponent(), device: 0x0B)
+        XCTAssertEqual(reopened.messages(chat).map(\.text), ["Keep my question", "Saved on retry"])
+        let records = ChatStore.decodeLines(try Data(contentsOf: destination)).records
+        XCTAssertEqual(records.count, 3)
+    }
+
+    func testDeletingChatClearsOnlyItsLibraryPendingSaveThroughBothEntrypoints() async throws {
+        for command in [false, true] {
+            let provider = P(events: [P.answer("Unsaved A"), P.answer("Unsaved B")])
+            let (h, agent) = AgentFixture.make(provider)
+            let other = Harness()
+            let chat = "CHATTEST0001"
+            let original = agent.chatStore
+            var destinations: [URL] = []
+            for library in [h.library, other.library] {
+                h.app.services.library = library
+                let destination = library.metadataURL.appendingPathComponent("ai")
+                    .appendingPathComponent(agent.chatStore.ownFileName(chat))
+                destinations.append(destination)
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                do {
+                    _ = try await agent.complete(AgentFixture.request("Question"))
+                    XCTFail("Saving must fail")
+                } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+                XCTAssertNotNil(agent.pendingSaves[ObjectIdentifier(agent.chatStore)]?[chat])
+            }
+            let otherStore = agent.chatStore
+            h.app.services.library = h.library
+            if command {
+                do {
+                    _ = try await h.run("ai.chat.delete", ["chat": .string(chat)])
+                    XCTFail("The tombstone is still blocked")
+                } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+            } else { agent.deleteChat(chat) }
+            XCTAssertNil(agent.pendingSaves[ObjectIdentifier(original)]?[chat])
+            XCTAssertNotNil(agent.pendingSaves[ObjectIdentifier(otherStore)]?[chat])
+            try FileManager.default.removeItem(at: destinations[0])
+            let failure = await original.flushAsync()
+            XCTAssertNil(failure)
+            let fresh = store(destinations[0].deletingLastPathComponent(), device: 0x0B)
+            XCTAssertTrue(fresh.isDeleted(chat))
+            XCTAssertTrue(fresh.messages(chat).isEmpty)
+            XCTAssertEqual(provider.requests.count, 2)
+        }
+    }
+
+    func testDeletedInFlightTurnDoesNotReinstallPendingSave() async throws {
+        let provider = P(events: [P.answer("Cancelled answer")])
+        let (h, agent) = AgentFixture.make(provider)
+        let chat = "CHATTEST0001"
+        let original = agent.chatStore
+        let destination = h.library.metadataURL.appendingPathComponent("ai")
+            .appendingPathComponent(original.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        provider.beforeEvents = { agent.deleteChat(chat) }
+        _ = try await agent.complete(AgentFixture.request("Delete while answering"))
+        XCTAssertTrue(original.isDeleted(chat))
+        XCTAssertNil(agent.pendingSaves[ObjectIdentifier(original)]?[chat])
+        try FileManager.default.removeItem(at: destination)
+        let failure = await original.flushAsync()
+        XCTAssertNil(failure)
+        XCTAssertTrue(store(destination.deletingLastPathComponent(), device: 0x0B).isDeleted(chat))
+    }
+
+    func testPendingAnswerRecoversThroughCompleteAndStreamWithoutRegeneration() async throws {
+        for streaming in [false, true] {
+            for flushedElsewhere in [false, true] {
+                let provider = P(events: [P.answer("Retained answer")])
+                let (h, agent) = AgentFixture.make(provider)
+                let chat = "CHATTEST0001"
+                let destination = h.library.metadataURL.appendingPathComponent("ai")
+                    .appendingPathComponent(agent.chatStore.ownFileName(chat))
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                let request = AgentFixture.request("Keep my question")
+                do {
+                    _ = try await agent.complete(request)
+                    XCTFail("Blocked write must fail")
+                } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+                XCTAssertEqual(agent.messages(chatID: chat).map(\.text), ["Keep my question", "Retained answer"])
+                try FileManager.default.removeItem(at: destination)
+                if flushedElsewhere { XCTAssertNil(agent.chatStore.flush()) }
+                // Save recovery must work even if the original provider is no longer configured.
+                let providers = try XCTUnwrap(agent.providerStore as? ScriptedProviderStore)
+                providers.activeID = nil
+                var receipt: AIResponse?
+                if streaming {
+                    for try await event in agent.stream(request) {
+                        if case .finished(let response) = event { receipt = response }
+                        if case .failed(let error) = event { XCTFail(error.description) }
+                    }
+                } else { receipt = try await agent.complete(request) }
+                XCTAssertEqual(receipt?.text, "Retained answer")
+                XCTAssertEqual(receipt?.chatID, chat)
+                XCTAssertEqual(receipt?.usage.output, 10)
+                XCTAssertEqual(provider.requests.count, 1)
+                let reopened = store(destination.deletingLastPathComponent(), device: 0x0B)
+                XCTAssertEqual(reopened.messages(chat).map(\.text), ["Keep my question", "Retained answer"])
+                XCTAssertEqual(ChatStore.decodeLines(try Data(contentsOf: destination)).records.count, 3)
+                providers.activeID = provider.config.id
+                _ = try await agent.complete(AgentFixture.request("A new question"))
+                XCTAssertEqual(provider.requests.count, 2, "Recovery must clear the pending entry")
+            }
+        }
+    }
+
+    func testNewPromptFlushesPendingAnswerThenContinuesNormally() async throws {
+        let provider = P(events: [P.answer("First answer"), P.answer("Second answer")])
+        let (h, agent) = AgentFixture.make(provider)
+        let chat = "CHATTEST0001"
+        let destination = h.library.metadataURL.appendingPathComponent("ai")
+            .appendingPathComponent(agent.chatStore.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        do {
+            _ = try await agent.complete(AgentFixture.request("First question"))
+            XCTFail("Blocked write must fail")
+        } catch let error as NibError { XCTAssertEqual(error.path, "$.chat.persistence") }
+        try FileManager.default.removeItem(at: destination)
+        let response = try await agent.complete(AgentFixture.request("Second question"))
+        XCTAssertEqual(response.text, "Second answer")
+        XCTAssertEqual(provider.requests.count, 2)
+        let reopened = store(destination.deletingLastPathComponent(), device: 0x0B)
+        XCTAssertEqual(reopened.messages(chat).map(\.text), ["First question", "First answer", "Second question", "Second answer"])
+    }
+
+    func testSaveFailureDoesNotMaskProviderFailureOrSuccessfulCancellation() async throws {
+        for cancelled in [false, true] {
+            let provider = P(events: [P.answer("Unused")])
+            let expected = NibError(.timeout, "Provider timed out")
+            if cancelled { provider.beforeEvents = { throw CancellationError() } }
+            else { provider.failures[0] = expected }
+            let (h, agent) = AgentFixture.make(provider)
+            let destination = h.library.metadataURL.appendingPathComponent("ai")
+                .appendingPathComponent(agent.chatStore.ownFileName("CHATTEST0001"))
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            var finished: [NibEvent] = []
+            let token = h.app.events.subscribe { if $0.type == NibEventType.aiTurnFinished { finished.append($0) } }
+            defer { token.cancel() }
+            do {
+                _ = try await agent.complete(AgentFixture.request("Question"))
+                XCTAssertTrue(cancelled, "Provider failure must still throw")
+            } catch let error as NibError {
+                XCTAssertFalse(cancelled, "Cancellation should retain its successful receipt")
+                XCTAssertEqual(error, expected)
+            }
+            XCTAssertEqual(finished.count, 1)
+            XCTAssertNotNil(finished.first?.payload?["persistenceError"])
+            if cancelled {
+                XCTAssertEqual(finished.first?.payload?["recovery"]?["command"], "ai.chat.save")
+            } else {
+                XCTAssertNil(finished.first?.payload?["recovery"], "There is no completed answer to recover")
+                do {
+                    _ = try await h.run("ai.chat.save", ["chat": "CHATTEST0001"])
+                    XCTFail("A provider failure must not install a pending answer")
+                } catch let error as NibError { XCTAssertEqual(error.code, .notFound) }
+                try FileManager.default.removeItem(at: destination)
+                _ = try await agent.complete(AgentFixture.request("Question"))
+                XCTAssertEqual(provider.requests.count, 2, "Provider failure must allow regeneration")
+            }
+        }
+    }
+
+    func testHistoryIndexDoesNotRetainBodiesAndSelectionUsesABoundedCache() async throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = store(dir, device: 0x0A)
+        let ids = (0..<20).map { "HISTORY\($0)" }
+        for chat in ids {
+            writer.ensureChat(chat, title: chat, doc: Fixtures.docID)
+            let records = (0..<12).map { _ in writer.makeMessage(role: "user", text: String(repeating: "x", count: 1_024)) }
+            writer.append(records, chat: chat)
+        }
+        XCTAssertNil(writer.flush())
+        let coldSelection = store(dir, device: 0x0C)
+        let coldState = await coldSelection.stateAsync(ids[0])
+        XCTAssertEqual(coldState?.messages.count, 12)
+        XCTAssertEqual(coldSelection.cachedChatIDs, Set([ids[0]]))
+        XCTAssertEqual(coldSelection.messageCount(ids[1]), 0, "A cold selection must not decode other chats")
+        let reader = store(dir, device: 0x0B)
+        let summaries = await reader.summariesAsync(doc: Fixtures.docID)
+        XCTAssertEqual(Set(summaries.map(\.id)), Set(ids))
+        XCTAssertTrue(reader.cachedChatIDs.isEmpty, "Listing must retain summary metadata only")
+        for chat in ids { XCTAssertEqual(reader.messageCount(chat), 12) }
+        let selected = await reader.stateAsync(ids[0])
+        XCTAssertEqual(selected?.messages.count, 12)
+        XCTAssertEqual(reader.cachedChatIDs, Set([ids[0]]), "Only the selected chat enters the body cache")
+        for chat in ids {
+            let state = await reader.stateAsync(chat)
+            XCTAssertEqual(state?.messages.count, 12)
+            XCTAssertTrue(reader.cachedChatIDs.contains(chat))
+            XCTAssertLessThanOrEqual(reader.cachedChatIDs.count, ChatStore.messageCacheLimit)
+        }
+        // Synchronous AIService clients use the same index/cache and still return complete data.
+        XCTAssertEqual(reader.summaries(doc: Fixtures.docID).count, ids.count)
+        XCTAssertEqual(reader.messages(ids[0]).count, 12)
+        XCTAssertLessThanOrEqual(reader.cachedChatIDs.count, ChatStore.messageCacheLimit)
+    }
+
+    func testHistoryEvictionKeepsFailedWritesAndMergesRemoteRatings() async throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = store(dir, device: 0x0A)
+        let blocked = dir.appendingPathComponent(writer.ownFileName("UNSAVED"))
+        try FileManager.default.createDirectory(at: blocked, withIntermediateDirectories: true)
+        writer.append([writer.makeMessage(role: "user", text: "Keep until durable")], chat: "UNSAVED")
+        XCTAssertNotNil(writer.flush())
+        for i in 0..<10 {
+            writer.append([writer.makeMessage(role: "assistant", text: "Answer")], chat: "CACHE\(i)")
+        }
+        _ = await writer.summariesAsync(doc: nil)
+        XCTAssertTrue(writer.cachedChatIDs.contains("UNSAVED"))
+        XCTAssertEqual(writer.messages("UNSAVED").first?.text, "Keep until durable")
+        try FileManager.default.removeItem(at: blocked)
+        XCTAssertNil(writer.flush())
+        XCTAssertLessThanOrEqual(writer.cachedChatIDs.count, ChatStore.messageCacheLimit)
+        let remote = store(dir, device: 0x0B)
+        XCTAssertEqual(remote.messages("UNSAVED").first?.text, "Keep until durable")
+        try remote.rate("CACHE0", message: "last", rating: "up")
+        XCTAssertNil(remote.flush())
+        let reloaded = await writer.stateAsync("CACHE0")
+        XCTAssertEqual(reloaded?.messages.first?.rating, "up")
+        XCTAssertEqual(writer.messageCount("CACHE0"), 1)
+    }
+
+    func testHistoryIndexKeepsOwnerAndDeletionWhileMetadataFileIsUnavailable() async throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = store(dir, device: 0x0A)
+        let b = store(dir, device: 0x0B)
+        let chat = "INDEXOWNER"
+        a.ensureChat(chat, title: "Private", doc: Fixtures.docID)
+        XCTAssertNil(a.flush())
+        b.append([b.makeMessage(role: "assistant", text: "Private answer")], chat: chat)
+        XCTAssertNil(b.flush())
+        let reader = store(dir, device: 0x0C)
+        let indexed = await reader.summariesAsync(doc: Fixtures.docID)
+        XCTAssertEqual(indexed.map(\.id), [chat])
+        XCTAssertTrue(reader.cachedChatIDs.isEmpty)
+
+        let file = dir.appendingPathComponent(a.ownFileName(chat))
+        let metadata = try Data(contentsOf: file)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        let selected = await reader.stateAsync(chat)
+        XCTAssertEqual(selected?.meta?.doc, Fixtures.docID.raw, "Eviction must not forget a known owner")
+        try FileManager.default.removeItem(at: file)
+        try metadata.write(to: file)
+        try a.delete(chat)
+        XCTAssertNil(a.flush())
+
+        let deletedReader = store(dir, device: 0x0D)
+        let deleted = await deletedReader.summariesAsync(doc: nil, all: true)
+        XCTAssertTrue(deleted.isEmpty)
+        XCTAssertTrue(deletedReader.cachedChatIDs.isEmpty)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        let stillDeleted = await deletedReader.summariesAsync(doc: nil, all: true)
+        XCTAssertTrue(stillDeleted.isEmpty, "An unavailable tombstone must not resurrect another device's messages")
+    }
+
     func testChatFilesFromTwoDevicesMergeByMessageID() throws {
         let dir = tempFolder()
         let a = store(dir, device: 0x0A)
@@ -144,26 +578,132 @@ final class NibAIAgentTests: XCTestCase {
 
     func testConflictCopySurvivesFailedMergeWriteAndRetries() throws {
         let dir = tempFolder()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
         let a = store(dir, device: 0x0A)
         let chat = "CHATCONFLICT"
         let record = a.makeMessage(role: "user", text: "Only in the conflict copy")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
         try ChatStore.encodeLines([record]).write(to: conflict)
-        // A directory at the destination makes the atomic file replacement fail reliably.
-        let own = dir.appendingPathComponent(a.ownFileName(chat))
-        try FileManager.default.createDirectory(at: own, withIntermediateDirectories: true)
+        // Keep every source readable while preventing atomic replacement in the folder.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
         a.refresh(force: true)
-        a.flush()
+        XCTAssertNotNil(a.flush())
         XCTAssertTrue(FileManager.default.fileExists(atPath: conflict.path))
         XCTAssertEqual(a.messages(chat).map(\.id), [record.id])
         a.flush()
-        try FileManager.default.removeItem(at: own)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         a.refresh(force: true)
         a.flush()
         XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
         XCTAssertEqual(store(dir, device: 0x0B).messages(chat).map(\.id), [record.id])
+    }
+
+    func testChangedConflictSurvivesRetainedFlushWithoutRescanning() throws {
+        let dir = tempFolder()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let writer = store(dir, device: 0x0A)
+        let chat = "CHATMERGELATE"
+        let first = writer.makeMessage(role: "user", text: "Captured before storage failed")
+        let second = writer.makeMessage(role: "assistant", text: "Synced while storage was blocked")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
+        try ChatStore.encodeLines([first]).write(to: conflict)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        writer.refresh(force: true)
+        XCTAssertNotNil(writer.flush())
+        let updated = ChatStore.encodeLines([first, second])
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        try updated.write(to: conflict, options: .atomic)
+        // Deliberately no refresh/messages/state call between sync and recovery.
+        XCTAssertNil(writer.flush())
+        XCTAssertEqual(try Data(contentsOf: conflict), updated)
+        let reopened = store(dir, device: 0x0B)
+        XCTAssertEqual(reopened.messages(chat).map(\.id), [first.id, second.id])
+        XCTAssertNil(reopened.flush())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+        XCTAssertEqual(store(dir, device: 0x0C).messages(chat).map(\.id), [first.id, second.id])
+    }
+
+    func testRepeatedConflictScansKeepOnePendingMergePerSnapshot() throws {
+        let dir = tempFolder()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let writer = store(dir, device: 0x0A)
+        let chat = "CHATMERGEQUEUE"
+        let first = writer.makeMessage(role: "user", text: "First conflict record")
+        let second = writer.makeMessage(role: "assistant", text: "Later conflict record")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
+        try ChatStore.encodeLines([first]).write(to: conflict)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        for _ in 0..<10 {
+            writer.refresh(force: true)
+            XCTAssertNotNil(writer.flush())
+            XCTAssertEqual(writer.pendingWriteCount, 1, "An unchanged blocked merge must not accumulate snapshots")
+        }
+        // A newer synced copy must still be queued, even while the older snapshot is blocked.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        try ChatStore.encodeLines([first, second]).write(to: conflict)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        for _ in 0..<10 {
+            writer.refresh(force: true)
+            XCTAssertEqual(writer.pendingWriteCount, 2)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        XCTAssertNil(writer.flush())
+        XCTAssertEqual(writer.pendingWriteCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+        XCTAssertEqual(store(dir, device: 0x0B).messages(chat).map(\.id), [first.id, second.id])
+
+        // Successful completion releases the deduplication key for a later sync conflict.
+        try ChatStore.encodeLines([first, second]).write(to: conflict)
+        writer.refresh(force: true)
+        XCTAssertNil(writer.flush())
+        XCTAssertEqual(writer.pendingWriteCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+    }
+
+    func testUnreadableDeviceFileDefersConflictMergeWithoutLosingRecords() throws {
+        for sourceDevice in ["0000000a", "0000000b"] {
+            let dir = tempFolder()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let writer = store(dir, device: 0x0A)
+            let chat = "CHATUNREADDEVICE"
+            let original = writer.makeMessage(role: "user", text: "Only in the device file")
+            let extra = writer.makeMessage(role: "assistant", text: "Only in the conflict copy")
+            let source = dir.appendingPathComponent("\(chat).\(sourceDevice).jsonl")
+            let backup = ChatStore.encodeLines([original])
+            // A directory stands in for a temporarily unreadable device file; this store has
+            // never cached its records, just like a chat evicted from the bounded body cache.
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+            let conflict = dir.appendingPathComponent("\(chat).0000000a 2.jsonl")
+            let conflictData = ChatStore.encodeLines([extra])
+            try conflictData.write(to: conflict)
+            writer.refresh(force: true)
+            XCTAssertEqual(writer.pendingWriteCount, 0, "An incomplete snapshot must never be queued")
+            XCTAssertNil(writer.flush())
+            XCTAssertEqual(try Data(contentsOf: conflict), conflictData)
+            try FileManager.default.removeItem(at: source)
+            try backup.write(to: source)
+            // Restoring access must not let a retained incomplete job overwrite the source.
+            XCTAssertNil(writer.flush())
+            XCTAssertEqual(try Data(contentsOf: source), backup)
+            writer.refresh(force: true)
+            XCTAssertNil(writer.flush())
+            XCTAssertFalse(FileManager.default.fileExists(atPath: conflict.path))
+            let reopened = store(dir, device: 0x0C)
+            XCTAssertEqual(reopened.messages(chat).map(\.id), [original.id, extra.id])
+        }
     }
 
     func testUnreadableConflictCopyIsRetried() throws {
@@ -496,7 +1036,7 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertTrue(staticPart.contains("Cite sources as markdown links to nib://open/<doc>/<page>"))
         XCTAssertTrue(staticPart.contains("Reply in the user's language."))
         XCTAssertTrue(staticPart.contains("- edit (2): edit.redo, edit.undo"))
-        XCTAssertTrue(staticPart.contains("- ai (5): ai.ask, ai.chat.delete, ai.chat.feedback"))
+        XCTAssertTrue(staticPart.contains("- ai (6): ai.ask, ai.chat.delete, ai.chat.feedback"))
         XCTAssertTrue(staticPart.contains("- Prefer dev.nib.cards.fromSelection for flashcards."))
         XCTAssertFalse(staticPart.contains("plugin.install"), "the plugin-authoring rule needs plugin.install")
         XCTAssertEqual(staticPart, SystemPrompt.staticPart(registry: h.app.commands, exposure: .ai,

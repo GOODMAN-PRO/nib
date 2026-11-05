@@ -53,6 +53,44 @@ final class NibAIProvidersTests: XCTestCase {
 
     // MARK: Store
 
+    func testFailedKeyMutationRestoresPreviousCredential() throws {
+        let secrets = FailingProviderSecrets()
+        let store = ProviderStore(fileURL: nil, secrets: secrets)
+        let original = anthropicConfig()
+        try store.save(original, apiKey: "original-key")
+        for replacement in ["replacement-key", ""] {
+            secrets.failNext = true
+            XCTAssertThrowsError(try store.save(original, apiKey: replacement))
+            XCTAssertEqual(secrets.get(service: AIProviderConfig.keychainService, account: original.keychainAccount),
+                           Data("original-key".utf8))
+            XCTAssertEqual(store.configs, [original])
+        }
+    }
+
+    func testFailedSaveRestoresExistingKeyForReplacementAndRemoval() throws {
+        for replacement in ["replacement-key", ""] {
+            let url = tempFile()
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let secrets = InMemorySecretStore()
+            let store = ProviderStore(fileURL: url, secrets: secrets)
+            let original = anthropicConfig()
+            try store.save(original, apiKey: "original-key")
+            let saved = try Data(contentsOf: url)
+            try FileManager.default.removeItem(at: url)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+            var changed = original
+            changed.baseURL = URL(string: "https://another.example")!
+            XCTAssertThrowsError(try store.save(changed, apiKey: replacement))
+            XCTAssertEqual(store.configs, [original])
+            XCTAssertEqual(store.activeID, original.id)
+            XCTAssertEqual(secrets.get(service: AIProviderConfig.keychainService, account: original.keychainAccount),
+                           Data("original-key".utf8))
+            try FileManager.default.removeItem(at: url)
+            try saved.write(to: url)
+            XCTAssertEqual(ProviderStore(fileURL: url, secrets: secrets).configs, [original])
+        }
+    }
+
     func testFailedDeletePreservesProviderActiveIDAndKeyAndCanRetry() throws {
         let url = tempFile()
         let secrets = InMemorySecretStore()
@@ -419,6 +457,68 @@ final class NibAIProvidersTests: XCTestCase {
         XCTAssertEqual(StopReasons.normalized("pause_turn", sawToolCalls: false), "pause_turn")
     }
 
+    func testRecoveryDurationsUseLocaleAndRejectMalformedRetryAfter() {
+        let french = Locale(identifier: "fr_FR")
+        XCTAssertTrue(ProviderErrors.duration(12, locale: french).contains("secondes"))
+        XCTAssertEqual(ProviderErrors.retryDuration("12", locale: french), ProviderErrors.duration(12, locale: french))
+        XCTAssertNil(ProviderErrors.retryDuration("12 seconds of server text", locale: french))
+        XCTAssertNil(ProviderErrors.retryDuration("nan", locale: french))
+        XCTAssertNil(ProviderErrors.retryDuration("-1", locale: french))
+    }
+
+    func testHTTPAndTimeoutRecoveryUseFrenchMessagesHintsAndDurations() throws {
+        // Exercise the actual error constructors with an isolated language bundle. No global
+        // AppleLanguages mutation or dependency on the host application's catalogue is needed.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".bundle")
+        let language = root.appendingPathComponent("fr.lproj")
+        try FileManager.default.createDirectory(at: language, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let strings = #"""
+        "%@ answered HTTP %lld." = "%@ a répondu HTTP %lld.";
+        "check the API key in Settings › AI" = "vérifiez la clé API dans Réglages › IA";
+        "rate limited — retry later" = "limite atteinte — réessayez plus tard";
+        "Retry after %@." = "Réessayez après %@.";
+        "%@ did not answer within %@." = "%@ n’a pas répondu dans un délai de %@.";
+        "check the network and the base URL, then retry" = "vérifiez le réseau et l’URL de base, puis réessayez";
+        "the model may still be loading — retry, or check that the server is running" = "le modèle charge peut-être encore — réessayez ou vérifiez le serveur";
+        """#
+        try strings.write(to: language.appendingPathComponent("Localizable.strings"), atomically: true, encoding: .utf8)
+        let info: [String: Any] = ["CFBundleIdentifier": "app.nib.tests.french-errors",
+                                   "CFBundlePackageType": "BNDL", "CFBundleDevelopmentRegion": "fr",
+                                   "CFBundleLocalizations": ["fr"]]
+        let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try plist.write(to: root.appendingPathComponent("Info.plist"))
+        let bundle = try XCTUnwrap(Bundle(url: root))
+        let locale = Locale(identifier: "fr_FR")
+        let config = AIProviderConfig(name: "P", kind: .openAICompatible,
+                                      baseURL: URL(string: "https://api.example.com/v1")!, model: "m")
+        let ctx = ProviderCallContext(call: .chat, config: config, timeout: 12)
+        let waited = ProviderErrors.duration(12, locale: locale)
+        XCTAssertTrue(waited.contains("secondes"))
+        let diagnostic = "Server diagnostic: invalid key / quota exhausted"
+        let body = Data("{\"error\":{\"message\":\"\(diagnostic)\"}}".utf8)
+        let unauthorized = ProviderErrors.http(HTTPStatusError(status: 401, body: body, retryAfter: nil), ctx,
+                                                bundle: bundle, locale: locale)
+        XCTAssertEqual(unauthorized.code, .permissionDenied)
+        XCTAssertEqual(unauthorized.message, "P a répondu HTTP 401.\n" + diagnostic)
+        XCTAssertEqual(unauthorized.hint, "vérifiez la clé API dans Réglages › IA")
+        let limited = ProviderErrors.http(HTTPStatusError(status: 429, body: body, retryAfter: "12"), ctx,
+                                          bundle: bundle, locale: locale)
+        XCTAssertEqual(limited.code, .unavailable)
+        XCTAssertEqual(limited.message, "P a répondu HTTP 429.\n" + diagnostic + "\nRéessayez après \(waited).")
+        XCTAssertEqual(limited.hint, "limite atteinte — réessayez plus tard")
+        let timeout = ProviderErrors.transport(URLError(.timedOut), ctx, bundle: bundle, locale: locale)
+        XCTAssertEqual(timeout.code, .timeout)
+        XCTAssertEqual(timeout.message, "P n’a pas répondu dans un délai de \(waited).")
+        XCTAssertEqual(timeout.hint, "vérifiez le réseau et l’URL de base, puis réessayez")
+        var localConfig = config
+        localConfig.baseURL = URL(string: "http://localhost:11434/v1")!
+        let localContext = ProviderCallContext(call: .chat, config: localConfig, timeout: 12)
+        let localTimeout = ProviderErrors.transport(URLError(.timedOut), localContext, bundle: bundle, locale: locale)
+        XCTAssertEqual(localTimeout.message, timeout.message)
+        XCTAssertEqual(localTimeout.hint, "le modèle charge peut-être encore — réessayez ou vérifiez le serveur")
+    }
+
     func testErrorBodiesMapToNibErrorsWithHints() {
         let config = AIProviderConfig(name: "P", kind: .openAICompatible, baseURL: URL(string: "https://api.openai.com/v1")!, model: "m")
         let ctx = ProviderCallContext(call: .chat, config: config, timeout: 120)
@@ -445,4 +545,20 @@ final class NibAIProvidersTests: XCTestCase {
         XCTAssertEqual(ProviderErrors.transport(URLError(.cannotConnectToHost), ctx).code, .unavailable)
         XCTAssertEqual(ProviderErrors.map(CancellationError(), ctx).code, .userDenied)
     }
+}
+
+private final class FailingProviderSecrets: SecretStore {
+    private let memory = InMemorySecretStore()
+    var failNext = false
+
+    func set(_ data: Data?, service: String, account: String) -> Bool {
+        if failNext {
+            failNext = false
+            _ = memory.set(nil, service: service, account: account)
+            return false
+        }
+        return memory.set(data, service: service, account: account)
+    }
+
+    func get(service: String, account: String) -> Data? { memory.get(service: service, account: account) }
 }
