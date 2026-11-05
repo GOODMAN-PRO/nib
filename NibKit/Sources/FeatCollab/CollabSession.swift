@@ -2782,13 +2782,30 @@ final class CollabService: ObservableObject {
             await runRejoin([0] + timing.retryDelays)
         case .host:
             guard away >= timing.suspendThreshold || (s.transport.peers.isEmpty && s.hasAdmittedGuests) else { return }
+            rejoinTask?.cancel()
+            let task = Task<Void, Never> { [weak self] in
+                await self?.runRehost(s, delays: [0] + (self?.timing.retryDelays ?? []))
+            }
+            rejoinTask = task
+            await task.value
+            if rejoinTask == task { rejoinTask = nil }
+        }
+    }
+
+    private func runRehost(_ s: CollabSession, delays: [TimeInterval]) async {
+        var lastError: NibError?
+        for delay in delays {
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            guard !Task.isCancelled, session === s, !s.isClosed else { return }
             do {
                 try await s.rehost()
+                return
             } catch {
-                let e = NibError.wrap(error)
-                s.end(reason: String(localized: "The live session couldn't restart: \(e.message)"), notify: false)
+                lastError = NibError.wrap(error)
             }
         }
+        guard !Task.isCancelled, session === s, !s.isClosed, let error = lastError else { return }
+        s.end(reason: String(localized: "The live session couldn't restart: \(error.message)"), notify: false)
     }
 
     func scheduleRejoin() {

@@ -814,6 +814,43 @@ final class FeatCollabTests: XCTestCase {
 
     // MARK: Re-joining
 
+    func testHostResumeRetriesUntilTheNetworkReturns() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        pair.hostService.timing.suspendThreshold = 0
+        pair.hostService.timing.retryDelays = [0, 0]
+        let code = try await pair.share()
+        let original = try XCTUnwrap(pair.hostService.session)
+        transport.hostFailures = 2
+        transport.leave()
+        pair.hostService.didEnterBackground()
+        await pair.hostService.resumeAfterSuspend()
+        XCTAssertEqual(transport.hostAttempts, 4, "initial host plus three resume attempts")
+        XCTAssertTrue(pair.hostService.session === original)
+        XCTAssertFalse(original.isClosed)
+        XCTAssertEqual(original.code, code)
+        try await pair.join(code)
+        XCTAssertEqual(pair.guestService.session?.phase, .active)
+    }
+
+    func testHostResumeEndsOnlyAfterAllRetriesFail() async throws {
+        let pair = CollabPair()
+        let transport = InterruptedCollabTransport(pair.hostTransport)
+        pair.host.app.services.set(transport, for: ServiceKeys.collabMultipeer)
+        pair.hostService.timing.suspendThreshold = 0
+        pair.hostService.timing.retryDelays = [0, 0]
+        _ = try await pair.share()
+        transport.hostFailures = 3
+        transport.leave()
+        pair.hostService.didEnterBackground()
+        await pair.hostService.resumeAfterSuspend()
+        XCTAssertEqual(transport.hostAttempts, 4)
+        XCTAssertNil(pair.hostService.session)
+        XCTAssertNotNil(pair.hostService.state.message)
+        XCTAssertNoThrow(try pair.host.app.workspace.content(Fixtures.docID))
+    }
+
     func testHostSuspendThenGuestsRejoinWithoutApproval() async throws {
         let pair = CollabPair()
         pair.guestService.timing.retryDelays = [0.2, 0.4, 0.8, 1.6, 3.2]
