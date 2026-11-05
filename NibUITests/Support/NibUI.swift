@@ -1709,6 +1709,7 @@ final class NibUI {
             if isKeyboardFocused(field, allowingAttributeFallback: true, in: scope) { return }
             throw Failure.message("Native field cannot receive focus: \(field)")
         }
+        logQA("Stall boundary", "native field focus tap; field=\(field.label)")
         field.tap()
         // Cheap evidence establishes text focus, not the identity of the editor. Exact text
         // postconditions remain with callers; remote editors retain the field-specific fallback.
@@ -1744,6 +1745,7 @@ final class NibUI {
                 // XCUIElement.typeKey cannot produce Escape or Delete either (see hidUsage(forKey:)).
                 try sendHIDKey(usage)
             } else {
+                logQA("Stall boundary", "native typeKey key=\(key) modifiers=\(modifiers.rawValue)")
                 field.typeKey(key == XCUIKeyboardKey.return.rawValue ? "\n" : key, modifierFlags: modifiers)
             }
         }
@@ -1757,6 +1759,7 @@ final class NibUI {
         if value.isEmpty || value == field.placeholderValue { return }
         try deliverNativeKey("a", .command, in: field)
         // Deletion proves the extent of Select All: a partial/absent selection leaves a nonempty value.
+        logQA("Stall boundary", "clearNativeText typeText Delete after Select All; field=\(field.label)")
         field.typeText(XCUIKeyboardKey.delete.rawValue)
         let remainingValue = field.value as? String
         guard let remaining = remainingValue ?? (field.elementType == .textView ? "" : nil) else {

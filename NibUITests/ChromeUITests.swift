@@ -284,10 +284,12 @@ final class ChromeUITests: XCTestCase {
         try open()
         for orientation in [UIDeviceOrientation.portrait, .landscapeLeft] {
             XCUIDevice.shared.orientation = orientation
-            try ui.diagnoseAction("Rotated More", facts: { self.ui.elementFacts(self.query("menu.more").firstMatch, includeOverlaps: true) }) {
-                try tap("menu.more")
+            ui.logQA("Stall boundary", "Rotated More tap orientation=\(orientation.rawValue)")
+            do { try tap("menu.more") }
+            catch {
+                ui.recordDiagnostics("Rotated More failed", facts: ui.elementFacts(ui.app.buttons["menu.more"].firstMatch))
+                throw error
             }
-            defer { ui.recordDiagnostics("Rotated More final", facts: ui.elementFacts(query("menu.more").firstMatch), includeHierarchy: false) }
             try tap("Go to Page…")
             try panel("pages.goToPage"); try ui.dismissSheets()
             try more("Hide Tools")
@@ -910,9 +912,11 @@ final class ChromeUITests: XCTestCase {
     }
 
     // layer.panel/setActive/setVisible/rename
-    private func layers() throws {
+    private func layers(useShortcut: Bool = false) throws {
         try open(); try editing("Layers"); try toggle("Layers", to: true); try closeEditing()
-        try more("Layers"); try panel("layers")
+        if useShortcut { try key("l", [.command, .option]) }
+        else { try more("Layers") }
+        try panel("layers")
     }
     func testLayersSettingMenuAndShortcutReflectFiveLayers() throws {
         try layers()
@@ -967,7 +971,7 @@ final class ChromeUITests: XCTestCase {
         try tap("cmd.panel.close"); try sameContent(before)
     }
     func testRenameLayerKeepsItsContentAndSupportsUndoRedo() throws {
-        try layers(); let before = try ui.state()
+        try layers(useShortcut: true); let before = try ui.state()
         let oldValue = try require("Layer 1").value as? String
         try reachable("Layer 1").press(forDuration: 0.8); try tap("Rename…")
         try replace("Layer name", "Chrome annotations"); try tap("Rename")

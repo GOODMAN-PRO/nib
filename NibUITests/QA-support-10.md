@@ -46,3 +46,13 @@ Confirmed chrome-singles#1 verifier diagnosis: AX frame points were sent directl
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | RulerTwoFingerRotation | Interface touch conversion / Touch path orientation | Which interface and converted screen points were delivered? |
+
+### H6 - unproven stalls remain diagnostic
+
+Confirmed chrome-timeouts#3/#4, create#3 and insert-timeouts-state#1 corrections: sleeping app threads do not identify the animation/overlay or host cause. Removed the entire rotated-More after/final facts read on success (not merely its overlap snapshot). Rename Layer uses the existing Command-Option-L opening route after enabling Layers, avoiding that repeated More traversal; other menu-coverage tests retain their menu route. Round 9b already supplies cheap focus checks. Immediate runner log boundaries now precede focus tap, modified native typeKey, clear's typeText Delete and Insert Finish Editing tap. No HID Delete experiment was made; clearNativeText still has its exact empty-field verification. No speculative stall fix, timeout change or retry. CI thread samples must be correlated with these markers. App layer census/sampling schedule changes are outside this job's allowed paths; existing CI sampling remains the evidence route.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Rename Layer / Create SuggestedTitle / native text callers | Stall boundary (focus / typeKey / Delete) | Which exact XCTest action was about to enter the stall? |
+| Insert CopyTextUsesActualSelectedText | Stall boundary (Finish Editing) | Did the stall begin at the finish tap after paste? |
+| Rotated More | Stall boundary / Rotated More failed | Did the tap fail, without paying post-tap facts on success? |

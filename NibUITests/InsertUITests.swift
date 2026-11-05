@@ -113,7 +113,10 @@ final class InsertUITests: XCTestCase {
         let target = try control(name, scroll: scroll)
         if [.textField, .secureTextField, .textView, .searchField].contains(target.elementType) {
             try ui.focusField(target)
-        } else { target.tap() }
+        } else {
+            if name == "Finish Editing" { ui.logQA("Stall boundary", "Insert Finish Editing tap after native clipboard actions") }
+            target.tap()
+        }
     }
     /// Samples typed controls in the active presentation without retaining mixed-type ordinals during transitions.
     private func visible(_ name: String) -> Bool {

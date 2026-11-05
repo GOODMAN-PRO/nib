@@ -890,6 +890,7 @@ final class CreateUITests: XCTestCase {
                          matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
+        ui.logQA("Stall boundary", "Create replacement field focus tap; field=\(field.label)")
         field.tap()
         try ui.clearNativeText(in: field)
         if !text.isEmpty { field.typeText(text) }
