@@ -98,6 +98,7 @@ final class ZoomWindowController: ObservableObject {
     }
 
     func detach() {
+        writing?.finishToolUse()
         removeOptions()
         commits?.cancel()
         commits = nil
@@ -128,6 +129,7 @@ final class ZoomWindowController: ObservableObject {
             configureWriting()
             scheduleRender()
         } else {
+            writing?.finishToolUse()
             removeOptions()
             renderTask?.cancel()
             // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless,
@@ -166,6 +168,7 @@ final class ZoomWindowController: ObservableObject {
     func paneDisappeared() {
         paneAppearances = max(0, paneAppearances - 1)
         guard paneAppearances == 0 else { return }
+        writing?.finishToolUse()
         removeOptions()
         renderTask?.cancel()
         clearWet()
@@ -1121,12 +1124,26 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
 
     var wetCount: Int { canvas.drawing.strokes.count - pendingRemovals.count }
 
-    func configure(box: Rect, pageSize: PageSize, tool: PKTool, erasing: Bool, policy: PKCanvasViewDrawingPolicy,
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { finishToolUse() }
+    }
+
+    /// PencilKit may omit its end callback when hidden or interrupted by a tool switch. Capture any final stroke
+    /// before clearing deferred wet ink, and release the render gate just as a normal lift does.
+    func finishToolUse() {
+        guard isUsingTool else { return }
+        canvasViewDidEndUsingTool(canvas)
+    }
+
+    func configure(box: Rect, pageSize: PageSize, tool: PKInkingTool, erasing: Bool, policy: PKCanvasViewDrawingPolicy,
                    fingersDraw: Bool, eraserDiameter: CGFloat, showsZone: Bool) {
+        let toolChanged = (canvas.tool as? PKInkingTool) != tool
+        if toolChanged || eraser.isEnabled != erasing || canvas.drawingPolicy != policy { finishToolUse() }
         self.box = box
         self.pageSize = pageSize
         self.eraserDiameter = eraserDiameter
-        canvas.tool = tool
+        if toolChanged { canvas.tool = tool }
         canvas.drawingPolicy = policy
         canvas.drawingGestureRecognizer.isEnabled = !erasing
         eraser.isEnabled = erasing

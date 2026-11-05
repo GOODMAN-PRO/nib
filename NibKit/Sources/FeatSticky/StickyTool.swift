@@ -198,23 +198,45 @@ struct StickyInspector: View {
 
     let app: NibApp
     let session: EditorSession
+    private let sourceTargets: [Target]
+    private let revision: String
     @State private var targets: [Target]
     @State private var custom: Color
     @State private var customApply: Task<Void, Never>?
     /// The last formatting write; the next one waits for it so each reads the text the previous one saved.
     @State private var formatting: Task<Void, Never>?
-    @State private var collapsed: Bool
-    @State private var resolved: Bool
-    @State private var bold: Bool
-    @State private var italic: Bool
-    @State private var underline: Bool
-    @State private var strikethrough: Bool
-    @State private var size: Double
-    @State private var alignment: ParagraphAlignment
+    @State private var controls: Controls
 
-    /// Rebuild local editing state whenever the host supplies a new item revision (including undo and sync).
+    /// Selection changes rebuild the inspector; commits must keep the picker and pending tasks alive.
     static func identity(_ items: [Item]) -> String {
+        items.map { $0.id.raw }.joined(separator: ",")
+    }
+
+    static func revisions(_ items: [Item]) -> String {
         items.map { $0.id.raw + ":" + $0.rev.description }.joined(separator: ",")
+    }
+
+    struct Controls {
+        var collapsed: Bool
+        var resolved: Bool
+        var bold: Bool
+        var italic: Bool
+        var underline: Bool
+        var strikethrough: Bool
+        var size: Double
+        var alignment: ParagraphAlignment
+
+        init(_ notes: [StickyItem]) {
+            func all(_ f: (StickyItem) -> Bool) -> Bool { !notes.isEmpty && notes.allSatisfy(f) }
+            collapsed = all { $0.collapsed }
+            resolved = all { $0.resolved }
+            bold = all { StickyFormat.isOn(.bold, in: $0.text) }
+            italic = all { StickyFormat.isOn(.italic, in: $0.text) }
+            underline = all { StickyFormat.isOn(.underline, in: $0.text) }
+            strikethrough = all { StickyFormat.isOn(.strikethrough, in: $0.text) }
+            size = notes.first.map { StickyFormat.size(of: $0.text) } ?? 15
+            alignment = notes.first.map { StickyFormat.alignment(of: $0.text) } ?? .natural
+        }
     }
 
     init(context ctx: InspectorContext) {
@@ -224,18 +246,12 @@ struct StickyInspector: View {
             guard let s = it.sticky, !it.deleted else { return nil }
             return Target(ref: NodeRef.item(ctx.doc, ctx.page, it.id).description, note: s, locked: it.locked)
         }
-        func all(_ f: (StickyItem) -> Bool) -> Bool { !t.isEmpty && t.allSatisfy { f($0.note) } }
         let first = t.first?.note
+        sourceTargets = t
+        revision = Self.revisions(ctx.items)
         _targets = State(initialValue: t)
         _custom = State(initialValue: Color(uiColor: (first?.color ?? StickyColour.lemon.rgba).uiColor))
-        _collapsed = State(initialValue: all { $0.collapsed })
-        _resolved = State(initialValue: all { $0.resolved })
-        _bold = State(initialValue: all { StickyFormat.isOn(.bold, in: $0.text) })
-        _italic = State(initialValue: all { StickyFormat.isOn(.italic, in: $0.text) })
-        _underline = State(initialValue: all { StickyFormat.isOn(.underline, in: $0.text) })
-        _strikethrough = State(initialValue: all { StickyFormat.isOn(.strikethrough, in: $0.text) })
-        _size = State(initialValue: first.map { StickyFormat.size(of: $0.text) } ?? 15)
-        _alignment = State(initialValue: first.map { StickyFormat.alignment(of: $0.text) } ?? .natural)
+        _controls = State(initialValue: Controls(t.map { $0.note }))
     }
 
     private var colour: RGBA? {
@@ -246,23 +262,30 @@ struct StickyInspector: View {
     private var editable: Bool { targets.contains { !$0.locked } }
 
     var body: some View {
-        if targets.isEmpty {
-            EmptyView()
-        } else {
-            VStack(alignment: .leading, spacing: NibSpacing.l) {
-                colourSection
-                noteSection
-                textSection
+        Group {
+            if targets.isEmpty {
+                EmptyView()
+            } else {
+                VStack(alignment: .leading, spacing: NibSpacing.l) {
+                    colourSection
+                    noteSection
+                    textSection
+                }
+                .onChange(of: custom) { _, new in customChanged(new) }
             }
-            .onChange(of: custom) { _, new in customChanged(new) }
-            .onChange(of: collapsed) { _, new in setCollapsed(new) }
-            .onChange(of: resolved) { _, new in setResolved(new) }
-            .onChange(of: bold) { _, new in format { StickyFormat.setting(.bold, new, in: $0) } }
-            .onChange(of: italic) { _, new in format { StickyFormat.setting(.italic, new, in: $0) } }
-            .onChange(of: underline) { _, new in format { StickyFormat.setting(.underline, new, in: $0) } }
-            .onChange(of: strikethrough) { _, new in format { StickyFormat.setting(.strikethrough, new, in: $0) } }
-            .onChange(of: alignment) { _, new in format { StickyFormat.aligned($0, new) } }
         }
+        .onChange(of: revision) { _, _ in
+            targets = sourceTargets
+            controls = Controls(sourceTargets.map { $0.note })
+        }
+    }
+
+    /// Only user edits write commands. Refreshing controls after undo/sync must not write them back.
+    private func binding<Value>(_ key: WritableKeyPath<Controls, Value>, apply: @escaping (Value) -> Void) -> Binding<Value> {
+        Binding(get: { controls[keyPath: key] }, set: { new in
+            controls[keyPath: key] = new
+            apply(new)
+        })
     }
 
     private var colourSection: some View {
@@ -278,8 +301,8 @@ struct StickyInspector: View {
 
     private var noteSection: some View {
         NibInspectorSection(String(localized: "Note")) {
-            NibToggle(String(localized: "Collapse to icon"), isOn: $collapsed)
-            NibToggle(String(localized: "Resolved"), isOn: $resolved)
+            NibToggle(String(localized: "Collapse to icon"), isOn: binding(\.collapsed, apply: setCollapsed))
+            NibToggle(String(localized: "Resolved"), isOn: binding(\.resolved, apply: setResolved))
             if let author = signature {
                 NibInspectorRow(String(localized: "Signed by"), subtitle: author)
             }
@@ -287,19 +310,28 @@ struct StickyInspector: View {
     }
 
     private var textSection: some View {
-        NibInspectorSection(String(localized: "Text"), value: String(localized: "\(Int(size.rounded())) pt")) {
+        NibInspectorSection(String(localized: "Text"), value: String(localized: "\(Int(controls.size.rounded())) pt")) {
             HStack(spacing: NibSpacing.s) {
                 NibIconButton(.minus, label: String(localized: "Smaller text"), size: .panel) { resize(by: -1) }
-                    .disabled(size <= StickyFormat.sizes.lowerBound)
+                    .disabled(controls.size <= StickyFormat.sizes.lowerBound)
                 NibIconButton(.plus, label: String(localized: "Larger text"), size: .panel) { resize(by: 1) }
-                    .disabled(size >= StickyFormat.sizes.upperBound)
+                    .disabled(controls.size >= StickyFormat.sizes.upperBound)
                 Spacer(minLength: 0)
             }
-            NibToggle(String(localized: "Bold"), isOn: $bold)
-            NibToggle(String(localized: "Italic"), isOn: $italic)
-            NibToggle(String(localized: "Underline"), isOn: $underline)
-            NibToggle(String(localized: "Strikethrough"), isOn: $strikethrough)
-            NibSegmentedControl(selection: $alignment, options: [ParagraphAlignment.left, .center, .right],
+            NibToggle(String(localized: "Bold"), isOn: binding(\.bold) { new in
+                format { StickyFormat.setting(.bold, new, in: $0) }
+            })
+            NibToggle(String(localized: "Italic"), isOn: binding(\.italic) { new in
+                format { StickyFormat.setting(.italic, new, in: $0) }
+            })
+            NibToggle(String(localized: "Underline"), isOn: binding(\.underline) { new in
+                format { StickyFormat.setting(.underline, new, in: $0) }
+            })
+            NibToggle(String(localized: "Strikethrough"), isOn: binding(\.strikethrough) { new in
+                format { StickyFormat.setting(.strikethrough, new, in: $0) }
+            })
+            NibSegmentedControl(selection: binding(\.alignment) { new in format { StickyFormat.aligned($0, new) } },
+                                options: [ParagraphAlignment.left, .center, .right],
                                 title: Self.alignmentTitle)
                 .accessibilityLabel(String(localized: "Alignment"))
         }
@@ -355,7 +387,7 @@ struct StickyInspector: View {
     }
 
     private func resize(by delta: Double) {
-        size = min(max(size + delta, StickyFormat.sizes.lowerBound), StickyFormat.sizes.upperBound)
+        controls.size = min(max(controls.size + delta, StickyFormat.sizes.lowerBound), StickyFormat.sizes.upperBound)
         format { StickyFormat.resized($0, by: delta) }
     }
 

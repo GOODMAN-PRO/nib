@@ -878,8 +878,72 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(view.canvas.drawing.strokes[0].path[0].location, last.path[0].location)
     }
 
+    func testLeavingWindowFinishesToolAndClearsDeferredWetInk() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        let view = ZoomWritingView(frame: window.bounds)
+        window.addSubview(view)
+        view.onStroke = { _ in true }
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(120, 150))])
+        view.canvasViewDrawingDidChange(view.canvas)
+        view.clearWet()
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 1)
+        view.removeFromSuperview()
+        XCTAssertFalse(view.isUsingTool)
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 0)
+        XCTAssertTrue(view.dropWet(1))
+        // The deferred clear must not discard the next stroke when this view is reused.
+        window.addSubview(view)
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(160, 190))])
+        view.canvasViewDidEndUsingTool(view.canvas)
+        XCTAssertEqual(view.wetCount, 1)
+    }
+
+    func testToolChangesFinishCaptureButOrdinaryConfigurationKeepsItActive() {
+        let view = ZoomWritingView(frame: CGRect(x: 0, y: 0, width: 400, height: 100))
+        let pen = PKInkingTool(.pen, color: .black, width: 2)
+        let pencil = PKInkingTool(.pencil, color: .black, width: 2)
+        func configure(_ tool: PKInkingTool, erasing: Bool = false) {
+            view.configure(box: Rect(x: 100, y: 200, width: 200, height: 50), pageSize: .a4, tool: tool,
+                           erasing: erasing, policy: .anyInput, fingersDraw: true, eraserDiameter: 14, showsZone: false)
+        }
+        configure(pen)
+        var captured = 0
+        view.onStroke = { _ in captured += 1; return true }
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(pen)
+        XCTAssertTrue(view.isUsingTool, "layout and box updates must not interrupt capture")
+        view.canvas.drawing = PKDrawing(strokes: [PKBridge.pkStroke(stroke(120, 150))])
+        configure(pencil)
+        XCTAssertFalse(view.isUsingTool)
+        XCTAssertEqual(captured, 1, "a final drawing is captured even without an end callback")
+        XCTAssertTrue(view.dropWet(1))
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        configure(pencil, erasing: true)
+        XCTAssertFalse(view.isUsingTool, "the eraser disables drawing without changing the underlying inking tool")
+    }
+
+    func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
+        let h = harness()
+        let (host, overlay) = try await openWindow(h)
+        defer { overlay.detach(from: host) }
+        let c = overlay.controller
+        let view = c.writingView()
+        c.paneAppeared()
+        view.canvasViewDidBeginUsingTool(view.canvas)
+        showWet(c, [stroke(120, 150)])
+        c.paneDisappeared()
+        XCTAssertFalse(view.isUsingTool)
+        XCTAssertEqual(host.committed.count, 1, "hiding must capture the final drawing before clearing it")
+        XCTAssertEqual(view.canvas.drawing.strokes.count, 0)
+        XCTAssertEqual(c.landed, 0)
+        XCTAssertTrue(view.dropWet(1))
+    }
+
     func testRenderCompletionKeepsLandedInkUntilTheToolEnds() async throws {
         let h = harness()
+        h.app.services.renderer = FakeRenderer()
         try await h.run("zoom.setBox", ["page": .string(page1), "rect": [100, 200, 200, 50]])
         try await h.run("zoom.toggle", ["on": true])
         let host = ScriptedCanvasHost(h)
@@ -899,6 +963,7 @@ final class FeatZoomWindowTests: XCTestCase {
             overlay.detach(from: host)
             window.isHidden = true
         }
+        XCTAssertNil(view.paper.image, "the first render must not satisfy the completion poll before the stroke")
         view.onStroke = { _ in true }
         showWet(c, [stroke(120, 150)])
         view.canvasViewDrawingDidChange(view.canvas)

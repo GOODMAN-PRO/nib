@@ -174,7 +174,6 @@ final class FeatElementsTests: XCTestCase {
         }
     }
 
-    /// Acceptance: a collection exported as .nibcollection (zip) imports back with the same elements.
     func testImportingExportedPackKeepsTheReadOnlyPack() async throws {
         let h = harness()
         let fragment = try JSONValue.from(Self.box)
@@ -192,6 +191,7 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(try ElementCatalog(app: h.app).list(copy).elements.count, 1)
     }
 
+    /// Acceptance: a collection exported as .nibcollection (zip) imports back with the same elements.
     func testCollectionExportImportRoundTrip() async throws {
         let h = harness()
         try await h.run("element.collection.create", ["title": "Revision", "id": "revision"])
@@ -636,9 +636,6 @@ final class FeatElementsTests: XCTestCase {
 
     // MARK: Popover behaviour
 
-    /// Non-sticky: after one successful insert the palette goes back to the tool used before Elements (contracts-v2
-    /// `finishToolUse`, which announces `tool.finished`); a failed insert leaves Elements active; a temporary switch into
-    /// Elements returns where it came from.
     func testCollectionLoadsCannotOverwriteANewerSelectionOrItsLoadingState() async throws {
         for newestFinishesFirst in [false, true] {
             let h = harness()
@@ -684,6 +681,9 @@ final class FeatElementsTests: XCTestCase {
         }
     }
 
+    /// Non-sticky: after one successful insert the palette goes back to the tool used before Elements (contracts-v2
+    /// `finishToolUse`, which announces `tool.finished`); a failed insert leaves Elements active; a temporary switch into
+    /// Elements returns where it came from.
     func testInsertHandsBackToThePreviousTool() async throws {
         let h = harness()
         var finished: [JSONValue?] = []
