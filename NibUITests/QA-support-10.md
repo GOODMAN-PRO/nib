@@ -211,3 +211,11 @@ For #2 correction, the 27 ms run with Skip Silence/Reduce Noise is proven; an em
 ### I8 - Replay Options closure
 
 Confirmed insert-pickers-audio#6 and current 10a H4: dismissSheets already closes identified native popovers and requires the dismissal region to disappear. Reused it, adding the Replay in Full Screen content sentinel through 10a waitForMenuClosed before pixels or the next More action. No second dismissal implementation. ReplayModesAndSeek must reach Spotlight/Reveal/Static and retain both pixel-difference and stroke/seek/zoom assertions. Existing Menu remained open and State step diagnostics identify a surviving surface.
+
+### I9 - touch visible content under Selection AX wrappers
+
+Confirmed insert-singles#0 against SelectionOverlay/HandleAccessView (non-interactive) and the failing Connector end/text frames. AX occlusion is inferred, not a UIKit hit-test result. Connector start/end/bend and committed text now require enabled visible geometry and touch a point inside its canvas/window-clipped frame. Non-hittable targets log all covering AX frames through existing elementFacts. Text double-tap no longer relies on AX activation. Every connector attachment/route/bend/undo and text/edit/undo assertion remains. CI must reach the original expected geometry/content changes, with covering Selection evidence if isHittable remains false.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| ConnectorDragAnchorRoutesBendsAndUndo; TextInsertCommitEditAndUndo | Insert covered target | Which Selection/other AX frames cover the visible target that receives the coordinate contact? |

@@ -355,6 +355,25 @@ final class InsertUITests: XCTestCase {
 
     // MARK: text, text.setText, text.format, text.setParagraph, text.autoLists
 
+    /// Selection AX wrappers can cover non-interactive drawing/handle views; touch their visible geometry.
+    private func overlayControl(_ name: String) throws -> XCUIElement {
+        let target = query(name, .other).firstMatch
+        try wait("Overlay control must have enabled visible geometry: " + name) {
+            target.exists && target.isEnabled && self.ui.hasVisibleFrame(target, in: self.ui.canvas.frame)
+        }
+        if !target.isHittable { ui.logQA("Insert covered target", ui.elementFacts(target, includeOverlaps: true)) }
+        return target
+    }
+    private func visibleContact(_ target: XCUIElement) throws -> XCUICoordinate {
+        let frame = target.frame.intersection(ui.canvas.frame).intersection(ui.app.windows.firstMatch.frame)
+        guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0 else {
+            throw NibUI.Failure.message("Target has no visible contact rectangle")
+        }
+        if !target.isHittable { ui.logQA("Insert covered target", ui.elementFacts(target, includeOverlaps: true)) }
+        return ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+            dx: frame.midX - ui.app.frame.minX, dy: frame.midY - ui.app.frame.minY))
+    }
+
     /// Waits for the committed text's live visible position after keyboard scrolling, editing or undo.
     private func visibleCanvasText(_ value: String) throws -> XCUIElement {
         let text = ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
@@ -364,8 +383,9 @@ final class InsertUITests: XCTestCase {
                 ui.recordDiagnostics("Committed Text wait failed", facts: ui.elementFacts(text, includeOverlaps: true))
             }
         }
-        try wait("Committed text must be visible at its current canvas position") { text.exists && text.isHittable }
+        try wait("Committed text must be visible at its current canvas position") { text.exists && text.isEnabled && self.ui.hasVisibleFrame(text, in: self.ui.canvas.frame) }
         ready = true
+        if !text.isHittable { ui.logQA("Insert covered target", ui.elementFacts(text, includeOverlaps: true)) }
         ui.recordGeometry("Committed text position", touches: [CGPoint(x: text.frame.midX, y: text.frame.midY)], selection: text.frame)
         return text
     }
@@ -374,9 +394,9 @@ final class InsertUITests: XCTestCase {
         try undo(4, redo: 5)
         try ui.selectTool("lasso")
         let restored = try visibleCanvasText("Velocity = distance / time")
-        restored.tap()
+        try visibleContact(restored).tap()
         try ui.waitForState { $0.selectionCount == 1 }
-        try visibleCanvasText("Velocity = distance / time").doubleTap()
+        try visibleContact(visibleCanvasText("Velocity = distance / time")).doubleTap()
         try replace(try control("Text box", .textView), with: "Acceleration = change in velocity")
         try finish()
         XCTAssertEqual(try plain(snapshot("text")), "Acceleration = change in velocity")
@@ -695,19 +715,19 @@ final class InsertUITests: XCTestCase {
             XCTAssertEqual(try item("connector")["route"] as? String, route.lowercased())
         }
         ui.recordDiagnostics("Connector end before lookup", facts: ui.elementFacts(query("Connector end", .other).firstMatch, includeOverlaps: true))
-        let handle = try control("Connector end", .other)
+        let handle = try overlayControl("Connector end")
         let previous = try item("connector")
-        handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.1, thenDragTo: ui.coordinate(CGPoint(x: 0.68, y: 0.85)))
+        try visibleContact(handle).press(forDuration: 0.1, thenDragTo: ui.coordinate(CGPoint(x: 0.68, y: 0.85)))
         XCTAssertNotEqual(json(try item("connector")["to"]), json(previous["to"]))
         try ui.tapCommand("edit.undo"); XCTAssertEqual(json(try item("connector")["to"]), json(previous["to"]))
-        let startFrame = try control("Connector start", .other).frame
-        let endFrame = try control("Connector end", .other).frame
+        let startFrame = try overlayControl("Connector start").frame
+        let endFrame = try overlayControl("Connector end").frame
         let midpoint = ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
             dx: (startFrame.midX + endFrame.midX) / 2, dy: (startFrame.midY + endFrame.midY) / 2))
         midpoint.press(forDuration: 0.1, thenDragTo: midpoint.withOffset(CGVector(dx: -45, dy: 35)))
         let bends = try XCTUnwrap(try item("connector")["bends"] as? [JSON])
         XCTAssertEqual(bends.count, 1, "Dragging the midpoint must insert a control bend")
-        let bend = try control("Bend 1", .other).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let bend = try visibleContact(overlayControl("Bend 1"))
         bend.press(forDuration: 0.1, thenDragTo: bend.withOffset(CGVector(dx: 20, dy: 20)))
         XCTAssertNotEqual(json(try item("connector")["bends"]), json(bends))
         try menu("Connector Style", "Remove Bends")
