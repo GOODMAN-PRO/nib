@@ -1170,6 +1170,31 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertFalse(picker.isActive)
     }
 
+    func testEyedropperRendererRemovedWhileOpenReportsFailureWithoutChangingSlot() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        h.app.services.renderer = PaintedRenderer(rect: Rect(x: 0, y: 0, width: 500, height: 500), colour: .blue)
+        let host = FakeCanvasHost(h), picker = EyedropperAttachment()
+        picker.attach(to: host)
+        defer { picker.detach(from: host) }
+        picker.begin(.init(tool: "pen", target: .slot(1)))
+        for _ in 0..<100 where picker.current == nil { await Task.yield() }
+        XCTAssertNotNil(picker.current)
+        let before = presets(h, "pen")
+        let notice = expectation(description: "missing renderer reported")
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, "render.page")
+            XCTAssertEqual((note.userInfo?["error"] as? NibError)?.code, .unavailable)
+            notice.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        h.app.services.renderer = nil
+        picker.loupe.onUse?()
+        await fulfillment(of: [notice], timeout: 1)
+        XCTAssertEqual(presets(h, "pen"), before)
+        XCTAssertTrue(picker.isActive)
+        XCTAssertNil(picker.commitTask)
+    }
+
     func testAccessibleMoveThenImmediateUseSamplesRequestedPosition() async throws {
         let h = Harness(features: [FeatPresetsFeature.self])
         h.app.services.renderer = PaintedRenderer(rect: Rect(x: 110, y: 100, width: 10, height: 10), colour: .blue)

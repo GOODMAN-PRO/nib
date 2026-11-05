@@ -32,7 +32,6 @@ final class PenTool: CanvasTool {
         let grab: Point
         var current: Point
         var result: PenShapeResult?
-        var neighborRevisions: [String: Rev] = [:]
         var recognition: Task<Void, Never>?
         var lastTimestamp: TimeInterval?
         init(stroke: Stroke, page: PageID) {
@@ -187,11 +186,6 @@ final class PenTool: CanvasTool {
                 guard !Task.isCancelled else { return }
                 state.result = try PenShapeResult.parse(json, ink: stroke.style, doc: doc, page: page)
                 if let result = state.result {
-                    for ref in result.mergeWith {
-                        guard case let .item(d, p, id)? = NodeRef(ref),
-                              let item = try? app.workspace.item(d, page: p, id: id), !item.deleted else { continue }
-                        state.neighborRevisions[ref] = item.rev
-                    }
                     if let self, let host, self.hold === state {
                         self.drawShape(result.shape, grab: state.grab, at: state.current, page: page, host: host)
                     }
@@ -265,37 +259,19 @@ final class PenTool: CanvasTool {
             let app = host.app, session = host.session, doc = host.documentID
             Task { @MainActor [weak host] in
                 await state.recognition?.value
-                if let result = state.result {
+                if let result = state.result, !result.mergeWith.isEmpty {
+                    // item.delete has no transactional expected-revision guard. A check here can
+                    // become stale in a command hook, and even creating the merged shape would
+                    // retain obsolete neighbour geometry. Preserve only the user's original ink
+                    // until recognition and deletion support an atomic revision-checked merge.
+                    Self.report(NibError(.conflict, String(localized: "Could not safely join nearby shapes. Your original stroke was kept.")),
+                                command: CommandIDs.shapeRecognize, app: app)
+                    await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
+                } else if let result = state.result {
                     let shape = PenShapeAdjustment.adjust(result.shape, grab: state.grab, current: state.current)
                     do {
-                        let group = NibID.make().raw
-                        // Create first so a failed creation preserves both the stroke and every neighbour.
-                        let created = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
-                            params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session, group: group))
-                        // Re-read after shape.create too: it can suspend while another editor changes a neighbour.
-                        // Missing/deleted neighbours also invalidate the entire merge; keep the new shape.
-                        let neighborsUnchanged = result.mergeWith.allSatisfy { ref in
-                            guard let expected = state.neighborRevisions[ref],
-                                  case let .item(d, p, id)? = NodeRef(ref),
-                                  let item = try? app.workspace.item(d, page: p, id: id) else { return false }
-                            return !item.deleted && item.rev == expected
-                        }
-                        if !result.mergeWith.isEmpty && neighborsUnchanged {
-                            do {
-                                _ = try await app.bus.execute(Invocation(command: CommandIDs.itemDelete,
-                                    params: ["refs": .array(result.mergeWith.map(JSONValue.string))], session: session, group: group))
-                            } catch {
-                                Self.report(error, command: CommandIDs.itemDelete, app: app)
-                                if app.bus.history.entries(doc).last?.group == group {
-                                    _ = try await app.bus.execute(CommandIDs.undo,
-                                        ["doc": .string(NodeRef.document(doc).description)], session: session)
-                                } else if let ref = created.value["ref"]?.stringValue {
-                                    _ = try await app.bus.execute(CommandIDs.itemDelete,
-                                        ["refs": .array([.string(ref)])], session: session)
-                                }
-                                await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)
-                            }
-                        }
+                        _ = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate,
+                            params: try PenShapeResult.createParams(shape, doc: doc, page: state.page), session: session))
                     } catch {
                         Self.report(error, command: CommandIDs.shapeCreate, app: app)
                         await Self.preserve(state.stroke, page: state.page, doc: doc, app: app, session: session, host: host)

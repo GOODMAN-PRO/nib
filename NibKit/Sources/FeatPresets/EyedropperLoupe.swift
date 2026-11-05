@@ -257,7 +257,12 @@ final class EyedropperAttachment: CanvasAttachment {
     private func commit(at spot: (page: PageID, point: Point)?) {
         guard !committing, let request, let host, let target = spot ?? requested else { return }
         let app = host.app, session = host.session, doc = host.documentID, scale = renderScale
-        guard let renderer = app.services.renderer else { return }
+        guard let renderer = app.services.renderer else {
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                userInfo: ["command": "render.page", "error": NibError(.unavailable,
+                    String(localized: "The page renderer is unavailable. Try picking the colour again."))])
+            return
+        }
         requested = target
         committing = true
         sampling?.cancel()
