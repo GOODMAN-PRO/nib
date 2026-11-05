@@ -184,11 +184,35 @@ final class EyedropperAttachment: CanvasAttachment {
         let middle = CGPoint(x: bounds.midX, y: bounds.midY)
         if let hit = host.pagePoint(middle) {
             track(page: hit.page, point: hit.point)
+        } else if let hit = nearestPagePoint(to: middle, host: host) {
+            track(page: hit.page, point: hit.point)
         } else {
             loupe.place(focus: middle, within: bounds)
         }
         // VoiceOver moves to the loupe, which reads its colour and offers Use This Colour and Cancel.
         UIAccessibility.post(notification: .layoutChanged, argument: loupe)
+    }
+
+    /// A viewport can be centred in a page gap or margin. Start on the closest visible paper,
+    /// so VoiceOver and keyboard users can move and use the picker without a touch first.
+    private func nearestPagePoint(to point: CGPoint, host: CanvasHost) -> (page: PageID, point: Point)? {
+        guard let pages = try? host.app.workspace.content(host.documentID).pages else { return nil }
+        var nearest: (page: PageID, point: Point)?
+        var distance = CGFloat.infinity
+        for page in pages where !page.deleted {
+            guard let frame = host.pageFrame(page.id) else { continue }
+            let visible = frame.intersection(host.canvasView.bounds)
+            guard !visible.isNull, !visible.isEmpty else { continue }
+            // CGRect.contains excludes the maximum edges; stay one representable step inside.
+            let candidate = CGPoint(x: min(max(point.x, visible.minX), visible.maxX.nextDown),
+                                    y: min(max(point.y, visible.minY), visible.maxY.nextDown))
+            let delta = hypot(candidate.x - point.x, candidate.y - point.y)
+            if delta < distance, let hit = host.pagePoint(candidate) {
+                nearest = hit
+                distance = delta
+            }
+        }
+        return nearest
     }
 
     /// Closes the loupe without changing anything.

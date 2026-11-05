@@ -1210,6 +1210,43 @@ final class FeatPresetsTests: XCTestCase {
         assertClose(presets(h, "pen").swatches[1].color, RGBA(0, 0, 255))
     }
 
+    func testPageGapStartSupportsVoiceOverAndKeyboardWithoutTouches() async throws {
+        for keyboard in [false, true] {
+            let h = Harness(features: [FeatPresetsFeature.self])
+            let host = FakeCanvasHost(h), picker = EyedropperAttachment()
+            let bottom = host.pageSize.height
+            // The viewport centre is eight points past page one's bottom, inside the 20 pt gap.
+            host.canvasView.bounds = CGRect(x: 5, y: bottom + 8 - 100, width: 200, height: 200)
+            XCTAssertNil(host.pagePoint(CGPoint(x: 105, y: bottom + 8)))
+            h.app.services.renderer = PaintedRenderer(
+                rect: Rect(x: 110, y: bottom - 15, width: 10, height: 10), colour: .blue)
+            picker.attach(to: host)
+            defer { picker.detach(from: host) }
+            picker.begin(.init(tool: "pen", target: .slot(1)))
+            let start = try XCTUnwrap(picker.requested)
+            XCTAssertEqual(start.page, Fixtures.page1)
+            XCTAssertEqual(start.point.x, 105, accuracy: 0.001)
+            XCTAssertEqual(start.point.y, bottom, accuracy: 0.001)
+            if keyboard {
+                for input in [UIKeyCommand.inputRightArrow, UIKeyCommand.inputUpArrow] {
+                    let key = try XCTUnwrap(picker.loupe.keyCommands?.first { $0.input == input })
+                    _ = picker.loupe.perform(key.action, with: key)
+                }
+            } else {
+                for name in [String(localized: "Move Right"), String(localized: "Move Up")] {
+                    let action = try XCTUnwrap(picker.loupe.accessibilityCustomActions?.first { $0.name == name })
+                    XCTAssertEqual(action.actionHandler?(action), true)
+                }
+            }
+            XCTAssertEqual(picker.requested?.point.x, 115)
+            XCTAssertEqual(try XCTUnwrap(picker.requested).point.y, bottom - 10, accuracy: 0.001)
+            XCTAssertTrue(picker.loupe.accessibilityActivate())
+            await picker.commitTask?.value
+            assertClose(presets(h, "pen").swatches[1].color, RGBA(0, 0, 255))
+            XCTAssertFalse(picker.isActive)
+        }
+    }
+
     func testEyedropperSetsTheSlotToTheColourUnderTheFinger() async throws {
         let h = Harness(features: [FeatPresetsFeature.self])
         h.app.services.renderer = PaintedRenderer(rect: Rect(x: 100, y: 100, width: 50, height: 50),
