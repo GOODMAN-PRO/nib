@@ -33,7 +33,7 @@ struct ChatPanel: View {
                 .accessibilityLabel(String(localized: "Assistant options"))
             }
             if model.showsConversations { conversationList }
-            else if !model.isConfigured { connectionBody }
+            else if !model.isConfigured && model.entries.isEmpty { connectionBody }
             else { configuredBody }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -198,7 +198,7 @@ struct ChatPanel: View {
             if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
             if let error = model.error {
                 NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
-                          action: model.retryPrompt != nil && model.canSend ? NibAction(String(localized: "Retry")) {
+                          action: model.canRetry ? NibAction(String(localized: "Retry")) {
                     model.perform(ChatCommand.send, ["retry": true])
                 } : nil)
                 NibButton(String(localized: "Dismiss error"), kind: .plain, size: .compact) {

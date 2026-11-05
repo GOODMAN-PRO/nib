@@ -195,6 +195,8 @@ final class ChatViewModel: ObservableObject {
     @Published var docKind: DocumentKind?
     @Published var needsImagePicker = false
     @Published var retryPrompt: String?
+    @Published private(set) var isSavingConversation = false
+    private var recoveredSave: AIResponse?
     private var generation: UUID?
     private var sessionObservation: AnyCancellable?
     private var citationPages = ChatPageIndexCache()
@@ -234,14 +236,20 @@ final class ChatViewModel: ObservableObject {
     }
     var isConfigured: Bool { app?.services.ai?.isConfigured ?? false }
     // These mirror existing command guards; presentation must not offer an action the model rejects.
-    var canChangeConversation: Bool { !isStreaming && !isGeneratingImage && !isApplyingProposals && !isStagingProposals }
+    var canChangeConversation: Bool { !isStreaming && !isGeneratingImage && !isApplyingProposals && !isStagingProposals && !isSavingConversation }
     var canStartGeneration: Bool { canChangeConversation && !isLoadingChat }
     var canSend: Bool { isConfigured && canStartGeneration && proposals.isEmpty }
+    var needsSaveRetry: Bool { error?.path == "$.chat.persistence" }
+    var canRetry: Bool {
+        if needsSaveRetry { return chatID != nil && canChangeConversation && !isLoadingChat }
+        return retryPrompt != nil && canSend
+    }
     var canGenerateImage: Bool { isConfigured && app?.services.assets != nil && canStartGeneration }
     var canConfigureContext: Bool { !isStreaming && !isApplyingProposals }
     var canUseHistory: Bool { canStartGeneration && historyOperationLabel == nil }
     var progressLabel: String? {
         if let historyOperationLabel { return historyOperationLabel }
+        if isSavingConversation { return String(localized: "Saving conversation…") }
         if isLoadingChat { return String(localized: "Loading conversation…") }
         if isGeneratingImage { return String(localized: "Generating image…") }
         if isApplyingProposals { return String(localized: "Applying changes…") }
@@ -427,6 +435,7 @@ final class ChatViewModel: ObservableObject {
         draft = nil
         error = nil
         retryPrompt = nil
+        recoveredSave = nil
     }
 
     func newChat() throws {
@@ -444,12 +453,16 @@ final class ChatViewModel: ObservableObject {
         draft = nil
         error = nil
         retryPrompt = nil
+        recoveredSave = nil
         showsConversations = false
     }
 
     @discardableResult
     func send(prompt: String, principal: Principal, group: String, retry: Bool = false,
               linkUndoAcrossDocuments: (@MainActor () -> Void)? = nil) async throws -> AIResponse {
+        // Persistence recovery keeps the completed turn, including unreverted edits. It does
+        // not require a provider, a prompt, vision support or an empty proposal queue.
+        if retry && needsSaveRetry { return try await retryConversationSave(principal: principal) }
         guard let app, let ai = app.services.ai, ai.isConfigured else {
             throw NibError(.unavailable, "Connect a model to use the assistant.", hint: "open Settings › AI")
         }
@@ -573,6 +586,41 @@ final class ChatViewModel: ObservableObject {
             if generation == token, !(error is CancellationError) { self.error = NibError.wrap(error) }
             try? await persistConversation()
             throw error
+        }
+    }
+
+    private func retryConversationSave(principal: Principal) async throws -> AIResponse {
+        guard canRetry, let app, let chatID,
+              let answer = entries.lastIndex(where: { $0.role == "assistant" }) else {
+            throw NibError(.conflict, String(localized: "The conversation is not ready to retry saving."))
+        }
+        isSavingConversation = true
+        defer { isSavingConversation = false }
+        do {
+            let response: AIResponse
+            if let recoveredSave { response = recoveredSave }
+            else {
+                let value = try await app.bus.execute("ai.chat.save", ["chat": .string(chatID)],
+                                                      principal: principal, session: session)
+                response = try value.decode(AIResponse.self)
+                // Keep the receipt if the supplemental UI archive fails after the agent saved.
+                recoveredSave = response
+            }
+            let previousTokens = entries[answer].usage.input + entries[answer].usage.output
+            totalTokens += response.usage.input + response.usage.output - previousTokens
+            entries[answer].usage = response.usage
+            entries[answer].changes.merge(response.changes)
+            entries[answer].group = response.group ?? entries[answer].group
+            try await persistConversation()
+            error = nil
+            retryPrompt = nil
+            recoveredSave = nil
+            return response
+        } catch {
+            let failure = NibError.wrap(error)
+            let recoveryError = NibError(failure.code, failure.message, path: "$.chat.persistence", hint: failure.hint)
+            self.error = recoveryError
+            throw recoveryError
         }
     }
 
