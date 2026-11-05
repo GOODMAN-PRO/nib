@@ -338,15 +338,26 @@ final class FeatSearchUITests: XCTestCase {
     func testLibrarySearchSurfaceStaysInsideMeasuredContentColumn() {
         let host = CGRect(x: 0, y: 0, width: 1194, height: 834)
         let content = CGRect(x: 320, y: 80, width: 874, height: 754)
-        let surface = SearchViewport.libraryContentBounds(hostBounds: host, column: content)
+        let surface = SearchViewport.libraryContentBounds(hostBounds: host, column: content, hostOrigin: .zero)
         XCTAssertEqual(surface, content)
         XCTAssertFalse(surface.contains(CGPoint(x: 160, y: 300)), "sidebar stays usable")
         XCTAssertFalse(surface.contains(CGPoint(x: 900, y: 40)), "toolbar stays usable")
         XCTAssertTrue(surface.contains(CGPoint(x: 340, y: 90)), "banner/title cannot bleed through")
         let resized = CGRect(x: 0, y: 0, width: 834, height: 600)
-        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: resized, column: content),
+        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: resized, column: content, hostOrigin: .zero),
             CGRect(x: 320, y: 80, width: 514, height: 520))
-        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: host, column: nil), host)
+        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: host, column: nil, hostOrigin: .zero), host)
+    }
+
+    func testLibrarySearchConvertsGlobalColumnIntoInsetFloatingHost() {
+        let host = CGRect(x: 0, y: 0, width: 900, height: 600)
+        let origin = CGPoint(x: 70, y: 44)
+        let globalColumn = CGRect(x: 390, y: 124, width: 800, height: 700)
+        let surface = SearchViewport.libraryContentBounds(hostBounds: host, column: globalColumn, hostOrigin: origin)
+        XCTAssertEqual(surface, CGRect(x: 320, y: 80, width: 580, height: 520))
+        XCTAssertFalse(surface.contains(CGPoint(x: 160, y: 300)), "Inset hosts must still leave the sidebar usable")
+        XCTAssertTrue(surface.contains(CGPoint(x: 325, y: 85)), "The leading edge must not reveal library text")
+        XCTAssertEqual(SearchViewport.libraryContentBounds(hostBounds: host, column: nil, hostOrigin: origin), host)
     }
 
     func testLibrarySearchKeepsPortraitWidthWhenKeyboardChangesVisibleHeight() {

@@ -29,11 +29,12 @@ struct SearchViewport: Equatable {
         let visible = proposed.intersection(viewport?.visibleBounds ?? proposed)
         return visible.isEmpty ? .zero : visible
     }
-    /// The library supplies its laid-out content column in floating-host coordinates.
+    /// The library supplies global coordinates; translate into this host before clipping.
     /// Never paint or catch taps over its sibling sidebar or top chrome.
-    static func libraryContentBounds(hostBounds: CGRect, column: CGRect?) -> CGRect {
+    static func libraryContentBounds(hostBounds: CGRect, column: CGRect?, hostOrigin: CGPoint) -> CGRect {
         guard let column else { return hostBounds }
-        let bounds = hostBounds.intersection(column)
+        let localColumn = column.offsetBy(dx: -hostOrigin.x, dy: -hostOrigin.y)
+        let bounds = hostBounds.intersection(localColumn)
         return bounds.isEmpty ? .zero : bounds
     }
     static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool) -> CGFloat {

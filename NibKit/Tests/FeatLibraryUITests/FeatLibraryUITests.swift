@@ -1,6 +1,7 @@
 import XCTest
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 @testable import NibDesign
 import NibTesting
@@ -1564,6 +1565,58 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 1000, header: 140, insets: 84), 776)
         XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 400, header: 200, insets: 80), 120)
         XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 200, header: 240, insets: 80), 0)
+    }
+
+    func testCompactEmptyFoldersAndCollectionsFillTheScrollViewport() async throws {
+        for idiom in [UIUserInterfaceIdiom.phone, .pad] {
+            for collection in [LibraryCollection.documents, .recents, .studySets] {
+                let h = Harness(features: [FeatLibraryUIFeature.self])
+                h.session.document = nil
+                h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryList, title: "List Library",
+                    summary: "List an empty test library.", effect: .read, target: .library)) { _, _ in
+                    ["nodes": [], "total": 0]
+                }
+                let model = LibraryModels.get(h.app).model(h.session)
+                model.collection = collection
+                model.folder = collection == .documents ? Fixtures.folderID : nil
+                model.sidebarVisible = false
+                model.liquidMode = .off
+                let size = CGSize(width: idiom == .phone ? 390 : 540, height: 844)
+                var frames: [String: CGRect] = [:]
+                _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: idiom)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 },
+                    size: size, variant: .light, settlePasses: 10)
+                XCTAssertTrue(model.rows.isEmpty)
+                XCTAssertFalse(model.isLoading)
+                XCTAssertNil(model.error)
+                let grid = try XCTUnwrap(frames["content.grid"])
+                XCTAssertGreaterThan(grid.height, size.height / 2,
+                    "The compact empty placeholder must expand below the header for \(collection)")
+                XCTAssertLessThanOrEqual(grid.maxX, size.width)
+            }
+        }
+    }
+
+    func testLibraryModelsPublishesSearchBoundsThroughTheServiceKey() throws {
+        let h = harness(), store = LibraryModels.get(h.app)
+        let model = store.model(h.session)
+        let other = EditorSession()
+        let otherModel = store.model(other)
+        let publisher = try XCTUnwrap(h.app.services.get("libraryui.searchContentBounds",
+            as: (@MainActor (EditorSession) -> AnyPublisher<CGRect?, Never>).self))
+        var values: [CGRect?] = []
+        let subscription = publisher(h.session).sink { values.append($0) }
+        defer { subscription.cancel() }
+        XCTAssertEqual(values.count, 1)
+        XCTAssertNil(values[0])
+        let bounds = CGRect(x: 350, y: 100, width: 800, height: 650)
+        model.searchContentBounds = bounds
+        model.searchContentBounds = bounds
+        otherModel.searchContentBounds = CGRect(x: 20, y: 40, width: 500, height: 600)
+        XCTAssertEqual(values, [nil, bounds], "Updates are deduplicated and local to the requested window")
+        model.searchContentBounds = nil
+        XCTAssertEqual(values, [nil, bounds, nil])
+        XCTAssertTrue(LibraryModels.get(h.app) === store)
     }
 
     func testLibraryBannerAndTrailingChromeStayInsideViewport() async throws {

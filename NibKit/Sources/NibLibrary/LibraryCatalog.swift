@@ -814,6 +814,8 @@ struct CatalogScanner {
     /// iOS Open In only create the directory and deposit incoming files/packages.
     /// A record (even a damaged one) proves this is a user folder, not staging.
     /// On a failed listing, keep it visible rather than hiding potentially owned data.
+    /// Scanner-only until the shared contract/consumer work in REVIEW-round1.md lands;
+    /// this does not yet protect recorded folders from FeatImport's consumption path.
     static func isHandoffInbox(_ url: URL) -> Bool {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return false }
         return !names.contains(where: LibraryLayout.isFolderFile)

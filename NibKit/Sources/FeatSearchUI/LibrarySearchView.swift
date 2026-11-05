@@ -140,7 +140,8 @@ struct LibrarySearchFloatingContent: View {
         GeometryReader { geometry in
             let hostBounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
             let measuredColumn = belowBars ? nil : libraryContentBounds
-            let bounds = SearchViewport.libraryContentBounds(hostBounds: hostBounds, column: measuredColumn)
+            let bounds = SearchViewport.libraryContentBounds(hostBounds: hostBounds, column: measuredColumn,
+                hostOrigin: geometry.frame(in: .global).origin)
             let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
                 windowSize: viewport?.windowSize ?? geometry.size)
             let top = belowBars || measuredColumn != nil ? 0

@@ -62,6 +62,7 @@ final class LibraryViewModel: ObservableObject {
     let reflow = NibReflow<String>(combines: true)
     let folderReflow = NibReflow<String>(combines: false)
     let floatingAdapter: LibraryFloatingAdapter
+    /// Search replacement area in SwiftUI global coordinates, converted by the floating host.
     @Published var searchContentBounds: CGRect?
     @Published var collection: LibraryCollection = .documents
     @Published private(set) var sidebarCounts: [String: Int] = [:]
@@ -572,6 +573,7 @@ struct LibraryRootView: View {
     @State private var chromeFrames: [String: CGRect] = [:]
     @State private var searchText = ""
     @State private var contentHeaderHeight: CGFloat = 0
+    @State private var compactViewportHeight: CGFloat = 0
     var body: some View {
         GeometryReader { geometry in
             // Keyboard avoidance changes the available content height, not the window's
@@ -619,7 +621,7 @@ struct LibraryRootView: View {
                             content(compact: compact, compactHeight: short)
                                 .frame(width: LibraryPresentation.contentWidth(viewport: geometry.size.width,
                                     inlineSidebar: inlineSidebar), height: geometry.size.height)
-                                .libraryChromeFrame("content.column")
+                                .libraryChromeFrame("content.column", space: .global)
                         }
                     }
                 }
@@ -834,8 +836,9 @@ struct LibraryRootView: View {
                 LibraryGridView(model: model, compactHeight: compactHeight)
                     .environment(\.horizontalSizeClass, compact ? .compact : .regular)
                     .frame(minHeight: model.rows.isEmpty && !model.isLoading && model.error == nil
-                        ? LibraryPresentation.emptyContentHeight(viewport: viewport?.height ?? 0,
-                            header: contentHeaderHeight, insets: topInset + bottomInset + spacing) : 0)
+                        ? LibraryPresentation.emptyContentHeight(viewport: compact ? compactViewportHeight : viewport?.height ?? 0,
+                            header: contentHeaderHeight, insets: topInset + (compact ? 0 : bottomInset) + spacing) : 0)
+                    .libraryChromeFrame("content.grid")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
@@ -843,6 +846,17 @@ struct LibraryRootView: View {
             // A short viewport uses a trailing control lane instead of a whole bottom row.
             .padding(.trailing, compactHeight ? LibraryPresentation.actionPairWidth + NibSpacing.l : 0)
             .frame(width: viewport?.width)
+            .background {
+                if compact {
+                    // Read the nearest ScrollView from inside its content. Its container
+                    // length already excludes navigation and the bottom safeAreaInset.
+                    // A minimum (not fixed) grid height still lets large text scroll.
+                    Color.clear.containerRelativeFrame(.vertical)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { compactViewportHeight = $0 }
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if bottomInset > 0 { Color.clear.frame(height: bottomInset) }
@@ -971,10 +985,10 @@ struct LibraryChromeFrames: PreferenceKey {
 }
 
 extension View {
-    func libraryChromeFrame(_ id: String) -> some View {
+    func libraryChromeFrame(_ id: String, space: CoordinateSpace = .named("library.chrome")) -> some View {
         background {
             GeometryReader { geometry in
-                Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: .named("library.chrome"))])
+                Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: space)])
             }
         }
     }
