@@ -59271,6 +59271,95 @@
         }
       }
     },
+    "Cannot revert history in a read-only document or window." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "In einem schreibgeschützten Dokument oder Fenster kann der Verlauf nicht zurückgesetzt werden."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se puede revertir el historial en un documento o una ventana de solo lectura."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossible de rétablir l’historique dans un document ou une fenêtre en lecture seule."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Impossibile ripristinare la cronologia in un documento o una finestra di sola lettura."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "読み出し専用の書類またはウインドウでは履歴を元に戻せません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽기 전용 문서 또는 윈도우에서는 기록을 되돌릴 수 없습니다."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De geschiedenis kan niet worden teruggezet in een alleen-lezen document of venster."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie można przywrócić historii w dokumencie lub oknie tylko do odczytu."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não é possível reverter o histórico em um documento ou janela somente leitura."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Невозможно вернуть историю в документе или окне, доступном только для чтения."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det går inte att återställa historik i ett skrivskyddat dokument eller fönster."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Salt okunur bir belgede veya pencerede geçmiş geri alınamaz."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法在只读文稿或窗口中还原历史记录。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法在唯讀文件或視窗中回復歷史記錄。"
+          }
+        }
+      }
+    },
     "Canvas" : {
       "extractionState" : "manual",
       "localizations" : {
