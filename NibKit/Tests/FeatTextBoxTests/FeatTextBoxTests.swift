@@ -387,6 +387,37 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testCaretFormattingAndOrdinarySpacesDoNotRebuildLargeRichText() throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        editor.beginNewBox(page: Fixtures.page2, at: Point(100, 100))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        let paragraph = Paragraph(runs: [TextRun(String(repeating: "word ", count: 10))], align: .center, list: .plain, indent: 2)
+        let text = RichText(paragraphs: Array(repeating: paragraph, count: 2_000))
+        tv.attributedText = TextLayout.attributed(text, base: TextLayout.base(TextBoxStyle(), darkPaper: false)) { _, _ in nil }
+        let before = editor.richTextConversionCount
+        for location in [1, 50_001, 100_001] {
+            tv.selectedRange = NSRange(location: location, length: 0)
+            let state = try XCTUnwrap(editor.formatState())
+            XCTAssertEqual(state.align, .center)
+            XCTAssertEqual(state.indent, 2)
+            XCTAssertTrue(editor.textView(tv, shouldChangeTextIn: tv.selectedRange, replacementText: " "))
+        }
+        XCTAssertEqual(editor.richTextConversionCount, before)
+        editor.endEditing(commit: false)
+        editor.detach(from: host)
+    }
+
+    func testListPrefixCheckIsBoundedAndRecognisesEveryTrigger() {
+        for prefix in ["1.", "1)", "-", "*", "\u{2022}", "[]", "[ ]"] {
+            let text = "previous paragraph\n" + prefix
+            XCTAssertTrue(TextBoxEditor.hasListTriggerPrefix(text as NSString, at: text.utf16.count))
+        }
+        for text in ["", "ordinary space", "word -", "12.", String(repeating: "x", count: 100_000)] {
+            XCTAssertFalse(TextBoxEditor.hasListTriggerPrefix(text as NSString, at: text.utf16.count))
+        }
+    }
+
     func testTypingInANewBoxCreatesItOnTheFirstCommit() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let host = FakeCanvasHost(h)

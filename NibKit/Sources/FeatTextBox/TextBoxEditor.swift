@@ -107,6 +107,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private var needsNormalize = false
     private var pendingInsert: NSRange?
     private var lastCaret: Int?
+    /// Counts model rebuilds so caret-only paths can assert their work stays local.
+    private(set) var richTextConversionCount = 0
     /// The window's floating host while it shows this editor's More popover.
     private weak var floating: FloatingHosting?
     /// Fires whenever the text, selection or style changes (the keyboard bar and inspector refresh on it).
@@ -500,6 +502,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     /// The text view's content as rich text (model offsets, markers dropped).
     func currentRichText() -> RichText {
         guard let st = state else { return .empty }
+        richTextConversionCount += 1
         tagAttachments(st)
         let s = st.textView.textStorage
         return TextLayout.richText(from: s, base: st.base) { index in
@@ -594,8 +597,17 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             if i < s.length { chars = s.attributes(at: i, effectiveRange: nil) }
         }
         let relative = TextLayout.relativeAttributes(chars, base: st.base)
-        let text = currentRichText()
-        let p = text.paragraphs[AutoList.paragraphIndex(text, at: TextLayout.modelOffset(s, view: sel.location))]
+        let location = min(max(0, sel.location), s.length)
+        var p = TextLayout.paragraphAttributes(tv.typingAttributes)
+        if s.length > 0 {
+            let attributes = s.attributes(at: min(location, s.length - 1), effectiveRange: nil)
+            if location == s.length, (s.string as NSString).character(at: s.length - 1) == 10,
+               let trailing = TextLayout.trailingParagraph(attributes) {
+                p = trailing
+            } else {
+                p = TextLayout.paragraphAttributes(attributes)
+            }
+        }
         return TextFormatState(attrs: TextLayout.resolved(RichTextEdit.merged(st.base, relative)), align: p.align,
                                list: p.list, indent: p.indent, lineSpacing: p.lineSpacing, box: st.box.style,
                                canEditParagraphs: true)
@@ -1105,6 +1117,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     /// "1. ", "1) ", "- ", "* " at the start of a paragraph start a list. nil = not a trigger.
     private func autoListTrigger(at viewLocation: Int) -> Bool? {
         guard let st = state else { return nil }
+        // A trigger is at most three UTF-16 units at a paragraph start. Ordinary spaces must not rebuild the box.
+        guard Self.hasListTriggerPrefix(st.textView.textStorage.string as NSString, at: viewLocation) else { return nil }
         let text = currentRichText()
         let m = TextLayout.modelOffset(st.textView.textStorage, view: viewLocation)
         let i = AutoList.paragraphIndex(text, at: m)
@@ -1118,6 +1132,16 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                selection: NSRange(location: span.start, length: 0))
         scheduleCommit()
         return true
+    }
+
+    static func hasListTriggerPrefix(_ text: NSString, at location: Int) -> Bool {
+        guard location > 0, location <= text.length else { return false }
+        for length in 1...min(3, location) {
+            let start = location - length
+            guard start == 0 || text.character(at: start - 1) == 10 else { continue }
+            if AutoList.trigger(text.substring(with: NSRange(location: start, length: length))) != nil { return true }
+        }
+        return false
     }
 
     /// Return on a list item continues or ends the list. nil = not a list item.
