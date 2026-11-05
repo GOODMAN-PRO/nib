@@ -754,7 +754,7 @@ public struct NibPluginPanelChrome<Content: View>: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: NibMetrics.panelWidth(typeSize))
+        .frame(maxWidth: NibMetrics.panelWidth(typeSize))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "panels.plugin.label", defaultValue: "\(name) plugin", bundle: .module))
     }

@@ -214,4 +214,18 @@ final class ShippingPolishTests: XCTestCase {
         XCTAssertLessThanOrEqual(accessible.width, 312)
         XCTAssertGreaterThan(accessible.height, regular.height + 40)
     }
+
+    func testPluginChromeAcceptsTheNarrowViewportAtAccessibilityFive() {
+        let chrome = NibPluginPanelChrome(name: "Word Count", symbol: .puzzle, onReload: {},
+                                         onPermissions: {}, onReport: {}, onClose: {}) {
+            Color.clear
+        }
+        .environment(\.horizontalSizeClass, .regular)
+        .environment(\.dynamicTypeSize, .accessibility5)
+        let host = UIHostingController(rootView: chrome)
+        let size = host.sizeThatFits(in: CGSize(width: 300, height: 560))
+        XCTAssertEqual(size.width, 300, accuracy: 1,
+                       "Both sidebars can leave only 300 pt; plugin chrome must not insist on 420 pt")
+        XCTAssertLessThanOrEqual(size.height, 560)
+    }
 }
