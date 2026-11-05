@@ -715,24 +715,28 @@ final class InsertUITests: XCTestCase {
         try ui.tapCommand("edit.undo")
         XCTAssertEqual((try item("connector")["bends"] as? [JSON])?.count, 1)
     }
+    private func settingsButton(_ name: String) throws {
+        try ui.requireControl(name, type: .button, scroll: true, timeout: 8).tap()
+    }
     private func configureProvider() throws {
+        let started = Date()
+        defer { ui.logQA("Insert provider setup", "seconds=\(Date().timeIntervalSince(started))") }
         let state = try ui.state()
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
-        try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("AI", scroll: true); try tap("Add provider", scroll: true)
+        try ui.chord(",", .command) { _ = try self.ui.requireControl("Editing", type: .button) }; try settingsButton("AI"); try settingsButton("Add provider")
         let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
         ui.revealFormElement(preset)
         try wait("Provider preset button must be available") { preset.exists && preset.isHittable }
         preset.tap()
         try tap("Custom OpenAI-compatible", scroll: true)
         ui.recordDiagnostics("Provider custom preset selected", facts: ui.elementFacts(preset), includeHierarchy: false)
-        for (label, value) in [("Name", "Insert fixture"),
-                               ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
-                               ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")] {
-            try replace(try control(label, .textField, scroll: true), with: value)
-        }
-        try ui.dismissNativeKeyboard()
-        try ui.chord("s", .command) { try self.wait("Provider save must complete") { self.query("Provider saved.").firstMatch.exists } }
+        let lastField = try ui.fillNativeForm([("Name", "Insert fixture"),
+            ("Base URL", "http://127.0.0.1:\(try XCTUnwrap(provider?.port))/v1"),
+            ("Chat model", "insert-fixture"), ("Transcription model", "insert-transcript")])
+        try ui.nativeKey("s", in: lastField)
+        let saved = ui.app.staticTexts["Provider saved."].firstMatch
+        try wait("Provider save must complete") { saved.exists }
         try ui.dismissSheets()
     }
     func testNativeDiagramActionCreatesEditableNodesAndGroupedUndo() throws {
@@ -995,16 +999,15 @@ final class InsertUITests: XCTestCase {
     func testGIPHYKeySaveRemoveAndSearchRetryRetainsQuery() throws {
         try elements(); try tap("GIFs"); try tap("Open Settings")
         if visible("Remove Key") { try tap("Remove Key") }
-        let field = try control("Paste your GIPHY API key", .secureTextField)
-        try ui.focusField(field); field.typeText("nib-ui-invalid-test-key")
+        try ui.fillNativeForm([("Paste your GIPHY API key", "nib-ui-invalid-test-key")])
         try tap("Save Key")
         XCTAssertTrue(query("Remove Key").firstMatch.waitForExistence(timeout: 8))
         try ui.dismissSheets(); try elements(); try tap("GIFs")
-        let search = try control("Search GIPHY", .textField)
-        try ui.focusField(search); search.typeText("physics\n")
+        let search = try ui.fillNativeForm([("Search GIPHY", "physics")])
+        search.typeText("\n")
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
-        outside(); try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("Elements and GIFs", scroll: true); try tap("Remove Key")
+        outside(); try ui.chord(",", .command) { _ = try self.ui.requireControl("Editing", type: .button) }; try settingsButton("Elements and GIFs"); try settingsButton("Remove Key")
         XCTAssertTrue(query("Paste your GIPHY API key").firstMatch.waitForExistence(timeout: 8))
     }
 

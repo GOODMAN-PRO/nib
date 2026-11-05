@@ -176,3 +176,13 @@ Confirmed insert-timeouts-state#4 correction: proposal operation 1 at 22.880, re
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | ElementDragInsertsAtDropPoint; Pages thumbnail drags | System drag contact | Did the shared held contact run before the existing result/probe checks? |
+
+### I5 - Settings form setup
+
+Confirmed insert-timeouts-state#6/#7 corrections and insert-pickers-audio#5: the transcript test never reached transcript actions, and provider fields cost 25-65 seconds. Round 9b/10a already supply scoped modal batches and cheap focus. configureProvider now fills four fields in one fillNativeForm batch and saves through the last native editor, using the existing Selection-class route and one typed saved-status query. GIPHY key/search also use batches; sidebar/page actions use typed button lookup and the existing bounded reveal. No deep link, fixture injection or shared provider state. SettingsSidebar currently uses Buttons; fresh test fixtures remain independent.
+
+CI must show exact field values, Provider saved and original diagram/transcript/GIPHY assertions. Target: setup below 60 seconds and transcript regeneration before 120 seconds, unmeasured. Long native-menu stalls beyond setup were never observed in the baseline transcript test; I1 prevents that route without claiming measured savings there.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NativeDiagram; both transcript tests; GIPHY save/search | Native form field duration / Insert provider setup | Which field or total setup still consumes the unchanged allowance? |
