@@ -224,9 +224,11 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p ../build
+          # A unit test that never returns must fail by name instead of holding the job until its limit.
           xcodebuild test -scheme NibKit-Package \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300 \
             -derivedDataPath ../build/DerivedData \
             -clonedSourcePackagesDirPath ../build/SourcePackages \
             -skipPackagePluginValidation \
