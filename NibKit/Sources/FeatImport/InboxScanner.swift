@@ -194,7 +194,8 @@ enum ShareHandoff {
     /// Writes the waiting items into `dir` and clears them from the pasteboard. [] when they were just taken.
     /// Allow time for the person to answer iOS's paste permission prompt before timing out a provider.
     @MainActor
-    static func take(into dir: URL, timeoutNanoseconds: UInt64 = defaultProviderTimeoutNanoseconds) async throws -> [URL] {
+    static func take(into dir: URL, timeoutNanoseconds: UInt64 = defaultProviderTimeoutNanoseconds,
+                     writer: (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) async throws -> [URL] {
         try Task.checkCancellation()
         // Deep link and activation scan can arrive together while the providers are still loading.
         guard !taking else { return [] }
@@ -226,7 +227,7 @@ enum ShareHandoff {
         guard self.board === board, board.changeCount == revision else {
             throw NibError(.unavailable, String(localized: "The clipboard changed. Share the file with Nib again."))
         }
-        let urls = try write(items, into: dir)
+        let urls = try write(items, into: dir, writer: writer)
         guard !urls.isEmpty else {
             deniedChangeCount = board.changeCount
             throw NibError(.userDenied, "Nib couldn't read what was shared",
@@ -310,7 +311,8 @@ enum ShareHandoff {
     }
 
     /// Writes every hand-off item (name + bytes) into `dir`; other pasteboard items are ignored.
-    static func write(_ items: [[String: Any]], into dir: URL) throws -> [URL] {
+    static func write(_ items: [[String: Any]], into dir: URL,
+                      writer: (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) throws -> [URL] {
         var out: [URL] = []
         var committed = false
         defer {
@@ -322,8 +324,8 @@ enum ShareHandoff {
             let name = (item[nameType] as? Data).map { String(decoding: $0, as: UTF8.self) }
                 ?? (item[nameType] as? String) ?? ""
             let url = ImportNaming.unique(ImportNaming.sanitize(name), in: dir)
-            try data.write(to: url, options: .atomic)
             out.append(url)
+            try writer(data, url)
         }
         committed = true
         return out

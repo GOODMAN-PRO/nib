@@ -152,22 +152,42 @@ final class ShareHandoffLifecycleTests: XCTestCase {
     }
 
     func testWriteFailureRollsBackPartialFilesAndPreservesUpstreamPayload() async throws {
+        enum WriteFailure: Error, Equatable { case secondItem }
         let fixture = HandoffTestFixture()
         defer { fixture.restore() }
         let dir = try directory()
-        let bytes = Data("original".utf8)
-        // Under the character limit but over the filesystem's 255-byte component limit after UTF-8 encoding.
-        let invalidName = String(repeating: "界", count: 100) + ".pdf"
-        fixture.board.items = [[ShareHandoff.nameType: "first.pdf", ShareHandoff.dataType: bytes],
-                               [ShareHandoff.nameType: invalidName, ShareHandoff.dataType: bytes]]
+        let firstBytes = Data("first original".utf8)
+        let secondBytes = Data("second original".utf8)
+        fixture.board.items = [[ShareHandoff.nameType: "first.pdf", ShareHandoff.dataType: firstBytes],
+                               [ShareHandoff.nameType: "second.pdf", ShareHandoff.dataType: secondBytes]]
+        var writes = 0
         do {
-            _ = try await importStep("partial handoff write rolls back") { try await ShareHandoff.take(into: dir) }
-            XCTFail("Overlong filename must fail")
+            _ = try await importStep("partial handoff write rolls back") {
+                try await ShareHandoff.take(into: dir) { data, url in
+                    writes += 1
+                    if writes == 2 {
+                        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("first.pdf")), firstBytes)
+                        throw WriteFailure.secondItem
+                    }
+                    try data.write(to: url, options: .atomic)
+                }
+            }
+            XCTFail("The second write must fail")
         } catch {
-            // Foundation may report this filesystem failure in either the Cocoa or POSIX domain.
+            XCTAssertEqual(error as? WriteFailure, .secondItem)
         }
+        XCTAssertEqual(writes, 2)
         XCTAssertTrue(ShareHandoff.isWaiting)
         XCTAssertEqual(fixture.board.items.count, 2)
+        XCTAssertEqual(fixture.board.items.compactMap { $0[ShareHandoff.nameType] as? String }, ["first.pdf", "second.pdf"])
+        XCTAssertEqual(fixture.board.items.compactMap { $0[ShareHandoff.dataType] as? Data }, [firstBytes, secondBytes])
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+        let saved = try await importStep("retry after write failure imports both originals") {
+            try await ShareHandoff.take(into: dir)
+        }
+        XCTAssertEqual(saved.map { $0.lastPathComponent }, ["first.pdf", "second.pdf"])
+        XCTAssertEqual(try saved.map { try Data(contentsOf: $0) }, [firstBytes, secondBytes])
+        XCTAssertFalse(ShareHandoff.isWaiting)
+        XCTAssertTrue(fixture.board.items.isEmpty)
     }
 }
