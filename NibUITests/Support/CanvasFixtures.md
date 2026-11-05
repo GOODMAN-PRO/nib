@@ -29,6 +29,7 @@ cannot enable a scenario. Fixtures use an isolated library and preferences.
   its receipt advances while Board 3 remains unseen; Select All / Mark as Seen
   must clear both. Verify content and history as well. These fields inspect
   persisted receipts; they do not simulate F108's tracker or command results.
+- `tabsOverflow`: also seeds eight notebooks named `Chrome tab 2` through `Chrome tab 9`; Chrome opens them through the library alongside Physics — Motion to exercise nine open tabs and overflow without creating notebooks through the UI.
 
 The round-1 Canvas tests must explicitly launch the relevant scenario. The
 Mark as Seen test currently ends in an unconditional prerequisite `XCTFail`;

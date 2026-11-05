@@ -143,28 +143,78 @@ final class CaptureUITests: XCTestCase {
     /// Accessibility state can precede the canvas bitmaps and palette foreground. See QA-ui-app15-strip.md
     /// for the rendering paths and the unresolved diagnosis. A timeout fails the test and preserves the capture.
     private func settledNotebookWithAssistant() {
-        let pen = ui.app.buttons["tool.pen"]
-        let note = ui.app.staticTexts.matching(NSPredicate(
-            format: "label == %@ AND value == %@", "Sticky note", "Remember F = ma")).firstMatch
         var readiness = CaptureReadiness()
-        Self.checkAssistantReadiness(waitUntilRendered: {
-            try wait("Page note and palette glyph must finish presenting", timeout: 20) {
-                let time = ProcessInfo.processInfo.systemUptime
-                guard pen.exists, note.exists, pen.isHittable else {
-                    return readiness.observe([], canvas: .zero, window: .zero, at: time)
-                }
-                let elements = [pen, note].map {
-                    CaptureReadiness.Element(frame: $0.frame, isAvailable: true,
-                                             pixels: self.grayscalePixels($0))
-                }
-                return readiness.observe(elements, canvas: self.ui.canvas.frame,
-                                         window: self.ui.app.windows.firstMatch.frame, at: time)
+        var lastScreenshot: XCUIScreenshot?
+        var lastSnapshot: XCUIElementSnapshot?
+        var lastFacts = "No app snapshot obtained"
+        var lastDiagnosis = "elements.missing; no observation"
+        var pass = 0
+        func find(_ root: XCUIElementSnapshot?, matching predicate: (XCUIElementSnapshot) -> Bool) -> XCUIElementSnapshot? {
+            guard let root else { return nil }
+            if predicate(root) { return root }
+            for child in root.children {
+                if let match = find(child, matching: predicate) { return match }
             }
+            return nil
+        }
+        Self.checkAssistantReadiness(waitUntilRendered: {
+            let deadline = ProcessInfo.processInfo.systemUptime + 20
+            // No predicate expectation, element screenshot or hittability resolution in this loop.
+            // A snapshot failure is an unavailable sample; retain the screen image and keep logging.
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                pass += 1
+                let screenshot = XCUIScreen.main.screenshot()
+                lastScreenshot = screenshot
+                let root = try? ui.app.snapshot()
+                lastSnapshot = root
+                let pen = find(root) { $0.elementType == .button && $0.identifier == "tool.pen" }
+                let note = find(root) {
+                    $0.elementType == .staticText && $0.label == "Sticky note"
+                        && $0.value as? String == "Remember F = ma"
+                }
+                let canvas = find(root) { $0.elementType == .scrollView && $0.identifier == "nib.canvas" }
+                let window = find(root) { $0.elementType == .window }
+                // variants() establishes full screen before opening the notebook. The app snapshot's
+                // screen-space frame maps to this upright full-device bitmap in portrait and landscape.
+                let screenFrame = root?.frame ?? .zero
+                let image = uprightImage(screenshot.image)
+                let targets: [(String, XCUIElementSnapshot?)] = [("palette.pen", pen), ("page.note", note)]
+                let elements = targets.map { name, node in
+                    CaptureReadiness.Element(frame: node?.frame ?? .zero, isAvailable: node != nil,
+                        pixels: grayscalePixels(image, frame: node?.frame ?? .zero, screen: screenFrame), name: name)
+                }
+                let verdict = readiness.observe(elements, canvas: canvas?.frame ?? .zero,
+                    window: window?.frame ?? .zero, at: ProcessInfo.processInfo.systemUptime)
+                lastDiagnosis = verdict.diagnosis
+                lastFacts = targets.map { name, node in
+                    guard let node else { return name + " missing" }
+                    return "\(name) type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame) value=\(String(describing: node.value))"
+                }.joined(separator: "; ")
+                let imageFacts = "screen=\(screenFrame) bitmap=\(image?.width ?? 0)x\(image?.height ?? 0)"
+                let cropFacts = targets.map { name, node in
+                    let rect = CaptureReadiness.cropRect(frame: node?.frame ?? .zero, screen: screenFrame,
+                        pixelWidth: image?.width ?? 0, pixelHeight: image?.height ?? 0)
+                    return "\(name) cropPixels=\(String(describing: rect))"
+                }.joined(separator: "; ")
+                let presence = "snapshot=\(root != nil) canvasExists=\(canvas != nil) windowExists=\(window != nil)"
+                ui.logQA("Assistant readiness pass", "pass=\(pass) \(presence) \(imageFacts); \(cropFacts); \(lastDiagnosis)")
+                if verdict.isReady { return }
+            }
+            throw NibUI.Failure.message(lastDiagnosis)
         }, diagnose: { error in
             let stem = "assistant-readiness-timeout-\(appearance)-\(orientation)"
+            // Preserve the exact final sampled image BEFORE any further AX reads or XCTFail.
+            if let lastScreenshot { attach(XCTAttachment(screenshot: lastScreenshot), name: stem) }
+            ui.logQA("Assistant readiness timeout", "passes=\(pass) \(lastDiagnosis); \(lastFacts)")
+            func hierarchy(_ node: XCUIElementSnapshot, depth: Int = 0) -> String {
+                let line = String(repeating: " ", count: depth) + "type=\(node.elementType.rawValue) id=\(node.identifier) label=\(node.label) frame=\(node.frame) value=\(String(describing: node.value))"
+                return ([line] + node.children.map { hierarchy($0, depth: depth + 1) }).joined(separator: "\n")
+            }
+            let tree = lastSnapshot.map { hierarchy($0) } ?? "Last app snapshot unavailable"
+            ui.logQA("Assistant readiness hierarchy", tree)
+            attach(XCTAttachment(string: tree), name: stem + "-hierarchy")
+            ui.logStateStep(stem) // Raw nib.qa.state value; text attachments are not exported by CI.
             attach(XCTAttachment(string: "Rendering readiness unconfirmed: \(error)"), name: stem + "-reason")
-            attach(XCTAttachment(screenshot: XCUIScreen.main.screenshot()), name: stem)
-            attach(XCTAttachment(string: ui.app.debugDescription), name: stem + "-hierarchy")
         })
     }
 
@@ -180,13 +230,24 @@ final class CaptureUITests: XCTestCase {
         }
     }
 
-    /// A blank paper tile or empty glass capsule has no foreground detail. This deliberately loose contrast
-    /// gate checks presence only, in either appearance, rather than comparing a screenshot to a golden image.
-    private func grayscalePixels(_ element: XCUIElement) -> [UInt8] {
-        let image = element.screenshot().image
+    /// Normalize screenshot orientation once so both crops use the same upright bitmap.
+    private func uprightImage(_ image: UIImage) -> CGImage? {
+        if image.imageOrientation == .up { return image.cgImage }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = image.scale
+        return UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }.cgImage
+    }
+
+    /// Retain the original pen-glyph and page-note regions, 128x32 samples and >40 contrast policy.
+    /// Whole-page borders or the palette capsule must not substitute for their foreground detail.
+    private func grayscalePixels(_ image: CGImage?, frame: CGRect, screen: CGRect) -> [UInt8] {
         let width = 128, height = 32
         var pixels = [UInt8](repeating: 0, count: width * height)
-        guard let cgImage = image.cgImage else { return [] }
+        guard let image, let rect = CaptureReadiness.cropRect(frame: frame, screen: screen,
+                    pixelWidth: image.width, pixelHeight: image.height),
+              let cgImage = image.cropping(to: rect) else { return [] }
         let drawn = pixels.withUnsafeMutableBytes { bytes -> Bool in
             guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
                                           bitsPerComponent: 8, bytesPerRow: width,

@@ -36,6 +36,7 @@ final class CreateUITests: XCTestCase {
             shot.lifetime = .keepAlways
             add(shot)
             let tree = (testRun?.totalFailureCount ?? 0) > 0 ? ui.app.debugDescription : ""
+            if !tree.isEmpty { ui.logQA("Create failure hierarchy", tree) }
             let state = XCTAttachment(string: "\(ui.probe.value ?? "no probe")\n\(tree)")
             state.name = "Create-\(name)-state-and-accessibility"
             state.lifetime = .keepAlways
@@ -88,6 +89,8 @@ final class CreateUITests: XCTestCase {
     }
 
     func testTypeSwitchRetainsTitleAndChangesFields() throws {
+        ui.diagnoseStateReads = true
+        defer { ui.diagnoseStateReads = false }
         try notebook("Retained draft")
         for (kind, heading) in [("Whiteboard", "New Whiteboard"), ("Text document", "New Text Document"),
                                 ("Study set", "New Study Set"), ("Notebook", "New Notebook")] {
@@ -141,6 +144,8 @@ final class CreateUITests: XCTestCase {
     }
 
     func testSuggestedTitleUseReachesCreatedDocument() throws {
+        ui.diagnoseKeyDelivery = true
+        defer { ui.diagnoseKeyDelivery = false }
         // DESIGN §14.6 makes AI suggestions conditional on a connected provider. The fixture has none.
         // Exercise F021's local recognised-text suggestion in the QuickNote title form instead.
         let id = try quickNote()
@@ -890,8 +895,12 @@ final class CreateUITests: XCTestCase {
                          matching matcher: ((String, String) -> Bool)? = nil) throws {
         try require(field, "Missing editable field: \(field)")
         try scrollTo(field, name: field.label, in: application)
+        if name.contains("testSuggestedTitleUseReachesCreatedDocument") {
+            ui.recordDiagnostics("Create suggested title before focus", facts: ui.elementFacts(field, includeOverlaps: true))
+        }
+        ui.logQA("Stall boundary", "Create replacement field focus tap; field=\(field.label)")
         field.tap()
-        try ui.clearNativeText(in: field)
+        try ui.clearNativeText(in: field, diagnoseClear: field.label.contains("millimetres"))
         if !text.isEmpty { field.typeText(text) }
         try wait("Field must contain the replacement before dismissal: \(text)") {
             guard let actual = field.value as? String else { return false }
@@ -1051,14 +1060,19 @@ final class CreateUITests: XCTestCase {
         if continueButton.waitForExistence(timeout: 3) { continueButton.tap(); calendar.tap() }
         try NibUI.openCalendarEvent(in: calendar) { self.ui.logQA($0, $1) }
         let title = calendar.textFields["Title"]
-        try replace(title, with: eventTitle, in: calendar)
+        try require(title, "Calendar event must expose Title")
+        if !ui.isKeyboardFocused(title, in: calendar) { title.tap() }
+        try ui.fillNativeForm([("Title", eventTitle)], in: calendar)
         try dismissKeyboard(in: calendar)
         let save = calendar.buttons["add-button"]
         try require(save, "Calendar must expose its observed add-button (Done)")
         XCTAssertTrue(save.isEnabled)
         save.tap()
         try wait("Calendar must save the event and close its editor") { !title.exists }
+        let activationStarted = Date()
+        ui.logQA("Calendar activation boundary", "before Nib activate")
         ui.app.activate()
+        ui.logQA("Calendar activation duration", "seconds=\(Date().timeIntervalSince(activationStarted))")
         try tap("Calendar")
         let connect = button("Connect Calendars")
         if connect.exists { connect.tap() }
@@ -1101,7 +1115,10 @@ final class CreateUITests: XCTestCase {
     private func tapEventAction(_ action: String, eventTitle: String) throws {
         let summary = ui.app.descendants(matching: .any)
             .matching(NSPredicate(format: "label BEGINSWITH %@", eventTitle)).firstMatch
-        try scrollTo(summary, name: eventTitle)
+        ui.revealFormElement(summary)
+        if let failure = ui.formRevealFailure { throw NibUI.Failure.message(failure) }
+        try require(summary, "Calendar event must be revealed: " + eventTitle)
+        XCTAssertTrue(summary.isHittable, "Calendar event must be visible before its action")
         // Scope to the smallest event container so repeated suite runs cannot act on an older event.
         let containers = ui.app.otherElements.containing(NSPredicate(format: "label BEGINSWITH %@", eventTitle))
             .allElementsBoundByIndex.filter { $0.buttons[action].firstMatch.isHittable }

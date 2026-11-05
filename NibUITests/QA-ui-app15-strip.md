@@ -1,3 +1,15 @@
+# Round 10d: assistant evidence gate (2026-11-06)
+
+This section supersedes the historical capture-status notes below. R11:capture-assistant#0/#1 and their verifier corrections concern run 42094377121 at 9ef7f90. Both portrait failures have timeout-edge XCTest messages and no retained screenshots or gate verdict. Element disappearance, current blank rendering (especially light portrait), and the cause of the resolution errors are **not proven**. The earlier 42038428678 dark portrait image was blank while light portrait rendered. Landscape variants pass in the new run; all four variants still require verification of this test-support revision.
+
+The assistant gate now uses a manual monotonic 20-second deadline loop. Each pass captures exactly one full-screen image and one optional app snapshot, reads identities/frames from that snapshot, and crops both the pen glyph and page note from the same upright bitmap. No predicate expectation, live hittability call or per-element screenshot is used in the loop. Missing snapshots/invalid geometry produce failed samples. The >40 contrast threshold for **each** 128x32 sample, full window containment and 0.5-second geometry stability are unchanged. Sampling the existing content regions avoids accepting a blank page or palette merely because its border has contrast.
+
+`Assistant readiness pass` logs every false condition and the element/window/canvas frames, containment, bitmap/crop coordinates, grayscale counts/min/max/contrast and stability duration/reset. Timeout first attaches the last sampled full-screen image as `assistant-readiness-timeout-<appearance>-<orientation>` with keepAlways. It then logs the verdict, element facts, retained snapshot hierarchy and raw nib.qa.state before the existing XCTFail names the failed condition. Text attachments remain supplemental; the evidence reaches ui.log and exported screenshots.
+
+All six existing CaptureReadinessUITests remain; Bool assertions now read the structured verdict's isReady. Four added tests cover condition diagnostics, stability/containment resets, portrait/landscape crop mapping and rejected invalid crops. These tests have not executed on Windows. python Scripts/lint.py: 0 errors, 25 existing warnings; git diff --check: clean. Swift/UIKit/XCTest compilation and all four assistant captures remain CI work. No app rendering repair, portrait recovery or new landscape runtime pass is claimed. Run the same five identifiers listed below, inspect pass logs and timeout images, and only then choose between a geometry/stability gate issue and the suspected palette/tile rendering paths.
+
+---
+
 # ui-app15-strip review round 7
 
 ## Current outcome (2026-11-06)
