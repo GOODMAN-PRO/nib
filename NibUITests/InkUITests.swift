@@ -231,7 +231,7 @@ final class InkUITests: XCTestCase {
     private func swatchMenu(_ action: String, index: Int = 0) throws {
         let button = try XCTUnwrap(swatches.indices.contains(index) ? swatches[index] : nil, "Missing colour slot \(index)")
         button.press(forDuration: 0.7)
-        try tap(action)
+        try tap(action, scroll: true)
     }
 
     private func chooseColour(_ name: String) throws {
