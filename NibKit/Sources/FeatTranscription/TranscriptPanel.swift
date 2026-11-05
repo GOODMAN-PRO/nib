@@ -162,6 +162,7 @@ struct TranscriptPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             NibPanelHeader(title: String(localized: "Transcript"), subtitle: model.transcript?.name, symbol: .transcript,
+                handlesEscape: context.presentation == .sheet || context.presentation == .fullScreen,
                 onClose: { context.app.perform(CommandIDs.panelClose, ["id": .string(FeatTranscriptionFeature.panelID)], session: context.session) }) {
                 NibIconButton(.settings, label: String(localized: "Recording Settings"), size: .panel) { settings.toggle() }
             }

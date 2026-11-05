@@ -23,8 +23,9 @@ public enum FeatStudySessionFeature: NibFeature {
                     return AnyView(NibEmptyState(symbol: .studySets, title: String(localized: "Open a study set")))
                 }
                 let model = runtime.model(app: context.app, doc: doc, session: context.session ?? context.app.services.sessions.active)
-                if learn { return AnyView(SmartLearnView(model: model, close: context.dismiss)) }
-                return AnyView(PracticeView(model: model, close: context.dismiss))
+                let presentation = context.presentation ?? .fullScreen
+                if learn { return AnyView(SmartLearnView(model: model, close: context.dismiss, presentation: presentation)) }
+                return AnyView(PracticeView(model: model, close: context.dismiss, presentation: presentation))
             }
             descriptor.providesHeader = true
             app.ui.panels.register(descriptor)

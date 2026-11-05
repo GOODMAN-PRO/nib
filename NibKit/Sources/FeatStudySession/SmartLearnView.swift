@@ -5,7 +5,8 @@ import NibDesign
 struct SmartLearnView: View {
     @ObservedObject var model: StudySessionModel
     let close: () -> Void
-    var body: some View { StudySessionView(model: model, smartLearn: true, close: close) }
+    var presentation: PanelPresentation = .fullScreen
+    var body: some View { StudySessionView(model: model, smartLearn: true, close: close, presentation: presentation) }
 }
 
 struct StudySummaryView: View {

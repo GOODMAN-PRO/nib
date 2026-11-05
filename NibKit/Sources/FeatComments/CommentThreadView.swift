@@ -374,6 +374,7 @@ struct CommentThreadView: View {
     /// panel shows.
     private let requested: CommentPanelTarget?
     private let dismiss: @MainActor () -> Void
+    private let handlesEscape: Bool
     @State private var reply = ""
     @State private var sending = false
     @State private var editing: NibID?
@@ -389,6 +390,7 @@ struct CommentThreadView: View {
             app: context.app, session: context.session ?? context.app.services.sessions.active, target: requested))
         self.requested = requested
         dismiss = context.dismiss
+        handlesEscape = context.presentation == .sheet || context.presentation == .fullScreen
     }
 
     var body: some View {
@@ -478,7 +480,7 @@ struct CommentThreadView: View {
     private var header: some View {
         let comment = thread
         return NibPanelHeader(title: String(localized: "Comment"), subtitle: subtitle, symbol: .comment, badge: badge,
-                              onClose: { dismiss() }) {
+                              handlesEscape: handlesEscape, onClose: { dismiss() }) {
             if let comment = comment, let ref = model.ref {
                 if !model.readOnly {
                     NibIconButton(comment.resolved ? .checkCircleFill : .checkCircle,

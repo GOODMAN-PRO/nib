@@ -285,7 +285,8 @@ final class StudySessionModel: ObservableObject {
 struct PracticeView: View {
     @ObservedObject var model: StudySessionModel
     let close: () -> Void
-    var body: some View { StudySessionView(model: model, smartLearn: false, close: close) }
+    var presentation: PanelPresentation = .fullScreen
+    var body: some View { StudySessionView(model: model, smartLearn: false, close: close, presentation: presentation) }
 }
 
 enum StudyCardLayout {
@@ -326,6 +327,7 @@ struct StudySessionView: View {
     @ObservedObject var model: StudySessionModel
     let smartLearn: Bool
     let close: () -> Void
+    var presentation: PanelPresentation = .fullScreen
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @GestureState private var dragActive = false
     @State private var dragState = StudyCardDragState()
@@ -344,8 +346,7 @@ struct StudySessionView: View {
         }
         .sheet(isPresented: Binding(get: { model.scratchPresented }, set: { if !$0 { model.action("closeScratch") } })) {
             if let descriptor = model.app.ui.panels.get("studyeditor.scratch") {
-                descriptor.makeView(PanelContext(app: model.app, session: model.session,
-                    navigator: model.app.ui.activeNavigator, dismiss: { model.action("closeScratch") }))
+                descriptor.makeView(scratchContext)
             }
         }
         .onDisappear {
@@ -357,9 +358,16 @@ struct StudySessionView: View {
         }
     }
 
+    private var scratchContext: PanelContext {
+        var context = PanelContext(app: model.app, session: model.session,
+            navigator: model.app.ui.activeNavigator, dismiss: { model.action("closeScratch") })
+        context.presentation = .sheet
+        return context
+    }
+
     private var header: some View {
         NibPanelHeader(title: smartLearn ? String(localized: "Smart Learn") : String(localized: "Practice"),
-                       symbol: .studySets, onClose: {
+                       symbol: .studySets, handlesEscape: presentation == .sheet || presentation == .fullScreen, onClose: {
                            model.end(close: close)
                        }) {
             HStack(spacing: NibSpacing.xs) {
@@ -378,16 +386,9 @@ struct StudySessionView: View {
                     optionsPresented = true
                 }
                 .popover(isPresented: $optionsPresented) {
-                    VStack(spacing: 0) {
-                        NibPanelHeader(title: String(localized: "Study options"), symbol: .studySets,
-                                       onClose: { optionsPresented = false })
-                        ScrollView { controls.padding(NibSpacing.l) }
-                            .scrollBounceBehavior(.basedOnSize)
+                    StudyOptionsPanel(onClose: { optionsPresented = false }) {
+                        controls
                     }
-                    .frame(idealWidth: NibMetrics.studyCardSize.width,
-                           idealHeight: NibMetrics.popoverMaxHeight)
-                    .background(NibColor.background)
-                    .foregroundStyle(NibColor.label)
                 }
             }
         }
@@ -629,6 +630,28 @@ struct StudySessionView: View {
         }
     }
 
+}
+
+struct StudyOptionsPanel<Content: View>: View {
+    let onClose: () -> Void
+    let content: Content
+
+    init(onClose: @escaping () -> Void, @ViewBuilder content: () -> Content) {
+        self.onClose = onClose
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            NibPanelHeader(title: String(localized: "Study options"), symbol: .studySets,
+                           handlesEscape: true, onClose: onClose)
+            ScrollView { content.padding(NibSpacing.l) }
+                .scrollBounceBehavior(.basedOnSize)
+        }
+        .frame(idealWidth: NibMetrics.studyCardSize.width, idealHeight: NibMetrics.popoverMaxHeight)
+        .background(NibColor.background)
+        .foregroundStyle(NibColor.label)
+    }
 }
 
 /// Opaque neutral pills keep both the grade and its small interval readable on every study desk colour.
