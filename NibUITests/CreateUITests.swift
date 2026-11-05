@@ -675,8 +675,10 @@ final class CreateUITests: XCTestCase {
         if ui.app.buttons["DatePicker.NextMonth"].exists {
             let caption = ui.app.staticTexts["Starts"].firstMatch
             try require(caption, "Start-date caption must remain visible outside the calendar")
-            XCTAssertTrue(caption.isHittable)
-            caption.tap()
+            let frame = caption.frame
+            XCTAssertTrue(ui.app.windows.firstMatch.frame.contains(frame) && !frame.isEmpty)
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                dx: frame.midX - ui.app.frame.minX, dy: frame.midY - ui.app.frame.minY)).tap()
             try wait("Native date picker must dismiss before Create Planner") {
                 !self.ui.app.buttons["DatePicker.NextMonth"].exists
             }

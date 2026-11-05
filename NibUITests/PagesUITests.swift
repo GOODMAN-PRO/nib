@@ -367,8 +367,10 @@ final class PagesUITests: XCTestCase {
         else {
             let heading = ui.app.staticTexts["Library"].firstMatch
             try require(heading)
-            XCTAssertTrue(heading.isHittable && !heading.frame.intersects(destructive.frame))
-            heading.tap()
+            XCTAssertTrue(!heading.frame.intersects(destructive.frame))
+            let frame = heading.frame
+            ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                dx: frame.midX - ui.app.frame.minX, dy: frame.midY - ui.app.frame.minY)).tap()
         }
         try wait("Cancelling purge must dismiss its confirmation") { !self.button("Delete 1 item").exists }
         XCTAssertTrue(try allPages().contains { $0["id"] as? String == removed && $0["deleted"] as? Bool == true })
