@@ -413,6 +413,9 @@ struct FaceThumbnail: View {
     let card: StudyCard
     let side: CardSide
     @Environment(\.displayScale) private var displayScale
+    @State private var ink: UIImage?
+    @State private var renderedKey: String?
+    private var renderKey: String { StudySetModel.inkRenderKey(model.inkKey(card, side), displayScale: displayScale) }
 
     var body: some View {
         let face = side.face(card)
@@ -422,8 +425,7 @@ struct FaceThumbnail: View {
             if mode == .image, face.kind == .image, let asset = face.asset {
                 CardPicture(model: model, asset: asset, maxPixels: Int(NibMetrics.thumbnailWidth * max(displayScale, 1)))
                     .padding(NibSpacing.xs)
-            } else if mode == .ink,
-                      let ink = model.inkPicture(face, key: model.inkKey(card, side), displayScale: displayScale) {
+            } else if mode == .ink, renderedKey == renderKey, let ink {
                 Image(uiImage: ink)
                     .resizable()
                     .scaledToFit()
@@ -445,6 +447,13 @@ struct FaceThumbnail: View {
         .environment(\.colorScheme, .light)
         .accessibilityElement(children: .combine)
         .accessibilityValue(side.title)
+        .task(id: renderKey) {
+            let key = renderKey
+            let result = await model.inkPicture(face, key: model.inkKey(card, side), displayScale: displayScale)
+            guard !Task.isCancelled else { return }
+            ink = result
+            renderedKey = key
+        }
     }
 }
 

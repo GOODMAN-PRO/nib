@@ -404,7 +404,7 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 0)
     }
 
-    func testFreeformThumbnailsRenderAtABoundedScale() throws {
+    func testFreeformThumbnailsRenderAtABoundedScale() async throws {
         let h = harness()
         let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
         XCTAssertEqual(StudySetModel.inkThumbnailScale(canvas: CardFaces.canvas, displayScale: 3), 1)
@@ -414,8 +414,21 @@ final class FeatStudyEditorTests: XCTestCase {
         let line = Stroke(style: InkStyle(), points: [StrokePoint(x: 100, y: 100, width: 2, height: 2),
                                                       StrokePoint(x: 49_000, y: 29_000, width: 2, height: 2)])
         let huge = CardFace(kind: .ink, ink: [line], size: PageSize(50_000, 30_000))
-        let image = try XCTUnwrap(model.inkPicture(huge, key: "huge", displayScale: 3))
+        let rendered = await model.inkPicture(huge, key: "huge", displayScale: 3)
+        let image = try XCTUnwrap(rendered)
         XCTAssertLessThanOrEqual(image.size.width * image.scale, 1_100)
+    }
+
+    func testInkArtworkKeyTracksRevisionSideAndDisplayScale() async throws {
+        let h = harness()
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        let before = try XCTUnwrap(try liveCards(h).first)
+        let key = model.inkKey(before, .front)
+        XCTAssertNotEqual(key, model.inkKey(before, .back))
+        XCTAssertNotEqual(StudySetModel.inkRenderKey(key, displayScale: 1), StudySetModel.inkRenderKey(key, displayScale: 3))
+        try await h.run("card.update", ["ref": .string(NodeRef.card(Fixtures.studySetID, before.id).description), "front": "Changed"])
+        let after = try XCTUnwrap(try liveCards(h).first)
+        XCTAssertNotEqual(key, model.inkKey(after, .front))
     }
 
     // MARK: Order keys and list moves

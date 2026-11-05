@@ -241,32 +241,43 @@ final class StudySessionModel: ObservableObject {
         formatter.maximumUnitCount = 2
         return formatter.string(from: s.interval * Scheduler.day) ?? ""
     }
-    func picture(_ face: CardFace, card: StudyCard, back: Bool) -> UIImage? {
-        let paperStyle: UIUserInterfaceStyle = cardIsDark ? .dark : .light
+    func pictureKey(card: StudyCard, back: Bool) -> String {
         let side = back ? "/back" : "/front"
-        let appearance = paperStyle == .dark ? "/dark" : "/light"
-        let key = (card.id.raw + card.rev.description + side + appearance) as NSString
+        let appearance = cardIsDark ? "/dark" : "/light"
+        return card.id.raw + card.rev.description + side + appearance
+    }
+
+    func picture(_ face: CardFace, card: StudyCard, back: Bool) async -> UIImage? {
+        let key = pictureKey(card: card, back: back) as NSString
         if let image = pictures.object(forKey: key) { return image }
-        var image: UIImage?
-        if face.kind == .image, let asset = face.asset, let data = try? app.services.assets?.data(asset, doc: doc) {
-            // Downsample large imports before decoding to protect memory on older iPads.
-            if let source = CGImageSourceCreateWithData(data as CFData, nil),
-               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                   kCGImageSourceThumbnailMaxPixelSize: NibMetrics.studyCardSize.width * 2,
-                   kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) { image = UIImage(cgImage: cg) }
-        } else if face.kind == .ink {
-            let size = face.size ?? PageSize(Double(NibMetrics.studyCardSize.width), Double(NibMetrics.studyCardSize.height))
-            let scale = min(2, NibMetrics.studyCardSize.width * 2 / CGFloat(max(size.width, size.height, 1)))
-            // The paper's theme, not the surrounding window, determines PencilKit's ink appearance.
-            UITraitCollection(userInterfaceStyle: paperStyle).performAsCurrent {
-                image = PKBridge.drawing(face.ink ?? []).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+        let paperStyle: UIUserInterfaceStyle = cardIsDark ? .dark : .light
+        let store = app.services.assets, doc = self.doc
+        let worker = Task.detached(priority: .userInitiated) { () -> UIImage? in
+            guard !Task.isCancelled else { return nil }
+            var image: UIImage?
+            if face.kind == .image, let asset = face.asset, let data = try? store?.data(asset, doc: doc) {
+                // Downsample before decoding; asset reads and stroke conversion stay off the main actor.
+                if let source = CGImageSourceCreateWithData(data as CFData, nil),
+                   let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                       kCGImageSourceThumbnailMaxPixelSize: NibMetrics.studyCardSize.width * 2,
+                       kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) { image = UIImage(cgImage: cg) }
+            } else if face.kind == .ink {
+                let size = face.size ?? PageSize(Double(NibMetrics.studyCardSize.width), Double(NibMetrics.studyCardSize.height))
+                let scale = min(2, NibMetrics.studyCardSize.width * 2 / CGFloat(max(size.width, size.height, 1)))
+                UITraitCollection(userInterfaceStyle: paperStyle).performAsCurrent {
+                    image = PKBridge.drawing(face.ink ?? []).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+                }
             }
+            return image
         }
+        let image = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+        guard !Task.isCancelled else { return nil }
         if let image {
             pictures.setObject(image, forKey: key, cost: (image.cgImage?.bytesPerRow ?? 0) * (image.cgImage?.height ?? 0))
         }
         return image
     }
+
 }
 
 struct PracticeView: View {
@@ -618,6 +629,9 @@ struct StudyFaceView: View {
     let card: StudyCard
     let face: CardFace
     let back: Bool
+    @State private var image: UIImage?
+    @State private var renderedKey: String?
+    private var renderKey: String { model.pictureKey(card: card, back: back) }
     var body: some View {
         Group {
             if face.kind == .text {
@@ -625,14 +639,23 @@ struct StudyFaceView: View {
                     text.fixedSize(horizontal: false, vertical: true)
                     ScrollView { text }
                 }
-            } else if let image = model.picture(face, card: card, back: back) {
+            } else if renderedKey == renderKey, let image {
                 Image(uiImage: image).resizable().scaledToFit().padding(NibSpacing.l)
                     .accessibilityLabel(face.kind == .ink ? String(localized: "Handwritten card side") : String(localized: "Image card side"))
+            } else if renderedKey != renderKey {
+                ProgressView().accessibilityLabel(String(localized: "Loading card artwork"))
             } else {
                 Text(String(localized: "This card side is empty or its image is unavailable."))
                     .font(NibFont.callout).foregroundStyle(model.cardIsDark ? NibInk.chalk.color : NibInk.carbon.color)
                     .padding(NibSpacing.xxl)
             }
+        }
+        .task(id: renderKey) {
+            let key = renderKey
+            let result = await model.picture(face, card: card, back: back)
+            guard !Task.isCancelled else { return }
+            image = result
+            renderedKey = key
         }
     }
     private var attributedText: AttributedString {
