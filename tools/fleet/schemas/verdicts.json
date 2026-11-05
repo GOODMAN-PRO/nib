@@ -1,0 +1,40 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "verdicts": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "title": {
+      "type": "string"
+     },
+     "real": {
+      "type": "boolean"
+     },
+     "why": {
+      "type": "string"
+     },
+     "correction": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "title",
+     "real",
+     "why",
+     "correction"
+    ]
+   }
+  },
+  "notes": {
+   "type": "string"
+  }
+ },
+ "required": [
+  "verdicts",
+  "notes"
+ ]
+}
