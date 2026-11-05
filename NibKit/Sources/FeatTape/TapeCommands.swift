@@ -171,10 +171,12 @@ final class TapeStore {
     }
 
     /// The asset a strip in `doc` points at for the swatch pattern `ref`: the tile copied into the document
-    /// (content-addressed, so every strip with the same look shares one file). nil = plain colour.
+    /// (content-addressed, so every strip with the same look shares one file). A requested pattern must resolve.
     func documentAsset(for ref: AssetRef, color: RGBA, doc: DocumentID,
-                       in patterns: Registry<TapePatternDescriptor>) -> AssetRef? {
-        guard let assets = app?.services.assets else { return nil }
+                       in patterns: Registry<TapePatternDescriptor>) throws -> AssetRef {
+        guard let assets = app?.services.assets else {
+            throw NibError(.unavailable, String(localized: "Could not save the tape pattern. Try drawing the strip again."))
+        }
         let id = PresetSwatch.tapePatternID(ref)
         let key = AssetKey(doc: doc.raw, ref: ref.name, pattern: id, color: color.hex)
         if let known = documentAssets[key] { return known }
@@ -182,14 +184,15 @@ final class TapeStore {
         if let data = tile(pattern: id, color: color, in: patterns) {
             // Content-pack tiles come in at any size: normalise them like custom imports before they reach a document.
             let tile = source(of: id) == "pack" ? (TapeTile.customTile(from: data) ?? data) : data
-            result = try? assets.put(tile, ext: "png", doc: doc)
+            result = try assets.put(tile, ext: "png", doc: doc)
         } else if (try? assets.data(ref, doc: doc)) != nil {
             result = ref            // the swatch already points at an asset of this document (plugin or AI)
         }
-        if let result {
-            if documentAssets.count >= TapeStore.cacheLimit { documentAssets.removeAll() }
-            documentAssets[key] = result
+        guard let result else {
+            throw NibError(.notFound, String(localized: "Could not load the tape pattern. Choose another pattern or try again."))
         }
+        if documentAssets.count >= TapeStore.cacheLimit { documentAssets.removeAll() }
+        documentAssets[key] = result
         return result
     }
 

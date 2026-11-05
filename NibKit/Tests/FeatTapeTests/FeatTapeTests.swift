@@ -203,8 +203,14 @@ final class FeatTapeTests: XCTestCase {
         layer.sublayers?.contains { $0.name == TapeTool.previewLayerName } ?? false
     }
 
-    func testFailedCommitDropsThePreviewAndLeavesTheHistoryAlone() throws {
+    func testFailedCommitDropsThePreviewAndLeavesTheHistoryAlone() async throws {
         let h = harness()
+        let failed = expectation(description: "Rejected strip reports its error")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            if note.userInfo?["command"] as? String == CommandIDs.inkAddStrokes,
+               (note.userInfo?["error"] as? NibError)?.code == .permissionDenied { failed.fulfill() }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
         let host = FailingCanvasHost(FakeCanvasHost(h))
         let tool = TapeTool()
         tool.touchesBegan(sample(100, 300, 0), host: host)
@@ -216,6 +222,39 @@ final class FeatTapeTests: XCTestCase {
         XCTAssertFalse(previewShown(host.overlayLayer), "nothing landed, so the preview goes at once")
         XCTAssertEqual(host.renderWaits, [], "no dry strip to wait for")
         XCTAssertTrue(TapeHistory.live(try store(h).history).isEmpty, "tape that was not added is not recent tape")
+        await fulfillment(of: [failed], timeout: 1)
+    }
+
+    func testPatternFailureNeverCommitsPlainTape() async throws {
+        for missingPattern in [false, true] {
+            let h = harness()
+            let host = FakeCanvasHost(h)
+            if !missingPattern { h.app.services.assets = RejectingTapeAssets(base: h.assets) }
+            var presets = ToolPresets.defaults(for: "tape")
+            presets.swatches[0].pattern = PresetSwatch.tapePatternRef(id: missingPattern ? "missing-pattern" : TapePattern.dots.id)
+            h.app.settings.set(NibSettings.presets("tape"), presets)
+            let failed = expectation(description: "Pattern failure is reported")
+            let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+                if note.userInfo?["command"] as? String == CommandIDs.inkAddStrokes,
+                   note.userInfo?["error"] is NibError { failed.fulfill() }
+            }
+            let tool = TapeTool()
+            tool.touchesBegan(sample(100, 300, 0), host: host)
+            tool.touchesEnded(sample(250, 300, 0.06), host: host)
+            await fulfillment(of: [failed], timeout: 1)
+            NotificationCenter.default.removeObserver(observer)
+            XCTAssertTrue(host.committed.isEmpty)
+            XCTAssertFalse(previewShown(host.overlayLayer))
+            XCTAssertTrue(TapeHistory.live(try store(h).history).isEmpty)
+        }
+    }
+
+    func testPatternResolutionPreservesReadableDocumentAssetFallback() throws {
+        let h = harness()
+        let ref = try h.assets.put(Data([1, 2, 3]), ext: "png", doc: Fixtures.docID)
+        let tape = try store(h)
+        XCTAssertEqual(try tape.documentAsset(for: ref, color: .black, doc: Fixtures.docID,
+                                              in: h.app.content.tapePatterns), ref)
     }
 
     func testABarePatternIDInThePresetsStillResolves() throws {
@@ -360,7 +399,7 @@ final class FeatTapeTests: XCTestCase {
         // A strip in MYWASHI01 is recent tape until the pattern is deleted.
         let tape = try store(h)
         tape.recordUse(pattern: "MYWASHI01", color: .black)
-        let firstCopy = tape.documentAsset(for: PresetSwatch.tapePatternRef(id: "MYWASHI01"), color: .black,
+        let firstCopy = try tape.documentAsset(for: PresetSwatch.tapePatternRef(id: "MYWASHI01"), color: .black,
                                            doc: Fixtures.docID, in: h.app.content.tapePatterns)
         XCTAssertNotNil(firstCopy)
 
@@ -374,7 +413,7 @@ final class FeatTapeTests: XCTestCase {
         let redFile = FileManager.default.temporaryDirectory.appendingPathComponent("tape-import-\(UUID().uuidString).png")
         try red.write(to: redFile)
         try await h.run("tape.importPattern", ["url": .string(redFile.absoluteString), "id": "MYWASHI01"])
-        let secondCopy = tape.documentAsset(for: PresetSwatch.tapePatternRef(id: "MYWASHI01"), color: .black,
+        let secondCopy = try tape.documentAsset(for: PresetSwatch.tapePatternRef(id: "MYWASHI01"), color: .black,
                                             doc: Fixtures.docID, in: h.app.content.tapePatterns)
         XCTAssertNotNil(secondCopy)
         XCTAssertNotEqual(secondCopy, firstCopy)
@@ -505,6 +544,16 @@ final class FeatTapeTests: XCTestCase {
         entries = TapeHistory.recording(entries, pattern: "tape.grid", color: RGBA(10, 0, 0), at: 1_000, clock: clock)
         XCTAssertEqual(TapeHistory.live(entries).first?.color, RGBA(10, 0, 0), "using a tape again moves it to the front")
     }
+}
+
+private final class RejectingTapeAssets: AssetStore {
+    let base: AssetStore
+    init(base: AssetStore) { self.base = base }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { throw NibError(.unavailable, "Asset write failed") }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }
 
 /// A canvas whose `ink.addStrokes` fails (a read-only document, a full disk): everything else is the fake canvas.

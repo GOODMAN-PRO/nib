@@ -112,8 +112,18 @@ final class TapeTool: CanvasTool {
                              tapeFollowsDirection: current.followsDirection)
         let store = TapeTool.store(host)
         if let ref = current.patternRef {
-            style.tapePattern = store?.documentAsset(for: ref, color: current.color, doc: host.documentID,
-                                                     in: host.app.content.tapePatterns)
+            do {
+                guard let store else {
+                    throw NibError(.unavailable, String(localized: "Could not save the tape pattern. Try drawing the strip again."))
+                }
+                style.tapePattern = try store.documentAsset(for: ref, color: current.color, doc: host.documentID,
+                                                           in: host.app.content.tapePatterns)
+            } catch {
+                layer?.removeFromSuperlayer()
+                NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                                                userInfo: ["command": CommandIDs.inkAddStrokes, "error": NibError.wrap(error)])
+                return
+            }
         }
         let used = style.tapePattern == nil ? nil : current.pattern
         let colour = current.color
@@ -127,8 +137,12 @@ final class TapeTool: CanvasTool {
                 } else {
                     layer.removeFromSuperlayer()
                 }
-            case .failure:
+            case .failure(let error):
                 layer?.removeFromSuperlayer()     // nothing landed: drop the preview now, and leave the history alone
+                if let host {
+                    NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                                                    userInfo: ["command": CommandIDs.inkAddStrokes, "error": NibError.wrap(error)])
+                }
             }
         }
     }
