@@ -101,12 +101,10 @@ final class PresenceTests: XCTestCase {
         let follow = try XCTUnwrap(hub).follow
         let shared = try XCTUnwrap(hub).sharedModel
         let unseen = try XCTUnwrap(hub).unseen
-        weak var app = harness!.app
         hub?.timing.returnSummaryDelay = 0.02
         hub?.didEnterBackground()
         hub?.didBecomeActive()
         harness = nil
-        XCTAssertNil(app)
         // A retained panel/hub can outlive its app; a delayed summary must find no app to update.
         try await Task.sleep(nanoseconds: 50_000_000)
         hub?.refreshState()

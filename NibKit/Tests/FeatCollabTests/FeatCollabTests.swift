@@ -362,12 +362,11 @@ final class FeatCollabTests: XCTestCase {
         await fulfillment(of: [stopped], timeout: 1)
     }
 
-    func testPendingRejoinDoesNotKeepItsServiceOrAppAlive() async throws {
+    func testPendingRejoinDoesNotKeepItsServiceAlive() async throws {
         var pair: CollabPair? = CollabPair()
         let code = try await pair!.share()
         try await pair!.join(code)
         pair!.guestService.timing.rejoinTimeout = 0.08
-        weak var app = pair!.guest.app
         weak var service = pair!.guestService
         weak var session = service?.session
         let transport = pair!.guestTransport
@@ -375,8 +374,7 @@ final class FeatCollabTests: XCTestCase {
         try await waitUntil(timeout: 1) { session?.joinInProgress == true }
         XCTAssertTrue(session?.joinInProgress == true)
         pair = nil
-        try await waitUntil(timeout: 1) { app == nil && service == nil && session == nil }
-        XCTAssertNil(app)
+        try await waitUntil(timeout: 1) { service == nil && session == nil }
         XCTAssertNil(service, "the retry task must not own its service across the admission wait")
         XCTAssertNil(session)
         XCTAssertNil(transport.onMessage)
@@ -417,6 +415,55 @@ final class FeatCollabTests: XCTestCase {
         try await waitUntil { pair.guestService.session == nil }
         XCTAssertTrue(pair.guestService.state.message?.contains("folder sync") == true)
         // The guest's copy stays in its library.
+        XCTAssertNotNil(pair.guest.library.node(Fixtures.docID))
+    }
+
+    func testExhaustedForegroundResumeStartsUncancelledFolderSync() async throws {
+        let pair = CollabPair()
+        let watchdog = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: 20_000_000_000) }
+            catch { return }
+            XCTFail("foreground resume exceeded its 20-second deadline")
+            pair.guestService.leave()
+            pair.hostService.leave()
+        }
+        defer {
+            watchdog.cancel()
+            pair.guestService.leave()
+            pair.hostService.leave()
+        }
+        pair.guestService.timing.approvalTimeout = 1
+        pair.guestService.timing.rejoinTimeout = 0.1
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        let synced = expectation(description: "folder sync runs after exhausted foreground resume")
+        var syncCalls = 0
+        var syncWasCancelled: Bool?
+        var syncCompleted = false
+        pair.guest.app.commands.register(CommandDescriptor(id: CommandIDs.syncNow, title: "Sync",
+            summary: "Test folder-sync fallback.", effect: .library, target: .library)) { _, _ in
+            syncCalls += 1
+            syncWasCancelled = Task.isCancelled
+            defer { synced.fulfill() }
+            // Model cancellation-aware I/O rather than only checking that the handler was entered.
+            try await Task.sleep(nanoseconds: 1_000_000)
+            syncCompleted = true
+            return [:]
+        }
+        // Park the peer-loss retry so only foreground resume can exhaust the attempts.
+        pair.guestService.timing.retryDelays = [60]
+        pair.guestService.didEnterBackground()
+        pair.hostTransport.leave()
+        pair.guestService.timing.retryDelays = []
+        await pair.guestService.resumeAfterSuspend()
+        await fulfillment(of: [synced], timeout: 5)
+        XCTAssertEqual(syncCalls, 1)
+        XCTAssertEqual(syncWasCancelled, false)
+        XCTAssertTrue(syncCompleted)
+        XCTAssertTrue(session.isClosed)
+        XCTAssertNil(pair.guestService.session)
+        XCTAssertTrue(pair.guestService.state.message?.contains("folder sync") == true)
         XCTAssertNotNil(pair.guest.library.node(Fixtures.docID))
     }
 

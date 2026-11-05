@@ -3397,11 +3397,11 @@ final class CollabService: ObservableObject {
                 }
             }
             guard !Task.isCancelled else { return }
-            await self?.rejoinExhausted()
+            self?.rejoinExhausted()
         }
     }
 
-    private func rejoinExhausted() async {
+    private func rejoinExhausted() {
         guard let app, let s = session, s.side == .guest, !s.isClosed,
               !(s.phase == .active && s.isConnectedToHost && !s.synchronizationPending) else { return }
         // A folder-synced copy is the host's own document; a received Shared copy is not folder-synced.
@@ -3411,7 +3411,11 @@ final class CollabService: ObservableObject {
             : String(localized: "Couldn't reconnect to the live session. Your copy stays in the Shared folder, and your changes are sent when you join the session again.")
         s.end(reason: reason, notify: false, error: NibError(.unavailable, reason))
         if synced, app.commands.entry(CommandIDs.syncNow) != nil {
-            _ = try? await app.bus.execute(Invocation(command: CommandIDs.syncNow, principal: .user))
+            // Ending the session cancels the retry task. Folder sync must outlive that task.
+            Task { @MainActor [weak app] in
+                guard let app else { return }
+                _ = try? await app.bus.execute(Invocation(command: CommandIDs.syncNow, principal: .user))
+            }
         }
     }
 
