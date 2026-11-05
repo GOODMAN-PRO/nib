@@ -1156,6 +1156,29 @@ final class FeatElementsTests: XCTestCase {
 
     // MARK: Previews
 
+    func testImageThumbnailDecodeMatchesCellScaleCropAndSourceLimit() throws {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let data = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 800, height: 400), format: format)
+            .image { context in
+                UIColor.red.setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 800, height: 400))
+            }.pngData())
+        let frame = Frame(x: 0, y: 0, w: 64, h: 32)
+        let full = Rect(x: 0, y: 0, width: 1, height: 1)
+        let retina = CGAffineTransform(scaleX: 2, y: 2)
+        let cell = try XCTUnwrap(ElementRenderer.imageThumbnail(data, frame: frame, crop: full, transform: retina))
+        XCTAssertEqual(cell.width, 128)
+        XCTAssertEqual(cell.height, 64)
+        let crop = Rect(x: 0, y: 0, width: 0.25, height: 0.25)
+        let cropped = try XCTUnwrap(ElementRenderer.imageThumbnail(data, frame: frame, crop: crop, transform: retina))
+        XCTAssertEqual(cropped.width, 512)
+        let large = try XCTUnwrap(ElementRenderer.imageThumbnail(data,
+            frame: Frame(x: 0, y: 0, w: 2000, h: 1000), crop: full, transform: retina))
+        XCTAssertEqual(large.width, 800, "Never decode more pixels than the source contains")
+        XCTAssertEqual(large.height, 400)
+    }
+
     func testImagePreviewHonoursFlipsMaskAndOrientedCrop() throws {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
