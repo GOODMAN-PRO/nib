@@ -541,6 +541,33 @@ final class NibPluginHostTests: XCTestCase {
         XCTAssertEqual(try kit.text(of: revoked["ref"]?.stringValue ?? ""), "e")
     }
 
+    func testUnansweredHooksHaveABudgetAndAreRemovedAfterRepeatedTimeouts() async throws {
+        let kit = PluginTestKit()
+        kit.registerAddText()
+        let id = "dev.test.slowhook"
+        var pending: [CheckedContinuation<JSONValue, Never>] = []
+        kit.runtime.handlers[id + ".guard"] = { _, _ in
+            await withCheckedContinuation { pending.append($0) }
+        }
+        defer { for continuation in pending { continuation.resume(returning: [:]) } }
+        try await kit.installAndLoad(kit.manifest(id, permissions: ["document:read"], contributes: [
+            "commands": [kit.command(id + ".guard", effect: "read").merging(["longRunning": true])],
+            "commandHooks": [["commands": ["test.*"], "command": .string(id + ".guard")]]
+        ]))
+        for i in 0..<3 {
+            // The outer deadline also bounds the regression test when a fake handler never resumes.
+            let outcome = await Deadline.run(seconds: 3) {
+                try await kit.h.run("test.addText", ["text": .string("line \(i)")])
+            }
+            guard case .finished(.success(let result)) = outcome else { return XCTFail("hook blocked the user command") }
+            XCTAssertEqual(try kit.text(of: result["ref"]?.stringValue ?? ""), "line \(i)")
+        }
+        XCTAssertEqual(pending.count, 3)
+        XCTAssertFalse(kit.h.app.bus.hooks.all.contains { $0.owner == id })
+        _ = try await kit.h.run("test.addText", ["text": "after breaker"])
+        XCTAssertEqual(pending.count, 3, "disabled hooks must not be invoked again")
+    }
+
     /// The on/off switch is written only by plugin.enable: settings.set on it is refused for everyone.
     func testEnablementSettingIsReadOnlyForSettingsSet() async throws {
         let kit = PluginTestKit()

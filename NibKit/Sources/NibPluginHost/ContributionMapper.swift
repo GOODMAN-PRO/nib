@@ -324,24 +324,53 @@ struct ContributionMapper {
     /// and a hook that cannot answer (not running, timed out, lost the scope it reads with) lets the call pass.
     private func mapCommandHooks(_ c: PluginContributions?) {
         let pid = self.pid
+        let budget = PluginHookBudget()
+        let mappedHandle = host?.handle(pid)
         for (i, h) in (c?.commandHooks ?? []).enumerated() {
             let hookCommand = h.command
             var d = CommandHookDescriptor.guarding(id: "\(pid).hook.\(i)", owner: pid, commands: h.commands,
-                                                   order: 1000 + i) { command, params, ctx in
+                                                   order: 1000 + i) { [weak host, weak mappedHandle, weak app] command, params, ctx in
+                guard !budget.disabled, !budget.inFlight else { return nil }
                 let registry = ctx.bus.registry
                 if HookPolicy.isExempt(command, params: params, registry: registry) { return nil }
                 guard let hook = registry.descriptor(hookCommand),
                       hook.scopes.isSubset(of: ctx.bus.gateway.grants(.plugin(pid))) else { return nil }
+                budget.inFlight = true
+                defer { budget.inFlight = false }
                 let r: InvocationResult
                 do {
-                    r = try await ctx.bus.execute(Invocation(command: hookCommand,
-                                                             params: ["command": .string(command), "params": params],
-                                                             principal: .plugin(pid), session: ctx.session, group: ctx.group,
-                                                             dryRun: ctx.dryRun, depth: ctx.depth + 1, readOnly: true,
-                                                             inheritedPolicy: ctx.inheritedPolicy, skipHooks: true))
+                    let outcome = await Deadline.run(seconds: PluginHookBudget.seconds) {
+                        try await ctx.bus.execute(Invocation(command: hookCommand,
+                                                            params: ["command": .string(command), "params": params],
+                                                            principal: .plugin(pid), session: ctx.session, group: ctx.group,
+                                                            dryRun: ctx.dryRun, depth: ctx.depth + 1, readOnly: true,
+                                                            inheritedPolicy: ctx.inheritedPolicy, skipHooks: true))
+                    }
+                    switch outcome {
+                    case .finished(let result): r = try result.get()
+                    case .timedOut: throw NibError(.timeout, "plugin command hook exceeded its time budget")
+                    }
+                    budget.timeouts = 0
                 } catch let error where HookPolicy.letsPass(error) {
+                    if NibError.wrap(error).code == .timeout {
+                        budget.timeouts += 1
+                        if budget.timeouts >= PluginHookBudget.limit {
+                            budget.disabled = true
+                            // A late result from an old mapping must not unregister a reloaded plugin's hooks.
+                            if let mappedHandle = mappedHandle, let current = host?.handle(pid), current === mappedHandle {
+                                ctx.bus.hooks.unregister(owner: pid)
+                                let notice = NibError(.timeout,
+                                    String(localized: "A plugin's command hooks stopped responding and were disabled. Reload the plugin in Settings to try again."))
+                                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                    userInfo: ["command": hookCommand, "error": notice])
+                            }
+                        }
+                    } else { budget.timeouts = 0 }
                     hostLog.error("hook \(hookCommand, privacy: .public) did not answer for \(command, privacy: .public): \(NibError.wrap(error).message, privacy: .public)")
                     return nil
+                } catch {
+                    budget.timeouts = 0
+                    throw error
                 }
                 guard let replaced = r.value["params"], replaced != .null else { return nil }
                 try HookPolicy.checkReplacement(command, original: params, replacement: replaced, registry: registry)
@@ -624,6 +653,16 @@ enum HookPolicy {
         let code = NibError.wrap(error).code
         return code == .unavailable || code == .timeout
     }
+}
+
+/// Shared by all hooks of one mapping; reload creates a fresh budget. Concurrent calls bypass an occupied hook.
+@MainActor
+private final class PluginHookBudget {
+    static let seconds: TimeInterval = 1
+    static let limit = 3
+    var timeouts = 0
+    var inFlight = false
+    var disabled = false
 }
 
 // MARK: - JSON Schema → the flat schema
