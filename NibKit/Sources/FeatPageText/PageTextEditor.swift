@@ -118,6 +118,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         var item: ElementID
         var frame: Frame
         var defaults: TextAttributes
+        var baseline: RichText
     }
 
     private final class WeakEditor {
@@ -142,7 +143,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     /// Undo group of the current typing session: its commits merge into one undo step.
     private var group = NibID.make().raw
     /// Text a finished session sent that has not landed yet (`sending`) or failed to: opening the box shows it.
-    private var unsaved: [ElementID: (text: RichText, sending: Bool)] = [:]
+    private var unsaved: [ElementID: (text: RichText, sending: Bool, baseline: RichText)] = [:]
     /// Text views of finished sessions, left inert over their box until the canvas has drawn the committed text.
     private var ghosts: [ElementID: (view: UIView, page: PageID, frame: Frame, storage: NSTextStorage?)] = [:]
     private var dirty = false
@@ -239,7 +240,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         dropGhost(item.id)                                      // the live view takes over from a finished one
         let restored = unsaved[item.id]                         // a finished session's text that has not landed
         let initial = restored?.text ?? box.text
-        editing = Target(doc: doc, page: page, item: item.id, frame: box.frame, defaults: box.style.defaults)
+        editing = Target(doc: doc, page: page, item: item.id, frame: box.frame, defaults: box.style.defaults,
+                         baseline: restored?.baseline ?? box.text)
         group = NibID.make().raw                                // a new typing session is a new undo step
         dirty = false
         commitFailing = false
@@ -279,7 +281,16 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         pendingBegin = nil
         guard let e = editing, let tv = textView else { return }
         let text = currentRichText()
-        let send = commit && dirty
+        let conflicted = commit && dirty && hasTextConflict
+        if conflicted {
+            // Ending typing must remain possible. Reopening this box restores the draft with its original
+            // baseline, so neither Done nor a later session silently adopts the foreign text as its baseline.
+            unsaved[e.item] = (text, false, e.baseline)
+            if !commitFailing, let host {
+                Self.report(Self.textConflict, command: CommandIDs.itemUpdate, app: host.app)
+            }
+        }
+        let send = commit && dirty && !conflicted
         let group = self.group
         let textStorage = storage                               // the view's text lives as long as it is shown
         editing = nil
@@ -315,12 +326,12 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             showBox(e, dropping: tv)
             return
         }
-        unsaved[e.item] = (text, true)
+        unsaved[e.item] = (text, true, e.baseline)
         let app = host.app
         let session = host.session
         let ref = NodeRef.item(e.doc, e.page, e.item).description
         Task { @MainActor [weak self, weak tv] in
-            let ok = await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app)
+            let ok = await PageTextEditor.send(text, baseline: e.baseline, ref: ref, group: group, session: session, app: app)
             guard let self = self else {
                 tv?.removeFromSuperview()
                 return
@@ -346,7 +357,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             scheduleCommit()
             return
         }
-        unsaved[e.item] = (text, false)                         // never drop the only copy of what was typed
+        unsaved[e.item] = (text, false, e.baseline)             // never drop the only copy of what was typed
         if editing == nil {
             reopen(e, group: group)
         } else {
@@ -805,8 +816,18 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
 
     // MARK: Commit, undo and outside changes
 
+    private static var textConflict: NibError {
+        NibError(.conflict, String(localized: "This text changed elsewhere. Autosave is paused. Your draft remains available in this editor to copy before closing the document."))
+    }
+
+    private var hasTextConflict: Bool {
+        guard let e = editing, let host else { return false }
+        return (try? host.app.workspace.item(e.doc, page: e.page, id: e.item).text?.text) != e.baseline
+    }
+
     private func scheduleCommit() {
         commitTask?.cancel()
+        guard !hasTextConflict else { return }
         commitTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled else { return }
@@ -814,12 +835,12 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         }
     }
 
-    private func commitNow() async {
-        guard dirty, let e = editing, let host = host else { return }
+    func commitNow() async {
+        guard !hasTextConflict, dirty, let e = editing, let host = host else { return }
         dirty = false                                          // typing during the send marks it dirty again
         let text = currentRichText()
         let group = self.group                                 // the session's commits merge into one undo step
-        let ok = await Self.send(text, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
+        let ok = await Self.send(text, baseline: e.baseline, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
                                  session: host.session, app: host.app, quiet: commitFailing)
         commitFailing = !ok
         guard !ok else { return }
@@ -827,7 +848,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             dirty = true                                       // keep the text and try again
             scheduleCommit()
         } else if unsaved[e.item] == nil {                     // typing ended while this was the only copy
-            unsaved[e.item] = (text, false)
+            unsaved[e.item] = (text, false, e.baseline)
             if editing == nil {
                 reopen(e, group: group)
             } else {
@@ -838,9 +859,15 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
 
     /// Writes the typed text. Returns false (after reporting it unless `quiet`) when the commit failed.
     @discardableResult
-    private static func send(_ text: RichText, ref: String, group: String, session: EditorSession?, app: NibApp,
+    private static func send(_ text: RichText, baseline: RichText, ref: String, group: String, session: EditorSession?, app: NibApp,
                              quiet: Bool = false) async -> Bool {
         do {
+            // item.update still needs a transactional expected-text guard in F003. This preflight also
+            // protects final saves and reopened failed drafts from changes already in the workspace.
+            guard case let .item(doc, page, id)? = NodeRef(ref),
+                  try app.workspace.item(doc, page: page, id: id).text?.text == baseline else {
+                throw textConflict
+            }
             let json = try JSONValue.from(text)
             _ = try await app.bus.execute(Invocation(command: CommandIDs.itemUpdate,
                                                      params: ["ref": .string(ref), "patch": ["text": ["text": json]]],
@@ -870,13 +897,23 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                     finish(commit: false)                           // undone, deleted or no longer a page box
                     return
                 }
-                guard cs.group != group else { return }             // this session's own commit
+                guard cs.group != group else {                     // this session's own commit
+                    editing?.baseline = box.text
+                    return
+                }
                 group = NibID.make().raw                            // typing after an outside change is a new step
                 if cs.command == CommandIDs.undo || cs.command == CommandIDs.redo || cs.command == CommandIDs.revertGroup {
                     commitTask?.cancel()                            // the undo wins over typing not yet committed
                     dirty = false
                 }
-                if dirty {                                          // our pending text is newer and wins on commit
+                if dirty {                                          // keep both versions; never autosave over foreign text
+                    if box.text != e.baseline {
+                        commitTask?.cancel()
+                        if !commitFailing, let host {
+                            Self.report(Self.textConflict, command: CommandIDs.itemUpdate, app: host.app)
+                            commitFailing = true
+                        }
+                    }
                     editing?.frame = box.frame
                     layoutTextView()
                 } else {
@@ -895,6 +932,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         let spot = PageTextLayout.spot(at: tv.selectedRange.location, in: s)
         editing?.frame = box.frame
         editing?.defaults = box.style.defaults
+        editing?.baseline = box.text
         trailing = Self.shell(box.text.paragraphs.last ?? Paragraph())
         let fresh = RichTextBridge.attributed(box.text, base: box.style.defaults)
         if !fresh.isEqual(to: s) { install(fresh, selection: (spot, spot)) }

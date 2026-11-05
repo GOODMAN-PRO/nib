@@ -559,6 +559,40 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertEqual(tv.text, "Mine")
     }
 
+    func testPendingAutosavePreservesExternalTextAndLocalDraft() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(FakeItemUpdate.self)
+        let host = FakeCanvasHost(h)
+        let editor = PageTextEditor()
+        editor.attach(to: host)
+        defer { editor.finish(commit: false); editor.detach(from: host) }
+        let (page, id) = try await start(h, page2Ref)
+        let tv = try XCTUnwrap(textView(host))
+        let reports = Counter()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            reports.count += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        XCTAssertTrue(typeText("My pending draft", editor, tv))
+        let ref = NodeRef.item(Fixtures.docID, page, id).description
+        try await h.run(CommandIDs.itemUpdate, ["ref": .string(ref), "patch": ["text": ["text": "Their paragraph"]]])
+        let depth = h.undoDepth(Fixtures.docID)
+        await editor.commitNow() // deterministically exercise the pending debounce, without sleeping
+        editor.finish()
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "Their paragraph")
+        XCTAssertEqual(tv.text, "My pending draft")
+        XCTAssertFalse(h.session.isEditingText, "a conflict must not trap the user in the editor")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        XCTAssertEqual(reports.count, 1)
+        let current = try h.app.workspace.item(Fixtures.docID, page: page, id: id)
+        editor.beginEditing(current, doc: Fixtures.docID, page: page)
+        let reopened = try XCTUnwrap(textView(host))
+        XCTAssertEqual(reopened.text, "My pending draft", "keep the draft available to copy when reopening")
+        XCTAssertTrue(typeText("!", editor, reopened))
+        await editor.commitNow()
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "Their paragraph")
+    }
+
     func testAnInsertThatDoesNotFitIsRejectedAndOffersANewPage() async throws {
         let h = Harness(features: [FeatPageTextFeature.self])
         h.app.commands.register(FakeItemUpdate.self)
