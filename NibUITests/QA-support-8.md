@@ -150,3 +150,11 @@ D:controls-forms#7 confirms Button label Preset, Anthropic and a separate non-ac
 ## C3 - inline playback speeds
 
 D:controls-forms#8 shows inline 0.5x/2x/1x actions and no Speed submenu. Removed only the nonexistent intermediate tap in AudioPlayPauseSeekSkipSettingsAndClose. Each speed still checks Playback Options value. CI must reach all three speed assertions and the remaining playback settings/close checks.
+
+## C4 - Pages control types and Rotate submenu
+
+D:controls-forms#10 correction confirms Show hidden is a Switch, Imported second page a Cell, and the parent Rotate is visible while its children were unobserved. Pages button/tap now match those types in addition to Buttons, keeping visible/hittable selection and enabled taps. selectionAction opens Rotate when its requested leaf is unavailable. Expected hide/restore builtins, imported PDF outline navigation and rotate selection. CI must confirm the inferred leaf in the newly logged menu and the unchanged scope/undo assertions.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Pages rotate selection | Pages Rotate submenu | Which children appear after opening Rotate? One tree and screenshot per test. |

@@ -567,9 +567,15 @@ final class PagesUITests: XCTestCase {
         ui.app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", text)).firstMatch
     }
     private func button(_ text: String, prefix: Bool = false) -> XCUIElement {
-        let query = ui.app.buttons.matching(NSPredicate(format: prefix ? "label BEGINSWITH %@" : "label == %@", text))
-        let matches = query.allElementsBoundByIndex
-        return matches.first { $0.isHittable } ?? matches.first { $0.frame.width > 0 && $0.frame.height > 0 } ?? query.firstMatch
+        let predicate = NSPredicate(format: prefix ? "label BEGINSWITH %@" : "label == %@", text)
+        let queries = [XCUIElement.ElementType.button, .switch, .cell].map {
+            ui.app.descendants(matching: $0).matching(predicate)
+        }
+        let matches = queries.flatMap { $0.allElementsBoundByIndex }.filter { $0.exists }
+        return matches.first { ui.hasVisibleFrame($0) && $0.isHittable }
+            ?? matches.first { ui.hasVisibleFrame($0) }
+            ?? matches.first { $0.frame.width > 0 && $0.frame.height > 0 }
+            ?? matches.first ?? queries[0].firstMatch
     }
     @discardableResult private func require(_ element: XCUIElement, _ message: String = "Required page control missing") throws -> XCUIElement {
         guard element.exists || element.waitForExistence(timeout: 12) else { throw NibUI.Failure.message("\(message): \(element)\n\(ui.app.debugDescription)") }
@@ -675,8 +681,16 @@ final class PagesUITests: XCTestCase {
     }
     private func selectionAction(_ title: String) throws {
         if !button(title).isHittable { try tap("More Actions") }
+        if title.hasPrefix("Rotate "), !button(title).isHittable {
+            try tap("Rotate")
+            if !loggedRotateMenu {
+                loggedRotateMenu = true
+                ui.recordDiagnostics("Pages Rotate submenu")
+            }
+        }
         try tap(title)
     }
+    private var loggedRotateMenu = false
     private func value(_ element: XCUIElement) -> String { element.value as? String ?? "" }
     private func count(_ count: Int) throws {
         try ui.waitForState { $0.pageCount == count }
