@@ -328,7 +328,7 @@ final class PackagePersistence: DocumentPersistence {
             } catch {
                 log.error("write-ahead log of \(doc.raw, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 let payload = StoreStatus.payload("error", "walFailed",
-                                                  "Recent changes could not be logged: \(error.localizedDescription)")
+                                                  String(localized: "Recent changes could not be logged: \(error.localizedDescription)"))
                 DispatchQueue.main.async { events?.emit(payload, doc: doc) }
             }
         }
@@ -416,7 +416,7 @@ final class PackagePersistence: DocumentPersistence {
     private func failed(_ doc: DocumentID, _ error: Error) {
         let e = NibError.wrap(error)
         log.error("saving \(doc.raw, privacy: .public) failed: \(e.message, privacy: .public)")
-        emit(doc, StoreStatus.payload("error", "writeFailed", "Changes could not be saved: \(e.message)"))
+        emit(doc, StoreStatus.payload("error", "writeFailed", String(localized: "Changes could not be saved: \(e.message)")))
         if e.code != .notFound { scheduleWrite(doc) }
     }
 
