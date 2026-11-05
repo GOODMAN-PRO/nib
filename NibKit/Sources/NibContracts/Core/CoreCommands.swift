@@ -38,6 +38,9 @@ struct EditUndo: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01"]], effect: .edit)
 
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
+        guard !(ctx.principal.isUser && ctx.activeSession?.readOnly == true) else {
+            return Output(done: false, label: nil)
+        }
         let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.undoLabel(doc)
         if ctx.dryRun { return Output(done: ctx.bus.history.canUndo(doc), label: label) }
@@ -57,6 +60,9 @@ struct EditRedo: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01"]], effect: .edit)
 
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
+        guard !(ctx.principal.isUser && ctx.activeSession?.readOnly == true) else {
+            return Output(done: false, label: nil)
+        }
         let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.redoLabel(doc)
         if ctx.dryRun { return Output(done: ctx.bus.history.canRedo(doc), label: label) }

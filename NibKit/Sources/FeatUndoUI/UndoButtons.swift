@@ -144,7 +144,7 @@ enum UndoButtons {
                 action.title(session.document.flatMap { action.label(in: history, doc: $0) })
             }
             item.isEnabled = { session in
-                session.document.map { action.isAvailable(in: history, doc: $0) } ?? false
+                !session.readOnly && (session.document.map { action.isAvailable(in: history, doc: $0) } ?? false)
             }
             item.showsInCompactWidth = action == .undo
             return item

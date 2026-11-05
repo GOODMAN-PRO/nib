@@ -155,6 +155,41 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertEqual(undo.resolvedTitle(for: library), "Undo")
     }
 
+    func testReadOnlyBlocksToolbarKeyboardAndDirectUndoRedoButNotOtherPrincipals() async throws {
+        let h = harness()
+        h.app.gateway.grants = { principal in
+            if case .plugin = principal { return [.documentRead, .documentWrite] }
+            return Gateway.defaultGrants(principal)
+        }
+        let original = try title(h, Fixtures.page1)
+        try await setTitle(h, Fixtures.page1, "Keep this title")
+        h.session.readOnly = true
+        let undo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
+        XCTAssertEqual(undo.isEnabled?(h.session), false)
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(UndoButtons.keyID(.undo)))
+        let blocked = try await h.app.bus.execute(key.command, key.resolvedParams(for: h.session), session: h.session)
+        XCTAssertEqual(blocked["done"]?.boolValue, false)
+        XCTAssertEqual(try title(h, Fixtures.page1), "Keep this title")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+
+        let undone = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"], as: .ai("test"))
+        XCTAssertEqual(undone["done"]?.boolValue, true)
+        XCTAssertEqual(try title(h, Fixtures.page1), original)
+        let redo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.redo)))
+        XCTAssertEqual(redo.isEnabled?(h.session), false)
+        let redoKey = try XCTUnwrap(h.app.content.keyCommands.get(UndoButtons.keyID(.redo)))
+        let blockedRedo = try await h.app.bus.execute(redoKey.command, redoKey.resolvedParams(for: h.session), session: h.session)
+        XCTAssertEqual(blockedRedo["done"]?.boolValue, false)
+        XCTAssertEqual(try title(h, Fixtures.page1), original)
+        let redone = try await h.run(CommandIDs.redo, ["doc": "doc:FIXTUREDOC01"], as: .plugin("test"))
+        XCTAssertEqual(redone["done"]?.boolValue, true)
+        XCTAssertEqual(try title(h, Fixtures.page1), "Keep this title")
+        h.session.readOnly = false
+        XCTAssertEqual(undo.isEnabled?(h.session), true)
+        let writable = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(writable["done"]?.boolValue, true)
+    }
+
     /// CreateUITests' QuickNote sequence, using the registered toolbar commands and real stored strokes.
     /// The invoking window must keep its document even when another window is active.
     func testToolbarUndoRedoRetainsStrokeIdentityInTheInvokingDocument() async throws {
