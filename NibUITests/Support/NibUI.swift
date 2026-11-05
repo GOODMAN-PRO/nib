@@ -170,13 +170,16 @@ final class NibUI {
         }
     }
 
-    /// Waits for a target in its actual form, searching both directions until the visible rows stop changing.
+    /// Reveals in the actual form: absent lazy rows home to an edge, then scan in one direction.
     /// Existing callers pass lazy firstMatch queries; the closure overload also supports fresh section-scoped queries.
     func revealFormElement(_ element: XCUIElement) { revealFormElement { element } }
 
     /// Reacquires the target after each scroll and stops at a repeated visible range, avoiding stale virtualized indices.
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         formRevealFailure = nil
+        let revealStarted = Date()
+        var moves = 0
+        defer { logQA("Form reveal timing", "moves=\(moves) seconds=\(Date().timeIntervalSince(revealStarted))") }
         var ancestorClip: CGRect?
         var containerIsTransient = false
         func ancestry(_ target: XCUIElementSnapshot, in root: XCUIElementSnapshot) -> (clip: CGRect, transient: Bool)? {
@@ -370,6 +373,15 @@ final class NibUI {
         var direction: Bool?
         var reversed = false
         var endSignatures: [String] = []
+        // An absent lazy row has no directional evidence. Establish the top edge,
+        // confirmed by an unchanged visible range, then scan only toward the bottom.
+        let lazySearch = initialSnapshot == nil
+        var homing = lazySearch
+        var homeMoves = 0
+        let appFrame = app.frame
+        func hasSlider(_ node: XCUIElementSnapshot) -> Bool {
+            node.elementType == .slider || node.children.contains { hasSlider($0) }
+        }
         for _ in 0..<16 {
             let listFrame = snapshot.frame
             var clippedViewport = NibUITestScrollGeometry.viewport(
@@ -391,25 +403,45 @@ final class NibUI {
             let signature = formVisibleRange(snapshot, viewport: viewport).joined(separator: "\n")
             if !visited.insert(signature).inserted {
                 endSignatures.append(signature)
-                guard !reversed else {
-                    logQA("Form search exhausted", "both ends=\(endSignatures)")
-                    return
+                if lazySearch {
+                    guard homing else {
+                        logQA("Form search exhausted", "one-way scan reached bottom; moves=\(moves)")
+                        return
+                    }
+                    homing = false
+                    visited = [signature]
+                    logQA("Form lazy edge", "top confirmed after \(homeMoves) moves; scanning toward bottom")
+                } else {
+                    guard !reversed else {
+                        logQA("Form search exhausted", "both ends=\(endSignatures)")
+                        return
+                    }
+                    reversed = true
+                    direction = !(direction ?? false)
+                    visited = [signature]
                 }
-                reversed = true
-                direction = !(direction ?? false)
-                visited = [signature]
             }
-            if direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } ?? false }
-            let down = direction ?? false
+            if lazySearch && homing && homeMoves >= 6 {
+                logQA("Form lazy edge unavailable", "Top not confirmed within six bounded moves")
+                return
+            }
+            if !lazySearch && direction == nil { direction = targetFrame.map { $0.midY < viewport.midY } }
+            guard lazySearch || direction != nil else { return }
+            let down = lazySearch ? homing : (direction == true)
             guard let start = formDragStart(snapshot, viewport: viewport, down: down) else { return }
             let end = CGPoint(x: start.x, y: down ? viewport.maxY - 24 : viewport.minY + 24)
             let values = formControlValues(snapshot)
             let wasTransient = containerIsTransient
             logQA("Form drag before", "point=\(start) container=\(listFrame) rows=\(signature)")
             let origin = app.coordinate(withNormalizedOffset: .zero)
-            origin.withOffset(CGVector(dx: start.x - app.frame.minX, dy: start.y - app.frame.minY))
+            let moveStarted = Date()
+            origin.withOffset(CGVector(dx: start.x - appFrame.minX, dy: start.y - appFrame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
-                    CGVector(dx: end.x - app.frame.minX, dy: end.y - app.frame.minY)), withVelocity: .slow, thenHoldForDuration: 0)
+                    CGVector(dx: end.x - appFrame.minX, dy: end.y - appFrame.minY)),
+                       withVelocity: hasSlider(snapshot) ? .slow : (homing ? .fast : .default), thenHoldForDuration: 0)
+            moves += 1
+            if homing { homeMoves += 1 }
+            logQA("Form move timing", "move=\(moves) homing=\(homing) seconds=\(Date().timeIntervalSince(moveStarted))")
             // Library grids can replace their containers while scrolling. Keep the cheap cached query
             // normally, but reacquire it if that container disappears or its snapshot becomes unavailable.
             var nextSnapshot: XCUIElementSnapshot? = list.exists ? (try? list.snapshot()) : nil
@@ -513,7 +545,7 @@ final class NibUI {
         }
         let endY = down ? viewport.maxY - 24 : viewport.minY + 24
         // First pass ignores x: every interactive frame must be at least 32pt away vertically.
-        for y in ys where abs(endY - y) >= 24 {
+        for y in ys where abs(endY - y) >= viewport.height * 0.5 {
             let clearance = blocked.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
             if clearance >= 32 {
                 let point = CGPoint(x: viewport.midX, y: y)
@@ -523,7 +555,7 @@ final class NibUI {
         }
         // Second pass: any row that is 40pt away from every slider and 12pt away from the other holding
         // controls, which in practice is a row of plain buttons or captions.
-        for y in ys where abs(endY - y) >= 24 {
+        for y in ys where abs(endY - y) >= viewport.height * 0.5 {
             let sliderMargin = verticalMargin(sliders, y)
             let holdingMargin = verticalMargin(holding, y)
             if sliderMargin >= 40, holdingMargin >= 12 {
