@@ -1620,6 +1620,29 @@ final class FeatCanvasTests: XCTestCase {
         await waitUntil("tiles at the new level") { renderer.requests.contains { $0.region != nil && $0.scale == newScale } }
     }
 
+    func testLargeHiddenSelectionTraversesPageOnce() {
+        let items = (0..<10_000).map { _ in Item(kind: .shape) }
+        let ids = Set(items.map(\.id))
+        for _ in 0..<2 { // hide and unhide have the same symmetric difference
+            var visits = 0, boundsCalls = 0
+            let sequence = AnySequence<Item> {
+                var iterator = items.makeIterator()
+                return AnyIterator<Item> {
+                    guard let item = iterator.next() else { return nil }
+                    visits += 1
+                    return item
+                }
+            }
+            let dirty = CanvasHostImpl.hiddenBounds(items: sequence, changed: ids) { _ in
+                boundsCalls += 1
+                return Rect(x: Double(boundsCalls), y: 0, width: 1, height: 1)
+            }
+            XCTAssertEqual(visits, 10_000)
+            XCTAssertEqual(boundsCalls, 10_000)
+            XCTAssertEqual(dirty, Rect(x: 1, y: 0, width: 10_000, height: 1))
+        }
+    }
+
     func testHiddenLayersAndHiddenItemsRedrawTheTiles() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let renderer = RecordingRenderer()

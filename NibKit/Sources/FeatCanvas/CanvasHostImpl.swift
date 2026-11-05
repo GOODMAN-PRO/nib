@@ -137,16 +137,23 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
         guard before != ids else { return }
         hiddenItems[page] = ids.isEmpty ? nil : ids
         // Only the tiles under the items that appear or disappear are drawn again.
-        var dirty: Rect?
-        for id in before.symmetricDifference(ids) {
-            guard let item = try? app.workspace.item(documentID, page: page, id: id) else { continue }
-            let r = app.content.paintBounds(for: item)
-            dirty = dirty.map { $0.union(r) } ?? r
-        }
+        let changed = before.symmetricDifference(ids)
+        let items = (try? app.workspace.items(documentID, page: page)) ?? []
+        let dirty = Self.hiddenBounds(items: items, changed: changed) { app.content.paintBounds(for: $0) }
         for id in before.union(ids) {
             if let entry = liveViews[id], entry.page == page { entry.view.isHidden = ids.contains(id) }
         }
         if let dirty = dirty { scrollView.pageViews[page]?.invalidate(dirty) }
+    }
+
+    /// One page traversal, irrespective of the number of selected IDs.
+    static func hiddenBounds<S: Sequence>(items: S, changed: Set<ElementID>, bounds: (Item) -> Rect) -> Rect? where S.Element == Item {
+        var dirty: Rect?
+        for item in items where changed.contains(item.id) {
+            let rect = bounds(item)
+            dirty = dirty.map { $0.union(rect) } ?? rect
+        }
+        return dirty
     }
 
     func invalidate(page: PageID, rect: Rect?) {
