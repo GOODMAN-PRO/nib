@@ -4,6 +4,62 @@ import NibContracts
 
 @MainActor
 final class PrivateLessonPersistenceTests: XCTestCase {
+    func testPrivateHeadCacheAvoidsIdleWriterReadsAndTracksHeadChanges() throws {
+        let base = LessonMetadataPersistence()
+        defer { try? FileManager.default.removeItem(at: base.memory.root) }
+        let root = base.memory.root.appendingPathComponent("private")
+        var snapshot = largeSnapshot("PRESENT_HEADCACHE")
+        let doc = snapshot.content.meta.id, page = snapshot.content.pages[0].id
+        let seed = PrivateLessonPersistence(base: base, root: root)
+        try seed.seed(snapshot)
+        var reads = 0
+        let store = PrivateLessonPersistence(base: base, root: root, readHead: { url in
+            reads += 1
+            return try PrivateLessonFiles.head(at: url)
+        })
+        for _ in 0..<3 {
+            XCTAssertEqual(try store.loadHead(doc), snapshot.content)
+            XCTAssertEqual(try store.peekHead(doc), snapshot.content)
+            XCTAssertFalse(store.isReadOnly(doc))
+            store.didChange(doc, head: nil, pages: [page: []])
+            store.flush(doc)
+        }
+        XCTAssertEqual(reads, 1, "page-only edits with an idle writer must reuse the head")
+        snapshot.content.meta.layers[0].name = "Changed head"
+        store.didChange(doc, head: snapshot.content, pages: [:])
+        store.flush(doc)
+        XCTAssertEqual(try store.peekHead(doc), snapshot.content)
+        snapshot.content.meta.layers[0].name = "Reseeded head"
+        try store.seed(snapshot)
+        XCTAssertEqual(try store.loadHead(doc), snapshot.content)
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(store.retainedPageCount, 0, "the cache retains no page payloads")
+    }
+
+    func testSuccessfulManifestWriteSweepsCrashOrphansOnly() throws {
+        let base = LessonMetadataPersistence()
+        defer { try? FileManager.default.removeItem(at: base.memory.root) }
+        let store = PrivateLessonPersistence(base: base, root: base.memory.root.appendingPathComponent("private"))
+        let snapshot = largeSnapshot("PRESENT_ORPHANS")
+        let doc = snapshot.content.meta.id
+        try store.seed(snapshot)
+        let folder = store.package(doc)
+        let orphan = folder.appendingPathComponent("page-crash-orphan.json")
+        let asset = folder.appendingPathComponent("attachment.json")
+        try Data("orphan".utf8).write(to: orphan)
+        try Data("keep".utf8).write(to: asset)
+        store.didChange(doc, head: nil, pages: [snapshot.content.pages[0].id: []])
+        store.flush(doc)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+        XCTAssertEqual(try Data(contentsOf: asset), Data("keep".utf8))
+        let pageFiles = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasPrefix("page-") && $0.hasSuffix(".json") }
+        XCTAssertEqual(pageFiles.count, 500)
+        for page in snapshot.content.pages.dropFirst() {
+            XCTAssertEqual(try store.loadItems(doc, page: page.id), snapshot.items[page.id])
+        }
+    }
+
     func testSavedPrivatePagesAreReleasedWithoutWorkspaceCloseOrFlush() async throws {
         let base = LessonMetadataPersistence()
         defer { try? FileManager.default.removeItem(at: base.memory.root) }

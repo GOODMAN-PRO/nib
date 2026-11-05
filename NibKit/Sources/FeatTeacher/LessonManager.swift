@@ -199,6 +199,7 @@ private struct PrivateLessonStatusBatch {
 /// Old presentation.json snapshots are migrated on the first successful write, without discarding annotations.
 enum PrivateLessonFiles {
     private static let manifestLock = NSLock()
+    private static let writeLock = NSLock()
     private static func reading<T>(_ body: () throws -> T) rethrows -> T {
         manifestLock.lock(); defer { manifestLock.unlock() }
         return try body()
@@ -209,6 +210,8 @@ enum PrivateLessonFiles {
     }
 
     static func write(_ snapshot: LessonSnapshot, to url: URL) throws {
+        // A second wrapper must not sweep a writer's not-yet-published page files.
+        writeLock.lock(); defer { writeLock.unlock() }
         let folder = url.deletingLastPathComponent()
         var files: [PageID: String] = [:]
         var pages = snapshot.items
@@ -221,7 +224,6 @@ enum PrivateLessonFiles {
                 pages = old.items.merging(pages) { _, new in new }
             }
         }
-        let previous = Set(files.values)
         let valid = Set(snapshot.content.pages.map(\.id))
         files = files.filter { valid.contains($0.key) }
         var created: [URL] = []
@@ -243,7 +245,9 @@ enum PrivateLessonFiles {
             throw error
         }
         // Taking the manifest lock waited for old readers to finish. New readers only see the new files.
-        for name in previous.subtracting(Set(files.values)) {
+        let referenced = Set(files.values)
+        let candidates = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        for name in candidates where name.hasPrefix("page-") && name.hasSuffix(".json") && !referenced.contains(name) {
             try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
         }
     }
@@ -353,12 +357,14 @@ private final class PrivateLessonWrites {
 final class PrivateLessonPersistence: DocumentPersistence {
     let base: DocumentPersistence
     let root: URL
-    // Metadata tokens only; saved heads and page payloads belong to the workspace, not this wrapper.
+    // Heads only; saved page payloads belong to the workspace, not this wrapper.
     private var generations: [DocumentID: UInt64] = [:]
+    private var heads: [DocumentID: DocumentContent] = [:]
     private let writer = DispatchQueue(label: "app.nib.teacherlessons.private")
     private let log = Logger(subsystem: "app.nib", category: "teacherlessons")
 
     private let writes: PrivateLessonWrites
+    private let readHead: (URL) throws -> DocumentContent
     private let report: (DocumentID, String?) -> Void
     private var deliveredStatusSequence = 0
     private var reportedErrors: [DocumentID: String] = [:]
@@ -366,8 +372,10 @@ final class PrivateLessonPersistence: DocumentPersistence {
     init(base: DocumentPersistence, root: URL,
          write: @escaping (LessonSnapshot, URL) throws -> Void = { snapshot, url in
              try PrivateLessonFiles.write(snapshot, to: url)
-         }, report: @escaping (DocumentID, String?) -> Void = { _, _ in }) {
+         }, readHead: @escaping (URL) throws -> DocumentContent = { try PrivateLessonFiles.head(at: $0) },
+         report: @escaping (DocumentID, String?) -> Void = { _, _ in }) {
         self.base = base; self.root = root
+        self.readHead = readHead
         self.writes = PrivateLessonWrites(write: write); self.report = report
     }
     func pendingSnapshot(_ doc: DocumentID) -> LessonSnapshot? { writes.snapshot(doc) }
@@ -414,17 +422,17 @@ final class PrivateLessonPersistence: DocumentPersistence {
             writes.recordStatus(doc, error: nil)
         }
         generations[doc, default: 0] &+= 1
+        heads[doc] = snapshot.content
         reportStatus()
     }
     private func head(_ doc: DocumentID) throws -> DocumentContent {
-        try writes.locked {
-            if let value = writes.snapshot(doc) { return value.content }
-            let url = package(doc).appendingPathComponent("presentation.json")
-            guard FileManager.default.fileExists(atPath: url.path) else { throw NibError.notFound("private presentation \(doc.raw)") }
-            let content = try PrivateLessonFiles.head(at: url)
-            if generations[doc] == nil { generations[doc] = 0 }
-            return content
-        }
+        if let content = heads[doc] { return content }
+        let url = package(doc).appendingPathComponent("presentation.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { throw NibError.notFound("private presentation \(doc.raw)") }
+        let content = try readHead(url)
+        if generations[doc] == nil { generations[doc] = 0 }
+        heads[doc] = content
+        return content
     }
     func loadHead(_ doc: DocumentID) throws -> DocumentContent {
         if LessonManager.isPrivate(doc) { return try head(doc) }
@@ -457,6 +465,7 @@ final class PrivateLessonPersistence: DocumentPersistence {
         do {
             // Read only the head, even for a page-only edit; unchanged pages never enter the queue.
             let content = try head ?? self.head(doc)
+            heads[doc] = content
             let value = LessonSnapshot(content: content, items: pages)
             generations[doc, default: 0] &+= 1
             let url = package(doc).appendingPathComponent("presentation.json"), writes = self.writes

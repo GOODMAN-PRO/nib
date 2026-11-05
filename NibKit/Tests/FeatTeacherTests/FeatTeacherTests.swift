@@ -322,6 +322,14 @@ final class FeatTeacherTests: XCTestCase {
     // MARK: answerZone.revealHint
 
     func testRevealHintOneAtATimeRecordsUsageThatUndoCannotErase() async throws {
+        // U1 / round-1 review: this regression remains required. The out-of-lane fix belongs in
+        // NibContracts/Core/Bus.swift commit(_:label:command:record:) and Core/Undo.swift rebase(_:).
+        // For a non-undoable local write, exclude a recordKey from the rebase when any undo
+        // mutation created that record (beforeRev == nil). Leave ALL entries for that key stale,
+        // so selective undo conflicts instead of deleting the zone or reverting its usage.
+        // Add this history query/filter to the Bus commit path only: genuine undo/redo/revert
+        // revision rebasing must keep its current behavior. Preserve the two usage
+        // records and the existing undo depth/assertions below; do not make reveal undoable.
         let h = harness()
         let ref = try await create(h)
         let depth = h.undoDepth(Fixtures.docID)
