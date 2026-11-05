@@ -108075,6 +108075,95 @@
         }
       }
     },
+    "Document records" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dokumentdatensätze"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Registros del documento"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enregistrements du document"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Record del documento"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "書類レコード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "문서 레코드"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Documentrecords"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rekordy dokumentu"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Registros do documento"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Записи документа"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dokumentposter"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Belge kayıtları"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "文稿记录"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "文件記錄"
+          }
+        }
+      }
+    },
     "Document storage" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -126731,6 +126820,184 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "全部輸出…"
+          }
+        }
+      }
+    },
+    "Export completed without %lld unreadable assets in document records. See Export Report.txt in the archive." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export abgeschlossen ohne %lld nicht lesbare Ressourcen in Dokumentdatensätzen. Siehe Export Report.txt im Archiv."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportación completada sin %lld recursos ilegibles en los registros del documento. Consulta Export Report.txt en el archivo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportation terminée sans %lld ressources illisibles dans les enregistrements du document. Consultez Export Report.txt dans l’archive."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esportazione completata senza %lld risorse illeggibili nei record del documento. Consulta Export Report.txt nell’archivio."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "書類レコード内の読み込めないアセット%lld個を除いて書き出しが完了しました。アーカイブ内のExport Report.txtを参照してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "문서 레코드에서 읽을 수 없는 에셋 %lld개를 제외하고 내보내기를 완료했습니다. 아카이브의 Export Report.txt를 확인하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export voltooid zonder %lld onleesbare bestanden in documentrecords. Zie Export Report.txt in het archief."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eksport ukończony bez %lld nieczytelnych zasobów w rekordach dokumentu. Zobacz Export Report.txt w archiwum."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportação concluída sem %lld recursos ilegíveis nos registros do documento. Consulte Export Report.txt no arquivo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Экспорт завершен без нечитаемых ресурсов (%lld) в записях документа. См. Export Report.txt в архиве."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exporten slutfördes utan %lld oläsbara resurser i dokumentposter. Se Export Report.txt i arkivet."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dışa aktarma, belge kayıtlarındaki okunamayan %lld varlık olmadan tamamlandı. Arşivdeki Export Report.txt dosyasına bakın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出已完成，但未包含文稿记录中 %lld 个无法读取的素材。请查看归档中的 Export Report.txt。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸出已完成，但未包含文件記錄中 %lld 個無法讀取的素材。請查看封存檔中的 Export Report.txt。"
+          }
+        }
+      }
+    },
+    "Export completed without %lld unreadable assets on pages %@. See Export Report.txt in the archive." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export abgeschlossen ohne %lld nicht lesbare Ressourcen auf den Seiten %@. Siehe Export Report.txt im Archiv."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportación completada sin %lld recursos ilegibles en las páginas %@. Consulta Export Report.txt en el archivo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportation terminée sans %lld ressources illisibles sur les pages %@. Consultez Export Report.txt dans l’archive."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esportazione completata senza %lld risorse illeggibili nelle pagine %@. Consulta Export Report.txt nell’archivio."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "読み込めないアセット%lld個（ページ：%@）を除いて書き出しが完了しました。アーカイブ内のExport Report.txtを参照してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽을 수 없는 에셋 %lld개(페이지: %@)를 제외하고 내보내기를 완료했습니다. 아카이브의 Export Report.txt를 확인하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export voltooid zonder %lld onleesbare bestanden op pagina’s %@. Zie Export Report.txt in het archief."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eksport ukończony bez %lld nieczytelnych zasobów na stronach %@. Zobacz Export Report.txt w archiwum."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exportação concluída sem %lld recursos ilegíveis nas páginas %@. Consulte Export Report.txt no arquivo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Экспорт завершен без нечитаемых ресурсов (%lld) на страницах %@. См. Export Report.txt в архиве."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exporten slutfördes utan %lld oläsbara resurser på sidorna %@. Se Export Report.txt i arkivet."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dışa aktarma, okunamayan %lld varlık olmadan tamamlandı (sayfalar: %@). Arşivdeki Export Report.txt dosyasına bakın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出已完成，但未包含 %lld 个无法读取的素材（页面：%@）。请查看归档中的 Export Report.txt。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸出已完成，但未包含 %lld 個無法讀取的素材（頁面：%@）。請查看封存檔中的 Export Report.txt。"
           }
         }
       }
@@ -336377,7 +336644,7 @@
       }
     },
     "The asset %@ could not be read. Download it and try exporting again." : {
-      "extractionState" : "manual",
+      "extractionState" : "stale",
       "localizations" : {
         "de" : {
           "stringUnit" : {
@@ -336461,6 +336728,95 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "無法讀取素材 %@。請下載後再試一次輸出。"
+          }
+        }
+      }
+    },
+    "The asset %@ is missing, not downloaded, or unreadable. Restore it or download it before exporting this page." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Ressource %@ fehlt, wurde nicht geladen oder ist nicht lesbar. Stelle sie wieder her oder lade sie, bevor du diese Seite exportierst."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El recurso %@ falta, no se ha descargado o no se puede leer. Restáuralo o descárgalo antes de exportar esta página."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La ressource %@ est manquante, non téléchargée ou illisible. Restaurez-la ou téléchargez-la avant d’exporter cette page."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La risorsa %@ è mancante, non scaricata o illeggibile. Ripristinala o scaricala prima di esportare questa pagina."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "アセット %@ が見つからないか、ダウンロードされていないか、読み込めません。このページを書き出す前に復元またはダウンロードしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에셋 %@이(가) 없거나 다운로드되지 않았거나 읽을 수 없습니다. 이 페이지를 내보내기 전에 복원하거나 다운로드하십시오."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het bestand %@ ontbreekt, is niet gedownload of is onleesbaar. Zet het terug of download het voordat je deze pagina exporteert."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zasobu %@ brakuje, nie został pobrany lub jest nieczytelny. Przywróć go lub pobierz przed wyeksportowaniem tej strony."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O recurso %@ está ausente, não foi baixado ou está ilegível. Restaure-o ou baixe-o antes de exportar esta página."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ресурс %@ отсутствует, не загружен или не читается. Восстановите или загрузите его перед экспортом этой страницы."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resursen %@ saknas, är inte hämtad eller går inte att läsa. Återställ eller hämta den innan du exporterar den här sidan."
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ varlığı eksik, indirilmemiş veya okunamıyor. Bu sayfayı dışa aktarmadan önce geri yükleyin veya indirin."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "素材 %@ 缺失、未下载或无法读取。请先恢复或下载，再导出此页面。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "素材 %@ 遺失、未下載或無法讀取。請先復原或下載，再輸出此頁面。"
           }
         }
       }
