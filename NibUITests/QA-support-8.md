@@ -186,3 +186,7 @@ D:controls-menus#4 correction / D:app-round-4#7 show Size stopped at y869.5 belo
 ## C10 - clear outside selected content
 
 D:keyboard-and-state#3 correction proves the fixed clear tap is inside the comment-extended selection, not on its pin. Selection clear now obtains current selection bounds and chooses a canvas point outside them with a 12pt margin; no candidate fails explicitly. The selectionCount==0 wait remains. Expected FilterCommentsIndependently; CI must reach its filter loop with a real cleared selection and retain all other filter results.
+
+## C11 - settle deselection before page-text chord
+
+D:keyboard-and-state#4 proves selectionCount changed 5->0 during chord focus preparation after outside. Added the bounded zero-selection wait at that exact PageTypingUsesMarginsAndReusesItsBoxWithPresets transition. Chord invariants remain strict. CI must send Cmd-Option-T after deselection and retain the single-box/content/frame assertions.

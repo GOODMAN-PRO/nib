@@ -512,6 +512,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((frame["y"] as? Double) ?? 0, 0)
         XCTAssertLessThan((frame["w"] as? Double) ?? 595, 595)
         outside()
+        _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         try ui.chord("t", [.command, .alternate]) { _ = try self.control("Page text", .textView) }
         let reopened = try control("Page text", .textView)
         XCTAssertTrue((reopened.value as? String)?.contains("Full page report") == true)
