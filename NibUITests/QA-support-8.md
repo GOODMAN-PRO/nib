@@ -206,3 +206,7 @@ D:app-round-4#10 / keyboard-and-state#9 show repeated typing without focus on th
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Canvas Go to Page callers | Go to Page focus / focus retap / focus failed | Was autofocus present, did one tap acquire focus, or was one bounded retap needed? Failure includes screenshot. |
+
+## C15 - Pages thumbnail and persistence readiness
+
+S:singles-rest#2 correction places the caption-inclusive centre on the pen options edge; tapThumb now restricts contact to the upper image centre and passes visible Tools/preset-strip frames as obstructions. S:#1 unbookmark now waits on a successful persisted-page read (a read failure cannot count as false). S:#6 correction: Add to Outline waits for a finite stable alert frame on two reads plus keyboard presence before replacement; no interruption monitor. Expected two thumbnail selection/stack tests, bookmark persistence and outline add flow. CI must show two selected pages without New Colour, persisted unbookmark, and no default Cancel during outline typing; interruption cause remains unknown.

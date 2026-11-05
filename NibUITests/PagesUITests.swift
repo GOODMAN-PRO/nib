@@ -403,7 +403,10 @@ final class PagesUITests: XCTestCase {
         try ui.waitForState { $0.page == first }
         try ui.tapCommand("page.setBookmarked")
         try require(label("No bookmarks"))
-        XCTAssertFalse(try live()[0]["bookmarked"] as? Bool ?? false)
+        try wait("Unbookmark must persist on the current page") {
+            guard let pages = try? self.live(), let first = pages.first else { return false }
+            return first["bookmarked"] as? Bool != true
+        }
     }
 
     func testOutlineAddRenameNavigateAndDeleteRetainsPage() throws {
@@ -663,8 +666,18 @@ final class PagesUITests: XCTestCase {
             grid.swipeUp()
         }
         try require(element)
-        guard let viewport = NibUITestScrollGeometry.viewport(scroll: grid.frame, window: ui.app.frame, obstructions: []),
-              let point = NibUITestScrollGeometry.tapPoint(control: element.frame, viewport: viewport) else {
+        let palette = ui.app.otherElements.matching(NSPredicate(format: "label == 'Tools'"))
+            .allElementsBoundByIndex.filter { ui.hasVisibleFrame($0) }.map(\.frame)
+        let options = ui.app.scrollViews.matching(NSPredicate(format: "label ENDSWITH ' presets'"))
+            .allElementsBoundByIndex.filter { ui.hasVisibleFrame($0) }.map(\.frame)
+        let frame = element.frame
+        // The button includes its caption. Restrict contact to the upper image, around its horizontal centre.
+        let imageTarget = CGRect(x: frame.midX - 24, y: frame.minY + frame.height * 0.12,
+                                 width: 48, height: frame.height * 0.30)
+        let corridor = CGRect(x: imageTarget.minX, y: frame.minY, width: imageTarget.width, height: frame.height)
+        guard let viewport = NibUITestScrollGeometry.viewport(scroll: corridor.intersection(grid.frame),
+                  window: ui.app.frame, obstructions: palette + options),
+              let point = NibUITestScrollGeometry.tapPoint(control: imageTarget, viewport: viewport) else {
             throw NibUI.Failure.message("Thumbnail \(number) has no visible tap target")
         }
         ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY)).tap()
@@ -747,7 +760,17 @@ final class PagesUITests: XCTestCase {
     }
     private func addOutline(_ title: String) throws {
         if !(try ui.state().openPanels.contains("outline.tab")) { try tab("Outline", id: "outline.tab") }
-        try tap("Add entry"); try replace(ui.app.alerts.textFields.firstMatch, title); try tap("Add")
+        try tap("Add entry")
+        let alert = ui.app.alerts["Add to Outline"].firstMatch
+        var previous: CGRect?
+        try wait("Outline alert must settle with its keyboard before typing") {
+            guard alert.exists, self.ui.app.keyboards.firstMatch.exists else { previous = nil; return false }
+            let frame = alert.frame
+            guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0 else { previous = nil; return false }
+            defer { previous = frame }
+            return previous == frame
+        }
+        try replace(alert.textFields.firstMatch, title); try tap("Add")
         try wait("Outline entry \(title) must be created") { (try? self.entry(title)) != nil }
     }
     private func outlineMenu(_ title: String, _ action: String, move: Bool = false) throws {
