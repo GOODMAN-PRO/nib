@@ -39,7 +39,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         synchroniseLiquidMode()
         NotificationCenter.default.addObserver(self, selector: #selector(synchroniseLiquidMode),
             name: SettingsStore.didChange, object: app.settings)
-        let focusTap = UITapGestureRecognizer(target: self, action: #selector(reclaimLibraryKeyFocusAfterTap))
+        let focusTap = UITapGestureRecognizer(target: self, action: #selector(reclaimLibraryKeyFocusAfterTap(_:)))
         focusTap.cancelsTouchesInView = false
         focusTap.delaysTouchesBegan = false
         focusTap.delaysTouchesEnded = false
@@ -411,8 +411,22 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
 
-    @objc private func reclaimLibraryKeyFocusAfterTap() {
+    @objc private func reclaimLibraryKeyFocusAfterTap(_ tap: UITapGestureRecognizer) {
         guard !showsDocument else { return }
+        #if DEBUG
+        // Which view takes a library tap: tells a control that ignored its tap from a tap that never reached it.
+        if let window = view.window {
+            let point = tap.location(in: window)
+            var chain: [String] = []
+            var node: UIView? = window.hitTest(point, with: nil)
+            while let current = node, chain.count < 8 {
+                chain.append(String(String(describing: type(of: current)).prefix(70)))
+                node = current.superview
+            }
+            let hit = chain.joined(separator: " < ")
+            NSLog("%@", "[Nib QA tap] library tap point=\(point) hit=\(hit)")
+        }
+        #endif
         // SwiftUI finishes updating button/scroll focus after delivering the tap.
         DispatchQueue.main.async { [weak self] in self?.reclaimKeyFocusIfNeeded() }
     }
