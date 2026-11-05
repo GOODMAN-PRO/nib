@@ -9,6 +9,54 @@ import NibTesting
 
 @MainActor
 final class FeatLibraryUITests: XCTestCase {
+    func testLiveLibraryResizeKeepsGridAndSortAnchorInsideWindow() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        model.liquidMode = .off
+        var frames: [String: CGRect] = [:]
+        let host = UIHostingController(rootView: LibraryRootView(model: model, idiom: .pad)
+            .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 })
+        model.controller = host
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376),
+                     CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376)] {
+            window.frame.size = size
+            host.view.frame = window.bounds
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(100))
+            host.view.layoutIfNeeded()
+            let grid = try XCTUnwrap(frames["content.grid"])
+            let sort = try XCTUnwrap(frames["anchor.library.sort"])
+            XCTAssertGreaterThanOrEqual(grid.minX, 0)
+            XCTAssertLessThanOrEqual(grid.maxX, size.width + 0.5)
+            XCTAssertGreaterThanOrEqual(sort.minX, 0)
+            XCTAssertLessThanOrEqual(sort.maxX, size.width + 0.5)
+            XCTAssertGreaterThanOrEqual(sort.width, NibMetrics.hitTarget)
+        }
+    }
+
+    func testGridWidthUsesCurrentViewportAcrossRotationAndSidebarTransitions() {
+        for (size, inline) in [(CGSize(width: 1376, height: 1032), true),
+                               (CGSize(width: 1032, height: 1376), false),
+                               (CGSize(width: 1376, height: 1032), true)] {
+            let width = LibraryPresentation.gridWidth(viewport: size.width, inlineSidebar: inline,
+                compact: false, compactHeight: false)
+            let expected = size.width - (inline ? NibMetrics.sidebarWidth : 0) - 2 * NibMetrics.libraryGutter
+            XCTAssertEqual(width, expected)
+            XCTAssertLessThanOrEqual(width, size.width)
+        }
+        XCTAssertEqual(LibraryPresentation.gridWidth(viewport: 390, inlineSidebar: false,
+            compact: true, compactHeight: false), 390 - 2 * NibSpacing.l)
+        XCTAssertEqual(LibraryPresentation.gridWidth(viewport: 844, inlineSidebar: false,
+            compact: true, compactHeight: true), 844 - 3 * NibSpacing.l - LibraryPresentation.actionPairWidth)
+        XCTAssertEqual(LibraryPresentation.gridWidth(viewport: 0, inlineSidebar: true,
+            compact: false, compactHeight: false), 0)
+    }
+
     func testRecognizedLiftRejectsNativeMenuUntilTheNextTouch() {
         let card = LibraryItemTouchView()
         let interaction = UIContextMenuInteraction(delegate: card)

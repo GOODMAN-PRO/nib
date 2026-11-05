@@ -253,7 +253,16 @@ final class LibraryViewModel: ObservableObject {
         return result
     }
     func perform(_ id: String, _ params: JSONValue = [:]) { app.perform(id, params, session: session) }
-    func setView(_ params: JSONValue) { perform(CommandIDs.librarySetView, params) }
+    func setView(_ params: JSONValue) {
+        #if DEBUG
+        if let menu = params["menu"]?.stringValue {
+            let window = controller?.viewIfLoaded?.window
+            let anchor = menuAnchors["library." + menu]
+            NSLog("%@", "[Library menu diagnostic] action menu=\(menu) anchor=\(String(describing: anchor)) window=\(String(describing: window?.bounds)) key=\(window?.isKeyWindow ?? false)")
+        }
+        #endif
+        perform(CommandIDs.librarySetView, params)
+    }
     func restoreView() {
         let value = app.settings.json(LibraryOrder.viewKey(folder))
         layout = LibraryLayout(rawValue: value?["layout"]?.stringValue ?? "") ?? .grid
@@ -586,6 +595,11 @@ enum LibraryPresentation {
     static func contentWidth(viewport: CGFloat, inlineSidebar: Bool) -> CGFloat {
         max(0, viewport - (inlineSidebar ? NibMetrics.sidebarWidth : 0))
     }
+    static func gridWidth(viewport: CGFloat, inlineSidebar: Bool, compact: Bool, compactHeight: Bool) -> CGFloat {
+        let gutter = compact ? NibSpacing.l : NibMetrics.libraryGutter
+        let controlLane = compactHeight ? actionPairWidth + NibSpacing.l : 0
+        return max(0, contentWidth(viewport: viewport, inlineSidebar: inlineSidebar) - 2 * gutter - controlLane)
+    }
     static func usesInlineSidebar(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
         !isCompact(size: size, idiom: idiom) && size.width > size.height && size.width >= NibMetrics.librarySidebarBreakpoint
     }
@@ -674,6 +688,8 @@ struct LibraryRootView: View {
                     }
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+                .environment(\.libraryGridWidth, LibraryPresentation.gridWidth(viewport: geometry.size.width,
+                    inlineSidebar: inlineSidebar, compact: compact, compactHeight: short))
                 .background(NibColor.background)
                 if !inlineSidebar && !compact && model.sidebarVisible {
                     HStack { sidebar(compact: false).frame(width: NibMetrics.sidebarWidth); Spacer() }

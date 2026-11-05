@@ -51,7 +51,9 @@ struct LibraryGridView: View {
     @ObservedObject var model: LibraryViewModel
     var compactHeight = false
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @State private var contentWidth: CGFloat = 0
+    @State private var measuredContentWidth: CGFloat = 0
+    @Environment(\.libraryGridWidth) private var viewportWidth
+    private var contentWidth: CGFloat { viewportWidth ?? measuredContentWidth }
     @ScaledMetric(relativeTo: .footnote) private var labelAllowance = NibMetrics.libraryRowPitch - NibMetrics.coverSize.height
     @State private var frames: [String: CGRect] = [:]
     @State private var dragSelection = LibrarySelection()
@@ -114,8 +116,9 @@ struct LibraryGridView: View {
                 }
             }
         }
+        .frame(width: viewportWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredContentWidth = $0 }
     }
     var emptyImportAction: NibAction {
         NibAction(String(localized: "Import"), command: CommandIDs.importPick) {
@@ -234,6 +237,17 @@ struct LibraryGridView: View {
                 model.setView(["selection": "replace", "refs": .array(dragSelection.refs.sorted().map(JSONValue.string))])
             }
             .onEnded { _ in selecting = false; marquee = nil }
+    }
+}
+
+private struct LibraryGridWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+extension EnvironmentValues {
+    var libraryGridWidth: CGFloat? {
+        get { self[LibraryGridWidthKey.self] }
+        set { self[LibraryGridWidthKey.self] = newValue }
     }
 }
 

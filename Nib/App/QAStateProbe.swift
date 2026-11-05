@@ -49,9 +49,17 @@ final class QAStateProbe: UIView {
             // "expression too complex" type-check failure.
             let keyResponder: JSONValue = ShellFocus.firstResponder().map { .string(NSStringFromClass(type(of: $0))) } ?? .null
             let keyResponderIsText: JSONValue = .bool(ShellFocus.isEditingText(in: shell.view.window))
+            let window = shell.view.window
+            let keyWindowState: JSONValue = [
+                "isKey": .bool(window?.isKeyWindow == true),
+                "width": .number(Double(window?.bounds.width ?? 0)),
+                "height": .number(Double(window?.bounds.height ?? 0)),
+                "sceneActivation": .number(Double(window?.windowScene?.activationState.rawValue ?? -1))
+            ]
             let state: JSONValue = [
                 "keyResponder": keyResponder,
                 "keyResponderIsText": keyResponderIsText,
+                "keyWindowState": keyWindowState,
                 "keyLog": .array(NibUITestKeyLog.recent.map(JSONValue.string)),
                 "keyLogTotal": .number(Double(NibUITestKeyLog.total)),
                 "screen": .string(UITestFixture.failure != nil ? "fixtureError" : !UITestFixture.isReady ? "loading" : doc == nil ? "library" : "document"),
