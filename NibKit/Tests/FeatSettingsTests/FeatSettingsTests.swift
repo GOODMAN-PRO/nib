@@ -4,6 +4,7 @@ import SwiftUI
 import UIKit
 import UserNotifications
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatSettings
 
@@ -452,6 +453,32 @@ final class FeatSettingsTests: XCTestCase {
     }
 
     // MARK: Stylus and language
+
+    func testEveryPostureDrawingFitsInsideItsTile() {
+        for size in [CGSize(width: 44, height: 72), CGSize(width: 72, height: 72),
+                     CGSize(width: 120, height: 72)] {
+            let reach = PostureIllustrationGeometry.reach(in: size)
+            let tip = CGPoint(x: size.width / 2, y: size.height / 2)
+            let content = CGRect(origin: .zero, size: size).insetBy(dx: NibSpacing.s, dy: NibSpacing.s)
+            for posture in WritingPosture.all {
+                let palm = posture.palmAngle * .pi / 180
+                let lean = posture.penAngle * .pi / 180
+                let penEnd = CGPoint(x: tip.x + CGFloat(cos(lean)) * reach * 1.3,
+                                     y: tip.y + CGFloat(sin(lean)) * reach * 1.3)
+                XCTAssertTrue(content.contains(penEnd), posture.title)
+                for degree in stride(from: 0, to: 360, by: 15) {
+                    let angle = Double(degree) * .pi / 180
+                    let x = reach + reach * 0.55 * CGFloat(cos(angle))
+                    let y = reach * 0.4 * CGFloat(sin(angle))
+                    let edge = CGPoint(x: tip.x + x * CGFloat(cos(palm)) - y * CGFloat(sin(palm)),
+                                       y: tip.y + x * CGFloat(sin(palm)) + y * CGFloat(cos(palm)))
+                    XCTAssertTrue(content.contains(edge), posture.title)
+                }
+            }
+        }
+        XCTAssertEqual(PostureIllustrationGeometry.reach(in: .zero), 0)
+        XCTAssertEqual(PostureIllustrationGeometry.reach(in: CGSize(width: 8, height: 8)), 0)
+    }
 
     func testWritingPosturesCoverTheEightStoredValues() throws {
         let h = Harness(features: [FeatSettingsFeature.self])

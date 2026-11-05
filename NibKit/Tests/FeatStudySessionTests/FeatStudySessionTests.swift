@@ -260,7 +260,8 @@ final class FeatStudySessionTests: XCTestCase {
             XCTAssertNotNil(model.current)
             for variant in NibSnapshot.Variant.allCases {
                 for size in [CGSize(width: 390, height: 844), CGSize(width: 874, height: 402),
-                             CGSize(width: 768, height: 1_024)] {
+                             CGSize(width: 768, height: 1_024), CGSize(width: 1_032, height: 1_376),
+                             CGSize(width: 1_376, height: 1_032)] {
                     let view = StudySessionView(model: model, smartLearn: learn, close: {}).snapshotContent
                     let fitted = NibSnapshot.fittingSize(view.frame(height: size.height), width: size.width, variant: variant)
                     XCTAssertLessThanOrEqual(fitted.width, size.width + 1)

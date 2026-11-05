@@ -14,7 +14,7 @@ public enum FeatPluginManagerFeature: NibFeature {
             summary: "Saved gallery plugin or content pack, keyed by publisher and plugin id.", owner: id, schema: .bool())
         ManagerCommands.register(app)
         var settings = SettingsPageDescriptor(id: "pluginmanager.plugins", title: String(localized: "Plugins"),
-            icon: NibSymbol.puzzle.name, section: .plugins, order: 0, owner: id) { AnyView(PluginListView(app: $0)) }
+            icon: NibSymbol.puzzle.name, section: .plugins, order: 0, owner: id) { AnyView(PluginListView(app: $0, showsHeader: false)) }
         settings.keywords = ["plugins", "gallery", "developer", "permissions", "content packs"]
         app.ui.settingsPages.register(settings)
         var gallery = PanelDescriptor(id: PanelIDs.gallery, title: String(localized: "Gallery"),

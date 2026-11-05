@@ -258,7 +258,6 @@ final class ShapeTool: CanvasTool {
 
     private let preview = ShapePreviewLayer()
     private var drag: Drag?
-    private var menuOpened = false
     /// The last creation (tests await it).
     private(set) var pendingCreate: Task<Void, Never>?
 
@@ -274,14 +273,13 @@ final class ShapeTool: CanvasTool {
     func activate(_ host: CanvasHost) {
         host.overlayLayer.addSublayer(preview)
         preview.clear()
-        openMenu(host)
+        // The palette exposes the library in its options popover. A separate library panel is opt-in.
     }
 
     func deactivate(_ host: CanvasHost) {
         drag = nil
         preview.clear()
         preview.removeFromSuperlayer()
-        closeMenu(host)
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
@@ -386,35 +384,4 @@ final class ShapeTool: CanvasTool {
         }
     }
 
-    // MARK: Floating shape library
-
-    /// Windows (sessions) whose user closed the library panel the tool had opened: it is not opened for them again.
-    private static var declined: Set<NibID> = []
-
-    /// Opens the library panel (floating, dockable to either edge) on regular-width windows, unless it is already open
-    /// (the user opened or docked it) or the user closed it before in this window; on iPhone and in narrow windows the
-    /// toolbar's settings popover carries the same library.
-    private func openMenu(_ host: CanvasHost) {
-        menuOpened = false
-        let session = host.session
-        guard host.canvasView.traitCollection.horizontalSizeClass != .compact,
-              !session.openPanels.contains(ShapeLibraryMenu.panelID), !Self.declined.contains(session.id),
-              ShapesUI.has(host.app, CommandIDs.panelOpen),
-              host.app.ui.panels.get(ShapeLibraryMenu.panelID) != nil else { return }
-        menuOpened = true
-        host.app.perform(CommandIDs.panelOpen, ["id": .string(ShapeLibraryMenu.panelID)], session: session)
-    }
-
-    /// Closes the panel only when this tool opened it and it is still open; one the user closed is remembered.
-    private func closeMenu(_ host: CanvasHost) {
-        guard menuOpened else { return }
-        menuOpened = false
-        let session = host.session
-        guard session.openPanels.contains(ShapeLibraryMenu.panelID) else {
-            Self.declined.insert(session.id)
-            return
-        }
-        guard ShapesUI.has(host.app, CommandIDs.panelClose) else { return }
-        host.app.perform(CommandIDs.panelClose, ["id": .string(ShapeLibraryMenu.panelID)], session: session)
-    }
 }

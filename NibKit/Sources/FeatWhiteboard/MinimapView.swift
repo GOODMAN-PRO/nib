@@ -690,8 +690,9 @@ struct MinimapMap: View {
             }
         }
         .frame(width: g.size.width, height: g.size.height, alignment: .topLeading)
-        // Keep the edge-to-edge foreground inside the panel at rest; the droplet adds its shrinking body mask.
-        .clipShape(NibDropletShape(cornerRadius: DropletStyle.floatingPanel.cornerRadius))
+        // The paper inset and its outer chrome have concentric corners.
+        .clipShape(NibDropletShape(cornerRadius: NibRadius.concentric(DropletStyle.floatingPanel.cornerRadius,
+                                                                   inset: NibSpacing.s)))
         .contentShape(Rectangle())
         // Panning the viewport takes priority over the floating-panel preset's pickup gesture.
         .highPriorityGesture(DragGesture(minimumDistance: 3)
@@ -719,6 +720,11 @@ struct MinimapMap: View {
         .accessibilityAction(named: Text(String(localized: "Move View Right"))) { model.pan(dx: 1, dy: 0) }
         .accessibilityAction(named: Text(String(localized: "Move View Up"))) { model.pan(dx: 0, dy: -1) }
         .accessibilityAction(named: Text(String(localized: "Move View Down"))) { model.pan(dx: 0, dy: 1) }
+        // The preview keeps the document's paper colour. Leave a semantic chrome surround visible
+        // in either appearance instead of letting white paper cover the entire floating surface.
+        // Padding is outside the gestures so their locations remain in the map's coordinate space.
+        .padding(NibSpacing.s)
+        .background(NibColor.backgroundSecondary)
         .droplet("whiteboard.minimap", style: .floatingPanel)
     }
 }

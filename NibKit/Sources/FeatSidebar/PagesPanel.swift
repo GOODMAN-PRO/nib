@@ -654,6 +654,7 @@ struct PagesPanel: View {
 
 /// Filter chips and Select; in select mode Select All, the count and Done.
 struct PagesPanelHeader: View {
+    @Environment(\.isEnabled) private var isEnabled
     @ObservedObject var model: PagesPanelModel
 
     var body: some View {
@@ -690,7 +691,7 @@ struct PagesPanelHeader: View {
                 }
             }
         }
-        .padding(.horizontal, NibSpacing.m)
+        .padding(.horizontal, NibSpacing.l)
         .padding(.vertical, NibSpacing.xs)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -706,7 +707,14 @@ struct PagesPanelHeader: View {
     }
 
     private var selectButton: some View {
-        NibButton(String(localized: "Select"), kind: .plain, size: .compact) { model.setSelecting(true) }
+        Button { model.setSelecting(true) } label: {
+            Text(String(localized: "Select"))
+                .font(NibFont.button)
+                .foregroundStyle(NibColor.accent)
+                .opacity(isEnabled && !model.rows.isEmpty ? 1 : NibOpacity.disabled)
+                .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget, alignment: .leading)
+        }
+            .buttonStyle(NibPressStyle())
             .disabled(model.rows.isEmpty)
             .accessibilityHint(String(localized: "Choose pages to copy, move, export or trash together"))
     }

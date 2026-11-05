@@ -164,6 +164,13 @@ enum ObjectMenuPlacement {
     /// Below it: past the bottom handles' hit areas.
     static let gapBelow = NibMetrics.hitTarget / 2 + NibSpacing.xs
 
+    /// A freehand lasso can surround much more than the item handles. Keep the action bar outside
+    /// both, so scaling the page cannot move it onto the retained dashed outline.
+    static func exclusionBounds(items: Rect, outline: [Point]?) -> Rect {
+        guard let outline, outline.count >= 3, let lasso = Rect.bounding(outline) else { return items }
+        return items.union(lasso)
+    }
+
     /// The canvas already receives the chrome's reserved insets, including a docked palette and its options.
     @MainActor
     static func viewport(in view: UIView) -> CGRect {

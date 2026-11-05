@@ -417,12 +417,23 @@ struct ExportFormatPicker: View {
     }
 
     private var menu: some View {
-        Picker(String(localized: "Format"), selection: $selection) {
-            ForEach(options, id: \.self) { id in Text(title(id)).tag(id) }
+        Menu {
+            Picker(String(localized: "Format"), selection: $selection) {
+                ForEach(options, id: \.self) { id in Text(title(id)).tag(id) }
+            }
+        } label: {
+            HStack(spacing: NibSpacing.s) {
+                Text(title(selection)).font(NibFont.body)
+                Spacer(minLength: NibSpacing.s)
+                Image(nib: .chevronDown).font(NibFont.footnote).accessibilityHidden(true)
+            }
+            .foregroundStyle(NibColor.label)
+            .padding(.horizontal, NibSpacing.m)
+            .frame(minHeight: NibMetrics.hitTarget)
+            .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field))
         }
-        .pickerStyle(.menu)
-        .font(NibFont.body)
-        .frame(minHeight: NibMetrics.hitTarget)
+        .accessibilityLabel(String(localized: "Format"))
+        .accessibilityValue(title(selection))
     }
 }
 
@@ -525,7 +536,8 @@ struct ExportPopover: View {
     }
     private var title: String { printing ? String(localized: "Print") : String(localized: "Share & Export") }
     @ViewBuilder private var contents: some View {
-        NibIconButton(.xmark, label: String(localized: "Close export options"), size: .round, shortcut: .cancelAction) { close() }
+        // NibPopoverPanel owns the title row. Bud dismissal handles Escape and VoiceOver;
+        // the outside-touch shield also closes the popover without an extra header row.
         ExportDialog(selection: selection, printing: printing, app: app, session: session, dismiss: close, draft: draft)
     }
     private func close() { host.dismiss("exportui.dialog"); host.removeAnchor("exportui.source") }

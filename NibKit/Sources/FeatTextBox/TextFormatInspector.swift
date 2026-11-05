@@ -905,9 +905,15 @@ private struct TextStylesSection: View {
                     }
                 }
             }
-            NibButton(String(localized: "Set as Default for New Text"), kind: .plain, size: .compact) {
+            Button {
                 model.saveAsDefault()
+            } label: {
+                Text(String(localized: "Set as Default for New Text"))
+                    .font(NibFont.button)
+                    .foregroundStyle(NibColor.accent)
+                    .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
             }
+            .buttonStyle(NibPressStyle())
         }
     }
 }
@@ -960,6 +966,7 @@ private struct TextEmphasisSection: View {
             HStack(spacing: NibSpacing.s) {
                 ForEach(TextBoxEditor.Toggle.all, id: \.self) { t in
                     NibIconButton(t.symbol, label: t.title, size: .panel, isOn: model.state.isOn(t)) { model.toggle(t) }
+                        .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
                 }
                 Spacer(minLength: 0)
             }
@@ -979,6 +986,10 @@ private struct TextParagraphSection: View {
                                     title: { TextFormatOptions.alignmentTitle($0) })
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(String(localized: "Alignment"))
+                Text(String(localized: "Line Spacing"))
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.labelSecondary)
+                    .accessibilityHidden(true)
                 NibSegmentedControl(selection: Binding(get: { model.state.lineSpacingOption }, set: { model.setLineSpacing($0) }),
                                     options: LineSpacingOption.allCases,
                                     title: { $0.title })

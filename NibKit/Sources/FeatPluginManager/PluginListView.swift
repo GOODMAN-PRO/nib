@@ -103,33 +103,28 @@ final class PluginManagerModel: ObservableObject {
 struct PluginListView: View {
     let app: NibApp
     var close: (() -> Void)?
+    let showsHeader: Bool
     @StateObject private var model: PluginManagerModel
     @State private var selection: String?
     @State private var showURL = false
     @Environment(\.dynamicTypeSize) private var typeSize
-    init(app: NibApp, close: (() -> Void)? = nil) {
-        self.app = app; self.close = close
+    init(app: NibApp, close: (() -> Void)? = nil, showsHeader: Bool = true) {
+        self.app = app; self.close = close; self.showsHeader = showsHeader
         _model = StateObject(wrappedValue: PluginManagerModel(app: app))
     }
     var body: some View {
         VStack(spacing: 0) {
-            NibPanelHeader(title: String(localized: "Plugins"), symbol: .puzzle, onClose: {
-                app.perform(CommandIDs.panelClose, ["id": .string(ManagerCommands.managerPanel)])
-                close?()
-            }) {
-                Menu {
-                    Button(String(localized: "Install from Files")) { app.perform(ManagerCommands.installFile) }
-                    Button(String(localized: "Install from URL")) { showURL = true }
-                    Button(String(localized: "Browse Gallery")) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) }
-                    .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
-                } label: {
-                    Label { Text(String(localized: "Install from…")) } icon: { Image(nib: .importFile) }
-                        .font(NibFont.button).frame(minHeight: NibMetrics.hitTarget)
+            if showsHeader {
+                NibPanelHeader(title: String(localized: "Plugins"), symbol: .puzzle, onClose: {
+                    app.perform(CommandIDs.panelClose, ["id": .string(ManagerCommands.managerPanel)])
+                    close?()
+                }) { installMenu }
+            } else {
+                HStack {
+                    Spacer(minLength: 0)
+                    installMenu
                 }
-                NibIconButton(.command, label: String(localized: "Open Developer Console"), size: .panel) {
-                    app.perform(CommandIDs.panelOpen, ["id": .string(ManagerCommands.consolePanel)])
-                }
-                .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
+                .padding(.horizontal, NibSpacing.l)
             }
             if let error = model.error { NibBanner(error, style: .warning, action: NibAction(String(localized: "Try Again")) { Task { await refresh() } }) }
             GeometryReader { proxy in
@@ -150,7 +145,7 @@ struct PluginListView: View {
                 }
             }
         }
-        .background(NibColor.backgroundSecondary)
+        .background(NibColor.groupedBackground)
         .frame(idealWidth: NibMetrics.pluginManagerSheetSize.width, idealHeight: NibMetrics.pluginManagerSheetSize.height)
         .tint(NibColor.accent)
         .nibSheet(isPresented: $showURL) { PluginURLSheet(model: model) }
@@ -168,6 +163,22 @@ struct PluginListView: View {
             Task { await model.loadPlugins(); if name == NibSettings.pluginGalleries.name { await model.loadUpdates() } }
         }
     }
+    private var installMenu: some View {
+        Menu {
+            Button(String(localized: "Install from Files")) { app.perform(ManagerCommands.installFile) }
+            Button(String(localized: "Install from URL")) { showURL = true }
+            Button(String(localized: "Browse Gallery")) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) }
+                .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
+            Divider()
+            Button(String(localized: "Open Developer Console")) {
+                app.perform(CommandIDs.panelOpen, ["id": .string(ManagerCommands.consolePanel)])
+            }
+            .accessibilityIdentifier("cmd." + CommandIDs.panelOpen)
+        } label: {
+            Label { Text(String(localized: "Install from…")) } icon: { Image(nib: .importFile) }
+                .font(NibFont.button).frame(minHeight: NibMetrics.hitTarget)
+        }
+    }
     private func refresh() async {
         await model.loadPlugins()
         await model.loadUpdates(refresh: true)
@@ -179,6 +190,7 @@ struct PluginListView: View {
                 NibEmptyState(symbol: .puzzle, title: String(localized: "No plugins yet"),
                     message: String(localized: "Plugins add tools, panels and templates."),
                     primary: NibAction(String(localized: "Browse Gallery"), command: CommandIDs.panelOpen) { app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.gallery)]) })
+                    .listRowBackground(NibColor.backgroundTertiary)
             }
             ForEach(model.plugins) { plugin in
                 HStack(spacing: NibSpacing.s) {
@@ -194,10 +206,12 @@ struct PluginListView: View {
                         model.perform(CommandIDs.pluginEnable, ["id": .string(plugin.id), "enabled": .bool(enabled)])
                     })).labelsHidden().disabled(model.busy || plugin.needsReview)
                 }.padding(.vertical, NibSpacing.xs)
+                    .listRowBackground(NibColor.backgroundTertiary)
             }
             Section(String(localized: "Galleries")) {
                 GallerySettingsView(model: model)
             }
+            .listRowBackground(NibColor.backgroundTertiary)
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)

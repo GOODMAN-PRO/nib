@@ -337,6 +337,7 @@ final class FeatPluginManagerTests: XCTestCase {
         let h = Harness(features: [FeatPluginManagerFeature.self])
         let screens: [(String, AnyView, CGSize)] = [
             ("Plugins", AnyView(PluginListView(app: h.app)), NibMetrics.pluginManagerSheetSize),
+            ("Plugins in Settings", AnyView(PluginListView(app: h.app, showsHeader: false)), NibMetrics.pluginManagerSheetSize),
             ("Gallery", AnyView(GalleryView(app: h.app)), NibMetrics.pluginManagerSheetSize),
             ("Console", AnyView(DevConsoleView(app: h.app, close: {})), NibMetrics.developerConsoleSize)
         ]

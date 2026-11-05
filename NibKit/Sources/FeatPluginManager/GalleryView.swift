@@ -185,9 +185,10 @@ struct GallerySettingsView: View {
     @ObservedObject var model: PluginManagerModel
     @State private var draft = ""
     var body: some View {
-        NibRow(String(localized: "Nib Community"), subtitle: GalleryClient.defaultIndex, icon: .gallery)
+        GallerySourceRow(title: String(localized: "Nib Community"), source: GalleryClient.defaultIndex)
         ForEach(model.galleries, id: \.self) { index in
-            NibRow(URL(string: index)?.host ?? index, subtitle: index, icon: .gallery) {
+            HStack(spacing: NibSpacing.s) {
+                GallerySourceRow(title: URL(string: index)?.host ?? index, source: index)
                 NibIconButton(.trash, label: String(localized: "Remove gallery \(index)"), size: .panel) { update(model.galleries.filter { $0 != index }) }
             }
         }
@@ -201,5 +202,25 @@ struct GallerySettingsView: View {
     private func update(_ values: [String]) {
         let unique = values.reduce(into: [String]()) { if !$0.contains($1) && $1 != GalleryClient.defaultIndex { $0.append($1) } }
         model.perform(CommandIDs.settingsSet, ["name": .string(NibSettings.pluginGalleries.name), "value": .array(unique.map(JSONValue.string))])
+    }
+}
+
+/// Keep the source inspectable without splitting a URL path across several lines.
+private struct GallerySourceRow: View {
+    let title: String
+    let source: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: NibSpacing.xxs) {
+            Text(title).font(NibFont.body).foregroundStyle(NibColor.label)
+            Text(source)
+                .font(NibFont.caption1)
+                .foregroundStyle(NibColor.labelSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .help(source)
     }
 }

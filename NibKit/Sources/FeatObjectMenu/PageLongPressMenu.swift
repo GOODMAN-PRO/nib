@@ -383,7 +383,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             scheduleReshow()
             return
         }
-        let viewRect = ScreenshotSharing.viewRect(facts.bounds, page: facts.page, host: host)
+        let menuBounds = ObjectMenuPlacement.exclusionBounds(items: facts.bounds, outline: host.session.selection.outline)
+        let viewRect = ScreenshotSharing.viewRect(menuBounds, page: facts.page, host: host)
         guard let target = host.session.floatingHost else {
             // The canvas can restore a selection before the document chrome publishes its floating host.
             // That weak property emits no event, so keep recovery pending even when page geometry is ready.
