@@ -336,6 +336,7 @@ final class CollabMergeTests: XCTestCase {
                                    snapshot: CollabMessage.Snapshot(doc: Fixtures.docID, title: "Big", kind: .notebook,
                                                                     format: .package, content: nil))
         header.blob = CollabMessage.Blob(id: CollabCode.hex(id), bytes: prepared.bytes, sha256: prepared.sha256)
+        header.syncID = "catch-up-attempt"
         let headerFrames = try CollabFrames.frames(for: header)
         XCTAssertEqual(headerFrames.count, 1)
         XCTAssertLessThan(headerFrames[0].count, 1024, "the package bytes are not inside the JSON")
@@ -349,6 +350,11 @@ final class CollabMergeTests: XCTestCase {
         var wire = headerFrames[0].count
         var peakBatch = 0
         var arrived: URL?
+        var progressCount = 0
+        let progress: (CollabMessage) -> Void = { message in
+            XCTAssertEqual(message.syncID, "catch-up-attempt")
+            progressCount += 1
+        }
         var next = 0
         while next < count {
             let range = next..<min(next + CollabFrames.blobBatch, count)
@@ -357,9 +363,14 @@ final class CollabMergeTests: XCTestCase {
             for frame in frames {
                 wire += frame.count
                 XCTAssertLessThanOrEqual(frame.count, CollabFrames.maxFrameBytes)
-                if case let .blob(m, url)? = try assembler.feed(frame, from: "host", trusted: true) {
+                if case let .blob(m, url)? = try assembler.feed(frame, from: "host", trusted: true,
+                                                               blobProgress: progress) {
                     XCTAssertEqual(m.kind, .snapshot)
                     arrived = url
+                }
+                if progressCount == 1 {
+                    XCTAssertNil(try assembler.feed(frame, from: "host", trusted: true, blobProgress: progress))
+                    XCTAssertEqual(progressCount, 1, "duplicate bytes are not synchronization progress")
                 }
                 // Nothing of the blob is held in memory while it arrives.
                 XCTAssertEqual(assembler.pendingBytes, 0)
@@ -376,6 +387,7 @@ final class CollabMergeTests: XCTestCase {
         XCTAssertEqual(received.bytes, size)
         XCTAssertEqual(received.sha256, prepared.sha256)
         XCTAssertEqual(assembler.pendingBlobs, 0)
+        XCTAssertEqual(progressCount, count)
     }
 
     func testBlobsAreAcceptedOnlyWhenExpected() throws {

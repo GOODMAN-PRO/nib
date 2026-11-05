@@ -488,6 +488,8 @@ struct CollabMessage: Codable {
     var denial: Denial? = nil
     var blob: Blob? = nil
     var asset: Asset? = nil
+    /// Identifies a digest exchange; ordinary live traffic must not extend its deadline.
+    var syncID: String? = nil
 }
 
 // MARK: - Frames
@@ -689,7 +691,8 @@ enum CollabFrames {
         /// missing (or when a blob frame belongs to nothing expected). Throws on frames that are not Nib's or break the
         /// limits (the peer's half-received messages are then dropped).
         func feed(_ frame: Data, from peer: String, trusted: Bool, now: Date = Date(),
-                  blobPolicy: (CollabMessage) -> Int? = { _ in nil }) throws -> Output? {
+                  blobPolicy: (CollabMessage) -> Int? = { _ in nil },
+                  blobProgress: (CollabMessage) -> Void = { _ in }) throws -> Output? {
             purge(now)
             let header = [UInt8](frame.prefix(CollabFrames.partHeaderBytes))
             guard header.count >= CollabFrames.prefixBytes, header[0] == CollabFrames.magic else {
@@ -705,7 +708,9 @@ enum CollabFrames {
                     throw NibError(.permissionDenied, "a large message from someone who isn't in the live session")
                 }
             }
-            if flags & CollabFrames.blobFlag != 0 { return try blobPart(frame, header: header, from: peer, now: now) }
+            if flags & CollabFrames.blobFlag != 0 {
+                return try blobPart(frame, header: header, from: peer, now: now, progress: blobProgress)
+            }
             let message: CollabMessage
             if flags & CollabFrames.partFlag == 0 {
                 message = try whole(frame, header: header, flags: flags,
@@ -823,7 +828,8 @@ enum CollabFrames {
             return nil
         }
 
-        private func blobPart(_ frame: Data, header: [UInt8], from peer: String, now: Date) throws -> Output? {
+        private func blobPart(_ frame: Data, header: [UInt8], from peer: String, now: Date,
+                              progress: (CollabMessage) -> Void) throws -> Output? {
             guard header.count >= CollabFrames.blobHeaderBytes else { throw NibError.invalid("truncated collaboration frame") }
             let id = CollabCode.hex(header[3..<19])
             // Frames of a blob nobody announced (or one that was refused) are dropped without a word.
@@ -844,6 +850,7 @@ enum CollabFrames {
                     throw NibError.wrap(error)
                 }
                 incoming.received.insert(index)
+                progress(incoming.message)
             }
             incoming.touched = now
             guard incoming.received.count == incoming.count else {
@@ -1251,6 +1258,7 @@ final class CollabSession {
     private var readyTimer: Task<Void, Never>?
     private var syncTimer: Task<Void, Never>?
     private var syncProgressAt = Date()
+    private var synchronizationID: String?
     private let log = Logger(subsystem: "app.nib", category: "collab")
 
     /// A host session for `doc`.
@@ -1409,6 +1417,9 @@ final class CollabSession {
         guard !isClosed else { return }
         // Closed first, so nothing the others do while they hear about it (leaving, answering) reaches this session.
         isClosed = true
+        syncTimer?.cancel()
+        syncTimer = nil
+        synchronizationPending = false
         if notify {
             switch side {
             case .host:
@@ -1543,10 +1554,17 @@ final class CollabSession {
         // Frames are assembled at once (a blob's frames go straight to disk); what they complete is delivered in order.
         do {
             if let out = try assembler.feed(data, from: peer.id, trusted: isTrusted(peer),
-                                            blobPolicy: { m in self.blobAllowance(m, from: peer) }) {
+                                            blobPolicy: { m in self.blobAllowance(m, from: peer) },
+                                            blobProgress: { m in
+                                                guard self.side == .guest, peer.id == self.hostPeer?.id,
+                                                      m.session == self.id else { return }
+                                                if (m.kind == .snapshot && self.phase == .receiving)
+                                                    || (m.syncID != nil && m.syncID == self.synchronizationID) {
+                                                    self.syncProgress()
+                                                }
+                                            }) {
                 deliveries.append((peer, out))
             }
-            if side == .guest, peer.id == hostPeer?.id { syncProgress() }
         } catch {
             log.error("collab: dropped a frame from \(peer.id, privacy: .public): \(NibError.wrap(error).message, privacy: .public)")
         }
@@ -1640,7 +1658,7 @@ final class CollabSession {
             broadcastPatch(m, patch: patch, except: pid)
         case .sync:
             guard p.state == .active, let digest = m.digest else { return }
-            answerSync(digest, to: pid)
+            answerSync(digest, to: pid, syncID: m.syncID)
         case .needSnapshot:
             guard p.state == .active else { return }
             sendSnapshot(to: pid)
@@ -1765,6 +1783,16 @@ final class CollabSession {
                 guard phase == .active, let patch = m.patch, authorMayEdit(m.from) else { return }
                 applyRemote(patch, author: m.from)
             case .syncReply:
+                guard synchronizationPending, readyWaiter != nil,
+                      m.syncID == nil || m.syncID == synchronizationID else { return }
+                if let reason = m.reason {
+                    catchUps[.host]?.cancel()
+                    hasUnsentChanges = true
+                    service.notice(reason)
+                    resolveReady(NibError(.unavailable, reason))
+                    return
+                }
+                syncProgress()
                 if let digest = m.digest { knownAssets[.host] = Set(digest.assets) }
                 if let patch = m.patch { applyRemote(patch, author: m.from) }
                 if let digest = m.digest {
@@ -1793,6 +1821,7 @@ final class CollabSession {
         readyTimer?.cancel()
         readyTimer = nil
         synchronizationPending = true
+        synchronizationID = UUID().uuidString
         startSyncDeadline()
         id = session
         hostPeer = peer
@@ -1969,7 +1998,7 @@ final class CollabSession {
 
     /// Sends the files among `names` that this device holds and `route` isn't known to hold, ahead of whatever is
     /// posted to the route next.
-    private func sendFiles(_ names: Set<String>, to route: Route) {
+    private func sendFiles(_ names: Set<String>, to route: Route, syncID: String? = nil) {
         guard let doc = localDoc, !names.isEmpty, !isClosed else { return }
         var known = knownAssets[route] ?? []
         var sizes = sentFileSizes[route] ?? [:]
@@ -1984,7 +2013,8 @@ final class CollabSession {
                 continue
             }
             known.insert(name)
-            let header = CollabMessage(kind: .asset, session: id, from: me, asset: CollabMessage.Asset(name: name))
+            let header = CollabMessage(kind: .asset, session: id, from: me,
+                                       asset: CollabMessage.Asset(name: name), syncID: syncID)
             postBlob(header, source: source, copy: isFile, cleanup: nil, to: route)
         }
         knownAssets[route] = known
@@ -2069,12 +2099,12 @@ final class CollabSession {
         _ = send(CollabMessage(kind: .welcome, session: id, from: me, welcome: w, roster: publicRoster), to: pid)
     }
 
-    private func answerSync(_ digest: CollabDigest, to pid: String) {
+    private func answerSync(_ digest: CollabDigest, to pid: String, syncID: String?) {
         guard localDoc != nil, ensureUnlocked() else { return }
         let route = Route.participant(pid)
         knownAssets[route] = Set(digest.assets)
         sentFileSizes[route] = [:]
-        startCatchUp(to: route, against: digest, kind: .syncReply)
+        startCatchUp(to: route, against: digest, kind: .syncReply, syncID: syncID)
     }
 
     /// The zipped package when the library keeps one on disk (streamed as a blob), else the document's records.
@@ -2286,9 +2316,21 @@ final class CollabSession {
         if let meta = local.meta, let current = try? app.workspace.content(doc).meta {
             local.meta = CollabSession.keepingLocalFields(meta, of: current)
         }
+        let pages = Set(local.items.keys.map { PageID($0) })
+        let borrowed = pages.subtracting(app.workspace.cachedPages(doc))
+        defer {
+            // applyRemote synchronously hands the full changed pages to persistence before returning.
+            // No suspension separates this cache snapshot from eviction. Preserve existing readers,
+            // pages opened by commit observers, and every window's current page (including new editors).
+            let visible = Set(app.services.sessions.sessions.filter { $0.document == doc }.compactMap(\.page))
+            let disposable = borrowed.subtracting(visible)
+            let cached = app.workspace.cachedPages(doc)
+            if !app.workspace.isReadOnly(doc), !cached.isDisjoint(with: disposable) {
+                app.workspace.evictPages(doc, keeping: cached.subtracting(disposable))
+            }
+        }
         let summary = app.bus.applyRemote(local, origin: CollabSession.originPrefix + author)
         guard !summary.isEmpty else { return }
-        let pages = Set(local.items.keys.map { PageID($0) })
         service.hooks.publish(.remoteChanges(participant: author, doc: doc, summary: summary, pages: pages))
     }
 
@@ -2315,9 +2357,11 @@ final class CollabSession {
 
     /// One task per route bounds overlapping requests. A changed snapshot is retried; partial page delivery
     /// is safe because every patch retains its original LWW revisions.
-    private func startCatchUp(to route: Route, against other: CollabDigest?, kind: CollabMessage.Kind) {
+    private func startCatchUp(to route: Route, against other: CollabDigest?, kind: CollabMessage.Kind,
+                              syncID: String? = nil) {
         catchUps[route]?.cancel()
         let token = UUID()
+        let exchange = side == .guest ? synchronizationID : syncID
         catchUpTokens[route] = token
         catchUps[route] = Task { [weak self] in
             guard let self else { return }
@@ -2329,17 +2373,31 @@ final class CollabSession {
             }
             for attempt in 0..<3 {
                 do {
-                    try await self.catchUp(to: route, against: other, kind: kind, allowChanged: attempt == 2)
+                    try await self.catchUp(to: route, against: other, kind: kind, syncID: exchange,
+                                          allowChanged: attempt == 2)
                     return
                 } catch is CancellationError {
                     return
                 } catch {
                     if Task.isCancelled || self.isClosed { return }
+                    if self.side == .host, self.peers(for: route) == nil {
+                        self.log.info("collab: participant disconnected during catch-up")
+                        return
+                    }
                     if (error as? NibError)?.code == .conflict, attempt < 2 { continue }
-                    self.hasUnsentChanges = true
                     let message = NibError.wrap(error).message
-                    self.service.notice(String(localized: "Couldn't catch up shared changes. Reconnect to retry. \(message)"))
-                    if self.side == .guest { self.resolveReady(error) }
+                    let reason = String(localized: "Couldn't catch up shared changes. Reconnect to retry. \(message)")
+                    if self.side == .guest {
+                        self.hasUnsentChanges = true
+                        self.service.notice(reason)
+                        self.resolveReady(error)
+                    } else {
+                        self.log.error("collab: catch-up failed: \(message, privacy: .public)")
+                        // A terminal host read/send error must release the guest's join waiter, even
+                        // while presence and unrelated edits keep this connection busy.
+                        self.post(CollabMessage(kind: .syncReply, session: self.id, from: self.me,
+                                               reason: reason, syncID: exchange), to: route)
+                    }
                     return
                 }
             }
@@ -2347,7 +2405,7 @@ final class CollabSession {
     }
 
     private func catchUp(to route: Route, against other: CollabDigest?, kind: CollabMessage.Kind,
-                         allowChanged: Bool) async throws {
+                         syncID: String?, allowChanged: Bool) async throws {
         guard let doc = localDoc, let remote = remoteDoc, ensureUnlocked() else { return }
         if kind == .patch, side == .guest, myRole != .edit { resolveReady(nil); return }
         let failures = sendFailures[route, default: 0]
@@ -2365,17 +2423,21 @@ final class CollabSession {
         state.digest.assets = heldFiles(state.names, doc: doc)
         var sent = Set<PageID>()
         if let other {
-            sendFiles(state.names, to: route)
+            sendFiles(state.names, to: route, syncID: syncID)
             await outbox[route]?.value
             try CollabCatchUp.check(current)
             let head = CollabDigest.delta(content: state.content, items: [:], against: other, doc: doc)
-            if !head.isEmpty { try await sendCatchUpPatch(head, remote: remote, to: route, isCurrent: current) }
+            if !head.isEmpty {
+                try await sendCatchUpPatch(head, remote: remote, to: route, syncID: syncID, isCurrent: current)
+            }
             for page in state.content.pages {
                 try CollabCatchUp.check(current)
                 if state.needsPage(page.id, against: other) {
                     let patch = try state.pageDelta(page.id, doc: doc, workspace: app.workspace,
                                                     against: other, allowChanged: allowChanged)
-                    if !patch.isEmpty { try await sendCatchUpPatch(patch, remote: remote, to: route, isCurrent: current) }
+                    if !patch.isEmpty {
+                        try await sendCatchUpPatch(patch, remote: remote, to: route, syncID: syncID, isCurrent: current)
+                    }
                     sent.insert(page.id)
                 }
                 syncProgress()
@@ -2392,8 +2454,9 @@ final class CollabSession {
             throw NibError.unavailable(String(localized: "Some shared changes could not be sent."))
         }
         if kind != .patch {
-            let message = CollabMessage(kind: kind, session: id, from: me, digest: state.digest)
-            guard await deliver(try CollabFrames.frames(for: message), to: route) else {
+            let message = CollabMessage(kind: kind, session: id, from: me, digest: state.digest, syncID: syncID)
+            guard await deliver(try CollabFrames.frames(for: message), to: route,
+                                progress: { self.syncProgress() }) else {
                 throw NibError.unavailable(String(localized: "The connection dropped while catching up."))
             }
         }
@@ -2404,15 +2467,16 @@ final class CollabSession {
     }
 
     private func sendCatchUpPatch(_ patch: DocumentPatch, remote: DocumentID, to route: Route,
-                                 isCurrent: () -> Bool) async throws {
+                                 syncID: String?, isCurrent: () -> Bool) async throws {
         // The final retry may read a newer page than the scan, including newly referenced files.
-        sendFiles(CollabAssets.names(in: patch), to: route)
+        sendFiles(CollabAssets.names(in: patch), to: route, syncID: syncID)
         await outbox[route]?.value
         try CollabCatchUp.check(isCurrent)
-        let message = CollabMessage(kind: .patch, session: id, from: me,
-                                   patch: CollabSession.rewrite(patch, to: remote))
+        let message = CollabMessage(kind: side == .host ? .syncReply : .patch, session: id, from: me,
+                                   patch: CollabSession.rewrite(patch, to: remote), syncID: syncID)
         // Await each page's frames instead of retaining every page in queued send closures.
-        guard await deliver(try CollabFrames.frames(for: message), to: route) else {
+        guard await deliver(try CollabFrames.frames(for: message), to: route,
+                            progress: { self.syncProgress() }) else {
             throw NibError.unavailable(String(localized: "The connection dropped while catching up."))
         }
     }
@@ -2584,7 +2648,6 @@ final class CollabSession {
         while next < frames.count {
             do {
                 try transport.send(frames[next], to: targets)
-                syncProgress()
                 next += 1
             } catch let error as NibError where error.code == .timeout && error.hint == "relay-busy" {
                 return false
@@ -2593,12 +2656,15 @@ final class CollabSession {
         return true
     }
 
-    private func deliver(_ frames: [Data], to route: Route) async -> Bool {
+    private func deliver(_ frames: [Data], to route: Route, progress: () -> Void = {}) async -> Bool {
         guard !isClosed, let targets = peers(for: route) else { return false }
         var next = 0
         do {
             while !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == targets.map(\.id) {
-                if try sendAvailable(frames, to: route == .broadcast ? nil : targets, next: &next) { return true }
+                let previous = next
+                let complete = try sendAvailable(frames, to: route == .broadcast ? nil : targets, next: &next)
+                if next > previous { progress() }
+                if complete { return true }
                 try await Task.sleep(nanoseconds: 50_000_000)
             }
         } catch {
@@ -2637,6 +2703,9 @@ final class CollabSession {
         }
         guard !isClosed, peers(for: route)?.map(\.id) == first.map(\.id), await deliver(headerFrames, to: route) else { return false }
         let count = CollabFrames.blobPartCount(prepared.bytes)
+        let progress = { [self] in
+            if header.syncID != nil, header.syncID == synchronizationID { syncProgress() }
+        }
         var next = 0
         while next < count {
             let range = next..<min(next + CollabFrames.blobBatch, count)
@@ -2651,7 +2720,8 @@ final class CollabSession {
                 log.error("collab: couldn't read a file to send: \(NibError.wrap(error).message, privacy: .public)")
                 return false
             }
-            guard !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == first.map(\.id), await deliver(frames, to: route) else { return false }
+            guard !isClosed, !Task.isCancelled, peers(for: route)?.map(\.id) == first.map(\.id),
+                  await deliver(frames, to: route, progress: progress) else { return false }
             next = range.upperBound
         }
         return true
