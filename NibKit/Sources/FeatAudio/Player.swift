@@ -96,11 +96,19 @@ struct PlaybackChunk: Equatable {
 struct PlaybackProgress: Equatable {
     private(set) var pending = 0
     private(set) var exhausted = false
+    private(set) var failed = false
+
+    /// Once reading fails, no later callback may skip that chunk and resume the stream.
+    mutating func read(_ operation: () throws -> Void) -> Error? {
+        guard !failed else { return nil }
+        do { try operation(); return nil }
+        catch { failed = true; return error }
+    }
 
     mutating func scheduled() { pending += 1 }
     mutating func ranOut() { exhausted = true }
     mutating func played() { pending = max(0, pending - 1) }
-    var isFinished: Bool { exhausted && pending == 0 }
+    var isFinished: Bool { !failed && exhausted && pending == 0 }
 }
 
 /// All clips of a document laid end to end: the playback bar's timeline, with a dot where each clip starts.
@@ -225,7 +233,8 @@ protocol PlaybackEngine: AnyObject {
     /// Opens a clip's file and returns its length in seconds. Stops whatever was playing.
     func open(_ url: URL) throws -> Double
     /// Plays `plan`; `onFinish` runs on the main actor once the plan has played out (never after `stop`).
-    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool, onFinish: @escaping @MainActor () -> Void) throws
+    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool,
+              onFinish: @escaping @MainActor () -> Void, onFailure: @escaping @MainActor (Error) -> Void) throws
     func stop()
     func setRate(_ rate: Double)
     func setNoiseReduction(_ on: Bool)
@@ -245,6 +254,7 @@ final class AVPlaybackEngine: PlaybackEngine {
         let sampleRate: Double
         let generation: Int
         let onFinish: @MainActor () -> Void
+        let onFailure: @MainActor (Error) -> Void
         var reducers: [NoiseReducer]
         var progress = PlaybackProgress()
     }
@@ -296,7 +306,8 @@ final class AVPlaybackEngine: PlaybackEngine {
         return Double(f.length) / format.sampleRate
     }
 
-    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool, onFinish: @escaping @MainActor () -> Void) throws {
+    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool,
+              onFinish: @escaping @MainActor () -> Void, onFailure: @escaping @MainActor (Error) -> Void) throws {
         halt()
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .spokenAudio)
@@ -314,10 +325,12 @@ final class AVPlaybackEngine: PlaybackEngine {
             let cursor = PlaybackPlan.ChunkCursor(plan: plan, sampleRate: format.sampleRate, fileLength: file.length,
                                                   maxFrames: Self.chunk)
             reader = Reader(cursor: cursor, sampleRate: format.sampleRate, generation: generation, onFinish: onFinish,
+                            onFailure: onFailure,
                             reducers: (0..<Int(format.channelCount)).map { _ in NoiseReducer(sampleRate: format.sampleRate) })
             for _ in 0..<Self.lookahead { scheduleNext() }
-            return (reader?.progress.pending ?? 0) == 0
+            return (reader?.progress.pending ?? 0) == 0 && reader?.progress.failed != true
         }
+        if queue.sync(execute: { reader?.progress.failed == true }) { return }
         if empty {
             queue.sync { reader = nil }
             Task { @MainActor in onFinish() }
@@ -358,17 +371,28 @@ final class AVPlaybackEngine: PlaybackEngine {
 
     /// The queue: reads, processes and schedules the plan's next chunk, or marks the plan as run out.
     private func scheduleNext() {
-        guard var r = reader, let file else { return }
+        guard var r = reader, !r.progress.failed, let file else { return }
         let format = file.processingFormat
         while let chunk = r.cursor.next() {
             let count = AVAudioFrameCount(chunk.count)
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count) else { break }
-            do {
+            var loaded: AVAudioPCMBuffer?
+            if let error = r.progress.read({
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count) else {
+                    throw NibError.unavailable(String(localized: "Audio playback buffer"))
+                }
                 file.framePosition = chunk.start
                 try file.read(into: buffer, frameCount: count)
-            } catch {
-                break
+                guard buffer.frameLength == count else {
+                    throw NibError.unavailable(String(localized: "The recording could not be read completely."))
+                }
+                loaded = buffer
+            }) {
+                reader = r
+                let failure = r.onFailure
+                Task { @MainActor in failure(error) }
+                return
             }
+            guard let buffer = loaded else { return }
             let frames = Int(buffer.frameLength)
             guard frames > 0 else { continue }
             if let data = buffer.floatChannelData {
@@ -896,14 +920,25 @@ extension AudioController {
         let s = playbackSettings
         let map = s.skipSilence ? silenceMap(for: p) : nil
         let next = PlaybackPlan.make(from: t, duration: p.duration, silence: map, skipSilence: s.skipSilence)
-        try engine.play(next, rate: s.speed, noiseReduction: s.noiseReduction) { [weak self] in
+        try engine.play(next, rate: s.speed, noiseReduction: s.noiseReduction, onFinish: { [weak self] in
             self?.planFinished(generation)
-        }
+        }, onFailure: { [weak self] error in
+            self?.planFailed(generation, error: error)
+        })
         plan = next
         p.isPlaying = true
         p.position = next.origin
         playback = p
         emitPlayback()
+    }
+
+    private func planFailed(_ generation: Int, error: Error) {
+        guard generation == playGeneration else { return }
+        pausePlayback() // Captures the last played position and invalidates late completion callbacks.
+        if let app {
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                            userInfo: ["command": CommandIDs.audioPlay, "error": NibError.wrap(error)])
+        }
     }
 
     /// The clip played out: rest at its end, then carry on with the document's next clip.

@@ -95,6 +95,7 @@ final class FakePlaybackEngine: PlaybackEngine {
     private(set) var stops = 0
     var played: Double? = 0
     var finish: (@MainActor () -> Void)?
+    var fail: (@MainActor (Error) -> Void)?
 
     init(length: Double) {
         self.length = length
@@ -105,17 +106,20 @@ final class FakePlaybackEngine: PlaybackEngine {
         return length
     }
 
-    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool, onFinish: @escaping @MainActor () -> Void) throws {
+    func play(_ plan: PlaybackPlan, rate: Double, noiseReduction: Bool,
+              onFinish: @escaping @MainActor () -> Void, onFailure: @escaping @MainActor (Error) -> Void) throws {
         plans.append(plan)
         self.rate = rate
         self.noiseReduction = noiseReduction
         finish = onFinish
+        fail = onFailure
         played = 0
     }
 
     func stop() {
         stops += 1
         finish = nil
+        fail = nil
     }
 
     func setRate(_ rate: Double) { self.rate = rate }
@@ -976,6 +980,46 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(engine.plans.last?.origin, 0)
         XCTAssertEqual(audio.playback?.clip, try clip(h, second).id)
         XCTAssertEqual(audio.playback?.isPlaying, true)
+    }
+
+    func testReadFailurePausesAtLastPositionWithoutAdvancing() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        audio.makeSource = { source }
+        audio.clock = { 1_800_000_000 }
+        _ = try await record(h, source, seconds: 1)
+        let engine = FakePlaybackEngine(length: 600)
+        audio.makeEngine = { engine }
+        try Data([0]).write(to: try file(h, "audio/FIXTUREAUD01.caf"))
+        _ = try await h.run("audio.play", ["clip": .string(fixtureClip), "t": 12])
+        let staleFinish = engine.finish
+        engine.played = 3
+        let reported = expectation(description: "Playback error is reported")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { _ in
+            reported.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        engine.fail?(CocoaError(.fileReadCorruptFile))
+        staleFinish?()
+        await fulfillment(of: [reported], timeout: 1)
+        XCTAssertEqual(audio.playback?.isPlaying, false)
+        XCTAssertEqual(audio.position, 15, accuracy: 0.01)
+        XCTAssertEqual(engine.opened.count, 1)
+        XCTAssertEqual(audio.playback?.clip, Fixtures.audioID)
+    }
+
+    func testStreamingReadFailureNeverBecomesNormalExhaustion() {
+        var progress = PlaybackProgress()
+        var reads = 0
+        XCTAssertNil(progress.read { reads += 1 })
+        progress.scheduled()
+        XCTAssertNotNil(progress.read { reads += 1; throw CocoaError(.fileReadCorruptFile) })
+        XCTAssertTrue(progress.failed)
+        progress.played()
+        progress.ranOut()
+        XCTAssertFalse(progress.isFinished)
+        _ = progress.read { reads += 1 }
+        XCTAssertEqual(reads, 2, "A pending buffer callback cannot resume reading after failure")
     }
 
     func testThePlaybackBarShowsWhileAClipIsLoaded() async throws {
