@@ -375,11 +375,22 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     /// Where `edit.undo` / `edit.redo` act (nil for any other command): the document's history while it has a step,
     /// else the window's UndoManager.
     private func undoRoute(_ d: KeyCommandDescriptor, params: JSONValue) -> UndoRoute? {
-        UndoRoute.forCommand(d.command, params: params, session: session, history: app.bus.history,
+        let route = UndoRoute.forCommand(d.command, params: params, session: session, history: app.bus.history,
                              window: windowUndoManager)
+        #if DEBUG
+        if d.command == CommandIDs.undo || d.command == CommandIDs.redo {
+            let manager = windowUndoManager
+            NSLog("%@", "[Nib QA undo] command=\(d.command) route=\(String(describing: route)) manager=\(String(describing: manager.map { ObjectIdentifier($0) })) grouping=\(manager?.groupingLevel ?? -1) canUndo=\(manager?.canUndo ?? false) canRedo=\(manager?.canRedo ?? false)")
+        }
+        #endif
+        return route
     }
 
     private func undoWindow(redo: Bool) {
+        #if DEBUG
+        let observed = windowUndoManager
+        NSLog("%@", "[Nib QA undo] window invoked redo=\(redo) manager=\(String(describing: observed.map { ObjectIdentifier($0) })) grouping=\(observed?.groupingLevel ?? -1) canUndo=\(observed?.canUndo ?? false) canRedo=\(observed?.canRedo ?? false) undoing=\(observed?.isUndoing ?? false) redoing=\(observed?.isRedoing ?? false)")
+        #endif
         // NSUndoManager closes one open top-level group itself; undoing inside a nested group or a replay would throw.
         guard let manager = windowUndoManager, manager.groupingLevel <= 1,
               !manager.isUndoing, !manager.isRedoing else { return }

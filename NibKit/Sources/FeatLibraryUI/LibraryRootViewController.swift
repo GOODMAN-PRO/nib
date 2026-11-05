@@ -342,8 +342,16 @@ final class LibraryViewModel: ObservableObject {
         return context
     }
     func registerUndo(undo: JSONValue, redo: JSONValue) {
+        #if DEBUG
+        let observed = testUndoManager ?? controller?.viewIfLoaded?.window?.undoManager
+        NSLog("%@", "[Nib QA undo] register reorder parent=\(String(describing: undo["folder"])) manager=\(String(describing: observed.map { ObjectIdentifier($0) })) grouping=\(observed?.groupingLevel ?? -1) canUndo=\(observed?.canUndo ?? false) undoing=\(observed?.isUndoing ?? false)")
+        #endif
         guard let manager = testUndoManager ?? controller?.viewIfLoaded?.window?.undoManager else { return }
         manager.registerUndo(withTarget: self) { model in
+            #if DEBUG
+            let observed = model.testUndoManager ?? model.controller?.viewIfLoaded?.window?.undoManager
+            NSLog("%@", "[Nib QA undo] reorder closure ran parent=\(String(describing: undo["folder"])) manager=\(String(describing: observed.map { ObjectIdentifier($0) })) grouping=\(observed?.groupingLevel ?? -1) canUndo=\(observed?.canUndo ?? false)")
+            #endif
             model.registerUndo(undo: redo, redo: undo)
             model.perform(CommandIDs.libraryReorder, undo)
         }
@@ -364,6 +372,10 @@ final class LibraryViewModel: ObservableObject {
                 if canUndo { undoAction = { [weak self] in
                     guard let self else { return }
                     for (parent, rows) in parents {
+                        #if DEBUG
+                        let manager = self.testUndoManager ?? self.controller?.viewIfLoaded?.window?.undoManager
+                        NSLog("%@", "[Nib QA undo] move toast closure ran restoreParent=\(parent) refs=\(rows.map(\.ref)) manager=\(String(describing: manager.map { ObjectIdentifier($0) })) grouping=\(manager?.groupingLevel ?? -1) canUndo=\(manager?.canUndo ?? false)")
+                        #endif
                         var undo: JSONValue = ["refs": .array(rows.map { .string($0.ref) })]
                         if parent != "lib" { undo = undo.merging(["folder": .string(parent)]) }
                         self.perform(CommandIDs.libraryMove, undo)
@@ -425,6 +437,10 @@ final class LibraryViewModel: ObservableObject {
                     let result = try await self.app.bus.execute(CommandIDs.libraryReorder, params, session: self.session)
                     if result["undo"] != nil {
                         self.floatingAdapter.postToast(String(localized: "Items reordered"), actionTitle: String(localized: "Undo")) { [weak self] in
+                            #if DEBUG
+                            let manager = self?.testUndoManager ?? self?.controller?.viewIfLoaded?.window?.undoManager
+                            NSLog("%@", "[Nib QA undo] reorder toast closure ran manager=\(String(describing: manager.map { ObjectIdentifier($0) })) grouping=\(manager?.groupingLevel ?? -1) canUndo=\(manager?.canUndo ?? false)")
+                            #endif
                             (self?.testUndoManager ?? self?.controller?.viewIfLoaded?.window?.undoManager)?.undo()
                         }
                     }

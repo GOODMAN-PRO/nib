@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UIKit
 import NibContracts
 
 /// The one container per window for everything that floats. iOS 26+: the system's Liquid Glass inside a
@@ -202,7 +203,12 @@ struct DismissCatcher: View {
     var body: some View {
         Color.clear
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onEnded { _ in field.dismissBuds() })
+            .gesture(DragGesture(minimumDistance: 0).onEnded { value in
+                #if DEBUG
+                NSLog("%@", "[Nib QA ink] rejected by modal dismiss cover point=\(value.location) hasOpenBud=\(field.hasOpenBud)")
+                #endif
+                field.dismissBuds()
+            })
             .ignoresSafeArea()
             .accessibilityHidden(true)
     }

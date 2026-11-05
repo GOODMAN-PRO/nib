@@ -1,6 +1,7 @@
 import SwiftUI
 import Observation
 import QuartzCore
+import UIKit
 
 /// What one droplet's views need this frame. Equatable, so a node is only written when something changed.
 struct DropletPresentation: Equatable {
@@ -200,7 +201,7 @@ final class DropletField {
 
     /// Text input can leave a native animation running even when our field has parked.
     /// Report both outcomes, once two seconds have passed since the last input.
-    func noteQAInput(in window: UIWindow?) {
+    @MainActor func noteQAInput(in window: UIWindow?) {
         idleDiagnostic?.cancel()
         let work = DispatchWorkItem { [weak self, weak window] in
             guard let self else { return }
@@ -723,6 +724,9 @@ final class DropletField {
 
     func dismissBuds() {
         for (id, dismiss) in dismissers where entries[id]?.bud?.presented == true && entries[id]?.style.modalWhenBudded == true {
+            #if DEBUG
+            NSLog("%@", "[Nib QA ink] dismiss modal bud=\(id) popoverFrame=\(String(describing: visualFrame(id)))")
+            #endif
             dismiss()
         }
     }
