@@ -818,7 +818,7 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibSlider`** | 4 pt `fill1` track, `label` fill, 28 pt white bead thumb | 44 pt tall | Thumb stretches up to **0.10** with speed (`thumb` spring, about its grab side) and settles in one small undershoot; detent haptics |
 | **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3`. `init(width:range:presets:title:unit:)` titles it and measures in `.millimetres` ("0.50 mm") or `.points` ("12 pt", the eraser's Size) |
 | **`NibWidthPresetButton`** | One preset: a `label` dot (`NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt) in a 44 × 40 cell | 44 pt hit | Selected on `fill3` (radius 12). The slider's presets, the Pencil palette's widths, options bars: a thickness looks the same everywhere. A hover outline of a width is a `NibStroke.hairline` circle |
-| **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `selectedSegment` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold. `sizing: .intrinsic` (default) preserves full labels and stacks when needed. Opt-in `sizing: .fitting` shares the available width equally (including RTL); labels use one line, 4 pt side padding and scale down only as far as 85% of the footnote size before tail truncation. Intrinsic and stacked labels keep their full font size and 12 pt padding. The full label remains available to accessibility. Fitting needs 44 pt per segment plus the 4 pt track inset; narrower rows and accessibility Dynamic Type sizes stack with full labels. Use for the 240 pt page switcher and equal-width paragraph controls |
+| **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `selectedSegment` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold. `sizing: .intrinsic` (default) preserves full labels and stacks when needed. Opt-in `sizing: .fitting` shares the available width equally (including RTL); labels use one line, 4 pt side padding and scale down only as far as 85% of the footnote size before tail truncation. The navigator's opt-in `sizing: .compactFitting` uses 2 pt side padding and an 80% scale floor to leave room for its 44 pt Panel Options button. Intrinsic and stacked labels keep their full font size and 12 pt padding. The full label remains available to accessibility. Fitting needs 44 pt per segment plus the 4 pt track inset; narrower rows and accessibility Dynamic Type sizes stack with full labels. Use for the 240 pt page switcher and equal-width paragraph controls |
 
 ### 13.4 Controls and text
 
@@ -869,6 +869,8 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibWebTokens`** | `stylesheet(for:)`: every colour, spacing, radius and type token as `--nib-…` CSS variables for the traits, `color-scheme`, body text in `label` at `-apple-system-body`, a transparent page | Plugin HTML panels inject it at document start and again when the traits change |
 
 ### 13.7 Sheets and lists
+
+`NibScrollView` keeps native scroll indicators and reserves a 16 pt cue lane when content exceeds its viewport. The chevron points towards more content (back towards the start at the end), below a vertical list or after a horizontal strip. The cue never masks a label or control, does not intercept touches, and stays reserved while scrolling to prevent layout jumps. `NibPopoverPanel` uses it for all tool lists; forms with pinned actions use it for their options only.
 
 | Component | Anatomy | Notes |
 |---|---|---|
@@ -949,6 +951,8 @@ The palette is `NibToolPalette`: six everyday tools by default (pen, highlighter
 
 **Lasso selection and the object menu.** The marquee is a dashed accent line (1 pt, 4/4). Handles are 12 pt beads with 44 pt hit areas (corners scale, edges resize one axis, a rotation bead 24 pt above the top edge on a hairline). **Handles are rigid**: cap 0, no wobble, no poke, so the visual centre always sits on the hotspot (§10.15). The object menu buds from the selection's top centre as a Clear capsule that never refracts (it sits on ink): Cut, Copy, Duplicate, Colour, Convert, More. More opens the system menu with the full list (Arrange, Lock, Screenshot, Style, Add Comment, Create Element, Ask Assistant, plugin items under their plugin's name). Items made by the AI show "Made by Assistant · 09:41" at the top of the menu.
 
+A completed lasso whose projected bounds surround the selected items with empty space on every side displays the tight item bounds with the standard 4 pt selection inset. Tight and intersecting outlines keep their gesture shape. This affects the overlay only; stored selection geometry and item transforms remain unchanged.
+
 **Zoom window.** The target box on the page is a `frame` droplet (rim and outline only, no body, `NibRadius.zoomFrame` 18), draggable with stretch. The writing pane is a Deep panel docked at the bottom (full width − 32, 240 tall) with a bead slider for zoom and Return, New line and Margin controls. The ink in the pane is the real canvas at 3×, never refracted.
 
 **Ruler.** An opaque on-page object (1 pt ticks, `label` at 60 %) moved and rotated with two fingers; the angle shows in a Clear 40 pt HUD next to it and snaps at 0/45/90° with a Pencil Pro alignment haptic.
@@ -958,6 +962,7 @@ The palette is `NibToolPalette`: six everyday tools by default (pen, highlighter
 ### 14.4 Page navigator, outline and bookmarks
 
 - **iPad**: a Deep panel 240 wide at the leading edge (trailing per Settings), 16 pt from the chrome, full height below the bars. In landscape the canvas insets so the page stays fully visible; in portrait the panel floats over the page with E2. A segmented control at the top: Pages · Outline · Bookmarks.
+- **Panel Options**: self-headed navigators keep a visible 44 pt menu button beside the tabs for secondary panels and placement/window controls. Their own header menu retains its feature actions. Compact fitting labels keep Bookmarks readable at 240 pt; accessibility sizes stack the tabs.
 - **Pages**: a single column of 176 pt thumbnails with the number under each; the current page has the accent ring. Long-press lifts a thumbnail into a Clear droplet (3 pt envelope, radius 7, cap 0.10; it lands with `slot`); neighbours reflow with `reflow`; no merge between thumbnails. "Select" shows check beads, and the panel's opaque bottom row offers Move, Copy, Export, Delete (no droplet inside the panel). An "Add page" row sits at the end.
 - **Outline**: rows (title in body, page number in hud) grouped "From the PDF" and "Yours"; swipe to delete; "Add entry for this page" at the top.
 - **Bookmarks**: rows with a 40 pt thumbnail, page number and title.

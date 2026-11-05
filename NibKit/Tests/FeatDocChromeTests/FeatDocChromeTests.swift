@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatDocChrome
 
@@ -1346,6 +1346,66 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
+    func testSelfHeadedOutlineTabsKeepVisiblePanelOptionsAndReadableLabelsAt240Points() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let titles = ["Pages", "Outline", "Bookmarks"]
+        let ids = ["sidebar.pages", "outline.tab", "outline.bookmarks"]
+        let tabs = zip(ids, titles).map { id, title in
+            var descriptor = PanelDescriptor(id: id, title: title, icon: NibSymbol.outline.name,
+                placement: .sidebarTab, order: 0, owner: "tests") { _ in
+                AnyView(NibPanelHeader(title: title, symbol: .outline, onClose: {}) {
+                    NibIconButton(.more, label: "Outline Options", size: .round) {}
+                })
+            }
+            descriptor.providesHeader = true
+            return descriptor
+        }
+        for selected in [tabs[1], tabs[2]] {
+            XCTAssertFalse(chrome.drawsHeader(selected), "Exercise both self-headed navigators")
+            for scheme in [ColorScheme.light, .dark] {
+                var frames: [String: CGRect] = [:]
+                let content = SidebarPanelView(chrome: chrome, side: .left, tabs: tabs, selected: selected,
+                                               mode: .sidebar, presentation: .sidebar)
+                    .environment(\.dynamicTypeSize, .large)
+                    .environment(\.colorScheme, scheme)
+                    .environment(\.nibMeasuresSegmentFrames, true)
+                    .onPreferenceChange(NibSegmentFrames.self) { frames = $0 }
+                let host = UIHostingController(rootView: content)
+                host.safeAreaRegions = []
+                let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 240, height: 600))
+                window.rootViewController = host
+                window.isHidden = false
+                defer { window.isHidden = true; window.rootViewController = nil }
+                host.view.frame = window.bounds
+                for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+                let segments = try titles.map { try XCTUnwrap(frames[$0], $0) }
+                let row = segments.reduce(CGRect.null) { $0.union($1) }
+                let inset = NibSpacing.xs + 2 // Sidebar padding and segmented-track inset.
+                XCTAssertEqual(row.minX, inset, accuracy: 1)
+                XCTAssertEqual(row.maxX, 240 - NibMetrics.hitTarget - inset, accuracy: 1,
+                               "A visible 44 pt Panel Options button must remain beside self-headed tabs")
+                for segment in segments {
+                    XCTAssertEqual(segment.width, (240 - NibMetrics.hitTarget - 2 * inset) / 3, accuracy: 1)
+                    XCTAssertEqual(segment.minY, row.minY, accuracy: 1, "All tabs stay in one row")
+                    XCTAssertEqual(segment.height, NibMetrics.hitTarget, accuracy: 1)
+                }
+                let bookmarks = segments[2]
+                let base = UIFont.preferredFont(forTextStyle: .footnote,
+                    compatibleWith: UITraitCollection(preferredContentSizeCategory: .large))
+                let font = selected.id == "outline.bookmarks"
+                    ? UIFont.systemFont(ofSize: base.pointSize, weight: .semibold) : base
+                let labelWidth = ("Bookmarks" as NSString).size(withAttributes: [.font: font]).width
+                let sizing = NibSegmentedControl<String>.Sizing.compactFitting
+                XCTAssertLessThanOrEqual(labelWidth * sizing.minimumLabelScale,
+                                        bookmarks.width - 2 * sizing.labelPadding,
+                                        "Bookmarks must fit its actual production segment without truncation")
+                // Removing the host menu fails the row width assertion. Restoring it
+                // without compact sizing fails the measured Bookmarks label budget.
+            }
+        }
+    }
+
     func testSidebarToggleShowsHidesAndSwitchesMode() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         h.app.ui.panels.register(panel("test.pages", .sidebarTab, order: 0))
@@ -1707,6 +1767,83 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(h.library.node(Fixtures.docID)?.title, title)
         XCTAssertEqual(try h.app.workspace.content(Fixtures.docID), original)
         XCTAssertFalse(h.app.bus.undo(Fixtures.docID), "Cancelling must not add document history")
+    }
+
+    func testUnchangedRenameDraftDoesNotRestoreAnExternallyChangedTitle() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let context = chrome.panelContext(ChromePanels.rename, presentation: .sheet)
+        var draft = RenameDocumentDraft(context: context)
+        let calls = CallLog()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
+                                                  effect: .library, target: .app)) { params, _ in
+            calls.params.append(params)
+            return [:]
+        }
+        try h.library.rename(Fixtures.docID, to: "New title from another window")
+        try await draft.submit(context: context)
+        XCTAssertTrue(calls.params.isEmpty)
+        XCTAssertEqual(h.library.node(Fixtures.docID)?.title, "New title from another window")
+        draft.title = "My edited draft"
+        do {
+            try await draft.submit(context: context)
+            XCTFail("An edited stale draft must report the conflict")
+        } catch {
+            XCTAssertFalse(NibError.wrap(error).message.isEmpty)
+        }
+        XCTAssertEqual(draft.title, "My edited draft", "Keep the user's work available after a conflict")
+        XCTAssertTrue(calls.params.isEmpty)
+    }
+
+    func testRenameDraftRetainsItsOriginalDocumentAndPropagatesCommandFailure() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let context = chrome.panelContext(ChromePanels.rename, presentation: .sheet)
+        var draft = RenameDocumentDraft(context: context)
+        draft.title = "Edited title"
+        h.session.document = Fixtures.textDocID
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
+                                                  effect: .library, target: .app)) { params, _ in
+            XCTAssertEqual(params["ref"]?.stringValue, NodeRef.document(Fixtures.docID).description)
+            throw NibError.invalid("Rename failed")
+        }
+        do {
+            try await draft.submit(context: context)
+            XCTFail("The sheet must receive errors instead of dismissing")
+        } catch {
+            XCTAssertEqual(NibError.wrap(error).message, "Rename failed")
+        }
+        XCTAssertEqual(draft.title, "Edited title")
+    }
+
+    func testPresentedPanelHeadersCloseThroughEscapeButDockedHeadersDecline() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let descriptor = panel("test.escape", .floating)
+        h.app.ui.panels.register(descriptor)
+        for presentation in [PanelPresentation.sidebar, .window, .sheet, .fullScreen] {
+            try await h.run(CommandIDs.panelOpen, ["id": .string(descriptor.id)])
+            let host = UIHostingController(rootView: SidebarPanelView(chrome: chrome, side: .left,
+                tabs: [descriptor], selected: descriptor, mode: .sidebar, presentation: presentation))
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 600))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let modal = presentation == .sheet || presentation == .fullScreen
+            XCTAssertEqual(NibEscapeRouting.cancel(in: host.view), modal)
+            if modal { try await waitUntil { !h.session.openPanels.contains(descriptor.id) } }
+            else { XCTAssertTrue(h.session.openPanels.contains(descriptor.id)) }
+        }
+        try await h.run(CommandIDs.panelOpen, ["id": .string(descriptor.id)])
+        let host = UIHostingController(rootView: PanelSheetView(chrome: chrome, panel: descriptor))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 600))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
+        try await waitUntil { !h.session.openPanels.contains(descriptor.id) }
     }
 
     func testContainerFollowsTheStatusBarSettingAndBackGoesToTheLibrary() async throws {

@@ -4,7 +4,7 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
 /// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
-/// Panels providing their own header own its actions too; never prepend a second, untitled More row.
+/// Self-headed panels keep host placement actions beside the tabs, without a second header.
 /// The assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
@@ -19,11 +19,10 @@ struct SidebarPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             // §14.4: tabs lead every navigator, including panels that embed their own header.
-            // The host menu rides in the tab row only when that row exists: a self-headed panel on its own
-            // keeps its single header (no second, untitled More row).
             if selected.id != PanelIDs.assistant, SidebarNavigation.primary(tabs).count > 1 {
                 HStack(spacing: 0) {
                     tabStrip.frame(maxWidth: .infinity)
+                        .contextMenu { placementMenu.items }
                     if !chrome.drawsHeader(selected) { placementMenu }
                 }
             }
@@ -43,12 +42,13 @@ struct SidebarPanelView: View {
 
     private var header: some View {
         NibPanelHeader(title: selected.title, symbol: NibSymbol(systemName: selected.icon) ?? .puzzle,
+                       handlesEscape: presentation == .sheet || presentation == .fullScreen,
                        onClose: { chrome.closePanel(selected.id) }) {
             placementMenu
         }
     }
 
-    private var placementMenu: some View {
+    private var placementMenu: PanelPlacementMenu {
         PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot,
                            mode: showsModeToggle ? mode : nil, additionalPanels: tabs)
     }
@@ -58,7 +58,8 @@ struct SidebarPanelView: View {
     private var tabStrip: some View {
         let primary = SidebarNavigation.primary(tabs)
         if primary.count > 1 {
-            NibSegmentedControl(selection: selection, options: primary.map { $0.id }, sizing: .fitting) { id in
+            NibSegmentedControl(selection: selection, options: primary.map { $0.id },
+                                sizing: chrome.drawsHeader(selected) ? .fitting : .compactFitting) { id in
                 primary.first(where: { $0.id == id })?.title ?? id
             }
             .padding(.horizontal, NibSpacing.xs)
@@ -84,29 +85,7 @@ struct PanelPlacementMenu: View {
     var additionalPanels: [PanelDescriptor] = []
 
     var body: some View {
-        Menu {
-            if !additionalPanels.isEmpty {
-                Section(String(localized: "Panels")) {
-                    ForEach(additionalPanels, id: \.id) { tab in
-                        Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
-                        .accessibilityIdentifier("cmd." + "panel.open")
-                    }
-                }
-            }
-            if let mode {
-                Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
-                    chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
-                }
-                .accessibilityIdentifier("cmd." + "sidebar.toggle")
-            }
-            option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
-            option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)
-            option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay)
-            if hasOverride {
-                Divider()
-                Button(String(localized: "Use Default Position")) { set(nil) }
-            }
-        } label: {
+        Menu { items } label: {
             Image(nib: .more)
                 .font(NibFont.glyph(.panel))
                 .foregroundStyle(NibColor.labelSecondary)
@@ -114,6 +93,30 @@ struct PanelPlacementMenu: View {
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(String(localized: "Panel Options"))
+    }
+
+    @ViewBuilder var items: some View {
+        if !additionalPanels.isEmpty {
+            Section(String(localized: "Panels")) {
+                ForEach(additionalPanels, id: \.id) { tab in
+                    Button(tab.title) { chrome.tap("panel.open", ["id": .string(tab.id)]) }
+                    .accessibilityIdentifier("cmd." + "panel.open")
+                }
+            }
+        }
+        if let mode {
+            Button(mode == .window ? String(localized: "Show as Sidebar") : String(localized: "Show as Window")) {
+                chrome.tap("sidebar.toggle", ["mode": .string(mode == .window ? "sidebar" : "window")])
+            }
+            .accessibilityIdentifier("cmd." + "sidebar.toggle")
+        }
+        option(.left, String(localized: "Move to Left Side"), symbol: .sidebar)
+        option(.right, String(localized: "Move to Right Side"), symbol: .sidebar)
+        option(.floating, String(localized: "Float Panel"), symbol: .externalDisplay)
+        if hasOverride {
+            Divider()
+            Button(String(localized: "Use Default Position")) { set(nil) }
+        }
     }
 
     private var hasOverride: Bool {
