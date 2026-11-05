@@ -131,6 +131,21 @@ struct TemplateChoose: NibCommand {
 }
 
 enum TemplateSizing {
+    /// Decimal entry uses the keyboard's locale. Do not accept grouping or a partially parsed value.
+    static func parse(width: String, height: String, locale: Locale) throws -> PageSize {
+        func number(_ text: String) -> Double? {
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let separator = locale.decimalSeparator ?? "."
+            // Keep accepting the ungrouped dot notation supported by earlier versions too.
+            return Double(text.replacingOccurrences(of: separator, with: "."))
+        }
+        guard let widthValue = number(width), let heightValue = number(height),
+              let size = try parse([widthValue, heightValue]) else {
+            throw NibError.invalid(String(localized: "Enter a width and height in page points."))
+        }
+        return size
+    }
+
     static func parse(_ array: [Double]?) throws -> PageSize? {
         guard let array else { return nil }
         guard array.count == 2, array.allSatisfy({ $0.isFinite && (36...14_400).contains($0) }) else {

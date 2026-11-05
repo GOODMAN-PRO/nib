@@ -441,6 +441,74 @@ final class FeatA11yTests: XCTestCase {
         XCTAssertEqual(PageDescriber.clusters([]).count, 0)
     }
 
+    func testTenThousandSeparatedHighlightsUseBoundedSpatialCandidates() {
+        let strokes = (0..<10_000).map { i -> Item in
+            let x = Float(i % 100) * 512, y = Float(i / 100) * 512
+            return Item.makeStroke(Stroke(style: .defaultHighlighter, points: [
+                StrokePoint(x: x, y: y), StrokePoint(x: x + 20, y: y + 10)
+            ]))
+        }
+        var comparisons = 0
+        let groups = PageDescriber.clusters(strokes, comparisons: &comparisons)
+        XCTAssertEqual(groups.count, strokes.count)
+        XCTAssertLessThan(comparisons, strokes.count * 10)
+        let input = PageDescriber.Input(doc: Fixtures.docID, page: Fixtures.page1, items: strokes,
+            blocks: [], pdfLinks: [], hiddenLayers: [], customTypes: [:], availableCommands: [])
+        let entries = PageDescriber.entries(input)
+        XCTAssertEqual(entries.count, strokes.count)
+        XCTAssertTrue(entries.allSatisfy { $0.kind == .highlight && $0.text == nil })
+        let index = PageDescriber.RectIndex(strokes.map(\.bounds))
+        let candidates = strokes.reduce(0) { $0 + index.candidates($1.bounds).count }
+        XCTAssertLessThan(candidates, strokes.count * 10)
+    }
+
+    func testSpatialClusteringKeepsGrowingBoundsAndOriginalMergeOrder() {
+        // Reference the old exhaustive algorithm, including its bounding-box (not just pairwise stroke) merges.
+        func exhaustive(_ items: [Item]) -> [[Item]] {
+            var groups: [(rect: Rect, items: [Item])] = []
+            let gap = PageDescriber.clusterGap / 2
+            for item in items.sorted(by: { ($0.bounds.minY, $0.bounds.minX) < ($1.bounds.minY, $1.bounds.minX) }) {
+                if let i = groups.lastIndex(where: { $0.rect.insetBy(-gap).intersects(item.bounds.insetBy(-gap)) }) {
+                    groups[i].rect = groups[i].rect.union(item.bounds)
+                    groups[i].items.append(item)
+                } else { groups.append((item.bounds, [item])) }
+            }
+            var merged = true
+            while merged {
+                merged = false
+                outer: for i in groups.indices {
+                    for j in groups.indices where j > i {
+                        if groups[i].rect.insetBy(-gap).intersects(groups[j].rect.insetBy(-gap)) {
+                            groups[i].rect = groups[i].rect.union(groups[j].rect)
+                            groups[i].items += groups[j].items
+                            groups.remove(at: j)
+                            merged = true
+                            break outer
+                        }
+                    }
+                }
+            }
+            return groups.map { $0.items }
+        }
+        for seed in 0..<12 {
+            let strokes = (0..<80).map { i -> Item in
+                let x = Float((i * 137 + seed * 97) % 700 - 350)
+                let y = Float((i * 79 + seed * 31) % 500 - 250)
+                return Item.makeStroke(Stroke(style: .defaultPen, points: [
+                    StrokePoint(x: x, y: y), StrokePoint(x: x + Float(i % 7) * 20, y: y + Float(i % 5) * 10)
+                ]))
+            }
+            XCTAssertEqual(PageDescriber.clusters(strokes).map { $0.map(\.id) },
+                           exhaustive(strokes).map { $0.map(\.id) })
+        }
+        let huge = Rect(x: -1e10, y: -1e10, width: 2e10, height: 2e10)
+        var index = PageDescriber.RectIndex([huge, .zero])
+        XCTAssertEqual(index.candidates(.zero), [0, 1])
+        index.remove(0)
+        index.insert(1, Rect(x: 1000, y: 1000, width: 1, height: 1))
+        XCTAssertTrue(index.candidates(.zero).isEmpty)
+    }
+
     func testPagingStaysUnderTheResultBudgetAndRoundTrips() throws {
         let long = String(repeating: "word ", count: 100)
         let entries = (0..<200).map { i -> PageEntry in
