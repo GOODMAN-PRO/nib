@@ -6,6 +6,56 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testContextAndSendFollowWindowDocumentChanges() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read context.", effect: .read)) { _, _ in
+            ["document": ["kind": "textDocument"]]
+        }
+        let ai = FakeAIService(responses: [.init(text: "Current document")])
+        h.app.services.ai = ai
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try model.setScope(.selection, refs: ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"])
+        h.session.document = Fixtures.textDocID
+        h.session.page = nil
+        _ = try await h.run(ChatCommand.inspect, ["section": "context"])
+        XCTAssertEqual(model.scope.kind, .document)
+        XCTAssertEqual(model.scope.doc, Fixtures.textDocID)
+        XCTAssertTrue(model.scope.refs.isEmpty)
+        h.session.document = Fixtures.docID
+        h.session.page = Fixtures.page2
+        _ = try await model.send(prompt: "Read this", principal: .user, group: "FOLLOWDOC")
+        XCTAssertEqual(ai.requests.last?.scope?.doc, Fixtures.docID)
+    }
+
+    func testInitialLibraryScopeFollowsDocumentButExplicitLibraryStays() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.session.document = nil
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        h.session.document = Fixtures.docID
+        model.refreshSessionScope()
+        XCTAssertEqual(model.scope.doc, Fixtures.docID)
+        try model.setScope(.library)
+        h.session.document = Fixtures.textDocID
+        model.refreshSessionScope()
+        XCTAssertEqual(model.scope.kind, .library)
+        XCTAssertNil(model.scope.doc)
+    }
+
+    func testContextUndoRestoresExplicitLibraryChoiceAcrossDocumentSwitch() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try model.setScope(.library)
+        model.localUndo.beginUndoGrouping()
+        model.registerContextUndo()
+        try model.setScope(.document)
+        model.localUndo.endUndoGrouping()
+        model.localUndo.undo()
+        h.session.document = Fixtures.textDocID
+        model.refreshSessionScope()
+        XCTAssertEqual(model.scope.kind, .library)
+        XCTAssertNil(model.scope.doc)
+    }
+
     func testPageLabelUsesOneBasedScopedPageEvenWhenCanvasMoves() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read the visible canvas context.", effect: .read)) { _, ctx in

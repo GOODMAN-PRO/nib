@@ -88,7 +88,8 @@ struct ChatPanel: View {
         .task {
             model.windowUndoManager = context.navigator?.rootViewController?.undoManager
             model.perform(ChatCommand.inspect, ["section": "visibility", "visible": true, "lease": .string(visibilityLease)])
-            if let scope = context.params["scope"]?.stringValue {
+            if let scope = context.params["scope"]?.stringValue,
+               scope != model.scope.kind.rawValue || (context.params["refs"]?.arrayValue?.compactMap(\.stringValue) ?? []) != model.scope.refs {
                 model.perform(ChatCommand.configure, ["scope": .string(scope), "refs": context.params["refs"] ?? []])
             } else { model.perform(ChatCommand.inspect, ["section": "context"]) }
         }

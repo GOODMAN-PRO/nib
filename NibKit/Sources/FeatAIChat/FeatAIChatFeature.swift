@@ -233,6 +233,7 @@ enum ChatCommands {
             examples: [[:], ["scope": "block", "refs": ["block:FIXTUREDOC02/FIXTUREBLK01"]]]) { p, ctx in
                 let model = try model(ctx)
                 if ctx.dryRun { return [:] }
+                model.refreshSessionScope()
                 if let scope = p["scope"]?.stringValue {
                     guard model.canConfigureContext else { throw NibError(.conflict, "stop this turn before changing its context") }
                     if ctx.principal.isUser { model.registerContextUndo() }

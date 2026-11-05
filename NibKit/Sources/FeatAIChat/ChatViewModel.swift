@@ -171,6 +171,8 @@ final class ChatViewModel: ObservableObject {
     @Published var retryPrompt: String?
     private var generation: UUID?
     private var sessionObservation: AnyCancellable?
+    private var contextDocument: DocumentID?
+    private var explicitLibraryScope = false
     var turnToken: UUID? { generation }
     @Published private(set) var isLoadingChat = false
     private var loadToken: UUID?
@@ -183,6 +185,7 @@ final class ChatViewModel: ObservableObject {
     init(app: NibApp, session: EditorSession?) {
         self.app = app
         self.session = session
+        contextDocument = session?.document
         if let d = session?.document {
             scope = AIScope(kind: .document, doc: d)
         }
@@ -305,10 +308,28 @@ final class ChatViewModel: ObservableObject {
 
     func loadContext(principal: Principal = .user) async throws {
         guard let app else { throw NibError.unavailable("assistant is closed") }
+        refreshSessionScope()
         let result = try await app.bus.execute(CommandIDs.queryContext, [:], principal: principal, session: session)
         let value = result
         docKind = value["document"]?["kind"]?.stringValue.flatMap(DocumentKind.init(rawValue:))
         refreshProviderLabel()
+        refreshContextLabel()
+    }
+
+    /// Keep a chosen page/selection pinned within its document, but never carry it into a different notebook.
+    func refreshSessionScope() {
+        guard canConfigureContext, contextDocument != session?.document else { return }
+        contextDocument = session?.document
+        guard scope.kind != .library || !explicitLibraryScope else { return }
+        if let doc = session?.document {
+            if scope.kind == .page, let page = session?.page {
+                scope = AIScope(kind: .page, doc: doc, page: page)
+            } else {
+                scope = AIScope(kind: .document, doc: doc)
+            }
+        } else {
+            scope = AIScope(kind: .library)
+        }
         refreshContextLabel()
     }
 
@@ -334,6 +355,8 @@ final class ChatViewModel: ObservableObject {
             scope = AIScope(kind: kind, doc: NodeRef(selected[0])?.documentID,
                             page: NodeRef(selected[0])?.pageID, refs: selected)
         }
+        contextDocument = session?.document
+        explicitLibraryScope = kind == .library
         refreshContextLabel()
     }
 
@@ -368,6 +391,8 @@ final class ChatViewModel: ObservableObject {
         if let owner = list.chats.first(where: { $0.id == id })?.doc, let ref = NodeRef(owner), let doc = ref.documentID {
             scope = AIScope(kind: .document, doc: doc)
         } else { scope = AIScope(kind: .library) }
+        contextDocument = session?.document
+        explicitLibraryScope = scope.kind == .library
         refreshContextLabel()
         showsConversations = false
         composer = ""
@@ -402,6 +427,7 @@ final class ChatViewModel: ObservableObject {
             throw NibError(.unavailable, "Connect a model to use the assistant.", hint: "open Settings › AI")
         }
         guard canStartGeneration else { throw NibError(.conflict, "a turn or conversation load is already running") }
+        refreshSessionScope()
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("enter a question or instruction", path: "$.prompt") }
         let images = retry ? retryImages : attachments
@@ -944,11 +970,13 @@ extension ChatViewModel {
 
     func registerContextUndo() {
         let previousScope = scope, previousMode = mode, previousLabel = contextLabel
+        let previousDocument = contextDocument, previousLibraryScope = explicitLibraryScope
         let manager = windowUndoManager ?? (session?.editor as? UIViewController)?.undoManager ?? localUndo
         manager.registerUndo(withTarget: self) { model in
             MainActor.assumeIsolated {
                 model.registerContextUndo()
                 model.scope = previousScope; model.mode = previousMode; model.contextLabel = previousLabel
+                model.contextDocument = previousDocument; model.explicitLibraryScope = previousLibraryScope
             }
         }
         manager.setActionName(String(localized: "Change assistant context"))
