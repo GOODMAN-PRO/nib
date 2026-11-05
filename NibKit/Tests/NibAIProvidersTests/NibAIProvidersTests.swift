@@ -17,6 +17,20 @@ final class NibAIProvidersTests: XCTestCase {
 
     // MARK: Feature
 
+    func testOpenAIHistoryNormalizesInvalidToolArgumentsWithoutChangingValidObjects() throws {
+        let arguments: [JSONValue] = [.string("{bad"), .string("[1]"), .string("null"), .array([1]),
+                                      .string("{\"page\":\"page:D/P\"}"), ["page": "page:D/P"]]
+        for (index, argument) in arguments.enumerated() {
+            let messages = OpenAIWire.messages(system: "", [ChatMessage(role: .assistant, parts: [
+                .toolCall(id: "call", name: "nib_get", arguments: argument)
+            ])], vision: false)
+            let raw = try XCTUnwrap(messages.first?["tool_calls"]?[0]?["function"]?["arguments"]?.stringValue)
+            let parsed = try JSONValue.parse(raw)
+            XCTAssertEqual(parsed, index < 4 ? .object([:]) : ["page": "page:D/P"])
+        }
+        XCTAssertEqual(JSONWire.arguments("{bad"), .string("{bad"), "the runner still sees the invalid original input")
+    }
+
     func testFeatureInstallsTheProviderStore() async throws {
         let h = Harness(features: [NibAIProvidersFeature.self])
         XCTAssertEqual(NibAIProvidersFeature.id, "aiproviders")
