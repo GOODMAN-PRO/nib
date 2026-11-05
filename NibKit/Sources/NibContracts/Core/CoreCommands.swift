@@ -76,6 +76,7 @@ struct HistoryList: NibCommand {
         var limit: Int?
     }
     struct Row: Codable {
+        var id: String
         var group: String
         var label: String
         var principal: String
@@ -88,14 +89,14 @@ struct HistoryList: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: CommandIDs.historyList, title: "History",
-        summary: "List undoable changes in a document, newest first, with their undo group ids (for history.revertGroup).",
+        summary: "List undoable changes in a document, newest first, with stable entry ids and undo group ids (for history.revertGroup).",
         params: .obj(["doc": .ref, "limit": .int(min: 1, max: 200)], required: ["doc"]),
         examples: [["doc": "doc:FIXTUREDOC01", "limit": 10]], effect: .read)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let doc = NodeRef.documentID(from: p.doc)
         let rows = ctx.bus.history.entries(doc).reversed().prefix(p.limit ?? 50).map {
-            Row(group: $0.group, label: $0.label, principal: $0.principal.description, changes: $0.mutations.count,
+            Row(id: $0.id, group: $0.group, label: $0.label, principal: $0.principal.description, changes: $0.mutations.count,
                 at: $0.at.timeIntervalSince1970)
         }
         return Output(entries: Array(rows), canRedo: ctx.bus.history.canRedo(doc))
@@ -106,6 +107,7 @@ struct HistoryRevertGroup: NibCommand {
     struct Params: Codable {
         var doc: String
         var group: String
+        var entryID: String?
     }
     struct Output: Codable {
         var reverted: Int
@@ -115,7 +117,8 @@ struct HistoryRevertGroup: NibCommand {
     static let descriptor = CommandDescriptor(
         id: CommandIDs.revertGroup, title: "Revert Changes",
         summary: "Revert one undo group (e.g. everything an AI turn did) even after later edits; records changed since are skipped.",
-        params: .obj(["doc": .ref, "group": .str("undo group id from history.list or an AI turn")], required: ["doc", "group"]),
+        params: .obj(["doc": .ref, "group": .str("undo group id from history.list or an AI turn"),
+                      "entryID": .str("exact entry id from history.list; omit for the newest entry in the group")], required: ["doc", "group"]),
         examples: [["doc": "doc:FIXTUREDOC01", "group": "G0"]], effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
@@ -123,7 +126,10 @@ struct HistoryRevertGroup: NibCommand {
             throw NibError(.unsupported, String(localized: "Selective undo cannot be previewed. Run Revert Changes to apply it."))
         }
         let doc = NodeRef.documentID(from: p.doc)
-        guard let r = ctx.bus.revert(group: p.group, doc: doc, principal: ctx.principal) else {
+        guard !ctx.isReadOnly(doc), !(ctx.principal.isUser && ctx.activeSession?.readOnly == true) else {
+            throw NibError(.permissionDenied, String(localized: "Cannot revert history in a read-only document or window."))
+        }
+        guard let r = ctx.bus.revert(group: p.group, doc: doc, principal: ctx.principal, entryID: p.entryID) else {
             throw NibError.notFound("undo group '\(p.group)'")
         }
         let reason = r.reverted == 0 && r.skipped > 0

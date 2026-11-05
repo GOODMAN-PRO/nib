@@ -635,10 +635,20 @@ public enum ShellChromePolicy {
         controller.presentedViewController != nil || controller.children.contains { hasModal($0) }
     }
 
-    public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool) -> Bool {
+    public static func permits(_ descriptor: KeyCommandDescriptor, hasModal: Bool,
+                               context: KeyCommandContext = KeyCommandContext(docKind: nil), effect: Effect? = nil) -> Bool {
         // The presented controller owns its keys. Filtering one scope must never promote
         // an underlying document/global descriptor that happens to share the shortcut.
-        !hasModal
+        !hasModal && !(context.readOnly && effect == .edit)
+    }
+
+    /// SceneNavigator's synchronous open API cannot return a later UIKit refusal. Report it on the
+    /// same command-failure channel as FeatWindows, including the originating command id.
+    public static func reportNewWindowFailure(app: NibApp, command: String = CommandIDs.docOpen) {
+        let failure = NibError(.unavailable, String(localized: "A new window could not be opened."),
+                               hint: String(localized: "Try again, or open the document in this window."))
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                        userInfo: ["command": command, "error": failure])
     }
 
     public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {

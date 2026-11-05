@@ -441,6 +441,70 @@ final class FeatShapeRecognitionTests: XCTestCase {
         }
     }
 
+    func testFailedFallbackHandsOffInkBeforeRetiringPreviewAndReportsRecoveryRefusal() async throws {
+        for accepts in [true, false] {
+            let h = Harness(features: [FeatShapeRecognitionFeature.self])
+            let host = ControlledInkHost(h)
+            let calls = Calls()
+            standIn(CommandIDs.shapeCreate, h, calls, fails: true)
+            let drawn = rectangleStroke(h)
+            var resume: CheckedContinuation<Void, Never>?
+            let failure = expectation(description: "recovery refusal")
+            failure.isInverted = accepts
+            let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+                if note.userInfo?["command"] as? String == "canvas.retainFailedInk" {
+                    XCTAssertEqual((note.userInfo?["error"] as? NibError)?.code, .unavailable)
+                    failure.fulfill()
+                }
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
+            h.app.commands.register(CommandDescriptor(id: "canvas.retainFailedInk", title: "Retain", summary: "Test recovery",
+                params: .anything(), effect: .session)) { params, ctx in
+                calls.params["canvas.retainFailedInk"] = params
+                XCTAssertTrue(ctx.session === h.session)
+                await withCheckedContinuation { resume = $0 }
+                XCTAssertEqual(host.overlayLayer.sublayers?.count, 1, "keep the preview until handoff finishes")
+                if !accepts { throw NibError.unavailable("recovery store") }
+                return ["id": "RETAINED_INK"]
+            }
+            DrawShapeTool().strokeFinished(drawn, page: page, host: host)
+            await settle { host.pending != nil }
+            host.finish(.failure(NibError(.internalError, "Could not save ink")))
+            await settle { resume != nil }
+            // Resume before any throwing assertions, so a failed test cannot strand the command task.
+            resume?.resume()
+            let params = try XCTUnwrap(calls.params["canvas.retainFailedInk"])
+            XCTAssertEqual(params["page"], .string(pageRef))
+            XCTAssertEqual(params["stroke"], try JSONValue.from(drawn))
+            XCTAssertEqual(params["processed"], false)
+            await settle { host.overlayLayer.sublayers?.isEmpty != false }
+            XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, 0, "refusal must not restore the orphaned overlay bug")
+            XCTAssertTrue(host.base.renderWaits.isEmpty)
+            await fulfillment(of: [failure], timeout: 0.1)
+        }
+    }
+
+    func testClosedCanvasRetainsFailedFallbackInk() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let calls = Calls()
+        standIn(CommandIDs.inkAddStrokes, h, calls, fails: true)
+        let retained = expectation(description: "closed canvas recovery")
+        standIn("canvas.retainFailedInk", h, calls, retained)
+        let drawn = rectangleStroke(h)
+        weak var gone: FakeCanvasHost?
+        do {
+            let host = FakeCanvasHost(h)
+            gone = host
+            DrawShapeTool().strokeFinished(drawn, page: page, host: host)
+        }
+        XCTAssertNil(gone)
+        await fulfillment(of: [retained], timeout: 5)
+        let params = try XCTUnwrap(calls.params["canvas.retainFailedInk"])
+        XCTAssertEqual(params["page"], .string(pageRef))
+        XCTAssertEqual(params["stroke"], try JSONValue.from(drawn))
+        XCTAssertEqual(params["processed"], false)
+    }
+
     /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
     func testFailedCreateKeepsTheNeighboursAndTheInk() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])

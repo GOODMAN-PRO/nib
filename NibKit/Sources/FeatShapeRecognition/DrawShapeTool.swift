@@ -159,13 +159,20 @@ final class DrawShapeTool: CanvasTool {
                     case .success:
                         host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
                     case .failure(let error):
-                        layer?.removeFromSuperlayer()
-                        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                            userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                        Task { @MainActor in
+                            await ShapeCommit.retainFailedInk(stroke, doc: doc, page: page, app: app, session: session)
+                            // The canvas owns an accepted stroke. If recovery is unavailable or refuses it,
+                            // retire the phantom shape too (round 10); the failure has been reported.
+                            layer?.removeFromSuperlayer()
+                            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                        }
                     }
                 }
             } else {
-                _ = await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session)
+                if !(await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session)) {
+                    await ShapeCommit.retainFailedInk(stroke, doc: doc, page: page, app: app, session: session)
+                }
                 layer?.removeFromSuperlayer()
             }
         }
@@ -285,6 +292,22 @@ enum ShapeCommit {
             NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                 userInfo: ["command": CommandIDs.inkAddStrokes, "error": NibError.wrap(error)])
             return false
+        }
+    }
+
+    /// Transfers the original, unprocessed stroke to the canvas's Retry/Discard store, even after the host closes.
+    /// As with PenTool, stripped-down hosts need not install canvas recovery.
+    @MainActor
+    static func retainFailedInk(_ stroke: Stroke, doc: DocumentID, page: PageID, app: NibApp,
+                                session: EditorSession) async {
+        guard app.commands.entry("canvas.retainFailedInk") != nil else { return }
+        do {
+            let params: JSONValue = ["page": .string(NodeRef.page(doc, page).description),
+                                     "stroke": try JSONValue.from(stroke), "processed": false]
+            _ = try await app.bus.execute("canvas.retainFailedInk", params, session: session)
+        } catch {
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                userInfo: ["command": "canvas.retainFailedInk", "error": NibError.wrap(error)])
         }
     }
 

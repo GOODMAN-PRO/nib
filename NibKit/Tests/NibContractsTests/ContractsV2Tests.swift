@@ -319,6 +319,42 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).locked)
     }
 
+    func testExactHistoryEntrySurvivesSkippedRevertAndDryRun() async throws {
+        let h = Harness()
+        let first = try await probeContext(h)
+        try first.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            item.locked = true
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        let later = try await probeContext(h)
+        try later.mutate { tx in
+            var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            item.layer = 3
+            try tx.put(item, doc: self.doc, page: self.page1)
+        }
+        let entries = h.app.bus.history.entries(doc)
+        let selected = try XCTUnwrap(entries.first)
+        let params: JSONValue = ["doc": .string(NodeRef.document(doc).description),
+                                "group": .string(selected.group), "entryID": .string(selected.id)]
+        do {
+            _ = try await h.app.bus.execute(Invocation(command: CommandIDs.revertGroup, params: params, dryRun: true))
+            XCTFail("Exact-entry selective undo still refuses dry runs")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unsupported)
+        }
+        let result = try await h.run(CommandIDs.revertGroup, params)
+        XCTAssertEqual(result["reverted"]?.intValue, 0)
+        XCTAssertEqual(result["skipped"]?.intValue, 1)
+        XCTAssertNotNil(result["reason"]?.stringValue)
+        XCTAssertEqual(h.app.bus.history.entries(doc).map(\.id), entries.map(\.id))
+        XCTAssertTrue(h.app.bus.undo(doc))
+        let retry = try await h.run(CommandIDs.revertGroup, params)
+        XCTAssertEqual(retry["reverted"]?.intValue, 1)
+        XCTAssertFalse(h.app.bus.history.entries(doc).contains { $0.id == selected.id })
+        XCTAssertFalse(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).locked)
+    }
+
     func testLinkedUndoAcrossDocuments() async throws {
         let h = Harness()
         let beforeA = try h.snapshot(Fixtures.docID)

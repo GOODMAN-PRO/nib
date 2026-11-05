@@ -1,6 +1,8 @@
 import Foundation
 
 public struct UndoEntry {
+    /// Stable across coalescing, revision rebasing and undo/redo.
+    public let id: String
     public let group: String
     public var label: String
     public let principal: Principal
@@ -10,7 +12,8 @@ public struct UndoEntry {
     /// (`CommandContext.linkUndoAcrossDocuments()`, e.g. a page moved between two documents).
     public var linked: Bool = false
 
-    public init(group: String, label: String, principal: Principal, mutations: [Mutation], at: Date = Date()) {
+    public init(group: String, label: String, principal: Principal, mutations: [Mutation], at: Date = Date(), id: String = UUID().uuidString) {
+        self.id = id
         self.group = group
         self.label = label
         self.principal = principal
@@ -103,8 +106,8 @@ public final class UndoHistory {
     func pushUndo(_ e: UndoEntry, doc: DocumentID) { undoStacks[doc, default: []].append(e) }
     func pushRedo(_ e: UndoEntry, doc: DocumentID) { redoStacks[doc, default: []].append(e) }
 
-    func removeEntry(group: String, doc: DocumentID) -> UndoEntry? {
-        guard let i = undoStacks[doc]?.lastIndex(where: { $0.group == group }) else { return nil }
+    func removeEntry(id: String, doc: DocumentID) -> UndoEntry? {
+        guard let i = undoStacks[doc]?.lastIndex(where: { $0.id == id }) else { return nil }
         return undoStacks[doc]?.remove(at: i)
     }
 }

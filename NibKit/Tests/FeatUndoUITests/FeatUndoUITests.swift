@@ -430,6 +430,72 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertEqual(model.receipt, .gone)
     }
 
+    func testHistoryRevertsTheChosenOlderEntryInARepeatedGroup() async throws {
+        let h = harness()
+        let original = try title(h, Fixtures.page1)
+        let group = "REPEATED_TURN"
+        try await setTitle(h, Fixtures.page1, "Older", as: .ai("t"), group: group)
+        try await setTitle(h, Fixtures.pdfPage, "Interleaved")
+        try await setTitle(h, Fixtures.page2, "Newer", as: .ai("t"), group: group)
+        let model = HistoryViewModel(app: h.app, session: h.session)
+        await model.show(doc: Fixtures.docID)
+        let older = try XCTUnwrap(model.rows.last { $0.group == group })
+        let newer = try XCTUnwrap(model.rows.first { $0.group == group })
+        XCTAssertNotEqual(older.id, newer.id)
+
+        await model.revert(older)
+        XCTAssertEqual(model.receipt, .reverted(count: 1, kept: 0))
+        XCTAssertEqual(try title(h, Fixtures.page1), original)
+        XCTAssertEqual(try title(h, Fixtures.page2), "Newer")
+        XCTAssertEqual(try title(h, Fixtures.pdfPage), "Interleaved")
+        XCTAssertFalse(model.rows.contains { $0.id == older.id })
+        XCTAssertTrue(model.rows.contains { $0.id == newer.id })
+        await model.revert(older)
+        XCTAssertEqual(model.receipt, .gone, "a stale entry id must never fall back to its group's newer entry")
+        XCTAssertEqual(try title(h, Fixtures.page2), "Newer")
+
+        // Group-only callers still select the newest matching entry.
+        let result = try await h.run(CommandIDs.revertGroup, ["doc": "doc:FIXTUREDOC01", "group": .string(group)])
+        XCTAssertEqual(result["reverted"]?.intValue, 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try title(h, Fixtures.page2), "Newer")
+    }
+
+    func testHistoryIdentitySurvivesCoalescingUndoAndRedo() async throws {
+        let h = harness()
+        try await setTitle(h, Fixtures.page1, "First", group: "SAME")
+        let entry = try XCTUnwrap(h.app.bus.history.entries(Fixtures.docID).first)
+        try await setTitle(h, Fixtures.page2, "Second", group: "SAME")
+        XCTAssertEqual(h.app.bus.history.entries(Fixtures.docID).first?.id, entry.id)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        let restored = try XCTUnwrap(h.app.bus.history.entries(Fixtures.docID).first)
+        XCTAssertEqual(restored.id, entry.id)
+        XCTAssertEqual(restored.at, entry.at)
+    }
+
+    func testHistoryCommandRefusesReadOnlyWindowAndDocument() async throws {
+        for documentReadOnly in [false, true] {
+            let h = harness()
+            try await setTitle(h, Fixtures.page1, "Keep")
+            let entry = try XCTUnwrap(h.app.bus.history.entries(Fixtures.docID).first)
+            if documentReadOnly {
+                h.app.services.set(NSMutableSet(array: [Fixtures.docID.raw]), for: ServiceKeys.storeReadOnly)
+            } else {
+                h.session.readOnly = true
+            }
+            do {
+                _ = try await h.run(CommandIDs.revertGroup, ["doc": "doc:FIXTUREDOC01",
+                    "group": .string(entry.group), "entryID": .string(entry.id)])
+                XCTFail("Read-only history must be refused at the command boundary")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .permissionDenied)
+            }
+            XCTAssertEqual(try title(h, Fixtures.page1), "Keep")
+            XCTAssertEqual(h.app.bus.history.entries(Fixtures.docID).map(\.id), [entry.id])
+        }
+    }
+
     /// The open panel follows live commits (coalesced into one reload), and stops once it is off screen.
     func testHistoryFollowsCommitsWhileObservingAndStopsAfter() async throws {
         let h = harness()
