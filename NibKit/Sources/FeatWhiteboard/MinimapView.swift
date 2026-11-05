@@ -6,14 +6,19 @@ import NibDesign
 
 // MARK: - Geometry (pure)
 
-/// Maps a page-space `world` region into a minimap of `size` points, letterboxed and centred.
+/// Maps a page-space `world` region inside the minimap's chrome inset, letterboxed and centred.
 struct MinimapGeometry: Equatable {
     let world: Rect
     let size: CGSize
 
+    static let previewInset = NibSpacing.s
+    static let previewRadius = NibRadius.concentric(NibRadius.panel, inset: previewInset)
+
     /// Map points per page point.
     var scale: Double {
-        min(Double(size.width) / max(world.width, 1), Double(size.height) / max(world.height, 1))
+        let width = max(Double(size.width - 2 * Self.previewInset), 1)
+        let height = max(Double(size.height - 2 * Self.previewInset), 1)
+        return min(width / max(world.width, 1), height / max(world.height, 1))
     }
 
     /// Top-left of the world inside the map.
@@ -663,8 +668,8 @@ struct MinimapMap: View {
             .droplet("whiteboard.minimap", style: .floatingPanel)
     }
 
-    /// Paper belongs to the preview, inset from the Deep surface. Keep the existing world mapping
-    /// for the bitmap, viewport and gestures; only clip the padded world margin, never rescale ink.
+    /// Geometry reserves the chrome inset before mapping the bitmap, viewport and gestures.
+    /// Round only the padded world margin; do not take another inset out of the rendered content.
     /// Internal so hostless pixel tests can exercise the content without system glass compositing.
     var overview: some View {
         let g = model.geometry
@@ -674,11 +679,7 @@ struct MinimapMap: View {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .frame(width: r.width, height: r.height)
-                    .mask {
-                        NibDropletShape(cornerRadius: NibRadius.concentric(
-                            NibRadius.panel, inset: NibSpacing.s))
-                            .padding(NibSpacing.s)
-                    }
+                    .clipShape(NibDropletShape(cornerRadius: MinimapGeometry.previewRadius))
                     .offset(x: r.minX, y: r.minY)
             } else {
                 Canvas { context, _ in

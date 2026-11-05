@@ -1043,6 +1043,35 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(MinimapFit.scale(content: nil, canvas: CGSize(width: 800, height: 600)), 1)
     }
 
+    func testMinimapFitsContentCornersInsideRoundedPreviewAndMapsThemBack() {
+        for compact in [false, true] {
+            for dimensions in [CGSize(width: 1000, height: 1000), CGSize(width: 1600, height: 300),
+                               CGSize(width: 300, height: 1600), CGSize(width: 10, height: 10)] {
+                let content = Rect(x: -500, y: -400, width: Double(dimensions.width), height: Double(dimensions.height))
+                let g = MinimapGeometry(world: MinimapGeometry.world(content: content, visible: content),
+                                        size: MinimapGeometry.mapSize(compact: compact))
+                let tile = g.map(g.world)
+                let available = CGRect(origin: .zero, size: g.size).insetBy(dx: NibSpacing.s, dy: NibSpacing.s)
+                XCTAssertTrue(available.insetBy(dx: -0.001, dy: -0.001).contains(tile), "Reserve the chrome before scaling")
+                let mask = NibDropletShape(cornerRadius: MinimapGeometry.previewRadius).path(in: tile)
+                let corners = [Point(content.minX, content.minY), Point(content.maxX, content.minY),
+                               Point(content.minX, content.maxY), Point(content.maxX, content.maxY)]
+                for corner in corners {
+                    let mapped = g.map(corner)
+                    XCTAssertTrue(mask.contains(mapped), "Unclipped content: compact=\(compact), content=\(content), corner=\(mapped)")
+                    let back = g.page(mapped)
+                    XCTAssertEqual(back.x, corner.x, accuracy: 1e-6)
+                    XCTAssertEqual(back.y, corner.y, accuracy: 1e-6)
+                    var drag = MinimapDrag()
+                    let target = drag.target(for: mapped, current: g)
+                    XCTAssertEqual(target.x, corner.x, accuracy: 1e-6)
+                    XCTAssertEqual(target.y, corner.y, accuracy: 1e-6)
+                }
+                XCTAssertEqual(g.map(content).origin, g.map(corners[0]), "The viewport uses the same transform")
+            }
+        }
+    }
+
     /// Dragging the viewport feeds the canvas, which moves the viewport, which changes the live map world: every
     /// finger position must still map through the geometry the drag started with.
     func testDraggingTheViewportMapsTheFinger1to1() {
@@ -1415,9 +1444,9 @@ final class FeatWhiteboardTests: XCTestCase {
                 let emptyImage = try XCTUnwrap(NibSnapshot.image(empty, size: size, variant: variant))
                 let strokePoint = CGPoint(x: tile.midX, y: tile.midY)
                 let paperPoint = CGPoint(x: tile.midX, y: tile.midY - tile.height / 4)
-                let rimPoint = CGPoint(x: tile.midX, y: tile.minY + 2)
-                // Inside the inset rectangle, but outside its rounded corner.
-                let cornerPoint = CGPoint(x: tile.minX + NibSpacing.s + 1, y: tile.minY + NibSpacing.s + 1)
+                let rimPoint = CGPoint(x: tile.midX, y: tile.minY - NibSpacing.s / 2)
+                // Inside the preview rectangle, but outside its rounded corner.
+                let cornerPoint = CGPoint(x: tile.minX + 1, y: tile.minY + 1)
                 let stroke = try XCTUnwrap(NibSnapshot.pixel(image, at: strokePoint))
                 let background = try XCTUnwrap(NibSnapshot.pixel(image, at: paperPoint))
                 let rim = try XCTUnwrap(NibSnapshot.pixel(image, at: rimPoint))
@@ -1431,6 +1460,64 @@ final class FeatWhiteboardTests: XCTestCase {
                                      "Paper stays inset: \(geometry); rim@\(rimPoint)=\(rim); \(samples)")
                 XCTAssertEqual(Double(corner.r), Double(emptyCorner.r), accuracy: 8,
                                "No square paper corner: \(geometry); corner@\(cornerPoint)=\(corner), empty=\(emptyCorner)")
+            }
+        }
+    }
+
+    func testPopulatedMinimapKeepsOppositeCornerMarksInRegularAndCompactMapsInBothAppearances() async throws {
+        let marks = [Rect(x: 0, y: 0, width: 32, height: 32), Rect(x: 968, y: 968, width: 32, height: 32)]
+        for compact in [false, true] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let h = harness(), renderer = ScriptedRenderer()
+                let items = marks.enumerated().map { index, rect -> Item in
+                    // Item.bounds includes the outline and antialias allowance. Keep the actual
+                    // content bounds at exactly 1000 x 1000, including that allowance.
+                    let frame = rect.insetBy(ShapeItemStyle().strokeWidth / 2 + 1)
+                    var item = Item.makeShape(ShapeItem(shape: .rectangle,
+                                                       frame: Frame(x: frame.x, y: frame.y, w: frame.width, h: frame.height)))
+                    item.id = NibID("CORNER\(index)")
+                    return item
+                }
+                h.persistence.pageItems[Fixtures.whiteboardID, default: [:]][Fixtures.boardID] = items
+                renderer.draw = { request in
+                    let region = request.region!
+                    let format = UIGraphicsImageRendererFormat()
+                    format.scale = 1
+                    let pixels = CGSize(width: ceil(region.width * request.scale), height: ceil(region.height * request.scale))
+                    return UIGraphicsImageRenderer(size: pixels, format: format).image { ctx in
+                        if request.background {
+                            (variant == .dark ? UIColor.white : UIColor.black).setFill()
+                            ctx.fill(CGRect(origin: .zero, size: pixels))
+                        }
+                        UIColor.red.setFill()
+                        for mark in marks {
+                            let rect = CGRect(x: (mark.x - region.x) / region.width * Double(pixels.width),
+                                              y: (mark.y - region.y) / region.height * Double(pixels.height),
+                                              width: mark.width / region.width * Double(pixels.width),
+                                              height: mark.height / region.height * Double(pixels.height))
+                            ctx.fill(rect)
+                        }
+                    }.cgImage!
+                }
+                h.app.services.renderer = renderer
+                h.session.document = Fixtures.whiteboardID
+                h.session.page = Fixtures.boardID
+                let model = MinimapModel(app: h.app, doc: Fixtures.whiteboardID, session: h.session)
+                model.compact = compact
+                model.reloadContent()
+                for _ in 0..<100 where model.image == nil { try await Task.sleep(nanoseconds: 20_000_000) }
+                XCTAssertNotNil(model.image)
+                XCTAssertEqual(model.tally.bounds, Rect(x: 0, y: 0, width: 1000, height: 1000))
+                let size = model.geometry.size
+                let image = try XCTUnwrap(NibSnapshot.image(modelOverview(model), size: size, variant: variant))
+                for mark in marks {
+                    let point = model.geometry.map(mark.center)
+                    let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: point))
+                    let message = "Visible corner ink: compact=\(compact), variant=\(variant), point=\(point), pixel=\(pixel)"
+                    XCTAssertGreaterThan(pixel.r, 220, message)
+                    XCTAssertLessThan(pixel.g, 35, message)
+                    XCTAssertLessThan(pixel.b, 35, message)
+                }
             }
         }
     }
