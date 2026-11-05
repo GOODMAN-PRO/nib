@@ -578,7 +578,8 @@ final class PagesUITests: XCTestCase {
         try pages(); try navigate(1)
         try ui.waitForState { $0.strokeCountOnPage == source.strokeCountOnPage }
         try closeNavigator(); try manageTemplates(); try tap("Custom")
-        try require(button("Motion master")).press(forDuration: 0.8); try tap("Delete Template"); try confirm("Delete Template")
+        try ui.nativeContextMenu(try require(button("Motion master")), path: ["Delete Template"])
+        try confirm("Delete Template")
         try wait("Delete custom template must remove only chosen catalogue entry") { (try? self.customTemplates().contains { $0["title"] as? String == "Motion master" }) == false }
         try category("Essentials"); try require(button("Blank"))
         try assertAssets(added)

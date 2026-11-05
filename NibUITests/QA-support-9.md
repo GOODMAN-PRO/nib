@@ -204,3 +204,9 @@ Should unblock Pages OutlineAddRenameNavigateAndDeleteRetainsPage, OutlineMoveNe
 P:pages-outline-templates#1 is proven and current OutlineTableController still returns the default full-swipe-enabled action. Removed only the erroneous post-full-swipe Delete tap: the original [First, Third] and four-page checks now observe the immediate deletion of Second. Added a 0.4s synthesized partial drag across 30% of Third's row (85% to 55%), requiring the Delete button while both remaining titles are still present, then tapping it and requiring [First] with four pages intact. No sleeps or allowance changes.
 
 Should unblock OutlineSortByCurrentPageNumberAndSwipeDelete and cover both platform interactions. Next CI must prove full swipe deletes immediately and partial swipe only reveals until the button tap. Existing touch-path logging records delivered coordinates; no new log prefix.
+
+### C4 - custom template menu readiness
+
+P:pages-outline-templates#2 and verdict establish no menu after the Custom switch and long press, but do not distinguish layout movement, button arbitration or a delayed/swallowed touch (gesture-gate timeout). Current custom tile still has its own contextMenu. Template deletion now goes through H2 after switching to Custom, so the tile must have two consecutive stable visible frames before the single press. Confirmation and chosen-template-only, built-in availability, flattened-asset and page-count assertions remain.
+
+Should unblock CreateTemplateFromDrawnPageFlattensAppearanceAndDeleteOnlyChosenTemplate if delivery/readiness was responsible. Otherwise H2 logs the target/probe/tree and screenshot without blindly repressing. Next CI must show Delete Template followed by its separate confirmation and all original results; cause remains unknown until then. Uses H2's diagnostic table.
