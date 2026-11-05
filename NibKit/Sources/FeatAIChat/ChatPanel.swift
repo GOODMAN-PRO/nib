@@ -149,12 +149,20 @@ struct ChatPanel: View {
                 Text(String(localized: "Use your Claude or ChatGPT subscription with Nib Agent on your Mac."))
                     .font(NibFont.callout).foregroundStyle(NibColor.label)
                     .fixedSize(horizontal: false, vertical: true)
-                ForEach(ChatViewModel.connectionActions, id: \.self) { provider in
-                    NibButton(provider, symbol: .settings, kind: .plain) {
-                        model.perform(CommandIDs.settingsOpen, ["page": .string(ChatViewModel.connectionPage(for: provider))])
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(ChatViewModel.connectionActions, id: \.self) { provider in
+                        Button {
+                            model.perform(CommandIDs.settingsOpen, ["page": .string(ChatViewModel.connectionPage(for: provider))])
+                        } label: {
+                            Label { Text(provider) } icon: { Image(nib: .link) }
+                                .font(NibFont.button)
+                                .foregroundStyle(NibColor.accent)
+                                .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                        }
+                        .buttonStyle(NibPressStyle())
+                        .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
+                        .accessibilityHint(String(localized: "Opens setup for this provider."))
                     }
-                    .accessibilityIdentifier("cmd." + CommandIDs.settingsOpen)
-                    .accessibilityHint(String(localized: "Opens setup for this provider."))
                 }
                 operationFeedback
             }
