@@ -631,6 +631,30 @@ final class FeatCalendarTests: XCTestCase {
 
     // MARK: Planner creation and the tab
 
+    func testPlannerUsesGregorianStorageDatesForNonGregorianCalendars() throws {
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Bangkok"))
+        gregorian.locale = Locale(identifier: "th_TH")
+        // Near midnight in UTC: preserving the selected local day matters too.
+        let start = date(2026, 9, 30, 1, 0, gregorian)
+        for identifier in [Calendar.Identifier.buddhist, .hebrew, .islamic] {
+            var calendar = Calendar(identifier: identifier)
+            calendar.timeZone = gregorian.timeZone
+            calendar.locale = gregorian.locale
+            for layout in EventPlannerParams.Layout.allCases {
+                for weekStart in EventPlannerParams.WeekStart.allCases {
+                    let expected = PlannerPlan(start: start, layout: layout, weekStart: weekStart,
+                                               count: 3, calendar: gregorian)
+                    let actual = PlannerPlan(start: start, layout: layout, weekStart: weekStart,
+                                             count: 3, calendar: calendar)
+                    XCTAssertEqual(actual.pages, expected.pages)
+                    XCTAssertEqual(actual.interval, expected.interval)
+                    XCTAssertEqual(actual.pages.first?.year, 2026)
+                }
+            }
+        }
+    }
+
     func testNewPlannerBatchCreatesOneDatedPagePerWeek() {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(secondsFromGMT: 0)!

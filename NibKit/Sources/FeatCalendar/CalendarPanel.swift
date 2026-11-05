@@ -73,8 +73,10 @@ struct PlannerPlan {
     init(start: Date, layout: EventPlannerParams.Layout, weekStart: EventPlannerParams.WeekStart, count: Int,
          calendar base: Calendar) {
         let n = max(1, min(count, layout == .daily ? Self.maxDays : Self.maxWeeks))
-        let probe = EventPlannerParams(date: start, layout: layout, weekStart: weekStart, calendar: base)
-        let cal = probe.calendar(timeZone: base.timeZone, locale: base.locale ?? .current)
+        // Stored planner components are Gregorian, regardless of the calendar used by the date picker.
+        let cal = EventPlannerParams(layout: layout, weekStart: weekStart)
+            .calendar(timeZone: base.timeZone, locale: base.locale ?? .current)
+        let probe = EventPlannerParams(date: start, layout: layout, weekStart: weekStart, calendar: cal)
         let first = probe.firstDay(in: cal) ?? cal.startOfDay(for: start)
         let step = layout == .daily ? 1 : 7
         pages = (0..<n).compactMap { i in
