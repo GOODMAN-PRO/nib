@@ -309,7 +309,7 @@ final class WebDAVMirrorTests: XCTestCase {
         XCTAssertEqual(server.requestCount("PUT"), puts)
     }
 
-    func testFailedMoveCopyDefersRemoteAndLocalDeletions() async throws {
+    func testFailedMoveCopyDefersRelatedDeletionsAndAllowsUnrelatedDeletion() async throws {
         let server = FakeDAVServer.install()
         let root = DAVTest.tempDir("move-failure"), state = DAVTest.tempDir("state")
         try DAVTest.write(root, "Old.nibnote/asset.json", "original")
@@ -319,21 +319,79 @@ final class WebDAVMirrorTests: XCTestCase {
         try FileManager.default.moveItem(at: root.appendingPathComponent("Old.nibnote"),
                                         to: root.appendingPathComponent("New.nibnote"))
         server.remove("/dav/Nib/remote-deleted.json")
-        // A non-fatal copy failure must also stop deletions, independently of fatal-error handling.
+        // A failed renamed package must retain its old copy, but an unrelated deletion still applies.
         server.intercept = { method, path in
             method == "PUT" && path == "/dav/Nib/New.nibnote/asset.json" ? (423, [:], Data()) : nil
         }
         let result = try await sync(server, root, state, dev)
         XCTAssertEqual(result.deletedRemote, 0)
-        XCTAssertEqual(result.deletedLocal, 0)
+        XCTAssertEqual(result.deletedLocal, 1)
         XCTAssertFalse(result.errors.isEmpty)
         XCTAssertGreaterThan(result.pending, 1)
         XCTAssertEqual(server.text("/dav/Nib/Old.nibnote/asset.json"), "original")
-        XCTAssertTrue(DAVTest.exists(root, "remote-deleted.json"))
+        XCTAssertFalse(DAVTest.exists(root, "remote-deleted.json"))
         server.intercept = nil
         let retry = try await sync(server, root, state, dev)
         XCTAssertGreaterThan(retry.deletedRemote, 0)
         XCTAssertEqual(server.text("/dav/Nib/New.nibnote/asset.json"), "original")
+    }
+
+    func testFailedRemoteMoveRetainsOldLocalPackage() async throws {
+        let server = FakeDAVServer.install()
+        let root = DAVTest.tempDir("remote-move"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "Old.nibnote/asset.json", "original")
+        try DAVTest.write(root, "keep.json", "keep")
+        _ = try await sync(server, root, state, dev)
+        // Nib moves with PUT + DELETE, which changes the destination validator.
+        server.put("/dav/Nib/New.nibnote/asset.json", "original")
+        server.remove("/dav/Nib/Old.nibnote")
+        server.intercept = { method, path in
+            method == "GET" && path.contains("New.nibnote") ? (403, [:], Data()) : nil
+        }
+        let result = try await sync(server, root, state, dev)
+        XCTAssertEqual(result.deletedLocal, 0)
+        XCTAssertEqual(DAVTest.read(root, "Old.nibnote/asset.json"), "original")
+        server.intercept = nil
+        let retry = try await sync(server, root, state, dev)
+        XCTAssertEqual(retry.deletedLocal, 1)
+        XCTAssertEqual(DAVTest.read(root, "New.nibnote/asset.json"), "original")
+    }
+
+    func testChangedDuringSyncDoesNotDeferMoveDeletions() async throws {
+        let server = FakeDAVServer.install()
+        let root = DAVTest.tempDir("move-race"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "Old.nibnote/asset.json", "original")
+        try DAVTest.write(root, "keep.json", "keep")
+        _ = try await sync(server, root, state, dev)
+        try FileManager.default.moveItem(at: root.appendingPathComponent("Old.nibnote"),
+                                        to: root.appendingPathComponent("New.nibnote"))
+        server.intercept = { method, path in
+            method == "PUT" && path.contains("New.nibnote") ? (412, [:], Data()) : nil
+        }
+        let result = try await sync(server, root, state, dev)
+        XCTAssertEqual(result.deletedRemote, 1)
+        XCTAssertEqual(result.pending, 1)
+        XCTAssertTrue(result.errors.isEmpty)
+        XCTAssertEqual(DAVTest.read(root, "New.nibnote/asset.json"), "original")
+    }
+
+    func testPermanentCopyFailureAndPreconditionRaceDoNotStarveUnrelatedDeletions() async throws {
+        for status in [403, 412] {
+            let server = FakeDAVServer.install()
+            let root = DAVTest.tempDir("unrelated"), state = DAVTest.tempDir("state")
+            try DAVTest.write(root, "delete.json", "delete me")
+            try DAVTest.write(root, "keep.json", "keep")
+            _ = try await sync(server, root, state, dev)
+            try FileManager.default.removeItem(at: root.appendingPathComponent("delete.json"))
+            try DAVTest.write(root, "Bad.nibnote/asset.json", "new file fails")
+            server.intercept = { method, path in
+                method == "PUT" && path.contains("Bad.nibnote") ? (status, [:], Data()) : nil
+            }
+            let result = try await sync(server, root, state, dev)
+            XCTAssertEqual(result.deletedRemote, 1)
+            XCTAssertNil(server.text("/dav/Nib/delete.json"))
+            XCTAssertEqual(result.pending, 1)
+        }
     }
 
     func testSamePathDivergenceKeepsBothVersionsOnEveryDevice() async throws {

@@ -705,6 +705,7 @@ final class WebDAVMirrorRun {
         var counter: Counter?
         var conflictFile: String?
         var error: WebDAVError?
+        var failedCopyKey: String?
         var uploadedPaths: [String] = []
         var deletedRemotePath: String?
         var deletedLocalPath: String?
@@ -758,14 +759,16 @@ final class WebDAVMirrorRun {
             var remainingRemote = Set(tree.files.values.map { $0.path })
             var deletedRemote: [String] = []
             var applied = 0
-            var copyFailed = false
+            let dependencies = Self.deletionDependencies(copies: copies, deletions: deletions,
+                                                         scan: scan, tree: tree, state: state.entries)
+            var failedCopies = Set<String>()
             for phase in [copies, deletions] {
-                // A move is copies followed by deletions. Keep the old copies until every new copy is safe.
-                if copyFailed {
-                    report.pending += deletions.count
-                    break
+                // A failed destination copy retains its old document/folder, not every deletion in the library.
+                let ready = phase.filter { action in
+                    !failedCopies.contains { dependencies[$0]?.contains(action.key) == true }
                 }
-                try await execute(phase, scan: scan, tree: tree, scratch: scratch) { outcome in
+                report.pending += phase.count - ready.count
+                try await execute(ready, scan: scan, tree: tree, scratch: scratch) { outcome in
                     for (key, entry) in outcome.updates { state.entries[key] = entry }
                     if let counter = outcome.counter { report.count(counter) }
                     if let file = outcome.conflictFile { report.conflictFiles.append(file) }
@@ -776,7 +779,9 @@ final class WebDAVMirrorRun {
                     }
                     if let path = outcome.deletedLocalPath { deletedLocal.append(path) }
                     if let error = outcome.error {
-                        copyFailed = true
+                        if case .changedDuringSync = error {} else if let key = outcome.failedCopyKey {
+                            failedCopies.insert(key)
+                        }
                         report.pending += 1
                         if case .changedDuringSync = error {} else { report.errors.append(error.message) }
                     }
@@ -800,6 +805,64 @@ final class WebDAVMirrorRun {
         state.lastReport = report
         try? store.save(state)
         return report
+    }
+
+    /// Relate destination scopes to old scopes before copying. Local fingerprints survive moves; on the
+    /// server Nib implements moves with PUT, so validators can change. Match those files by package member
+    /// path and size as well (page IDs and asset names are stable). Ambiguous matches retain the candidate
+    /// old scopes conservatively, but never block every deletion merely because one request failed.
+    static func deletionDependencies(copies: [MirrorAction], deletions: [MirrorAction], scan: LocalScan,
+                                     tree: RemoteTree, state: [String: SyncedEntry]) -> [String: Set<String>] {
+        func scope(_ key: String) -> String {
+            let parts = key.split(separator: "/").map(String.init)
+            if let package = parts.firstIndex(where: { $0.hasSuffix(".nibnote") }) {
+                return parts.prefix(package + 1).joined(separator: "/")
+            }
+            return parts.count > 1 ? parts.dropLast().joined(separator: "/") : key
+        }
+        func member(_ key: String) -> String {
+            let prefix = scope(key)
+            return key == prefix ? key : String(key.dropFirst(prefix.count + 1))
+        }
+        func sizeKey(_ key: String, _ size: Int64) -> String { member(key) + "|" + String(size) }
+        var byFingerprint: [String: Set<String>] = [:]
+        var byVersion: [String: Set<String>] = [:]
+        var byMemberSize: [String: Set<String>] = [:]
+        var deletedByScope: [String: Set<String>] = [:]
+        for deletion in deletions {
+            let origin = scope(deletion.key)
+            deletedByScope[origin, default: []].insert(deletion.key)
+            if deletion.kind == .deleteRemote, let previous = state[deletion.key] {
+                byFingerprint[previous.local, default: []].insert(origin)
+            }
+            if deletion.kind == .deleteLocal, let previous = state[deletion.key] {
+                byVersion[previous.remote, default: []].insert(origin)
+                if let file = scan.files[deletion.key] {
+                    byMemberSize[sizeKey(deletion.key, file.size), default: []].insert(origin)
+                }
+            }
+        }
+        var oldScopes: [String: Set<String>] = [:]
+        for copy in copies where copy.kind != .forget {
+            let destination = scope(copy.key)
+            oldScopes[destination, default: []].insert(destination)
+            if copy.kind == .upload, let file = scan.files[copy.key] {
+                oldScopes[destination, default: []].formUnion(byFingerprint[file.fingerprint] ?? [])
+            }
+            if copy.kind == .download, let file = tree.files[copy.key] {
+                oldScopes[destination, default: []].formUnion(byVersion[file.version] ?? [])
+                if let size = file.size {
+                    oldScopes[destination, default: []].formUnion(byMemberSize[sizeKey(copy.key, size)] ?? [])
+                }
+            }
+        }
+        var dependencies: [String: Set<String>] = [:]
+        for copy in copies {
+            var protected = Set<String>()
+            for origin in oldScopes[scope(copy.key)] ?? [] { protected.formUnion(deletedByScope[origin] ?? []) }
+            dependencies[copy.key] = protected
+        }
+        return dependencies
     }
 
     /// Lists the server (creating the library folder when it is missing) and stores the new snapshot in `state`.
@@ -893,7 +956,13 @@ final class WebDAVMirrorRun {
                 guard next < actions.count else { return }
                 let action = actions[next]
                 next += 1
-                group.addTask { await self.perform(action, scan: scan, tree: tree, scratch: scratch) }
+                group.addTask {
+                    var outcome = await self.perform(action, scan: scan, tree: tree, scratch: scratch)
+                    if [.upload, .download, .resolve].contains(action.kind), outcome.error != nil {
+                        outcome.failedCopyKey = action.key
+                    }
+                    return outcome
+                }
             }
             for _ in 0..<min(max(1, concurrency), actions.count) { startNext() }
             while let outcome = await group.next() {
