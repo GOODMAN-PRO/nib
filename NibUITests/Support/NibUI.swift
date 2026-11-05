@@ -499,7 +499,7 @@ final class NibUI {
               focused.zoom == before.zoom, focused.contentOffset.x == before.contentOffset.x,
               focused.contentOffset.y == before.contentOffset.y, focused.openPanels == before.openPanels,
               !app.keyboards.firstMatch.exists else {
-            throw Failure.message("Keyboard focus preparation changed document content or navigation")
+            throw Failure.message("Keyboard focus preparation changed document content or navigation; before=\(before); after=\(focused)")
         }
         try XCTContext.runActivity(named: "Requested chord \(key), modifiers \(modifiers.rawValue)") { [self] activity in
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
@@ -527,6 +527,12 @@ final class NibUI {
             throw Failure.message("Global chord rejected text responder: \(current.keyResponder ?? "unknown")")
         }
         if app.state != .runningForeground { app.activate() }
+        if let responder = current.keyResponder {
+            guard current.keyResponderIsText == false else {
+                throw Failure.message("Cannot classify existing keyboard responder: \(responder)")
+            }
+            return responder
+        }
 
         func tapInertHeader(in surface: XCUIElement, modal: Bool) throws {
             // One snapshot avoids per-control AX round trips. Conservatively exclude every control frame,
@@ -565,8 +571,21 @@ final class NibUI {
         if let surface {
             try tapInertHeader(in: surface, modal: true)
         } else if canvas.exists {
-            // Reach the real document responder chain outside paper and away from the side palette.
-            coordinate(CGPoint(x: 0.18, y: 0.85)).tap()
+            // NavBar inserts NibBarSeparator between editingOrder 1 (Redo) and 2 (Search).
+            // Chrome.swift defines a non-action Rectangle, 0.5pt + 6pt padding on either side,
+            // within the fixed bar droplet. Never use empty window space over the whiteboard.
+            let redo = app.buttons["cmd.edit.redo"].firstMatch
+            let search = app.buttons["cmd.search.open"].firstMatch
+            guard redo.exists, search.exists else { throw Failure.message("No document chrome separator for focus") }
+            let left = redo.frame, right = search.frame
+            let gap = right.minX - left.maxX
+            let point = CGPoint(x: (left.maxX + right.minX) / 2, y: left.midY)
+            guard abs(gap - 12.5) <= 2, abs(left.midY - right.midY) < 1,
+                  app.windows.firstMatch.frame.contains(point) else {
+                throw Failure.message("Unverified document chrome separator: redo=\(left) search=\(right)")
+            }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
         } else {
             // The shell's library tap recognizer schedules reclaimKeyFocusIfNeeded after a real window tap.
             try tapInertHeader(in: app.windows.firstMatch, modal: false)
