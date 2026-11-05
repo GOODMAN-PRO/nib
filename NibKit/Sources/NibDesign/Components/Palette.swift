@@ -230,7 +230,8 @@ public struct NibToolButton: View {
 
 /// The floating tool palette: tools, More, quick colours, plugin tools after a second divider, the selection bead,
 /// docking to any edge (it re-forms between vertical and horizontal by gathering into a bead and spreading), the
-/// selected tool's settings popover (buds out of the tool on a second tap), the More grid, and the active tool's
+/// selected tool's settings popover (opened by its chevron, accessibility action, or reselection without options),
+/// the More grid, and the active tool's
 /// options bar. Place it as a full-size child of the `NibDropletContainer`.
 ///
 /// `tools` is the customised palette (native and plugin tools, in order); `moreTools` is what More holds by default.
@@ -756,7 +757,8 @@ public struct NibToolPalette<Settings: View>: View {
     }
 
     private func toolButton(_ tool: NibTool, _ d: NibPaletteDock, _ map: [String: CGFloat]) -> some View {
-        let hint = optionsState.map { $0(tool.id).hint(hasSettings: tool.hasSettings, settingsOpen: settingsOpen) } ?? ""
+        let hint = tool.id == selection
+            ? (optionsState?(tool.id).hint(hasSettings: tool.hasSettings, settingsOpen: settingsOpen) ?? "") : ""
         return NibToolButton(tool: tool, isSelected: tool.id == selection, paletteID: id, along: map[tool.id] ?? 0,
                       pitch: pitch) {
             tap(tool)

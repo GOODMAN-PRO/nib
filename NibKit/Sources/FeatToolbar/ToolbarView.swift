@@ -135,7 +135,8 @@ final class ToolbarModel: ObservableObject {
     var optionsCollapsed: Bool { optionsFoldedByScroll || manuallyFoldedTools.contains(tool) }
     /// Settings › Appearance › Liquid (`NibSettings.liquidMode`).
     @Published private(set) var liquidMode: NibLiquidMode = .full
-    /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): the options bar's chevron opens it.
+    /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): opened by the options chevron,
+    /// the accessibility action, or reselection of a tool without options content.
     /// One popover at a time: opening it closes the options bar's own popover.
     @Published var settingsOpen = false {
         didSet {
@@ -479,7 +480,7 @@ final class ToolbarModel: ObservableObject {
     func optionsState(for id: String) -> NibToolOptionsState {
         let descriptor = descriptors[id]
         let hasStrip = descriptor.map {
-            ActiveToolMenuHost.source(for: $0, app: app) != .absent || $0.settings != nil
+            ActiveToolMenuHost.source(for: $0, app: app) != .absent
         } ?? false
         return NibToolOptionsState(hasStrip: hasStrip, foldedByUser: manuallyFoldedTools.contains(id),
                                    foldedByScroll: optionsFoldedByScroll)
@@ -500,7 +501,9 @@ final class ToolbarModel: ObservableObject {
             closeOptionsPopovers()
             manuallyFoldedTools.remove(id)
             expandOptions()
-        case .settings(let presented): settingsOpen = presented
+        case .settings(let presented):
+            expandOptions()
+            settingsOpen = presented
         case .none: break
         }
         runtime?.setOptionsFolded(manuallyFoldedTools, session: session)

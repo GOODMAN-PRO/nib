@@ -1499,6 +1499,35 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertTrue(model.optionsCollapsed, "An open settings popover must not turn reselection into a settings toggle")
     }
 
+    func testSettingsOnlyToolReselectionTogglesSettingsAndKeepsChevronAvailable() throws {
+        let h = harness()
+        var text = try XCTUnwrap(h.app.ui.toolbar.get("text.item"))
+        text.settings = { _ in AnyView(Text("Text settings")) }
+        h.app.ui.toolbar.register(text)
+        h.session.tool = "text"
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(ActiveToolMenuHost.source(for: text, app: h.app), .absent)
+        XCTAssertFalse(model.optionsState(for: "text").hasStrip)
+        XCTAssertNotNil(model.toolOptions(for: "text"), "Settings-only tools retain their chevron")
+
+        for presented in [true, false, true, false] {
+            model.toolReselected("text")
+            XCTAssertEqual(model.settingsOpen, presented)
+            XCTAssertFalse(model.optionsCollapsed)
+            XCTAssertFalse(model.optionsState(for: "text").foldedByUser)
+            XCTAssertNotNil(model.toolOptions(for: "text"))
+        }
+
+        // Reselecting a settings-only tool also restores a chevron hidden by scrolling.
+        h.session.visibleRect = Rect(x: 0, y: 0, width: 400, height: 600)
+        h.session.visibleRect = Rect(x: 0, y: 40, width: 400, height: 600)
+        XCTAssertTrue(model.optionsCollapsed)
+        model.toolReselected("text")
+        XCTAssertTrue(model.settingsOpen)
+        XCTAssertFalse(model.optionsCollapsed)
+        XCTAssertNotNil(model.toolOptions(for: "text"))
+    }
+
     /// T-109 and the options bar's sources.
     func testScrollingFoldsTheOptionsBarAndAToolBringsItBack() throws {
         let h = harness()
