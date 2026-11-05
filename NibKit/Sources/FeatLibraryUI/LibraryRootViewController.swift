@@ -370,6 +370,9 @@ final class LibraryViewModel: ObservableObject {
                 let canUndo = !destination.hasPrefix("doc:") && !parents.isEmpty
                 var undoAction: (@MainActor () -> Void)?
                 if canUndo { undoAction = { [weak self] in
+                    #if DEBUG
+                    NSLog("%@", "[Nib QA toast] move undo entered modelAlive=\(self != nil)")
+                    #endif
                     guard let self else { return }
                     for (parent, rows) in parents {
                         #if DEBUG
@@ -464,6 +467,9 @@ final class LibraryFloatingAdapter: FloatingHosting {
     func removeAnchor(_ id: String) { host.removeAnchor(id) }
     func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { host.containerRect(rect, from: view) }
     func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {
+        #if DEBUG
+        NSLog("%@", String("[Nib QA toast] library post hasAction=\(action != nil) message=\(message)".prefix(890)))
+        #endif
         let button = actionTitle.flatMap { title in action.map { handler in NibAction(title) { handler() } } }
         host.post(NibToastItem(message, action: button))
     }
