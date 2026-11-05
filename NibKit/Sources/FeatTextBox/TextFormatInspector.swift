@@ -905,9 +905,15 @@ private struct TextStylesSection: View {
                     }
                 }
             }
-            NibButton(String(localized: "Set as Default for New Text"), kind: .plain, size: .compact) {
+            Button {
                 model.saveAsDefault()
+            } label: {
+                Text(String(localized: "Set as Default for New Text"))
+                    .font(NibFont.button)
+                    .foregroundStyle(NibColor.accent)
+                    .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
             }
+            .buttonStyle(NibPressStyle())
         }
     }
 }
@@ -971,7 +977,7 @@ private struct TextParagraphSection: View {
     @ObservedObject var model: TextFormatModel
 
     var body: some View {
-        NibInspectorSection(String(localized: "Paragraph")) {
+        NibInspectorSection(String(localized: "Alignment")) {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 NibSegmentedControl(selection: Binding(get: { model.state.align == .natural ? .left : model.state.align },
                                                        set: { model.setAlign($0) }),
@@ -979,6 +985,9 @@ private struct TextParagraphSection: View {
                                     title: { TextFormatOptions.alignmentTitle($0) })
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(String(localized: "Alignment"))
+                Text(String(localized: "Line Spacing"))
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.labelSecondary)
                 NibSegmentedControl(selection: Binding(get: { model.state.lineSpacingOption }, set: { model.setLineSpacing($0) }),
                                     options: LineSpacingOption.allCases,
                                     title: { $0.title })
