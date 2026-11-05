@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import LinkPresentation
+import Combine
 import NibContracts
 import NibTesting
 @testable import FeatTextDoc
@@ -46,6 +47,43 @@ final class FeatTextDocTests: XCTestCase {
     private let table = "block:FIXTUREDOC02/FIXTUREBLK03"
 
     private func harness() -> Harness { Harness(features: [FeatTextDocFeature.self]) }
+
+    func testPhotoImportReportsProviderAndStagingFailures() throws {
+        let providerError = CocoaError(.fileReadNoPermission)
+        XCTAssertThrowsError(try TextDocPhotoImport.stage(nil, error: providerError)) { error in
+            XCTAssertEqual((error as NSError).code, providerError.errorCode)
+        }
+        XCTAssertThrowsError(try TextDocPhotoImport.stage(nil, error: nil))
+        var destination: URL?
+        XCTAssertThrowsError(try TextDocPhotoImport.stage(URL(fileURLWithPath: "/photo.jpg"), error: nil) { _, output in
+            destination = output
+            try Data([1]).write(to: output)
+            throw CocoaError(.fileWriteNoPermission)
+        })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(destination).path))
+    }
+
+    func testImageInsertRechecksIDAfterMediaResolution() async throws {
+        let h = harness()
+        let descriptor = CommandDescriptor(id: "test.suspendedInsert", title: "Insert", summary: "Interleaved import",
+                                           params: .obj([:]), effect: .edit)
+        h.app.commands.register(descriptor) { _, ctx in
+            let p = BlockInsert.Params(doc: "doc:FIXTUREDOC02", kind: .image, id: "RACINGBLOCK")
+            _ = try await BlockInsert.insert(p, ctx) {
+                // Run another invocation while the first is awaiting its media resolver.
+                try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "paragraph",
+                                                "id": "RACINGBLOCK", "text": "New text"])
+                try await h.run("block.update", ["ref": "block:FIXTUREDOC02/RACINGBLOCK", "text": "Edited text"])
+                return BlockMedia.Resolved(asset: AssetRef("fixture-image.png"))
+            }
+            return [:]
+        }
+        await assertError(.invalidParams) { _ = try await h.run("test.suspendedInsert", [:]) }
+        let survivor = try block(h, "RACINGBLOCK")
+        XCTAssertEqual(survivor.kind, .paragraph)
+        XCTAssertEqual(survivor.text.plainText, "Edited text")
+        XCTAssertEqual(h.undoDepth(doc), 2)
+    }
 
     private func live(_ h: Harness) throws -> [TextBlock] { try h.app.workspace.content(doc).liveBlocks }
 
@@ -819,6 +857,112 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertEqual(tables, 1)
     }
 
+    func testDetachedTableViewsAreBoundedAndReconstructedOnRevisit() throws {
+        let h = harness()
+        var made = 0
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { context in
+            made += 1
+            context.heightChanged(180)
+            return UIView()
+        })
+        let editor = openEditor(h)
+        let firstBlock = TextBlock(id: "CACHEFIRST", kind: .table)
+        weak var first: UIView?
+        autoreleasepool { first = editor.embeddedView(for: firstBlock) }
+        XCTAssertNotNil(first)
+        let holder = UIView()
+        defer { withExtendedLifetime(holder) {} }
+        let activeBlock = TextBlock(id: "CACHEACTIVE", kind: .table)
+        let active = try XCTUnwrap(editor.embeddedView(for: activeBlock))
+        holder.addSubview(active)
+        for i in 0..<40 {
+            autoreleasepool {
+                _ = editor.embeddedView(for: TextBlock(id: NibID("CACHE\(i)"), kind: .table))
+            }
+            XCTAssertLessThanOrEqual(editor.retainedEmbeddedViewCount, TextDocViewController.detachedTableLimit + 1)
+        }
+        XCTAssertNil(first)
+        XCTAssertEqual(editor.embeddedHeight(for: firstBlock.id), 180)
+        XCTAssertTrue(editor.embeddedView(for: activeBlock) === active)
+        let previous = made
+        XCTAssertNotNil(editor.embeddedView(for: firstBlock))
+        XCTAssertEqual(made, previous + 1)
+    }
+
+    func testEvictionPressureReusesSuspendedTableQueueUntilNewerWriteFinishes() async throws {
+        let h = harness()
+        var stored = "Original"
+        var releaseOlder = false
+        var olderStarted = false
+        var writes: [String] = []
+        let active = CurrentValueSubject<Set<UIView>, Never>([])
+        h.app.services.set(active, for: "tables.activeQueues")
+        defer { releaseOlder = true }
+        // Feature targets cannot import one another. This descriptor exercises the host's queue-activity
+        // contract; FeatTextDocTablesTests also exercises it with the real editor and gated table.edit.
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { _ in
+            QueuedTableStub(active: active) { text in
+                if text == "Older" {
+                    olderStarted = true
+                    let deadline = Date().addingTimeInterval(1)
+                    while !releaseOlder {
+                        guard Date() < deadline else { throw NibError(.internalError, "Write gate timed out") }
+                        try await Task.sleep(nanoseconds: 1_000_000)
+                    }
+                }
+                stored = text
+                writes.append(text)
+            }
+        })
+        let editor = openEditor(h)
+        let block = try XCTUnwrap(editor.block(Fixtures.tableBlockID))
+        let first = try XCTUnwrap(editor.embeddedView(for: block) as? QueuedTableStub)
+        let holder = UIView()
+        holder.addSubview(first)
+        first.write("Older")
+        try await waitUntil("older table write", timeout: 1) { olderStarted }
+        first.removeFromSuperview() // Editor dismissed; its write is still suspended.
+        for i in 0..<40 {
+            _ = editor.embeddedView(for: TextBlock(id: NibID("BUSYCACHE\(i)"), kind: .table))
+        }
+        let revisited = try XCTUnwrap(editor.embeddedView(for: block) as? QueuedTableStub)
+        XCTAssertTrue(first === revisited, "A pending table must stay discoverable under eviction pressure")
+        holder.addSubview(revisited)
+        revisited.write("Newest")
+        await Task.yield()
+        XCTAssertEqual(stored, "Original", "The revisit must share the suspended command queue")
+        releaseOlder = true
+        try await waitUntil("both table writes", timeout: 1) { writes.count == 2 }
+        XCTAssertEqual(writes, ["Older", "Newest"])
+        XCTAssertEqual(stored, "Newest")
+        revisited.removeFromSuperview()
+        for i in 0..<40 {
+            _ = editor.embeddedView(for: TextBlock(id: NibID("IDLECACHE\(i)"), kind: .table))
+        }
+        XCTAssertLessThanOrEqual(editor.retainedEmbeddedViewCount, TextDocViewController.detachedTableLimit)
+        XCTAssertFalse(editor.embeddedView(for: block) === first, "Idle queues can be evicted again")
+    }
+
+    func testWillDisplayReattachesWithoutReconfiguringDecorators() throws {
+        let h = harness()
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { _ in UIView() })
+        let editor = openEditor(h)
+        let block = try XCTUnwrap(editor.block(Fixtures.tableBlockID))
+        let cell = BlockCell(frame: CGRect(x: 0, y: 0, width: 600, height: 200))
+        cell.host = editor
+        cell.configure(block, environment: environment(.table))
+        let embedded = try XCTUnwrap(editor.embeddedView(for: block))
+        cell.detachEmbeddedView()
+        var decorations = 0
+        TextDocHooks.addCellDecorator("test.redisplay") { _, _, _ in decorations += 1 }
+        defer { TextDocHooks.removeAll(prefix: "test.redisplay") }
+        let collection = UICollectionView(frame: .zero, collectionViewLayout: UICollectionViewFlowLayout())
+        editor.collectionView(collection, willDisplay: cell, forItemAt: IndexPath(item: 0, section: 0))
+        XCTAssertTrue(embedded.isDescendant(of: cell.contentView))
+        editor.collectionView(collection, willDisplay: cell, forItemAt: IndexPath(item: 0, section: 0))
+        XCTAssertEqual(decorations, 0)
+    }
+
     func testARegistryChangeRemakesOnlyTheViewsOfTheEntriesThatChanged() async throws {
         let h = harness()
         var tables = 0
@@ -1142,6 +1286,43 @@ final class FeatTextDocTests: XCTestCase {
         // Budget 200 ms, asserted at 4x for CI simulators (ARCHITECTURE §15.10).
         XCTAssertLessThan(insertAll, 0.2 * 4)
         XCTAssertLessThan(reconfigureAll, 0.2 * 4)
+    }
+}
+
+/// A descriptor-owned queue stand-in for the host cache test, using the table feature's activity contract.
+@MainActor
+private final class QueuedTableStub: UIView {
+    private let save: @MainActor (String) async throws -> Void
+    private let active: CurrentValueSubject<Set<UIView>, Never>
+    private var tail: Task<Void, Never>?
+    private var queued = 0
+
+    init(active: CurrentValueSubject<Set<UIView>, Never>, save: @escaping @MainActor (String) async throws -> Void) {
+        self.active = active
+        self.save = save
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func write(_ text: String) {
+        queued += 1
+        publish()
+        let previous = tail
+        tail = Task { @MainActor [self] in
+            await previous?.value
+            do { try await save(text) }
+            catch { XCTFail("Table write failed: \(error)") }
+            queued -= 1
+            publish()
+        }
+    }
+
+    private func publish() {
+        var views = active.value
+        if queued > 0 { views.insert(self) }
+        else { views.remove(self) }
+        active.send(views)
     }
 }
 
