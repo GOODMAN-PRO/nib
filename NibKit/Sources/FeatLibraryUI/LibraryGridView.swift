@@ -402,6 +402,12 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
     }
     #if DEBUG
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                willDisplayMenuFor configuration: UIContextMenuConfiguration,
+                                animator: UIContextMenuInteractionAnimating?) {
+        NibQAIdleDiagnostics.schedule(reason: "library-context-menu")
+    }
+
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willEndFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
         NSLog("%@", "[Nib QA reflow] native-menu willEnd view=\(ObjectIdentifier(self))")
