@@ -123,18 +123,37 @@ final class DeepLinkRouterTests: XCTestCase {
         assertInvalid("nib://plugin/remove?url=https%3A%2F%2Fexample.com%2Fdice.nibplugin")
     }
 
+    func testPairingRejectsUntrustedTokensBeforeShowingOrCopying() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let stubs = CommandStubs()
+        stubs.stub(h.app, CommandIDs.panelOpen)
+        let valid = "nib_" + String(repeating: "A", count: 43)
+        for token in ["x$(id)", "a\"b", "`id`", "nib_a+b/c=", "t", String(valid.dropLast()),
+                      valid + "A", valid + "\n", " " + valid,
+                      "nib_" + String(repeating: "$", count: 43)] {
+            XCTAssertThrowsError(try BridgePairing(host: "10.0.0.2", port: nil, token: token))
+            let url = "nib://bridge/pair?" + DeepLinkCoding.query([("host", "10.0.0.2"), ("token", token)])
+            await assertCode(.invalidParams) {
+                try await h.run(CommandIDs.appOpenURL, ["url": .string(url)])
+            }
+        }
+        XCTAssertTrue(stubs.calls.isEmpty)
+        let pairing = try BridgePairing(host: "10.0.0.2", port: nil, token: valid)
+        XCTAssertTrue(pairing.claudeCommand(masked: false).contains(valid))
+    }
+
     func testPairingLinkWithPort() throws {
-        let link = try DeepLinkParser.parse("nib://bridge/pair?host=100.101.102.103&port=8443&token=nib_4qVx9")
+        let link = try DeepLinkParser.parse("nib://bridge/pair?host=100.101.102.103&port=8443&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         guard case .bridgePair(let p) = link else { return XCTFail("not a pairing link: \(link)") }
         XCTAssertEqual(p.host, "100.101.102.103")
         XCTAssertEqual(p.port, 8443)
-        XCTAssertEqual(p.token, "nib_4qVx9")
+        XCTAssertEqual(p.token, "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         // Parameters in any order.
-        XCTAssertEqual(try DeepLinkParser.parse("nib://bridge/pair?token=nib_4qVx9&port=8443&host=100.101.102.103"), link)
+        XCTAssertEqual(try DeepLinkParser.parse("nib://bridge/pair?token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&port=8443&host=100.101.102.103"), link)
     }
 
     func testPairingLinkWithoutPortDefaultsTo7331() throws {
-        let link = try DeepLinkParser.parse("nib://bridge/pair?token=nib_4qVx9&host=ipad.tail1234.ts.net")
+        let link = try DeepLinkParser.parse("nib://bridge/pair?token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&host=ipad.tail1234.ts.net")
         guard case .bridgePair(let p) = link else { return XCTFail("not a pairing link: \(link)") }
         XCTAssertEqual(p.port, 7331)
         XCTAssertEqual(p.port, BridgePairing.defaultPort)
@@ -143,15 +162,15 @@ final class DeepLinkRouterTests: XCTestCase {
     }
 
     func testPairingLinkValidation() throws {
-        assertInvalid("nib://bridge/pair?host=10.0.0.2&port=0&token=t")
-        assertInvalid("nib://bridge/pair?host=10.0.0.2&port=70000&token=t")
-        assertInvalid("nib://bridge/pair?host=10.0.0.2&port=abc&token=t")
+        assertInvalid("nib://bridge/pair?host=10.0.0.2&port=0&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=10.0.0.2&port=70000&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=10.0.0.2&port=abc&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         assertInvalid("nib://bridge/pair?host=10.0.0.2")
-        assertInvalid("nib://bridge/pair?token=t")
-        assertInvalid("nib://bridge/pair?host=evil.com%2Fx&token=t")
-        assertInvalid("nib://bridge/enable?host=10.0.0.2&token=t")
+        assertInvalid("nib://bridge/pair?token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=evil.com%2Fx&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/enable?host=10.0.0.2&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         // IPv6: bracketed in URLs, and the claude line quotes it (brackets are shell globs).
-        guard case .bridgePair(let p) = try DeepLinkParser.parse("nib://bridge/pair?host=fd7a%3A%3A1&token=nib_x") else {
+        guard case .bridgePair(let p) = try DeepLinkParser.parse("nib://bridge/pair?host=fd7a%3A%3A1&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") else {
             return XCTFail("IPv6 host not accepted")
         }
         XCTAssertEqual(p.mcpURL, "http://[fd7a::1]:7331/mcp")
@@ -180,7 +199,7 @@ final class DeepLinkRouterTests: XCTestCase {
             .new(kind: .studySet),
             .search(query: "a+b = c & d #1 / ü"),
             .pluginInstall(url: URL(string: "https://example.com/p/dice.nibplugin?v=2&x=1")!),
-            .bridgePair(try BridgePairing(host: "fd7a::1", port: "7332", token: "nib_a+b/c=")),
+            .bridgePair(try BridgePairing(host: "fd7a::1", port: "7332", token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")),
             .importPasteboard,
         ]
         for link in links {
@@ -191,31 +210,31 @@ final class DeepLinkRouterTests: XCTestCase {
     }
 
     func testPairingSnippets() throws {
-        let p = try BridgePairing(host: "100.101.102.103", port: nil, token: "nib_4qVx9SECRET")
+        let p = try BridgePairing(host: "100.101.102.103", port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         XCTAssertEqual(p.claudeCommand(masked: false),
-                       "claude mcp add --transport http nib http://100.101.102.103:7331/mcp --header \"Authorization: Bearer nib_4qVx9SECRET\"")
+                       "claude mcp add --transport http nib http://100.101.102.103:7331/mcp --header \"Authorization: Bearer nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"")
         XCTAssertFalse(p.claudeCommand(masked: true).contains("SECRET"))
         XCTAssertTrue(p.maskedToken.hasPrefix("nib_"))
         let json = try JSONValue.parse(p.jsonConfig(masked: false))
         XCTAssertEqual(json["mcpServers"]?["nib"]?["url"], "http://100.101.102.103:7331/mcp")
-        XCTAssertEqual(json["mcpServers"]?["nib"]?["headers"]?["Authorization"], "Bearer nib_4qVx9SECRET")
+        XCTAssertEqual(json["mcpServers"]?["nib"]?["headers"]?["Authorization"], "Bearer nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         XCTAssertFalse(p.jsonConfig(masked: true).contains("SECRET"))
     }
 
     func testPairingHostMustBeAHostOrAnIPv6Literal() throws {
         // A ':' is only allowed in an IPv6 literal: "evil.com:80" would otherwise become http://[evil.com:80]:7331.
-        assertInvalid("nib://bridge/pair?host=evil.com%3A80&token=t")
-        assertInvalid("nib://bridge/pair?host=%5Bevil.com%3A80%5D&token=t")
-        assertInvalid("nib://bridge/pair?host=10.0.0.2%3A8080&token=t")
-        assertInvalid("nib://bridge/pair?host=a%5Bb&token=t")
-        assertInvalid("nib://bridge/pair?host=fe80%3A%3A1%25en0&token=t")
-        XCTAssertEqual(try BridgePairing(host: "[fd7a:115c:a1e0::1]", port: nil, token: "t").mcpURL,
+        assertInvalid("nib://bridge/pair?host=evil.com%3A80&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=%5Bevil.com%3A80%5D&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=10.0.0.2%3A8080&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=a%5Bb&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        assertInvalid("nib://bridge/pair?host=fe80%3A%3A1%25en0&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        XCTAssertEqual(try BridgePairing(host: "[fd7a:115c:a1e0::1]", port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").mcpURL,
                        "http://[fd7a:115c:a1e0::1]:7331/mcp")
-        XCTAssertEqual(try BridgePairing(host: "my-ipad", port: "8080", token: "t").mcpURL, "http://my-ipad:8080/mcp")
+        XCTAssertEqual(try BridgePairing(host: "my-ipad", port: "8080", token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").mcpURL, "http://my-ipad:8080/mcp")
     }
 
     func testPairingHostPrivateNetworkCheck() throws {
-        func isPrivate(_ host: String) throws -> Bool { try BridgePairing(host: host, port: nil, token: "t").isPrivateNetwork }
+        func isPrivate(_ host: String) throws -> Bool { try BridgePairing(host: host, port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").isPrivateNetwork }
         for host in ["10.1.2.3", "172.16.0.9", "172.31.255.1", "192.168.1.20", "100.101.102.103", "100.64.0.1",
                      "169.254.3.4", "127.0.0.1", "fd7a:115c:a1e0::1", "fe80::1", "::1", "::ffff:192.168.0.2",
                      "ipad.tail1234.ts.net", "IPAD.TAIL1234.TS.NET.", "studio.local", "my-ipad"] {
@@ -228,6 +247,30 @@ final class DeepLinkRouterTests: XCTestCase {
     }
 
     // MARK: Routing
+
+    func testEveryDocumentLinkRefusesLockedDocumentsBeforeAnyAction() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let lock = FakeLockService(locked: [Fixtures.docID])
+        h.app.services.lock = lock
+        let stubs = CommandStubs()
+        for id in [CommandIDs.docOpen, CommandIDs.commentTapAt, CommandIDs.audioPlay] { stubs.stub(h.app, id) }
+        let navigator = FakeNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let links = ["nib://open/FIXTUREDOC01", "nib://open/FIXTUREDOC01/FIXTUREPG001",
+                     "nib://open/FIXTUREDOC01/FIXTUREPG001?comment=FIXTURECMT01",
+                     "nib://audio/FIXTUREDOC01/FIXTUREAUD01?t=0"]
+        for url in links {
+            await assertCode(.locked) { try await h.run(CommandIDs.appOpenURL, ["url": .string(url)]) }
+        }
+        XCTAssertTrue(stubs.calls.isEmpty)
+        XCTAssertTrue(navigator.opened.isEmpty)
+        XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.docID))
+        lock.locked.remove(Fixtures.docID)
+        for url in links { _ = try await h.run(CommandIDs.appOpenURL, ["url": .string(url)]) }
+        XCTAssertEqual(stubs.ids.filter { $0 == CommandIDs.docOpen }.count, 4)
+        XCTAssertEqual(stubs.ids.filter { $0 == CommandIDs.commentTapAt }.count, 1)
+        XCTAssertEqual(stubs.ids.filter { $0 == CommandIDs.audioPlay }.count, 1)
+    }
 
     func testOpenLinkOpensThePageAndTheCommentThread() async throws {
         let h = Harness(features: [FeatSystemIntegrationFeature.self])
@@ -374,8 +417,8 @@ final class DeepLinkRouterTests: XCTestCase {
         stubs.stub(h.app, "bridge.setEnabled")
         let enabledBefore = h.app.settings.json(BridgeNames.enabledSetting)
 
-        _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?host=10.0.0.2&token=nib_tok"])
-        _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?token=nib_tok&port=8080&host=10.0.0.2"])
+        _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?host=10.0.0.2&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"])
+        _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&port=8080&host=10.0.0.2"])
 
         // panel.open carries only a nonce: never the address or the token.
         let opened = stubs.params(CommandIDs.panelOpen)
@@ -383,12 +426,12 @@ final class DeepLinkRouterTests: XCTestCase {
         for params in opened {
             XCTAssertEqual(params["id"], .string(SystemIDs.pairingPanel))
             XCTAssertEqual(params.objectValue.map { Set($0.keys) }, ["id", "pairing"])
-            XCTAssertFalse("\(params)".contains("nib_tok"))
+            XCTAssertFalse("\(params)".contains("nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
         }
         // The nonces the person's links wrote resolve to their pairings, flat or nested, as often as the chrome asks.
         let first = try XCTUnwrap(BridgePairingSheet.pairing(for: ["pairing": opened[0]["pairing"] ?? .null],
                                                              services: h.app.services))
-        XCTAssertEqual(first, try BridgePairing(host: "10.0.0.2", port: nil, token: "nib_tok"))
+        XCTAssertEqual(first, try BridgePairing(host: "10.0.0.2", port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
         XCTAssertEqual(BridgePairingSheet.pairing(for: ["params": ["pairing": opened[0]["pairing"] ?? .null]],
                                                   services: h.app.services), first)
         XCTAssertEqual(BridgePairingSheet.pairing(for: ["pairing": opened[1]["pairing"] ?? .null],
@@ -397,7 +440,7 @@ final class DeepLinkRouterTests: XCTestCase {
         XCTAssertEqual(h.app.settings.json(BridgeNames.enabledSetting), enabledBefore)
         // Only the person opens a pairing sheet.
         await assertCode(.permissionDenied) {
-            try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?host=10.0.0.2&token=nib_tok"], as: .ai("chat"))
+            try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?host=10.0.0.2&token=nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"], as: .ai("chat"))
         }
         XCTAssertEqual(stubs.params(CommandIDs.panelOpen).count, 2)
         // The sheet is a registered .sheet panel, so the chrome or the library presents it.
@@ -428,7 +471,7 @@ final class DeepLinkRouterTests: XCTestCase {
         let runtime = try XCTUnwrap(SystemRuntime.shared(h.app.services))
         var clock = Date(timeIntervalSince1970: 1_800_000_000)
         runtime.now = { clock }
-        let pairing = try BridgePairing(host: "10.0.0.2", port: nil, token: "nib_tok")
+        let pairing = try BridgePairing(host: "10.0.0.2", port: nil, token: "nib_4qVx9SECRETAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         let kept = runtime.holdPairing(pairing)
         let closed = runtime.holdPairing(pairing)
         XCTAssertNotEqual(kept, closed)

@@ -309,6 +309,10 @@ struct AudioPlay: NibCommand {
             throw NibError(.invalidParams, "t must be 0 or more seconds", path: "$.t")
         }
         let (doc, clip) = try resolve(p.clip, ctx, audio)
+        if ctx.services.lock?.isLocked(doc) == true {
+            throw NibError(.locked, String(localized: "This document is locked."),
+                           hint: String(localized: "Unlock the document before playing its audio."))
+        }
         let url = try AudioRefs.fileURL(doc, clip, ctx)
         if audio.recording?.doc == doc && audio.recording?.clip == clip.id {
             throw NibError(.conflict, "this clip is still recording", path: "$.clip", hint: audio.stopHint())

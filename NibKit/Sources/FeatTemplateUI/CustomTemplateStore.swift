@@ -215,17 +215,25 @@ actor CustomTemplateStore {
             let bounds = first.bounds(for: .cropBox)
             let odd = (first.rotation / 90) % 2 != 0
             let size = PageSize(Double(odd ? bounds.height : bounds.width), Double(odd ? bounds.width : bounds.height))
-            guard size.width > 0, size.height > 0 else { throw NibError.invalid("The first PDF page has no size.") }
+            try validateImportSize(size)
             let one = PDFDocument(); one.insert(first, at: 0)
             guard let flattened = one.dataRepresentation() else { throw NibError(.invalidParams, "Cannot read the first PDF page.") }
             return (flattened, "pdf", size)
         }
         guard let image = UIImage(data: data), image.size.width > 0, image.size.height > 0,
               image.size.width * image.size.height <= 100_000_000 else { throw NibError.invalid("Import a PDF or a supported image of at most 100 megapixels.", path: "$.url") }
+        let size = PageSize(Double(image.size.width), Double(image.size.height))
+        try validateImportSize(size)
         let format = UIGraphicsImageRendererFormat(); format.scale = 1
         let normalised = UIGraphicsImageRenderer(size: image.size, format: format).image { _ in image.draw(in: CGRect(origin: .zero, size: image.size)) }
         guard let png = normalised.pngData() else { throw NibError(.invalidParams, "Cannot decode the template image.") }
-        return (png, "png", PageSize(Double(image.size.width), Double(image.size.height)))
+        return (png, "png", size)
+    }
+
+    nonisolated private static func validateImportSize(_ size: PageSize) throws {
+        guard (try? TemplateSizing.parse([size.width, size.height])) != nil else {
+            throw NibError.invalid(String(localized: "Template pages must have each side between 36 and 14400 points. Resize the image or PDF page and import it again."), path: "$.url")
+        }
     }
 
     nonisolated func url(group: TemplateGroup, template: CustomTemplate) -> URL {

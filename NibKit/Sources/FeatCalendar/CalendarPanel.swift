@@ -619,14 +619,51 @@ enum CalendarSystem {
 
 // MARK: - See Other Events
 
+/// A date change invalidates the old request immediately, including uncancelled retries and failed reads.
+@MainActor
+final class OtherEventsModel: ObservableObject {
+    @Published var date = Date() {
+        didSet {
+            guard CalendarDates.day(date) != CalendarDates.day(oldValue) else { return }
+            requestID = UUID()
+            events = []
+            failure = nil
+            loading = true
+        }
+    }
+    @Published private(set) var events: [CalendarEvent] = []
+    @Published private(set) var loading = false
+    @Published private(set) var failure: String?
+    private var requestID = UUID()
+
+    func load(fetch: @MainActor (Date, Date) async throws -> [CalendarEvent]) async {
+        guard !Task.isCancelled else { return }
+        let request = UUID()
+        requestID = request
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: date)
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
+        events = []
+        failure = nil
+        loading = true
+        do {
+            let found = try await fetch(start, end)
+            guard !Task.isCancelled, requestID == request else { return }
+            events = found.filter { CalendarEventCache.overlaps($0, start, end) }.sorted(by: CalendarEvent.chronological)
+            loading = false
+        } catch {
+            guard !Task.isCancelled, requestID == request else { return }
+            failure = NibError.wrap(error).message
+            loading = false
+        }
+    }
+}
+
 struct OtherEventsSheet: View {
     @ObservedObject var store: CalendarStore
     let session: EditorSession?
     let onDone: () -> Void
-    @State private var date = Date()
-    @State private var events: [CalendarEvent] = []
-    @State private var loading = false
-    @State private var failure: String?
+    @StateObject private var model = OtherEventsModel()
     @State private var busy: Set<String> = []
 
     var body: some View {
@@ -634,10 +671,10 @@ struct OtherEventsSheet: View {
             NibSheetHeader(String(localized: "Other Events"), cancelTitle: String(localized: "Done"), onCancel: onDone)
             ScrollView {
                 VStack(alignment: .leading, spacing: NibSpacing.l) {
-                    DatePicker(String(localized: "Date"), selection: $date, displayedComponents: .date)
+                    DatePicker(String(localized: "Date"), selection: $model.date, displayedComponents: .date)
                         .datePickerStyle(.graphical)
                         .tint(NibColor.accent)
-                    Text(CalendarText.dayTitle(date))
+                    Text(CalendarText.dayTitle(model.date))
                         .font(NibFont.title3)
                         .foregroundStyle(NibColor.label)
                         .accessibilityAddTraits(.isHeader)
@@ -648,13 +685,13 @@ struct OtherEventsSheet: View {
             }
         }
         .background(NibColor.backgroundSecondary)
-        .task(id: CalendarDates.day(date)) { await load() }
+        .task(id: CalendarDates.day(model.date)) { await load() }
     }
 
     @ViewBuilder private var dayContent: some View {
-        if let failure = failure {
+        if let failure = model.failure {
             NibBanner(failure, action: NibAction(String(localized: "Try Again")) { Task { await load() } })
-        } else if loading && events.isEmpty {
+        } else if model.loading && model.events.isEmpty {
             HStack(spacing: NibSpacing.s) {
                 ProgressView()
                 Text(String(localized: "Loading events"))
@@ -663,29 +700,19 @@ struct OtherEventsSheet: View {
             }
             .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget)
             .accessibilityElement(children: .combine)
-        } else if events.isEmpty {
+        } else if model.events.isEmpty {
             Text(String(localized: "No events on this day."))
                 .font(NibFont.callout)
                 .foregroundStyle(NibColor.labelSecondary)
                 .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
         } else {
-            CalendarEventList(events: events, store: store, busy: $busy, session: session, onBeforeOpen: onDone)
+            CalendarEventList(events: model.events, store: store, busy: $busy, session: session, onBeforeOpen: onDone)
         }
     }
 
     private func load() async {
-        let cal = Calendar.current
-        let start = cal.startOfDay(for: date)
-        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
-        loading = true
-        defer { loading = false }
-        do {
-            let found = try await store.load(from: start, to: end, session: session)
-            events = found.filter { CalendarEventCache.overlaps($0, start, end) }.sorted(by: CalendarEvent.chronological)
-            failure = nil
-        } catch {
-            events = []
-            failure = NibError.wrap(error).message
+        await model.load { start, end in
+            try await store.load(from: start, to: end, session: session)
         }
     }
 }
