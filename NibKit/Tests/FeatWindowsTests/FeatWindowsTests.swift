@@ -336,7 +336,7 @@ final class FeatWindowsTests: XCTestCase {
                       in: origin)
         var requested: NSUserActivity?
         scenes.supportsMultipleWindows = { true }
-        scenes.requestWindow = { activity, _ in requested = activity }
+        scenes.requestWindow = { activity, _, _ in requested = activity }
         let stale = WindowState(tabs: [notebook], active: notebook, page: Fixtures.page2)
         h.app.settings.set(WindowSettings.lastSession, stale)
 
@@ -393,12 +393,36 @@ final class FeatWindowsTests: XCTestCase {
         }
     }
 
+    func testSceneRefusalReportsTheOriginatingCommandWithoutChangingTabs() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        scenes.supportsMultipleWindows = { true }
+        var fail: (@MainActor (Error) -> Void)?
+        scenes.requestWindow = { _, _, onFailure in fail = onFailure }
+        let failures = FailedCommands()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            XCTAssertEqual((note.userInfo?["error"] as? NibError)?.code, .unavailable)
+            if let command = note.userInfo?["command"] as? String { failures.append(command) }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        for command in [CommandIDs.windowOpen, CommandIDs.docOpen] {
+            let params: JSONValue = command == CommandIDs.docOpen
+                ? ["doc": "doc:FIXTUREDOC01", "mode": "newWindow"] : [:]
+            try await run(h, command, params, in: navigator)
+            let callback = try XCTUnwrap(fail)
+            // UIKit reports refusal after the request has returned.
+            callback(NSError(domain: "SceneActivation", code: 1))
+        }
+        XCTAssertEqual(failures.commands, [CommandIDs.windowOpen, CommandIDs.docOpen])
+        XCTAssertTrue(navigator.openDocuments.isEmpty)
+    }
+
     func testNewWindowRequestsCarryTheDocumentAndPage() async throws {
         let (h, scenes, _) = try windows()
         let navigator = window(h, scenes)
         var requests: [NSUserActivity] = []
         scenes.supportsMultipleWindows = { true }
-        scenes.requestWindow = { activity, _ in requests.append(activity) }
+        scenes.requestWindow = { activity, _, _ in requests.append(activity) }
 
         try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC01", "page": "page:FIXTUREDOC01/FIXTUREPG002", "mode": "newWindow"],
                       in: navigator)

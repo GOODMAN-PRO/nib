@@ -134,7 +134,8 @@ final class WindowScenes {
         !NibApp.isHostlessTest && UIApplication.shared.supportsMultipleScenes
     }
     /// Asks iPadOS for a new window scene carrying `activity`, placed beside `requestingScene`. Swapped in tests.
-    var requestWindow: @MainActor (NSUserActivity, UIWindowScene?) throws -> Void = WindowScenes.activateScene(_:requestingScene:)
+    var requestWindow: @MainActor (NSUserActivity, UIWindowScene?, @escaping @MainActor (Error) -> Void) throws -> Void
+        = WindowScenes.activateScene(_:requestingScene:onFailure:)
 
     init(app: NibApp) {
         self.app = app
@@ -272,13 +273,20 @@ final class WindowScenes {
 
     // MARK: Actions
 
-    func openWindow(_ state: WindowState, from navigator: SceneNavigator?) throws {
+    func openWindow(_ state: WindowState, from navigator: SceneNavigator?, command: String = CommandIDs.windowOpen) throws {
         guard supportsMultipleWindows() else {
             throw NibError(.unsupported, "this device shows one window at a time",
                            hint: "open it here instead with doc.open {\"mode\": \"newTab\"}")
         }
         let name = state.active.map { title(of: $0) }
-        try requestWindow(state.activity(title: name), navigator?.rootViewController?.viewIfLoaded?.window?.windowScene)
+        try requestWindow(state.activity(title: name), navigator?.rootViewController?.viewIfLoaded?.window?.windowScene) { [weak app] error in
+            guard let app else { return }
+            logger.error("New window failed: \(error.localizedDescription, privacy: .public)")
+            let failure = NibError(.unavailable, String(localized: "A new window could not be opened."),
+                                   hint: String(localized: "Try again, or open the document in this window."))
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                            userInfo: ["command": command, "error": failure])
+        }
     }
 
     /// Closes `doc`'s tab. The tab on screen hands over to its right-hand neighbour (else the left one) at the page that
@@ -323,13 +331,14 @@ final class WindowScenes {
         pendingCloses[window.session.id] = nil
     }
 
-    static func activateScene(_ activity: NSUserActivity, requestingScene: UIWindowScene?) throws {
+    static func activateScene(_ activity: NSUserActivity, requestingScene: UIWindowScene?,
+                              onFailure: @escaping @MainActor (Error) -> Void) throws {
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("a new window") }
         let options = UIScene.ActivationRequestOptions()
         options.requestingScene = requestingScene
         let request = UISceneSessionActivationRequest(role: .windowApplication, userActivity: activity, options: options)
         UIApplication.shared.activateSceneSession(for: request) { error in
-            logger.error("New window failed: \(error.localizedDescription, privacy: .public)")
+            Task { @MainActor in onFailure(error) }
         }
     }
 }
@@ -423,7 +432,8 @@ struct DocOpen: NibCommand {
         let mode = try WindowTargets.mode(p.mode)
         let scenes = try WindowTargets.windowScenes(ctx)
         if mode == .newWindow {
-            try scenes.openWindow(WindowState(tabs: [doc], active: doc, page: page), from: scenes.navigator(for: ctx.session))
+            try scenes.openWindow(WindowState(tabs: [doc], active: doc, page: page),
+                                  from: scenes.navigator(for: ctx.session), command: CommandIDs.docOpen)
             return NoResult()
         }
         let (_, navigator) = try WindowTargets.window(ctx)
