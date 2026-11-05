@@ -478,6 +478,13 @@ final class PageTileView: UIView {
 
     private func notifyIfSettled() {
         guard isSettled else { return }
+        // A failed low-resolution fallback is irrelevant once all requested sharp
+        // tiles landed. Never treat an empty coverage or a failed tile as recovery.
+        if previewFailed, !slots.isEmpty, failedSlots.isEmpty,
+           slots.values.allSatisfy({ $0.hasImage }) {
+            previewFailed = false
+            recoveryPending = true
+        }
         // Sibling tiles and the preview cannot clear an empty failed slot. Wait for all
         // current work as well, so a slower failing tile cannot make the banner flicker.
         if recoveryPending, failedSlots.isEmpty, !previewFailed, hasShownContent,

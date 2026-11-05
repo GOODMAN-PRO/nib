@@ -3,6 +3,23 @@ import Combine
 import NibContracts
 import NibDesign
 
+/// Ownership is valid only while both the slot and its last saved colour match.
+enum PenCustomSwatch {
+    enum Destination: Equatable { case replace(Int), select(Int), append, full }
+
+    static func destination(in swatches: [PresetSwatch], owned: (index: Int, colour: RGBA)?, colour: RGBA) -> Destination {
+        if let index = ownedIndex(in: swatches, owned: owned) { return .replace(index) }
+        if let index = swatches.firstIndex(where: { $0.color == colour }) { return .select(index) }
+        return swatches.count < ToolPresets.maxSwatches ? .append : .full
+    }
+
+    static func ownedIndex(in swatches: [PresetSwatch], owned: (index: Int, colour: RGBA)?) -> Int? {
+        guard let owned, swatches.indices.contains(owned.index),
+              swatches[owned.index].color == owned.colour else { return nil }
+        return owned.index
+    }
+}
+
 @MainActor
 final class PenOptions: ObservableObject {
     let app: NibApp
@@ -126,26 +143,27 @@ final class PenOptions: ObservableObject {
             // Keep the final choice even if the popover closes before the drag settles.
             self.customSave = Task { @MainActor [self] in
                 do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
-                changePreset { presets in
-                    let owned = session == customSession ? customSwatch : nil
-                    if let owned, presets.swatches.indices.contains(owned.index),
-                       presets.swatches[owned.index].color == owned.colour {
-                        presets.swatches[owned.index] = PresetSwatch(color: rgba)
-                        presets.selectedSwatch = owned.index
-                        customSwatch = (owned.index, rgba)
-                    } else if let index = presets.swatches.firstIndex(where: { $0.color == rgba }) {
-                        presets.selectedSwatch = index
-                    } else if presets.swatches.count < ToolPresets.maxSwatches {
-                        presets.swatches.append(PresetSwatch(color: rgba))
-                        presets.selectedSwatch = presets.swatches.count - 1
-                        if session == customSession { customSwatch = (presets.selectedSwatch, rgba) }
-                    } else {
-                        let index = max(0, min(presets.selectedSwatch, presets.swatches.count - 1))
-                        presets.swatches[index] = PresetSwatch(color: rgba)
-                        presets.selectedSwatch = index
-                        if session == customSession { customSwatch = (index, rgba) }
-                    }
+                var presets = self.presets
+                let owned = session == customSession ? customSwatch : nil
+                switch PenCustomSwatch.destination(in: presets.swatches, owned: owned, colour: rgba) {
+                case .replace(let index):
+                    presets.swatches[index] = PresetSwatch(color: rgba)
+                    presets.selectedSwatch = index
+                    customSwatch = (index, rgba)
+                case .select(let index):
+                    presets.selectedSwatch = index
+                case .append:
+                    presets.swatches.append(PresetSwatch(color: rgba))
+                    presets.selectedSwatch = presets.swatches.count - 1
+                    if session == customSession { customSwatch = (presets.selectedSwatch, rgba) }
+                case .full:
+                    // Match preset selection when there is no room for another swatch.
+                    let index = max(0, min(presets.selectedSwatch, presets.swatches.count - 1))
+                    presets.swatches[index] = PresetSwatch(color: rgba)
+                    presets.selectedSwatch = index
+                    if session == customSession { customSwatch = (index, rgba) }
                 }
+                set(NibSettings.presets(tool), presets)
                 customDraft = nil
                 await lastWrite?.value
             }

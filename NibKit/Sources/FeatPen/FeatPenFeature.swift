@@ -61,15 +61,26 @@ final class StrokeInspectorModel: ObservableObject {
     let ids: [ElementID]
     private let group = NibID.make().raw
     @Published private(set) var style: InkStyle
+    let widthRange: ClosedRange<Double>
+    @Published private(set) var canChangeColour: Bool
     private(set) var pending: Task<Void, Never>?
     private var observation: EventSubscription?
 
     init(context: InspectorContext) {
         self.context = context
         ids = context.items.filter { $0.stroke != nil && !$0.locked }.map(\.id)
-        style = context.items.compactMap(\.stroke).first?.style ?? .defaultPen
+        let initialStyle = context.items.compactMap(\.stroke).first?.style ?? .defaultPen
+        style = initialStyle
+        // The inspector represents one selection. Its range must not shrink as the thumb moves.
+        widthRange = 0.1...max(3, initialStyle.width * 25.4 / 72)
+        canChangeColour = !context.items.contains { item in
+            !item.locked && item.stroke?.style.tool == .tape && item.stroke?.style.tapePattern != nil
+        }
+        let doc = context.doc
+        let refs = Set(ids.map { NodeRef.item(doc, context.page, $0).description })
         observation = context.app.events.subscribe { [weak self] event in
-            guard event.type == NibEventType.committed else { return }
+            guard event.type == NibEventType.committed, event.doc == doc,
+                  event.changes?.all.contains(where: { refs.contains($0) }) == true else { return }
             Task { @MainActor in self?.refresh() }
         }
     }
@@ -80,6 +91,10 @@ final class StrokeInspectorModel: ObservableObject {
         guard let id = ids.first,
               let stroke = try? context.app.workspace.item(context.doc, page: context.page, id: id).stroke else { return }
         style = stroke.style
+        canChangeColour = !ids.contains { id in
+            guard let stroke = try? context.app.workspace.item(context.doc, page: context.page, id: id).stroke else { return false }
+            return stroke.style.tool == .tape && stroke.style.tapePattern != nil
+        }
     }
 
     func change(_ patch: JSONValue) {
@@ -102,13 +117,6 @@ final class StrokeInspectorModel: ObservableObject {
     var width: Binding<Double> {
         Binding(get: { self.style.width * 25.4 / 72 },
                 set: { self.change(["width": .number($0 * 72 / 25.4)]) })
-    }
-    var widthRange: ClosedRange<Double> { 0.1...max(3, style.width * 25.4 / 72) }
-    var canChangeColour: Bool {
-        !ids.contains { id in
-            guard let stroke = try? context.app.workspace.item(context.doc, page: context.page, id: id).stroke else { return false }
-            return stroke.style.tool == .tape && stroke.style.tapePattern != nil
-        }
     }
     var swatch: Binding<String?> {
         Binding(get: { NibInk.allCases.first { RGBA($0.uiColor) == self.style.color }?.rawValue },

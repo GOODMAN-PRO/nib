@@ -96,6 +96,10 @@ final class PenTool: CanvasTool {
                             host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
                         case .failure(let error):
                             Self.report(error, command: CommandIDs.inkAddStrokes, app: app)
+                            Task { @MainActor in
+                                await Self.retainFailed(stroke, page: page, doc: doc, app: app,
+                                                        session: session, preview: layer)
+                            }
                         }
                     }
                 }
@@ -123,6 +127,8 @@ final class PenTool: CanvasTool {
                     return true
                 } catch {
                     Self.report(error, command: CommandIDs.inkAddStrokes, app: app)
+                    await Self.retainFailed(saved, page: page, doc: doc, app: app, session: session,
+                                            preview: layer, id: id, processed: true)
                     return false
                 }
             }
@@ -359,6 +365,21 @@ final class PenTool: CanvasTool {
         }
         CATransaction.commit()
     }
+    /// Transfer the unsaved data to the canvas command owner before retiring our layer.
+    /// A stripped-down host without canvas recovery keeps the original preview.
+    private static func retainFailed(_ stroke: Stroke, page: PageID, doc: DocumentID, app: NibApp,
+                                     session: EditorSession, preview: CALayer?, id: ElementID? = nil,
+                                     processed: Bool = false) async {
+        guard app.commands.entry("canvas.retainFailedInk") != nil else { return }
+        do {
+            var params: [String: JSONValue] = ["page": .string(NodeRef.page(doc, page).description),
+                                    "stroke": try JSONValue.from(stroke), "processed": .bool(processed)]
+            if let id { params["id"] = .string(id.raw) }
+            _ = try await app.bus.execute("canvas.retainFailedInk", .object(params), session: session)
+            preview?.removeFromSuperlayer()
+        } catch { report(error, command: "canvas.retainFailedInk", app: app) }
+    }
+
     private static func report(_ error: Error, command: String, app: NibApp) {
         NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                        userInfo: ["command": command, "error": NibError.wrap(error)])

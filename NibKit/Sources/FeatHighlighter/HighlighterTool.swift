@@ -48,7 +48,7 @@ final class HighlighterTool: CanvasTool {
 
     private static let log = Logger(subsystem: "app.nib", category: "highlighter")
 
-    private struct Hold {
+    private final class Hold {
         let generation: Int
         var stroke: Stroke
         let page: PageID
@@ -64,6 +64,12 @@ final class HighlighterTool: CanvasTool {
         var recognitionDone = false
         var touchEnded = false
         var lastTimestamp: TimeInterval?
+        let preview = HighlighterPreviewPath()
+
+        init(generation: Int, stroke: Stroke, page: PageID, holdPoint: Point, layer: CAShapeLayer, current: Point) {
+            self.generation = generation; self.stroke = stroke; self.page = page
+            self.holdPoint = holdPoint; self.layer = layer; self.current = current
+        }
     }
 
     private var hold: Hold?
@@ -102,7 +108,7 @@ final class HighlighterTool: CanvasTool {
     }
 
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
-        guard var h = hold, let sample = samples.last(where: { !$0.isPredicted }) ?? samples.last else { return }
+        guard let h = hold, let sample = samples.last(where: { !$0.isPredicted }) ?? samples.last else { return }
         // The pen may wander onto the next page: follow it in the held stroke's page coordinates.
         h.current = host.convert(sample.location, from: sample.page, to: h.page) ?? h.current
         if let r = h.recognised {
@@ -148,7 +154,7 @@ final class HighlighterTool: CanvasTool {
     }
 
     private func recognitionFinished(_ found: HeldShape.Recognition?, generation g: Int, host: CanvasHost) {
-        guard var h = hold, h.generation == g else { return }
+        guard let h = hold, h.generation == g else { return }
         h.recognitionDone = true
         if let found {
             let styled = HeldShape.styled(found.shape, like: h.stroke.style)
@@ -211,6 +217,18 @@ final class HighlighterTool: CanvasTool {
                 HighlighterTool.log.error("keeping the stroke failed: \(String(describing: error), privacy: .public)")
                 NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
                     userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                Task { @MainActor in
+                    guard host.app.commands.entry("canvas.retainFailedInk") != nil else { return }
+                    do {
+                        _ = try await host.app.bus.execute("canvas.retainFailedInk",
+                            ["page": .string(NodeRef.page(host.documentID, page).description),
+                             "stroke": try JSONValue.from(stroke)], session: host.session)
+                        preview.removeFromSuperlayer()
+                    } catch {
+                        NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                            userInfo: ["command": "canvas.retainFailedInk", "error": NibError.wrap(error)])
+                    }
+                }
                 return
             }
             host.afterNextRender(page: page) { preview.removeFromSuperlayer() }
@@ -223,11 +241,17 @@ final class HighlighterTool: CanvasTool {
         func view(_ p: Point) -> CGPoint {
             transform.map { CGPoint(x: p.x, y: p.y).applying($0) } ?? host.viewPoint(p, page: h.page)
         }
-        let path = CGMutablePath()
-        for sub in h.shape.map(HeldShape.outline) ?? [h.stroke.polyline] {
-            guard let first = sub.first else { continue }
-            path.move(to: view(first))
-            for p in sub.dropFirst() { path.addLine(to: view(p)) }
+        let path: CGPath
+        if let shape = h.shape {
+            let outline = CGMutablePath()
+            for sub in HeldShape.outline(shape) {
+                guard let first = sub.first else { continue }
+                outline.move(to: view(first))
+                for p in sub.dropFirst() { outline.addLine(to: view(p)) }
+            }
+            path = outline
+        } else {
+            path = h.preview.extend(h.stroke.points, transform: transform, view: view)
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)                  // follows the pen; never animates
@@ -236,6 +260,29 @@ final class HighlighterTool: CanvasTool {
         h.layer.lineWidth = CGFloat(h.stroke.style.width * host.zoomScale)
         h.layer.path = path
         CATransaction.commit()
+    }
+}
+
+/// Retains the unsnapped path and transforms only newly captured points. A viewport
+/// transform change starts a new path; recognition uses its own small shape outline.
+final class HighlighterPreviewPath {
+    private var path = CGMutablePath()
+    private var count = 0
+    private var transform: CGAffineTransform?
+
+    func extend(_ points: [StrokePoint], transform: CGAffineTransform?, view: (Point) -> CGPoint) -> CGPath {
+        // Without a transform, viewPoint can change with scrolling or zooming.
+        if transform == nil || self.transform != transform || points.count < count {
+            path = CGMutablePath()
+            count = 0
+        }
+        self.transform = transform
+        for i in count..<points.count {
+            let point = view(points[i].location)
+            if i == 0 { path.move(to: point) } else { path.addLine(to: point) }
+        }
+        count = points.count
+        return path
     }
 }
 

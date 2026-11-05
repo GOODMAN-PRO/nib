@@ -384,7 +384,9 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
         // No renderer installed (a stripped-down build): the pages show their paper, which is not a failure.
         guard let page = view.pageID, NibError.wrap(error).code != .unavailable else { return }
         CanvasHostImpl.log.error("page \(page.raw, privacy: .public) failed to render: \(NibError.wrap(error).description, privacy: .public)")
-        controller?.pageDidFail(page)
+        // Renderer diagnostics belong in the log, never in user-facing copy.
+        let reason = String(localized: "This page could not be displayed. Try again.")
+        controller?.pageDidFail(page, reason: reason)
     }
 
     // MARK: Live views
@@ -497,5 +499,201 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
     /// Double-tap zoom: to twice fit around `viewPoint`, or back to fit.
     func zoomToggle(at viewPoint: CGPoint) {
         controller?.toggleZoom(at: viewPoint)
+    }
+}
+
+// MARK: - Failed ink recovery
+
+/// App-owned unsaved strokes outlive recycled canvases. Attachments own only their
+/// page-coordinate previews; retry uses a stable item id and never reruns processors.
+@MainActor
+final class FailedInkStore {
+    static let key = "canvas.failedInk"
+    final class Entry {
+        let id: ElementID
+        let doc: DocumentID
+        let page: PageID
+        let stroke: Stroke
+        var processed: Stroke?
+        var retrying = false
+        var previewHidden = false
+        var sequence = 0
+        init(id: ElementID, doc: DocumentID, page: PageID, stroke: Stroke, processed: Bool) {
+            self.id = id; self.doc = doc; self.page = page; self.stroke = stroke
+            self.processed = processed ? stroke : nil
+        }
+    }
+    private(set) var entries: [ElementID: Entry] = [:]
+    var observers: [UUID: @MainActor () -> Void] = [:]
+    private var commits: EventSubscription?
+    private var sequence = 0
+    private weak var app: NibApp?
+
+    init(_ app: NibApp) {
+        self.app = app
+        commits = app.bus.observeCommits { [weak self] changes in
+            guard changes.command == CommandIDs.undo, let self else { return }
+            for entry in self.entries.values where changes.documents.contains(entry.doc) && !entry.retrying {
+                // An unrelated undo must not discard ink that never reached the document.
+                entry.previewHidden = true
+            }
+            self.changed()
+        }
+    }
+    deinit { commits?.cancel() }
+
+    static func shared(_ app: NibApp) -> FailedInkStore {
+        if let store = app.services.get(key, as: FailedInkStore.self) { return store }
+        let store = FailedInkStore(app)
+        app.services.set(store, for: key)
+        return store
+    }
+    func retain(_ entry: Entry) throws {
+        if let existing = entries[entry.id] {
+            guard existing.doc == entry.doc, existing.page == entry.page, existing.stroke == entry.stroke else {
+                throw NibError(.conflict, String(localized: "An unsaved stroke already uses this id."))
+            }
+            return
+        }
+        sequence += 1
+        entry.sequence = sequence
+        entries[entry.id] = entry
+        changed()
+    }
+    func remove(_ id: ElementID) { entries[id] = nil; changed() }
+    private func changed() {
+        for observer in Array(observers.values) { observer() }
+        app?.ui.setNeedsChromeUpdate()
+    }
+}
+
+@MainActor
+final class FailedInkAttachment: CanvasAttachment {
+    let store: FailedInkStore
+    private let token = UUID()
+    private weak var host: CanvasHost?
+    private(set) var layers: [ElementID: CAShapeLayer] = [:]
+    private var pages: [ElementID: PageID] = [:]
+    private var retiring: Set<ElementID> = []
+    init(store: FailedInkStore) { self.store = store }
+    func attach(to host: CanvasHost) {
+        self.host = host
+        store.observers[token] = { [weak self] in
+            guard let self, let host = self.host else { return }
+            self.canvasDidChange(host)
+        }
+        canvasDidChange(host)
+    }
+    func detach(from host: CanvasHost) {
+        store.observers[token] = nil
+        for layer in layers.values { layer.removeFromSuperlayer() }
+        layers.removeAll()
+        pages.removeAll()
+        retiring.removeAll()
+        self.host = nil
+    }
+    func canvasDidChange(_ host: CanvasHost) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        let entries = store.entries.values.filter { $0.doc == host.documentID && !$0.previewHidden }.sorted { $0.sequence < $1.sequence }
+        let live = Set(entries.map(\.id))
+        for (id, layer) in layers where !live.contains(id) && !retiring.contains(id) {
+            guard let page = pages[id] else { continue }
+            retiring.insert(id)
+            host.afterNextRender(page: page) { [weak self] in
+                guard let self, self.layers[id] === layer else { layer.removeFromSuperlayer(); return }
+                self.retiring.remove(id)
+                guard self.store.entries[id]?.previewHidden != false else { return }
+                layer.removeFromSuperlayer()
+                self.layers[id] = nil
+                self.pages[id] = nil
+            }
+        }
+        for entry in entries {
+            guard let transform = host.pageTransform(entry.page) else {
+                layers.removeValue(forKey: entry.id)?.removeFromSuperlayer()
+                continue
+            }
+            let layer: CAShapeLayer
+            if let existing = layers[entry.id] { layer = existing }
+            else {
+                layer = CAShapeLayer()
+                layer.actions = CanvasLayers.noActions
+                layer.path = InkOutline.path(entry.stroke)
+                layer.fillColor = entry.stroke.style.color.cgColor
+                if entry.stroke.style.tool == .highlighter { layer.compositingFilter = "multiplyBlendMode" }
+                layers[entry.id] = layer
+                pages[entry.id] = entry.page
+                // Persistent previews belong to the attachment, not the active tool overlay.
+                host.canvasView.layer.addSublayer(layer)
+                layer.zPosition = 999
+            }
+            layer.setAffineTransform(transform)
+        }
+    }
+}
+
+struct CanvasRetainFailedInk: NibCommand {
+    struct Params: Codable { var page: String; var stroke: Stroke; var id: String?; var processed: Bool? }
+    struct Output: Codable { var id: String }
+    static let descriptor = CommandDescriptor(id: "canvas.retainFailedInk", title: String(localized: "Keep Unsaved Ink"),
+        summary: "Keep a failed ink stroke in the current app session so it can be retried or discarded.",
+        params: .obj(["page": .ref, "stroke": .anything(), "id": .str(), "processed": .bool()], required: ["page", "stroke"]),
+        examples: [["page": "page:FIXTUREDOC01/FIXTUREPG002",
+                    "stroke": try! JSONValue.from(Stroke(style: .defaultPen, points: [StrokePoint(x: 10, y: 10), StrokePoint(x: 20, y: 20)]))]],
+        effect: .session)
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        guard let app = ctx.app, case let .page(doc, page)? = NodeRef(p.page) else { throw NibError.invalid(String(localized: "A page ref is required.")) }
+        guard p.id.map(NibID.isValid) ?? true else { throw NibError.invalid(String(localized: "Invalid stroke id."), path: "$.id") }
+        let id = p.id.map { ElementID($0) } ?? NibID.make()
+        if !ctx.dryRun {
+            try FailedInkStore.shared(app).retain(.init(id: id, doc: doc, page: page, stroke: p.stroke, processed: p.processed ?? false))
+        }
+        return Output(id: id.raw)
+    }
+}
+
+struct CanvasRecoverInk: NibCommand {
+    struct Params: Codable { var doc: String?; var discard: Bool? }
+    struct Output: Codable { var recovered: Int }
+    static let descriptor = CommandDescriptor(id: "canvas.recoverInk", title: String(localized: "Recover Unsaved Ink"),
+        summary: "Retry the document's unsaved ink, or discard it explicitly. Retried strokes use stable ids.",
+        params: .obj(["doc": .ref, "discard": .bool()], required: ["doc"]), examples: [["doc": "doc:FIXTUREDOC01"], ["doc": "doc:FIXTUREDOC01", "discard": true]], effect: .edit, destructive: true)
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        guard let app = ctx.app else { throw NibError.unavailable("canvas") }
+        let doc = try ctx.documentOrSession(p.doc)
+        if p.discard != true, ctx.isReadOnly(doc) || (ctx.session?.readOnly ?? false) {
+            throw NibError(.permissionDenied, String(localized: "This document is read-only."))
+        }
+        let store = FailedInkStore.shared(app)
+        let entries = store.entries.values.filter { $0.doc == doc }.sorted { $0.sequence < $1.sequence }
+        guard !entries.contains(where: { $0.retrying }) else { throw NibError(.conflict, String(localized: "Ink recovery is already running.")) }
+        if ctx.dryRun { return Output(recovered: entries.count) }
+        for entry in entries { entry.retrying = true }
+        defer { for entry in entries { entry.retrying = false } }
+        for entry in entries {
+            if p.discard == true { store.remove(entry.id); continue }
+            if entry.processed == nil {
+                guard let session = ctx.session ?? ctx.activeSession else { throw NibError.unavailable("editor session") }
+                var stroke = entry.stroke
+                var keep = true
+                for processor in app.content.strokeProcessors.all {
+                    if !processor.processor.process(&stroke, page: entry.page, session: session) { keep = false; break }
+                }
+                if !keep { store.remove(entry.id); continue }
+                entry.processed = stroke
+            }
+            guard let stroke = entry.processed else { continue }
+            if let saved = try? ctx.workspace.item(doc, page: entry.page, id: entry.id), !saved.deleted {
+                guard saved.stroke == stroke else { throw NibError(.conflict, String(localized: "The recovered stroke id is already in use.")) }
+            } else {
+                _ = try await ctx.execute(CommandIDs.inkAddStrokes,
+                    ["page": .string(NodeRef.page(doc, entry.page).description),
+                     "strokes": .array([try JSONValue.from(stroke)]), "ids": .array([.string(entry.id.raw)])])
+            }
+            store.remove(entry.id)
+        }
+        return Output(recovered: entries.count)
     }
 }

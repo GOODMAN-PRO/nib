@@ -24,6 +24,25 @@ public enum FeatCanvasFeature: NibFeature {
         app.commands.register(ViewReveal.self)
         app.commands.register(CanvasDecorate.self)
         app.commands.register(CanvasClearDecorations.self)
+        app.commands.register(CanvasRetainFailedInk.self)
+        app.commands.register(CanvasRecoverInk.self)
+        let failedInk = FailedInkStore.shared(app)
+        app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "canvas.failedInk", owner: id, order: 950) { _ in
+            FailedInkAttachment(store: failedInk)
+        })
+        for discard in [false, true] {
+            app.ui.menus.register(MenuItemDescriptor(id: discard ? "canvas.discardInk" : "canvas.retryInk",
+                title: discard ? String(localized: "Discard Unsaved Ink") : String(localized: "Retry Unsaved Ink"),
+                location: .documentMore, order: discard ? 373 : 372, owner: id,
+                command: CanvasRecoverInk.descriptor.id,
+                params: { context in
+                    guard let doc = context.doc ?? context.session?.document else { return [:] }
+                    return ["doc": .string(NodeRef.document(doc).description), "discard": .bool(discard)]
+                }, isVisible: { context in
+                    guard let doc = context.doc ?? context.session?.document else { return false }
+                    return failedInk.entries.values.contains { $0.doc == doc }
+                }, destructive: discard))
+        }
         app.commands.register(CanvasDoubleTapZoom.self)
         app.content.tapHandlers.register(TapHandlerDescriptor(
             id: CanvasDoubleTapZoom.descriptor.id, owner: id, gesture: .doubleTap,

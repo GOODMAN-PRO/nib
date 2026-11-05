@@ -1492,15 +1492,36 @@ enum ElementRenderer {
             .draw(with: r, options: [.usesLineFragmentOrigin, .usesFontLeading, .truncatesLastVisibleLine], context: nil)
     }
 
-    /// Crop and mask coordinates are in oriented image space, before the item's flips.
-    private static func drawImage(_ data: Data, item: Item, in cg: CGContext) {
-        guard let image = item.image, let source = CGImageSourceCreateWithData(data as CFData, nil) else { return }
+    /// Decode only the pixels the transformed cell can display, including its screen
+    /// scale and crop magnification. Source dimensions cap the request: never upscale.
+    static func imageThumbnail(_ data: Data, frame: Frame, crop: Rect, transform: CGAffineTransform) -> CGImage? {
+        guard crop.width > 0, crop.height > 0,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let rawWidth = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let rawHeight = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let swapped = (5...8).contains(orientation)
+        let width = swapped ? rawHeight.doubleValue : rawWidth.doubleValue
+        let height = swapped ? rawWidth.doubleValue : rawHeight.doubleValue
+        guard width > 0, height > 0 else { return nil }
+        let xScale = Double(hypot(transform.a, transform.b))
+        let yScale = Double(hypot(transform.c, transform.d))
+        let needed = max(frame.w * xScale / (width * crop.width), frame.h * yScale / (height * crop.height))
+        guard needed.isFinite else { return nil }
+        let cap = max(1, Int(ceil(max(width, height) * min(1, max(0, needed)))))
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
                                       kCGImageSourceCreateThumbnailWithTransform: true,
-                                      kCGImageSourceThumbnailMaxPixelSize: 2048]
-        guard let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return }
+                                      kCGImageSourceThumbnailMaxPixelSize: cap]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+
+    /// Crop and mask coordinates are in oriented image space, before the item's flips.
+    private static func drawImage(_ data: Data, item: Item, in cg: CGContext) {
+        guard let image = item.image else { return }
         let crop = image.crop ?? Rect(x: 0, y: 0, width: 1, height: 1)
-        guard crop.width > 0, crop.height > 0 else { return }
+        guard crop.width > 0, crop.height > 0,
+              let bitmap = imageThumbnail(data, frame: image.frame, crop: crop, transform: cg.ctm) else { return }
         let pixels = CGRect(x: crop.x * Double(bitmap.width), y: crop.y * Double(bitmap.height),
                             width: crop.width * Double(bitmap.width), height: crop.height * Double(bitmap.height))
         guard let part = bitmap.cropping(to: pixels.integral) else { return }
