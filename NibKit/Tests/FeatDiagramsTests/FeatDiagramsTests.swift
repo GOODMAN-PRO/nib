@@ -87,6 +87,25 @@ final class FeatDiagramsTests: XCTestCase {
         }
     }
 
+    func testCreateRejectsAutomaticEndsOnTheSameItemWithoutWriting() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let before = try h.snapshot()
+        let destinations: [JSONValue] = [["item": "FIXTURESHP01"],
+                                        ["item": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "side": "auto"]]
+        for destination in destinations {
+            do {
+                try await h.run("connector.create", ["page": "page:FIXTUREDOC01/FIXTUREPG001",
+                    "from": ["item": "FIXTURESHP01"], "to": destination, "id": "SELFCONNECT"])
+                XCTFail("automatic ends on the same item must not create a degenerate connector")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .invalidParams)
+                XCTAssertEqual(error.path, "$.to.item")
+            }
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+    }
+
     func testSetPathSwitchesSideAndRouteInOneUndoStep() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         let params: JSONValue = ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECON01", "route": "elbow", "from": ["side": "bottom"]]

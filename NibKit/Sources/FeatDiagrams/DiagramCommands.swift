@@ -236,6 +236,9 @@ struct ConnectorCreate: NibCommand {
         let newID = try DiagramRefs.newID(p.id, doc: doc, page: page, in: ws, path: "$.id")
         let from = try DiagramRefs.end(p.from, doc: doc, page: page, in: ws, path: "$.from")
         let to = try DiagramRefs.end(p.to, doc: doc, page: page, in: ws, path: "$.to")
+        if let source = from.item, source.id == to.item?.id, from.side == nil, to.side == nil {
+            throw NibError(.invalidParams, String(localized: "Choose two different items to connect."), path: "$.to.item")
+        }
         let (f, t) = Anchoring.ends(from, to)
         let label = p.label.flatMap { $0.isEmpty ? nil : $0 }
         let style = ShapeItemStyle(arrowStart: p.arrowStart ?? false, arrowEnd: p.arrowEnd ?? true)
