@@ -642,6 +642,15 @@ public enum ShellChromePolicy {
         !hasModal && !(context.readOnly && effect == .edit)
     }
 
+    /// SceneNavigator's synchronous open API cannot return a later UIKit refusal. Report it on the
+    /// same command-failure channel as FeatWindows, including the originating command id.
+    public static func reportNewWindowFailure(app: NibApp, command: String = CommandIDs.docOpen) {
+        let failure = NibError(.unavailable, String(localized: "A new window could not be opened."),
+                               hint: String(localized: "Try again, or open the document in this window."))
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                        userInfo: ["command": command, "error": failure])
+    }
+
     public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {
         guard !openDocuments.isEmpty else { return nil }
         return make()

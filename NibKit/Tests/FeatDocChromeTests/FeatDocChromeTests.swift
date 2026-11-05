@@ -85,6 +85,27 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
+    func testShellSceneRefusalReportsOpenFailureWithoutChangingTheDocument() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let before = try h.snapshot()
+        let doc = h.session.document
+        let notice = expectation(description: "new window refusal")
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.docOpen)
+            let error = note.userInfo?["error"] as? NibError
+            XCTAssertEqual(error?.code, .unavailable)
+            XCTAssertEqual(error?.message, String(localized: "A new window could not be opened."))
+            XCTAssertEqual(error?.hint, String(localized: "Try again, or open the document in this window."))
+            notice.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        ShellChromePolicy.reportNewWindowFailure(app: h.app)
+        await fulfillment(of: [notice], timeout: 1)
+        XCTAssertEqual(h.session.document, doc)
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
     func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
         let h = Harness(features: [FeatDocChromeFeature.self])
         var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]

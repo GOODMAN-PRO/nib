@@ -176,7 +176,12 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             let activity = NSUserActivity(activityType: "app.nib.openDocument")
             activity.userInfo = ["doc": doc.raw, "page": page?.raw ?? ""]
             let request = UISceneSessionActivationRequest(role: .windowApplication, userActivity: activity, options: nil)
-            UIApplication.shared.activateSceneSession(for: request, errorHandler: nil)
+            UIApplication.shared.activateSceneSession(for: request) { [weak app = self.app] _ in
+                Task { @MainActor in
+                    guard let app else { return }
+                    ShellChromePolicy.reportNewWindowFailure(app: app)
+                }
+            }
             return
         }
         guard let docContent = try? app.workspace.content(doc) else {
