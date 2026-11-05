@@ -364,7 +364,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
         if st.exists {
             let params: JSONValue = ["ref": .string(st.ref), "text": textJSON]
-            enqueue { [self] in await execute(CommandIDs.textSetText, params, group: st.group) }
+            enqueue { [self] in
+                if await execute(CommandIDs.textSetText, params, group: st.group) { st.box.text = text }
+            }
             return
         }
         st.exists = true
@@ -380,6 +382,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         ]
         enqueue { [self] in
             if await self.execute(CommandIDs.textCreateBox, params, group: st.group) {
+                st.box.text = text
                 if self.state === st {
                     self.hide(st.id, page: st.page)
                     self.publishFocus()
@@ -488,6 +491,16 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
     private func reload(_ box: TextBoxItem) {
         guard let st = state else { return }
+        // Geometry/style commits carry the stored text too. They must not replace the live draft or its undo stack.
+        let sameText = box.text == st.box.text || box.text == st.lastCommitted
+        if sameText && (box.style == st.box.style || currentRichText() != st.lastCommitted) {
+            st.box = box
+            st.base = TextLayout.base(box.style, darkPaper: st.darkPaper)
+            applyInsets(st)
+            layoutEditing()
+            changes.send()
+            return
+        }
         debounce?.cancel()
         let selection = modelSelection()
         st.box = box

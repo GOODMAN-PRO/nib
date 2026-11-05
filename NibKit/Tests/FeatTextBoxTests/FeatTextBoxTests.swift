@@ -312,6 +312,55 @@ final class FeatTextBoxTests: XCTestCase {
         }
     }
 
+    func testExternalMovePreservesPendingTyping() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        tv.attributedText = NSAttributedString(string: "Unsaved typing", attributes: tv.typingAttributes)
+        editor.textViewDidChange(tv)
+        let selection = NSRange(location: 3, length: 4)
+        tv.selectedRange = selection
+        var undoWasKept = false
+        tv.undoManager?.registerUndo(withTarget: tv) { _ in undoWasKept = true }
+        h.app.commands.register(CommandDescriptor(id: "test.moveText", title: "Move Text", summary: "Test move.",
+                                                  params: .obj([:]), effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var moved = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                moved.text?.frame.x += 40
+                try tx.put(moved, doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return [:]
+        }
+        try await h.run("test.moveText", [:])
+        XCTAssertEqual(tv.text, "Unsaved typing")
+        XCTAssertEqual(tv.selectedRange, selection)
+        tv.undoManager?.undo()
+        XCTAssertTrue(undoWasKept)
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertEqual(try box(h).text.plainText, "Unsaved typing")
+        XCTAssertEqual(try box(h).frame.x, try XCTUnwrap(item.text).frame.x + 40)
+        editor.detach(from: host)
+    }
+
+    func testExternalUndoReloadsTextAfterAnAutosave() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        tv.attributedText = NSAttributedString(string: "Saved typing", attributes: tv.typingAttributes)
+        editor.commitNow()
+        await editor.flush()
+        try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "Hello Nib"])
+        XCTAssertEqual(tv.text, "Hello Nib", "an external text change must not be mistaken for a geometry-only update")
+        editor.endEditing()
+        await editor.flush()
+        editor.detach(from: host)
+    }
+
     func testTypingInANewBoxCreatesItOnTheFirstCommit() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         let host = FakeCanvasHost(h)
