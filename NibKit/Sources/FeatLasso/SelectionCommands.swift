@@ -396,7 +396,8 @@ enum SelectionSupport {
                       session: EditorSession) -> SelectionOutput {
         let items = items.filter { !session.hiddenLayers.contains($0.layer) }
         guard let bounds = LassoGeometry.union(items) else {
-            clear(session)
+            // Missing the objects during a drag is not an explicit end to temporary selection.
+            session.selection = Selection()
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
         session.selection = Selection(doc: doc, page: page, items: items.map { $0.id }, bounds: bounds,
@@ -457,7 +458,7 @@ struct SelectionSet: NibCommand {
             ids.append(id)
         }
         guard let t = target else {
-            SelectionSupport.clear(session)
+            session.selection = Selection()
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
         _ = try SelectionSupport.page(NodeRef.page(t.doc, t.page).description, ctx, path: "$.refs")

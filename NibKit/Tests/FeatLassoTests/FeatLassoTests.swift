@@ -199,6 +199,34 @@ final class FeatLassoTests: XCTestCase {
 
     // MARK: Circle to Lasso
 
+    func testEmptySelectionAttemptsKeepTemporaryLassoUntilExplicitClear() async throws {
+        let h = harness()
+        let loopID: ElementID = "EMPTYLOOP"
+        editFixturePage(h) { items in
+            let points = [StrokePoint(x: 2000, y: 2000), StrokePoint(x: 2100, y: 2000),
+                          StrokePoint(x: 2100, y: 2100), StrokePoint(x: 2000, y: 2000)]
+            items.append(Item(id: loopID, kind: .stroke, z: "zz", stroke: Stroke(style: .defaultPen, points: points)))
+        }
+        h.session.tool = "pen"
+        h.session.selectTemporarily("lasso")
+        let commands: [(String, JSONValue)] = [
+            ("selection.fromRect", ["page": .string(pageRef), "rect": [3000, 3000, 100, 100]]),
+            ("selection.fromPolygon", polygon([(3000, 3000), (3100, 3000), (3100, 3100), (3000, 3100)])),
+            ("selection.set", ["refs": []]),
+            ("selection.fromLoop", ["page": .string(pageRef), "stroke": .string(ref(loopID))])
+        ]
+        for (command, params) in commands {
+            let result = try await h.run(command, params)
+            XCTAssertEqual(result["count"]?.intValue, 0, command)
+            XCTAssertTrue(h.session.selection.isEmpty, command)
+            XCTAssertEqual(h.session.tool, "lasso", command)
+            XCTAssertEqual(h.session.temporaryReturnTool, "pen", command)
+        }
+        try await h.run("selection.clear")
+        XCTAssertEqual(h.session.tool, "pen")
+        XCTAssertNil(h.session.temporaryReturnTool)
+    }
+
     func testFromLoopDeletesTheLoopSelectsWhatItTouchesAndUndoRestoresIt() async throws {
         let h = harness()
         let loopID: ElementID = "LOOPSTROKE01"
