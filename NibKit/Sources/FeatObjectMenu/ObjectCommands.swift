@@ -182,6 +182,8 @@ struct DeletePlan: Equatable {
 struct ItemDelete: NibCommand {
     struct Params: Codable {
         var refs: [String]?
+        /// When supplied, every target must still have its recognition-time revision.
+        var expectedRevisions: [String: Rev]? = nil
     }
 
     struct Output: Codable {
@@ -199,7 +201,8 @@ struct ItemDelete: NibCommand {
     static let descriptor = CommandDescriptor(
         id: CommandIDs.itemDelete, title: "Delete",
         summary: "Delete items; attached contents go too, connectors to them are detached (or deleted when both ends go).",
-        params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I (any pages; locked items are refused)")],
+        params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I (any pages; locked items are refused)"),
+                      "expectedRevisions": .anything("optional map of every target item ref to its expected revision; changed or missing items cause a conflict")],
                      required: ["refs"]),
         examples: [exampleShape, exampleMany],
         effect: .edit, destructive: true)
@@ -214,6 +217,15 @@ struct ItemDelete: NibCommand {
         try ctx.mutate { tx in
             for g in groups {
                 let items = try tx.items(g.doc, page: g.page)
+                if let expected = p.expectedRevisions {
+                    let live = Dictionary(uniqueKeysWithValues: items.filter { !$0.deleted }.map { ($0.id, $0.rev) })
+                    for target in g.targets {
+                        guard let revision = expected[target.ref], live[target.id] == revision else {
+                            throw NibError(.conflict, String(localized: "The selected item changed or was deleted. Try again."),
+                                           path: target.path)
+                        }
+                    }
+                }
                 _ = try ItemTargets.check(g.targets, items: items, allowLocked: false)
                 let plan = DeletePlan.make(targets: g.targets.map { $0.id }, items: items)
                 if ctx.principal.isUser, let session = ctx.activeSession, session.document == g.doc,

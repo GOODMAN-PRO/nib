@@ -220,12 +220,30 @@ final class FeatShapeRecognitionTests: XCTestCase {
         let active = try await h.run("shape.recognize", params)
         XCTAssertEqual(active["shape"]?["shape"], "polyline")
         XCTAssertEqual(active["mergeWith"], [.string(itemRef("LAYERLINE001"))])
+        let neighbor = try h.app.workspace.item(Fixtures.docID, page: page, id: "LAYERLINE001")
+        XCTAssertEqual(active["mergeRevisions"], try JSONValue.from([itemRef("LAYERLINE001"): neighbor.rev]))
 
         h.session.activeLayer = 0
         h.session.hiddenLayers = [1]
         let hidden = try await h.run("shape.recognize", params)
         XCTAssertEqual(hidden["mergeWith"], [])
         assertPoints(hidden["shape"]?["points"], [Point(402, 605), Point(402, 700)])
+    }
+
+    func testRecognizeItemRefsReturnsTheRevisionsOfTheGeometryRead() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        try await seedLines(h, [(id: "JOINLINE0001", from: Point(300, 600), to: Point(400, 600), layer: 0)])
+        let ref = itemRef("JOINLINE0001")
+        let original = try h.app.workspace.item(Fixtures.docID, page: page, id: "JOINLINE0001")
+        let result = try await h.run("shape.recognize", ["points": [[402, 605], [402, 700]], "neighbors": [.string(ref)]])
+        let decoded = try result.decode(ShapeRecognizeCommand.Output.self)
+        XCTAssertEqual(decoded.mergeWith, [ref])
+        XCTAssertEqual(decoded.mergeRevisions, [ref: original.rev])
+        // A later edit must not change the revision carried by the earlier result.
+        try await seedLines(h, [(id: "JOINLINE0001", from: Point(300, 620), to: Point(400, 620), layer: 0)])
+        let edited = try h.app.workspace.item(Fixtures.docID, page: page, id: "JOINLINE0001")
+        XCTAssertNotEqual(decoded.mergeRevisions?[ref], edited.rev)
+        XCTAssertEqual(try JSONValue.from(decoded), result)
     }
 
     // MARK: Draw Shape tool

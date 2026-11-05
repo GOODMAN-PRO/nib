@@ -8,6 +8,8 @@ struct SnapNeighbor {
     var shape: ShapeItem
     /// False for locked items and items on another layer: they are snap targets but are never merged away.
     var mergeable: Bool = true
+    /// Revision of the item whose geometry was read; inline shapes have no stored revision.
+    var revision: Rev? = nil
 }
 
 struct SnapResult {
