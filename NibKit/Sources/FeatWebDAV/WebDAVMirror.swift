@@ -1048,10 +1048,11 @@ final class WebDAVMirrorRun {
             let value = WebDAVPaths.normalizeETag(raw)
             return value.isEmpty ? nil : "e:" + value
         }
-        // DAVResource.version and uploaded both normalize the raw validator exactly once. Compare only
-        // ETags: a date/size fallback is not evidence that another device wrote after our PUT.
+        // DAVResource.version and uploaded both normalize the raw validator exactly once. If PUT supplied
+        // an ETag, only that same ETag verifies the read-back; date/size could describe an intervening write.
+        // Servers that never supply ETags can still settle on their date/size version.
         let version: String?
-        if let observed = observed, let uploaded = uploaded, observed.hasPrefix("e:"), observed != uploaded {
+        if let observed = observed, let uploaded = uploaded, observed != uploaded {
             version = nil
         } else {
             version = observed ?? uploaded

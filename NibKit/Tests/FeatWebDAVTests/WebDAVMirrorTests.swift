@@ -517,7 +517,12 @@ final class WebDAVMirrorTests: XCTestCase {
             try DAVTest.write(root, "a.json", "ours")
             _ = try await sync(server, root, state, dev)
             let saved = MirrorStateStore(directory: state, key: dev).load()
-            XCTAssertFalse(try XCTUnwrap(saved.entries["a.json"]).remote.isEmpty)
+            XCTAssertEqual(try XCTUnwrap(saved.entries["a.json"]).remote.isEmpty, form == 3)
+            if form == 3 {
+                let verification = try await sync(server, root, state, dev)
+                XCTAssertEqual(verification.downloaded, 1, "a missing read-back ETag requires one verification download")
+                XCTAssertEqual(verification.uploaded + verification.conflicts, 0)
+            }
             let stable = try await sync(server, root, state, dev)
             XCTAssertEqual(stable.downloaded + stable.uploaded + stable.conflicts, 0)
             try DAVTest.write(root, "a.json", "edited locally after upload")
@@ -536,6 +541,47 @@ final class WebDAVMirrorTests: XCTestCase {
         _ = try await sync(server, a, state, "0000000a")
         let r = try await sync(server, a, state, "0000000a")
         XCTAssertEqual(r.uploaded + r.downloaded, 0, "the version read back after PUT matches the listing")
+    }
+
+    func testConcurrentWriteAfterPutWithETaglessListingIsDownloadedOnce() async throws {
+        let server = FakeDAVServer.install()
+        server.omitFileETags = true
+        let root = DAVTest.tempDir("mixed-validators"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "a.json", "ours")
+        server.intercept = { [unowned server] method, path in
+            if method == "PROPFIND", path == "/dav/Nib/a.json", server.text(path) == "ours" {
+                server.put(path, "the other device's content")
+            }
+            return nil
+        }
+        _ = try await sync(server, root, state, dev)
+        server.intercept = nil
+        XCTAssertEqual(MirrorStateStore(directory: state, key: dev).load().entries["a.json"]?.remote, "")
+        let next = try await sync(server, root, state, dev)
+        XCTAssertEqual(next.downloaded, 1)
+        XCTAssertEqual(DAVTest.read(root, "a.json"), "the other device's content")
+        let stable = try await sync(server, root, state, dev)
+        XCTAssertEqual(stable.downloaded + stable.uploaded + stable.conflicts, 0)
+    }
+
+    func testServerWithoutAnyETagsSettlesWithoutRepeatedDownloads() async throws {
+        let server = FakeDAVServer.install()
+        server.omitFileETags = true
+        server.omitPutETag = true
+        let root = DAVTest.tempDir("no-validators"), state = DAVTest.tempDir("state")
+        try DAVTest.write(root, "a.json", "ours")
+        _ = try await sync(server, root, state, dev)
+        XCTAssertTrue(try XCTUnwrap(MirrorStateStore(directory: state, key: dev).load().entries["a.json"]).remote.hasPrefix("m:"))
+        for _ in 0..<2 {
+            let stable = try await sync(server, root, state, dev)
+            XCTAssertEqual(stable.downloaded + stable.uploaded + stable.conflicts, 0)
+        }
+        server.put("/dav/Nib/a.json", "a longer remote edit")
+        let changed = try await sync(server, root, state, dev)
+        XCTAssertEqual(changed.downloaded, 1)
+        XCTAssertEqual(DAVTest.read(root, "a.json"), "a longer remote edit")
+        let stable = try await sync(server, root, state, dev)
+        XCTAssertEqual(stable.downloaded + stable.uploaded + stable.conflicts, 0)
     }
 
     func testBusyServerStopsSchedulingCopies() async throws {
