@@ -634,6 +634,46 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path), "only the sidebar's own copies are deleted")
     }
 
+    func testMixedReadableAndUnreadableDropsImportNothing() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.pagePaste, CommandIDs.importFiles], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        var failures = 0
+        let watch = NotificationCenter.default.publisher(for: .nibCommandFailed, object: h.app)
+            .sink { _ in failures += 1 }
+        defer { watch.cancel() }
+        let badPages = NSItemProvider()
+        badPages.registerDataRepresentation(forTypeIdentifier: PagesPayload.typeIdentifier, visibility: .all) { done in
+            done(nil, CocoaError(.fileReadUnknown))
+            return nil
+        }
+        await model.pastePages([provider(h, p1), badPages], into: doc, at: .end)
+        XCTAssertTrue(log.calls.isEmpty)
+        XCTAssertEqual(failures, 1)
+
+        let original = FileManager.default.temporaryDirectory.appendingPathComponent("drop-\(UUID().uuidString).pdf")
+        try Data("%PDF".utf8).write(to: original)
+        defer { try? FileManager.default.removeItem(at: original) }
+        let goodFile = NSItemProvider()
+        goodFile.registerFileRepresentation(forTypeIdentifier: UTType.pdf.identifier, fileOptions: [], visibility: .all) { done in
+            done(original, false, nil)
+            return nil
+        }
+        let badFile = NSItemProvider()
+        badFile.registerFileRepresentation(forTypeIdentifier: UTType.pdf.identifier, fileOptions: [], visibility: .all) { done in
+            done(nil, false, CocoaError(.fileReadUnknown))
+            return nil
+        }
+        await model.importFiles([goodFile, badFile], into: doc, at: .end)
+        XCTAssertTrue(log.calls.isEmpty, "no successful subset can be duplicated by retrying")
+        XCTAssertEqual(failures, 2)
+        try await waitUntil {
+            let folders = (try? FileManager.default.contentsOfDirectory(at: DroppedFiles.root, includingPropertiesForKeys: nil)) ?? []
+            return !folders.contains { FileManager.default.fileExists(atPath: $0.appendingPathComponent(original.lastPathComponent).path) }
+        }
+    }
+
     // MARK: One command per gesture
 
     func testDraggingAStackReordersWithOnePageReorder() async {

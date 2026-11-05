@@ -172,20 +172,33 @@ enum PageClipboard {
     /// Keeps `payload` for pastes in this process, then puts it with its asset bytes on the system pasteboard. Reading
     /// the assets, cutting PDFs and encoding run off the main actor (ARCHITECTURE §14).
     static func write(_ payload: PagesPayload, store: AssetStore?) async throws {
-        memory = payload
-        guard usesSystemPasteboard else { return }
+        guard usesSystemPasteboard else {
+            memory = payload
+            generation += 1
+            return
+        }
         let board = UIPasteboard.general
-        writtenChangeCount = board.changeCount
+        try await write(payload, changeCount: { board.changeCount }, publish: {
+            board.setData($0, forPasteboardType: typeIdentifier)
+        }, encode: {
+            try payload.encodedWithBytes(store: store, pdfUse: payload.pdfUse)
+        })
+    }
+
+    /// The same publication path with an injectable board and worker for deterministic race tests.
+    static func write(_ payload: PagesPayload, changeCount: () -> Int, publish: (Data) -> Void,
+                      encode: @escaping @Sendable () throws -> Data) async throws {
+        memory = payload
         generation += 1
+        let startingChangeCount = changeCount()
+        writtenChangeCount = startingChangeCount
         let mine = generation
-        let pdfUse = payload.pdfUse
-        let data = try await Task.detached(priority: .userInitiated) {
-            try payload.encodedWithBytes(store: store, pdfUse: pdfUse)
-        }.value
+        let data = try await Task.detached(priority: .userInitiated) { try encode() }.value
         // A newer copy, ours or another app's, replaced this one while it was being encoded.
-        guard mine == generation, board.changeCount == writtenChangeCount else { return }
-        board.setData(data, forPasteboardType: typeIdentifier)
-        writtenChangeCount = board.changeCount
+        // Reads may update the cache count while encoding, so it cannot be the overwrite guard.
+        guard mine == generation, changeCount() == startingChangeCount else { return }
+        publish(data)
+        writtenChangeCount = changeCount()
     }
 
     /// Cheap check for menus: it never reads the pasteboard's contents, so it never prompts.
@@ -196,17 +209,30 @@ enum PageClipboard {
         return board.contains(pasteboardTypes: [typeIdentifier])
     }
 
-    static func read() -> PagesPayload? {
+    static func read() async -> PagesPayload? {
         guard usesSystemPasteboard else { return memory }
         let board = UIPasteboard.general
-        if board.changeCount == writtenChangeCount, let m = memory { return m }
-        guard board.contains(pasteboardTypes: [typeIdentifier]),
-              let data = board.data(forPasteboardType: typeIdentifier) else { return nil }
-        return PagesPayload.decode(data)
+        return await read(changeCount: { board.changeCount }, data: { board.data(forPasteboardType: typeIdentifier) })
+    }
+
+    /// The system read path, injectable without the simulator pasteboard. Only Data acquisition touches UIKit;
+    /// decoding its potentially large base64 assets runs on a worker, once per unchanged clipboard.
+    static func read(changeCount: () -> Int, data: () -> Data?,
+                     decode: @escaping @Sendable (Data) -> PagesPayload? = { PagesPayload.decode($0) }) async -> PagesPayload? {
+        let count = changeCount()
+        if count == writtenChangeCount, let memory { return memory }
+        guard let bytes = data() else { return nil }
+        let mine = generation
+        let payload = await Task.detached(priority: .userInitiated) { decode(bytes) }.value
+        guard mine == generation, changeCount() == count else { return nil }
+        memory = payload
+        writtenChangeCount = count
+        return payload
     }
 
     /// Tests start from an empty clipboard.
     static func clear() {
+        generation += 1
         memory = nil
         writtenChangeCount = nil
     }
@@ -286,8 +312,8 @@ enum AssetTransfer {
     /// down to those pages, each PDF once however many pages show it. An asset `target` already holds is left out:
     /// names are content hashes, so its references work there as they are, and nothing is read, cut or stored for it
     /// (moving pages back into a document that has their PDF copies nothing). An asset that cannot be read is left out
-    /// and keeps its reference, unless `strict` (moves) and its file is there: then this throws, before anything was
-    /// stored.
+    /// and keeps its reference, unless `strict` (moves): then this throws before anything is stored, including when
+    /// the store cannot yet provide a URL for an unavailable cloud asset.
     static func fill(_ assets: [PagesPayload.Asset], pdfUse: [String: [Int]], for target: DocumentID? = nil,
                      store: AssetStore, strict: Bool) throws -> [PagesPayload.Asset] {
         var out: [PagesPayload.Asset] = []
@@ -354,17 +380,9 @@ enum AssetTransfer {
         do {
             return try store.data(ref, doc: doc)
         } catch {
-            // A reference that already dangles (no file) moves as it is; a file that is there but unreadable does not.
-            guard strict, let url = store.url(ref, doc: doc), isPresent(url) else { return nil }
-            throw NibError(.unavailable, "asset \(ref.name) could not be read; nothing was moved",
-                           hint: "try again when the file has downloaded")
+            guard strict else { return nil }
+            throw NibError(.unavailable, String(localized: "An asset could not be read. Nothing was moved. Try again when the file has downloaded."))
         }
-    }
-
-    /// On disk, or an iCloud placeholder of a file that has not downloaded yet.
-    private static func isPresent(_ url: URL) -> Bool {
-        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
-        return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
     }
 }
 
