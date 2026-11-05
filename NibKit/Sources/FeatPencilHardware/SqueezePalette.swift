@@ -292,7 +292,7 @@ struct SqueezePaletteView: View {
 
     private var rows: some View {
         let plan = model.plan
-        VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: 0) {
             if plan.showsTools {
                 toolRows(plan)
             }
