@@ -1349,6 +1349,51 @@ final class FeatWhiteboardTests: XCTestCase {
 
     // MARK: Minimap attachment
 
+    func testMinimapRendersContentWithoutPaintingPaperOverChrome() async throws {
+        let h = harness(), renderer = ScriptedRenderer()
+        h.app.services.renderer = renderer
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let model = MinimapModel(app: h.app, doc: Fixtures.whiteboardID, session: h.session)
+        model.reloadContent()
+        for _ in 0..<100 where model.image == nil { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertNotNil(model.image)
+        let request = try XCTUnwrap(renderer.requests.last)
+        XCTAssertEqual(request.page, Fixtures.boardID)
+        XCTAssertEqual(request.region, model.geometry.world)
+        XCTAssertFalse(request.background, "White paper must not obscure the dark Deep minimap surface")
+        XCTAssertTrue(request.annotations, "The overview still renders the board's content")
+    }
+
+    func testMinimapUsesRoundedChromeInBothAppearancesAndOrientations() async throws {
+        guard NibSnapshot.supportsHostedImages else { throw XCTSkip("System glass needs a window scene") }
+        let h = harness()
+        // No viewport or content: sample the actual card surface without ink or the accent wash.
+        let model = MinimapModel(app: h.app, doc: Fixtures.whiteboardID, session: h.session)
+        for size in [CGSize(width: 320, height: 480), CGSize(width: 480, height: 320)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let view = MinimapMap(model: model)
+                    .frame(width: size.width, height: size.height)
+                    .background(Color.white)
+                let captured = try await NibSnapshot.hostedImage(view, size: size, variant: variant)
+                let image = try XCTUnwrap(captured)
+                let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width / 2, y: size.height / 2)))
+                let channels = [centre.r, centre.g, centre.b]
+                if variant == .dark {
+                    XCTAssertTrue(channels.allSatisfy { $0 < 128 }, "Dark minimap chrome over white paper: \(centre)")
+                } else {
+                    XCTAssertTrue(channels.allSatisfy { $0 > 180 }, "Light minimap chrome: \(centre)")
+                }
+                let map = model.geometry.size
+                // Just outside the rounded corner but inside the former square backing rectangle.
+                let corner = CGPoint(x: (size.width - map.width) / 2 + 1, y: (size.height - map.height) / 2 + 1)
+                let outside = try XCTUnwrap(NibSnapshot.pixel(image, at: corner))
+                XCTAssertTrue([outside.r, outside.g, outside.b].allSatisfy { $0 > 200 },
+                              "No square backdrop behind the rounded minimap: \(outside), \(variant), \(size)")
+            }
+        }
+    }
+
     /// The minimap recedes while the Pencil is down in its window and comes back after it lifts (DESIGN §10.8).
     func testMinimapRecedesWhileInking() async throws {
         let h = harness()

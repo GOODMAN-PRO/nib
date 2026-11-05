@@ -203,7 +203,6 @@ final class MinimapModel: ObservableObject {
     @Published private(set) var sketch: [Rect] = []
     @Published private(set) var limit: BoardLimitStatus = .ok
     @Published private(set) var itemCount = 0
-    @Published private(set) var paper: RGBA = .white
     /// Faded to 22 % while the Pencil (or a drawing finger) is down in this window, back 450 ms after it lifts
     /// (DESIGN §10.8, `EditorSession.inking`).
     @Published private(set) var receding = false
@@ -224,7 +223,6 @@ final class MinimapModel: ObservableObject {
     private(set) var tally = BoardContentTally()
     private var dragState = MinimapDrag()
     private var pendingRescan = false
-    private var pendingHead = false
     private var lastAnnouncement = Date.distantPast
     private var renderTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
@@ -246,7 +244,6 @@ final class MinimapModel: ObservableObject {
     func reloadContent() {
         board = session.document == doc ? session.page : nil
         pendingRescan = false
-        pendingHead = false
         guard let board, let items = try? app.workspace.items(doc, page: board) else {
             tally = BoardContentTally()
             publishTally()
@@ -258,7 +255,6 @@ final class MinimapModel: ObservableObject {
         }
         tally = BoardContentTally(items: items)
         publishTally()
-        paper = Self.paper(of: (try? app.workspace.content(doc).page(board))?.background)
         sketch = app.services.renderer == nil ? Self.sketch(items) : []
         updateGeometry(forceRender: true)
     }
@@ -279,7 +275,6 @@ final class MinimapModel: ObservableObject {
         if touched && app.services.renderer == nil { pendingRescan = true }
         let head = changes.headChanged(doc)
         guard touched || head else { return }
-        if head { pendingHead = true }
         reloadTask?.cancel()
         reloadTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
@@ -292,10 +287,6 @@ final class MinimapModel: ObservableObject {
         if pendingRescan {
             reloadContent()
             return
-        }
-        if pendingHead, let board {
-            paper = Self.paper(of: (try? app.workspace.content(doc).page(board))?.background)
-            pendingHead = false
         }
         publishTally()
         updateGeometry(forceRender: true)
@@ -361,7 +352,9 @@ final class MinimapModel: ObservableObject {
         guard showsMap, let renderer = app.services.renderer, let board else { return }
         let world = geometry.world
         let scale = max(geometry.scale * Double(displayScale), 0.001)
-        let request = RenderRequest(doc: doc, page: board, region: world, scale: scale, background: true, annotations: true)
+        // The overview is chrome, not a second sheet of paper. Render only board content so the
+        // shared Deep droplet remains visible in either appearance, including over white boards.
+        let request = RenderRequest(doc: doc, page: board, region: world, scale: scale, background: false, annotations: true)
         renderTask = Task { @MainActor [weak self] in
             // Renders after the viewport or the content stops changing, never per frame.
             try? await Task.sleep(nanoseconds: 300_000_000)
@@ -667,21 +660,13 @@ struct MinimapMap: View {
     // (package CI 42010472894: "unable to type-check this expression in reasonable time").
     var body: some View {
         accessible
-            // The preview keeps the document's paper colour. Leave a semantic chrome surround visible
-            // in either appearance instead of letting white paper cover the entire floating surface.
-            // Padding is outside the gestures so their locations remain in the map's coordinate space.
-            .padding(NibSpacing.s)
-            .background(NibColor.backgroundSecondary)
             .droplet("whiteboard.minimap", style: .floatingPanel)
     }
 
-    /// The board render and the viewport, clipped concentrically with the outer chrome.
-    private var paper: some View {
+    /// Content fills the Deep surface edge to edge, with no paper fill or second rounded card.
+    private var overview: some View {
         let g = model.geometry
-        // The style's radius is optional (nil draws a capsule); only a fixed radius can be made concentric.
-        let radius = DropletStyle.floatingPanel.cornerRadius.map { NibRadius.concentric($0, inset: NibSpacing.s) }
         return ZStack(alignment: .topLeading) {
-            Color(uiColor: model.paper.uiColor)
             if let image = model.image, let world = model.imageWorld {
                 let r = g.map(world)
                 Image(decorative: image, scale: 1)
@@ -705,14 +690,13 @@ struct MinimapMap: View {
             }
         }
         .frame(width: g.size.width, height: g.size.height, alignment: .topLeading)
-        // The paper inset and its outer chrome have concentric corners.
-        .clipShape(NibDropletShape(cornerRadius: radius))
+        .clipShape(NibDropletShape(cornerRadius: DropletStyle.floatingPanel.cornerRadius))
         .contentShape(Rectangle())
     }
 
-    /// The paper with its pan, fit and centre gestures.
+    /// The overview with its pan, fit and centre gestures.
     private var interactive: some View {
-        paper
+        overview
         // Panning the viewport takes priority over the floating-panel preset's pickup gesture.
         .highPriorityGesture(DragGesture(minimumDistance: 3)
             .updating($dragging) { _, state, _ in state = true }
