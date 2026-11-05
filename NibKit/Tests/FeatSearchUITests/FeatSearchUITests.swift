@@ -139,6 +139,23 @@ final class FeatSearchUITests: XCTestCase {
         XCTAssertFalse(SearchScrollContinuation.isVisible(contentBottom: 120, viewportHeight: 160))
     }
 
+    func testContinuationUsesContentAndViewportFromTheSameLayout() {
+        let content = CGRect(x: 0, y: 40, width: 400, height: 600)
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBounds: content, viewportBounds: .zero))
+        // A first viewport measurement must show overflow without any content movement or scroll.
+        XCTAssertTrue(SearchScrollContinuation.isVisible(contentBounds: content,
+            viewportBounds: CGRect(x: 0, y: 40, width: 400, height: 300)))
+        // Resizing alone can remove or restore the cue.
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBounds: content,
+            viewportBounds: CGRect(x: 0, y: 40, width: 400, height: 600)))
+        XCTAssertTrue(SearchScrollContinuation.isVisible(contentBounds: content,
+            viewportBounds: CGRect(x: 0, y: 40, width: 400, height: 200)))
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBounds: content.offsetBy(dx: 0, dy: -400),
+            viewportBounds: CGRect(x: 0, y: 40, width: 400, height: 200)))
+        XCTAssertFalse(SearchScrollContinuation.isVisible(contentBounds: nil,
+            viewportBounds: CGRect(x: 0, y: 40, width: 400, height: 200)))
+    }
+
     func testMatchControlsDisableForEmptyPendingFailedAndFilteredResults() {
         let state = SearchState()
         state.scope = NodeRef.document(Fixtures.docID).description

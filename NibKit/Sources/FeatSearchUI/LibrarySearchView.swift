@@ -215,9 +215,7 @@ struct SearchResults: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
-    @Namespace private var scrollSpace
     @State private var overflows = false
-    @State private var viewportHeight: CGFloat = 0
     private var showsContinuation: Bool {
         overflows
     }
@@ -294,15 +292,20 @@ struct SearchResults: View {
                     }
                     .foregroundStyle(NibColor.label)
                     .padding(NibSpacing.l)
-                    .onGeometryChange(for: Bool.self) {
-                        SearchScrollContinuation.isVisible(
-                            contentBottom: $0.frame(in: .named(scrollSpace)).maxY, viewportHeight: viewportHeight)
-                    } action: {
-                        overflows = $0
-                    }
+                    .anchorPreference(key: SearchContentBounds.self, value: .bounds) { $0 }
                 }
-                .coordinateSpace(name: scrollSpace)
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { viewportHeight = $0 }
+                // Resolve both measurements in one layout pass. Only the decision reaches
+                // state, so scrolling does not invalidate all result rows every frame.
+                .overlayPreferenceValue(SearchContentBounds.self) { anchor in
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: SearchContinuationVisible.self,
+                            value: SearchScrollContinuation.isVisible(contentBounds: anchor.map { geometry[$0] },
+                                viewportBounds: CGRect(origin: .zero, size: geometry.size)))
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
+                .onPreferenceChange(SearchContinuationVisible.self) { overflows = $0 }
                 .scrollBounceBehavior(.basedOnSize)
                 .scrollIndicators(.visible)
                 .nibFadeBottomEdge(showsContinuation ? NibSpacing.l : 0)
@@ -329,7 +332,22 @@ struct SearchResults: View {
     }
 }
 
+private struct SearchContentBounds: PreferenceKey {
+    static let defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = nextValue() ?? value }
+}
+
+private struct SearchContinuationVisible: PreferenceKey {
+    static let defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+}
+
 enum SearchScrollContinuation {
+    static func isVisible(contentBounds: CGRect?, viewportBounds: CGRect) -> Bool {
+        guard let contentBounds else { return false }
+        return isVisible(contentBottom: contentBounds.maxY - viewportBounds.minY, viewportHeight: viewportBounds.height)
+    }
+
     static func isVisible(contentBottom: CGFloat, viewportHeight: CGFloat) -> Bool {
         viewportHeight > 0 && contentBottom > viewportHeight + NibSpacing.xxs
     }
