@@ -2290,6 +2290,48 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(vc.failedPages.isEmpty)
     }
 
+    func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = FailingRenderer()
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        defer { vc.closeCanvas() }
+        await waitUntil("render failure") { vc.failedPages.contains(Fixtures.boardID) }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+        await waitUntil("failed renders to settle") { page.isSettled }
+        XCTAssertFalse(vc.errorView.isHidden, "Settling alone is not recovery")
+        XCTAssertEqual(vc.errorView.reason, "the tile could not be drawn")
+        h.app.services.renderer = RecordingRenderer()
+        page.invalidate(nil)
+        await waitUntil("successful rerender") { page.isSettled && !vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertTrue(vc.errorView.isHidden)
+        XCTAssertTrue(page.hasShownContent)
+        // A subsequent recovery must also notify after the first-content fade has already run.
+        vc.pageDidFail(Fixtures.boardID)
+        page.invalidate(nil)
+        await waitUntil("second recovery") { !vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testOffscreenFailedPageDoesNotCoverHealthyPages() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        // Freeze page selection while the viewport moves, as during a pending page transition.
+        vc.scrollView.delegate = nil
+        let next = try XCTUnwrap(vc.host.pageFrame(Fixtures.page2))
+        vc.scrollView.contentOffset.y = next.minY
+        vc.pageDidFail(Fixtures.page1)
+        XCTAssertTrue(vc.errorView.isHidden)
+        XCTAssertEqual(vc.errorView.frame, .zero)
+        vc.scrollView.contentOffset.y = next.minY - 100
+        vc.pageDidFail(Fixtures.page1)
+        let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
+        let visible = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
+        XCTAssertFalse(visible.isEmpty)
+        XCTAssertEqual(vc.errorView.frame, visible)
+        XCTAssertTrue(vc.errorView.clipsToBounds)
+    }
+
     func testABoardWhoseTilesFailToRenderSaysSoAndTriesAgain() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let renderer = FailingRenderer()

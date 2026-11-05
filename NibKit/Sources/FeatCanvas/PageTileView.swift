@@ -74,6 +74,8 @@ protocol PageTileSource: AnyObject {
     func placeholderTile(page: PageID, region: Rect, scale: Double) -> CGImage?
     /// The page view finished every render it had in flight (tiles and preview).
     func pageTileViewDidSettle(_ view: PageTileView)
+    /// A real tile or preview landed, including a successful render after an earlier failure.
+    func pageTileViewDidRender(_ view: PageTileView)
     /// A render of the page (a tile or its low-resolution preview) failed, not cancelled: the canvas shows "Couldn't
     /// show this page." Called at most once per configuration until `retry()`.
     func pageTileView(_ view: PageTileView, didFailWith error: Error)
@@ -242,6 +244,8 @@ final class PageTileView: UIView {
     /// The first bitmap since the page was configured landed: its content fades in (`NibMotion.fade`, 120 ms). The
     /// SwiftUI timing token drives UIKit from iOS 18; iOS 17 shows it at once.
     private func contentLanded() {
+        failureReported = false
+        source?.pageTileViewDidRender(self)
         guard !hasShownContent else { return }
         hasShownContent = true
         if #available(iOS 18, *), window != nil {

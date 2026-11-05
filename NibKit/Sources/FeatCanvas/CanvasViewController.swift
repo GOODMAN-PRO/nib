@@ -81,6 +81,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private var notificationObservers: [NSObjectProtocol] = []
     private var paperCache: [String: UIColor] = [:]
     private(set) var failedPages: Set<PageID> = []
+    private var failureReasons: [PageID: String] = [:]
     private var loadingTask: Task<Void, Never>?
     private var sessionFlushScheduled = false
     private var hudLingerTask: Task<Void, Never>?
@@ -784,6 +785,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         boardBoundsPage = nil
         paperCache.removeAll()
         failedPages.removeAll()
+        failureReasons.removeAll()
         guard isViewLoaded, didInitialLayout else { return }
         scrollView.recycleAll()
         let survivingAnchor = anchor.flatMap { a in livePages.contains { $0.id == a.page } ? a : nil }
@@ -1381,14 +1383,22 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         refreshForReplayIfIdle()
     }
 
-    func pageDidFail(_ page: PageID) {
+    func pageDidRender(_ page: PageID) {
+        guard failedPages.remove(page) != nil else { return }
+        failureReasons.removeValue(forKey: page)
+        layoutFixedViews()
+    }
+
+    func pageDidFail(_ page: PageID, reason: String = String(localized: "The page renderer could not finish drawing this page.")) {
         failedPages.insert(page)
+        failureReasons[page] = reason
         layoutFixedViews()
     }
 
     private func retryFailedPages() {
         let pages = failedPages
         failedPages.removeAll()
+        failureReasons.removeAll()
         for p in pages { scrollView.pageViews[p]?.retry() }
         layoutFixedViews()
     }
@@ -1572,10 +1582,11 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         }
         if let page = displayedPage, failedPages.contains(page), let f = host.pageFrame(page) {
             errorView.showsRestore = canRestoreFromBackup
+            errorView.reason = failureReasons[page] ?? String(localized: "The page renderer could not finish drawing this page.")
             let visible = scrollView.convert(f, to: fixedOverlay).intersection(b)
             // The failure state replaces the visible paper, including stale tiles and attachments beneath it.
-            errorView.frame = visible.isNull ? b : visible
-            errorView.isHidden = false
+            errorView.frame = visible.isNull ? .zero : visible
+            errorView.isHidden = visible.isNull || visible.isEmpty
             fixedOverlay.bringSubviewToFront(scrubber)
         } else {
             errorView.isHidden = true
@@ -2002,6 +2013,9 @@ final class AddPageIndicatorView: UIView {
 final class PageErrorView: UIView {
     var onRetry: (() -> Void)?
     var onRestore: (() -> Void)?
+    var reason = String(localized: "The page renderer could not finish drawing this page.") {
+        didSet { if reason != oldValue { update() } }
+    }
     /// Shows Restore from Backup (the canvas sets it when the Cloud & Backup panel is registered).
     var showsRestore = false {
         didSet { if showsRestore != oldValue { update() } }
@@ -2017,6 +2031,7 @@ final class PageErrorView: UIView {
         super.init(frame: frame)
         backgroundColor = NibUIColor.background
         isOpaque = true
+        clipsToBounds = true
         hosting.view.backgroundColor = .clear
         // Placed by the canvas, clear of the chrome already: no safe-area padding of its own.
         hosting.safeAreaRegions = []
@@ -2045,7 +2060,7 @@ final class PageErrorView: UIView {
             ? NibAction(String(localized: "Restore from Backup")) { [weak self] in self?.onRestore?() } : nil
         actions = [retry] + (restore.map { [$0] } ?? [])
         hosting.rootView = NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."),
-                                         primary: retry, secondary: restore)
+                                         message: reason, primary: retry, secondary: restore)
         setNeedsLayout()
     }
 
