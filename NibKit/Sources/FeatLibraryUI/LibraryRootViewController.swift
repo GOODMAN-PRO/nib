@@ -534,6 +534,9 @@ final class LibraryRootViewController: UIViewController {
 }
 
 enum LibraryPresentation {
+    static func contentWidth(viewport: CGFloat, inlineSidebar: Bool) -> CGFloat {
+        max(0, viewport - (inlineSidebar ? NibMetrics.sidebarWidth : 0))
+    }
     static func usesInlineSidebar(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
         !isCompact(size: size, idiom: idiom) && size.width > size.height && size.width >= NibMetrics.librarySidebarBreakpoint
     }
@@ -599,9 +602,14 @@ struct LibraryRootView: View {
                                     }
                             }.frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
-                        else { content(compact: compact, compactHeight: short).frame(maxWidth: .infinity, maxHeight: .infinity) }
+                        else {
+                            content(compact: compact, compactHeight: short)
+                                .frame(width: LibraryPresentation.contentWidth(viewport: geometry.size.width,
+                                    inlineSidebar: inlineSidebar), height: geometry.size.height)
+                        }
                     }
                 }
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
                 .background(NibColor.background)
                 if !inlineSidebar && !compact && model.sidebarVisible {
                     HStack { sidebar(compact: false).frame(width: NibMetrics.sidebarWidth); Spacer() }
@@ -647,7 +655,8 @@ struct LibraryRootView: View {
                                 }
                             }
                         }
-                        .padding(NibSpacing.l)
+                        .padding(.vertical, NibMetrics.chromeInset)
+                        .padding(.horizontal, compact ? NibMetrics.chromeInset : NibMetrics.libraryGutter)
                         LibraryBuds(model: model)
                         NibReflowCarrier(model.reflow, id: "library.card.carrier") { ref in
                             LibraryStackedCarrier(ref: ref, model: model)
@@ -660,8 +669,12 @@ struct LibraryRootView: View {
                             .nibToast(model.floating.toastBinding)
                     }
                 }
+                // Floating content must receive the viewport, not an intrinsic width enlarged by
+                // a banner or the previous grid measurement after rotation/presentation.
+                .frame(width: geometry.size.width, height: geometry.size.height)
                 .environment(\.horizontalSizeClass, compact ? .compact : .regular)
             }
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
             .coordinateSpace(name: "library.chrome")
             .onPreferenceChange(LibraryTargets.self) { targets = $0; model.dropTargets = $0 }
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
