@@ -84,6 +84,36 @@ final class FeatSettingsTests: XCTestCase {
 
     // MARK: Sections and search
 
+    func testPageDraftSurvivesWidthAndDynamicTypeBreakpoints() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let probe = SettingsDraftProbe()
+        h.app.ui.settingsPages.register(SettingsPageDescriptor(
+            id: "test.draft", title: "Draft", icon: "gearshape", section: .sync, order: 0, owner: "test"
+        ) { _ in AnyView(SettingsDraftProbeView(probe: probe)) })
+        let state = SettingsNavigationState()
+        state.show(page: "test.draft", in: SettingsCatalog(pages: h.app.ui.settingsPages.all))
+        let root = SettingsRootView(app: h.app, state: state, onDone: {})
+        let host = UIHostingController(rootView: root.environment(\.dynamicTypeSize, .large))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 900, height: 800))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for (width, size) in [(CGFloat(900), DynamicTypeSize.large), (390, .large),
+                              (900, .large), (900, .accessibility5), (900, .large)] {
+            window.frame.size.width = width
+            host.view.frame = window.bounds
+            host.rootView = root.environment(\.dynamicTypeSize, size)
+            for _ in 0..<10 {
+                host.view.layoutIfNeeded()
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertEqual(probe.models.count, 1, "resizing must not create another page model")
+            let draft = try XCTUnwrap(probe.models.last)
+            if draft.password.isEmpty { draft.password = "unsaved password" }
+            XCTAssertEqual(probe.models.first?.password, draft.password)
+        }
+    }
+
     func testPagesFromOtherFeaturesAppearInTheirSection() {
         let h = Harness(features: [FeatSettingsFeature.self])
         h.app.ui.settingsPages.register(page("ai.providers", "AI Providers", .ai, owner: "aisettings"))
@@ -571,6 +601,26 @@ final class FeatSettingsTests: XCTestCase {
             XCTFail("\(error)", file: file, line: line)
         }
     }
+}
+
+@MainActor
+private final class SettingsDraftProbe {
+    var models: [SettingsDraftModel] = []
+}
+
+@MainActor
+private final class SettingsDraftModel: ObservableObject {
+    @Published var password = ""
+    init(probe: SettingsDraftProbe) { probe.models.append(self) }
+}
+
+@MainActor
+private struct SettingsDraftProbeView: View {
+    @StateObject private var model: SettingsDraftModel
+    init(probe: SettingsDraftProbe) {
+        _model = StateObject(wrappedValue: SettingsDraftModel(probe: probe))
+    }
+    var body: some View { SecureField("Password", text: $model.password) }
 }
 
 private func page(_ id: String, _ title: String, _ section: SettingsSection, order: Int = 10,

@@ -28,12 +28,14 @@ private final class Calls {
 private final class CountingPersistence: DocumentPersistence {
     let base: DocumentPersistence
     var loads: [PageID] = []
+    var onLoad: (() -> Void)?
 
     init(_ base: DocumentPersistence) { self.base = base }
 
     func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
 
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        onLoad?()
         loads.append(page)
         return try base.loadItems(doc, page: page)
     }
@@ -744,5 +746,28 @@ final class FeatCommentsTests: XCTestCase {
         XCTAssertFalse(fresh.scanning)
         XCTAssertEqual(fresh.sections, model.sections)
         XCTAssertEqual(fresh.sections.last?.rows.map(\.text), ["At the end"])
+    }
+
+    func testCommentsScanDoesNotPopulateEditingCacheWithColdPages() async throws {
+        let h = harness()
+        let doc = Fixtures.docID
+        h.app.workspace.close(doc)
+        for i in 0..<200 {
+            let page = PageRecord(id: NibID("COLD\(i)"), order: "z\(i)")
+            h.persistence.heads[doc]?.pages.append(page)
+            h.persistence.pageItems[doc, default: [:]][page.id] = []
+        }
+        _ = try h.app.workspace.items(doc, page: Fixtures.page1)
+        let cached = h.app.workspace.cachedPages(doc)
+        let expectedCold = try h.app.workspace.content(doc).livePages.count - cached.count
+        let counting = CountingPersistence(h.persistence)
+        counting.onLoad = { XCTAssertEqual(h.app.workspace.cachedPages(doc), cached) }
+        h.app.workspace.persistence = counting
+        let model = CommentsListModel(app: h.app, session: h.session)
+        for _ in 0..<1000 where model.scanning { await Task.yield() }
+        XCTAssertFalse(model.scanning)
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1"])
+        XCTAssertEqual(h.app.workspace.cachedPages(doc), cached)
+        XCTAssertEqual(Set(counting.loads).count, expectedCold)
     }
 }

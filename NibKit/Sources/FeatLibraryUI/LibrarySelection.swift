@@ -31,3 +31,24 @@ extension LibrarySelection {
         refs.isEmpty ? String(localized: "Select items") : String(localized: "\(refs.count) selected")
     }
 }
+
+/// The baseline belongs to one physical gesture, never to the next pickup.
+struct LibrarySelectionDrag {
+    private(set) var active = false
+    var selection = LibrarySelection()
+    var marquee: CGRect?
+
+    mutating func begin(selection current: LibrarySelection, anchor: Int?) {
+        guard !active else { return }
+        active = true
+        selection = current
+        if let anchor { selection.beginRange(at: anchor) }
+        else { selection.beginMarquee() }
+    }
+
+    mutating func cancel() {
+        active = false
+        marquee = nil
+        selection = LibrarySelection()
+    }
+}

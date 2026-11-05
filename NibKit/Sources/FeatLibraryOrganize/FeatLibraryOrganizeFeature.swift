@@ -389,6 +389,95 @@ extension NibFolderGlyphView {
 
 /// The page render behind a thumbnail or a cover (paper-coloured placeholder while it loads; never a shimmer).
 /// A password-locked document shows a lock instead of its content.
+@MainActor
+final class PageThumbnailModel: ObservableObject {
+    struct Request: Hashable {
+        var doc: DocumentID
+        var page: PageID?
+        var pixels: Int
+        var locked: Bool
+    }
+
+    @Published private(set) var image: CGImage?
+    private let app: NibApp
+    private let bag = SubscriptionBag()
+    private var request: Request?
+    private var generation = UUID()
+    private var task: Task<Void, Never>?
+    private let debounceNanoseconds: UInt64
+    private var coverPage: PageID?
+    private var needsCoverResolution = true
+
+    init(app: NibApp, debounceNanoseconds: UInt64 = 300_000_000) {
+        self.app = app
+        self.debounceNanoseconds = debounceNanoseconds
+        bag.items.append(app.bus.observeCommits { [weak self] changes in
+            guard let self, let request = self.request, changes.documents.contains(request.doc) else { return }
+            if changes.headChanged(request.doc) { self.needsCoverResolution = true }
+            self.reload()
+        })
+        bag.items.append(app.events.subscribe { [weak self] event in
+            guard event.type == NibEventType.libraryChanged else { return }
+            Task { @MainActor in
+                guard let self, let request = self.request else { return }
+                // Quiet modification notifications accompany ink commits, which already tell us whether
+                // the head changed. Only a relevant catalogue refresh/change can replace a closed cover.
+                let refs = event.payload?["refs"]?.arrayValue?.compactMap(\.stringValue)
+                // Catalogue payloads cap refs at 500; a full list cannot rule this document out.
+                let relevant = refs == nil || refs?.isEmpty == true || (refs?.count ?? 0) >= 500 ||
+                    refs?.contains("doc:" + request.doc.raw) == true
+                if event.payload?["root"]?.boolValue == true ||
+                    (relevant && event.payload?["modified"]?.boolValue != true) {
+                    self.needsCoverResolution = true
+                }
+                self.reload()
+            }
+        })
+    }
+
+    func configure(_ request: Request) {
+        needsCoverResolution = true
+        coverPage = nil
+        self.request = request
+        reload(immediately: true)
+    }
+
+    func stop() {
+        generation = UUID()
+        task?.cancel()
+        task = nil
+        request = nil
+    }
+
+    private func reload(immediately: Bool = false) {
+        task?.cancel()
+        let token = UUID()
+        generation = token
+        guard let request, !request.locked, app.services.lock?.isLocked(request.doc) != true else {
+            image = nil
+            return
+        }
+        let delay = immediately ? 0 : debounceNanoseconds
+        task = Task { @MainActor [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard !Task.isCancelled, let self, self.generation == token else { return }
+            guard self.app.services.lock?.isLocked(request.doc) != true else { self.image = nil; return }
+            if request.page == nil, self.needsCoverResolution {
+                guard let head = try? self.app.workspace.peekContent(request.doc) else { self.image = nil; return }
+                self.coverPage = head.livePages.first?.id
+                self.needsCoverResolution = false
+            }
+            guard let target = request.page ?? self.coverPage, let renderer = self.app.services.renderer else {
+                self.image = nil
+                return
+            }
+            let rendered = await renderer.thumbnail(doc: request.doc, page: target, maxPixelSize: request.pixels)
+            guard !Task.isCancelled, self.generation == token else { return }
+            self.image = rendered
+        }
+    }
+}
+
 struct PageThumbnailImage: View {
     let app: NibApp
     let doc: DocumentID
@@ -397,7 +486,20 @@ struct PageThumbnailImage: View {
     let pixelSize: CGFloat
     let isLocked: Bool
     @Environment(\.displayScale) private var displayScale
-    @State private var image: CGImage? = nil
+    @StateObject private var model: PageThumbnailModel
+
+    init(app: NibApp, doc: DocumentID, page: PageID?, pixelSize: CGFloat, isLocked: Bool) {
+        self.app = app
+        self.doc = doc
+        self.page = page
+        self.pixelSize = pixelSize
+        self.isLocked = isLocked
+        _model = StateObject(wrappedValue: PageThumbnailModel(app: app))
+    }
+
+    private var request: PageThumbnailModel.Request {
+        .init(doc: doc, page: page, pixels: Int(pixelSize * displayScale), locked: isLocked)
+    }
 
     var body: some View {
         ZStack {
@@ -406,21 +508,16 @@ struct PageThumbnailImage: View {
                 Image(nib: .lock)
                     .font(NibFont.glyph(.bar))
                     .foregroundStyle(NibColor.labelTertiary)
-            } else if let image {
+            } else if let image = model.image {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .scaledToFill()
                     .transition(.opacity)
             }
         }
-        .animation(NibMotion.fade, value: image != nil)
-        .task(id: "\(doc.raw)/\(page?.raw ?? "")/\(isLocked)") {
-            guard !isLocked else {
-                image = nil
-                return
-            }
-            image = await load()
-        }
+        .animation(NibMotion.fade, value: model.image != nil)
+        .task(id: request) { model.configure(request) }
+        .onDisappear { model.stop() }
         .accessibilityHidden(true)
     }
 
@@ -429,11 +526,4 @@ struct PageThumbnailImage: View {
         app.services.lock?.isLocked(doc) ?? catalogued
     }
 
-    private func load() async -> CGImage? {
-        guard let renderer = app.services.renderer else { return nil }
-        var target = page
-        if target == nil, let head = try? app.workspace.peekContent(doc) { target = head.livePages.first?.id }
-        guard let target else { return nil }
-        return await renderer.thumbnail(doc: doc, page: target, maxPixelSize: Int(pixelSize * displayScale))
-    }
 }

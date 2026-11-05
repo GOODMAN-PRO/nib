@@ -142,6 +142,11 @@ final class PresentationViewModel: ObservableObject {
     static let maxPixels: Double = 4096
 
     @Published private(set) var display: PresentationDisplay = .idle
+    /// The failed base render, including its page/version. Detail failures can keep the valid base image.
+    @Published private(set) var renderFailure: RenderedImage.Key? {
+        didSet { if renderFailure != oldValue { onFailureChange?() } }
+    }
+    var onFailureChange: (() -> Void)?
     let laser = LaserModel()
     let source: PresentationPageSource
     var mode: ExternalDisplayMode
@@ -214,6 +219,12 @@ final class PresentationViewModel: ObservableObject {
         laser.clear()
     }
 
+    func retry() async {
+        base = nil
+        detail = nil
+        await update()
+    }
+
     /// Updates run one at a time, so a render in flight is never started twice; changes meanwhile set `dirty`.
     private func drain(detailDelay: Double) async {
         guard !draining else { return }
@@ -229,10 +240,12 @@ final class PresentationViewModel: ObservableObject {
         detailTask?.cancel()
         detailTask = nil
         if blank {
+            renderFailure = nil
             show(.blank)
             return
         }
         if mode == .mirror {
+            renderFailure = nil
             lastFrame = nil
             laser.clear()
             // Entering Mirror shows the window at once; after that only the budgeted ticks snapshot it, so scrolling
@@ -245,11 +258,13 @@ final class PresentationViewModel: ObservableObject {
         }
         stopMirroring()
         guard let page = source.current, !page.bounds.isEmpty else {
+            renderFailure = nil
             show(.idle)
             return
         }
         let key = RenderedImage.Key(doc: page.doc, page: page.page, version: page.version, hiddenLayers: page.hiddenLayers,
                                     region: page.bounds, scale: fitScale(for: page.bounds))
+        if renderFailure != key { renderFailure = nil }
         if base?.key != key {
             let image = await render(key)
             if let image = image {
@@ -264,6 +279,12 @@ final class PresentationViewModel: ObservableObject {
                 guard !blank, mode != .mirror, let now = source.current, now.doc == page.doc, now.page == page.page else {
                     return
                 }
+            }
+            // An obsolete failure must not describe a newer page/version, even on the same document page.
+            if !blank, mode != .mirror, let now = source.current,
+               now.doc == key.doc, now.page == key.page, now.version == key.version,
+               now.hiddenLayers == key.hiddenLayers {
+                renderFailure = image == nil ? key : nil
             }
         }
         guard let base = base else {

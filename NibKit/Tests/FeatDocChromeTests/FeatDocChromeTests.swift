@@ -8,6 +8,81 @@ import NibTesting
 
 @MainActor
 final class FeatDocChromeTests: XCTestCase {
+    func testLongStatusKeepsEssentialNavigationVisibleAndHittableAt393Points() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        let name = String(repeating: "W", count: 48)
+        var status = ToolbarItemDescriptor(id: "bridge", title: name, icon: "circle",
+                                           group: .navLeading, order: 40, owner: "test")
+        status.navSlot = .afterTitle
+        status.compactStatus = { _ in
+            AnyView(Button {} label: {
+                HStack(spacing: 6) { Circle().frame(width: 6, height: 6); Text(name) }
+            }.accessibilityLabel("MCP bridge " + name))
+        }
+        h.app.ui.toolbar.register(status)
+        let input = NavBarModel.Input(
+            doc: Fixtures.docID, kind: .notebook, page: Fixtures.page1, readOnly: false, bookmarked: false, tool: "pen",
+            hasSidebar: false, sidebarVisible: false, assistantPanel: PanelIDs.assistant, assistantOpen: false,
+            registered: [status], commandExists: { _ in true }, hasMenu: { _ in true })
+        let items = NavBarModel.split(NavBarModel.build(input), compact: true)
+        var frames: [String: CGRect] = [:]
+        let bar = NavBarView(chrome: chrome, items: items, title: "Physics", kind: .notebook,
+                            subtitle: "Page 1 of 3", readOnly: false, titleHasMenu: true, compact: true,
+                            sidebarMode: .sidebar, openMenu: .constant(nil), onControlFrames: { frames = $0 })
+        let host = UIHostingController(rootView: NibDropletContainer {
+            bar.frame(width: 361, height: 44).position(x: 196.5, y: 80)
+        }.environment(\.dynamicTypeSize, .large))
+        host.safeAreaRegions = []
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.frame = window.bounds
+        let ids = [NavBarModel.library, NavBarModel.undo, NavBarModel.more]
+        try await waitUntil {
+            host.view.layoutIfNeeded()
+            return ids.allSatisfy { frames[$0]?.isEmpty == false }
+        }
+        for id in ids {
+            let frame = try XCTUnwrap(frames[id], id)
+            XCTAssertTrue(window.bounds.contains(frame), "\(id) is wholly visible: \(frame)")
+            XCTAssertGreaterThanOrEqual(frame.width, 44)
+            XCTAssertGreaterThanOrEqual(frame.height, 44)
+            let hit = try XCTUnwrap(window.hitTest(CGPoint(x: frame.midX, y: frame.midY), with: nil), id)
+            XCTAssertTrue(hit === host.view || hit.isDescendant(of: host.view), "\(id) reaches the hosted control")
+            XCTAssertTrue((items.leading + items.trailing).first { $0.id == id }?.isEnabled == true)
+        }
+    }
+
+    func testTranscriptSidebarUsesProductionPanelFrameWithoutResizingCanvas() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let chrome = try makeWindow(h)
+        h.app.ui.panels.register(PanelDescriptor(id: "transcription", title: "Transcript", icon: "text.alignleft",
+            placement: .sidebarTab, order: 0, owner: "test", makeView: { _ in AnyView(Text("Transcript")) }))
+        chrome.state.open("transcription", at: .left)
+        let geometry = ChromeGeometry()
+        geometry.update(size: CGSize(width: 1194, height: 834), safeArea: .zero)
+        let root = ChromeRootView(chrome: chrome, editor: UIViewController(), toolbar: nil,
+            inking: ChromeInkingMirror(session: h.session), backdrop: ChromeBackdrop(),
+            overlays: ChromeOverlayModel(chrome: chrome, kind: .notebook), floating: NibFloatingHost(),
+            live: ChromeLiveState(chrome: chrome), geometry: geometry, model: ChromeDocumentModel(chrome: chrome))
+        let before = root.currentLayout
+        let original = try XCTUnwrap(before.left)
+        XCTAssertGreaterThan(original.maxY, 500)
+        XCTAssertEqual(root.panelFrame(original, id: "transcription"), original)
+        geometry.updateKeyboard(CGRect(x: 0, y: 500, width: 1194, height: 334))
+        let during = root.currentLayout
+        let panel = root.panelFrame(try XCTUnwrap(during.left), id: "transcription")
+        XCTAssertLessThanOrEqual(panel.maxY, 484)
+        XCTAssertGreaterThan(panel.height, 0)
+        XCTAssertEqual(panel.minY, original.minY)
+        XCTAssertEqual(during.editor, before.editor)
+        XCTAssertEqual(during.editorInsets, before.editorInsets)
+        geometry.updateKeyboard(nil)
+        XCTAssertEqual(root.panelFrame(original, id: "transcription"), original)
+    }
+
     func testModalBlocksAllUnderlyingShellKeys() {
         let delete = KeyCommandDescriptor(id: "delete", title: "Delete", shortcut: KeyShortcut("delete", []),
                                           command: "keyboard.delete", scope: .canvas, owner: "tests")

@@ -66,16 +66,32 @@ struct A11yDescribePage: NibCommand {
                                           language: content.meta.language, ctx: ctx)
         let links = pdfLinks(record: record, doc: doc, ctx: ctx)
         try Task.checkCancellation()
-        // Recognition can suspend while a commit lands. Never publish that obsolete snapshot.
-        guard try ctx.workspace.content(doc) == content,
-              try ctx.workspace.items(doc, page: page).map({ "\($0.id):\($0.rev)" }) == snapshot.revisions,
-              hiddenLayers(for: doc, ctx: ctx) == hidden else {
-            throw NibError(.invalidParams, "page changed during recognition", hint: "restart with no cursor")
-        }
         let input = PageDescriber.Input(doc: doc, page: page, items: items, blocks: recognition.blocks,
                                         pdfLinks: links, hiddenLayers: hidden, customTypes: customTitles,
                                         availableCommands: available)
-        let entries = PageDescriber.entries(input)
+        let work = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let entries = PageDescriber.entries(input)
+            try Task.checkCancellation()
+            return entries
+        }
+        let entries = try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            work.cancel()
+        }
+        try Task.checkCancellation()
+        // Both recognition and description suspend. Never publish a stale or newly locked snapshot.
+        if ctx.services.lock?.isLocked(doc) == true {
+            throw NibError(.locked, "the document is locked", hint: "unlock the document, then describe the page again")
+        }
+        guard try ctx.workspace.content(doc) == content,
+              try ctx.workspace.items(doc, page: page).map({ "\($0.id):\($0.rev)" }) == snapshot.revisions,
+              hiddenLayers(for: doc, ctx: ctx) == hidden,
+              Set(PageDescriber.commands.filter { ctx.app?.commands.entry($0) != nil }) == available,
+              ctx.content.customItemTypes.all.map({ "\($0.id):\($0.title):\($0.textPath ?? "")" }).sorted() == snapshot.customTypes else {
+            throw NibError(.invalidParams, String(localized: "Page changed during description."), hint: "restart with no cursor")
+        }
         let live = content.livePages
         let index = live.firstIndex { $0.id == page }.map { $0 + 1 }
         let title = PageDescriber.title(record: record, index: index, count: live.count)
@@ -354,6 +370,16 @@ enum PageDescriber {
         let pageRef = NodeRef.page(doc, page).description
         let hiddenTape = input.items.filter { $0.stroke?.style.tool == .tape && $0.stroke?.tapeRevealed == false }
 
+        let tapeIndex = RectIndex(hiddenTape.map { $0.bounds.insetBy(-2) })
+        func coveringTape(_ rect: Rect) -> [Item] {
+            let point = Rect(x: rect.midX, y: rect.midY, width: 0, height: 0)
+            return tapeIndex.candidates(point).sorted().compactMap { index -> Item? in
+                let tape = hiddenTape[index]
+                return tape.bounds.insetBy(-2).contains(rect.center) ? tape : nil
+            }
+        }
+        func isCovered(_ rect: Rect) -> Bool { !coveringTape(rect).isEmpty }
+
         var entries: [PageEntry] = []
         var covered = Set<ElementID>()
 
@@ -394,17 +420,22 @@ enum PageDescriber {
                                  layer: group.first?.layer, input: input, pageRef: pageRef))
         }
         let highlights = input.items.filter { $0.stroke?.style.tool == .highlighter }
+        // Freeze and index only text-bearing candidates; previously each highlight rescanned all earlier
+        // highlights and every stroke, even on a page with no text at all.
+        let handwriting = entries.filter { $0.kind == .handwriting }
+        let typedItems = input.items.filter { $0.kind == .text }
+        let writingIndex = RectIndex(handwriting.map(\.bbox))
+        let typedIndex = RectIndex(typedItems.map(\.bounds))
         for group in clusters(highlights) {
             let area = bounds(group)
-            let written = entries.filter { e in
-                e.kind == .handwriting && overlaps(e.bbox, area)
-                    && !hiddenTape.contains { $0.bounds.insetBy(-2).contains(e.bbox.center) }
-            }.compactMap { $0.text }
-            let typed = input.items.filter { item in
-                item.kind == .text && overlaps(item.bounds, area)
-                    && !hiddenTape.contains { $0.bounds.insetBy(-2).contains(item.bounds.center) }
+            let written = writingIndex.candidates(area).sorted().compactMap { index -> String? in
+                let e = handwriting[index]
+                return overlaps(e.bbox, area) && !isCovered(e.bbox) ? e.text : nil
             }
-                .compactMap { $0.text?.text.plainText }
+            let typed = typedIndex.candidates(area).sorted().compactMap { index -> String? in
+                let item = typedItems[index]
+                return overlaps(item.bounds, area) && !isCovered(item.bounds) ? item.text?.text.plainText : nil
+            }
             let text = clean((written + typed).joined(separator: " "))
             entries.append(entry(kind: .highlight, text: text.isEmpty ? nil : text, refs: group.map { ref($0.id) },
                                  bbox: area, layer: group.first?.layer, input: input, pageRef: pageRef))
@@ -482,7 +513,7 @@ enum PageDescriber {
         // Hidden tape withholds what it covers.
         if !hiddenTape.isEmpty {
             for i in entries.indices where entries[i].kind != .tape {
-                let tapes = hiddenTape.filter { $0.bounds.insetBy(-2).contains(entries[i].bbox.center) }
+                let tapes = coveringTape(entries[i].bbox)
                 guard !tapes.isEmpty else { continue }
                 entries[i].coveredByTape = true
                 entries[i].text = nil
@@ -634,35 +665,104 @@ enum PageDescriber {
         return items.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
     }
 
-    /// Groups strokes whose bounds come within `clusterGap` of each other (transitively), in first-seen order.
+    /// Grid candidates are a superset of intersections. Very large/nonfinite bounds use a fallback set,
+    /// keeping memory bounded without dropping legacy geometry or changing the exact rectangle predicate.
+    struct RectIndex {
+        private struct Cell: Hashable { var x: Int; var y: Int }
+        private var buckets: [Cell: Set<Int>] = [:]
+        private var membership: [Int: [Cell]] = [:]
+        private var broad: Set<Int> = []
+        private var ids: Set<Int> = []
+
+        init(_ rects: [Rect] = []) {
+            for (id, rect) in rects.enumerated() { insert(id, rect) }
+        }
+
+        private func cells(_ rect: Rect) -> [Cell]? {
+            let coordinates = [rect.minX, rect.maxX, rect.minY, rect.maxY]
+            guard coordinates.allSatisfy({ $0.isFinite && abs($0) < 1e12 }),
+                  rect.minX <= rect.maxX, rect.minY <= rect.maxY else { return nil }
+            let x0 = Int(floor(rect.minX / 128)), x1 = Int(floor(rect.maxX / 128))
+            let y0 = Int(floor(rect.minY / 128)), y1 = Int(floor(rect.maxY / 128))
+            guard x1 - x0 < 256, y1 - y0 < 256,
+                  (x1 - x0 + 1) * (y1 - y0 + 1) <= 256 else { return nil }
+            return (x0...x1).flatMap { x in (y0...y1).map { Cell(x: x, y: $0) } }
+        }
+
+        mutating func insert(_ id: Int, _ rect: Rect) {
+            remove(id)
+            ids.insert(id)
+            guard let cells = cells(rect) else { broad.insert(id); return }
+            membership[id] = cells
+            for cell in cells { buckets[cell, default: []].insert(id) }
+        }
+
+        mutating func remove(_ id: Int) {
+            for cell in membership.removeValue(forKey: id) ?? [] {
+                buckets[cell]?.remove(id)
+                if buckets[cell]?.isEmpty == true { buckets[cell] = nil }
+            }
+            broad.remove(id)
+            ids.remove(id)
+        }
+
+        func candidates(_ rect: Rect) -> Set<Int> {
+            guard let cells = cells(rect) else { return ids }
+            var result = broad
+            for cell in cells { result.formUnion(buckets[cell] ?? []) }
+            return result
+        }
+    }
+
+    /// Preserve the original last-matching-group and growing bounding-box merge order.
     static func clusters(_ items: [Item]) -> [[Item]] {
+        var comparisons = 0
+        return clusters(items, comparisons: &comparisons)
+    }
+
+    static func clusters(_ items: [Item], comparisons: inout Int) -> [[Item]] {
         var groups: [(rect: Rect, items: [Item])] = []
+        var index = RectIndex()
         for item in items.sorted(by: { ($0.bounds.minY, $0.bounds.minX) < ($1.bounds.minY, $1.bounds.minX) }) {
             let area = item.bounds.insetBy(-clusterGap / 2)
-            if let i = groups.lastIndex(where: { $0.rect.insetBy(-clusterGap / 2).intersects(area) }) {
+            let match = index.candidates(area).sorted(by: >).first { i in
+                comparisons += 1
+                return groups[i].rect.insetBy(-clusterGap / 2).intersects(area)
+            }
+            let id: Int
+            if let i = match {
+                id = i
                 groups[i].rect = groups[i].rect.union(item.bounds)
                 groups[i].items.append(item)
             } else {
+                id = groups.count
                 groups.append((item.bounds, [item]))
             }
+            index.insert(id, groups[id].rect.insetBy(-clusterGap / 2))
         }
-        // Merge groups that grew into each other.
+        // Stable IDs keep exactly the old lexicographic pair order even after a group is removed.
+        var removed = Set<Int>()
         var merged = true
-        while merged && groups.count > 1 {
+        while merged && groups.count - removed.count > 1 {
             merged = false
-            outer: for i in groups.indices {
-                for j in groups.indices where j > i {
-                    if groups[i].rect.insetBy(-clusterGap / 2).intersects(groups[j].rect.insetBy(-clusterGap / 2)) {
+            outer: for i in groups.indices where !removed.contains(i) {
+                let area = groups[i].rect.insetBy(-clusterGap / 2)
+                for j in index.candidates(area).filter({ $0 > i }).sorted() {
+                    comparisons += 1
+                    if area.intersects(groups[j].rect.insetBy(-clusterGap / 2)) {
                         groups[i].rect = groups[i].rect.union(groups[j].rect)
                         groups[i].items += groups[j].items
-                        groups.remove(at: j)
+                        groups[j].items = []
+                        removed.insert(j)
+                        index.remove(j)
+                        index.insert(i, groups[i].rect.insetBy(-clusterGap / 2))
                         merged = true
                         break outer
                     }
                 }
             }
         }
-        return groups.map { $0.items }
+        return groups.enumerated().filter { !removed.contains($0.offset) }.map { $0.element.items }
     }
 
     /// Whether a highlight and some text are mostly on top of each other (either way round: a highlight over one line

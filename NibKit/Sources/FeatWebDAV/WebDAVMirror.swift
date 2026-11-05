@@ -552,9 +552,13 @@ struct RemoteListingState: Codable, Equatable {
 /// per server, user, folder and library root, so changing any of them starts from a clean three-way merge.
 final class MirrorStateStore {
     let url: URL
+    private let write: (Data, URL) throws -> Void
 
-    init(directory: URL, key: String) {
+    init(directory: URL, key: String, write: @escaping (Data, URL) throws -> Void = { data, url in
+        try data.write(to: url, options: .atomic)
+    }) {
         url = directory.appendingPathComponent("state-\(key).json")
+        self.write = write
     }
 
     static var defaultDirectory: URL {
@@ -606,7 +610,7 @@ final class MirrorStateStore {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(state).write(to: url, options: .atomic)
+        try write(encoder.encode(state), url)
     }
 }
 
@@ -651,6 +655,7 @@ final class WebDAVMirrorRun {
     let progress = MirrorProgress()
     /// The error that stopped the run early, if any (set when `run()` returns).
     private(set) var failure: WebDAVError?
+    private var needsLibraryFolder = false
     var concurrency = 3
     /// Saves the state after this many finished actions, so an interrupted run loses little.
     var checkpointEvery = 50
@@ -751,8 +756,10 @@ final class WebDAVMirrorRun {
             let touched = serverPaths(of: plan, scan: scan, tree: tree)
             if !touched.isEmpty {
                 state.remote?.markDirty(above: touched)
-                try? store.save(state)
             }
+            // Persist dirty markers before either side is changed. A failed checkpoint aborts the pass.
+            if !plan.actions.isEmpty || needsLibraryFolder { try store.save(state) }
+            if needsLibraryFolder { try await client.ensureCollections(client.configuration.folderComponents) }
             progress.begin(plan.actions.count)
             let copies = plan.actions.filter { [.resolve, .download, .upload, .forget].contains($0.kind) }
             let deletions = plan.actions.filter { [.deleteLocal, .deleteRemote].contains($0.kind) }
@@ -786,7 +793,7 @@ final class WebDAVMirrorRun {
                         if case .changedDuringSync = error {} else { report.errors.append(error.message) }
                     }
                     applied += 1
-                    if applied % max(1, self.checkpointEvery) == 0 { try? self.store.save(state) }
+                    if applied % max(1, self.checkpointEvery) == 0 { try self.store.save(state) }
                 }
             }
             await pruneRemoteFolders(deleted: deletedRemote, remaining: remainingRemote, collections: tree.collections)
@@ -803,7 +810,14 @@ final class WebDAVMirrorRun {
         LocalFiles.pruneEmptyFolders(root: root, deleted: deletedLocal)
         report.finished = Date().timeIntervalSince1970
         state.lastReport = report
-        try? store.save(state)
+        do {
+            try store.save(state)
+        } catch {
+            let failure = WebDAVError.from(error, host: client.host)
+            self.failure = failure
+            report.failure = failure.reason
+            report.errors.append(failure.message)
+        }
         return report
     }
 
@@ -865,17 +879,18 @@ final class WebDAVMirrorRun {
         return dependencies
     }
 
-    /// Lists the server (creating the library folder when it is missing) and stores the new snapshot in `state`.
+    /// Lists the server and stores the new snapshot in `state`. Folder creation waits for the durable checkpoint.
     /// Unchanged subtrees come from the last listing only on a server seen to propagate collection ETags, and only
     /// between full listings; every full listing checks that the server still behaves that way.
     func list(_ state: inout MirrorState) async throws -> RemoteTree {
+        needsLibraryFolder = false
         var listing = state.remote ?? RemoteListingState()
         let now = Date().timeIntervalSince1970
         let useCache = listing.propagates == true && !listing.collections.isEmpty
             && (listing.lastFullListing.map { now - $0 < fullListingInterval && now >= $0 } ?? false)
         guard let tree = try await client.listLibrary(isExcluded: isExcludedTopLevel,
                                                       cache: useCache ? listing.collections : nil) else {
-            try await client.ensureCollections(client.configuration.folderComponents)
+            needsLibraryFolder = true
             listing.collections = [:]
             state.remote = listing
             return RemoteTree()
@@ -947,10 +962,10 @@ final class WebDAVMirrorRun {
     /// order. A fatal error (authentication, network, cancellation) stops the phase and is rethrown; what the
     /// failed action already did (a conflict copy installed before the network dropped) is still applied.
     func execute(_ actions: [MirrorAction], scan: LocalScan, tree: RemoteTree, scratch: URL,
-                 apply: (Outcome) -> Void) async throws {
+                 apply: (Outcome) throws -> Void) async throws {
         guard !actions.isEmpty else { return }
         var fatal: WebDAVError?
-        await withTaskGroup(of: Outcome.self) { group in
+        try await withThrowingTaskGroup(of: Outcome.self) { group in
             var next = 0
             func startNext() {
                 guard next < actions.count else { return }
@@ -965,7 +980,7 @@ final class WebDAVMirrorRun {
                 }
             }
             for _ in 0..<min(max(1, concurrency), actions.count) { startNext() }
-            while let outcome = await group.next() {
+            while let outcome = try await group.next() {
                 progress.step()
                 if let e = outcome.error, e.isFatal {
                     if fatal == nil { fatal = e }
@@ -973,10 +988,10 @@ final class WebDAVMirrorRun {
                     var partial = outcome
                     partial.counter = nil
                     partial.error = nil
-                    apply(partial)
+                    try apply(partial)
                     continue
                 }
-                apply(outcome)
+                try apply(outcome)
                 if fatal == nil && !isCancelled { startNext() }
             }
         }

@@ -442,7 +442,7 @@ struct PanelOpen: NibCommand {
         var placement: String
     }
     static let descriptor = CommandDescriptor(
-        id: "panel.open", title: "Open Panel",
+        id: "panel.open", title: String(localized: "Open Panel"),
         summary: "Open a registered panel by id where the placement settings say; other keys and params reach the panel; edge docks a floating panel. With no document open the library shows it.",
         params: .obj(["id": .str("panel id, e.g. 'chrome.editingSettings', PanelIDs.assistant or a plugin panel id"),
                       "edge": .str("floating panels only: the side edge it rests on",
@@ -522,7 +522,7 @@ struct PanelClose: NibCommand {
         var closed: Bool
     }
     static let descriptor = CommandDescriptor(
-        id: "panel.close", title: "Close Panel",
+        id: "panel.close", title: String(localized: "Close Panel"),
         summary: "Close an open panel by id (closing a sidebar's tab hides that sidebar); closed=false if it was not open. With no document open the library closes it.",
         params: .obj(["id": .str("panel id")], required: ["id"]),
         examples: [["id": "chrome.editingSettings"]], effect: .session, target: .app)
@@ -555,7 +555,7 @@ struct SidebarToggle: NibCommand {
         var panel: String?
     }
     static let descriptor = CommandDescriptor(
-        id: "sidebar.toggle", title: "Show or Hide Sidebar",
+        id: "sidebar.toggle", title: String(localized: "Show or Hide Sidebar"),
         summary: "Show or hide the document sidebar (Pages, Outline… tabs); mode 'sidebar' docks it beside the page, 'window' fills the window.",
         params: .obj(["mode": .str("sidebar (a column beside the page) or window (full-window thumbnails)",
                                    choices: SidebarMode.allCases.map { $0.rawValue })]),
@@ -602,7 +602,7 @@ struct DocSetScrollDirection: NibCommand {
         var direction: String
     }
     static let descriptor = CommandDescriptor(
-        id: "doc.setScrollDirection", title: "Set Scrolling Direction",
+        id: "doc.setScrollDirection", title: String(localized: "Set Scrolling Direction"),
         summary: "Make a notebook's pages scroll vertically (continuous) or horizontally (page by page). Undoable.",
         params: .obj(["doc": .ref,
                       "direction": .str("page scrolling", choices: ScrollDirection.allCases.map { $0.rawValue })],
@@ -654,5 +654,109 @@ public enum ShellChromePolicy {
     public static func makeTabBar(openDocuments: [DocumentID], make: () -> UIView?) -> UIView? {
         guard !openDocuments.isEmpty else { return nil }
         return make()
+    }
+}
+
+/// The shell's notification route and fallback presenter live together so package tests exercise the
+/// same active-window, accessibility and expiry decisions as the app. The document host owns its toast.
+@MainActor
+public final class ShellToastPresenter {
+    public typealias Schedule = @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> (() -> Void)
+
+    private let center: NotificationCenter
+    private var observer: NSObjectProtocol?
+    private let isActive: @MainActor () -> Bool
+    private let present: @MainActor (String) -> Bool
+    private let container: @MainActor () -> UIView?
+    private let announce: @MainActor (String) -> Void
+    private let voiceOverRunning: @MainActor () -> Bool
+    private let dismiss: @MainActor (UILabel) -> Void
+    private let schedule: Schedule
+    private var cancelExpiry: (() -> Void)?
+    private var label: UILabel?
+    private var generation = 0
+
+    public init(center: NotificationCenter = .default, isActive: @escaping @MainActor () -> Bool,
+                present: @escaping @MainActor (String) -> Bool, container: @escaping @MainActor () -> UIView?,
+                onFailure: (@MainActor (String) -> Void)? = nil,
+                announce: @escaping @MainActor (String) -> Void = { UIAccessibility.post(notification: .announcement, argument: $0) },
+                voiceOverRunning: @escaping @MainActor () -> Bool = { UIAccessibility.isVoiceOverRunning },
+                dismiss: @escaping @MainActor (UILabel) -> Void = { label in
+                    NibMotion.animateUIKit(NibMotion.retract, animations: { label.alpha = 0 },
+                                           completion: { _ in label.removeFromSuperview() })
+                },
+                schedule: Schedule? = nil) {
+        self.center = center
+        self.isActive = isActive
+        self.present = present
+        self.container = container
+        self.announce = announce
+        self.voiceOverRunning = voiceOverRunning
+        self.dismiss = dismiss
+        self.schedule = schedule ?? { interval, action in
+            let task = Task { @MainActor in
+                do { try await Task.sleep(for: .seconds(interval)) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                action()
+            }
+            return { task.cancel() }
+        }
+        observer = center.addObserver(forName: .nibCommandFailed, object: nil, queue: .main) { [weak self] note in
+            let message = (note.userInfo?["error"] as? NibError)?.message ?? String(localized: "Something went wrong")
+            Task { @MainActor [weak self] in
+                guard let self, self.isActive() else { return }
+                if let onFailure { onFailure(message) } else { self.show(message) }
+            }
+        }
+    }
+
+    deinit {
+        if let observer { center.removeObserver(observer) }
+        cancelExpiry?()
+    }
+
+    public func show(_ message: String) {
+        generation += 1
+        cancelExpiry?()
+        cancelExpiry = nil
+        label?.removeFromSuperview()
+        label = nil
+        if present(message) { return }
+        guard let view = container() else { return }
+        let label = UILabel()
+        self.label = label
+        label.accessibilityIdentifier = "nib.toast"
+        label.isAccessibilityElement = true
+        label.text = message
+        label.textColor = .white
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.8)
+        label.font = .preferredFont(forTextStyle: .footnote)
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.layer.cornerRadius = NibRadius.field
+        label.clipsToBounds = true
+        let width = min(view.bounds.width - 32, 480)
+        let size = label.sizeThatFits(CGSize(width: width - 24, height: .greatestFiniteMagnitude))
+        label.frame = CGRect(x: (view.bounds.width - size.width - 24) / 2,
+                             y: view.bounds.height - view.safeAreaInsets.bottom - size.height - 48,
+                             width: size.width + 24, height: size.height + 16)
+        view.addSubview(label)
+        announce(message)
+        expire(afterTicks: 10, generation: generation)
+    }
+
+    private func expire(afterTicks remaining: Int, generation mine: Int) {
+        cancelExpiry = schedule(0.25) { [weak self] in
+            guard let self, self.generation == mine else { return }
+            let next = remaining - (self.voiceOverRunning() ? 0 : 1)
+            if next > 0 {
+                self.expire(afterTicks: next, generation: mine)
+            } else {
+                if let label = self.label { self.dismiss(label) }
+                self.label = nil
+                self.cancelExpiry = nil
+            }
+        }
     }
 }

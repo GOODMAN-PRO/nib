@@ -531,7 +531,12 @@ final class PagesPanelModel: ObservableObject {
         guard SidebarMenuTarget.canEdit(app: app, session: session, doc: target) else { return }
         var loaded: [Data] = []
         for provider in providers {
-            if let d = await PageDragProvider.loadPayload(provider) { loaded.append(d) }
+            guard provider.hasItemConformingToTypeIdentifier(PagesPayload.typeIdentifier) else { continue }
+            guard let d = await PageDragProvider.loadPayload(provider) else {
+                fail(SidebarIDs.pagePaste, NibError(.unavailable, String(localized: "Some dropped pages could not be read. Nothing was imported. Drag them again.")))
+                return
+            }
+            loaded.append(d)
         }
         guard !loaded.isEmpty else {
             fail(SidebarIDs.pagePaste, NibError(.unavailable, "the dropped pages could not be read", hint: "drag them again"))
@@ -563,7 +568,13 @@ final class PagesPanelModel: ObservableObject {
     /// PDF and image files dropped from Files or another app become pages here (`import.files`, D-053).
     func importFiles(_ providers: [NSItemProvider], into target: DocumentID, at place: PageDropTarget) async {
         guard SidebarMenuTarget.canEdit(app: app, session: session, doc: target) else { return }
-        let urls = await DroppedFiles.load(providers)
+        let urls: [URL]
+        do {
+            urls = try await DroppedFiles.load(providers)
+        } catch {
+            fail(CommandIDs.importFiles, error)
+            return
+        }
         guard !urls.isEmpty else {
             fail(CommandIDs.importFiles, NibError(.unavailable, "the dropped files could not be read", hint: "drag them again"))
             return

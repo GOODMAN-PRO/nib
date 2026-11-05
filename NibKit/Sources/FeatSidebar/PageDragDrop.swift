@@ -394,11 +394,15 @@ enum DroppedFiles {
         return types.contains { type.conforms(to: $0) }
     }
 
-    static func load(_ providers: [NSItemProvider]) async -> [URL] {
+    static func load(_ providers: [NSItemProvider]) async throws -> [URL] {
         var urls: [URL] = []
         for provider in providers {
             guard let type = provider.registeredTypeIdentifiers.first(where: { isImportable($0) }) else { continue }
-            if let url = await copy(provider, type: type) { urls.append(url) }
+            guard let url = await copy(provider, type: type) else {
+                cleanUp(urls)
+                throw NibError(.unavailable, String(localized: "Some dropped files could not be read. Nothing was imported. Drag them again."))
+            }
+            urls.append(url)
         }
         return urls
     }
@@ -418,6 +422,7 @@ enum DroppedFiles {
                     try fm.copyItem(at: url, to: destination)
                     continuation.resume(returning: destination)
                 } catch {
+                    try? fm.removeItem(at: folder)
                     continuation.resume(returning: nil)
                 }
             }

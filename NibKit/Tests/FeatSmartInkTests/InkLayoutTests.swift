@@ -109,6 +109,25 @@ final class InkLayoutTests: XCTestCase {
         }
     }
 
+    func testRTLReflowAtHalfWidthGivesFiveLinesInOrder() {
+        var s = Synth.paragraph()
+        s.strokes = s.strokes.map { (id: $0.id, points: $0.points.map { Point(300 - $0.x, $0.y) }) }
+        let layout = InkLayout.analyze(s.glyphs, rightToLeft: true)
+        XCTAssertEqual(layout.lines.map { $0.startsParagraph }, [true, false, false])
+        XCTAssertEqual(layout.words.map { Set($0.ids) }, s.words.map { Set($0) })
+        let half = layout.box.width / 2
+        let result = layout.reflow(width: half)
+        XCTAssertEqual(result.lineCount, 5)
+        let again = InkLayout.analyze(s.moved(result.moves), rightToLeft: true)
+        XCTAssertEqual(again.words.map { Set($0.ids) }, s.words.map { Set($0) }, "RTL reading order changed")
+        for line in again.lines {
+            XCTAssertEqual(line.box.maxX, layout.box.minX + half, accuracy: 0.01)
+            XCTAssertLessThanOrEqual(line.box.width, half + 0.5)
+        }
+        for word in s.words { XCTAssertEqual(Set(word.map { result.moves[$0] ?? .zero }).count, 1) }
+        XCTAssertLessThan(layout.insertionPoint(after: 0, word: 0).x, layout.lines[0].words[0].box.minX)
+    }
+
     func testReflowWiderJoinsLinesAndNeverNarrowerThanAWord() {
         let s = Synth.paragraph()
         let layout = InkLayout.analyze(s.glyphs)

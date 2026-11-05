@@ -8,6 +8,43 @@ import NibTesting
 /// Dispatch, destinations, naming, sniffing and the other pure pieces of import.
 @MainActor
 final class ImportDispatchTests: XCTestCase {
+    func testMixedDropImportsReadableFileAndReportsFailedProvider() async throws {
+        let h = Harness(features: [])
+        h.app.content.importers.register(ImageImporter.descriptor(owner: "test"))
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.importFiles, title: "Import",
+            summary: "Import dropped images into a known destination.", effect: .edit)) { params, ctx in
+            let urls = (params["urls"]?.arrayValue ?? []).compactMap { $0.stringValue.flatMap(URL.init(string:)) }
+            _ = try await ImageImporter.importImages(urls, target: ImportTarget(document: Fixtures.docID), ctx: ctx)
+            return .null
+        }
+        let file = try tempDir().appendingPathComponent("Readable.png")
+        try Fixtures.pngData.write(to: file)
+        let good = NSItemProvider()
+        good.suggestedName = "Readable.png"
+        good.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [], visibility: .all) { done in
+            done(file, false, nil)
+            return nil
+        }
+        let bad = NSItemProvider()
+        bad.suggestedName = "Missing.png"
+        bad.registerFileRepresentation(forTypeIdentifier: UTType.png.identifier, fileOptions: [], visibility: .all) { done in
+            done(nil, false, CocoaError(.fileReadNoPermission))
+            return nil
+        }
+        let reported = expectation(description: "failed provider reported")
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            let error = note.userInfo?["error"] as? NibError
+            XCTAssertTrue(error?.message.contains("Missing.png") == true)
+            XCTAssertTrue(error?.message.contains("try again") == true)
+            reported.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        let before = try h.app.workspace.content(Fixtures.docID).livePages.count
+        await ImportDropTarget.importDrop([good, bad], app: h.app, navigator: nil)
+        await fulfillment(of: [reported], timeout: 2)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).livePages.count, before + 1)
+    }
+
     // MARK: Helpers
 
     private func registries() -> ContentRegistries {

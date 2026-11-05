@@ -190,20 +190,33 @@ final class TranscriptStore {
 
 /// Ink timestamps are absolute, transcript timestamps are relative to the clip.
 enum TranscriptPageLink {
-    static func mostEditedPage(clip: AudioClip, segment: TranscriptSegment,
-                               pages: [(PageID, [Item])]) -> PageID? {
-        let lower = clip.start + segment.start
-        let upper = lower + segment.duration
+    struct Scan {
+        let lower: Double
+        let upper: Double
         var winner: PageID?
-        var count = 0
-        for (page, items) in pages {
-            let written = items.filter { item in
-                guard !item.deleted, let stroke = item.stroke, stroke.style.tool != .tape else { return false }
-                return stroke.t0 >= lower && stroke.t0 < upper
-            }.count
+        private(set) var count = 0
+
+        init(clip: AudioClip, segment: TranscriptSegment) {
+            lower = clip.start + segment.start
+            upper = lower + segment.duration
+            winner = clip.page
+        }
+
+        mutating func include(_ page: PageID, items: [Item]) {
+            let written = items.reduce(0) { count, item in
+                guard !item.deleted, let stroke = item.stroke, stroke.style.tool != .tape,
+                      stroke.t0 >= lower, stroke.t0 < upper else { return count }
+                return count + 1
+            }
             if written > count { count = written; winner = page }
         }
-        return winner ?? clip.page
+    }
+
+    static func mostEditedPage(clip: AudioClip, segment: TranscriptSegment,
+                               pages: [(PageID, [Item])]) -> PageID? {
+        var scan = Scan(clip: clip, segment: segment)
+        for (page, items) in pages { scan.include(page, items: items) }
+        return scan.winner
     }
 
     static func activeIndex(_ lines: [TranscriptSegment], at time: Double) -> Int? {

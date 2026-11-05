@@ -361,6 +361,15 @@ final class PackageMergeTests: XCTestCase {
         let pageCopy = pkg.appendingPathComponent("pages/\(Fixtures.page1.raw)/0000000a 2.nibpage")
         try PackageCodec.encodeItems([stroke]).write(to: pageCopy)
 
+        let ownURL = pkg.appendingPathComponent("pages/\(Fixtures.page1.raw)/0000000a.nibpage")
+        let ownBytes = try Data(contentsOf: ownURL)
+        try Data("temporarily unreadable".utf8).write(to: ownURL)
+        XCTAssertThrowsError(try store.remoteChanges(doc))
+        store.flush(doc)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: headCopy.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pageCopy.path))
+        try ownBytes.write(to: ownURL)
+        // Neither remote copy changed its stamp: the failed poll must not have consumed either change.
         let patch = try XCTUnwrap(store.remoteChanges(doc))
         XCTAssertEqual(patch.outline.map(\.id), ["COPYOUTLINE2"])
         XCTAssertEqual(patch.items[Fixtures.page1.raw]?.map(\.id), ["COPYSTROKE02"])

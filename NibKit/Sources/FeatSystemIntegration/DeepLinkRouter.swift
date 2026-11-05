@@ -771,12 +771,14 @@ struct BridgePairingSheet: View {
                     }
                 }
                 NibRow(String(localized: "Token"), subtitle: revealed ? pairing.token : pairing.maskedToken, icon: .key) {
-                    Button(revealed ? String(localized: "Hide") : String(localized: "Show")) { revealed.toggle() }
+                    Button { revealed.toggle() } label: {
+                        Text(revealed ? String(localized: "Hide") : String(localized: "Show"))
+                            .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                            .contentShape(Rectangle())
+                    }
                         .font(NibFont.body)
                         .foregroundStyle(NibColor.accent)
                         .buttonStyle(.plain)
-                        .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
-                        .contentShape(Rectangle())
                         .hoverEffect(.highlight)
                         .accessibilityLabel(revealed ? String(localized: "Hide token") : String(localized: "Show token"))
                 }
