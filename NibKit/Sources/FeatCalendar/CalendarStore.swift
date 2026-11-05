@@ -515,7 +515,7 @@ final class CalendarEventCache {
     // MARK: Private (call with the lock held)
 
     /// Drops events more than `horizon` from `now` and clips every synced range to the horizon, so coverage never
-    /// claims a span whose events were dropped (a later page of `calendar.events` then reads the calendar again).
+    /// claims a span whose events were dropped. Command paging keeps its own complete snapshot.
     private func prune(now: Date) {
         let oldest = now.addingTimeInterval(-Self.horizon), newest = now.addingTimeInterval(Self.horizon)
         byID = byID.filter { $0.value.end >= oldest && $0.value.start <= newest }
@@ -995,6 +995,7 @@ final class CalendarStore: ObservableObject {
 
     weak var app: NibApp?
     let cache: CalendarEventCache
+    let eventPages = CalendarEventPages()
 
     @Published private(set) var access: CalendarAccess = .notDetermined
     /// Today and the next six days, from the cache after every read that touches them.
@@ -1057,6 +1058,7 @@ final class CalendarStore: ObservableObject {
         }
         set {
             supersededReads.formUnion(activeReads.keys)
+            eventPages.clear()
             providerStorage = newValue
             access = newValue.access
         }
@@ -1258,6 +1260,8 @@ final class CalendarStore: ObservableObject {
         }
         try Task.checkCancellation()
         if lostAccess() { return [] }
+        // Accept a cache miss for any uncovered part of a superseded wide read: publishing
+        // it whole would overwrite the newer overlapping interval. Its caller keeps its own result.
         guard isCurrent() else { return events }
         // Only a published success supersedes older overlapping reads. A failed/cancelled
         // newer request must leave an older successful read free to refresh the cache.
@@ -1309,6 +1313,7 @@ final class CalendarStore: ObservableObject {
     /// Calendar access went away: forget every cached event (privacy) and redraw planner pages.
     private func forgetEvents() {
         accessGeneration += 1
+        eventPages.clear()
         supersededReads.formUnion(activeReads.keys)
         guard cache.latestSync != nil || !upcoming.isEmpty else { return }
         cache.clear()

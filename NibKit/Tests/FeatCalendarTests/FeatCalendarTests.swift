@@ -236,7 +236,95 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertGreaterThan(pages, 1)
         XCTAssertEqual(seen.count, 60)
         XCTAssertEqual(Set(seen).count, 60)
-        XCTAssertEqual(fake.reads, 1, "later pages come from the cache the first page filled")
+        XCTAssertEqual(fake.reads, 1, "later pages come from the first read's retained snapshot")
+    }
+
+    func testPagedCommandKeepsSupersededSnapshotAcrossInsertion() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: true)
+    }
+
+    func testPagedCommandKeepsSupersededSnapshotAcrossDeletion() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: false)
+    }
+
+    func testPagedCommandKeepsSnapshotWhenEventIsInsertedBetweenPages() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: true, publishBeforeFirstPage: false)
+    }
+
+    func testPagedCommandKeepsSnapshotWhenEventIsDeletedBetweenPages() async throws {
+        try await assertPagedCommandKeepsSupersededSnapshot(inserting: false, publishBeforeFirstPage: false)
+    }
+
+    private func assertPagedCommandKeepsSupersededSnapshot(inserting: Bool, publishBeforeFirstPage: Bool = true) async throws {
+        let start = Date().addingTimeInterval(3_600)
+        let oldEvents = (0..<3).map { event("Old \($0)", start.addingTimeInterval(Double($0) * 600)) }
+        let latest = inserting ? [event("Inserted", start.addingTimeInterval(-600))] + oldEvents : Array(oldEvents.dropFirst())
+        let (h, store, _) = harness([])
+        let started = expectation(description: "old calendar.events read blocked")
+        let provider = BlockingCalendarRead(old: oldEvents, latest: latest, started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let params: [String: JSONValue] = ["from": .string(CalendarDates.iso(window.start)),
+                                         "to": .string(CalendarDates.iso(window.end)), "limit": 1]
+        let old = Task { try await h.run("calendar.events", .object(params)) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        if publishBeforeFirstPage {
+            // The newer command publishes before the older command can return its first page.
+            _ = try await h.run("calendar.events", .object(params))
+            XCTAssertEqual(store.cache.events(overlapping: window.start, window.end).map(\.id), latest.map(\.id))
+        }
+        provider.release()
+        var result = try await old.value
+        var seen: [String] = []
+        for _ in 0..<oldEvents.count {
+            seen += (result["events"]?.arrayValue ?? []).compactMap { $0["id"]?.stringValue }
+            guard let cursor = result["cursor"]?.stringValue else { break }
+            // Also publish changes between pages, not just while the first read is suspended.
+            _ = try await store.fetch(from: window.start, to: window.end, principal: .user)
+            var next = params
+            next["cursor"] = .string(cursor)
+            result = try await h.run("calendar.events", .object(next))
+        }
+        XCTAssertEqual(seen, oldEvents.map(\.id), "no duplicates, omissions, or cursor-past-end after a refresh")
+        XCTAssertNil(result["cursor"]?.stringValue)
+    }
+
+    func testPagingSnapshotBoundsExpiryAndRangeValidation() throws {
+        let events = [EventJSON(event("Meeting", date(2026, 9, 30, 9)), note: nil)]
+        let from = date(2026, 9, 30), to = date(2026, 10, 1), now = date(2026, 9, 29)
+        let pages = CalendarEventPages(maxSnapshots: 1, lifetime: 10)
+        let first = try pages.retain(events, from: from, to: to, principal: .user, now: now)
+        let second = try pages.retain(events, from: from, to: to, principal: .user, now: now)
+        XCTAssertThrowsError(try pages.read(first + ":0", from: from, to: to, principal: .user, now: now))
+        XCTAssertEqual(try pages.read(second + ":0", from: from, to: to, principal: .user, now: now).events, events)
+        XCTAssertThrowsError(try pages.read(second + ":0", from: from.addingTimeInterval(1), to: to, principal: .user, now: now))
+        XCTAssertThrowsError(try pages.read(second + ":0", from: from, to: to, principal: .plugin("other"), now: now))
+        XCTAssertThrowsError(try pages.read(second + ":1", from: from, to: to, principal: .user, now: now))
+        XCTAssertThrowsError(try pages.read("1", from: from, to: to, principal: .user, now: now))
+        XCTAssertThrowsError(try pages.read(second + ":0", from: from, to: to, principal: .user, now: now.addingTimeInterval(10)))
+        let bytes = try JSONEncoder().encode(events).count
+        let budget = CalendarEventPages(maxBytes: bytes)
+        let evicted = try budget.retain(events, from: from, to: to, principal: .user)
+        _ = try budget.retain(events, from: from, to: to, principal: .user)
+        XCTAssertThrowsError(try budget.read(evicted + ":0", from: from, to: to, principal: .user))
+        XCTAssertThrowsError(try budget.retain(events + events, from: from, to: to, principal: .user))
+    }
+
+    func testPagingSnapshotIsForgottenWhenCalendarAccessIsLost() async throws {
+        let (h, store, _) = harness([event("A", date(2026, 9, 30, 9)), event("B", date(2026, 9, 30, 10))])
+        let first = try await h.run("calendar.events", ["from": "2026-09-30", "to": "2026-10-01", "limit": 1])
+        let cursor = try XCTUnwrap(first["cursor"]?.stringValue)
+        store.provider = FakeCalendarProvider(access: .denied, events: [])
+        let denied = await code {
+            _ = try await h.run("calendar.events", ["from": "2026-09-30", "to": "2026-10-01", "cursor": .string(cursor)])
+        }
+        XCTAssertEqual(denied, .unavailable)
+        store.provider = FakeCalendarProvider(access: .granted, events: [])
+        let expired = await code {
+            _ = try await h.run("calendar.events", ["from": "2026-09-30", "to": "2026-10-01", "cursor": .string(cursor)])
+        }
+        XCTAssertEqual(expired, .invalidParams)
     }
 
     // MARK: Event notes
@@ -1045,7 +1133,7 @@ final class FeatCalendarTests: XCTestCase {
         XCTAssertGreaterThan(pages, 1)
         XCTAssertEqual(seen.count, 60)
         XCTAssertEqual(Set(seen), Set(many.map { $0.id }), "every event exactly once, none skipped")
-        XCTAssertEqual(fake.reads, pages, "the cache no longer covers the range, so every page reads the calendar")
+        XCTAssertEqual(fake.reads, 1, "paging retains the complete read even when the shared cache trims its horizon")
     }
 
     func testCreateNoteForAnEventBeyondTheHorizon() async throws {
