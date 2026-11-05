@@ -50,7 +50,7 @@ enum NameLookupCanary {
         Exposure.self, JSONSchema.self, CommandDescriptor.self, NoResult.self, CommandRegistry.self,
         CommandIDs.self, ChangeSummary.self, Mutation.self, Changeset.self, DocumentPatch.self,
         DocumentPersistence.self, InMemoryPersistence.self, Workspace.self, DocTransaction.self, UndoEntry.self,
-        UndoHistory.self, NibEventType.self, NibEvent.self, EventSubscription.self, EventBus.self,
+        UndoHistory.self, NonUndoableHistoryPolicy.self, NibEventType.self, NibEvent.self, EventSubscription.self, EventBus.self,
         Invocation.self, CommandHookDescriptor.self, InvocationResult.self, CommandContext.self, CommandBus.self,
         ConfirmationPolicy.self, ConfirmationRequest.self, ConfirmationDecision.self, ConfirmationPresenter.self, Gateway.self,
         Selection.self, ReplayMode.self, ReplayState.self, StylusMode.self, EditorSession.self,

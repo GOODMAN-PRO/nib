@@ -2729,11 +2729,16 @@ final class NibUI {
     }
 
     private func waitForFormClosed(_ form: XCUIElementSnapshot, cover: XCUIElement) throws {
+        // Compared in steps: one expression over five terms with interpolating closures can exceed the type checker.
+        func signature(_ node: XCUIElementSnapshot) -> String {
+            "\(node.elementType.rawValue)|\(node.identifier)|\(node.label)|\(node.frame)"
+        }
         func sameContainer(_ node: XCUIElementSnapshot) -> Bool {
-            node.elementType == form.elementType && node.identifier == form.identifier
-                && node.label == form.label && node.frame == form.frame
-                && node.children.map { "\($0.elementType.rawValue)|\($0.identifier)|\($0.label)|\($0.frame)" }
-                    == form.children.map { "\($0.elementType.rawValue)|\($0.identifier)|\($0.label)|\($0.frame)" }
+            guard node.elementType == form.elementType, node.identifier == form.identifier else { return false }
+            guard node.label == form.label, node.frame == form.frame else { return false }
+            let own: [String] = node.children.map { signature($0) }
+            let wanted: [String] = form.children.map { signature($0) }
+            return own == wanted
         }
         func containsForm(_ node: XCUIElementSnapshot) -> Bool {
             sameContainer(node) || node.children.contains { containsForm($0) }
