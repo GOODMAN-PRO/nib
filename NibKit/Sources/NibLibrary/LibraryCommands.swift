@@ -1443,7 +1443,9 @@ struct TrashDeletePermanently: NibCommand {
         }
         var deleted: [String] = []
         for node in nodes {
-            if !ctx.dryRun { try library.deletePermanently(node.id) }
+            // Validation above covers every requested ref. A preceding parent deletion may
+            // already have removed this node; it still belongs in the successful receipt.
+            if !ctx.dryRun, library.node(node.id) != nil { try library.deletePermanently(node.id) }
             deleted.append(LibraryRefs.ref(node))
         }
         LibraryEvents.changed(ctx, library, deleted)
