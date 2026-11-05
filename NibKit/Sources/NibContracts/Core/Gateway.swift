@@ -103,6 +103,23 @@ public final class Gateway {
         if d.scopes.contains(.security) {
             throw NibError(.permissionDenied, "'\(d.id)' can only be run by the user")
         }
+        try validateAuthority(d, params: params, principal: principal)
+        guard needsConfirmation(d, principal: principal, inheritedPolicy: inheritedPolicy),
+              !allowedGroups.contains(group) else { return }
+        guard let presenter = confirmationPresenter(for: principal) else {
+            throw NibError(.userDenied, "'\(d.title)' needs confirmation but no confirmation UI is available")
+        }
+        let decision = await presenter.confirm(ConfirmationRequest(principal: principal, command: d, params: params))
+        switch decision {
+        case .allow, .allowRestOfGroup:
+            // Grants and locks can change in another window while the sheet is open.
+            try validateAuthority(d, params: params, principal: principal)
+            if case .allowRestOfGroup = decision { allowedGroups.insert(group) }
+        case .deny: throw NibError(.userDenied, "the user declined '\(d.title)'")
+        }
+    }
+
+    private func validateAuthority(_ d: CommandDescriptor, params: JSONValue, principal: Principal) throws {
         let missing = d.scopes.subtracting(grants(principal))
         guard missing.isEmpty else {
             throw NibError(.permissionDenied, "missing permission(s): " + missing.map { $0.rawValue }.sorted().joined(separator: ", "),
@@ -110,16 +127,6 @@ public final class Gateway {
         }
         for doc in Gateway.referencedDocuments(params) where isLocked(doc) {
             throw NibError(.locked, "document \(doc) is locked", hint: "ask the user to unlock it first")
-        }
-        guard needsConfirmation(d, principal: principal, inheritedPolicy: inheritedPolicy),
-              !allowedGroups.contains(group) else { return }
-        guard let presenter = confirmationPresenter(for: principal) else {
-            throw NibError(.userDenied, "'\(d.title)' needs confirmation but no confirmation UI is available")
-        }
-        switch await presenter.confirm(ConfirmationRequest(principal: principal, command: d, params: params)) {
-        case .allow: return
-        case .allowRestOfGroup: allowedGroups.insert(group)
-        case .deny: throw NibError(.userDenied, "the user declined '\(d.title)'")
         }
     }
 

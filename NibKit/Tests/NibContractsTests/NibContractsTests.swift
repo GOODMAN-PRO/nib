@@ -365,6 +365,36 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(list["commands"]?.arrayValue?.count, 2)
     }
 
+    func testGatewayRevalidatesAuthorityAfterConfirmation() async throws {
+        for decision in [ConfirmationDecision.allow, .allowRestOfGroup] {
+            for revoke in [true, false] {
+                let h = Harness()
+                let before = try h.snapshot()
+                h.app.gateway.grants = { _ in Set(Scope.allCases) }
+                let presenter = ChangingAuthorityPresenter(decision: decision) {
+                    if revoke { h.app.gateway.grants = { _ in [] } }
+                    else { h.app.gateway.isLocked = { _ in true } }
+                }
+                h.app.gateway.presenter = presenter
+                h.app.commands.register(CommandDescriptor(id: "test.delete", title: "Delete", summary: "Delete an item.",
+                                                          effect: .edit, destructive: true)) { _, ctx in
+                    try ctx.mutate { tx in
+                        try tx.delete(item: Fixtures.strokeID, doc: Fixtures.docID, page: Fixtures.page1)
+                    }
+                    return .null
+                }
+                do {
+                    _ = try await h.run("test.delete", ["doc": "doc:FIXTUREDOC01"], as: .plugin("disabled"))
+                    XCTFail("Authority changed while confirmation was suspended")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, revoke ? .permissionDenied : .locked)
+                }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+            }
+        }
+    }
+
     func testSchemaValidation() {
         let s = JSONSchema.obj(["page": .ref, "n": .int(min: 1)], required: ["page"])
         XCTAssertTrue(s.validate(["page": "page:A/B", "n": 2]).isEmpty)
@@ -555,5 +585,20 @@ enum ProbeFeature: NibFeature {
                                                 examples: [[:]], effect: .edit)) { _, ctx in
             try await ctx.execute("missing.command")
         }
+    }
+}
+
+@MainActor
+private final class ChangingAuthorityPresenter: ConfirmationPresenter {
+    let decision: ConfirmationDecision
+    let change: () -> Void
+    init(decision: ConfirmationDecision, change: @escaping () -> Void) {
+        self.decision = decision
+        self.change = change
+    }
+    func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
+        await Task.yield()
+        change()
+        return decision
     }
 }
