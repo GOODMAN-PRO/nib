@@ -168,6 +168,51 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertThrowsError(try h.app.workspace.item(doc, page: page1, id: id))
     }
 
+    func testUndoAndRedoReportFalseAfterRemoteReplacement() async throws {
+        for redo in [false, true] {
+            let h = Harness()
+            let ctx = try await probeContext(h)
+            try ctx.mutate { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.locked = true
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+            if redo { XCTAssertTrue(h.app.bus.undo(doc)) }
+            var remote = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+            remote.rev = Rev(wallMs: remote.rev.wallMs, counter: remote.rev.counter + 1, device: 99)
+            remote.layer = 7
+            let patch = DocumentPatch(doc: doc, items: [page1.raw: [remote]])
+            XCTAssertEqual(h.app.bus.applyRemote(patch, origin: "test").updated.count, 1)
+            let result = try await h.run(redo ? "edit.redo" : "edit.undo", ["doc": .string(NodeRef.document(doc).description)])
+            XCTAssertEqual(result["done"]?.boolValue, false)
+            XCTAssertFalse(h.app.bus.history.canRedo(doc))
+            XCTAssertFalse(h.app.bus.history.canUndo(doc))
+            XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).layer, 7)
+        }
+    }
+
+    func testSkippedLinkedDocumentGetsNoEmptyRedoEntry() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        ctx.linkUndoAcrossDocuments()
+        try ctx.mutate { tx in
+            var text = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            text.locked = true
+            try tx.put(text, doc: self.doc, page: self.page1)
+            var board = try tx.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID)
+            board.locked = true
+            try tx.put(board, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
+        }
+        var remote = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+        remote.rev = Rev(wallMs: remote.rev.wallMs, counter: remote.rev.counter + 1, device: 99)
+        _ = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page1.raw: [remote]]), origin: "test")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
+        XCTAssertFalse(h.app.bus.history.canRedo(doc))
+        XCTAssertTrue(h.app.bus.history.canRedo(Fixtures.whiteboardID))
+        XCTAssertTrue(h.app.bus.redo(Fixtures.whiteboardID))
+        XCTAssertFalse(h.app.bus.history.canUndo(doc))
+    }
+
     func testSelectiveRevertStillSkipsRecordsChangedLater() async throws {
         let h = Harness()
         let first = try await probeContext(h)
