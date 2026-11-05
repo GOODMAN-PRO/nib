@@ -146,6 +146,17 @@ Replaces:
 - F015 `FeatUndoUI/UndoButtons.swift` `UIWindow.didBecomeKeyNotification` observer, F063 `FeatPresentation/FeatPresentationFeature.swift` `UIScene.didActivateNotification` re-reads → `NibEventType.sessionActivated`.
 - F041 (canvas redraw on layer visibility) → `NibEventType.layersChanged`.
 
+### Non-undoable writes: bookkeeping and sealed history
+
+`CommandContext.mutate(_:undoable:nonUndoableHistory:_:)` accepts the public `NonUndoableHistoryPolicy` (declared in `Core/Undo.swift`). The additional argument defaults to `.rebase`, preserving the current local bookkeeping behaviour introduced by 3bb128a. It is used only when `undoable` is false; recorded writes and remote changes ignore it. This section supersedes G4's historical statement that all non-undoable writes conflict with earlier history.
+
+- `.rebase`: no new undo step. Rebase existing undo/redo expectations across local updates, including repeated writes in one transaction. Tape visibility, study scheduling and import bookkeeping retain this behaviour. Irreversible removals retain their existing revision conflicts.
+- `.seal`: no new undo step and no revision rebase. Earlier history that touches the written record remains stale, so it cannot delete that record or restore its pre-write value. `answerZone.revealHint` uses this policy to preserve revealed hints and usage. Later bookkeeping cannot bridge the revision gap. Later undoable edits can still undo back to the sealed value, including edits in the same group.
+
+Undo keeps the existing per-record conflict semantics: consume the selected step, skip conflicting records, and revert its other records (including eligible linked documents). Redo contains only the writes actually undone. A wholly blocked undo returns false and creates no redo entry; any unrelated redo entries already present remain available. Redo applies the same conflict rules. Selective `revert(group:)` retains an entirely skipped entry for retry and reports its skipped count, as before. This is record-level protection from earlier history, not a ban on later explicit edits or resets. Remote merges continue to conflict under either policy.
+
+Coverage: the unchanged `testNonUndoableLocalRestampsPreserveCreateUndoAndRedo` and Teacher `testRevealHintOneAtATimeRecordsUsageThatUndoCannotErase`; new contract tests `testNonUndoablePolicyControlsWhetherAnEarlierCreateCanBeUndone`, `testSealedRecordSurvivesPartialUndoRedoAndLaterEditsInTheSameGroup`, `testSealingAnExistingRecordBlocksPendingRedoAndSelectiveRevert`, and `testNeitherNonUndoablePolicyRebasesAcrossARemoteWrite`; Teacher `testHintUsageSealsEarlierScoreAndCreateButAllowsLaterEditsToUndo`.
+
 ### G4 — Undo: revert rebasing and linked undo across documents
 
 Gap (the F031 blocker, also F005, F026, F028, F029, F034, F036, F044, F049): `DocTransaction.revert` only reverted a record whose current revision equalled the stored after-revision, but reverting writes a fresh revision. So (a) a record written twice in one undo group (move then attach, debounced text commits, two meta writes) was only reverted to the middle state, and (b) the older of two consecutive undo entries on one record was silently skipped. Also, a change across two documents (page.moveTo) was two undo steps.
