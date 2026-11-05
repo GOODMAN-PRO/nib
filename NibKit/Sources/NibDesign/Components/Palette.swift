@@ -2,6 +2,15 @@ import SwiftUI
 import QuartzCore
 import NibContracts
 
+/// Shared presentation rules for the palette and popovers hosted elsewhere in the window.
+enum NibPalettePresentation {
+    static let anchorPrefix = "nib.palette.bounds."
+
+    static func showsOptions(settings: Bool, more: Bool, modal: Bool, optionsPopover: Bool) -> Bool {
+        !settings && !more && (!modal || optionsPopover)
+    }
+}
+
 public struct NibTool: Identifiable, Hashable, Sendable {
     public let id: String
     public let label: String
@@ -488,6 +497,8 @@ public struct NibToolPalette<Settings: View>: View {
             let d = current
             let c = centre(d, in: r)
             let bounds = CGRect(origin: .zero, size: proxy.size)
+            let paletteFrame = CGRect(origin: CGPoint(x: c.x - size(d, a).width / 2 + origin.x,
+                                                       y: c.y - size(d, a).height / 2 + origin.y), size: size(d, a))
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
@@ -508,8 +519,7 @@ public struct NibToolPalette<Settings: View>: View {
                 if let tool = a.natives.first(where: { $0.id == selection }) ?? a.plugins.first(where: { $0.id == selection }),
                    tool.hasSettings, let along = map[tool.id] {
                     popover(for: tool, anchor: slotAt(along), placement: placement(d), bounds: bounds)
-                        // The options strip overlaps the top of a side-docked settings panel.
-                        // Keep the open modal above that strip and the retained closed menus.
+                        // Retained closed menus must stay below the open modal.
                         .zIndex(settingsOpen ? 1 : 0)
                 }
                 if a.hasMore, let along = map[Self.moreID] {
@@ -522,9 +532,12 @@ public struct NibToolPalette<Settings: View>: View {
                     let optionsBounds = CGRect(x: r.minX - NibMetrics.chromeInset, y: bounds.minY,
                                                width: r.width + 2 * NibMetrics.chromeInset, height: bounds.height)
                     let available = placement(d).availableSize(beside: slotAt(along), gap: 0, in: optionsBounds)
-                    NibToolOptionsPlacement(containerSize: bounds.size, bounds: optionsBounds,
+                    if NibPalettePresentation.showsOptions(settings: settingsOpen, more: moreOpen,
+                        modal: field?.hasOpenBud ?? false, optionsPopover: opts.popover?.isPresented.wrappedValue ?? false) {
+                        NibToolOptionsPlacement(containerSize: bounds.size, bounds: optionsBounds,
                                             anchor: slotAt(along), placement: placement(d)) {
-                        NibToolOptionsBar(id: id + ".options", availableWidth: available.width) { opts.bar }
+                            NibToolOptionsBar(id: id + ".options", availableWidth: available.width) { opts.bar }
+                        }
                     }
                     if let pop = opts.popover {
                         // NibBudPopover works in container coordinates; this layer starts at `origin` in them.
@@ -537,6 +550,10 @@ public struct NibToolPalette<Settings: View>: View {
                 }
             }
             .frame(width: NibGeometry.dimension(proxy.size.width), height: NibGeometry.dimension(proxy.size.height), alignment: .topLeading)
+            .onChange(of: paletteFrame, initial: true) { _, frame in
+                field?.setWorldAnchor(NibPalettePresentation.anchorPrefix + id, frame)
+            }
+            .onDisappear { field?.removeWorldAnchor(NibPalettePresentation.anchorPrefix + id) }
             .onChange(of: AnchorKey(dock: d, slots: map), initial: true) { _, key in
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
