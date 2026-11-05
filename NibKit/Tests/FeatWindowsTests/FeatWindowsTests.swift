@@ -1427,6 +1427,49 @@ final class FeatWindowsTests: XCTestCase {
         }
     }
 
+    func testDocumentTabsReserveMeasuredActionsAndTheFullActiveTitle() {
+        let bounds = CGRect(x: 0, y: 0, width: 834, height: 1194)
+        let menu = CGRect(x: 228, y: 32, width: 44, height: 44)
+        let trailing = CGRect(x: 630, y: 32, width: 188, height: 44)
+        let slot = TabStripLayout.documentSlot(control: menu, bounds: bounds, compact: false,
+                                               rightToLeft: false, trailingFrame: trailing)
+        XCTAssertEqual(trailing.minX - slot.maxX, NibMetrics.minimumRestingGap)
+        let plan = TabStripLayout.documentPlan(count: 3, active: 2, width: slot.width,
+                                               compact: false, activeTitleWidth: 130)
+        XCTAssertTrue(plan.shown.contains(2))
+        XCTAssertLessThan(plan.shown.count, 3)
+        XCTAssertGreaterThanOrEqual(plan.tabWidth, 130 + NibSpacing.m + NibMetrics.hitTarget)
+        XCTAssertLessThanOrEqual(plan.dropletWidth, slot.width)
+    }
+
+    func testLongDocumentTitleTruncatesInsteadOfHidingAllCapsules() {
+        for compact in [false, true] {
+            let maximum = TabStripLayout.tabWidths(compact: compact).upperBound
+            let width = 2 * maximum + 2 * TabStripLayout.inset
+            let plan = TabStripLayout.documentPlan(count: 4, active: 3, width: width,
+                                                   compact: compact, activeTitleWidth: 1200)
+            XCTAssertEqual(plan.shown, [0, 3])
+            XCTAssertEqual(plan.hidden, [1, 2])
+            XCTAssertEqual(plan.tabWidth, maximum)
+            XCTAssertLessThanOrEqual(plan.dropletWidth, width)
+        }
+    }
+
+    func testLongDocumentTitleKeepsOneCapsuleInANarrowSlot() {
+        for compact in [false, true] {
+            let widths = TabStripLayout.tabWidths(compact: compact)
+            for available in [widths.lowerBound, (widths.lowerBound + widths.upperBound) / 2] {
+                let width = available + 2 * TabStripLayout.inset
+                let plan = TabStripLayout.documentPlan(count: 4, active: 3, width: width,
+                                                       compact: compact, activeTitleWidth: 1200)
+                XCTAssertEqual(plan.shown, [3])
+                XCTAssertEqual(plan.hidden, [0, 1, 2])
+                XCTAssertEqual(plan.tabWidth, available)
+                XCTAssertEqual(plan.dropletWidth, width)
+            }
+        }
+    }
+
     func testDocumentTabsFitOnlyTheSpaceBetweenTheBars() {
         let safeBounds = CGRect(x: 24, y: 24, width: 1146, height: 780)
         let menu = CGRect(x: 308, y: 32, width: 44, height: 44)

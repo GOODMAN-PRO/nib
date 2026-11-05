@@ -33,6 +33,10 @@ public enum FeatBridgeUIFeature: NibFeature {
             group: .navLeading, order: 40, owner: id, hideable: false, docKinds: Set(DocumentKind.allCases))
         status.navSlot = .afterTitle
         status.compactStatus = { context in
+            #if DEBUG
+            let visible = context.kind != nil && monitor.pillVisible
+            NSLog("%@", "[Nib QA bridge] compact status rebuilt visible=\(visible) enabled=\(String(describing: monitor.snapshot?.enabled)) state=\(String(describing: monitor.snapshot?.state))")
+            #endif
             guard context.kind != nil, monitor.pillVisible else { return nil }
             return AnyView(BridgeStatusPill(monitor: monitor, context: context, isNavStatus: true))
         }

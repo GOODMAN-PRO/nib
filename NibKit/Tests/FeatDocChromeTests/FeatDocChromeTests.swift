@@ -181,6 +181,36 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
+    func testOpenRevalidatesLibraryAfterSuspendedGate() async throws {
+        for change in ["trash", "delete", "folder"] {
+            let h = Harness(features: [FeatDocChromeFeature.self])
+            let current = h.session.document
+            let target = Fixtures.textDocID
+            XCTAssertTrue(ShellChromePolicy.validateOpen(target, app: h.app))
+            let notice = expectation(forNotification: .nibCommandFailed, object: h.app) { note in
+                (note.userInfo?["command"] as? String) == CommandIDs.docOpen
+                    && (note.userInfo?["error"] as? NibError)?.code == .notFound
+            }
+            let gate: @MainActor () async throws -> Bool = {
+                await Task.yield()
+                if change == "trash" {
+                    try h.library.trash(target)
+                } else {
+                    try h.library.deletePermanently(target)
+                    if change == "folder" {
+                        _ = try h.library.createFolder(title: "Replacement", in: nil, style: nil, id: target)
+                    }
+                }
+                return true
+            }
+            let allowed = try await gate()
+            XCTAssertTrue(allowed)
+            XCTAssertFalse(ShellChromePolicy.validateOpen(target, app: h.app))
+            await fulfillment(of: [notice], timeout: 1)
+            XCTAssertEqual(h.session.document, current)
+        }
+    }
+
     func testTabBarIsRequestedForRemainingTabsBehindLibrary() {
         let h = Harness(features: [FeatDocChromeFeature.self])
         var documents: [DocumentID] = ["TAB_A", "TAB_B", "TAB_C"]
@@ -902,6 +932,19 @@ final class FeatDocChromeTests: XCTestCase {
             }
         }
         XCTAssertLessThan(try XCTUnwrap(frames["audio"]).minY, try XCTUnwrap(frames["search"]).minY)
+    }
+
+    func testPortraitPageHUDKeepsChromeInsetInsidePaperEdge() throws {
+        let region = CGRect(x: 16, y: 100, width: 802, height: 1000)
+        let page = CGRect(x: 16, y: 100, width: 802, height: 1200)
+        let item = ChromeOverlayGeometry.Item(id: "canvas.pageHUD", placement: .bottomTrailing,
+                                              size: CGSize(width: 104, height: 40))
+        let portrait = try XCTUnwrap(ChromeOverlayGeometry.frames([item], in: region,
+            portraitPageFrame: page)[item.id])
+        XCTAssertEqual(page.maxX - portrait.maxX, NibMetrics.chromeInset)
+        let landscape = try XCTUnwrap(ChromeOverlayGeometry.frames([item], in: region)[item.id])
+        XCTAssertEqual(landscape.maxX, region.maxX, "Landscape keeps its existing window inset")
+        XCTAssertEqual(portrait.maxY, landscape.maxY)
     }
 
     func testOverlayGeometryPlacesAndStacksEachPlacement() {
@@ -1801,10 +1844,12 @@ final class FeatDocChromeTests: XCTestCase {
         let context = chrome.panelContext(ChromePanels.rename, presentation: .sheet)
         var draft = RenameDocumentDraft(context: context)
         draft.title = "Edited title"
+        let expectedTitle = draft.originalTitle
         h.session.document = Fixtures.textDocID
         h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryRename, title: "Rename", summary: "test double",
                                                   effect: .library, target: .app)) { params, _ in
             XCTAssertEqual(params["ref"]?.stringValue, NodeRef.document(Fixtures.docID).description)
+            XCTAssertEqual(params["expectedTitle"]?.stringValue, expectedTitle)
             throw NibError.invalid("Rename failed")
         }
         do {

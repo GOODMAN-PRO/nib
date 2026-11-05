@@ -172,9 +172,8 @@ enum BridgePillActions {
             return
         }
         if !host.isPresenting(BridgeUIIDs.detailsPopover) {
-            let app = context.app
             host.present(BridgeUIIDs.detailsPopover) {
-                BridgeDetailsPopover(monitor: monitor, state: state, app: app)
+                BridgeDetailsPopover(monitor: monitor, state: state, context: context)
             }
         }
         state.error = nil
@@ -203,7 +202,8 @@ extension BridgePillPresentation.Dot {
 struct BridgeDetailsPopover: View {
     @ObservedObject var monitor: BridgeMonitor
     @ObservedObject var state: BridgePillState
-    let app: NibApp
+    let context: ChromeContext
+    private var app: NibApp { context.app }
 
     var body: some View {
         NibBudPopover(id: BridgeUIIDs.detailsPopover, source: BridgeUIIDs.pillAnchor, isPresented: $state.detailsPresented,
@@ -297,7 +297,7 @@ struct BridgeDetailsPopover: View {
         }
     }
 
-    private func turnOff() async {
+    func turnOff() async {
         state.busy = true
         defer { state.busy = false }
         do {
@@ -306,6 +306,8 @@ struct BridgeDetailsPopover: View {
             await monitor.refresh()
             #if DEBUG
             NSLog("%@", "[Nib QA bridge] pill turnOff awaited enabled=\(String(describing: monitor.snapshot?.enabled)) state=\(String(describing: monitor.snapshot?.state))")
+            let content = app.ui.toolbar.get(BridgeUIIDs.statusItem)?.compactStatus?(context)
+            NSLog("%@", "[Nib QA bridge] compact status after turnOff returned=\(content == nil ? "nil" : "view")")
             #endif
         } catch {
             state.error = NibError.wrap(error).message

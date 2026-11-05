@@ -178,7 +178,7 @@ enum ChromeOverlayGeometry {
 
     static func frames(_ items: [Item], in region: CGRect, keyboardFrame: CGRect? = nil,
                        gap: CGFloat = NibMetrics.minimumRestingGap,
-                       anchorGap: CGFloat = NibMetrics.popoverGap) -> [String: CGRect] {
+                       anchorGap: CGFloat = NibMetrics.popoverGap, portraitPageFrame: CGRect? = nil) -> [String: CGRect] {
         var frames: [String: CGRect] = [:]
         var stacks: [ChromePlacement: [(id: String, size: CGSize)]] = [:]
         for item in items {
@@ -226,6 +226,10 @@ enum ChromeOverlayGeometry {
             for entry in stacks[placement] ?? [] {
                 var frame = CGRect(x: x(placement, width: entry.size.width, in: region),
                                    y: bottom - entry.size.height, width: entry.size.width, height: entry.size.height)
+                if entry.id == "canvas.pageHUD", let page = portraitPageFrame, page.intersects(region) {
+                    frame.origin.x = max(region.minX,
+                        min(frame.minX, page.maxX - NibMetrics.chromeInset - frame.width))
+                }
                 while let ceiling = bottomFrames.filter({ other in
                     frame.minX < other.maxX + gap && frame.maxX + gap > other.minX
                         && frame.minY < other.maxY + gap && frame.maxY + gap > other.minY
@@ -316,6 +320,7 @@ final class ChromeOverlayFrames {
 final class ChromeOverlayModel: ObservableObject {
     @Published private(set) var overlays: [ChromeOverlayDescriptor] = []
     @Published private(set) var anchors: [String: CGRect] = [:]
+    @Published private(set) var pageFrame: CGRect?
     let placed = ChromeOverlayFrames()
     /// The container's view, for window and page anchors (nil: window rects are used as they are).
     weak var containerView: UIView?
@@ -355,6 +360,14 @@ final class ChromeOverlayModel: ObservableObject {
 
     func refresh() {
         pending = false
+        let currentPageFrame: CGRect?
+        if let host = chrome.session.editor?.canvasHost, let page = chrome.session.page,
+           let frame = host.pageFrame(page), let container = containerView {
+            currentPageFrame = host.canvasView.convert(frame, to: container)
+        } else {
+            currentPageFrame = nil
+        }
+        if pageFrame != currentPageFrame { pageFrame = currentPageFrame }
         let context = self.context
         var visible: [ChromeOverlayDescriptor] = []
         var anchors: [String: CGRect] = [:]
@@ -423,6 +436,7 @@ struct ChromeOverlayStack: Layout {
     let region: CGRect
     let placed: ChromeOverlayFrames
     var keyboardFrame: CGRect? = nil
+    var portraitPageFrame: CGRect? = nil
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         proposal.replacingUnspecifiedDimensions()
@@ -436,7 +450,8 @@ struct ChromeOverlayStack: Layout {
             return ChromeOverlayGeometry.Item(id: slot.id, placement: slot.placement, size: subview.sizeThatFits(offer),
                                               anchor: slot.anchor)
         }
-        let frames = ChromeOverlayGeometry.frames(items, in: region, keyboardFrame: keyboardFrame)
+        let frames = ChromeOverlayGeometry.frames(items, in: region, keyboardFrame: keyboardFrame,
+                                                  portraitPageFrame: portraitPageFrame)
         placed.frames = frames
         for (item, subview) in zip(items, subviews) {
             let frame = frames[item.id] ?? CGRect(x: region.midX, y: region.midY, width: 0, height: 0)
@@ -462,20 +477,24 @@ struct ChromeOverlayLayer: View {
     let inking: ChromeInkingMirror
     let region: CGRect
     let keyboardFrame: CGRect?
+    let isPortrait: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.nibLiquidMode) private var liquidMode
 
-    init(model: ChromeOverlayModel, inking: ChromeInkingMirror, region: CGRect, keyboardFrame: CGRect? = nil) {
+    init(model: ChromeOverlayModel, inking: ChromeInkingMirror, region: CGRect, keyboardFrame: CGRect? = nil,
+         isPortrait: Bool = false) {
         _model = ObservedObject(wrappedValue: model)
         self.inking = inking
         self.region = region
         self.keyboardFrame = keyboardFrame
+        self.isPortrait = isPortrait
     }
 
     var body: some View {
         let context = model.context
         let reduced = reduceMotion || liquidMode == .off
-        ChromeOverlayStack(region: region, placed: model.placed, keyboardFrame: keyboardFrame) {
+        ChromeOverlayStack(region: region, placed: model.placed, keyboardFrame: keyboardFrame,
+                           portraitPageFrame: isPortrait ? model.pageFrame : nil) {
             ForEach(model.overlays, id: \.id) { overlay in
                 ChromeOverlaySurface(overlay: overlay, context: context, inking: inking)
                     .layoutValue(key: ChromeOverlaySlot.self,

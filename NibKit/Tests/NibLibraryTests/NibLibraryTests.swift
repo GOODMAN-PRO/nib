@@ -318,6 +318,28 @@ final class NibLibraryTests: XCTestCase {
 
     // MARK: Rename and move
 
+    func testRenameRejectsChangedExpectedTitleWithoutMovingPackage() async throws {
+        let lib = try await makeLibrary()
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Draft"]))
+        let ref = JSONValue.string("doc:\(d.raw)")
+        try await lib.run("library.rename", ["ref": ref, "title": "Other window"])
+        do {
+            try await lib.run("library.rename", ["ref": ref, "title": "My draft", "expectedTitle": "Draft"])
+            XCTFail("A stale rename must fail inside the command")
+        } catch {
+            XCTAssertEqual(NibError.wrap(error).code, .invalidParams)
+            XCTAssertTrue(NibError.wrap(error).message.contains("title changed"))
+        }
+        XCTAssertEqual(lib.library.node(d)?.title, "Other window")
+        XCTAssertTrue(lib.exists("Other window.nibnote"))
+        XCTAssertFalse(lib.exists("My draft.nibnote"))
+        try await lib.run("library.rename", ["ref": ref, "title": "My draft", "expectedTitle": "Other window"])
+        XCTAssertEqual(lib.library.node(d)?.title, "My draft")
+        // Existing callers omit the precondition and retain their unconditional behaviour.
+        try await lib.run("library.rename", ["ref": ref, "title": "Plugin title"])
+        XCTAssertEqual(lib.library.node(d)?.title, "Plugin title")
+    }
+
     func testRenameAndMoveKeepPackageLocationsInSync() async throws {
         let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Draft"]))
