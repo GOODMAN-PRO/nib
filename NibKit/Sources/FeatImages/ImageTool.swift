@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import UIKit
 import Photos
 import PhotosUI
@@ -72,6 +73,13 @@ enum ImageUI {
     @discardableResult
     static func perform(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
                         target: ImageMenuTarget? = nil) async -> [String] {
+        let originDoc = target?.doc ?? session?.document
+        let originPage = target?.page ?? session?.page
+        var navigated = session?.document != originDoc || session?.page != originPage
+        // Remember navigation even if the user leaves and returns before loading completes.
+        let documentWatch = session?.$document.dropFirst().sink { if $0 != originDoc { navigated = true } }
+        let pageWatch = session?.$page.dropFirst().sink { if $0 != originPage { navigated = true } }
+        defer { documentWatch?.cancel(); pageWatch?.cancel() }
         let group = NibID.make().raw
         var created: [String] = []
         for call in calls {
@@ -85,7 +93,8 @@ enum ImageUI {
                 return []
             }
         }
-        guard !created.isEmpty, let session = session else { return created }
+        guard !created.isEmpty, let session = session, !navigated,
+              session.document == originDoc, session.page == originPage else { return created }
         finishToolUse(session, target: target)
         _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
                                        session: session)

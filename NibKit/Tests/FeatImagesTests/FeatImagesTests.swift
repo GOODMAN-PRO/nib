@@ -96,6 +96,7 @@ final class FeatImagesTests: XCTestCase {
 
     func testAnInsertFinishesTheImageToolAndSelectsTheNewImage() async throws {
         let h = Harness(features: [FeatImagesFeature.self])
+        h.session.page = Fixtures.page2 // The menu belongs to the page currently being edited.
         // selection.set belongs to the lasso (F011); a stand-in records what the image UI asks it to select.
         var selected: [String] = []
         h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select", summary: "Test stand-in.",

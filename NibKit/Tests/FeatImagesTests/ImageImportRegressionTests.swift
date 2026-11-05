@@ -41,6 +41,40 @@ final class ImageAssetSpy: AssetStore {
 
 @MainActor
 final class ImageImportRegressionTests: XCTestCase {
+    func testLateImportPreservesSelectionAndToolAfterNavigation() async throws {
+        for returnToOrigin in [false, true] {
+            let h = Harness(features: [FeatImagesFeature.self])
+            h.session.page = Fixtures.page2
+            h.session.tool = "image"
+            var selections = 0
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select", summary: "Test selection.",
+                                                      effect: .session)) { _, _ in
+                selections += 1
+                return .null
+            }
+            h.app.commands.register(CommandDescriptor(id: "test.lateImage", title: "Import", summary: "Delayed image import.",
+                                                      effect: .edit)) { _, ctx in
+                await Task.yield()
+                h.session.document = "FIXTUREDOC04"
+                h.session.page = "FIXTUREBRD01"
+                if returnToOrigin {
+                    h.session.document = Fixtures.docID
+                    h.session.page = Fixtures.page2
+                }
+                return try await ctx.execute("image.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002",
+                    "asset": "fixture-image.png", "id": "LATEIMAGE"])
+            }
+            let selection = h.session.selection
+            let refs = await ImageUI.perform(h.app, [("test.lateImage", [:])], session: h.session,
+                target: ImageMenuTarget(doc: Fixtures.docID, page: Fixtures.page2, point: nil))
+            XCTAssertEqual(refs, ["item:FIXTUREDOC01/FIXTUREPG002/LATEIMAGE"])
+            XCTAssertNotNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "LATEIMAGE").image)
+            XCTAssertEqual(selections, 0)
+            XCTAssertEqual(h.session.selection, selection)
+            XCTAssertEqual(h.session.tool, "image")
+        }
+    }
+
     func testProviderFailureRejectsTheWholeSelection() async {
         let good = NSItemProvider()
         good.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
