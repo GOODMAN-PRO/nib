@@ -663,9 +663,23 @@ struct MinimapMap: View {
     /// Resets when the drag ends or is cancelled, so the map never stays frozen.
     @GestureState private var dragging = false
 
+    // The view is built in three steps. As one modifier chain it exceeded the Swift type checker's budget
+    // (package CI 42010472894: "unable to type-check this expression in reasonable time").
     var body: some View {
+        accessible
+            // The preview keeps the document's paper colour. Leave a semantic chrome surround visible
+            // in either appearance instead of letting white paper cover the entire floating surface.
+            // Padding is outside the gestures so their locations remain in the map's coordinate space.
+            .padding(NibSpacing.s)
+            .background(NibColor.backgroundSecondary)
+            .droplet("whiteboard.minimap", style: .floatingPanel)
+    }
+
+    /// The board render and the viewport, clipped concentrically with the outer chrome.
+    private var paper: some View {
         let g = model.geometry
-        ZStack(alignment: .topLeading) {
+        let radius = NibRadius.concentric(DropletStyle.floatingPanel.cornerRadius, inset: NibSpacing.s)
+        return ZStack(alignment: .topLeading) {
             Color(uiColor: model.paper.uiColor)
             if let image = model.image, let world = model.imageWorld {
                 let r = g.map(world)
@@ -691,9 +705,13 @@ struct MinimapMap: View {
         }
         .frame(width: g.size.width, height: g.size.height, alignment: .topLeading)
         // The paper inset and its outer chrome have concentric corners.
-        .clipShape(NibDropletShape(cornerRadius: NibRadius.concentric(DropletStyle.floatingPanel.cornerRadius,
-                                                                   inset: NibSpacing.s)))
+        .clipShape(NibDropletShape(cornerRadius: radius))
         .contentShape(Rectangle())
+    }
+
+    /// The paper with its pan, fit and centre gestures.
+    private var interactive: some View {
+        paper
         // Panning the viewport takes priority over the floating-panel preset's pickup gesture.
         .highPriorityGesture(DragGesture(minimumDistance: 3)
             .updating($dragging) { _, state, _ in state = true }
@@ -704,6 +722,11 @@ struct MinimapMap: View {
         }
         .simultaneousGesture(TapGesture(count: 2).onEnded { model.fit() }
             .exclusively(before: SpatialTapGesture().onEnded { model.centre(onMap: $0.location) }))
+    }
+
+    /// One accessibility element for the overview, with its adjustable and named actions.
+    private var accessible: some View {
+        interactive
         .accessibilityElement()
         .accessibilityLabel(String(localized: "Board overview"))
         .accessibilityValue(Text(model.zoom, format: .percent.precision(.fractionLength(0))))
@@ -720,12 +743,6 @@ struct MinimapMap: View {
         .accessibilityAction(named: Text(String(localized: "Move View Right"))) { model.pan(dx: 1, dy: 0) }
         .accessibilityAction(named: Text(String(localized: "Move View Up"))) { model.pan(dx: 0, dy: -1) }
         .accessibilityAction(named: Text(String(localized: "Move View Down"))) { model.pan(dx: 0, dy: 1) }
-        // The preview keeps the document's paper colour. Leave a semantic chrome surround visible
-        // in either appearance instead of letting white paper cover the entire floating surface.
-        // Padding is outside the gestures so their locations remain in the map's coordinate space.
-        .padding(NibSpacing.s)
-        .background(NibColor.backgroundSecondary)
-        .droplet("whiteboard.minimap", style: .floatingPanel)
     }
 }
 
