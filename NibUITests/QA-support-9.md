@@ -198,3 +198,9 @@ Next CI must pair the runner result with app dragSessionWillBegin, move proposal
 Confirmed the current outlineMenu uses ordinary press, Move tap and action tap while OutlineTableController supplies native context menus (P:pages-outline-templates#0 and correction). Rename, Delete and every Move submenu action now use H2 as one path. The shared thumbnail pageMenu also uses H2 for the diagnosed Add to Outline and Create Template from Page stalls. Kept assertions, Rename alert handling, submenu depth checks and all allowances.
 
 Should unblock Pages OutlineAddRenameNavigateAndDeleteRetainsPage, OutlineMoveNestOutdentAndThreeLevelLimit and remove the observed waits in OutlineThumbnailAndMoreAddTargetCorrectPage / template creation. Next CI must show all submenu contacts without idle waits, then the unchanged page-link, nesting, deletion and Undo checks. Uses the H2 diagnostic table; no separate log family.
+
+### C3 - full and partial outline swipes
+
+P:pages-outline-templates#1 is proven and current OutlineTableController still returns the default full-swipe-enabled action. Removed only the erroneous post-full-swipe Delete tap: the original [First, Third] and four-page checks now observe the immediate deletion of Second. Added a 0.4s synthesized partial drag across 30% of Third's row (85% to 55%), requiring the Delete button while both remaining titles are still present, then tapping it and requiring [First] with four pages intact. No sleeps or allowance changes.
+
+Should unblock OutlineSortByCurrentPageNumberAndSwipeDelete and cover both platform interactions. Next CI must prove full swipe deletes immediately and partial swipe only reveals until the button tap. Existing touch-path logging records delivered coordinates; no new log prefix.

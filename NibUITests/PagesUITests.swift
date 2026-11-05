@@ -481,8 +481,16 @@ final class PagesUITests: XCTestCase {
         try tab("Pages", id: "sidebar.pages"); try navigate(2); try addOutline("Second")
         try tap("Outline Options"); try tap("Sort by Page Number")
         try wait("Sort must follow current page order") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Second", "Third"] }
-        try require(label("Second")).swipeLeft(); try tap("Delete")
+        try require(label("Second")).swipeLeft()
         try wait("Swipe Delete must remove only Second") { (try? self.outline().map { $0["title"] as? String }) == ["First", "Third"] }
+        try count(4)
+        let third = try require(label("Third"))
+        try ui.dragWithoutIdle(from: third.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)),
+            to: third.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: 0.5)), duration: 0.4)
+        try require(button("Delete"), "Partial swipe must reveal Delete without deleting Third")
+        XCTAssertEqual(try outline().map { $0["title"] as? String }, ["First", "Third"])
+        try tap("Delete")
+        try wait("Revealed Delete must remove only Third") { (try? self.outline().map { $0["title"] as? String }) == ["First"] }
         try count(4)
     }
 

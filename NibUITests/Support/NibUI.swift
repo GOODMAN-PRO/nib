@@ -2100,6 +2100,12 @@ final class NibUI {
         try pressWithoutIdle(element, duration: 0.05)
     }
 
+    /// Continuous coordinate path for a partial row swipe; caller verifies the revealed action.
+    func dragWithoutIdle(from start: XCUICoordinate, to end: XCUICoordinate,
+                         duration: TimeInterval) throws {
+        try synthesize(screenPaths: [[start.screenPoint, end.screenPoint]], duration: duration)
+    }
+
     private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
         let frame = app.frame
         let screen = app.coordinate(withNormalizedOffset: .zero)
