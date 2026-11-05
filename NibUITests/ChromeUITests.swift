@@ -716,9 +716,30 @@ final class ChromeUITests: XCTestCase {
         _ = try reachable("Apply " + name)
     }
     private func reorderHighlighterAbovePen(_ handle: XCUIElement) throws {
+        let list = ui.app.collectionViews.containing(.button, identifier: "cmd.toolbar.setLayout").firstMatch
+        var previousFrame: CGRect?
+        try wait("Customise list must have stable geometry before reorder") {
+            guard list.exists else { previousFrame = nil; return false }
+            let frame = list.frame
+            defer { previousFrame = frame }
+            return frame.width > 0 && frame.height > 0 && previousFrame == frame
+        }
+        func rows(_ node: XCUIElementSnapshot) -> [String] {
+            let own = node.elementType == .button && node.label.hasPrefix("Hide ")
+                ? ["\(node.label) frame=\(node.frame)"] : []
+            return own + node.children.flatMap { rows($0) }
+        }
+        func logOrder(_ stage: String) {
+            guard let snapshot = try? list.snapshot() else {
+                ui.logQA("Toolbar reorder " + stage, "list snapshot unavailable"); return
+            }
+            ui.logQA("Toolbar reorder " + stage, rows(snapshot).joined(separator: "\n"))
+        }
+        logOrder("before")
+        defer { logOrder("after") }
         let destination = try reachable("Hide Fountain Pen").coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.2))
         handle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 0.5, thenDragTo: destination)
+            .press(forDuration: 0.5, thenDragTo: destination, withVelocity: .default, thenHoldForDuration: 0.4)
     }
     func testCustomizeHideShowAndReorderPersistsWithLassoFixedFirst() throws {
         try open(); try customize()

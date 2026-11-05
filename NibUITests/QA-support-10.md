@@ -93,3 +93,11 @@ Completed ruler callers through H3/H5 for chrome-singles#0/#1. Position fields s
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | RulerTwoFingerRotation | State step (Ruler rotation ink invariants) | Did a failed rotation instead add pen ink? |
+
+### C6 - reorder evidence and bounded gesture preparation
+
+Confirmed chrome-singles#2 correction: an identical drag passed in a sibling, so no-hold cancellation is not a proven cause. Kept the actual drag and original destination; require the list frame to match on two bounded reads, log visible row order before/after, and hold the destination 0.4 seconds as the requested gesture experiment. No accessibility Move action or weakened order assertion. Both reorder tests must show Highlighter initially below Pen and finally above it, including saved-layout restoration; the next run distinguishes geometry readiness from an unchanged/cancelled drag.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| Both Customise reorder tests | Toolbar reorder before / Toolbar reorder after | Was the initial ordering non-vacuous, and did the held drag change it? |
