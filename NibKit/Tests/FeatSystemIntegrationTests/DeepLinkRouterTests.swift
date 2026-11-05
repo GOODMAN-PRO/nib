@@ -248,6 +248,30 @@ final class DeepLinkRouterTests: XCTestCase {
 
     // MARK: Routing
 
+    func testEveryDocumentLinkRefusesLockedDocumentsBeforeAnyAction() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let lock = FakeLockService(locked: [Fixtures.docID])
+        h.app.services.lock = lock
+        let stubs = CommandStubs()
+        for id in [CommandIDs.docOpen, CommandIDs.commentTapAt, CommandIDs.audioPlay] { stubs.stub(h.app, id) }
+        let navigator = FakeNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let links = ["nib://open/FIXTUREDOC01", "nib://open/FIXTUREDOC01/FIXTUREPG001",
+                     "nib://open/FIXTUREDOC01/FIXTUREPG001?comment=FIXTURECMT01",
+                     "nib://audio/FIXTUREDOC01/FIXTUREAUD01?t=0"]
+        for url in links {
+            await assertCode(.locked) { try await h.run(CommandIDs.appOpenURL, ["url": .string(url)]) }
+        }
+        XCTAssertTrue(stubs.calls.isEmpty)
+        XCTAssertTrue(navigator.opened.isEmpty)
+        XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.docID))
+        lock.locked.remove(Fixtures.docID)
+        for url in links { _ = try await h.run(CommandIDs.appOpenURL, ["url": .string(url)]) }
+        XCTAssertEqual(stubs.ids.filter { $0 == CommandIDs.docOpen }.count, 4)
+        XCTAssertEqual(stubs.ids.filter { $0 == CommandIDs.commentTapAt }.count, 1)
+        XCTAssertEqual(stubs.ids.filter { $0 == CommandIDs.audioPlay }.count, 1)
+    }
+
     func testOpenLinkOpensThePageAndTheCommentThread() async throws {
         let h = Harness(features: [FeatSystemIntegrationFeature.self])
         let stubs = CommandStubs()

@@ -830,6 +830,27 @@ final class FeatAudioTests: XCTestCase {
 
     // MARK: Playback
 
+    func testPlayRefusesLockedDocumentsForExplicitAndImplicitClips() async throws {
+        let (h, audio) = try harness()
+        let engine = FakePlaybackEngine(length: 600)
+        audio.makeEngine = { engine }
+        try Data([0]).write(to: try file(h, "audio/FIXTUREAUD01.caf"))
+        let lock = FakeLockService(locked: [Fixtures.docID])
+        h.app.services.lock = lock
+        await assertThrows(.locked) { try await h.run("audio.play", ["clip": .string(self.fixtureClip)]) }
+        await assertThrows(.locked) { try await h.run("audio.play") }
+        XCTAssertTrue(engine.opened.isEmpty)
+        XCTAssertNil(audio.playback)
+        lock.locked.remove(Fixtures.docID)
+        _ = try await h.run("audio.play", ["clip": .string(fixtureClip)])
+        _ = try await h.run("audio.pause")
+        lock.locked.insert(Fixtures.docID)
+        let plans = engine.plans.count
+        await assertThrows(.locked) { try await h.run("audio.play", ["toggle": true]) }
+        XCTAssertEqual(engine.plans.count, plans)
+        XCTAssertEqual(audio.playback?.isPlaying, false)
+    }
+
     func testPlaybackCommandsDriveTheOutput() async throws {
         let (h, audio) = try harness()
         let engine = FakePlaybackEngine(length: 600)

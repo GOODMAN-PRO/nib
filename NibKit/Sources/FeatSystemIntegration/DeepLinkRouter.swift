@@ -464,6 +464,7 @@ enum DeepLinkRouter {
             guard !ctx.dryRun else { return RouteResult(route: link.route, ref: ref) }
             try await show(doc: doc, page: page, ctx: ctx)
             if comment != nil, let page {
+                try requireUnlocked(doc, ctx)
                 // F037: a comment link opens its thread (the tap chain, with the thread named explicitly). Without the
                 // comments feature the page is still the right place to land.
                 if ctx.bus.registry.entry(SystemIDs.commentTapAt) != nil {
@@ -566,6 +567,7 @@ enum DeepLinkRouter {
     /// Opens `doc` (at `page`) in the active window: `doc.open` (F018), or the window's navigator when that feature is
     /// not installed.
     static func show(doc: DocumentID, page: PageID?, ctx: CommandContext) async throws {
+        try requireUnlocked(doc, ctx)
         if ctx.bus.registry.entry(SystemIDs.docOpen) != nil {
             var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
             if let page { params["page"] = .string(NodeRef.page(doc, page).description) }
@@ -576,8 +578,17 @@ enum DeepLinkRouter {
         navigator.openDocument(doc, page: page, mode: .replace)
     }
 
-    /// The document exists in the library and is not in Trash (a link can outlive what it points at).
+    /// Refuse before a link reads or presents document content; the user can unlock it from the library.
+    static func requireUnlocked(_ doc: DocumentID, _ ctx: CommandContext) throws {
+        if ctx.services.lock?.isLocked(doc) == true {
+            throw NibError(.locked, String(localized: "This document is locked."), path: "$.url",
+                           hint: String(localized: "Unlock the document in the library, then open the link again."))
+        }
+    }
+
+    /// The document is unlocked, exists in the library and is not in Trash.
     static func requireDocument(_ doc: DocumentID, _ ctx: CommandContext) throws {
+        try requireUnlocked(doc, ctx)
         if let library = ctx.services.library {
             guard let node = library.node(doc), node.kind == .document, node.trashedAt == nil else {
                 throw NibError(.notFound, "document \(doc.raw) not found (it may be in Trash)", path: "$.url",
