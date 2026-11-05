@@ -325,6 +325,46 @@ final class LessonManagerTests: XCTestCase {
         XCTAssertEqual(try fresh.loadHead(doc), changed)
     }
 
+    func testCloseFlushReportsRepeatedFailureThenPersistsPrivateAnnotations() throws {
+        let h = harness()
+        let doc = LessonManager.privateID(Fixtures.docID, device: h.app.workspace.clock.deviceHex)
+        let root = h.persistence.root.appendingPathComponent("close-retry-private-save")
+        let failure = PrivateSaveFailureSwitch()
+        let store = PrivateLessonPersistence(base: h.persistence, root: root, write: { snapshot, url in
+            try failure.write(snapshot, url: url)
+        }, report: { [weak app = h.app] doc, error in
+            if let app { PrivateLessonPersistence.reportStatus(doc, message: error, app: app) }
+        })
+        let page = PageRecord(id: "PRIVATEPAGE01", order: "V", size: .a4, background: .ofColor(.white))
+        let head = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook), pages: [page])
+        try store.seed(LessonSnapshot(content: head, items: [:]))
+        h.app.workspace.persistence = store
+        _ = try h.app.workspace.content(doc)
+        let annotation = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 200, h: 80),
+                                                   text: RichText(plain: "Private annotation")), layer: 0)
+        failure.setFailing(true)
+        store.didChange(doc, head: nil, pages: [page.id: [annotation]])
+        // ShellViewController.closeDocument uses this workspace-exposed persistence, not the base store.
+        // Each explicit failed close must report synchronously, even if the same error was already shown.
+        for _ in 0..<2 {
+            let before = h.app.events.lastSeq
+            h.app.workspace.persistence.flush(doc)
+            let status = h.app.events.events(since: before).last { $0.doc == doc }?.decode(SyncStatusPayload.self)
+            XCTAssertEqual(status?.state, "error")
+            XCTAssertEqual(status?.source, "store")
+            XCTAssertEqual(store.pendingSnapshot(doc)?.items[page.id], [annotation])
+        }
+        failure.setFailing(false)
+        let before = h.app.events.lastSeq
+        h.app.workspace.persistence.flush(doc)
+        let recovered = h.app.events.events(since: before).last { $0.doc == doc }?.decode(SyncStatusPayload.self)
+        XCTAssertEqual(recovered?.state, "idle")
+        XCTAssertNil(store.pendingSnapshot(doc))
+        XCTAssertNotNil(h.app.workspace.loadedDocuments.first { $0 == doc }, "another window may still use the workspace")
+        let fresh = PrivateLessonPersistence(base: h.persistence, root: root)
+        XCTAssertEqual(try fresh.loadItems(doc, page: page.id), [annotation])
+    }
+
     func testPresentRefreshPreservesEditsMadeDuringTransfer() async throws {
         let h = harness()
         let (doc, page, _, _) = try source(h)

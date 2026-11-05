@@ -243,6 +243,7 @@ final class PrivateLessonPersistence: DocumentPersistence {
     private let writes: PrivateLessonWrites
     private let report: (DocumentID, String?) -> Void
     private var deliveredStatusSequence = 0
+    private var reportedErrors: [DocumentID: String] = [:]
 
     init(base: DocumentPersistence, root: URL,
          write: @escaping (LessonSnapshot, URL) throws -> Void = { snapshot, url in
@@ -263,7 +264,10 @@ final class PrivateLessonPersistence: DocumentPersistence {
     private func deliverStatus(_ batch: PrivateLessonStatusBatch) {
         guard batch.sequence > deliveredStatusSequence else { return }
         deliveredStatusSequence = batch.sequence
-        for (doc, error) in batch.changes { report(doc, error) }
+        for (doc, error) in batch.changes {
+            reportedErrors[doc] = error
+            report(doc, error)
+        }
         let writes = self.writes
         writer.async { writes.undeliveredStatus.removeAll { $0.sequence <= batch.sequence } }
     }
@@ -335,9 +339,13 @@ final class PrivateLessonPersistence: DocumentPersistence {
     }
     func flush(_ doc: DocumentID) {
         guard LessonManager.isPrivate(doc) else { base.flush(doc); return }
+        let previouslyReported = reportedErrors[doc]
         let url = package(doc).appendingPathComponent("presentation.json")
         writer.sync { writes.retry(doc, at: url) }
         reportStatus()
+        // A user retry (including tab close) must receive a synchronous failure even
+        // when background saves have already reported this same error.
+        if let error = saveError(doc), error == previouslyReported { report(doc, error) }
     }
     func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
         guard LessonManager.isPrivate(doc) else { return try base.fileURL(doc, relativePath: relativePath) }
