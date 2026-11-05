@@ -115,6 +115,47 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testMalformedStoredKeysAreRejectedForSingleAndBatchWrites() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        let before = try h.snapshot()
+        for key in ["0", "00", "_", "V0", "A-B", "é"] {
+            for batch in [false, true] {
+                for kind in 0..<5 {
+                    XCTAssertThrowsError(try ctx.mutate { tx -> Void in
+                        switch kind {
+                        case 0:
+                            var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                            item.z = key
+                            if batch { try tx.put([item], doc: Fixtures.docID, page: Fixtures.page1) }
+                            else { try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1) }
+                        case 1:
+                            let page = PageRecord(order: key)
+                            if batch { try tx.put([PageRecord(), page], doc: Fixtures.docID) }
+                            else { try tx.put(page, doc: Fixtures.docID) }
+                        case 2:
+                            let block = TextBlock(kind: .paragraph, order: key)
+                            if batch { try tx.put([TextBlock(kind: .paragraph), block], doc: Fixtures.docID) }
+                            else { try tx.put(block, doc: Fixtures.docID) }
+                        case 3:
+                            let card = StudyCard(front: CardFace(), back: CardFace(), order: key)
+                            if batch { try tx.put([StudyCard(front: CardFace(), back: CardFace()), card], doc: Fixtures.docID) }
+                            else { try tx.put(card, doc: Fixtures.docID) }
+                        default:
+                            let entry = OutlineEntry(title: "Invalid order", page: nil, order: key)
+                            if batch { try tx.put([OutlineEntry(title: "Valid", page: nil), entry], doc: Fixtures.docID) }
+                            else { try tx.put(entry, doc: Fixtures.docID) }
+                        }
+                    }) { error in
+                        XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+                    }
+                    XCTAssertEqual(try h.snapshot(), before, "Failed writes must be atomic")
+                    XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+                }
+            }
+        }
+    }
+
     func testSelectiveRevertSkipsLaterEdits() async throws {
         let h = Harness()
         let ctx = try await probeContext(h)

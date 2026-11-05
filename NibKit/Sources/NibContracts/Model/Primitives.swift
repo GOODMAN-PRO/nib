@@ -179,6 +179,13 @@ public final class HLCClock {
 public enum FractionalIndex {
     private static let digits = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".utf8)
 
+    /// Stored keys are nonempty base-62 strings with room for an insertion before them.
+    public static func isValid(_ key: String) -> Bool {
+        !key.isEmpty && key.utf8.last != digits[0] && key.utf8.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+        }
+    }
+
     private static func value(_ byte: UInt8) -> Int {
         switch byte {
         case 48...57: return Int(byte - 48)
@@ -190,6 +197,7 @@ public enum FractionalIndex {
 
     /// A key strictly between `a` and `b` (nil = unbounded). Precondition: a < b when both are given.
     /// Existing base-62 keys keep their lexical order; no stored keys need rewriting.
+    /// Malformed legacy bounds are tolerated without trapping, but cannot guarantee a strict interval.
     public static func between(_ a: String?, _ b: String?) -> String {
         if let a, !a.isEmpty, b == nil { return boundary(a, increasing: true) }
         if (a == nil || a?.isEmpty == true), let b, !b.isEmpty { return boundary(b, increasing: false) }
@@ -242,10 +250,14 @@ public enum FractionalIndex {
         for i in 0..<min(width, bytes.count - prefix) { counter[i] = value(bytes[prefix + i]) }
         var i = width - 1
         if increasing {
-            while counter[i] == 61 { counter[i] = 0; i -= 1 }
+            while i >= 0 && counter[i] == 61 { counter[i] = 0; i -= 1 }
+            guard i >= 0 else { return midpoint(key, nil) }
             counter[i] += 1
         } else {
-            while counter[i] == 0 { counter[i] = 61; i -= 1 }
+            while i >= 0 && counter[i] == 0 { counter[i] = 61; i -= 1 }
+            // An all-zero (or non-base62) legacy key may have no valid predecessor.
+            // Stay total; transaction validation rejects malformed keys on writes.
+            guard i >= 0 else { return midpoint(nil, key) }
             counter[i] -= 1
         }
         var result = [UInt8](repeating: digits[edge], count: prefix)

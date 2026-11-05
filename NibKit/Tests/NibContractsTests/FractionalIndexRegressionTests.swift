@@ -2,6 +2,22 @@ import XCTest
 import NibContracts
 
 final class FractionalIndexRegressionTests: XCTestCase {
+    func testMalformedLegacyBoundsNeverTrap() {
+        let malformed = ["", "0", "00", "_", "000_", "V0", "é", "🙂", String(repeating: "0", count: 20_000)]
+        for key in malformed {
+            XCTAssertFalse(FractionalIndex.isValid(key))
+            // There is no valid base-62 predecessor of "0"; only valid bounds promise ordering.
+            assertValid(FractionalIndex.between(nil, key))
+            assertValid(FractionalIndex.between(key, nil))
+            XCTAssertEqual(FractionalIndex.balanced(count: 3, before: key).count, 3)
+            XCTAssertEqual(FractionalIndex.sequence(after: key, count: 3).count, 3)
+            for other in ["0", "_", "V", "é"] {
+                XCTAssertFalse(FractionalIndex.between(key, other).isEmpty)
+                XCTAssertFalse(FractionalIndex.between(other, key).isEmpty)
+            }
+        }
+    }
+
     func testLongBoundaryRunsGrowLogarithmicallyInBothDirections() {
         for increasing in [true, false] {
             var previous: String?

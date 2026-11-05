@@ -128,6 +128,7 @@ public final class DocTransaction {
                     it.z = FractionalIndex.between(top, nil)
                 }
             }
+            try checkOrderKey(it.z, path: "$.z")
             if top.map({ it.z > $0 }) ?? true { top = it.z }
             stampProvenance(&it, existing: existing, inherited: nil)
             it.rev = workspace.clock.tick()
@@ -155,6 +156,7 @@ public final class DocTransaction {
     }
 
     private func checked(_ item: Item) throws -> Item {
+        if !item.z.isEmpty { try checkOrderKey(item.z, path: "$.z") }
         guard item.isValid else {
             throw NibError(.invariantViolation, "item \(item.id) must carry exactly the '\(item.kind.rawValue)' payload")
         }
@@ -162,6 +164,12 @@ public final class DocTransaction {
             throw NibError.invalid("layer must be 0...\(NibLimits.layerCount - 1)")
         }
         return item
+    }
+
+    private func checkOrderKey(_ key: String, path: String = "$.order") throws {
+        guard FractionalIndex.isValid(key) else {
+            throw NibError.invalid(String(localized: "Order keys must contain only letters A–Z, a–z and digits, and must not end in 0."), path: path)
+        }
     }
 
     /// Provenance cannot be forged: non-user principals always stamp themselves on create and never change it;
@@ -183,6 +191,7 @@ public final class DocTransaction {
         if it.z.isEmpty {
             if let z = existing?.z, !z.isEmpty { it.z = z } else { it.z = try topZ(doc, page: page) }
         }
+        try checkOrderKey(it.z, path: "$.z")
         stampProvenance(&it, existing: existing, inherited: inherited)
         it.rev = workspace.clock.tick()
         let before = try workspace.writeItem(it, doc: doc, page: page)
@@ -209,6 +218,7 @@ public final class DocTransaction {
             let last = try content(doc).livePages.last?.order
             p.order = FractionalIndex.between(last, nil)
         }
+        try checkOrderKey(p.order)
         return try putRecord(p, doc: doc, at: \.pages) { .page(doc, before: $0, after: $1) }
     }
 
@@ -226,6 +236,7 @@ public final class DocTransaction {
             let last = try content(doc).liveBlocks.last?.order
             b.order = FractionalIndex.between(last, nil)
         }
+        try checkOrderKey(b.order)
         return try putRecord(b, doc: doc, at: \.blocks) { .block(doc, before: $0, after: $1) }
     }
 
@@ -236,6 +247,7 @@ public final class DocTransaction {
             let last = try content(doc).liveCards.last?.order
             c.order = FractionalIndex.between(last, nil)
         }
+        try checkOrderKey(c.order)
         return try putRecord(c, doc: doc, at: \.cards) { .card(doc, before: $0, after: $1) }
     }
 
@@ -302,6 +314,7 @@ public final class DocTransaction {
             let last = try content(doc).liveOutline.last?.order
             e.order = FractionalIndex.between(last, nil)
         }
+        try checkOrderKey(e.order)
         return try putRecord(e, doc: doc, at: \.outline) { .outline(doc, before: $0, after: $1) }
     }
 
@@ -323,6 +336,7 @@ public final class DocTransaction {
                 }
                 r.order = runKeys.removeFirst()
             }
+            try checkOrderKey(r.order)
             if top.map({ r.order > $0 }) ?? true { top = r.order }
             r.rev = workspace.clock.tick()
             prepared.append(r)
