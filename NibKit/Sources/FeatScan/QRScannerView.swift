@@ -167,24 +167,31 @@ struct QRResultPanel: View {
     @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
+        ViewThatFits(in: .vertical) {
+            content(scrollDestination: true)
+                .fixedSize(horizontal: false, vertical: true)
+            // Small landscape windows may not even fit the header and action. Scroll them together.
+            ScrollView { content(scrollDestination: false) }
+        }
+        .frame(maxWidth: NibMetrics.panelWidth(typeSize))
+        .droplet("scan.qr.result", style: .panel)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func content(scrollDestination: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             NibPanelHeader(title: QRResultPanel.kindTitle(payload.kind), symbol: QRResultPanel.symbol(payload.kind),
                            onClose: onClose)
-            if let host = QRResultPanel.host(payload) {
-                Text(host)
-                    .font(NibFont.bodyEmphasis)
-                    .foregroundStyle(NibColor.label)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, NibSpacing.l)
-                    .padding(.bottom, NibSpacing.xs)
-                    .accessibilityLabel(String(localized: "Goes to \(host)"))
-            }
             if payload.url != nil {
-                // The whole link, wrapped; a very long one scrolls instead of pushing the button off screen.
-                ViewThatFits(in: .vertical) {
-                    link
-                    ScrollView { link }
-                        .frame(maxHeight: QRResultPanel.linkMaxHeight)
+                if scrollDestination {
+                    ViewThatFits(in: .vertical) {
+                        destination
+                        ScrollView { destination }
+                            .frame(height: QRResultPanel.linkMaxHeight)
+                    }
+                    .frame(maxHeight: QRResultPanel.linkMaxHeight)
+                } else {
+                    destination
                 }
             } else {
                 link
@@ -195,9 +202,21 @@ struct QRResultPanel: View {
                       action: action)
                 .padding(NibSpacing.l)
         }
-        .frame(maxWidth: NibMetrics.panelWidth(typeSize))
-        .droplet("scan.qr.result", style: .panel)
-        .accessibilityElement(children: .contain)
+    }
+
+    private var destination: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let host = QRResultPanel.host(payload) {
+                Text(host)
+                    .font(NibFont.bodyEmphasis)
+                    .foregroundStyle(NibColor.label)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, NibSpacing.l)
+                    .padding(.bottom, NibSpacing.xs)
+                    .accessibilityLabel(String(localized: "Goes to \(host)"))
+            }
+            link
+        }
     }
 
     private var link: some View {

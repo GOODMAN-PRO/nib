@@ -67,7 +67,7 @@ struct MathRecognize: NibCommand {
 
 struct MathConvert: NibCommand {
     struct Params: Codable { var refs: [String]; var latex: [String]?; var id: String?; var revs: [Rev]? = nil }
-    struct Output: Codable { var ref: String; var lines: [String] }
+    struct Output: Codable { var ref: String; var lines: [String]; var rev: Rev }
     static let descriptor = CommandDescriptor(id: CommandIDs.mathConvert, title: String(localized: "Convert to Maths"),
         summary: "Replace selected handwriting with a math object, retaining the original ink. latex is an array of LaTeX lines; id chooses its ID; optional revs guards against ink changed since recognition.",
         params: .obj(["refs": .arr(.ref), "latex": .arr(.str()), "id": .str(), "revs": .arr(.str("Recognised item revision, in the same order as refs"))], required: ["refs"]),
@@ -95,7 +95,7 @@ struct MathConvert: NibCommand {
         if let revs = p.revs, revs.count != selection.items.count {
             throw NibError(.invalidParams, "Pass one recognised revision per ref", path: "$.revs")
         }
-        try ctx.mutate { tx in
+        let revision = try ctx.mutate { tx in
             if let revs = p.revs {
                 for (index, item) in selection.items.enumerated() {
                     guard try tx.item(selection.doc, page: selection.page, id: item.id).rev == revs[index] else {
@@ -125,26 +125,30 @@ struct MathConvert: NibCommand {
                 if changed { try tx.put(other, doc: selection.doc, page: selection.page) }
             }
             try tx.delete(items: selection.items.map(\.id), doc: selection.doc, page: selection.page)
-            try tx.put(item, doc: selection.doc, page: selection.page)
+            return try tx.put(item, doc: selection.doc, page: selection.page).rev
         }
         if !ctx.dryRun, ctx.principal.isUser, let session = ctx.session,
            session.document == selection.doc, session.page == selection.page {
             session.selection = Selection(doc: selection.doc, page: selection.page, items: [id], bounds: math.frame.bounds)
         }
-        return Output(ref: NodeRef.item(selection.doc, selection.page, id).description, lines: lines)
+        return Output(ref: NodeRef.item(selection.doc, selection.page, id).description, lines: lines, rev: revision)
     }
 }
 
 struct MathSetLatex: NibCommand {
-    struct Params: Codable { var ref: String; var lines: [String] }
+    struct Params: Codable { var ref: String; var lines: [String]; var rev: Rev? = nil }
+    struct Output: Codable { var rev: Rev }
     static let descriptor = CommandDescriptor(id: CommandIDs.mathSetLatex, title: String(localized: "Edit LaTeX"),
         summary: "Replace a math object's LaTeX lines while preserving its colour, position, width, rotation and original handwriting, and fitting its height to the formula.",
-        params: .obj(["ref": .ref, "lines": .arr(.str())], required: ["ref", "lines"]),
+        params: .obj(["ref": .ref, "lines": .arr(.str()), "rev": .str("Revision loaded by the editor")], required: ["ref", "lines"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01", "lines": ["\\frac{a}{b}", "x^{2}"]]], effect: .edit)
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let selection = try await MathSelection.load([p.ref], ctx, strokesOnly: false)
         try selection.requireEditable(ctx)
         var item = selection.items[0]
+        if let rev = p.rev, item.rev != rev {
+            throw NibError(.conflict, String(localized: "This formula changed elsewhere. Your draft has been kept. Reopen the editor to load the updated formula."))
+        }
         guard var math = item.math else { throw NibError(.invalidParams, "Select a math object", path: "$.ref", hint: "call query.get to inspect the item kind") }
         let color = math.color
         let natural = try await Task.detached(priority: .userInitiated) {
@@ -152,12 +156,12 @@ struct MathSetLatex: NibCommand {
         }.value
         math.frame.h = math.frame.w * natural.height / natural.width
         math.latex = p.lines; item.math = math
-        try ctx.mutate { tx in
+        return try ctx.mutate { tx in
             try selection.requireEditable(ctx)
             try selection.requireUnchanged(tx)
-            try tx.put(item, doc: selection.doc, page: selection.page)
+            let saved = try tx.put(item, doc: selection.doc, page: selection.page)
+            return Output(rev: saved.rev)
         }
-        return NoResult()
     }
 }
 
@@ -169,6 +173,7 @@ struct MathCopy: NibCommand {
         var lines: [String]?
         var asset: String?
         var fragment: NibFragment?
+        var rev: Rev? = nil
     }
     static let descriptor = CommandDescriptor(id: CommandIDs.mathCopy, title: String(localized: "Copy Maths"),
         summary: "Return a math object as LaTeX, a temporary PNG asset, or its original nib-fragment/1 handwriting.",
@@ -178,7 +183,7 @@ struct MathCopy: NibCommand {
         let selection = try await MathSelection.load([p.ref], ctx, strokesOnly: false)
         guard let math = selection.items[0].math else { throw NibError(.invalidParams, "Select a math object", path: "$.ref", hint: "call query.get for math items") }
         switch p.as {
-        case "latex": return Output(format: "latex", latex: math.latex.joined(separator: "\n"), lines: math.latex)
+        case "latex": return Output(format: "latex", latex: math.latex.joined(separator: "\n"), lines: math.latex, rev: selection.items[0].rev)
         case "image":
             guard let assets = ctx.services.assets else { throw NibError.unavailable("The asset store is not installed") }
             let data = try await Task.detached(priority: .userInitiated) {

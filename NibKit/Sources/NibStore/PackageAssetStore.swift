@@ -32,14 +32,36 @@ final class PackageAssetStore: AssetStore {
 
     func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
         if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
-        let pkg = try PackageFiles.existingPackage(doc, locator)
         let ref = try PackageAssetStore.ref(for: data, ext: ext)
-        let url = pkg.appendingPathComponent("assets", isDirectory: true).appendingPathComponent(ref.name)
-        // Content-addressed: an existing file with this name already holds these bytes.
-        if FileManager.default.fileExists(atPath: url.path) { return ref }
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try PackageFiles.coordinatedWrite(data, to: url)
+        let pkg = try PackageFiles.existingPackage(doc, locator)
+        try write(data, ref: ref, doc: doc, package: pkg)
         return ref
+    }
+
+    /// Coordinate the package itself, as library moves do. Revalidate inside the accessor: a move may have
+    /// completed while coordination was waiting. Never recreate an old package or acknowledge a stranded asset.
+    func write(_ data: Data, ref: AssetRef, doc: DocumentID, package: URL) throws {
+        var coordinationError: NSError?
+        var writeError: Error?
+        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: package, options: [],
+                                                         error: &coordinationError) { target in
+            do {
+                guard locator.url(doc)?.standardizedFileURL == target.standardizedFileURL,
+                      FileManager.default.fileExists(atPath: target.path) else {
+                    throw NibError(.conflict, String(localized: "The notebook moved. Try importing the asset again."))
+                }
+                if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
+                let directory = target.appendingPathComponent("assets", isDirectory: true)
+                let url = directory.appendingPathComponent(ref.name)
+                if FileManager.default.fileExists(atPath: url.path) { return }
+                if !FileManager.default.fileExists(atPath: directory.path) {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                }
+                try data.write(to: url, options: .atomic)
+            } catch { writeError = error }
+        }
+        if let error = coordinationError { throw error }
+        if let error = writeError { throw error }
     }
 
     func url(_ ref: AssetRef, doc: DocumentID) -> URL? {

@@ -15,6 +15,7 @@ private struct LatexLine: Identifiable, Equatable {
 struct MathEditorSheet: View {
     let context: PanelContext
     @State private var lines: [LatexLine] = []
+    @State private var revision: Rev?
     @State private var revs: [Rev]?
     @State private var loaded = false
     @State private var targetInitialized = false
@@ -213,7 +214,9 @@ struct MathEditorSheet: View {
             if let ref {
                 let result = try await context.app.bus.execute(Invocation(command: CommandIDs.mathCopy,
                     params: ["ref": .string(ref), "as": "latex"], session: context.session))
-                lines = (try result.value.decode(MathCopy.Output.self).lines ?? []).map { LatexLine(text: $0) }
+                let copied = try result.value.decode(MathCopy.Output.self)
+                lines = (copied.lines ?? []).map { LatexLine(text: $0) }
+                revision = copied.rev
             } else {
                 refs = context.params["refs"]?.arrayValue?.compactMap(\.stringValue) ?? context.session?.selection.refs ?? []
                 guard !refs.isEmpty else {
@@ -240,9 +243,13 @@ struct MathEditorSheet: View {
                 var params: [String: JSONValue]
                 if let ref { params = ["ref": .string(ref), "lines": .array(texts.map(JSONValue.string))] }
                 else { params = ["refs": .array(refs.map(JSONValue.string)), "latex": .array(texts.map(JSONValue.string))] }
+                if ref != nil, let revision { params["rev"] = try JSONValue.from(revision) }
                 if ref == nil, let revs { params["revs"] = try JSONValue.from(revs) }
                 let result = try await context.app.bus.execute(Invocation(command: command, params: .object(params), session: context.session))
-                if ref == nil { ref = result.value["ref"]?.stringValue }
+                if ref == nil {
+                    let converted = try result.value.decode(MathConvert.Output.self)
+                    ref = converted.ref; revision = converted.rev
+                } else { revision = try result.value.decode(MathSetLatex.Output.self).rev }
                 undoGroup = result.group; applied = true; applyFailed = false
             } catch {
                 let failure = NibError.wrap(error)

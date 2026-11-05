@@ -475,6 +475,7 @@ final class PrintTable {
 
 /// The whole document as units (a block's text, an image, a rule, a table, a drawing) and the pages they fall on.
 final class TextDocPrintLayout {
+    private(set) var imageFailure: Error?
     enum Decoration {
         case none
         /// A bullet or list number, right-aligned in the gutter on the first line.
@@ -543,6 +544,13 @@ final class TextDocPrintLayout {
         let units = TextDocPrintLayout.units(snapshot, width: size.width, pageHeight: size.height)
         self.units = units
         self.pages = TextDocPrintLayout.paginate(units, pageHeight: size.height)
+        let laidOut = Set(units.compactMap { unit -> AssetRef? in
+            if case .image(let asset, _) = unit.content { return asset }
+            return nil
+        })
+        if let missing = snapshot.blocks.first(where: { $0.kind == .image && $0.asset.map { !laidOut.contains($0) } == true })?.asset {
+            imageFailure = TextDocPrintImages.unreadable(missing)
+        }
     }
 
     // MARK: Units
@@ -810,6 +818,10 @@ final class TextDocPrintLayout {
                 autoreleasepool {
                     guard let store = snapshot.assets,
                           let image = BlockImageLoader.load(store, asset: asset, doc: snapshot.doc, maxPixel: maxPixel) else {
+                        imageFailure = TextDocPrintImages.unreadable(asset)
+                        // Printing callbacks cannot throw. A late file failure must remain visible on paper.
+                        String(localized: "Image unavailable").draw(at: origin, withAttributes: [
+                            .font: type.font(type.small), .foregroundColor: type.secondary])
                         return
                     }
                     image.draw(in: CGRect(x: origin.x, y: origin.y, width: u.width, height: p.height))
@@ -883,7 +895,13 @@ class TextDocPageRenderer: UIPrintPageRenderer {
     override var numberOfPages: Int { max(1, layout().pages.count) }
 
     override func drawContentForPage(at pageIndex: Int, in contentRect: CGRect) {
-        layout().draw(page: pageIndex, in: self.contentRect)
+        let prepared = layout()
+        if let error = prepared.imageFailure {
+            NibError.wrap(error).message.draw(in: self.contentRect, withAttributes: [
+                .font: snapshot.type.font(snapshot.type.small), .foregroundColor: snapshot.type.secondary])
+            return
+        }
+        prepared.draw(page: pageIndex, in: self.contentRect)
     }
 
     override func drawFooterForPage(at pageIndex: Int, in footerRect: CGRect) {
@@ -908,12 +926,24 @@ extension TextDocPrintLayout {
 enum TextDocPDF {
     /// Writes the PDF to `url` page by page. Pass the layout when it was made already (for the snapshot's paper).
     static func write(_ snapshot: TextDocPrintSnapshot, layout: TextDocPrintLayout? = nil, to url: URL) throws {
-        try renderer(snapshot).writePDF(to: url) { context in draw(snapshot, layout: layout, into: context) }
+        try TextDocPrintImages.validate(snapshot)
+        let layout = layout ?? TextDocPrintLayout(snapshot, size: TextDocPrintMetrics.contentRect(paper: snapshot.paper).size)
+        do {
+            try renderer(snapshot).writePDF(to: url) { context in draw(snapshot, layout: layout, into: context) }
+            if let error = layout.imageFailure { throw error }
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
     }
 
     /// The same PDF as data (tests, small documents).
-    static func data(_ snapshot: TextDocPrintSnapshot, layout: TextDocPrintLayout? = nil) -> Data {
-        renderer(snapshot).pdfData { context in draw(snapshot, layout: layout, into: context) }
+    static func data(_ snapshot: TextDocPrintSnapshot, layout: TextDocPrintLayout? = nil) throws -> Data {
+        try TextDocPrintImages.validate(snapshot)
+        let layout = layout ?? TextDocPrintLayout(snapshot, size: TextDocPrintMetrics.contentRect(paper: snapshot.paper).size)
+        let data = renderer(snapshot).pdfData { context in draw(snapshot, layout: layout, into: context) }
+        if let error = layout.imageFailure { throw error }
+        return data
     }
 
     private static func renderer(_ snapshot: TextDocPrintSnapshot) -> UIGraphicsPDFRenderer {
@@ -938,6 +968,26 @@ enum TextDocPDF {
 
 /// Image blocks on paper: measured from the file's header when the layout is made, decoded when a page is drawn.
 enum TextDocPrintImages {
+    static func unreadable(_ asset: AssetRef) -> NibError {
+        NibError(.notFound, String(localized: "An image could not be read: \(asset.name). Restore or replace it before exporting or printing."))
+    }
+
+    /// Validate headers AND pixels; a readable header alone does not guarantee a decodable image.
+    /// Each bitmap is released before the next. Printing preflights headers only; drawing validates the pixels.
+    static func validate(_ snapshot: TextDocPrintSnapshot,
+                         decodePixels: Bool = true,
+                         decode: (AssetStore, AssetRef, DocumentID, CGFloat) -> UIImage? = BlockImageLoader.load) throws {
+        for block in snapshot.blocks where block.kind == .image {
+            guard let asset = block.asset else { continue } // An empty image placeholder has no referenced content.
+            try autoreleasepool {
+                guard let store = snapshot.assets,
+                      pixelSize(store, asset: asset, doc: snapshot.doc) != nil,
+                      !decodePixels || decode(store, asset, snapshot.doc, snapshot.paper.width * 3) != nil else {
+                    throw unreadable(asset)
+                }
+            }
+        }
+    }
     /// The image's size in pixels, upright (EXIF orientation applied), without decoding it. Nil when the asset is
     /// missing or is not an image.
     static func pixelSize(_ store: AssetStore, asset: AssetRef, doc: DocumentID) -> CGSize? {
@@ -986,6 +1036,7 @@ enum TextDocPrinter {
             ?? String(localized: "Text Document")
         let snapshot = TextDocPrintSnapshot.make(doc: doc, title: title, blocks: blocks, assets: app.services.assets,
                                                  options: [:])
+        try TextDocPrintImages.validate(snapshot, decodePixels: false)
         return TextDocPageRenderer(snapshot: snapshot, paper: nil)
     }
 

@@ -15,7 +15,7 @@ struct ViewSetReadOnly: NibCommand {
     }
     static let example: JSONValue = ["on": true]
     static let descriptor = CommandDescriptor(
-        id: "view.setReadOnly", title: "Read Only Mode",
+        id: "view.setReadOnly", title: String(localized: "Read Only Mode"),
         summary: "Enter (on: true) or leave (on: false) read-only mode in the active window; omit on to toggle. No ink or tool input; links, tape, comments and audio still work.",
         params: .obj(["on": .bool("true = read-only, false = edit; omit to toggle")]),
         examples: [example],
@@ -60,7 +60,7 @@ struct PDFMarkSelection: NibCommand {
     static let strikeoutExample: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG003", "from": [76, 83], "to": [190, 83],
                                               "style": "strikeout"]
     static let descriptor = CommandDescriptor(
-        id: "pdf.markSelection", title: "Mark PDF Text",
+        id: "pdf.markSelection", title: String(localized: "Mark PDF Text"),
         summary: "Highlight (straight yellow highlighter) or strike out (pen line) the PDF text between two page points: one erasable stroke per line. Returns the stroke refs.",
         params: .obj(["page": .ref, "from": .point, "to": .point,
                       "style": .str("highlight = yellow highlighter over each line; strikeout = pen line through each line's middle",
@@ -134,7 +134,7 @@ struct PDFCopyText: NibCommand {
     }
     static let example: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG003", "from": [76, 83], "to": [190, 83]]
     static let descriptor = CommandDescriptor(
-        id: "pdf.copyText", title: "Copy PDF Text",
+        id: "pdf.copyText", title: String(localized: "Copy PDF Text"),
         summary: "Copy the PDF text between two page points to the clipboard; returns the text and its line rects.",
         params: .obj(["page": .ref, "from": .point, "to": .point], required: ["page", "from", "to"]),
         examples: [example],
@@ -175,7 +175,7 @@ struct PDFTapAt: NibCommand {
     }
     static let example: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG003", "point": [100, 82], "gesture": "longPress"]
     static let descriptor = CommandDescriptor(
-        id: "pdf.tapAt", title: "Select PDF Text at Point",
+        id: "pdf.tapAt", title: String(localized: "Select PDF Text at Point"),
         summary: "Tap chain: a long-press on PDF text selects the word under the point (the line when the PDF engine finds no word) and shows Highlight, Strikethrough, Define, Speak and Copy.",
         params: .obj(["page": .ref, "point": .point, "ref": .ref,
                       "gesture": .str("canvas gesture", choices: CanvasGesture.allCases.map { $0.rawValue })],

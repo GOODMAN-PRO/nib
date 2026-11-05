@@ -62,25 +62,31 @@ struct PageAdd: NibCommand {
         try! JSONValue.parse(#"{"doc": "doc:FIXTUREDOC04", "position": "end", "source": "blank"}"#)
     ]
 
-    static let descriptor = CommandDescriptor(
-        id: "page.add", title: "Add Page",
-        summary: "Add pages before/after a page or at the start/end: current template, blank, a template, a PDF or image asset, or the page clipboard. Returns the new page refs.",
-        params: .obj([
-            "doc": .ref,
-            "position": PageCommands.positionSchema,
-            "anchor": .ref,
-            "count": .int("number of pages (default 1); with source pdf, consecutive PDF pages from pdfPage", min: 1,
-                          max: PageCommands.maxNewPages),
-            "source": .str("current (default: the open page's paper) | blank | template | pdf | image | clipboard | choose (shows the template picker, user only)",
-                           choices: PageAdd.sources),
-            "template": .anything("source template: a template id (\"builtin.grid\"), {id, params}, or a Background {kind, template?, asset?, pdfPage?, color?}"),
-            "size": .anything("page size: preset name (A4, A5, Letter, Standard…, optionally ' landscape'), [width, height] or {width, height} in points; default: the open page's size"),
-            "asset": .str("source pdf or image: an asset name in this document (from asset.put)"),
-            "pdfPage": .int("source pdf: 0-based first PDF page (default 0)", min: 0),
-            "id": .str("caller-chosen id of the (first) new page"),
-            "ids": PageCommands.idsSchema
-        ]),
-        examples: PageAdd.examples, effect: .edit)
+    static var descriptor: CommandDescriptor { localizedDescriptor() }
+
+    /// Explicit bundle/locale lets package tests exercise app-catalogue localization without changing
+    /// process-wide language preferences or relying on the hostless runner's English main bundle.
+    static func localizedDescriptor(bundle: Bundle = .main, locale: Locale = .current) -> CommandDescriptor {
+        CommandDescriptor(
+            id: "page.add", title: String(localized: "Add Page", bundle: bundle, locale: locale),
+            summary: "Add pages before/after a page or at the start/end: current template, blank, a template, a PDF or image asset, or the page clipboard. Returns the new page refs.",
+            params: .obj([
+                "doc": .ref,
+                "position": PageCommands.positionSchema,
+                "anchor": .ref,
+                "count": .int("number of pages (default 1); with source pdf, consecutive PDF pages from pdfPage", min: 1,
+                              max: PageCommands.maxNewPages),
+                "source": .str("current (default: the open page's paper) | blank | template | pdf | image | clipboard | choose (shows the template picker, user only)",
+                               choices: PageAdd.sources),
+                "template": .anything("source template: a template id (\"builtin.grid\"), {id, params}, or a Background {kind, template?, asset?, pdfPage?, color?}"),
+                "size": .anything("page size: preset name (A4, A5, Letter, Standard…, optionally ' landscape'), [width, height] or {width, height} in points; default: the open page's size"),
+                "asset": .str("source pdf or image: an asset name in this document (from asset.put)"),
+                "pdfPage": .int("source pdf: 0-based first PDF page (default 0)", min: 0),
+                "id": .str("caller-chosen id of the (first) new page"),
+                "ids": PageCommands.idsSchema
+            ]),
+            examples: PageAdd.examples, effect: .edit)
+    }
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let doc = try PageArgs.document(p.doc, ctx)
@@ -90,7 +96,7 @@ struct PageAdd: NibCommand {
         let source = try PageAdd.source(p)
 
         if source == "clipboard" {
-            guard let payload = PageClipboard.read() else { throw PageClipboard.emptyError }
+            guard let payload = await PageClipboard.read() else { throw PageClipboard.emptyError }
             let refs = try await PagePasting.paste(payload, into: doc, position: position, anchor: anchor,
                                                    id: p.id, ids: p.ids, ctx: ctx)
             await PageNavigation.reveal(refs.first, doc: doc, ctx)
@@ -277,7 +283,7 @@ struct PageDuplicate: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]]
 
     static let descriptor = CommandDescriptor(
-        id: "page.duplicate", title: "Duplicate Page",
+        id: "page.duplicate", title: String(localized: "Duplicate Page"),
         summary: "Duplicate pages with all their items; each copy goes right after its original. Returns the new page refs.",
         params: .obj(["pages": PageCommands.pagesSchema, "ids": PageCommands.idsSchema], required: ["pages"]),
         examples: [PageDuplicate.example], effect: .edit)
@@ -337,7 +343,7 @@ struct PageCopy: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC01/FIXTUREPG002"]]
 
     static let descriptor = CommandDescriptor(
-        id: "page.copy", title: "Copy Pages",
+        id: "page.copy", title: String(localized: "Copy Pages"),
         summary: "Copy pages with their items and images to the page clipboard (UTI app.nib.pages), ready for page.paste in any document.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageCopy.example], effect: .read)
@@ -379,7 +385,7 @@ struct PagePaste: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "page.paste", title: "Paste Pages",
+        id: "page.paste", title: String(localized: "Paste Pages"),
         summary: "Paste pages from the page clipboard (or an app.nib.pages payload) before/after a page or at the start/end of a document. Returns the new page refs.",
         params: .obj([
             "doc": .ref,
@@ -398,7 +404,7 @@ struct PagePaste: NibCommand {
         let payload: PagesPayload
         if let json = p.payload {
             payload = try PagesPayload.from(json)
-        } else if let clip = PageClipboard.read() {
+        } else if let clip = await PageClipboard.read() {
             payload = clip
         } else {
             throw PageClipboard.emptyError
@@ -426,7 +432,7 @@ struct PageMoveTo: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "doc": "doc:FIXTUREDOC04"]
 
     static let descriptor = CommandDescriptor(
-        id: "page.moveTo", title: "Move Pages",
+        id: "page.moveTo", title: String(localized: "Move Pages"),
         summary: "Move pages with their items, images and outline entries to the end of another notebook or whiteboard; one undo in either document restores both. Returns the new page refs.",
         params: .obj(["pages": PageCommands.pagesSchema, "doc": .ref, "ids": PageCommands.idsSchema], required: ["pages", "doc"]),
         examples: [PageMoveTo.example], effect: .edit)
@@ -435,7 +441,7 @@ struct PageMoveTo: NibCommand {
         let target = NodeRef.documentID(from: p.doc)
         let sources = try PageArgs.pages(p.pages, ctx)
         let chosen = try NewPageIDs.parse(id: nil, ids: p.ids, count: sources.count)
-        // Every refusal comes before any bytes are copied.
+        // Validate records before copying, then validate their dependencies again before mutation.
         var plan = try MovePlan(sources, to: target, ids: chosen, ctx)
         var map = AssetMap()
         // Assets travel with the pages, copied off the main actor in ONE job for every page that leaves, whichever
@@ -447,12 +453,15 @@ struct PageMoveTo: NibCommand {
             let assets = plan.assets
             let pdfUse = plan.pdfUse
             map = try await Task.detached(priority: .userInitiated) { () -> AssetMap in
-                // Everything is read first: a file that is there but unreadable stops the move before anything is stored.
+                // Everything is read first: any unresolved asset stops the move before anything is stored.
                 let filled = try AssetTransfer.fill(assets, pdfUse: pdfUse, for: target, store: store, strict: true)
                 return try AssetTransfer.install(filled, into: target, store: store)
             }.value
             // The documents may have changed while the bytes were copied: plan again from their current state.
             plan = try MovePlan(sources, to: target, ids: chosen, ctx)
+            guard plan.assets == assets, plan.pdfUse == pdfUse else {
+                throw NibError(.unavailable, String(localized: "The pages changed while their assets were being copied. Nothing was moved. Try again."))
+            }
         }
         let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
         // Across documents the move is ONE undo step: undoing it in either document restores both (contracts-v2 G4).
@@ -571,7 +580,7 @@ struct PageReorder: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "before": "page:FIXTUREDOC01/FIXTUREPG001"]
 
     static let descriptor = CommandDescriptor(
-        id: "page.reorder", title: "Reorder Pages",
+        id: "page.reorder", title: String(localized: "Reorder Pages"),
         summary: "Move pages (kept in the given order) before or after another page of the same document, or to the end when neither is given.",
         params: .obj(["pages": PageCommands.pagesSchema, "before": .ref, "after": .ref], required: ["pages"]),
         examples: [PageReorder.example], effect: .edit)
@@ -639,7 +648,7 @@ struct PageRotate: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "page.rotate", title: "Rotate Pages",
+        id: "page.rotate", title: String(localized: "Rotate Pages"),
         summary: "Rotate pages 90° clockwise, or by degrees (180, 270, -90): the page turns with its items and PDF or image background; all: doc ref rotates every page.",
         params: .obj([
             "pages": PageCommands.pagesSchema,
@@ -701,7 +710,7 @@ struct PageTrash: NibCommand {
     static let example: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]]
 
     static let descriptor = CommandDescriptor(
-        id: "page.trash", title: "Move to Trash",
+        id: "page.trash", title: String(localized: "Move to Trash"),
         summary: "Move pages to the Trash (recoverable with page.restore). A document always keeps at least one page.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .edit, destructive: true)
@@ -738,7 +747,7 @@ struct PageRestore: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "page.restore", title: "Restore Pages",
+        id: "page.restore", title: String(localized: "Restore Pages"),
         summary: "Restore pages from the Trash (put there by page.trash first) to their places in their documents; pages not in the Trash are left alone.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .edit)
@@ -790,7 +799,7 @@ struct PagePurge: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "page.purge", title: "Delete Permanently",
+        id: "page.purge", title: String(localized: "Delete Permanently"),
         summary: "Delete trashed pages and their items permanently. Cannot be undone; the pages must be in the Trash (page.trash).",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .irreversible, undoable: false)
@@ -1023,7 +1032,7 @@ enum PagePasting {
                       id: String?, ids: [String]?, ctx: CommandContext) async throws -> [String] {
         guard !payload.pages.isEmpty else { throw PageClipboard.emptyError }
         let chosen = try NewPageIDs.parse(id: id, ids: ids, count: payload.pages.count)
-        try NewPageIDs.checkUnused(chosen, in: ctx.workspace.content(doc))
+        try NewPageIDs.checkUnused(chosen, in: PageArgs.pagedContent(doc, ctx))
         let intoSource = payload.source == NodeRef.document(doc).description
         // Back in its own document a page keeps its references; anywhere else its PDF page must travel with it, unless
         // this document already holds that PDF (same name, same bytes).
@@ -1045,7 +1054,7 @@ enum PagePasting {
             }.value
         }
         // The document may have changed while the assets were copied: place the pages in it as it is now.
-        let content = try ctx.workspace.content(doc)
+        let content = try PageArgs.pagedContent(doc, ctx)
         try NewPageIDs.checkUnused(chosen, in: content)
         let placement = OrderKeys.plan(position, anchor: anchor, count: payload.pages.count, in: content.livePages)
         let keys = placement.keys

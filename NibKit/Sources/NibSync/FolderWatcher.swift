@@ -653,6 +653,9 @@ final class FolderWatcher {
     static let serviceKey = "sync.watcher"
     static let source = "sync"
     static let origin = "folder"
+    /// Matches NibLibraryFeature.CatalogRefresh without importing another feature.
+    typealias CatalogRefresh = @MainActor () async throws -> Bool
+    static let catalogRefreshKey = "library.refreshCatalog"
 
     private weak var app: NibApp?
     let device: String
@@ -690,7 +693,7 @@ final class FolderWatcher {
     private var pendingFull = false
     private var running: Task<SyncReport, Never>?
     private var polls = 0
-    private var downloadsPending = false
+    private(set) var downloadsPending = false
     private var rootRecoveryInFlight = false
     /// Checks run so far (tests and diagnostics).
     private(set) var checks = 0
@@ -1012,10 +1015,21 @@ final class FolderWatcher {
             if (reconcile || libraryBaseline == nil) && !refresh {
                 refresh = (catalogTree().map { $0 != scan.tree } ?? false) || (catalogTrash().map { $0 != scan.trashTop } ?? false)
             }
-            libraryBaseline = scan
             if refresh, let library = library {
-                library.refresh()
+                do {
+                    try await refreshCatalog(library, app: app)
+                } catch {
+                    guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
+                    let error = NibError.wrap(error)
+                    report.errors.append(SyncIssue(doc: nil, code: error.code.rawValue, message: error.message))
+                    setStatus(nil, state: "error", reason: "refreshFailed", message: error.message)
+                    downloadsPending = waiting
+                    lastReport = report
+                    return report
+                }
+                guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
                 report.refreshed = true
+                if statuses[""]?.reason == "refreshFailed" { setStatus(nil, state: "idle") }
                 // Packages may have moved: point their presenters at the new places.
                 for (doc, presenter) in packagePresenters {
                     if let url = app.services.packages.url(doc), presenter.presentedItemURL?.standardizedFileURL != url.standardizedFileURL {
@@ -1024,6 +1038,7 @@ final class FolderWatcher {
                     }
                 }
             }
+            libraryBaseline = scan
             if scan.evicted.isEmpty {
                 if statuses[""]?.state == "downloading" { setStatus(nil, state: "idle") }
             } else {
@@ -1039,12 +1054,26 @@ final class FolderWatcher {
                       message: String(localized: "The library folder moved or can't be reached. Nib reopens it where it is now, or choose it again."))
             reopenMovedRoot(root)
         } else if packageMissing, let library = library {
-            library.refresh()
-            report.refreshed = true
+            do {
+                try await refreshCatalog(library, app: app)
+                guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
+                report.refreshed = true
+                if statuses[""]?.reason == "refreshFailed" { setStatus(nil, state: "idle") }
+            } catch {
+                guard rootGeneration == generation, library.rootURL.standardizedFileURL == root else { return report }
+                let error = NibError.wrap(error)
+                report.errors.append(SyncIssue(doc: nil, code: error.code.rawValue, message: error.message))
+                setStatus(nil, state: "error", reason: "refreshFailed", message: error.message)
+            }
         }
         downloadsPending = waiting
         lastReport = report
         return report
+    }
+
+    private func refreshCatalog(_ library: LibraryService, app: NibApp) async throws {
+        if let refresh = app.services.get(Self.catalogRefreshKey, as: CatalogRefresh.self), try await refresh() { return }
+        library.refresh() // Other LibraryService implementations retain their existing synchronous contract.
     }
 
     /// Follows a library folder that moved while Nib ran: its remembered bookmark finds the new place and

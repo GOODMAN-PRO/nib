@@ -362,7 +362,8 @@ final class PageCommandTests: XCTestCase {
         let start = Date()
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/LECTURE00251"]])
         XCTAssertLessThan(Date().timeIntervalSince(start), budget * 4)
-        let clip = try XCTUnwrap(PageClipboard.read())
+        let read = await PageClipboard.read()
+        let clip = try XCTUnwrap(read)
         XCTAssertNil(clip.assets.first?.data, "the in-process clipboard holds no bytes")
 
         // The system pasteboard gets that one PDF page, renumbered.
@@ -380,10 +381,90 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(pdfPageCount(try h.assets.data(XCTUnwrap(page.background.asset), doc: Fixtures.whiteboardID)), 1)
     }
 
+    func testSystemClipboardDecodesAssetsOffMainAndCachesUnchangedData() async throws {
+        let h = harness()
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1))
+        let bytes = Data(repeating: 42, count: 2 * 1024 * 1024)
+        let payload = PagesPayload(source: nil, pages: [.init(page: page, items: [])],
+                                   assets: [.init(name: "large.pdf", data: bytes, pdfPages: nil)])
+        let encoded = try JSONEncoder().encode(payload)
+        let probe = ClipboardDecodeProbe()
+        var reads = 0
+        for _ in 0..<2 {
+            let loaded = await PageClipboard.read(changeCount: { 17 }, data: { reads += 1; return encoded },
+                                                  decode: { probe.decode($0) })
+            XCTAssertEqual(loaded, payload)
+        }
+        XCTAssertEqual(reads, 1, "the cached payload avoids another system read")
+        XCTAssertEqual(probe.calls, 1, "unchanged clipboard bytes decode only once")
+        XCTAssertFalse(probe.wasMainThread)
+        let changed = await PageClipboard.read(changeCount: { 18 }, data: { encoded }, decode: { probe.decode($0) })
+        XCTAssertEqual(changed, payload)
+        XCTAssertEqual(probe.calls, 2)
+    }
+
+    func testSystemClipboardDiscardsAResultIfTheClipboardChangesDuringDecode() async throws {
+        let h = harness()
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1))
+        let payload = PagesPayload(source: nil, pages: [.init(page: page, items: [])], assets: [])
+        let encoded = try JSONEncoder().encode(payload)
+        var countReads = 0
+        let loaded = await PageClipboard.read(changeCount: {
+            countReads += 1
+            return countReads == 1 ? 1 : 2
+        }, data: { encoded })
+        XCTAssertNil(loaded, "an old decode must not replace the clipboard or paste obsolete pages")
+        XCTAssertFalse(PageClipboard.hasPages)
+    }
+
+    func testExternalClipboardReadCannotAuthorizeAnOlderEncodingWrite() async throws {
+        let h = harness()
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.page1))
+        let older = PagesPayload(source: nil, pages: [.init(page: page, items: [])], assets: [])
+        var newer = older
+        newer.pages[0].page.title = "External replacement"
+        let olderBytes = try JSONEncoder().encode(older)
+        let newerBytes = try JSONEncoder().encode(newer)
+        var boardBytes = olderBytes
+        var count = 10
+        var publications = 0
+        let started = expectation(description: "older encoding started")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let write = Task {
+            try await PageClipboard.write(older, changeCount: { count }, publish: {
+                publications += 1
+                boardBytes = $0
+                count += 1
+            }, encode: {
+                started.fulfill()
+                guard release.wait(timeout: .now() + 2) == .success else {
+                    throw CocoaError(.fileReadUnknown)
+                }
+                return olderBytes
+            })
+        }
+        await fulfillment(of: [started], timeout: 1)
+        count += 1
+        boardBytes = newerBytes
+        let replacement = await PageClipboard.read(changeCount: { count }, data: { boardBytes })
+        XCTAssertEqual(replacement, newer, "the replacement read must finish before releasing the older writer")
+        release.signal()
+        try await write.value
+        XCTAssertEqual(publications, 0)
+        XCTAssertEqual(boardBytes, newerBytes)
+        let cached = await PageClipboard.read(changeCount: { count }, data: {
+            XCTFail("the newer payload should still be cached")
+            return boardBytes
+        })
+        XCTAssertEqual(cached, newer)
+    }
+
     func testPasteAcceptsAPayloadAndAddPageCanPasteToo() async throws {
         let h = harness()
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])
-        let payload = try JSONValue.from(try XCTUnwrap(PageClipboard.read()))
+        let read = await PageClipboard.read()
+        let payload = try JSONValue.from(try XCTUnwrap(read))
         PageClipboard.clear()
         let r = try await h.run("page.paste", ["doc": "doc:FIXTUREDOC01", "position": "start", "payload": payload,
                                                "ids": ["PASTED000001"]])
@@ -602,6 +683,46 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(refs(r).count, 1)
     }
 
+    func testMoveRefusesAnUnavailableCloudAssetWithoutAURL() async throws {
+        let h = harness()
+        let photo = try h.assets.put(Data("cloud photo".utf8), ext: "png", doc: Fixtures.docID)
+        var image = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).first { $0.kind == .image })
+        image.image?.asset = photo
+        _ = try await h.insert([image])
+        h.app.services.assets = UnreadableAssetStore(h.assets, unreadable: photo.name, hidesURL: true)
+        let before = try h.snapshotAll()
+        let depths = h.undoDepths()
+        await assertFails("page.moveTo", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "doc": "doc:FIXTUREDOC04"],
+                          code: .unavailable, in: h)
+        XCTAssertEqual(try h.snapshotAll(), before)
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
+    func testMoveRefusesChangedImageDependenciesAfterCopying() async throws {
+        let h = harness()
+        // Fixtures install their standard assets in every document, which intentionally bypasses copying.
+        var image = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).first { $0.kind == .image })
+        image.image?.asset = try h.assets.put(Data("source-only image".utf8), ext: "png", doc: Fixtures.docID)
+        _ = try await h.insert([image])
+        let started = expectation(description: "asset read started")
+        let store = GatedMoveAssetStore(h.assets, started: started)
+        h.app.services.assets = store
+        let move = Task {
+            await self.assertFails("page.moveTo", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "doc": "doc:FIXTUREDOC04"],
+                                   code: .unavailable, in: h)
+        }
+        defer { store.release.signal() }
+        await fulfillment(of: [started], timeout: 2)
+        image.image?.asset = try h.assets.put(Data("new image".utf8), ext: "png", doc: Fixtures.docID)
+        _ = try await h.insert([image])
+        let before = try h.snapshotAll()
+        let depths = h.undoDepths()
+        store.release.signal()
+        await move.value
+        XCTAssertEqual(try h.snapshotAll(), before, "the interleaved edit survives and no page moves")
+        XCTAssertEqual(h.undoDepths(), depths)
+    }
+
     func testDryRunMovePreviewsWithoutCopyingBytes() async throws {
         let h = harness()
         let before = try h.snapshotAll()
@@ -806,19 +927,71 @@ private final class CountingAssetStore: AssetStore {
 private final class UnreadableAssetStore: AssetStore {
     let inner: InMemoryAssetStore
     let unreadable: String
+    let hidesURL: Bool
 
-    init(_ inner: InMemoryAssetStore, unreadable: String) {
+    init(_ inner: InMemoryAssetStore, unreadable: String, hidesURL: Bool = false) {
         self.inner = inner
         self.unreadable = unreadable
+        self.hidesURL = hidesURL
     }
 
     func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try inner.put(data, ext: ext, doc: doc) }
-    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { inner.url(ref, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? {
+        hidesURL && ref.name == unreadable ? nil : inner.url(ref, doc: doc)
+    }
     func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try inner.putTemporary(data, ext: ext) }
     func temporaryURL(_ ref: AssetRef) -> URL? { inner.temporaryURL(ref) }
 
     func data(_ ref: AssetRef, doc: DocumentID) throws -> Data {
         if ref.name == unreadable { throw CocoaError(.fileReadUnknown) }
         return try inner.data(ref, doc: doc)
+    }
+}
+
+/// Blocks only the first source read; every wait is bounded even if the test fails before releasing it.
+private final class GatedMoveAssetStore: AssetStore {
+    let inner: InMemoryAssetStore
+    let started: XCTestExpectation
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didWait = false
+
+    init(_ inner: InMemoryAssetStore, started: XCTestExpectation) {
+        self.inner = inner
+        self.started = started
+    }
+
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data {
+        lock.lock()
+        let shouldWait = !didWait
+        didWait = true
+        lock.unlock()
+        if shouldWait {
+            started.fulfill()
+            guard release.wait(timeout: .now() + 2) == .success else {
+                XCTFail("the test did not release the asset read")
+                throw CocoaError(.fileReadUnknown)
+            }
+        }
+        return try inner.data(ref, doc: doc)
+    }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try inner.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { inner.url(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try inner.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { inner.temporaryURL(ref) }
+}
+
+private final class ClipboardDecodeProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var onMain = false
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return count }
+    var wasMainThread: Bool { lock.lock(); defer { lock.unlock() }; return onMain }
+    func decode(_ data: Data) -> PagesPayload? {
+        lock.lock()
+        count += 1
+        onMain = onMain || Thread.isMainThread
+        lock.unlock()
+        return PagesPayload.decode(data)
     }
 }

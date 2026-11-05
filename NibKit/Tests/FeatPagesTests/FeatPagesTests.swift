@@ -371,6 +371,15 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(ItemCloner.clone([shape], freshIDs: false)[0].id, shape.id)
     }
 
+    func testOnePageOutOfRangeFeedbackUsesTheSingular() {
+        XCTAssertEqual(GoToPageResolver.resolve("2", titles: [nil]), .outOfRange)
+        XCTAssertEqual(GoToPageResolver.outOfRangeMessage(count: 1),
+                       String(localized: "This notebook has 1 page. Enter page 1."))
+        let count = 3
+        XCTAssertEqual(GoToPageResolver.outOfRangeMessage(count: count),
+                       String(localized: "This notebook has \(count) pages. Enter a number from 1 to \(count)."))
+    }
+
     func testGoToPageAcceptsNumbersAndTitles() {
         let titles: [String?] = [nil, "Kinematics", "Dynamics", nil]
         XCTAssertEqual(GoToPageResolver.resolve("  ", titles: titles), .empty)
