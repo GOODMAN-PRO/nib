@@ -195,10 +195,16 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         // Keep fitted paper below the complete chrome footprint; manual navigation keeps its reading anchor.
         let fittedPage = fitAreaChanged && isAtFit && !hasManualPan ? currentPage : nil
         if fitAreaChanged || !didInitialLayout {
+            #if DEBUG
+            NSLog("%@", "[Nib QA sidebar] relayout bounds=\(size) insets=\(previousInsets)->\(scrollView.chromeInsets) offset=\(scrollView.contentOffset) zoom=\(scrollView.zoom) fitted=\(isAtFit) manualPan=\(hasManualPan) anchor=\(String(describing: anchor)) fittedPage=\(String(describing: fittedPage))")
+            #endif
             lastViewport = size
             relayout(anchor: anchor, initial: !didInitialLayout, fittedPage: fittedPage)
             didInitialLayout = true
             applyPendingNavigation()
+            #if DEBUG
+            NSLog("%@", "[Nib QA sidebar] relayout complete offset=\(scrollView.contentOffset) zoom=\(scrollView.zoom) contentInset=\(scrollView.contentInset) safe=\(view.safeAreaInsets) additional=\(additionalSafeAreaInsets)")
+            #endif
         }
         layoutFixedViews()
     }
