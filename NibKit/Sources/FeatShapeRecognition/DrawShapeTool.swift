@@ -263,6 +263,8 @@ enum ShapeCommit {
                 _ = try await call(CommandIDs.itemDelete, ["refs": .array(result.mergeWith.map { JSONValue.string($0) })])
             } catch {
                 DrawShapeTool.log.error("removing merged shapes failed, keeping them: \(String(describing: error), privacy: .public)")
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                    userInfo: ["command": CommandIDs.itemDelete, "error": NibError.wrap(error)])
             }
         }
         return shape

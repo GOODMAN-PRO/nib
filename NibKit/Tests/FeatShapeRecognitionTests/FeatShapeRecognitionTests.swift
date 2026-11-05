@@ -459,6 +459,29 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
     }
 
+    func testFailedNeighbourDeleteReportsFailureAndKeepsBothShapes() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
+        let calls = Calls()
+        standIn(CommandIDs.shapeCreate, h, calls)
+        standIn(CommandIDs.itemDelete, h, calls, fails: true)
+        let notice = expectation(description: "merged neighbour delete failed")
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.itemDelete)
+            XCTAssertEqual((note.userInfo?["error"] as? NibError)?.code, .unavailable)
+            notice.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        let plain = ShapeRecognizer.pointShape(.line, [Point(402, 305), Point(402, 400)])
+        let joined = ShapeRecognizer.pointShape(.polyline, [Point(300, 300), Point(400, 300), Point(402, 400)])
+        let made = await ShapeCommit.create(SnapResult(shape: joined, mergeWith: [itemRef("OLDLINE00001")]),
+            plain: plain, doc: Fixtures.docID, page: page, app: h.app, session: h.session)
+        await fulfillment(of: [notice], timeout: 1)
+        XCTAssertEqual(made, joined)
+        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
+        XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
+    }
+
     /// When the canvas closes before the shape could be made, the stroke is still kept, through ink.addStrokes.
     func testClosedCanvasStillKeepsTheStrokeAsInk() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
