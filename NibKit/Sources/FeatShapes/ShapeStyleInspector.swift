@@ -365,6 +365,9 @@ struct ShapeLibraryPanel: View {
                 .padding(NibSpacing.l)
         }
         .scrollBounceBehavior(.basedOnSize)
+        .nibFadeBottomEdge()
+        .scrollIndicators(.visible)
+        .scrollIndicatorsFlash(onAppear: true)
     }
 }
 
