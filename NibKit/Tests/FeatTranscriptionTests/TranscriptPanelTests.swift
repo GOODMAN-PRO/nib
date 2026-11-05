@@ -7,6 +7,56 @@ import NibTesting
 final class TranscriptPanelTests: XCTestCase {
     private let clipRef = "audio:FIXTUREDOC01/FIXTUREAUD01"
 
+    func testStaleCorrectionKeepsDraftAndNewerSegment() async throws {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        let model = TranscriptPanelModel(context: PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {}))
+        await model.reload()
+        let line = try XCTUnwrap(model.transcript?.segments.first)
+        model.beginEdit(line)
+        model.editText = "My unsaved correction"
+        _ = try await h.run(CommandIDs.transcriptEditSegment, ["clip": .string(clipRef),
+            "index": .number(Double(line.index)), "text": "Newer correction"])
+        await model.refresh()
+        model.saveEdit()
+        let deadline = Date().addingTimeInterval(2)
+        while model.error == nil && model.editIndex != nil && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNotNil(model.error)
+        XCTAssertEqual(model.editIndex, line.index)
+        XCTAssertEqual(model.editText, "My unsaved correction")
+        let result = try await h.run(CommandIDs.transcriptGet, ["clip": .string(clipRef)])
+        let current = try result.decode(TranscriptGet.Output.self).segments.first { $0.index == line.index }
+        XCTAssertEqual(current?.text, "Newer correction")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testRegeneratedTimingCannotReceiveAnOlderDraftAtTheSameIndex() async throws {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        let model = TranscriptPanelModel(context: PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {}))
+        await model.reload()
+        var replacement = try XCTUnwrap(model.transcript?.segments.first)
+        model.beginEdit(replacement)
+        model.editText = "Draft for the old utterance"
+        if let rev = replacement.rev { h.app.clock.observe(rev) }
+        replacement.start += 30
+        replacement.rev = h.app.clock.tick()
+        let store = try TranscriptStore.of(h.app.services)
+        let clip = try store.clip(clipRef, workspace: h.app.workspace)
+        // Regeneration reuses the index; even identical text now identifies a different utterance.
+        _ = try await store.files.write(base: clip.base, device: store.device, lines: [replacement])
+        await model.refresh()
+        model.saveEdit()
+        let deadline = Date().addingTimeInterval(2)
+        while model.error == nil && model.editIndex != nil && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNotNil(model.error)
+        XCTAssertEqual(model.editText, "Draft for the old utterance")
+        let current = try await store.read(clip)
+        XCTAssertEqual(current.first(where: { $0.index == replacement.index }), replacement)
+    }
+
     func testRefreshPreservesIntentionallyEmptyDraftAndLoadsDeepLinkOnlyOnce() async throws {
         let h = Harness(features: [FeatTranscriptionFeature.self])
         for deepLink in [false, true] {

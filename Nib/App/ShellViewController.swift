@@ -15,7 +15,16 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     private var content: UIViewController?
     private var tabBar: UIView?
     private var qaProbe: QAStateProbe?
-    private var failureObserver: NSObjectProtocol?
+    private lazy var toastPresenter = ShellToastPresenter(
+        isActive: { [weak self] in
+            guard let self else { return false }
+            return self.app.ui.activeNavigator === self || self.app.ui.activeNavigator == nil
+        }, present: { [weak self] message in
+            guard let host = self?.session.floatingHost else { return false }
+            host.postToast(message)
+            return true
+        }, container: { [weak self] in self?.view },
+        onFailure: { [weak self] in self?.toastIfActive($0) })
     /// What the window shows right now, for key commands (`KeyCommandContext`): a document of `shownKind`, or the
     /// library / onboarding. `activeDocument` stays the selected tab while the library shows.
     private var showsDocument = false
@@ -56,10 +65,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             (shell: ShellViewController, _: UITraitCollection) in
             shell.synchroniseContentAppearance()
         }
-        failureObserver = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: nil, queue: .main) { [weak self] note in
-            let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
-            Task { @MainActor in self?.toastIfActive(message) }
-        }
+        _ = toastPresenter
         if NibUITestMode.isEnabled && !UITestFixture.isReady {
             display(FallbackEditorViewController(message: "Preparing test fixture…"))
         } else if let onboarding = app.ui.screens.onboarding?(app, self) {
@@ -218,6 +224,17 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     }
 
     func closeDocument(_ doc: DocumentID) {
+        // Flush through the workspace: lessons wrap the package persistence here. Do not
+        // evict the workspace, since another window may still be editing this document.
+        let beforeFlush = app.events.lastSeq
+        app.workspace.persistence.flush(doc)
+        let status = app.events.events(since: beforeFlush, limit: app.events.capacity).last {
+            $0.doc == doc && $0.decode(SyncStatusPayload.self)?.source == "store"
+        }?.decode(SyncStatusPayload.self)
+        if let status, status.state == "error" || status.state == "warning" {
+            toast(status.message ?? String(localized: "Changes could not be saved. Keep Nib open and try closing the document again."))
+            return
+        }
         openDocuments.removeAll { $0 == doc }
         guard activeDocument == doc else {
             refreshTabBar()
@@ -606,27 +623,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         #if DEBUG
         NSLog("%@", String("[Nib QA toast] shell toast message=\(message)".prefix(890)))
         #endif
-        let label = UILabel()
-        label.accessibilityIdentifier = "nib.toast"
-        label.text = message
-        label.textColor = .white
-        label.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-        label.font = .preferredFont(forTextStyle: .footnote)
-        label.numberOfLines = 0
-        label.textAlignment = .center
-        label.layer.cornerRadius = 10
-        label.clipsToBounds = true
-        let width = min(view.bounds.width - 32, 480)
-        let size = label.sizeThatFits(CGSize(width: width - 24, height: .greatestFiniteMagnitude))
-        label.frame = CGRect(x: (view.bounds.width - size.width - 24) / 2,
-                             y: view.bounds.height - view.safeAreaInsets.bottom - size.height - 48,
-                             width: size.width + 24, height: size.height + 16)
-        view.addSubview(label)
-        UIView.animate(withDuration: 0.3, delay: 2.5, options: []) {
-            label.alpha = 0
-        } completion: { _ in
-            label.removeFromSuperview()
-        }
+        toastPresenter.show(message)
     }
 }
 

@@ -106,6 +106,7 @@ struct InkLayout: Equatable {
     var wordGap: Double
     /// Union of the line boxes (layout frame).
     var box: Rect
+    var rightToLeft: Bool = false
 
     static let empty = InkLayout(lines: [], columns: [], skew: 0, xHeight: 0, pitch: 0, wordGap: 0, box: .zero)
 
@@ -165,7 +166,7 @@ struct InkLayout: Equatable {
 
     /// Clusters strokes into lines (baselines) and words (gaps wider than 0.6 x-height), refined by recognised words,
     /// and lines into columns.
-    static func analyze(_ input: [InkGlyph], hints: [InkHint] = []) -> InkLayout {
+    static func analyze(_ input: [InkGlyph], hints: [InkHint] = [], rightToLeft: Bool = false) -> InkLayout {
         let usable = input.filter { InkGlyph.isSane($0.bounds) }
         guard !usable.isEmpty else { return .empty }
         let size = sizeEstimate(usable.map { $0.bounds.height })
@@ -259,14 +260,18 @@ struct InkLayout: Equatable {
             }
             fragments.append(current)
         }
-        let made = fragments.map { makeLine($0, size: size, hints: hints, hintOf: hintOf, isSmall: isSmall) }
+        let made = fragments.map { glyphs -> InkLine in
+            var line = makeLine(glyphs, size: size, hints: hints, hintOf: hintOf, isSmall: isSmall)
+            if rightToLeft { line.words.reverse() }
+            return line
+        }
         let xHeight = median(made.map { $0.xHeight })
         let rows = inRows(made, xHeight: xHeight)
 
         // Columns in reading order; `lines` is rebuilt column by column.
         var lines: [InkLine] = []
         var columns: [InkColumn] = []
-        for column in columnsInReadingOrder(rows, xHeight: xHeight) {
+        for column in columnsInReadingOrder(rows, xHeight: xHeight, rightToLeft: rightToLeft) {
             let start = lines.count
             lines += column.map { rows[$0] }
             columns.append(InkColumn(lines: start..<lines.count, box: union(column.map { rows[$0].box })))
@@ -283,11 +288,15 @@ struct InkLayout: Equatable {
         let pitch = distances.isEmpty
             ? max(2.2 * xHeight, 1.3 * median(lines.map { $0.box.height }))
             : percentile(distances, 0.3)
-        let gaps = lines.flatMap { line in zip(line.words.dropFirst(), line.words).map { $0.box.minX - $1.box.maxX } }
+        let gaps = lines.flatMap { line in
+            zip(line.words.dropFirst(), line.words).map {
+                rightToLeft ? $1.box.minX - $0.box.maxX : $0.box.minX - $1.box.maxX
+            }
+        }
         let wordGap = gaps.isEmpty ? xHeight : median(gaps)
-        for column in columns { markParagraphs(&lines, column: column, pitch: pitch, xHeight: xHeight) }
+        for column in columns { markParagraphs(&lines, column: column, pitch: pitch, xHeight: xHeight, rightToLeft: rightToLeft) }
         return InkLayout(lines: lines, columns: columns, skew: skew, xHeight: xHeight, pitch: pitch, wordGap: wordGap,
-                         box: union(lines.map { $0.box }))
+                         box: union(lines.map { $0.box }), rightToLeft: rightToLeft)
     }
 
     private static func makeLine(_ glyphs: [InkGlyph], size: Double, hints: [InkHint], hintOf: [ElementID: Int],
@@ -388,7 +397,7 @@ struct InkLayout: Equatable {
     /// Row-ordered lines → columns (indices, top to bottom), in reading order. A line continues the column whose last
     /// line it overlaps horizontally (the nearest one above); failing that, a column whose span it overlaps and that
     /// has no line beside it on this row; otherwise it starts a column. Columns sharing rows read left to right.
-    private static func columnsInReadingOrder(_ lines: [InkLine], xHeight: Double) -> [[Int]] {
+    private static func columnsInReadingOrder(_ lines: [InkLine], xHeight: Double, rightToLeft: Bool) -> [[Int]] {
         let tolerance = 2 * xHeight
         func overlaps(_ a: Rect, _ b: Rect) -> Bool { a.minX <= b.maxX + tolerance && b.minX <= a.maxX + tolerance }
         var columns: [[Int]] = []
@@ -423,14 +432,14 @@ struct InkLayout: Equatable {
         var bandBottom = -Double.infinity
         for c in byTop {
             if !band.isEmpty && spans[c].minY >= bandBottom {
-                order += band.sorted { (spans[$0].minX, spans[$0].minY) < (spans[$1].minX, spans[$1].minY) }
+                order += band.sorted { rightToLeft ? spans[$0].maxX > spans[$1].maxX : spans[$0].minX < spans[$1].minX }
                 band = []
                 bandBottom = -Double.infinity
             }
             band.append(c)
             bandBottom = max(bandBottom, spans[c].maxY)
         }
-        order += band.sorted { (spans[$0].minX, spans[$0].minY) < (spans[$1].minX, spans[$1].minY) }
+        order += band.sorted { rightToLeft ? spans[$0].maxX > spans[$1].maxX : spans[$0].minX < spans[$1].minX }
         return order.map { columns[$0] }
     }
 
@@ -438,7 +447,9 @@ struct InkLayout: Equatable {
     /// (except a list item's hanging continuation). Where a line ends never matters: handwriting is ragged on the
     /// right, and a line the writer (or a deleted word) left short still flows on. Reflow never joins a paragraph to
     /// the one before it.
-    private static func markParagraphs(_ lines: inout [InkLine], column: InkColumn, pitch: Double, xHeight: Double) {
+    private static func markParagraphs(_ lines: inout [InkLine], column: InkColumn, pitch: Double, xHeight: Double,
+                                       rightToLeft: Bool) {
+        func leading(_ box: Rect) -> Double { rightToLeft ? -box.maxX : box.minX }
         var listText: Double?
         for i in column.lines {
             let line = lines[i]
@@ -449,11 +460,11 @@ struct InkLayout: Equatable {
             } else {
                 let previous = lines[i - 1]
                 let blank = line.center - previous.center > 1.6 * pitch
-                var indented = line.box.minX - previous.box.minX > 1.5 * xHeight
-                if indented, let text = listText, abs(line.box.minX - text) <= xHeight { indented = false }
+                var indented = leading(line.box) - leading(previous.box) > 1.5 * xHeight
+                if indented, let text = listText, abs(leading(line.box) - text) <= xHeight { indented = false }
                 lines[i].startsParagraph = blank || marker || indented
             }
-            if lines[i].startsParagraph { listText = marker ? line.words[1].box.minX : nil }
+            if lines[i].startsParagraph { listText = marker ? leading(line.words[1].box) : nil }
         }
     }
 
@@ -534,7 +545,10 @@ struct InkLayout: Equatable {
                 insertion: Insertion? = nil) -> Reflow {
         guard columns.indices.contains(c) else { return Reflow(moves: [:], lineCount: 0) }
         let range = columns[c].lines
-        let origin = columns[c].box.minX
+        let columnBox = columns[c].box
+        func indent(_ box: Rect) -> Double {
+            max(0, rightToLeft ? columnBox.maxX - box.maxX : box.minX - columnBox.minX)
+        }
         let l = left
         let w = max(width, 1)
         let r = l + w
@@ -572,12 +586,12 @@ struct InkLayout: Equatable {
             }
             guard !flow.isEmpty else { continue }
             let isList = first.isListItem && first.words.count > 1 && !isGone(first.words[0])
-            var firstIndent = max(0, first.box.minX - origin)
+            var firstIndent = indent(first.box)
             var hangIndent = 0.0
             if isList {
-                hangIndent = max(0, first.words[1].box.minX - origin)
+                hangIndent = indent(first.words[1].box)
             } else if paragraph.count > 1 {
-                hangIndent = max(0, lines[paragraph[1]].box.minX - origin)
+                hangIndent = indent(lines[paragraph[1]].box)
             }
             firstIndent = min(firstIndent, w / 2)
             hangIndent = min(hangIndent, w / 2)
@@ -585,7 +599,7 @@ struct InkLayout: Equatable {
             for (k, li) in paragraph.enumerated() {
                 let ws = lines[li].words
                 for j in ws.indices.dropFirst() where !(isList && k == 0 && j == 1) {
-                    gaps.append(ws[j].box.minX - ws[j - 1].box.maxX)
+                    gaps.append(rightToLeft ? ws[j - 1].box.minX - ws[j].box.maxX : ws[j].box.minX - ws[j - 1].box.maxX)
                 }
             }
             // Never closer than 0.9 x-height, so the moved words are still separate words when analysed again.
@@ -595,26 +609,27 @@ struct InkLayout: Equatable {
                 let extra = max(0, first.center - lines[paragraph[0] - 1].center - pitch)
                 y += pitch + extra
             }
-            var x = l + firstIndent
+            var x = firstIndent
             var lineHasWord = false
             count += 1
             for (k, item) in flow.enumerated() {
                 let word = item.word
                 if lineHasWord {
-                    if x + gap + word.box.width > r + 0.5 {
+                    if x + gap + word.box.width > w + 0.5 {
                         y += pitch
-                        x = l + hangIndent
+                        x = hangIndent
                         lineHasWord = false
                         count += 1
                     } else {
                         x += gap
                     }
                 }
-                let v = pageVector(Point(x - word.box.minX, y - item.centre))
+                let wordLeft = rightToLeft ? r - x - word.box.width : l + x
+                let v = pageVector(Point(wordLeft - word.box.minX, y - item.centre))
                 for id in word.ids { moves[id] = v }
                 x += word.box.width
                 lineHasWord = true
-                if isList && k == 0 { x = max(x, l + hangIndent - gap) }
+                if isList && k == 0 { x = max(x, hangIndent - gap) }
             }
             placedAny = true
         }
@@ -722,7 +737,9 @@ struct InkLayout: Equatable {
 
     /// Where handwriting pasted after a word lands first (page): one word gap after it, on its centre line.
     func insertionPoint(after li: Int, word wi: Int) -> Point {
-        let x = lines[li].words[wi].box.maxX + max(wordGap, xHeight)
+        let word = lines[li].words[wi]
+        let gap = max(wordGap, xHeight)
+        let x = rightToLeft ? word.box.minX - gap : word.box.maxX + gap
         return toPage(Point(x, lines[li].centerY(at: x)))
     }
 

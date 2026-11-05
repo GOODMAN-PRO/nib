@@ -307,6 +307,7 @@ struct AnswerZoneSetHints: NibCommand {
         var ref: String
         var hints: [String]
         var resetUsage: Bool?
+        var expectedHints: [String]? = nil
     }
 
     struct Output: Codable {
@@ -320,6 +321,7 @@ struct AnswerZoneSetHints: NibCommand {
         summary: "Set the teacher-approved hints of an answer zone (a page or doc ref: all its zones); resetUsage? erases the record of hints shown (asks the user first).",
         params: .obj(["ref": .ref,
                       "hints": .arr(.str("a teacher-approved hint"), "hints in reveal order, at most 10; [] removes them"),
+                      "expectedHints": .arr(.str(), "optional editing baseline; refuses a concurrent hint change"),
                       "resetUsage": .bool("true also erases the record of hints already shown; the user confirms it")],
                      required: ["ref", "hints"]),
         examples: [["ref": "page:FIXTUREDOC01/FIXTUREPG001", "hints": ["Which formula links v, u, a and t?"]],
@@ -347,6 +349,9 @@ struct AnswerZoneSetHints: NibCommand {
         try AnswerZoneRules.checkWritable(scope.doc, ctx)
         var changes: [(AnswerZoneTarget, AnswerZone)] = []
         for target in scope.targets {
+            if let expected = p.expectedHints, target.zone.hints != expected {
+                throw NibError(.conflict, String(localized: "These hints changed in another window. Reopen the hints and apply your edit again."))
+            }
             var zone = target.zone
             zone.hints = hints
             if reset {

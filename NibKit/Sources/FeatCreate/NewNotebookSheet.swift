@@ -1583,11 +1583,24 @@ struct TemplatePreview: View {
                     image = nil
                     return
                 }
-                image = await TemplateThumbnails.image(definition, params: params, page: page, size: proxy.size,
-                                                       scale: scale)
+                await TemplatePreviewPublication.render {
+                    await TemplateThumbnails.image(definition, params: params, page: page, size: proxy.size, scale: scale)
+                } publish: { rendered in
+                    image = rendered
+                }
             }
         }
         .accessibilityHidden(true)
+    }
+}
+
+/// Detached rendering may finish after SwiftUI cancels the selection's task.
+@MainActor
+enum TemplatePreviewPublication {
+    static func render(_ load: () async -> UIImage, publish: (UIImage) -> Void) async {
+        let rendered = await load()
+        guard !Task.isCancelled else { return }
+        publish(rendered)
     }
 }
 

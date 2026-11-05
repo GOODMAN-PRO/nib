@@ -154,8 +154,7 @@ struct WebDAVSettingsPage: View {
     }
 }
 
-/// State of the WebDAV settings page. Every change runs a command as the user; only the password is written
-/// straight to the Keychain (it is never a command parameter).
+/// State of the WebDAV settings page. Password drafts stay private until the command validates the saved baseline.
 @MainActor
 final class WebDAVSettingsModel: ObservableObject {
     enum Work: Equatable { case saving, testing, syncing }
@@ -168,6 +167,7 @@ final class WebDAVSettingsModel: ObservableObject {
     }
 
     let app: NibApp
+    private let validationBundle: Bundle
     @Published var url = ""
     @Published var user = ""
     @Published var password = ""
@@ -182,8 +182,9 @@ final class WebDAVSettingsModel: ObservableObject {
     private var subscription: EventSubscription?
     private var polling: Task<Void, Never>?
 
-    init(app: NibApp) {
+    init(app: NibApp, validationBundle: Bundle = .main) {
         self.app = app
+        self.validationBundle = validationBundle
         loadFields()
     }
 
@@ -238,6 +239,7 @@ final class WebDAVSettingsModel: ObservableObject {
 
     func refreshStatus() async {
         status = try? await app.bus.run(WebDAVStatusCommand.self, .init(check: nil))
+        reconcileFields()
         // While a pass runs, follow its pending count.
         if status?.running == true, polling == nil {
             polling = Task { @MainActor [weak self] in
@@ -251,7 +253,21 @@ final class WebDAVSettingsModel: ObservableObject {
         }
     }
 
-    /// Stores the password (if typed) for the new server and user, then runs `webdav.configure`.
+    private var expected: WebDAVSettings.Values {
+        WebDAVSettings.Values(url: saved.url, user: saved.user, folder: saved.folder,
+                              allowUntrustedCertificates: saved.allowUntrusted)
+    }
+
+    func reconcileFields() {
+        guard working == nil, WebDAVSettings.read(app.settings) != expected else { return }
+        if isDirty {
+            errorMessage = WebDAVConfigureCommand.staleSettings.message
+        } else {
+            loadFields()
+        }
+    }
+
+    /// Stages the password privately; the command validates the baseline before writing credentials or settings.
     func save() async -> Bool {
         errorMessage = nil
         testResult = nil
@@ -259,18 +275,12 @@ final class WebDAVSettingsModel: ObservableObject {
         defer { working = nil }
         let f = fields
         do {
-            let server = try WebDAVConfiguration.normalizeServerURL(f.url).absoluteString
-            if !password.isEmpty {
-                WebDAVCredentials.setPassword(password, url: server, user: f.user)
-            } else if server != saved.url || f.user != saved.user,
-                      WebDAVCredentials.password(url: server, user: f.user) == nil,
-                      let previous = WebDAVCredentials.password(url: saved.url, user: saved.user) {
-                // The user edited the address or name of the same account without retyping the password.
-                WebDAVCredentials.setPassword(previous, url: server, user: f.user)
-            }
+            let server = try WebDAVConfiguration.normalizeServerURL(f.url, bundle: validationBundle).absoluteString
+            let draft = WebDAVConfigureCommand.stage(settings: app.settings, expected: expected, password: password)
+            defer { WebDAVConfigureCommand.discard(draft) }
             _ = try await app.bus.run(WebDAVConfigureCommand.self,
                                       .init(url: server, user: f.user, folder: f.folder.isEmpty ? "Nib" : f.folder,
-                                            allowUntrustedCertificates: f.allowUntrusted))
+                                            allowUntrustedCertificates: f.allowUntrusted, draftID: draft))
             password = ""
             loadFields()
             await refreshStatus()
@@ -311,10 +321,14 @@ final class WebDAVSettingsModel: ObservableObject {
     func disconnect() async {
         errorMessage = nil
         testResult = nil
+        working = .saving
+        defer { working = nil }
         do {
+            let draft = WebDAVConfigureCommand.stage(settings: app.settings, expected: expected, password: "")
+            defer { WebDAVConfigureCommand.discard(draft) }
             _ = try await app.bus.run(WebDAVConfigureCommand.self,
                                       .init(url: "", user: "", folder: WebDAVSettings.folder.defaultValue,
-                                            allowUntrustedCertificates: nil))
+                                            allowUntrustedCertificates: nil, draftID: draft))
         } catch {
             errorMessage = NibError.wrap(error).message
         }

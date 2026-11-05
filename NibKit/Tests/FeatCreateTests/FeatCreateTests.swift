@@ -6,6 +6,11 @@ import NibTesting
 import NibDesign
 @testable import FeatCreate
 
+@MainActor
+private final class PreviewBox {
+    var image: UIImage?
+}
+
 /// Records the calls stand-in commands receive.
 @MainActor
 private final class CallLog {
@@ -797,6 +802,27 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(model.draft.pageSize, PageSize(800, 600))
         XCTAssertEqual(TemplateChoice.size(nil), nil)
         XCTAssertEqual(TemplateChoice.size([0, 10]), nil)
+    }
+
+    func testCancelledTemplateRenderCannotReplaceCurrentPreview() async {
+        let started = expectation(description: "old render started")
+        let release = expectation(description: "old render released")
+        let oldImage = UIImage(), currentImage = UIImage()
+        let box = PreviewBox()
+        let old = Task {
+            await TemplatePreviewPublication.render {
+                started.fulfill()
+                await self.fulfillment(of: [release], timeout: 2)
+                return oldImage
+            } publish: { box.image = $0 }
+        }
+        await fulfillment(of: [started], timeout: 2)
+        await TemplatePreviewPublication.render { currentImage } publish: { box.image = $0 }
+        XCTAssertTrue(box.image === currentImage)
+        old.cancel()
+        release.fulfill()
+        await old.value
+        XCTAssertTrue(box.image === currentImage)
     }
 
     func testTemplateThumbnailDrawsTheTemplateAndItsPaperColour() throws {

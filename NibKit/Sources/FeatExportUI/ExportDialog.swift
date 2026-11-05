@@ -103,6 +103,13 @@ struct ExportSelection {
         for ref in documentRefs {
             let doc = NodeRef.documentID(from: ref)
             try requireUnlocked(doc, ctx)
+            // Folder dialogs offer only All Pages and never save back to a source. The catalog already
+            // has their titles and kinds; avoid decoding every head and constructing unused page lists.
+            if folderExport, pages == nil, let node = ctx.services.library?.node(doc),
+               let kind = node.documentKind {
+                documents.append(ExportDocument(ref: ref, title: node.title, kind: kind, pages: [], hasSource: false))
+                continue
+            }
             let content = try ctx.workspace.peekContent(doc)
             let bookmark = content.meta.sourceBookmark
             let sourceName: String?
@@ -237,21 +244,17 @@ struct ExportDialog: View {
                 GeometryReader { geometry in
                     if !typeSize.isAccessibilitySize && geometry.size.height >= 4 * NibMetrics.hitTarget {
                         VStack(alignment: .leading, spacing: NibSpacing.l) {
-                            ScrollView {
+                            NibScrollView {
                                 VStack(alignment: .leading, spacing: NibSpacing.l) { options; secondaryActions }
                                     .padding(.bottom, NibSpacing.l)
                             }
                             .scrollBounceBehavior(.basedOnSize)
-                            .scrollIndicators(.visible)
-                            .nibFadeBottomEdge()
                             primaryActions
                         }
                     } else {
                         // Short windows and large text keep all actions reachable in one scroller.
-                        ScrollView { form.padding(.bottom, NibSpacing.l) }
+                        NibScrollView { form.padding(.bottom, NibSpacing.l) }
                             .scrollBounceBehavior(.basedOnSize)
-                            .scrollIndicators(.visible)
-                            .nibFadeBottomEdge()
                     }
                 }
             } else {
@@ -286,7 +289,9 @@ struct ExportDialog: View {
                             ForEach(selection.pageScopes, id: \.self) { scope in Text(scope.title(board: selection.isBoard)).tag(scope) }
                         }.font(NibFont.body).frame(minHeight: NibMetrics.hitTarget)
                     } else {
-                        NibSegmentedControl(selection: $draft.scope, options: selection.pageScopes) { $0.title(board: selection.isBoard) }
+                        NibSegmentedControl(selection: $draft.scope, options: selection.pageScopes, sizing: .fitting) {
+                            $0.title(board: selection.isBoard)
+                        }
                     }
                 }
             }

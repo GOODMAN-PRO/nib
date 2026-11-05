@@ -58,6 +58,66 @@ struct EventJSON: Codable, Equatable {
 
 // MARK: - calendar.events
 
+/// Short-lived command results, separate from the mutable cache used by planner/event lookup.
+/// Cursors are opaque and bound to their range and caller. Eviction asks the caller to restart.
+@MainActor
+final class CalendarEventPages {
+    private struct Snapshot {
+        let events: [EventJSON]
+        let from: Date
+        let to: Date
+        let principal: Principal
+        let expires: Date
+        let bytes: Int
+    }
+    private var snapshots: [String: Snapshot] = [:]
+    private var order: [String] = []
+    private let maxSnapshots: Int
+    private let maxBytes: Int
+    private let lifetime: TimeInterval
+
+    init(maxSnapshots: Int = 8, maxBytes: Int = 4 * 1_024 * 1_024, lifetime: TimeInterval = 300) {
+        self.maxSnapshots = maxSnapshots; self.maxBytes = maxBytes; self.lifetime = lifetime
+    }
+
+    func clear() { snapshots.removeAll(); order.removeAll() }
+
+    private func prune(at now: Date) {
+        order.removeAll { snapshots[$0].map { $0.expires <= now } ?? true }
+        snapshots = snapshots.filter { $0.value.expires > now }
+    }
+
+    func retain(_ events: [EventJSON], from: Date, to: Date, principal: Principal, now: Date = Date()) throws -> String {
+        prune(at: now)
+        let bytes = try JSONEncoder().encode(events).count
+        guard maxSnapshots > 0, bytes <= maxBytes else {
+            throw NibError(.unavailable, String(localized: "Calendar result is too large to page."),
+                           hint: String(localized: "Start again with a smaller date range."))
+        }
+        while order.count >= maxSnapshots || snapshots.values.reduce(0, { $0 + $1.bytes }) + bytes > maxBytes {
+            snapshots[order.removeFirst()] = nil
+        }
+        let token = UUID().uuidString
+        snapshots[token] = Snapshot(events: events, from: from, to: to, principal: principal,
+                                    expires: now.addingTimeInterval(lifetime), bytes: bytes)
+        order.append(token)
+        return token
+    }
+
+    func read(_ cursor: String, from: Date, to: Date, principal: Principal,
+              now: Date = Date()) throws -> (events: [EventJSON], offset: Int, token: String) {
+        prune(at: now)
+        let parts = cursor.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2, let offset = Int(parts[1]), offset >= 0,
+              let snapshot = snapshots[String(parts[0])], snapshot.from == from, snapshot.to == to,
+              snapshot.principal == principal, offset < snapshot.events.count else {
+            throw NibError(.invalidParams, String(localized: "Calendar cursor is invalid or expired."), path: "$.cursor",
+                           hint: String(localized: "Start again without a cursor."))
+        }
+        return (snapshot.events, offset, String(parts[0]))
+    }
+}
+
 struct CalendarEvents: NibCommand {
     static let maxLimit = 500
     /// Results are paged past this many bytes (ARCHITECTURE §6.1: big results carry `truncated` + `cursor`).
@@ -96,31 +156,31 @@ struct CalendarEvents: NibCommand {
         let (from, to) = try range(p)
         let limit = p.limit ?? maxLimit
         guard (1...maxLimit).contains(limit) else { throw NibError.invalid("limit must be 1…\(maxLimit)", path: "$.limit") }
-        var offset = 0
-        if let c = p.cursor {
-            guard let n = Int(c), n >= 0 else {
-                throw NibError(.invalidParams, "invalid cursor", path: "$.cursor", hint: "pass the cursor exactly as returned")
-            }
-            offset = n
-        }
         let store = try CalendarStore.require(ctx)
-        let events: [CalendarEvent]
-        if offset > 0, store.access == .granted, store.cache.lastSync(covering: from, to) != nil {
-            // A later page of the same read: the cache already holds exactly what the first page read.
-            events = store.cache.events(overlapping: from, to)
+        let events: [EventJSON]
+        let offset: Int
+        var token: String?
+        if let cursor = p.cursor {
+            store.refreshAccess()
+            guard store.access == .granted else {
+                store.eventPages.clear()
+                throw NibError(.unavailable, String(localized: "Full calendar access is required to continue paging."))
+            }
+            let snapshot = try store.eventPages.read(cursor, from: from, to: to, principal: ctx.principal)
+            events = snapshot.events; offset = snapshot.offset; token = snapshot.token
         } else {
-            events = try await store.fetch(from: from, to: to, principal: ctx.principal)
-        }
-        guard offset <= events.count else {
-            throw NibError(.invalidParams, "cursor past the end", path: "$.cursor", hint: "start again without a cursor")
+            let read = try await store.fetch(from: from, to: to, principal: ctx.principal)
+            events = read.map { e in
+                EventJSON(e, note: store.liveNote(for: e.id, key: e.key).map { NodeRef.document($0.doc).description })
+            }
+            offset = 0
         }
         let encoder = JSONEncoder()
         var page: [EventJSON] = []
         var bytes = 0
         var index = offset
         while index < events.count && page.count < limit {
-            let e = events[index]
-            let json = EventJSON(e, note: store.liveNote(for: e.id, key: e.key).map { NodeRef.document($0.doc).description })
+            let json = events[index]
             let size = (try? encoder.encode(json).count) ?? 0
             if !page.isEmpty && bytes + size > pageBytes { break }
             page.append(json)
@@ -128,8 +188,11 @@ struct CalendarEvents: NibCommand {
             index += 1
         }
         let more = index < events.count
+        if more, token == nil {
+            token = try store.eventPages.retain(events, from: from, to: to, principal: ctx.principal)
+        }
         return Output(events: page, from: CalendarDates.iso(from), to: CalendarDates.iso(to),
-                      truncated: more ? true : nil, cursor: more ? String(index) : nil)
+                      truncated: more ? true : nil, cursor: more ? token.map { $0 + ":" + String(index) } : nil)
     }
 
     static func range(_ p: Params) throws -> (Date, Date) {

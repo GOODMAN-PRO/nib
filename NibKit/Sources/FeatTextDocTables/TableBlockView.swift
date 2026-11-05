@@ -69,6 +69,12 @@ struct TableGridLayout: Equatable {
     func row(at y: CGFloat) -> Int? { TableLayout.band(at: y, offsets: ys) }
     func column(at x: CGFloat) -> Int? { TableLayout.band(at: x, offsets: xs) }
 
+    func resizeDivider(location: CGPoint, translation: CGPoint, origin: CGPoint) -> Int? {
+        let start = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+        guard start.y >= origin.y - TableMetrics.gutter, start.y <= origin.y + height else { return nil }
+        return divider(near: start.x - origin.x, slop: TableMetrics.dividerSlop)
+    }
+
     /// The column whose right edge is within `slop` of `x` (the closest one).
     func divider(near x: CGFloat, slop: CGFloat) -> Int? {
         guard xs.count > 1 else { return nil }
@@ -792,6 +798,7 @@ final class TableBlockView: UIView {
     private var heightCache: [CellPosition: (text: RichText, width: CGFloat, height: CGFloat)] = [:]
 
     private var tail: Task<Void, Never>?
+    private var queuedOperations = 0
     private var pendingText: (cell: CellPosition, text: RichText)?
     private var commitTask: Task<Void, Never>?
     private var inFlight = 0
@@ -957,6 +964,11 @@ final class TableBlockView: UIView {
             closeMenus(dismiss: true)
             unsubscribe()
         }
+    }
+
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        if superview == nil { flushTyping() }
     }
 
     private func traitsChanged(_ previous: UITraitCollection) {
@@ -1628,12 +1640,27 @@ final class TableBlockView: UIView {
     @discardableResult
     private func enqueue(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let previous = tail
-        let task = Task { @MainActor in
+        queuedOperations += 1
+        publishQueueActivity()
+        let task = Task { @MainActor [self] in
             await previous?.value
             await operation()
+            queuedOperations -= 1
+            publishQueueActivity()
         }
         tail = task
         return task
+    }
+
+    /// Synchronous main-actor service for FeatTextDoc: keep this editor discoverable until its queue is idle.
+    /// Detaching flushes debounced typing before the host considers eviction.
+    private func publishQueueActivity() {
+        guard let active: CurrentValueSubject<Set<UIView>, Never> = app.services.get("tables.activeQueues") else { return }
+        var views = active.value
+        let changed: Bool
+        if queuedOperations > 0 { changed = views.insert(self).inserted }
+        else { changed = views.remove(self) != nil }
+        if changed { active.send(views) }
     }
 
     @discardableResult
@@ -1853,7 +1880,7 @@ final class TableBlockView: UIView {
     }
 
     /// Puts text on the pasteboard through clipboard.copyText (F014).
-    private func copyToPasteboard(_ text: String) {
+    private func copyToPasteboard(_ text: String, afterCopy: (@MainActor () async -> Void)? = nil) {
         let params: JSONValue = ["text": .string(text)]
         let session = self.session
         let app = self.app
@@ -1861,6 +1888,7 @@ final class TableBlockView: UIView {
             do {
                 _ = try await app.bus.execute(Invocation(command: "clipboard.copyText", params: params, principal: .user,
                                                          session: session))
+                await afterCopy?()
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                 userInfo: ["command": "clipboard.copyText", "error": NibError.wrap(error)])
@@ -2150,12 +2178,50 @@ final class TableBlockView: UIView {
     }
 
     private func deleteSelection(_ target: TableMenuTarget) {
-        guard !isReadOnly else { return }
+        flushTyping()
+        guard let operation = selectionDeletion(target) else { return }
+        enqueue(operation)
+    }
+
+    /// Capture the deletion now, but execute it directly in the caller's queue position (also used by Cut).
+    private func selectionDeletion(_ target: TableMenuTarget) -> (@MainActor () async -> Void)? {
+        guard !isReadOnly, let range = target.range(in: table) else { return nil }
+        newTypingGroup()
+        let group = NibID.make().raw
+        let after: AfterEdit = editing != nil ? .editCell : .clearSelection
+        let params: [TableEdit.Params]
         switch target {
-        case .rows: run(.deleteRows, on: target)
-        case .columns: run(.deleteColumns, on: target)
-        case .cells: run(.clearContents, on: target)
-        case .table: run(.deleteTable, on: target)
+        case .rows:
+            guard range.rowCount < table.rows.count else { return nil }
+            params = [TableEdit.Params(ref: ref, op: .deleteRow, row: range.top,
+                                       column: editing?.column ?? range.left, count: range.rowCount)]
+        case .columns:
+            guard range.columnCount < columnCount else { return nil }
+            params = [TableEdit.Params(ref: ref, op: .deleteColumn, row: editing?.row ?? range.top,
+                                       column: range.left, count: range.columnCount)]
+        case .cells:
+            params = TableOps.visibleCells(table).filter { range.contains($0) && !cellText($0).isEmpty }.map {
+                TableEdit.Params(ref: ref, op: .setCell, row: $0.row, column: $0.column, text: .empty)
+            }
+        case .table:
+            let refs: JSONValue = ["refs": .array([.string(ref)])]
+            return { [self] in
+                closeMenus(dismiss: false)
+                await execute("block.delete", refs, group: group)
+            }
+        }
+        return { [self] in
+            for p in params {
+                guard let out = await execute(p, group: group) else { return }
+                switch target {
+                case .rows, .columns:
+                    if after == .clearSelection { select(TableSelection.none) }
+                    finish(after, out)
+                case .cells:
+                    if let e = editing, range.contains(e) { editor.attributedText = style.attributed(.empty) }
+                case .table: break
+                }
+            }
         }
     }
 
@@ -2197,8 +2263,9 @@ final class TableBlockView: UIView {
         case .copy:
             run(.copy, on: target)
         case .cut:
-            run(.copy, on: target)
-            deleteSelection(target)
+            guard !isReadOnly, let range = target.range(in: table) else { return }
+            flushTyping()
+            copyToPasteboard(TableOps.tabSeparated(table, range), afterCopy: selectionDeletion(target))
         }
     }
 
@@ -2353,7 +2420,7 @@ final class TableBlockView: UIView {
     @objc private func resizePanned(_ g: UIPanGestureRecognizer) {
         switch g.state {
         case .began:
-            guard let c = layout.divider(near: g.location(in: grid).x - gridOrigin.x, slop: TableMetrics.dividerSlop),
+            guard let c = layout.resizeDivider(location: g.location(in: grid), translation: g.translation(in: grid), origin: gridOrigin),
                   layout.columnWidths.indices.contains(c) else { return }
             flushTyping()
             resize = (c, layout.columnWidths[c])
@@ -2506,9 +2573,8 @@ extension TableBlockView: UIGestureRecognizerDelegate {
             guard !isReadOnly else { return false }
             let v = pan.velocity(in: grid)
             guard abs(v.x) > abs(v.y) else { return false }
-            let p = pan.location(in: grid)
-            guard p.y >= gridOrigin.y - TableMetrics.gutter, p.y <= gridOrigin.y + layout.height else { return false }
-            return layout.divider(near: p.x - gridOrigin.x, slop: TableMetrics.dividerSlop) != nil
+            return layout.resizeDivider(location: pan.location(in: grid), translation: pan.translation(in: grid),
+                                        origin: gridOrigin) != nil
         }
         if let pan = g as? UIPanGestureRecognizer, let handle = pan.view as? TableHandleButton {
             guard !isReadOnly else { return false }

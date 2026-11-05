@@ -71,6 +71,7 @@ struct PresentExport: NibCommand {
         // export.run owns omission warnings, including when delivery is cancelled.
         // Do not repeat or replace that warning with a generic success toast.
         if completed, result["warning"]?.stringValue == nil {
+            // Folder/library selections intentionally report documents without loading page lists.
             let count = params["pages"]?.arrayValue?.count ?? selection.documents.reduce(0) { $0 + $1.pages.count }
             ctx.activeSession?.floatingHost?.postToast(count > 0 ? String(localized: "Exported \(count) pages") : String(localized: "Exported \(selection.documents.count) documents"))
         }

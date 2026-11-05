@@ -65,7 +65,7 @@ enum Clipboard {
 
     static let log = Logger(subsystem: "app.nib", category: "clipboard")
     /// Copy itself never waits for OCR. Late text is best-effort, while this is still the same clipboard entry.
-    static let recognitionWindow: TimeInterval = 5
+    static var recognitionWindow: TimeInterval = 5
     private static var recognitionTask: Task<Void, Never>?
     private static var recognitionDeadline: Task<Void, Never>?
 
@@ -77,7 +77,8 @@ enum Clipboard {
         guard !ink.isEmpty, let recognizer else { return nil }
         let board = Clipboard.board
         let revision = board.changeCount
-        let deadline = ProcessInfo.processInfo.systemUptime + recognitionWindow
+        let window = recognitionWindow
+        let deadline = ProcessInfo.processInfo.systemUptime + window
         let task = Task { @MainActor in
             guard !Task.isCancelled else { return }
             guard let lines = try? await recognizer.recognize(strokes: ink, language: language),
@@ -96,7 +97,7 @@ enum Clipboard {
         }
         recognitionTask = task
         recognitionDeadline = Task { @MainActor in
-            do { try await Task.sleep(nanoseconds: UInt64(recognitionWindow * 1_000_000_000)) }
+            do { try await Task.sleep(nanoseconds: UInt64(window * 1_000_000_000)) }
             catch { return }
             task.cancel()
         }
@@ -190,13 +191,21 @@ enum ClipboardRender {
 
 /// Everything a copy puts on the pasteboard.
 struct ClipboardExport {
-    var fragment: NibFragment
+    let fragment: NibFragment
+    private let fragmentData: Data?
     var png: Data?
     var text: String
 
+    init(fragment: NibFragment, png: Data?, text: String) {
+        self.fragment = fragment
+        self.fragmentData = fragment.encoded()
+        self.png = png
+        self.text = text
+    }
+
     var representations: [String: Any] {
         var reps: [String: Any] = [:]
-        if let data = fragment.encoded() { reps[NibFragment.typeIdentifier] = data }
+        if let data = fragmentData { reps[NibFragment.typeIdentifier] = data }
         if let png = png { reps[UTType.png.identifier] = png }
         if !text.isEmpty { reps[UTType.utf8PlainText.identifier] = text }
         return reps
@@ -326,10 +335,10 @@ enum ClipboardCore {
     }
 
     /// Fragment (with asset bytes), PNG and typed text. Recognition must never gate a pasteboard write.
-    static func export(_ sel: ClipSelection, _ ctx: CommandContext) async -> ClipboardExport {
+    static func export(_ sel: ClipSelection, _ ctx: CommandContext) async throws -> ClipboardExport {
         let store = ctx.services.assets
         let doc = sel.doc
-        let fragment = NibFragment.make(items: sel.items) { ref in try? store?.data(ref, doc: doc) }
+        let fragment = try NibFragment.complete(items: sel.items, store: store, doc: doc)
         let png = await ClipboardRender.png(sel.items, doc: doc, page: sel.page, pageItems: sel.pageItems,
                                             renderer: ctx.services.renderer)
         let text = ClipboardText.join(sel.items.compactMap { item in
@@ -414,7 +423,7 @@ struct ClipboardCopy: NibCommand {
         let visible = ClipSelection(doc: sel.doc, page: sel.page,
                                     items: sel.items.filter { !hidden.contains($0.layer) }, pageItems: sel.pageItems)
         guard !visible.items.isEmpty else { return Output(count: 0, types: [], text: nil) }
-        let export = await ClipboardCore.export(visible, ctx)
+        let export = try await ClipboardCore.export(visible, ctx)
         let nowHidden = ClipboardCore.hiddenLayers(sel.doc, ctx)
         if visible.items.contains(where: { nowHidden.contains($0.layer) }) {
             throw NibError(.conflict, String(localized: "Layer visibility changed while copying. Copy the selection again."))
@@ -514,7 +523,7 @@ struct ClipboardCut: NibCommand {
             throw NibError(.invalidParams, "item \(locked.id.raw) is locked and cannot be cut", path: "$.refs",
                            hint: "unlock it with item.setLocked, or copy it with clipboard.copy")
         }
-        let export = await ClipboardCore.export(sel, ctx)
+        let export = try await ClipboardCore.export(sel, ctx)
         try ClipboardCore.ensureUnlocked(sel.doc, ctx)
         try ClipboardCore.ensureWritable(sel.doc, ctx, path: "$.refs")
         let current = try ctx.workspace.items(sel.doc, page: sel.page)

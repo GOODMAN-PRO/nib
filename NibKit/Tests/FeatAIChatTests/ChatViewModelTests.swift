@@ -6,6 +6,54 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testLongStreamParsesEachCompletedTokenOnceAndReusesPageIndex() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let template = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let pages = (0..<500).map { index -> PageRecord in
+            PageRecord(id: NibID("CITEPAGE\(index)"), order: String(format: "%04d", index),
+                       size: template.size, background: template.background)
+        }
+        let refs = pages.prefix(40).map { NodeRef.page(Fixtures.docID, $0.id).description }
+        let answer = (0..<5).map { _ in refs.joined(separator: " cited. ") + ". " }.joined()
+        var stream = ChatCitationStream()
+        var cache = ChatPageIndexCache()
+        var lookups = 0
+        for character in answer {
+            stream.append(String(character)) { raw in
+                lookups += 1
+                guard case let .page(doc, page)? = NodeRef(raw),
+                      let index = cache.index(of: page, in: doc, pages: pages) else { return "Page" }
+                return "Page \(index + 1)"
+            }
+        }
+        XCTAssertEqual(stream.refs, refs)
+        XCTAssertEqual(lookups, refs.count, "repeated references and deltas reuse resolved labels")
+        XCTAssertEqual(cache.buildCount, 1, "all 40 page citations share one sort of the 500 pages")
+        XCTAssertEqual(stream.parsedUTF16, answer.utf16.count, "completed text is scanned once across all deltas")
+        XCTAssertEqual(stream.displayText, ChatCitations.replacingRefs(in: answer, labels: stream.labels))
+        var reordered = pages
+        reordered[0].order = "9999"
+        XCTAssertEqual(cache.index(of: pages[0].id, in: Fixtures.docID, pages: reordered), 499)
+        XCTAssertEqual(cache.buildCount, 2)
+    }
+
+    func testEntryStreamingHandlesSplitReferencesAndLabelRefresh() {
+        var entry = ChatEntry(id: "STREAM", role: "assistant", text: "")
+        var lookups = 0
+        let label: (String) -> String = { _ in lookups += 1; return "Page 1" }
+        for delta in ["See pa", "ge:D/", "PAGE", ". Again page:D/PAGE."] { entry.appendText(delta, label: label) }
+        XCTAssertEqual(lookups, 1)
+        XCTAssertEqual(entry.text, "See page:D/PAGE. Again page:D/PAGE.")
+        XCTAssertEqual(entry.displayText, "See Page 1. Again Page 1.")
+        entry.resolveCitations { _ in "Page 2" }
+        entry.appendText(" More.", label: label)
+        XCTAssertEqual(entry.displayText, "See Page 2. Again Page 2. More.")
+        XCTAssertEqual(lookups, 1)
+        entry.text = "Replaced with doc:D."
+        entry.resolveCitations { _ in "Notebook" }
+        XCTAssertEqual(entry.displayText, "Replaced with Notebook.")
+    }
+
     func testCitationLabelsRefreshAfterPageReorderAndDocumentRename() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let model = ChatRuntime.get(h.app).model(for: h.session)
@@ -381,6 +429,58 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(model.entries.last?.text, "Recovered")
         XCTAssertEqual(model.tokenCount, 20)
         XCTAssertNil(model.error)
+    }
+
+    func testTrailingCitationFinalizesAfterFailureOrUnexpectedClosure() async throws {
+        let ref = "page:FIXTUREDOC01/FIXTUREPG001"
+        for fails in [true, false] {
+            let h = Harness(features: [FeatAIChatFeature.self])
+            let service = ScriptedChatService()
+            service.events = [.text("See " + ref)]
+            if fails { service.events.append(.failed(NibError(.unavailable, "offline"))) }
+            h.app.services.ai = service
+            let model = ChatRuntime.get(h.app).model(for: h.session)
+            do {
+                _ = try await model.send(prompt: "Read", principal: .user, group: "G1")
+                XCTFail("expected an incomplete stream")
+            } catch {}
+            XCTAssertEqual(model.entries.last?.text, "See " + ref)
+            XCTAssertEqual(model.entries.last?.displayText, "See Page 1")
+            XCTAssertEqual(model.entries.last?.citationRefs, [ref], "the navigation chip must survive termination")
+            XCTAssertEqual(model.entries.last?.citationLabels[ref], "Page 1")
+        }
+    }
+
+    func testTrailingCitationFinalizesAfterStopOrTaskCancellation() async throws {
+        let ref = "page:FIXTUREDOC01/FIXTUREPG001"
+        for stops in [true, false] {
+            let h = Harness(features: [FeatAIChatFeature.self])
+            let service = ScriptedChatService()
+            service.suspended = true
+            h.app.services.ai = service
+            let model = ChatRuntime.get(h.app).model(for: h.session)
+            let ended = expectation(description: "cancelled stream ended")
+            let turn = Task {
+                do {
+                    _ = try await model.send(prompt: "Read", principal: .user, group: "G1")
+                    XCTFail("expected cancellation")
+                } catch {}
+                ended.fulfill()
+            }
+            defer { turn.cancel(); service.continuation?.finish() }
+            for _ in 0..<100 where service.continuation == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+            XCTAssertNotNil(service.continuation)
+            service.continuation?.yield(.text("See " + ref))
+            for _ in 0..<100 where model.entries.last?.text != "See " + ref { try await Task.sleep(nanoseconds: 10_000_000) }
+            XCTAssertEqual(model.entries.last?.text, "See " + ref)
+            XCTAssertEqual(model.entries.last?.citationRefs, [], "no delimiter has arrived yet")
+            if stops { model.stop() } else { turn.cancel() }
+            await fulfillment(of: [ended], timeout: 3)
+            XCTAssertEqual(model.entries.last?.displayText, "See Page 1")
+            XCTAssertEqual(model.entries.last?.citationRefs, [ref])
+            XCTAssertEqual(model.entries.last?.citationLabels[ref], "Page 1")
+            XCTAssertFalse(model.isStreaming)
+        }
     }
 
     func testStopDoesNotAcceptLateStreamEvents() async throws {

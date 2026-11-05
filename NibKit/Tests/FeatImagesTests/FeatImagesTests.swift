@@ -108,7 +108,7 @@ final class FeatImagesTests: XCTestCase {
         // From the palette's popover (no canvas): the session finishes the tool.
         h.session.tool = "lasso"
         h.session.tool = ImageTool.toolID
-        var refs = await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: target, app: h.app,
+        var refs = try await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: target, app: h.app,
                                                                     session: h.session), session: h.session, target: target)
         XCTAssertEqual(refs.count, 1)
         XCTAssertEqual(h.session.tool, "lasso", "the non-sticky image tool hands back after one insert")
@@ -120,7 +120,7 @@ final class FeatImagesTests: XCTestCase {
         h.session.tool = "pen"
         h.session.selectTemporarily(ImageTool.toolID)
         let tapped = ImageMenuTarget(doc: Fixtures.docID, page: Fixtures.page2, point: Point(100, 100), host: host, tool: tool)
-        refs = await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: tapped, app: h.app,
+        refs = try await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: tapped, app: h.app,
                                                                 session: h.session), session: h.session, target: tapped)
         XCTAssertEqual(refs.count, 1)
         XCTAssertEqual(h.session.tool, "pen")
@@ -128,7 +128,7 @@ final class FeatImagesTests: XCTestCase {
 
         // Someone switched tools while the picker was up: the insert leaves their choice alone.
         h.session.tool = "eraser"
-        refs = await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: target, app: h.app,
+        refs = try await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: target, app: h.app,
                                                                 session: h.session), session: h.session, target: target)
         XCTAssertEqual(refs.count, 1)
         XCTAssertEqual(h.session.tool, "eraser")

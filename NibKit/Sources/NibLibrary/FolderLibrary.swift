@@ -136,11 +136,17 @@ enum FileNames {
             ? String(localized: "\(base) folder") : base
         let fm = FileManager.default
         let ignored = ignoring?.standardizedFileURL.path.lowercased()
+        // File Providers may compare names case-insensitively even on a case-sensitive volume.
+        // Reserve the same names before asking the coordinator to move into that directory.
+        let occupied = Set(((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { name in
+            dir.appendingPathComponent(name).standardizedFileURL.path.lowercased() != ignored
+        }.map { $0.lowercased() })
         func taken(_ name: String) -> Bool {
             let file = ext.map { name + "." + $0 } ?? name
             if reservedNames.contains(file.lowercased()) { return true }
             let url = dir.appendingPathComponent(file)
             if let i = ignored, url.standardizedFileURL.path.lowercased() == i { return false }
+            if occupied.contains(file.lowercased()) || occupied.contains(("." + file + LibraryLayout.placeholderSuffix).lowercased()) { return true }
             if fm.fileExists(atPath: url.path) { return true }
             return fm.fileExists(atPath: dir.appendingPathComponent("." + file + LibraryLayout.placeholderSuffix).path)
         }
@@ -191,6 +197,8 @@ final class FolderLibrary: LibraryService {
     private var started = false
     /// Bumped by every catalog change, so a background scan that raced a change is not applied over it.
     private var generation: UInt64 = 0
+    private var rootEpoch = UUID()
+    private(set) var lastRefreshRanOffMain = false
     private var scanning = false
     private var rebuilding = false
     private var rescanRequested = false
@@ -567,7 +575,7 @@ final class FolderLibrary: LibraryService {
     func duplicate(_ id: NibID) throws -> NibID {
         let job = try prepareDuplicate(id, as: nil)
         try job.run()
-        return finishDuplicate(job, top: job.topID ?? id)
+        return try finishDuplicate(job, top: job.topID ?? id)
     }
 
     /// Duplicates a document (new id in this device's head, other heads removed) or a folder (new ids for every folder
@@ -575,10 +583,10 @@ final class FolderLibrary: LibraryService {
     func duplicate(_ id: NibID, as newID: NibID?) async throws -> NibID {
         let job = try prepareDuplicate(id, as: newID)
         try await Task.detached(priority: .userInitiated) { try job.run() }.value
-        return finishDuplicate(job, top: job.topID ?? id)
+        return try finishDuplicate(job, top: job.topID ?? id)
     }
 
-    private func prepareDuplicate(_ id: NibID, as newID: NibID?) throws -> CopyJob {
+    func prepareDuplicate(_ id: NibID, as newID: NibID?) throws -> CopyJob {
         ensureLoaded()
         guard let e = catalog.entry(id: id) else { throw NibError.notFound("library item \(id.raw)") }
         guard !e.inTrash else {
@@ -589,7 +597,7 @@ final class FolderLibrary: LibraryService {
         guard catalog.entry(id: top) == nil else {
             throw NibError(.conflict, "the library already has an item with id \(top.raw)", hint: "omit ids to get fresh ones")
         }
-        flushDocuments(under: e)
+        try checkpointDocuments(under: e)
         let source = url(of: e)
         let dir = source.deletingLastPathComponent()
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
@@ -597,10 +605,13 @@ final class FolderLibrary: LibraryService {
         let name = uniqueName(base, ext: ext, in: dir)
         let destination = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         return CopyJob(source: source, destination: destination, topID: top, device: device, clock: clock,
-                       taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true)
+                       taken: Set(catalog.entries.map { $0.node.id }), collapseHeads: true, rootEpoch: rootEpoch)
     }
 
-    private func finishDuplicate(_ job: CopyJob, top fallback: NibID) -> NibID {
+    func finishDuplicate(_ job: CopyJob, top fallback: NibID) throws -> NibID {
+        guard job.rootEpoch == rootEpoch else {
+            throw NibError(.conflict, String(localized: "The library changed while duplicating. The copy remains in the original library."))
+        }
         let added = scanner(previous: [:]).scanItem(at: job.destination, inTrash: false, trashTop: false,
                                                     existing: catalog.byPath)
         for entry in added {
@@ -807,6 +818,68 @@ final class FolderLibrary: LibraryService {
         return try finishImport(job)
     }
 
+    /// Copy and scan in hidden staging. Only a complete package is moved into the visible library,
+    /// after revalidating its root, parent and IDs. Synchronous LibraryService callers remain supported.
+    func importPackageAsync(at url: URL, into folder: FolderID?,
+                            beforeCopy: @escaping @Sendable () throws -> Void = {}) async throws -> DocumentID {
+        ensureLoaded()
+        let epoch = rootEpoch
+        let parent = try directory(of: folder)
+        // The .tmp suffix also excludes in-progress packages from WebDAV's recursive mirror.
+        let staging = metadataURL.appendingPathComponent("import-" + UUID().uuidString + ".tmp", isDirectory: true)
+        let taken = Set(catalog.entries.map { $0.node.id })
+        let device = self.device, clock = self.clock
+        let rootScope = scopedRoot
+        let rootAccess = rootScope?.startAccessingSecurityScopedResource() ?? false
+        let sourceAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if sourceAccess { url.stopAccessingSecurityScopedResource() }
+            if rootAccess { rootScope?.stopAccessingSecurityScopedResource() }
+        }
+        let worker = Task.detached(priority: .userInitiated) {
+            try beforeCopy()
+            try Task.checkCancellation()
+            return try PreparedPackageImport.make(source: url, staging: staging, device: device, clock: clock, taken: taken)
+        }
+        do {
+            let prepared = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
+            try Task.checkCancellation()
+            if let current = services?.library, current !== self {
+                throw NibError(.conflict, String(localized: "The library changed. Try importing again."))
+            }
+            guard epoch == rootEpoch, try directory(of: folder) == parent,
+                  Set(prepared.entries.map { $0.node.id }).isDisjoint(with: catalog.entries.map { $0.node.id }) else {
+                throw NibError(.conflict, String(localized: "The library changed while importing. Nothing was imported. Try again."))
+            }
+            let name = uniqueName(prepared.base, ext: prepared.ext, in: parent)
+            let destination = parent.appendingPathComponent(FileNames.fileName(name, ext: prepared.ext), isDirectory: true)
+            let path = relativePath(destination)
+            let prefix = prepared.package.lastPathComponent
+            var entries = prepared.entries
+            for i in entries.indices {
+                let suffix = String(entries[i].node.path.dropFirst(prefix.count))
+                entries[i].node.path = path + suffix
+                entries[i].parentPath = LibraryLayout.parentPath(of: entries[i].node.path)
+                if suffix.isEmpty { entries[i].node.title = name; entries[i].node.parent = folder }
+            }
+            guard let first = entries.first(where: { $0.isDocument }) else {
+                throw NibError(.notFound, String(localized: "No document was found in the imported package."))
+            }
+            // Same-volume rename only: the recursive copy and head reads have already completed off-main.
+            try FileOps.move(prepared.package, to: destination)
+            for entry in entries {
+                catalog.upsert(entry)
+                if entry.isDocument { locator.set(self.url(of: entry), for: entry.node.id) }
+            }
+            changed(entries.map { $0.ref })
+            await Task.detached { try? FileManager.default.removeItem(at: staging) }.value
+            return first.node.id
+        } catch {
+            await Task.detached { try? FileManager.default.removeItem(at: staging) }.value
+            throw error
+        }
+    }
+
     private func prepareImport(_ url: URL, into folder: FolderID?) throws -> CopyJob {
         ensureLoaded()
         let scoped = url.startAccessingSecurityScopedResource()
@@ -861,6 +934,38 @@ final class FolderLibrary: LibraryService {
     }
 
     // MARK: LibraryService — refresh and root
+
+    /// Awaitable incremental refresh for sync. Scanning and preference reads run off-main; catalogue publication
+    /// is retried after intervening edits and refused after a root switch (including switching away and back).
+    func refreshCatalog() async throws {
+        let epoch = rootEpoch
+        let prefs = self.prefs
+        while true {
+            try Task.checkCancellation()
+            let gen = generation
+            var job = scanner(previous: catalog.byPath)
+            job.reuse = FileManager.default.fileExists(atPath: cacheURL.path)
+            let scan = job
+            let (result, names, offMain) = try await Task.detached(priority: .utility) {
+                _ = try FileManager.default.contentsOfDirectory(at: scan.root, includingPropertiesForKeys: nil)
+                return (scan.scanAll(), prefs.reload(), !Thread.isMainThread)
+            }.value
+            guard rootEpoch == epoch else {
+                throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))
+            }
+            guard generation == gen else { continue }
+            try Task.checkCancellation()
+            loaded = true
+            lastRefreshRanOffMain = offMain
+            apply(result)
+            guard rootEpoch == epoch else {
+                throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))
+            }
+            scheduleCacheSave()
+            postSettingsChanges(names)
+            return
+        }
+    }
 
     /// A synchronous rescan (after sync, import or repair). Incremental while the cached catalog file exists; when it
     /// is gone (deleted by a repair, never written) every head and folder record is read again and the file is
@@ -999,6 +1104,12 @@ final class FolderLibrary: LibraryService {
         overlayLoadedDocuments(&entries)
         let before = catalog.byPath
         install(entries)
+        // A remote Trash move has the same editor lifecycle as local trash. Install the new package URLs first
+        // so closing flushes pending edits to the moved package. Missing packages are left open for recovery.
+        let previouslyLive = Set(before.values.filter { $0.isDocument && !$0.inTrash }.map { $0.node.id })
+        for entry in entries where entry.isDocument && entry.inTrash && previouslyLive.contains(entry.node.id) {
+            workspace.close(entry.node.id)
+        }
         var refs: [String] = []
         for e in entries where before[e.node.path] != e { refs.append(e.ref) }
         let now = Set(entries.map { $0.node.path })
@@ -1092,6 +1203,7 @@ final class FolderLibrary: LibraryService {
         scopedRoot?.stopAccessingSecurityScopedResource()
         scopedRoot = scoped ? url : nil
         rootURL = target
+        rootEpoch = UUID()
         rootUnavailable = false
         LibrarySettings.saveRoot(bookmark, settings)
         try? FileOps.createDirectory(metadataURL)
@@ -1274,6 +1386,17 @@ final class FolderLibrary: LibraryService {
         return record
     }
 
+    /// Requires durable source bytes before copying, including failed writes retained after a document closed.
+    private func checkpointDocuments(under entry: CatalogEntry) throws {
+        // Matches NibStoreFeature.Checkpoint, like the optional catalogue-rebuild service: no feature import.
+        typealias Checkpoint = @MainActor (DocumentID) throws -> Bool
+        let checkpoint = services?.get("store.checkpoint", as: Checkpoint.self)
+        for e in catalog.subtree(path: entry.node.path) where e.isDocument {
+            if let checkpoint, try checkpoint(e.node.id) { continue }
+            workspace.persistence.flush(e.node.id)
+        }
+    }
+
     /// Writes pending changes of open documents at or under `entry` (before their package moves).
     private func flushDocuments(under entry: CatalogEntry) {
         for e in catalog.subtree(path: entry.node.path) where e.isDocument && workspace.isLoaded(e.node.id) {
@@ -1340,6 +1463,43 @@ final class FolderLibrary: LibraryService {
 
 // MARK: - Copies (duplicate, import)
 
+/// Filesystem-only import preparation, including the catalogue scan. Hidden staging cannot be published by a rescan.
+struct PreparedPackageImport {
+    let package: URL
+    let base: String
+    let ext: String?
+    let entries: [CatalogEntry]
+
+    static func make(source: URL, staging: URL, device: String, clock: HLCClock, taken: Set<NibID>) throws -> Self {
+        let sourcePath = source.resolvingSymlinksInPath().standardizedFileURL.path
+        guard !staging.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(sourcePath + "/") else {
+            throw NibError(.invalidParams, String(localized: "Choose a package outside the active library folder to import."))
+        }
+        var directory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: source.path, isDirectory: &directory), directory.boolValue else {
+            throw NibError(.invalidParams, String(localized: "'\(source.lastPathComponent)' is not a Nib package or a folder"))
+        }
+        let isPackage = CatalogScanner.isDocumentPackage(source)
+        guard isPackage || FolderLibrary.holdsPackages(source) else {
+            throw NibError(.invalidParams, String(localized: "'\(source.lastPathComponent)' holds no Nib documents"))
+        }
+        let raw = isPackage ? source.deletingPathExtension().lastPathComponent : source.lastPathComponent
+        let ext: String? = isPackage ? NibFormat.packageExtension : nil
+        let base = FileNames.sanitize(raw, fallback: String(localized: "Imported"))
+        let name = FileNames.unique(base, ext: ext, in: staging)
+        let package = staging.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
+        try CopyJob(source: source, destination: package, topID: nil, device: device, clock: clock,
+                    taken: taken, collapseHeads: false).run()
+        try Task.checkCancellation()
+        let entries = CatalogScanner(root: staging, device: device, previous: [:], skipInbox: false)
+            .scanItem(at: package, inTrash: false, trashTop: false, existing: [:])
+        guard entries.contains(where: { $0.isDocument }), entries.allSatisfy({ !$0.derivedID }) else {
+            throw NibError(.invalidParams, String(localized: "The imported package has no readable document identity. The original was kept."))
+        }
+        return Self(package: package, base: base, ext: ext, entries: entries)
+    }
+}
+
 /// Copies a package or folder into the library and gives the copy its own identity. Duplicates give every document
 /// and folder inside a new id (documents keep only this device's head); imports only re-identify documents and folders
 /// whose ids the library already has. Runs off the main actor: file I/O, a thread-safe clock and value state only.
@@ -1354,6 +1514,7 @@ struct CopyJob {
     let taken: Set<NibID>
     /// Duplicates: every document gets a new id and keeps only this device's head.
     let collapseHeads: Bool
+    var rootEpoch: UUID? = nil
 
     /// Copies, then re-identifies; a copy that cannot get its own identity is removed again.
     func run() throws {

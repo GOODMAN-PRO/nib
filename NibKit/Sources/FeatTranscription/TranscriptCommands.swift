@@ -33,21 +33,32 @@ struct TranscriptGet: NibCommand {
 
 @MainActor
 struct TranscriptEditSegment: NibCommand {
-    struct Params: Codable { var clip: String; var index: Int; var text: String }
+    struct Params: Codable { var clip: String; var index: Int; var text: String; var baseline: TranscriptSegment? = nil }
     static let descriptor = CommandDescriptor(id: CommandIDs.transcriptEditSegment, title: "Edit Transcript Line",
         summary: "Correct one transcript line in this device's sidecar; the edit is not undoable.",
-        params: .obj(["clip": .ref, "index": .int(min: 0), "text": .str()], required: ["clip", "index", "text"]),
+        params: .obj(["clip": .ref, "index": .int(min: 0), "text": .str(),
+                      "baseline": .anything("The segment originally opened for editing")], required: ["clip", "index", "text"]),
         examples: [["clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "index": 0, "text": "Welcome to the lecture."]],
         effect: .edit, undoable: false)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> TranscriptSegment {
         let store = try TranscriptStore.of(ctx.services)
         let clip = try store.clip(p.clip, workspace: ctx.workspace)
+        let expected = try await store.files.read(base: clip.base, includingRetired: true, device: store.device)
         let lines = try await TranscriptGet.run(.init(clip: p.clip), ctx).segments
         guard var line = lines.first(where: { $0.index == p.index }) else { throw NibError.notFound("transcript line \(p.index)") }
+        if let baseline = p.baseline, baseline != line {
+            throw NibError(.conflict, String(localized: "This transcript line changed while you were editing."),
+                           hint: String(localized: "Keep your draft and reopen the current line before saving."))
+        }
         if let rev = line.rev { ctx.workspace.clock.observe(rev) }
         line.text = p.text
         line.rev = ctx.workspace.clock.tick()
-        try await store.persist([line], clip: clip, ctx: ctx)
+        do {
+            try await store.persist([line], clip: clip, ctx: ctx, expected: expected)
+        } catch let error as NibError where error.code == .conflict {
+            throw NibError(.conflict, String(localized: "This transcript changed while you were saving your edit."),
+                           hint: String(localized: "Keep your draft and reopen the current line before saving."))
+        }
         return line
     }
 }
@@ -198,15 +209,21 @@ struct TranscriptSeek: NibCommand {
             throw NibError(.invalidParams, "Pass a transcript index or a timestamp in seconds", path: "$.t", hint: "call transcript.get")
         }
         let cached = ctx.workspace.cachedPages(clip.doc)
-        var keeping = cached
-        defer { ctx.workspace.evictPages(clip.doc, keeping: keeping) }
         let lowerMs = (clip.record.start + line.start) * 1000
-        let pages = try ctx.workspace.content(clip.doc).livePages.compactMap { page -> (PageID, [Item])? in
-            if let revision = ctx.workspace.contentRevision(clip.doc, page: page.id), Double(revision.wallMs) < lowerMs { return nil }
-            return (page.id, try ctx.workspace.items(clip.doc, page: page.id))
+        var scan = TranscriptPageLink.Scan(clip: clip.record, segment: line)
+        for page in try ctx.workspace.content(clip.doc).livePages {
+            if let revision = ctx.workspace.contentRevision(clip.doc, page: page.id), Double(revision.wallMs) < lowerMs { continue }
+            // Reduce one page at a time. Cold reads must not populate the shared editing cache.
+            let items: [Item]
+            if cached.contains(page.id) {
+                items = try ctx.workspace.items(clip.doc, page: page.id)
+            } else {
+                items = try ctx.workspace.persistence.loadItems(clip.doc, page: page.id)
+            }
+            scan.include(page.id, items: items)
         }
-        let page = TranscriptPageLink.mostEditedPage(clip: clip.record, segment: line, pages: pages)
-        if let page { keeping.insert(page) }
+        let page = scan.winner
+        if let page { _ = try ctx.workspace.items(clip.doc, page: page) }
         if !ctx.dryRun {
             _ = try await ctx.execute(CommandIDs.audioPlay, ["clip": .string(p.clip), "t": .number(line.start)])
             if let page {

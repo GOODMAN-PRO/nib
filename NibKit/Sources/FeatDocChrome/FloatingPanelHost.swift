@@ -147,6 +147,7 @@ struct PanelSheetView: View {
         VStack(spacing: 0) {
             if chrome.drawsHeader(panel) {
                 NibPanelHeader(title: panel.title, symbol: NibSymbol(systemName: panel.icon) ?? .puzzle,
+                               handlesEscape: true,
                                onClose: { chrome.closePanel(panel.id) })
                 Rectangle()
                     .fill(NibColor.separatorSoft)

@@ -161,6 +161,7 @@ final class PDFTextMenuAttachment: NSObject, CanvasAttachment, UIEditMenuInterac
     private var target: (from: Point, to: Point)?
     /// The in-flight PDF service query (at most one; newer drag positions wait in `target`).
     private(set) var query: Task<Void, Never>?
+    private var selectionGeneration = 0
     private var requeryAfterQuery = false
     private(set) var presentWhenSettled = false
     /// Set before this attachment dismisses the menu itself (a handle drag, a new selection), so the dismissal does
@@ -272,6 +273,11 @@ final class PDFTextMenuAttachment: NSObject, CanvasAttachment, UIEditMenuInterac
 
     /// Shows a fresh selection (from `pdf.tapAt`) and the text menu above it.
     func show(_ s: PDFTextSelection) {
+        selectionGeneration += 1
+        query?.cancel()
+        query = nil
+        presentWhenSettled = false
+        holdSelection = false
         if selection != nil {
             keepSelectionOnDismiss = true
             menu.dismissMenu()
@@ -288,6 +294,9 @@ final class PDFTextMenuAttachment: NSObject, CanvasAttachment, UIEditMenuInterac
     }
 
     func clear() {
+        selectionGeneration += 1
+        query?.cancel()
+        query = nil
         selection = nil
         drag = nil
         target = nil
@@ -319,9 +328,10 @@ final class PDFTextMenuAttachment: NSObject, CanvasAttachment, UIEditMenuInterac
             return
         }
         target = nil
+        let generation = selectionGeneration
         query = Task { [weak self] in
             let found = await source.selection(from: t.from, to: t.to)
-            guard let self = self else { return }
+            guard let self = self, self.selectionGeneration == generation else { return }
             self.query = nil
             // Dragged off the text: keep the last selection that had text, so every action stays meaningful.
             if let current = self.selection, current.doc == s.doc, current.page == s.page,

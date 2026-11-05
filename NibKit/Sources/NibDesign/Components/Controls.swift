@@ -279,9 +279,23 @@ public struct NibSegmentedControl<Value: Hashable>: View {
         case intrinsic
         /// Share the proposed width equally, reducing padding and scaling to 85% before truncating.
         case fitting
+        /// Leave room for an adjacent 44 pt menu in a narrow navigator, retaining full labels.
+        case compactFitting
 
-        var labelPadding: CGFloat { self == .fitting ? NibSpacing.xs : NibSpacing.m }
-        var minimumLabelScale: CGFloat { self == .fitting ? 0.85 : 1 }
+        var labelPadding: CGFloat {
+            switch self {
+            case .intrinsic: return NibSpacing.m
+            case .fitting: return NibSpacing.xs
+            case .compactFitting: return NibSpacing.xxs
+            }
+        }
+        var minimumLabelScale: CGFloat {
+            switch self {
+            case .intrinsic: return 1
+            case .fitting: return 0.85
+            case .compactFitting: return 0.8
+            }
+        }
     }
 
     @Binding var selection: Value
@@ -300,11 +314,12 @@ public struct NibSegmentedControl<Value: Hashable>: View {
 
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.nibMeasuresSegmentFrames) private var measuresSegmentFrames
 
     public var body: some View {
         if typeSize.isAccessibilitySize {
             verticalOptions
-        } else if sizing == .fitting {
+        } else if sizing != .intrinsic {
             ViewThatFits(in: .horizontal) {
                 fittingOptions
                 verticalOptions
@@ -384,8 +399,37 @@ public struct NibSegmentedControl<Value: Hashable>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
+        .background {
+            if measuresSegmentFrames {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: NibSegmentFrames.self,
+                                           value: [title(option): proxy.frame(in: .global)])
+                }
+                .allowsHitTesting(false)
+            }
+        }
         .accessibilityLabel(title(option))
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+// Opt-in geometry for hosted regressions of production controls. No readers are
+// installed in normal use; measuring the outer control alone misses intrinsic rows.
+private struct NibMeasuresSegmentFramesKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var nibMeasuresSegmentFrames: Bool {
+        get { self[NibMeasuresSegmentFramesKey.self] }
+        set { self[NibMeasuresSegmentFramesKey.self] = newValue }
+    }
+}
+
+struct NibSegmentFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
@@ -619,7 +663,7 @@ public struct NibChip: View {
             if let onRemove {
                 Button(action: onRemove) {
                     Image(nib: .xmark).font(.system(size: 10, weight: .bold))
-                        .frame(width: 28, height: NibMetrics.hitTarget)
+                        .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: Capsule(), rectangularHitTarget: true))

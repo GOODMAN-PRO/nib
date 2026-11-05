@@ -5,7 +5,7 @@ import SwiftUI
 import PDFKit
 import NibContracts
 import NibTesting
-import NibDesign
+@testable import NibDesign
 @testable import FeatExportUI
 
 @MainActor
@@ -174,6 +174,48 @@ final class FeatExportUITests: XCTestCase {
         }
     }
 
+    func testProductionPagesSegmentsSpanPopoverOptionsColumn() async throws {
+        let (h, presenter, _) = harness()
+        _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
+        let selection = try XCTUnwrap(presenter.selection)
+        let draft = try XCTUnwrap(presenter.draft)
+        let titles = selection.pageScopes.map { $0.title(board: selection.isBoard) }
+        XCTAssertGreaterThan(titles.count, 1, "The production Pages picker must be present")
+        for scheme in [ColorScheme.light, .dark] {
+            var frames: [String: CGRect] = [:]
+            let dialog = ExportDialog(selection: selection, printing: false, app: h.app, session: h.session,
+                                      dismiss: {}, draft: draft, scrollsOptions: true)
+            let content = NibPopoverPanel(title: "Share & Export", onClose: {}, scrollsContent: false) { dialog }
+                .environment(\.dynamicTypeSize, .large)
+                .environment(\.colorScheme, scheme)
+                .environment(\.nibMeasuresSegmentFrames, true)
+                .onPreferenceChange(NibSegmentFrames.self) { frames = $0 }
+            let host = UIHostingController(rootView: content)
+            host.safeAreaRegions = []
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: NibMetrics.popoverWidth, height: 520))
+            window.rootViewController = host
+            window.isHidden = false
+            defer { window.isHidden = true; window.rootViewController = nil }
+            host.view.frame = window.bounds
+            for _ in 0..<10 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+            let segments = try titles.map { try XCTUnwrap(frames[$0], $0) }
+            let row = segments.reduce(CGRect.null) { $0.union($1) }
+            let inset = NibSpacing.l + 2 // Popover content padding and track inset.
+            let available = NibMetrics.popoverWidth - 2 * inset
+            XCTAssertEqual(row.minX, inset, accuracy: 1)
+            XCTAssertEqual(row.maxX, NibMetrics.popoverWidth - inset, accuracy: 1)
+            XCTAssertEqual(row.width, available, accuracy: 1,
+                           "Pages must fill the options column, not just its intrinsic labels")
+            for segment in segments {
+                XCTAssertEqual(segment.width, available / CGFloat(titles.count), accuracy: 1)
+                XCTAssertEqual(segment.minY, row.minY, accuracy: 1)
+                XCTAssertEqual(segment.height, NibMetrics.hitTarget, accuracy: 1)
+            }
+            // Reverting d08965d to intrinsic sizing leaves a shorter, unequal row;
+            // measuring the surrounding InspectorSection would miss that defect.
+        }
+    }
+
     func testPopoverDialogPinsPrimaryActionsBelowItsSingleOptionsScroller() async throws {
         let (h, presenter, _) = harness()
         _ = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"]])
@@ -318,6 +360,25 @@ final class FeatExportUITests: XCTestCase {
         _ = try await h.run("export.present", draft.submitParams(destination: "files", selection: selection))
         XCTAssertNil(probe.calls.last?["options"]?[ExportOptionKeys.visibleLayers])
         XCTAssertEqual(probe.calls.last?["options"]?[ExportOptionKeys.visibleLayersOnly], false)
+    }
+
+    func testLargeFolderDialogDoesNotLoadDocumentHeads() async throws {
+        let (h, presenter, _) = harness()
+        let folder = try h.library.createFolder(title: "Large", in: nil, style: nil)
+        let base = try h.persistence.loadHead(Fixtures.docID)
+        for index in 0..<2_000 {
+            var content = base
+            content.meta.id = NibID.make()
+            _ = try h.library.createDocument(content, title: "Notebook \(index)", in: folder)
+            // Leave catalog metadata but no readable head: any preparation read would throw.
+            h.persistence.heads[content.meta.id] = nil
+        }
+        _ = try await h.run("export.present", ["docs": [.string(NodeRef.folder(folder).description)]])
+        let selection = try XCTUnwrap(presenter.selection)
+        XCTAssertEqual(selection.documents.count, 2_000)
+        XCTAssertEqual(selection.pageScopes, [.all])
+        XCTAssertTrue(selection.documents.allSatisfy { $0.pages.isEmpty && !$0.hasSource })
+        XCTAssertTrue(selection.formats.contains { $0.id == "pdf" })
     }
 
     func testNestedFolderAndMixedLibraryUseTypedFixtures() async throws {

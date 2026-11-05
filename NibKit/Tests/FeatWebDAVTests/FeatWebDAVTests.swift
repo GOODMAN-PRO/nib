@@ -589,6 +589,39 @@ final class FeatWebDAVTests: XCTestCase {
         XCTAssertThrowsError(try WebDAVConfiguration.normalizeFolder("Nib/../etc"))
     }
 
+    func testSettingsSaveShowsLocalisedValidationWithoutChangingConfiguration() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".bundle")
+        let french = directory.appendingPathComponent("fr.lproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: french, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A French-only bundle with a French development region avoids relying on the simulator's language.
+        // Integration must still extract the validation strings into Nib/Resources/Localizable.xcstrings
+        // and supply their translations; this fixture does not replace that catalogue handoff.
+        let translations = ["'%@' is not an http or https URL": "L’adresse « %@ » n’est pas une URL HTTP ou HTTPS."]
+        let data = try PropertyListSerialization.data(fromPropertyList: translations, format: .xml, options: 0)
+        try data.write(to: french.appendingPathComponent("Localizable.strings"))
+        let info: [String: Any] = ["CFBundleIdentifier": "com.nib.tests.webdav.french",
+                                  "CFBundleName": "WebDAV French Fixture", "CFBundlePackageType": "BNDL",
+                                  "CFBundleDevelopmentRegion": "fr", "CFBundleLocalizations": ["fr"]]
+        let infoData = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try infoData.write(to: directory.appendingPathComponent("Info.plist"))
+        let bundle = try XCTUnwrap(Bundle(path: directory.path))
+        XCTAssertEqual(bundle.localizedString(forKey: "'%@' is not an http or https URL", value: nil, table: nil),
+                       "L’adresse « %@ » n’est pas une URL HTTP ou HTTPS.")
+        let h = Harness(features: [FeatWebDAVFeature.self])
+        let model = WebDAVSettingsModel(app: h.app, validationBundle: bundle)
+        let before = WebDAVSettings.read(h.app.settings)
+        let address = "nas.local"
+        model.url = address
+        let saved = await model.save()
+        XCTAssertFalse(saved)
+        // Restoring the old English literal in normalizeServerURL fails this exact French assertion.
+        XCTAssertEqual(model.errorMessage, "L’adresse « nas.local » n’est pas une URL HTTP ou HTTPS.")
+        XCTAssertEqual(WebDAVSettings.read(h.app.settings), before)
+        XCTAssertTrue(model.isDirty)
+        XCTAssertFalse(model.isWorking)
+    }
+
     // MARK: Client against the fake server
 
     func testClientListsUploadsDownloadsAndDeletes() async throws {
@@ -709,6 +742,62 @@ final class FeatWebDAVTests: XCTestCase {
         let task = try XCTUnwrap(h.app.content.backgroundTasks.get("app.nib.webdav"))
         XCTAssertEqual(task.kind, .refresh)
         XCTAssertEqual(h.app.ui.settingsPages.get(FeatWebDAVFeature.settingsPageID)?.section, .sync)
+    }
+
+    func testStaleSettingsDraftCannotRevertConfigurationOrTouchPasswords() async throws {
+        let (h, _, first) = try makeHarness()
+        _ = try await h.run(CommandIDs.webdavConfigure, ["url": .string(first.baseURL), "user": "alex", "folder": "Nib"])
+        WebDAVCredentials.setPassword("first password", url: first.baseURL, user: "alex")
+        let stale = WebDAVSettingsModel(app: h.app)
+        let clean = WebDAVSettingsModel(app: h.app)
+        let newer = WebDAVSettingsModel(app: h.app)
+        let second = FakeDAVServer.install()
+        newer.url = second.baseURL
+        newer.password = "new password"
+        let saved = await newer.save()
+        XCTAssertTrue(saved)
+        let expected = WebDAVSettings.read(h.app.settings)
+        stale.folder = "Another folder"
+        stale.password = "stale password"
+        stale.reconcileFields()
+        XCTAssertNotNil(stale.errorMessage)
+        let accepted = await stale.save()
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(WebDAVSettings.read(h.app.settings), expected)
+        XCTAssertEqual(WebDAVCredentials.password(url: second.baseURL, user: "alex"), "new password")
+        XCTAssertNil(WebDAVCredentials.password(url: first.baseURL, user: "alex"), "the stale password was never written")
+        clean.reconcileFields()
+        XCTAssertEqual(clean.url, second.baseURL)
+        XCTAssertFalse(clean.isDirty)
+        WebDAVCredentials.setPassword(nil, url: second.baseURL, user: "alex")
+    }
+
+    func testOwnConfigurationStatusDoesNotMarkSuccessfulSaveOrDisconnectStale() async throws {
+        let (h, _, server) = try makeHarness()
+        let model = WebDAVSettingsModel(app: h.app)
+        model.url = server.baseURL
+        model.user = "status-race"
+        var reconciledDuringWrite = 0
+        // configurationChanged emits synchronously after writing settings, before save/disconnect reload
+        // their baseline. Reconcile at precisely the point a suspended status refresh could resume.
+        let subscription = h.app.events.subscribe { event in
+            guard event.decode(SyncStatusPayload.self)?.source == "webdav", model.isWorking else { return }
+            reconciledDuringWrite += 1
+            model.reconcileFields()
+            XCTAssertNil(model.errorMessage)
+        }
+        defer { subscription.cancel() }
+        let saved = await model.save()
+        XCTAssertTrue(saved)
+        XCTAssertGreaterThan(reconciledDuringWrite, 0)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isDirty)
+        let beforeDisconnect = reconciledDuringWrite
+        await model.disconnect()
+        XCTAssertGreaterThan(reconciledDuringWrite, beforeDisconnect)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.savedConfigured)
+        XCTAssertFalse(model.isWorking)
     }
 
     func testConfigureValidatesStoresAndReportsMissingCredentials() async throws {

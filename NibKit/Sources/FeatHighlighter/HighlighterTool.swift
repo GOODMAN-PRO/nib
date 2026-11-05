@@ -560,7 +560,7 @@ extension RGBA {
 
 enum HighlighterColourSelection {
     static func customBinding(presets: ToolPresets, edit: @escaping (PresetEdit) -> Void) -> Binding<Color> {
-        Binding(get: { Color(uiColor: presets.color.uiColor) }, set: { colour in
+        Binding(get: { Color(uiColor: presets.color.uiColor.withAlphaComponent(1)) }, set: { colour in
             edit(.setColour(index: presets.selectedSwatch, color: RGBA(UIColor(colour)).asHighlighter))
         })
     }

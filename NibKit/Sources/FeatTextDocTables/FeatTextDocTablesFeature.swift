@@ -1,4 +1,5 @@
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
@@ -11,6 +12,8 @@ public enum FeatTextDocTablesFeature: NibFeature {
     public static func register(_ app: NibApp) {
         app.commands.register(TableEdit.self)
         app.commands.register(TableExportCSV.self)
+        // Shared through NibServices so the text-document host can pin pending queues without importing tables.
+        app.services.set(CurrentValueSubject<Set<UIView>, Never>([]), for: "tables.activeQueues")
 
         app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: id) { context in
             TableBlockView(context: context)

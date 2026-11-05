@@ -308,11 +308,31 @@ struct TimerPreset: Codable, Equatable, Hashable, Identifiable {
     }
 }
 
+/// Duration entry and ownership of outstanding handwriting results.
+struct TimerDurationInput {
+    var text = ""
+    var writing = false
+    var generation = 0
+
+    mutating func select(_ seconds: Int) {
+        generation += 1
+        writing = false
+        text = TimerFormat.clock(Double(seconds))
+    }
+
+    /// A preset/mode or a switch to typing supersedes any outstanding handwriting result.
+    mutating func complete(_ recognised: String?, generation: Int) -> Bool {
+        guard writing, self.generation == generation else { return false }
+        if let recognised { text = recognised }
+        return true
+    }
+}
+
 /// Reads a duration a person typed or wrote: "25" (minutes), "25 min", "90s", "1h 15m", "1h15", "2.5 min",
 /// "1:30" (minutes:seconds), "1:05:00" (hours:minutes:seconds). Handwriting look-alikes next to digits are fixed
 /// ("I5" is 15, "O5:00" is 05:00). Returns whole seconds in 1 s…24 h, or nil. Total: any string, however long its
 /// digit run (a scribble misread as a dozen nines), gives nil rather than overflowing.
-/// ponytail: unit words match by their English first letter (h, m, s); digits and clock forms work in any language.
+/// Unit words use explicit aliases; unknown words must never silently acquire another unit's meaning.
 enum DurationParser {
     /// Longest part of a clock form ("99999:00" is already far beyond 24 h).
     static let maxClockDigits = 5
@@ -414,10 +434,15 @@ enum DurationParser {
     }
 
     static func unitValue(_ word: String) -> Double? {
-        switch word.first {
-        case "h": return 3600
-        case "m": return word.hasPrefix("ms") ? nil : 60
-        case "s": return 1
+        switch word {
+        case "h", "hr", "hrs", "hour", "hours", "std", "stunde", "stunden",
+             "hora", "horas", "heure", "heures", "ora", "ore", "uur", "godz", "godzina", "godziny",
+             "timme", "timmar", "saat": return 3600
+        case "m", "min", "mins", "minute", "minutes", "minuten",
+             "minuto", "minutos", "minuut", "minut", "minuty", "minuta", "minuter", "dakika", "minuti": return 60
+        case "s", "sec", "secs", "second", "seconds", "sek", "sekunde", "sekunden",
+             "segundo", "segundos", "seconde", "secondes", "secondo", "secondi", "seconden",
+             "sekund", "sekundy", "sekunder", "saniye": return 1
         default: return nil
         }
     }

@@ -268,8 +268,15 @@ struct CalendarTabBody: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.x3) {
             header
+            if let error = store.reminderError { reminderFailure(error) }
             content
         }
+    }
+
+    private func reminderFailure(_ message: String) -> some View {
+        NibBanner(message, action: NibAction(String(localized: "Retry Reminders")) {
+            app.perform(CalendarEvents.descriptor.id, PlannerPage.upcomingParams, session: context.session)
+        })
     }
 
     // MARK: Header
@@ -894,6 +901,11 @@ struct CalendarSettingsPage: View {
             Section {
                 Picker(String(localized: "Remind Me"), selection: reminderBinding) {
                     ForEach(CalendarSettings.reminderChoices, id: \.self) { m in Text(CalendarText.reminderTitle(m)).tag(m) }
+                }
+                if let error = store.reminderError {
+                    NibBanner(error, action: NibAction(String(localized: "Retry Reminders")) {
+                        app.perform(CalendarEvents.descriptor.id, PlannerPage.upcomingParams, session: app.services.sessions.active)
+                    })
                 }
                 if store.notifications == .denied && app.settings.get(CalendarSettings.reminderMinutes) > 0 {
                     NibBanner(String(localized: "Notifications are off for Nib, so reminders cannot appear."),

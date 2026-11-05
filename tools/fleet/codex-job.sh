@@ -32,7 +32,8 @@ for i in $(seq 1 9); do   # ~90 s per call, under the default Bash tool timeout;
     if [ "$rc" = 0 ] && [ -s "$BASE.json" ] && "$PY" -X utf8 -I -c "import json,sys;json.load(open(sys.argv[1],encoding='utf-8'))" "$BASE.json" 2>/dev/null; then
       echo "RESULT $(tr -d '\r\n' < "$BASE.json")"; exit 0
     fi
-    echo "CODEX_FAILED rc=$rc: $(grep -iE 'error|limit|quota|unauthor' "$BASE.log" | grep -v rmcp | tail -3 | tr '\n' ' ' | cut -c1-400)"; exit 1
+    # Codex's own ERROR lines first: the log starts with the echoed prompt, whose long lines also match "error".
+    echo "CODEX_FAILED rc=$rc: $( { grep -E '^ERROR' "$BASE.log" | tail -2; grep -iE 'limit|quota|unauthor|capacity' "$BASE.log" | grep -v rmcp | grep -vE '^ERROR' | tail -1; } | tr '\n' ' ' | cut -c1-400)"; exit 1
   fi
   if [ -f "$BASE.pid" ] && ! kill -0 "$(cat "$BASE.pid")" 2>/dev/null && [ ! -f "$BASE.exit" ]; then
     sleep 5; [ -f "$BASE.exit" ] || { echo 1 > "$BASE.exit"; echo "CODEX_FAILED job process died without an exit code: $(tail -3 "$BASE.log" | tr '\n' ' ' | cut -c1-300)"; exit 1; }

@@ -97,6 +97,13 @@ final class PresentationController: ObservableObject {
 
     var mode: ExternalDisplayMode { app.settings.get(PresentationSettings.mode) }
     var isConnected: Bool { !connections.isEmpty }
+    var hasRenderFailure: Bool { connections.contains { $0.model.renderFailure != nil } }
+
+    func retry() async {
+        for connection in connections where connection.model.renderFailure != nil {
+            await connection.model.retry()
+        }
+    }
     /// A page mode on a connected display (the presenter HUD shows).
     var isPresenting: Bool { isConnected && mode != .mirror }
     var displayNames: [String] { connections.map { $0.name } }
@@ -142,6 +149,14 @@ final class PresentationController: ObservableObject {
         disconnect(id)                                  // the same scene connecting again replaces its old model
         if connections.isEmpty && blank { blank = false }
         let model = PresentationViewModel(source: source, mode: mode, blank: blank)
+        model.onFailureChange = { [weak self] in
+            self?.objectWillChange.send()
+            if self?.hasRenderFailure == true {
+                UIAccessibility.post(notification: .announcement,
+                                     argument: String(localized: "Display could not update. Content may be out of date. Use Retry to try again."))
+            }
+            self?.chromeDidChange()
+        }
         connections.append(Connection(id: id, name: name, model: model, watch: nil))
         model.setNeedsUpdate()
         if isPresenting {
@@ -201,6 +216,7 @@ final class PresenterHUDModel: ObservableObject {
     @Published private(set) var laserAvailable = false
     @Published private(set) var laserOn = false
     @Published private(set) var blank = false
+    @Published private(set) var renderFailed = false
 
     private unowned let app: NibApp
     private weak var session: EditorSession?
@@ -238,6 +254,7 @@ final class PresenterHUDModel: ObservableObject {
         update(\.displayName, controller.displayNames.first ?? String(localized: "External Display"))
         update(\.modeTitle, controller.mode.title)
         update(\.blank, controller.blank)
+        update(\.renderFailed, controller.hasRenderFailure)
         let doc = session?.document
         let hasPages = PresentationController.hasPages(app, doc: doc)
         update(\.hasPages, hasPages)
@@ -270,6 +287,10 @@ final class PresenterHUDModel: ObservableObject {
                     session: session)
     }
 
+    func retry() {
+        app.perform(PresentSetMode.id, ["mode": .string(controller.mode.rawValue), "retry": true], session: session)
+    }
+
     /// Back to mirroring the whole screen, never black.
     func stop() {
         app.perform(PresentSetMode.id, ["mode": .string(ExternalDisplayMode.mirror.rawValue), "blank": .bool(false)],
@@ -290,7 +311,17 @@ struct PresenterHUD: View {
     }
 
     var body: some View {
-        Group {
+        VStack(spacing: NibSpacing.xs) {
+            if model.renderFailed {
+                HStack {
+                    Text(String(localized: "Display could not update. Content may be out of date."))
+                        .font(NibFont.caption1Emphasis)
+                        .foregroundStyle(NibColor.label)
+                    Button(String(localized: "Retry")) { model.retry() }
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .accessibilityElement(children: .contain)
+            }
             if compact {
                 HStack(spacing: 0) {
                     stopButton

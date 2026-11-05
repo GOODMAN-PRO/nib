@@ -339,10 +339,10 @@ final class CommentThreadModel: ObservableObject {
         }
     }
 
-    func edit(_ message: NibID, text: String) async -> Bool {
-        guard let ref = ref else { return false }
+    func edit(_ message: NibID, text: String, baseline: CommentMessage) async -> Bool {
+        guard let ref = ref, let encoded = try? JSONValue.from(baseline) else { return false }
         return await CommentUI.run(app, session, CommandIDs.commentEdit,
-                                   ["ref": .string(ref), "message": .string(message.raw), "text": .string(text)]) != nil
+                                   ["ref": .string(ref), "message": .string(message.raw), "text": .string(text), "baseline": encoded]) != nil
     }
 
     func delete(_ message: NibID) {
@@ -378,6 +378,8 @@ struct CommentThreadView: View {
     @State private var sending = false
     @State private var editing: NibID?
     @State private var editText = ""
+    @State private var editBaseline: CommentMessage?
+    @State private var editConflictText: String?
     @State private var lastMessagePendingDelete: NibID?
     @FocusState private var composerFocused: Bool
 
@@ -528,6 +530,11 @@ struct CommentThreadView: View {
                 .font(NibFont.caption1Emphasis)
                 .foregroundStyle(NibColor.labelSecondary)
             if isEditing {
+                if let current = editConflictText {
+                    Text(String(localized: "Current message: \(current)"))
+                        .font(NibFont.caption1Emphasis)
+                        .foregroundStyle(NibColor.labelSecondary)
+                }
                 NibField(text: $editText, prompt: String(localized: "Message"), lines: 1...8)
                     .onKeyPress(.return, phases: .down) { press in
                         guard press.modifiers.contains(.command) else { return .ignored }
@@ -571,6 +578,8 @@ struct CommentThreadView: View {
         if !model.readOnly {
             Button {
                 editText = message.text
+                editBaseline = message
+                editConflictText = nil
                 editing = message.id
             } label: {
                 Label { Text(String(localized: "Edit Message")) } icon: { Image(nib: .pencil) }
@@ -634,11 +643,14 @@ struct CommentThreadView: View {
 
     private func saveEdit(_ id: NibID) {
         let text = editText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, editing == id else { return }
+        guard !text.isEmpty, editing == id, let baseline = editBaseline else { return }
         editing = nil
         Task {
-            if !(await model.edit(id, text: text)) {
+            if !(await model.edit(id, text: text, baseline: baseline)) {
                 editText = text
+                let current = thread?.messages.first { $0.id == id } ?? baseline
+                editBaseline = current
+                if current != baseline { editConflictText = current.text }
                 editing = id
             }
         }

@@ -13,6 +13,12 @@ public enum NibLibraryFeature: NibFeature {
     /// successful cache write; false means the active library is not this feature's folder library.
     public typealias CatalogRebuild = @MainActor () async throws -> Bool
     public static let catalogRebuildKey = "library.rebuildCatalog"
+    /// Incremental, awaited scan for sync callers. Uses the same optional-service convention as catalogue repair.
+    public typealias CatalogRefresh = @MainActor () async throws -> Bool
+    public static let catalogRefreshKey = "library.refreshCatalog"
+    /// Optional asynchronous import for NibContracts-only callers; nil means a custom library owns the request.
+    public typealias PackageImport = @MainActor (LibraryService, URL, FolderID?) async throws -> DocumentID?
+    public static let packageImportKey = "library.importPackage"
 
     /// Re-reads package heads and folder records, updates package locations, and awaits catalogue persistence.
     /// Package contents and document undo history are preserved. Cache I/O failures propagate to the caller.
@@ -39,6 +45,20 @@ public enum NibLibraryFeature: NibFeature {
             return try await rebuildCatalog(app)
         }
         app.services.set(rebuild as AnyObject, for: catalogRebuildKey)
+        let refresh: CatalogRefresh = { [weak app] in
+            guard let library = app?.services.library as? FolderLibrary else { return false }
+            try await library.refreshCatalog()
+            return true
+        }
+        app.services.set(refresh as AnyObject, for: catalogRefreshKey)
+        let importer: PackageImport = { [weak app] expected, url, folder in
+            guard let current = app?.services.library, current === expected else {
+                throw NibError(.conflict, String(localized: "The library changed. Try importing again."))
+            }
+            guard let library = current as? FolderLibrary else { return nil }
+            return try await library.importPackageAsync(at: url, into: folder)
+        }
+        app.services.set(importer as AnyObject, for: packageImportKey)
         app.settings.syncedBackend = library.prefs
         LibraryCommands.register(app.commands)
     }

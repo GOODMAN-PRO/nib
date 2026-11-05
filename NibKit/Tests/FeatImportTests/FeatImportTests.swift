@@ -294,6 +294,31 @@ final class FeatImportTests: XCTestCase {
         }
     }
 
+    func testImageImportRejectsPageCreatedDuringAssetStorage() async throws {
+        let h = harness()
+        let image = try writePNG("scan.png", in: tempDir())
+        let entered = expectation(description: "asset storage started")
+        let gate = GatedImportAssets(base: h.assets, entered: entered)
+        h.app.services.assets = gate
+        defer { gate.resume.signal() }
+        let competing = PageRecord(id: "RACINGPAGE", order: "V", size: .a4, title: "Keep this page")
+        h.app.commands.register(CommandDescriptor(id: "test.competingPage", title: "Add page",
+            summary: "Create a page during import.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in _ = try tx.put(competing, doc: Fixtures.docID) }
+            return .null
+        }
+        let importing = Task { try await h.run("import.files", ["urls": urls([image]),
+            "doc": "doc:FIXTUREDOC01", "ids": ["RACINGPAGE"]]) }
+        await fulfillment(of: [entered], timeout: 2)
+        _ = try await h.run("test.competingPage")
+        let before = try h.snapshot(Fixtures.docID)
+        let undoBefore = h.undoDepth(Fixtures.docID)
+        gate.resume.signal()
+        await expectError(.conflict) { _ = try await importing.value }
+        XCTAssertEqual(try h.snapshot(Fixtures.docID), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), undoBefore)
+    }
+
     // MARK: Folders, archives and other importers
 
     func testZipOfTwoFoldersRecreatesBoth() async throws {
@@ -974,4 +999,20 @@ private final class StubNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) {}
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+
+private final class GatedImportAssets: AssetStore {
+    let base: AssetStore
+    let entered: XCTestExpectation
+    let resume = DispatchSemaphore(value: 0)
+    init(base: AssetStore, entered: XCTestExpectation) { self.base = base; self.entered = entered }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        entered.fulfill()
+        guard resume.wait(timeout: .now() + 5) == .success else { throw NibError(.unavailable, "Test gate timed out") }
+        return try base.put(data, ext: ext, doc: doc)
+    }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }

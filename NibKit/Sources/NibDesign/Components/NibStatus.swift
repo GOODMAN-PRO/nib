@@ -231,12 +231,16 @@ public struct NibBanner: View {
 
     @ViewBuilder private var actionButton: some View {
         if let action {
-            Button(action.title, action: action.handler).nibCommand(action.command)
+            Button(action: action.handler) {
+                Text(action.title)
+                    .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                    .contentShape(Rectangle())
+            }
+                .nibCommand(action.command)
                 .font(NibFont.button)
                 .foregroundStyle(NibColor.accent)
                 .buttonStyle(.plain)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(minHeight: NibMetrics.hitTarget)
         }
     }
 }
@@ -247,6 +251,14 @@ public struct NibBanner: View {
 public struct NibTraceRow: View {
     public enum Phase: Sendable {
         case running, done, warning
+
+        var accessibilityValue: String {
+            switch self {
+            case .running: return String(localized: "In progress", bundle: .module)
+            case .done: return String(localized: "Completed", bundle: .module)
+            case .warning: return String(localized: "Needs attention", bundle: .module)
+            }
+        }
     }
 
     let text: String
@@ -280,7 +292,7 @@ public struct NibTraceRow: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityValue(phase == .running ? String(localized: "In progress", bundle: .module) : "")
+        .accessibilityValue(phase.accessibilityValue)
     }
 }
 

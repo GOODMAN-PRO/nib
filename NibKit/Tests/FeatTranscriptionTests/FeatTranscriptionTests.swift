@@ -6,6 +6,22 @@ import NibDesign
 @testable import FeatTranscription
 
 @MainActor
+private final class SeekScanPersistence: DocumentPersistence {
+    let base: DocumentPersistence
+    let onLoad: () -> Void
+    init(_ base: DocumentPersistence, onLoad: @escaping () -> Void) { self.base = base; self.onLoad = onLoad }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        onLoad()
+        return try base.loadItems(doc, page: page)
+    }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) { base.didChange(doc, head: head, pages: pages) }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+}
+
+@MainActor
 final class FeatTranscriptionTests: XCTestCase {
     func testRecordingSettingsUsesRecordingGlyphWhileTranscriptKeepsCaptions() {
         let h = Harness(features: [FeatTranscriptionFeature.self])
@@ -263,6 +279,36 @@ final class FeatTranscriptionTests: XCTestCase {
         _ = try await h.app.bus.execute(TranscriptSeek.descriptor.id, ["clip": .string(ref), "index": 1], session: h.session)
         XCTAssertEqual(h.app.workspace.cachedPages(Fixtures.docID), cached.union([Fixtures.page2]))
         XCTAssertEqual(play["clip"]?.stringValue, ref)
+        XCTAssertEqual(play["t"]?.doubleValue, 4)
+        XCTAssertEqual(jump["page"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
+    }
+
+    func testTimestampScanKeepsColdNotebookOutOfEditingCache() async throws {
+        let h = Harness(features: [FeatTranscriptionFeature.self])
+        let doc = Fixtures.docID
+        h.app.workspace.close(doc)
+        for i in 0..<200 {
+            h.persistence.heads[doc]?.pages.append(PageRecord(id: NibID("COLD\(i)"), order: "z\(i)"))
+        }
+        let stroke = Stroke(style: .defaultPen, points: [StrokePoint(x: 10, y: 10)], t0: 1_700_000_005)
+        h.persistence.pageItems[doc, default: [:]][Fixtures.page2] = [Item(kind: .stroke, stroke: stroke)]
+        _ = try h.app.workspace.items(doc, page: Fixtures.page1)
+        var loads = 0
+        h.app.workspace.persistence = SeekScanPersistence(h.persistence) {
+            loads += 1
+            XCTAssertEqual(h.app.workspace.cachedPages(doc), [Fixtures.page1])
+        }
+        var play: JSONValue = [:]
+        var jump: JSONValue = [:]
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.audioPlay, title: "Play", summary: "Capture", effect: .session)) { p, _ in
+            play = p; return [:]
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewGoToPage, title: "Jump", summary: "Capture", effect: .session)) { p, _ in
+            jump = p; return [:]
+        }
+        _ = try await h.app.bus.execute(TranscriptSeek.descriptor.id, ["clip": .string(ref), "index": 1], session: h.session)
+        XCTAssertGreaterThanOrEqual(loads, 201)
+        XCTAssertEqual(h.app.workspace.cachedPages(doc), [Fixtures.page1, Fixtures.page2])
         XCTAssertEqual(play["t"]?.doubleValue, 4)
         XCTAssertEqual(jump["page"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
     }

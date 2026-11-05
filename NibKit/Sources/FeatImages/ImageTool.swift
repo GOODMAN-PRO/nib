@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import UIKit
 import Photos
 import PhotosUI
@@ -58,20 +59,73 @@ struct ImageMenuTarget {
 
 // MARK: - Running commands from image UI
 
+/// Owned by one import from target capture through loading, staging, dismissal and command execution.
+/// Returning to the original page does not give an old import ownership of the new selection or tool.
+@MainActor
+final class ImageNavigationTracker {
+    private let document: DocumentID?
+    private let page: PageID?
+    private var navigated: Bool
+    private var watches: [AnyCancellable] = []
+    var selectionTask: Task<JSONValue, Error>? {
+        didSet { if navigated { selectionTask?.cancel() } }
+    }
+
+    /// selection.set's optional snapshot uses the session baseline, not the tapped insertion page.
+    var expectedSession: JSONValue {
+        var value: [String: JSONValue] = [:]
+        if let document { value["document"] = .string(document.raw) }
+        if let page { value["page"] = .string(page.raw) }
+        return .object(value)
+    }
+
+    private func didNavigate() {
+        navigated = true
+        // Cancellation survives returning to the original page while a selection hook is suspended.
+        selectionTask?.cancel()
+    }
+
+    init(session: EditorSession?) {
+        // The tapped page can differ from the page at the viewport centre. Only changes to the
+        // captured session invalidate this import's ownership of selection and tool state.
+        document = session?.document
+        page = session?.page
+        navigated = false
+        if let session {
+            watches = [
+                session.$document.dropFirst().sink { [weak self] value in
+                    guard let self else { return }
+                    if value != self.document { self.didNavigate() }
+                },
+                session.$page.dropFirst().sink { [weak self] value in
+                    guard let self else { return }
+                    if value != self.page { self.didNavigate() }
+                }
+            ]
+        }
+    }
+
+    func canUpdate(_ session: EditorSession) -> Bool {
+        !navigated && session.document == document
+    }
+}
+
 @MainActor
 enum ImageUI {
     /// Runs commands as the user in one undo group, like `NibApp.perform` (failures reach the shell's toast). When items
     /// were created, the non-sticky image tool is finished and the new items are selected.
     static func run(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
-                    target: ImageMenuTarget? = nil) {
+                    target: ImageMenuTarget? = nil, navigation: ImageNavigationTracker? = nil) {
         guard !calls.isEmpty else { return }
-        Task { @MainActor in await perform(app, calls, session: session, target: target) }
+        let navigation = navigation ?? ImageNavigationTracker(session: session)
+        Task { @MainActor in await perform(app, calls, session: session, target: target, navigation: navigation) }
     }
 
     /// `run`, awaited. Returns the created or replaced item refs ([] when a call failed).
     @discardableResult
     static func perform(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
-                        target: ImageMenuTarget? = nil) async -> [String] {
+                        target: ImageMenuTarget? = nil, navigation: ImageNavigationTracker? = nil) async -> [String] {
+        let navigation = navigation ?? ImageNavigationTracker(session: session)
         let group = NibID.make().raw
         var created: [String] = []
         for call in calls {
@@ -85,10 +139,17 @@ enum ImageUI {
                 return []
             }
         }
-        guard !created.isEmpty, let session = session else { return created }
+        guard !created.isEmpty, let session = session, navigation.canUpdate(session) else { return created }
         finishToolUse(session, target: target)
-        _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
-                                       session: session)
+        let params: JSONValue = ["refs": .array(created.map { .string($0) }),
+                                 "expectedSession": navigation.expectedSession]
+        // Isolate cancellation to selection: insertion has committed and must remain undoable.
+        let selection = Task { @MainActor in
+            try await app.bus.execute(CommandIDs.selectionSet, params, session: session)
+        }
+        navigation.selectionTask = selection
+        defer { navigation.selectionTask = nil }
+        _ = try? await selection.value
         return created
     }
 
@@ -107,13 +168,23 @@ enum ImageUI {
     /// image.insert calls for bytes the menu already holds (recent photos, paste, drop): each is stored as a
     /// temporary asset and passed as a tmp: url, centred on the target and cascaded.
     static func insertCalls(_ images: [Data], target: ImageMenuTarget, app: NibApp,
-                            session: EditorSession?) -> [(command: String, params: JSONValue)] {
-        guard let store = app.services.assets,
-              let page = try? app.workspace.content(target.doc).page(target.page) else { return [] }
+                            session: EditorSession?) async throws -> [(command: String, params: JSONValue)] {
+        guard let store = app.services.assets else { throw NibError.unavailable("the asset store") }
+        guard let page = try app.workspace.content(target.doc).page(target.page), !page.deleted else {
+            throw NibError(.notFound, String(localized: "The page is no longer available."))
+        }
         let base = target.point ?? ImagePlacement.centre(of: page, doc: target.doc, session: session)
         var calls: [(command: String, params: JSONValue)] = []
         for (i, data) in images.enumerated() {
-            guard let info = ImageDecoder.info(data), let tmp = try? store.putTemporary(data, ext: info.fileExtension) else { continue }
+            let (info, tmp) = try await ImageIOWork.run {
+                guard let info = ImageDecoder.info(data) else { throw ImageLoading.failure }
+                try ImageAssets.check(info, path: "$.source")
+                do { return (info, try store.putTemporary(data, ext: info.fileExtension)) }
+                catch {
+                    throw NibError(.unavailable, String(localized: "The images could not be prepared for insertion."),
+                                   hint: String(localized: "Check available storage and try again."))
+                }
+            }
             let offset = Double(i) * ImagePlacement.cascade
             let f = ImagePlacement.frame(size: ImagePlacement.size(pixels: info.pixelSize, page: page.size),
                                          centre: Point(base.x + offset, base.y + offset), page: page.size)
@@ -231,31 +302,49 @@ struct ImageSourceMenu: View {
 
     private func choose(_ source: ImagePickSource) {
         guard let t = target() else { return }
+        let navigation = ImageNavigationTracker(session: session)
         var params: [String: JSONValue] = ["source": .string(source.rawValue), "page": .string(t.pageRef)]
         if let p = t.point { params["point"] = .array([.number(p.x), .number(p.y)]) }
         let app = self.app, session = self.session
-        close { ImageUI.run(app, [(command: "image.pick", params: .object(params))], session: session, target: t) }
-    }
-
-    private func insert(_ providers: [NSItemProvider]) {
-        guard let t = target() else { return }
-        let app = self.app, session = self.session, close = self.close
-        Task { @MainActor in
-            let images = await ImageProviders.load(providers)
-            guard !images.isEmpty else { return }
-            close {
-                ImageUI.run(app, ImageUI.insertCalls(images, target: t, app: app, session: session), session: session, target: t)
-            }
+        close {
+            ImageUI.run(app, [(command: "image.pick", params: .object(params))], session: session,
+                        target: t, navigation: navigation)
         }
     }
 
+    private func insert(_ providers: [NSItemProvider]) {
+        insertImages({ try await ImageProviders.load(providers) })
+    }
+
     private func insertRecent(_ asset: PHAsset) {
+        let recent = self.recent
+        insertImages({
+            guard let data = await recent.data(for: asset) else { throw ImageLoading.failure }
+            return [data]
+        })
+    }
+
+    /// All menu byte loaders share the same operation lifetime, including the dismissal continuation.
+    func insertImages(_ load: @escaping @MainActor () async throws -> [Data],
+                      completion: @escaping @MainActor ([String]) -> Void = { _ in }) {
         guard let t = target() else { return }
-        let app = self.app, session = self.session, close = self.close, recent = self.recent
+        let navigation = ImageNavigationTracker(session: session)
+        let app = self.app, session = self.session, close = self.close
         Task { @MainActor in
-            guard let data = await recent.data(for: asset) else { return }
-            close {
-                ImageUI.run(app, ImageUI.insertCalls([data], target: t, app: app, session: session), session: session, target: t)
+            do {
+                let images = try await load()
+                let calls = try await ImageUI.insertCalls(images, target: t, app: app, session: session)
+                guard !calls.isEmpty else { completion([]); return }
+                // A menu may suppress a duplicate dismissal callback; do not suspend a task waiting for it.
+                close {
+                    Task { @MainActor in
+                        let refs = await ImageUI.perform(app, calls, session: session, target: t, navigation: navigation)
+                        completion(refs)
+                    }
+                }
+            } catch {
+                ImageLoading.report(error, app: app)
+                completion([])
             }
         }
     }
@@ -537,7 +626,7 @@ enum ImagePickers {
                      from presenter: UIViewController) async throws -> [Data] {
         switch source {
         case .photos:
-            return await ImageProviders.load(PhotosPickerSession().run(limit: limit, from: presenter))
+            return try await ImageProviders.load(PhotosPickerSession().run(limit: limit, from: presenter))
         case .camera:
             guard UIImagePickerController.isSourceTypeAvailable(.camera) else { throw NibError.unsupported("a camera on this device") }
             let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -548,11 +637,14 @@ enum ImagePickers {
             return await CameraSession().run(from: presenter).map { [$0] } ?? []
         case .scan:
             guard VNDocumentCameraViewController.isSupported else { throw NibError.unsupported("document scanning on this device") }
-            return await ScanSession().run(from: presenter)
+            return try await ScanSession().run(from: presenter)
         case .files:
-            return await FilesSession().run(multiple: limit != 1, from: presenter)
+            return try await FilesSession().run(multiple: limit != 1, from: presenter)
         case .paste:
-            return await ImageProviders.load(UIPasteboard.general.itemProviders)
+            let providers = UIPasteboard.general.itemProviders.filter {
+                $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+            }
+            return try await ImageProviders.load(providers)
         case .playground:
             return try await ImagePlaygroundBridge.generate(seed, from: presenter).map { [$0] } ?? []
         }
@@ -562,20 +654,26 @@ enum ImagePickers {
 /// Image bytes out of item providers (PHPicker, paste, drop), preferring GIF and PNG so animation and transparency
 /// survive.
 enum ImageProviders {
-    static func load(_ providers: [NSItemProvider]) async -> [Data] {
+    static func load(_ providers: [NSItemProvider]) async throws -> [Data] {
         var out: [Data] = []
         for provider in providers {
-            if let data = await load(provider) { out.append(data) }
+            let data = try await load(provider)
+            try await ImageIOWork.run { try ImageLoading.validate(data) }
+            out.append(data)
         }
         return out
     }
 
-    static func load(_ provider: NSItemProvider) async -> Data? {
+    static func load(_ provider: NSItemProvider) async throws -> Data {
         let types = provider.registeredTypeIdentifiers.compactMap { UTType($0) }.filter { $0.conforms(to: .image) }
         guard let type = types.first(where: { $0.conforms(to: .gif) }) ?? types.first(where: { $0.conforms(to: .png) })
-            ?? types.first else { return nil }
-        return await withCheckedContinuation { continuation in
-            _ = provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, _ in
+            ?? types.first else { throw ImageLoading.failure }
+        return try await withCheckedThrowingContinuation { continuation in
+            _ = provider.loadDataRepresentation(forTypeIdentifier: type.identifier) { data, error in
+                guard error == nil, let data, !data.isEmpty else {
+                    continuation.resume(throwing: ImageLoading.failure)
+                    return
+                }
                 continuation.resume(returning: data)
             }
         }
@@ -671,13 +769,14 @@ final class CameraSession: NSObject, UIImagePickerControllerDelegate, UINavigati
 
 @MainActor
 final class ScanSession: NSObject, VNDocumentCameraViewControllerDelegate {
-    private var continuation: CheckedContinuation<[Data], Never>?
+    var receive: ((Result<[Data], Error>) -> Void)?
+    private let completion = ImagePickerCompletion<Result<[Data], Error>>()
 
-    func run(from presenter: UIViewController) async -> [Data] {
+    func run(from presenter: UIViewController) async throws -> [Data] {
         let scanner = VNDocumentCameraViewController()
         scanner.delegate = self
-        return await withCheckedContinuation { c in
-            continuation = c
+        return try await withCheckedThrowingContinuation { c in
+            receive = { c.resume(with: $0) }
             presenter.present(scanner, animated: true)
         }
     }
@@ -685,50 +784,62 @@ final class ScanSession: NSObject, VNDocumentCameraViewControllerDelegate {
     nonisolated func documentCameraViewController(_ controller: VNDocumentCameraViewController,
                                                   didFinishWith scan: VNDocumentCameraScan) {
         MainActor.assumeIsolated {
-            let pages = (0..<scan.pageCount).compactMap { scan.imageOfPage(at: $0).jpegData(compressionQuality: 0.85) }
-            controller.dismiss(animated: true)
-            finish(pages)
+            do {
+                let pages = try (0..<scan.pageCount).map { index -> Data in
+                    guard let data = scan.imageOfPage(at: index).jpegData(compressionQuality: 0.85) else {
+                        throw ImageLoading.failure
+                    }
+                    return data
+                }
+                finish(.success(pages), controller: controller)
+            } catch { finish(.failure(error), controller: controller) }
         }
     }
 
     nonisolated func documentCameraViewControllerDidCancel(_ controller: VNDocumentCameraViewController) {
         MainActor.assumeIsolated {
-            controller.dismiss(animated: true)
-            finish([])
+            finish(.success([]), controller: controller)
         }
     }
 
     nonisolated func documentCameraViewController(_ controller: VNDocumentCameraViewController, didFailWithError error: Error) {
         MainActor.assumeIsolated {
-            controller.dismiss(animated: true)
-            finish([])
+            fail(controller: controller)
         }
     }
 
-    private func finish(_ pages: [Data]) {
-        continuation?.resume(returning: pages)
-        continuation = nil
+    /// Shared failure/completion paths also work without constructing a hardware scanner in tests.
+    func fail(controller: UIViewController) {
+        finish(.failure(NibError(.unavailable, String(localized: "The document scan failed. Please try again."))),
+               controller: controller)
+    }
+
+    func finish(_ result: Result<[Data], Error>, controller: UIViewController) {
+        completion.finish(result, dismissing: controller) { [self] result in
+            receive?(result)
+            receive = nil
+        }
     }
 }
 
 @MainActor
 final class FilesSession: NSObject, UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate {
-    private var continuation: CheckedContinuation<[Data], Never>?
-    private let completion = ImagePickerCompletion<[Data]>()
+    private var continuation: CheckedContinuation<[URL], Never>?
+    private let completion = ImagePickerCompletion<[URL]>()
 
-    func run(multiple: Bool, from presenter: UIViewController) async -> [Data] {
+    func run(multiple: Bool, from presenter: UIViewController) async throws -> [Data] {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.image], asCopy: true)
         picker.allowsMultipleSelection = multiple
         picker.delegate = self
-        return await withCheckedContinuation { c in
+        let urls: [URL] = await withCheckedContinuation { c in
             continuation = c
             ImagePresenter.present(picker, from: presenter, delegate: self)
         }
+        return try await ImageFiles.load(urls)
     }
 
     nonisolated func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        let images = urls.compactMap { try? Data(contentsOf: $0) }
-        MainActor.assumeIsolated { finish(images, controller: controller) }
+        MainActor.assumeIsolated { finish(urls, controller: controller) }
     }
 
     nonisolated func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
@@ -739,10 +850,45 @@ final class FilesSession: NSObject, UIDocumentPickerDelegate, UIAdaptivePresenta
         finish([], controller: nil)
     }
 
-    private func finish(_ images: [Data], controller: UIViewController?) {
+    private func finish(_ images: [URL], controller: UIViewController?) {
         completion.finish(images, dismissing: controller) { [self] images in
             continuation?.resume(returning: images)
             continuation = nil
+        }
+    }
+}
+
+/// Fail a whole selection before delivery, rather than silently importing a subset.
+enum ImageLoading {
+    static func validate(_ data: Data) throws {
+        guard let info = ImageDecoder.info(data) else { throw failure }
+        try ImageAssets.check(info, path: "$.source")
+    }
+
+    static var failure: NibError {
+        NibError(.unavailable, String(localized: "The selected images could not be loaded. No images were inserted."),
+                 hint: String(localized: "Try choosing the images again."))
+    }
+
+    @MainActor
+    static func report(_ error: Error, app: NibApp) {
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                        userInfo: ["command": "image.pick", "error": NibError.wrap(error)])
+    }
+}
+
+enum ImageFiles {
+    static func load(_ urls: [URL], reader: @escaping (URL) throws -> Data = { try Data(contentsOf: $0) }) async throws -> [Data] {
+        try await ImageIOWork.run {
+            try urls.map { url in
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let data = try reader(url)
+                    try ImageLoading.validate(data)
+                    return data
+                } catch { throw ImageLoading.failure }
+            }
         }
     }
 }

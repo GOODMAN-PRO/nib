@@ -641,6 +641,28 @@ final class SpellcheckerTests: XCTestCase {
         }
     }
 
+    func testDictionaryValidationUsesExplicitFrenchLocalization() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let french = root.appendingPathComponent("fr.lproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: french, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A fixture bundle proves lookup independently of the app catalogue, regenerated at integration.
+        let translations = ["add one word at a time (no spaces)": "Ajoutez un seul mot à la fois (sans espaces).",
+                            "the word is empty or has no letters": "Le mot est vide ou ne contient aucune lettre."]
+        let data = try PropertyListSerialization.data(fromPropertyList: translations, format: .xml, options: 0)
+        try data.write(to: french.appendingPathComponent("Localizable.strings"))
+        let bundle = try XCTUnwrap(Bundle(url: french))
+        for (input, key) in [("two words", "add one word at a time (no spaces)"),
+                             ("123", "the word is empty or has no letters")] {
+            XCTAssertThrowsError(try PersonalDictionary.normalise(input, bundle: bundle)) { error in
+                guard let error = error as? NibError else { return XCTFail("Unexpected error") }
+                XCTAssertEqual(error.code, .invalidParams)
+                XCTAssertEqual(error.path, "$.word")
+                XCTAssertEqual(error.message, translations[key])
+            }
+        }
+    }
+
     func testDictionaryAddAndRemoveFromTwoDevicesMerge() async throws {
         let folder = PrefsFolder()
         let a = Harness(features: [FeatSpellcheckFeature.self], deviceID: 7)

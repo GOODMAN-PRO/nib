@@ -327,6 +327,8 @@ struct NavBarView: View {
     let compact: Bool
     let sidebarMode: SidebarMode
     @Binding var openMenu: ChromeMenu?
+    /// Optional layout observer used by hosting regressions; absent in the app.
+    var onControlFrames: (([String: CGRect]) -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 0) {
@@ -354,6 +356,7 @@ struct NavBarView: View {
                     .padding(.leading, NibSpacing.l)
             }
         }
+        .onPreferenceChange(NavControlFrames.self) { onControlFrames?($0) }
     }
 
     @ViewBuilder
@@ -364,10 +367,12 @@ struct NavBarView: View {
            let content = provider(context) {
             content
                 .nibCommand(chrome.app.ui.toolbar.get(item.id)?.command)
-                .fixedSize(horizontal: true, vertical: false)
                 .font(NibFont.caption1)
                 .foregroundStyle(NibColor.label)
-                .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                .lineLimit(1)
+                .frame(minWidth: NibMetrics.hitTarget, maxWidth: compact ? 120 : 160,
+                       minHeight: NibMetrics.hitTarget)
+                .clipped()
                 .disabled(!(chrome.app.ui.toolbar.get(item.id)?.isEnabled?(chrome.session) ?? true))
         }
     }
@@ -405,8 +410,20 @@ struct NavBarView: View {
         .contentShape(Rectangle())
     }
 
-    @ViewBuilder
     private func button(_ item: NavItem) -> some View {
+        buttonContent(item)
+            .background {
+                if onControlFrames != nil {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: NavControlFrames.self, value: [item.id: proxy.frame(in: .global)])
+                    }
+                    .allowsHitTesting(false)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func buttonContent(_ item: NavItem) -> some View {
         switch item.action {
         case .library:
             NibToolbarItem(item.symbol, label: item.title) { chrome.goToLibrary() }
@@ -469,6 +486,13 @@ struct NavBarView: View {
 
     private func toggle(_ menu: ChromeMenu) {
         openMenu = openMenu == menu ? nil : menu
+    }
+}
+
+private struct NavControlFrames: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 
