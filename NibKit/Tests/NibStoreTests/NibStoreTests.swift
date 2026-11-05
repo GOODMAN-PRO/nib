@@ -197,6 +197,7 @@ final class NibStoreTests: XCTestCase {
                                         walDirectory: writer.wal.directory, debounce: 3600,
                                         isDocumentOpen: { $0 == pinned })
         for head in heads {
+            XCTAssertEqual(try reader.peekHead(head.meta.id), head)
             XCTAssertEqual(try reader.loadHead(head.meta.id), head)
             for (page, expected) in items {
                 XCTAssertEqual(try reader.loadItems(head.meta.id, page: page), expected)
@@ -363,7 +364,11 @@ final class NibStoreTests: XCTestCase {
         nudged.stroke?.points[0].x += 10
         nudged.rev = clock.tick()
         store.didChange(doc, head: head, pages: [Fixtures.page2: [nudged]])
+        let pendingStamp = try XCTUnwrap(store.headReadStamp(doc))
+        XCTAssertEqual(try store.peekHead(doc), head)
         store.write(doc, synchronously: false)
+        XCTAssertNotEqual(store.headReadStamp(doc), pendingStamp)
+        XCTAssertEqual(try store.peekHead(doc), head, "queued metadata reads do not wait for the held writer")
 
         // This clean document has no durability obligation. Eviction must finish before releasing the held
         // writer above; draining the shared queue here would hit that writer's bounded watchdog.
@@ -372,6 +377,7 @@ final class NibStoreTests: XCTestCase {
         XCTAssertEqual(try store.loadHead(doc), head)
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [nudged])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), nudged.rev)
+        XCTAssertEqual(store.contentFingerprint(doc, page: Fixtures.page2), LWW.fingerprint([nudged]))
         XCTAssertEqual(try store.loadHead(other.meta.id), other, "one busy package must not stall library reads")
 
         // Undo arrives while the nudge is still queued/in flight, with its own fresh revision. Both pending and
@@ -379,10 +385,12 @@ final class NibStoreTests: XCTestCase {
         var undone = original
         undone.rev = clock.tick()
         store.didChange(doc, head: nil, pages: [Fixtures.page2: [undone]])
+        XCTAssertEqual(store.contentFingerprint(doc, page: Fixtures.page2), LWW.fingerprint([undone]))
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [undone])
         store.write(doc, synchronously: false)
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [undone])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), undone.rev)
+        XCTAssertEqual(store.contentFingerprint(doc, page: Fixtures.page2), LWW.fingerprint([undone]))
 
         release.signal()
         await fulfillment(of: [finished], timeout: 5)
@@ -433,6 +441,7 @@ final class NibStoreTests: XCTestCase {
         // The complete retained snapshot is still the only copy of this stroke.
         XCTAssertEqual(try store.loadItems(doc, page: Fixtures.page2), [stroke])
         XCTAssertEqual(store.contentRevision(doc, page: Fixtures.page2), stroke.rev)
+        XCTAssertEqual(store.contentFingerprint(doc, page: Fixtures.page2), LWW.fingerprint([stroke]))
 
         try FileManager.default.removeItem(at: store.wal.directory)
         store.flush(doc)

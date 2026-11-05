@@ -8,6 +8,12 @@ import Foundation
 public protocol DocumentPersistence: AnyObject {
     /// Loads and merges the document head from every device file. Throws `not_found`.
     func loadHead(_ doc: DocumentID) throws -> DocumentContent
+    /// Read-only head snapshot. Stores with recovery logs must skip page payload replay here.
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent
+    /// Cheap validation token for `loadHead`, or nil when no reliable token is available. Must change when
+    /// ANY input to the merged head changes (disk, WAL, queued/pending writes, or effective revision ordering).
+    /// Callers validate before and after reading, and must scope cached heads to this persistence instance.
+    func headReadStamp(_ doc: DocumentID) -> String?
     /// Loads and merges all items of a page, tombstones included.
     func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item]
     /// Called on the main actor after every commit/merge. `head` is nil when unchanged; `pages` holds the
@@ -25,17 +31,26 @@ public protocol DocumentPersistence: AnyObject {
     /// contracts-v2: the highest revision of a page's items (tombstones included) as stored, WITHOUT loading the items
     /// into memory (thumbnail and index validity checks). nil = unknown (the caller loads the page). Default: nil.
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev?
+    /// Stable `LWW.fingerprint` of every merged item (including pending writes and tombstones), if available
+    /// without loading the page. Unlike the maximum revision, this detects intermediate-revision remote edits.
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String?
 }
 
 @MainActor
 public extension DocumentPersistence {
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent { try loadHead(doc) }
+    func headReadStamp(_ doc: DocumentID) -> String? { nil }
     func isReadOnly(_ doc: DocumentID) -> Bool { false }
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { nil }
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? { nil }
 }
 
 @MainActor
 public final class InMemoryPersistence: DocumentPersistence {
-    public var heads: [DocumentID: DocumentContent] = [:]
+    public var heads: [DocumentID: DocumentContent] = [:] {
+        didSet { headGeneration &+= 1 }
+    }
+    private var headGeneration: UInt64 = 0
     public var pageItems: [DocumentID: [PageID: [Item]]] = [:]
     public let root: URL
 
@@ -47,6 +62,10 @@ public final class InMemoryPersistence: DocumentPersistence {
     public func loadHead(_ doc: DocumentID) throws -> DocumentContent {
         guard let h = heads[doc] else { throw NibError.notFound("document \(doc)") }
         return h
+    }
+
+    public func headReadStamp(_ doc: DocumentID) -> String? {
+        heads[doc] == nil ? nil : String(headGeneration)
     }
 
     public func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
@@ -145,11 +164,12 @@ public final class Workspace {
     public func cachedPages(_ doc: DocumentID) -> Set<PageID> { Set(pageItems[doc]?.keys.map { $0 } ?? []) }
 
     /// contracts-v2: the document head WITHOUT opening it: the loaded head when the document is open, else a fresh
-    /// read from persistence that is neither cached nor announced (`doc.opened` is not emitted). For library-wide
+    /// read from persistence that is neither cached in the workspace nor announced (`doc.opened` is not emitted).
+    /// Persistence may memoize metadata by its input stamps, without replaying page payloads. For library-wide
     /// scans (favourite and trashed pages, catalogues). Throws `not_found`.
     public func peekContent(_ doc: DocumentID) throws -> DocumentContent {
         if let h = heads[doc] { return h }
-        return try persistence.loadHead(doc)
+        return try persistence.peekHead(doc)
     }
 
     /// contracts-v2: the highest revision among a page's items (tombstones included): from memory when the page is
@@ -157,6 +177,15 @@ public final class Workspace {
     public func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
         if let items = pageItems[doc]?[page] { return items.map { $0.rev }.max() ?? .zero }
         return persistence.contentRevision(doc, page: page)
+    }
+
+    public func contentFingerprint(_ doc: DocumentID, page: PageID) throws -> String {
+        if let items = pageItems[doc]?[page] { return LWW.fingerprint(items) }
+        if let fingerprint = persistence.contentFingerprint(doc, page: page) { return fingerprint }
+        // A maximum revision cannot detect edits to other items below that maximum. Providers without
+        // complete metadata must read every item, even when they can report a cheap contentRevision.
+        // Validation of an unopened page must not populate the workspace item cache or sort by z.
+        return LWW.fingerprint(try persistence.loadItems(doc, page: page))
     }
 
     /// contracts-v2: true when persistence refuses to write the document (see `DocumentPersistence.isReadOnly`).

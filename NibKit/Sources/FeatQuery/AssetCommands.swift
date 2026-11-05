@@ -133,18 +133,21 @@ struct AssetGet: NibCommand {
         try AssetBytes.checkName(name, path: "$.asset")
         let ref = AssetRef(name)
         let ext = ref.ext.isEmpty ? "bin" : ref.ext
-        let result: (Data, AssetRef)
+        let data: Data
         do {
-            result = try await Task.detached { () throws -> (Data, AssetRef) in
-                let data = try store.data(ref, doc: doc)
-                return (data, try store.putTemporary(data, ext: ext))
-            }.value
+            data = try await Task.detached { try store.data(ref, doc: doc) }.value
         } catch let e as NibError {
             throw e
         } catch {
             throw NibError(.notFound, "asset \(name) not found in document \(doc)", path: "$.asset")
         }
-        let (data, tmp) = result
+        let tmp: AssetRef
+        do {
+            tmp = try await Task.detached { try store.putTemporary(data, ext: ext) }.value
+        } catch {
+            throw NibError(.unavailable, String(localized: "The asset could not be prepared for delivery."),
+                           hint: String(localized: "Check available device storage and try again. The document asset is unchanged."))
+        }
         return Output(asset: ref.name, url: "tmp:" + tmp.name, ext: ext, bytes: data.count,
                       base64: data.count <= Shapes.inlineAssetBytes ? data.base64EncodedString() : nil)
     }

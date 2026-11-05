@@ -228,6 +228,196 @@ final class NibIndexTests: XCTestCase {
         XCTAssertFalse(h.app.workspace.isLoaded(copy), "Background indexing must not open the copy")
     }
 
+    func testLibraryRefreshIndexesNewPagesOfAnAlreadyIndexedClosedDocument() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        await indexer.indexDocument(doc)
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+        indexer.debounce = 0.01
+        indexer.start()
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        let page = PageRecord(id: "SYNCNEWPAGE1", order: "z", size: .a4)
+        head.pages.append(page)
+        h.persistence.heads[doc] = head
+        let text = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30),
+                                             text: RichText(plain: "Syncedplatypus")))
+        h.persistence.pageItems[doc, default: [:]][page.id] = [text]
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["refresh": true, "refs": [.string(NodeRef.document(doc).description)]])
+        var found: [JSONValue] = []
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            found = results(try await h.run("search.text", ["query": "Syncedplatypus"]))
+        } while found.isEmpty && Date() < deadline
+        XCTAssertFalse(found.isEmpty)
+        XCTAssertEqual(found.first?["page"]?.stringValue, NodeRef.page(doc, page.id).description)
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
+    func testLibraryMetadataEventsScheduleNoDocumentWork() async throws {
+        let (h, indexer) = harness()
+        for doc in Fixtures.allDocuments { await indexer.indexDocument(doc) }
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = counting
+        var progress = 0
+        let subscription = h.app.events.subscribe { event in
+            if event.type == NibEventType.indexProgress { progress += 1 }
+        }
+        defer { subscription.cancel() }
+        // Exercise the event handler and drain synchronously, without waiting for its debounce timer.
+        let payloads: [JSONValue?] = [
+            ["modified": true], ["folder": "root"], ["templates": true], nil,
+            ["refs": [.string(NodeRef.document(Fixtures.docID).description)]],
+            ["refresh": true], ["refresh": true, "refs": []]
+        ]
+        for payload in payloads {
+            indexer.libraryChanged(payload)
+            await indexer.processDirty()
+            XCTAssertEqual(counting.headLoads, 0)
+            XCTAssertEqual(counting.itemLoads, 0)
+            XCTAssertEqual(progress, 0)
+            XCTAssertNil(indexer.sweepTask)
+        }
+    }
+
+    func testBroadLibraryRefreshSchedulesStampAwareSweep() async throws {
+        let (h, indexer) = harness()
+        for doc in Fixtures.allDocuments { await indexer.indexDocument(doc) }
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = counting
+        let refs = Array(repeating: JSONValue.string(NodeRef.document(Fixtures.docID).description), count: 500)
+        let payloads: [JSONValue] = [["root": true], ["refresh": true, "refs": .array(refs)]]
+        for payload in payloads {
+            indexer.libraryChanged(payload)
+            XCTAssertNotNil(indexer.sweepTask)
+            indexer.sweepTask?.cancel()
+            await indexer.processDirty()
+            XCTAssertEqual(counting.headLoads, 0, "broad refresh must not enter wholeDocs")
+            XCTAssertEqual(counting.itemLoads, 0)
+        }
+    }
+
+    func testUnchangedDocumentReusesHeadBetweenCooperativeYields() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        head.pages = (0..<96).map { i in
+            PageRecord(id: NibID("HEADPAGE" + String(format: "%04d", i)), order: String(format: "%04d", i), size: .a4)
+        }
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = counting
+        let indexed = await indexer.indexDocument(doc)
+        XCTAssertEqual(indexed, 0)
+        XCTAssertEqual(counting.itemLoads, 96)
+        XCTAssertLessThanOrEqual(counting.headLoads, 2, "stamp validation must reuse the head after every yield")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
+    func testUnstampedWrapperReusesHeadUntilAnActualSuspension() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        head.pages = (0..<96).map { i in
+            PageRecord(id: NibID("LEGACYPAGE" + String(i)), order: String(format: "%04d", i), size: .a4)
+        }
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        let counting = CountingIndexPersistence(base: h.persistence)
+        h.app.workspace.persistence = LegacyIndexPersistence(base: counting)
+        // Exercise the deterministic 32-page bound independently of machine speed.
+        indexer.pageBatchTimeLimit = .infinity
+        let indexed = await indexer.indexDocument(doc)
+        XCTAssertEqual(indexed, 0)
+        XCTAssertEqual(counting.itemLoads, 96)
+        XCTAssertLessThanOrEqual(counting.headLoads, 5, "Two initial reads and one per batch suspension")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
+    func testUnstampedHeadCacheRereadsAfterSuspensionAndPersistenceReplacement() throws {
+        let (h, _) = harness()
+        let doc = Fixtures.docID
+        let counting = CountingIndexPersistence(base: h.persistence)
+        counting.knowsHeadStamps = false
+        h.app.workspace.persistence = counting
+        let reader = DocReader(workspace: h.app.workspace)
+        var cache = DocReader.HeadCache()
+        let original = try reader.head(doc, cache: &cache, afterSuspension: false)
+        for _ in 0..<96 { XCTAssertEqual(try reader.head(doc, cache: &cache, afterSuspension: false), original) }
+        XCTAssertEqual(counting.headLoads, 1)
+        var changed = original
+        changed.pages[0].deleted = true
+        h.persistence.heads[doc] = changed
+        XCTAssertEqual(try reader.head(doc, cache: &cache, afterSuspension: true), changed)
+        XCTAssertEqual(counting.headLoads, 2)
+        let replacement = CountingIndexPersistence(base: h.persistence)
+        replacement.knowsHeadStamps = false
+        h.app.workspace.persistence = replacement
+        XCTAssertEqual(try reader.head(doc, cache: &cache, afterSuspension: false), changed)
+        XCTAssertEqual(replacement.headLoads, 1)
+    }
+
+    func testCompletedDeletionDuringUnchangedPageYieldCannotRestoreRowsOrPositions() async throws {
+        // First yield: the old pass must not re-extract the now-deleted later page. Final yield: it must not
+        // overwrite the remaining pages' positions using its old head. Also exercise providers without stamps.
+        for knowsStamps in [true, false] {
+            for yieldIndex in [0, 2] {
+                let (h, indexer) = harness()
+                let doc = Fixtures.docID
+                var head = try XCTUnwrap(h.persistence.heads[doc])
+                head.pages = (0..<3).map { i in
+                    PageRecord(id: NibID("YIELDPAGE00\(i)"), order: String(i), size: .a4)
+                }
+                let pages = head.pages
+                h.persistence.heads[doc] = head
+                for (page, text) in zip(pages, ["Yieldanchor", "Yieldvanishing", "Yieldtail"]) {
+                    h.persistence.pageItems[doc, default: [:]][page.id] = [
+                        Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30), text: RichText(plain: text)))
+                    ]
+                }
+                await indexer.indexDocument(doc)
+                let counting = CountingIndexPersistence(base: h.persistence)
+                counting.knowsHeadStamps = knowsStamps
+                h.app.workspace.persistence = counting
+                let entered = expectation(description: "Unchanged page reached cooperative yield")
+                let resume = expectation(description: "Deletion indexing completed during yield")
+                let finished = expectation(description: "Older pass finished")
+                var suspended = false
+                indexer.yieldAfterPage = { _, page in
+                    guard page == pages[yieldIndex].id, !suspended else { await Task.yield(); return }
+                    suspended = true
+                    XCTAssertEqual(indexer.extractionsInFlight, 0, "This is not the extraction-wait refresh path")
+                    entered.fulfill()
+                    await self.fulfillment(of: [resume], timeout: 2)
+                }
+                let sweep = Task { @MainActor in
+                    let units = await indexer.indexDocument(doc)
+                    XCTAssertEqual(units, 0, "Every live page was already indexed before the yield")
+                    finished.fulfill()
+                }
+                defer { sweep.cancel(); indexer.yieldAfterPage = nil }
+                await fulfillment(of: [entered], timeout: 2)
+                head.pages[1].deleted = true
+                head.pages[1].rev = Rev(wallMs: 10, counter: 0, device: 8)
+                head.pages[0].order = "z"
+                head.pages[0].rev = Rev(wallMs: 11, counter: 0, device: 8)
+                h.persistence.heads[doc] = head
+                await indexer.indexPage(doc, pages[1].id, head: head)
+                XCTAssertNil(indexer.db?.version(doc: doc, key: pages[1].id.raw))
+                XCTAssertEqual(indexer.extractionsInFlight, 0, "Deletion is complete before the older pass resumes")
+                resume.fulfill()
+                await fulfillment(of: [finished], timeout: 2)
+                XCTAssertNil(indexer.db?.version(doc: doc, key: pages[1].id.raw))
+                let vanished = results(try await h.run("search.text", ["query": "Yieldvanishing"]))
+                XCTAssertTrue(vanished.isEmpty)
+                let anchor = results(try await h.run("search.text", ["query": "Yieldanchor"]))
+                XCTAssertEqual(anchor.first?["pageIndex"]?.intValue, 1)
+                XCTAssertFalse(h.app.workspace.isLoaded(doc))
+            }
+        }
+    }
+
     private var strokeRef: String { NodeRef.item(Fixtures.docID, Fixtures.page1, Fixtures.strokeID).description }
 
     private func harness(_ script: [TextRecognition] = []) -> (Harness, Indexer) {
@@ -478,6 +668,12 @@ final class NibIndexTests: XCTestCase {
         h.app.events.emit(IndexProgressPayload(running: false, done: 5, total: 5))
         for _ in 0..<100 where model.status.hasPrefix("Indexing") { try await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertEqual(model.status, IndexSettingsModel.idleStatus(h.app))
+    }
+
+    func testIndexedStatusHandlesZeroOneAndManyPages() {
+        XCTAssertEqual(IndexSettingsModel.indexedStatus(pages: 0), "0 pages indexed on this device")
+        XCTAssertEqual(IndexSettingsModel.indexedStatus(pages: 1), "1 page indexed on this device")
+        XCTAssertEqual(IndexSettingsModel.indexedStatus(pages: 2), "2 pages indexed on this device")
     }
 
     func testRebuildDocument() async throws {
@@ -855,6 +1051,49 @@ final class NibIndexTests: XCTestCase {
 
     // MARK: Versions, sweeps and concurrency
 
+    func testIntermediateRemoteRevisionsRefreshSearchAndPageText() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let page = Fixtures.page2
+        var high = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30), text: RichText(plain: "Fixedmaximum")))
+        high.rev = Rev(wallMs: 100, counter: 0, device: 7)
+        var lower = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 50, w: 100, h: 30), text: RichText(plain: "Oldquokka")))
+        lower.rev = Rev(wallMs: 10, counter: 0, device: 8)
+        h.persistence.pageItems[doc, default: [:]][page] = [high, lower]
+        _ = try h.app.workspace.content(doc)
+        await indexer.indexDocument(doc)
+        lower.rev = Rev(wallMs: 50, counter: 0, device: 8)
+        lower.text?.text = RichText(plain: "Newquokka")
+        _ = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page.raw: [lower]]), origin: "offline-device")
+        await indexer.indexDocument(doc)
+        let text = try await indexer.pageText(doc, page)
+        XCTAssertTrue(text.blocks.contains { $0.text == "Newquokka" })
+        XCTAssertFalse(text.blocks.contains { $0.text == "Oldquokka" })
+        let hits = results(try await h.run("search.text", ["query": "Newquokka"]))
+        XCTAssertFalse(hits.isEmpty)
+        let oldHits = results(try await h.run("search.text", ["query": "Oldquokka"]))
+        XCTAssertTrue(oldHits.isEmpty)
+    }
+
+    func testIntermediateDocumentRecordRevisionRefreshesDocumentText() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.textDocID
+        var head = try XCTUnwrap(h.persistence.heads[doc])
+        head.blocks[0].rev = Rev(wallMs: 100, counter: 0, device: 7)
+        head.blocks[1].rev = Rev(wallMs: 10, counter: 0, device: 8)
+        head.blocks[1].text = RichText(plain: "Oldwombat")
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        head.blocks[1].rev = Rev(wallMs: 50, counter: 0, device: 8)
+        head.blocks[1].text = RichText(plain: "Newwombat")
+        h.persistence.heads[doc] = head
+        await indexer.indexDocument(doc)
+        let hits = results(try await h.run("search.text", ["query": "Newwombat"]))
+        XCTAssertFalse(hits.isEmpty)
+        let oldHits = results(try await h.run("search.text", ["query": "Oldwombat"]))
+        XCTAssertTrue(oldHits.isEmpty)
+    }
+
     func testPageVersionsDependOnlyOnSettingsThatApplyToThePage() throws {
         let (h, indexer) = harness()
         let head = try h.app.workspace.content(Fixtures.docID)
@@ -969,6 +1208,44 @@ final class NibIndexTests: XCTestCase {
         XCTAssertTrue(hits.isEmpty, "\(hits)")
     }
 
+    func testOlderSweepDoesNotRestoreALaterDeletedPage() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let head = try XCTUnwrap(h.persistence.heads[doc])
+        let text = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30),
+                                             text: RichText(plain: "Vanishingquokka")))
+        h.persistence.pageItems[doc, default: [:]][Fixtures.page2] = [text]
+        await indexer.indexPage(doc, Fixtures.page2, head: head)
+        let entered = expectation(description: "Earlier page extraction entered")
+        let finished = expectation(description: "Sweep finished")
+        let recognizer = GatedIndexRecognizer(entered: entered)
+        h.app.services.recognizer = recognizer
+        let sweep = Task { @MainActor in
+            await indexer.indexDocument(doc)
+            finished.fulfill()
+        }
+        defer { recognizer.release.signal(); sweep.cancel() }
+        await fulfillment(of: [entered], timeout: 2)
+        var current = head
+        let position = try XCTUnwrap(current.pages.firstIndex { $0.id == Fixtures.page2 })
+        current.pages[position].deleted = true
+        current.pages[position].rev = Rev(wallMs: 10, counter: 0, device: 8)
+        let moved = try XCTUnwrap(current.pages.firstIndex { $0.id == Fixtures.page1 })
+        current.pages[moved].order = "z"
+        current.pages[moved].rev = Rev(wallMs: 11, counter: 0, device: 8)
+        h.persistence.heads[doc] = current
+        await indexer.indexPage(doc, Fixtures.page2, head: current)
+        XCTAssertNil(indexer.db?.version(doc: doc, key: Fixtures.page2.raw))
+        recognizer.release.signal()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertNil(indexer.db?.version(doc: doc, key: Fixtures.page2.raw))
+        let hits = results(try await h.run("search.text", ["query": "Vanishingquokka"]))
+        XCTAssertTrue(hits.isEmpty)
+        let remaining = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertEqual(remaining.first?["pageIndex"]?.intValue, 1, "The final position update uses the current head")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
     func testRecognizeItemsKeepsReadingOrderPerPageAndPagesInRefOrder() async throws {
         let (h, _) = harness()
         let footer = Item.makeText(TextBoxItem(frame: Frame(x: 72, y: 700, w: 200, h: 30), text: RichText(plain: "Page two footer")))
@@ -1007,4 +1284,59 @@ final class NibIndexTests: XCTestCase {
         XCTAssertEqual(VisionRecognizer.resolve("pt_PT", supported: supported), "pt-BR")
         XCTAssertNil(VisionRecognizer.resolve("xx-YY", supported: supported))
     }
+}
+
+private final class GatedIndexRecognizer: TextRecognizer {
+    let entered: XCTestExpectation
+    let release = DispatchSemaphore(value: 0)
+    init(entered: XCTestExpectation) { self.entered = entered }
+    func recognize(strokes: [Item], language: String) async throws -> [TextRecognition] {
+        entered.fulfill()
+        guard release.wait(timeout: .now() + 3) == .success else {
+            throw NibError(.timeout, "Test recognition was not released")
+        }
+        return []
+    }
+    func recognize(image: CGImage, language: String) async throws -> [TextRecognition] { [] }
+}
+
+@MainActor
+private final class CountingIndexPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    var knowsHeadStamps = true
+    private(set) var headLoads = 0
+    private(set) var itemLoads = 0
+    init(base: InMemoryPersistence) { self.base = base }
+    func headReadStamp(_ doc: DocumentID) -> String? { knowsHeadStamps ? base.headReadStamp(doc) : nil }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent {
+        headLoads += 1
+        return try base.loadHead(doc)
+    }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        itemLoads += 1
+        return try base.loadItems(doc, page: page)
+    }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
+        try base.fileURL(doc, relativePath: relativePath)
+    }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+}
+
+@MainActor
+private final class LegacyIndexPersistence: DocumentPersistence {
+    let base: DocumentPersistence
+    init(base: DocumentPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { base.contentRevision(doc, page: page) }
 }

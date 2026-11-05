@@ -36,6 +36,7 @@ enum PDFImporter {
             try checkNewDocumentID(id, ctx)
         }
         let prepared = try await prepare(url, name: title, ctx)
+        try Task.checkCancellation()
         if prepared.decrypted { log.info("stored a decrypted copy of a password-protected PDF") }
         if prepared.flattened { log.info("flattened form fields and annotations of an imported PDF") }
         if let doc = target.document {
@@ -55,12 +56,14 @@ enum PDFImporter {
         var password: String?
         var attempts = 0
         while true {
+            try Task.checkCancellation()
             let candidate = password
             do {
                 return try await Task.detached(priority: .userInitiated) {
                     try PDFImportPreparation.prepare(url, name: name, password: candidate)
                 }.value
             } catch let failure as PDFImportPreparation.PasswordFailure {
+                try Task.checkCancellation()
                 attempts += 1
                 guard attempts <= maxPasswordAttempts,
                       let provider = ctx.services.get(passwordServiceKey, as: PDFPasswordProvider.self),
@@ -77,17 +80,21 @@ enum PDFImporter {
                                folder: FolderID?, assets: AssetStore, _ ctx: CommandContext) async throws -> DocumentID {
         let library = try ctx.services.require(ctx.services.library, "library")
         let settings = ctx.services.settings
+        try Task.checkCancellation()
         if let id = id { try checkNewDocumentID(id, ctx) }   // the library may have changed during the await
         var meta = DocumentMeta(id: id ?? NibID.make(), kind: .notebook,
                                 language: settings.get(NibSettings.defaultLanguage),
                                 scrollDirection: settings.get(NibSettings.scrollDirection))
         meta.coverEnabled = false                      // the PDF's first page is page 1, as in Goodnotes
+        try Task.checkCancellation()
         let doc = try library.createDocument(DocumentContent(meta: meta), title: title, in: folder)
         do {
             // The asset store files bytes into the package, so the document has to exist first.
             let asset = try await store(prepared.data, doc: doc, assets: assets, dryRun: false)
+            try Task.checkCancellation()
             let pages = pageRecords(prepared.sizes, asset: asset,
                                     orders: orderKeys(between: nil, nil, count: prepared.sizes.count))
+            try Task.checkCancellation()
             try ctx.mutate(undoable: false) { tx in
                 for page in pages { try tx.put(page, doc: doc) }
             }
@@ -105,12 +112,16 @@ enum PDFImporter {
         let chosen = target.ids ?? [], count = prepared.sizes.count
         _ = try pageIDs(chosen, count: min(chosen.count, count), in: ctx.workspace.content(doc))  // before storing
         let asset = try await store(prepared.data, doc: doc, assets: assets, dryRun: ctx.dryRun)
+        // Cancellation can leave an unreferenced, content-addressed asset. AssetStore has no removal API;
+        // deleting its URL here could remove a deduplicated asset already used by another page or command.
+        try Task.checkCancellation()
         // Read the neighbours and check the ids after the await: other commands may have changed the page list.
         let content = try ctx.workspace.content(doc)
         let ids = try pageIDs(chosen, count: count, in: content)
         let (lower, upper) = neighbours(content.livePages, target.position, anchor: target.anchorPage)
         let pages = pageRecords(prepared.sizes, asset: asset,
                                 orders: orderKeys(between: lower, upper, count: count), ids: ids)
+        try Task.checkCancellation()
         try ctx.mutate { tx in
             for page in pages { try tx.put(page, doc: doc) }
         }

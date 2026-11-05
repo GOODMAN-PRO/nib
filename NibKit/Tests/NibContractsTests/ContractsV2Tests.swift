@@ -163,6 +163,91 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "One two")
     }
 
+    func testLongTypingGroupCompactsRecordSnapshots() async throws {
+        let h = Harness()
+        let before = try h.snapshot(Fixtures.textDocID)
+        let ctx = try await probeContext(h, group: "LONGTYPING01")
+        for i in 0..<1_000 {
+            try ctx.mutate { tx in
+                var block = try XCTUnwrap(try tx.content(Fixtures.textDocID).blocks.first)
+                block.text = RichText(plain: String(repeating: "a", count: 1_000) + String(i))
+                try tx.put(block, doc: Fixtures.textDocID)
+            }
+        }
+        let entry = try XCTUnwrap(h.app.bus.history.entries(Fixtures.textDocID).last)
+        XCTAssertEqual(entry.mutations.count, 1)
+        XCTAssertEqual(h.undoDepth(Fixtures.textDocID), 1)
+        let after = try h.snapshot(Fixtures.textDocID)
+        XCTAssertNotEqual(after, before)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.textDocID))
+        XCTAssertEqual(try h.snapshot(Fixtures.textDocID), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.textDocID))
+        XCTAssertEqual(try h.snapshot(Fixtures.textDocID), after)
+    }
+
+    func testCompactionIndexFollowsStackChangesAndDistinctRecords() throws {
+        let history = UndoHistory()
+        let doc = Fixtures.docID
+        var pages = (0..<512).map { i in
+            PageRecord(id: NibID("UNDOPAGE" + String(format: "%04d", i)), order: "V", size: .a4)
+        }
+        func record(_ group: String, before: PageRecord?, after: PageRecord) {
+            history.record(Changeset(seq: 1, principal: .user, group: group, label: "Test", command: "test",
+                                     mutations: [.page(doc, before: before, after: after)]))
+        }
+        for i in pages.indices {
+            pages[i].rev = Rev(wallMs: 1, counter: 0, device: 7)
+            record("large", before: nil, after: pages[i])
+        }
+        for i in pages.indices.reversed() {
+            let before = pages[i]
+            pages[i].rev = Rev(wallMs: 2, counter: 0, device: 7)
+            record("large", before: before, after: pages[i])
+        }
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, pages.count)
+        let saved = try XCTUnwrap(history.popUndo(doc))
+        history.pushUndo(saved, doc: doc)
+        let before = pages[0]
+        pages[0].rev = Rev(wallMs: 3, counter: 0, device: 7)
+        record("large", before: before, after: pages[0])
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, pages.count)
+        XCTAssertEqual(history.entries(doc).last?.mutations.first?.afterRev, pages[0].rev)
+        XCTAssertEqual(saved.mutations.first?.afterRev, before.rev, "previous snapshots retain value semantics")
+        record("other", before: pages[1], after: pages[1])
+        let other = try XCTUnwrap(history.entries(doc).last)
+        _ = history.removeEntry(id: other.id, doc: doc)
+        record("large", before: pages[0], after: pages[0])
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, pages.count)
+        history.clear(doc)
+        record("large", before: nil, after: pages[1])
+        XCTAssertEqual(history.entries(doc).last?.mutations.count, 1)
+    }
+
+    func testGroupedCompactionKeepsSegmentsAcrossARemoteWrite() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h, group: "CONFLICTGROUP")
+        func write(_ text: String) throws {
+            try ctx.mutate { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.text?.text = RichText(plain: text)
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+        }
+        try write("Local one")
+        try write("Local two")
+        var remote = try h.app.workspace.item(doc, page: page1, id: Fixtures.textID)
+        remote.rev = Rev(wallMs: remote.rev.wallMs, counter: remote.rev.counter + 1, device: 99)
+        remote.text?.text = RichText(plain: "Remote text")
+        _ = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page1.raw: [remote]]), origin: "test")
+        try write("Local three")
+        try write("Local four")
+        XCTAssertEqual(h.app.bus.history.entries(doc).last?.mutations.count, 2)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "Remote text")
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "Local four")
+    }
+
     /// F026 / F029 / F034 / F036 / F049: consecutive undo entries on the SAME item all undo (each revert re-stamps the
     /// item, which used to make the next-older entry look "changed since" and be skipped), then all redo.
     func testConsecutiveUndosOnOneItem() async throws {
@@ -1066,6 +1151,21 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertTrue(w.cachedPages(doc).contains(page1))
         XCTAssertEqual(w.contentRevision(doc, page: page1), Rev(wallMs: 1, counter: 0, device: 0))
         XCTAssertFalse(w.isReadOnly(doc))
+    }
+
+    func testHeadReadStampTracksDirectEditsWritesAndRemoval() throws {
+        let h = Harness()
+        let persistence = h.persistence
+        let initial = try XCTUnwrap(persistence.headReadStamp(doc))
+        XCTAssertEqual(persistence.headReadStamp(doc), initial)
+        persistence.heads[doc]?.pages.reverse()
+        let edited = try XCTUnwrap(persistence.headReadStamp(doc))
+        XCTAssertNotEqual(edited, initial, "Direct fixture edits must invalidate read caches too")
+        let head = try persistence.loadHead(doc)
+        persistence.didChange(doc, head: head, pages: [:])
+        XCTAssertNotEqual(persistence.headReadStamp(doc), edited)
+        persistence.heads[doc] = nil
+        XCTAssertNil(persistence.headReadStamp(doc), "A removed head cannot validate an older cached snapshot")
     }
 
     func testWindowShowLibraryUsesTheNavigator() async throws {

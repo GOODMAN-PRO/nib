@@ -54,8 +54,9 @@ enum StoreStatus {
 
 /// Changes not on disk yet: the latest head and page snapshots, plus merged conflict copies to delete.
 struct PendingWrite {
-    var head: DocumentContent?
-    var pages: [PageID: [Item]] = [:]
+    var head: DocumentContent? { didSet { readToken = UUID() } }
+    var pages: [PageID: [Item]] = [:] { didSet { readToken = UUID() } }
+    private(set) var readToken = UUID()
     var copies: Set<URL> = []
     let since = Date()
 
@@ -121,6 +122,12 @@ final class ReadableWrites {
         return jobs[doc]?.job
     }
 
+    func token(_ doc: DocumentID) -> UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return jobs[doc]?.token
+    }
+
     func completed(_ doc: DocumentID, token: UUID) {
         lock.lock()
         defer { lock.unlock() }
@@ -144,11 +151,31 @@ final class ReadableWrites {
 ///   answer until one of those files changes.
 @MainActor
 final class PackagePersistence: DocumentPersistence {
-    /// The highest item revision of a page as its files hold it, and the stamps of those files by name.
+    /// Merged metadata of a page on disk, retained until a file or effective clock-skew ordering changes.
     private struct FileRevision {
         var stamps: [String: PackageFiles.Stamp]
+        var input: String
         var rev: Rev
+        var fingerprint: String?
+        var validUntil: UInt64
     }
+
+    private struct HeadRead {
+        let token = UUID()
+        var stamp: String
+        var head: DocumentContent
+        // The winning meta can be older-format even when a losing candidate contains unknown fields.
+        var format: Int
+        var validUntil: UInt64
+    }
+    private var headReads: [DocumentID: HeadRead] = [:]
+    /// Failed probes are also stamp-cached, including while WAL/pending inputs change.
+    private var failedMetadata: [DocumentID: [String: PackageFiles.Stamp]] = [:]
+    private(set) var metadataFileReads = 0
+    private(set) var metadataScans = 0
+    private(set) var metadataFallbacks = 0
+    private(set) var headFileReads = 0
+    private(set) var itemPageReads = 0
 
     /// What this device has in memory: the merged head and the item revs of pages loaded or written through it.
     private struct Known {
@@ -173,7 +200,9 @@ final class PackagePersistence: DocumentPersistence {
     static let closedReadCacheLimit = 32
     private let isDocumentOpen: (DocumentID) -> Bool
     private var readCacheOrder: [DocumentID] = []
-    var retainedReadDocuments: Set<DocumentID> { Set(known.keys).union(seen.keys).union(fileRevisions.keys) }
+    var retainedReadDocuments: Set<DocumentID> {
+        Set(known.keys).union(seen.keys).union(fileRevisions.keys).union(headReads.keys).union(failedMetadata.keys)
+    }
     /// Changes not handed to `io` yet.
     private var pending: [DocumentID: PendingWrite] = [:]
     private var timers: [DocumentID: Task<Void, Never>] = [:]
@@ -201,6 +230,87 @@ final class PackagePersistence: DocumentPersistence {
         try readHead(doc, remembering: true)
     }
 
+    private func writeStamp(_ doc: DocumentID) -> String {
+        let walStamp = PackageFiles.stamp(wal.url(doc))
+        return "\(walStamp.modified?.timeIntervalSince1970 ?? -1):\(walStamp.size ?? -1)"
+            + "|\(readable.token(doc)?.uuidString ?? "")|\(pending[doc]?.readToken.uuidString ?? "")"
+    }
+
+    private func diskHeadStamp(_ doc: DocumentID) -> String? {
+        guard let pkg = try? files.package(doc), let sources = try? files.headSources(pkg) else { return nil }
+        var parts = [pkg.path, writeStamp(doc)]
+        for source in sources {
+            parts.append("\(source.name):\(source.stamp.modified?.timeIntervalSince1970 ?? -1):\(source.stamp.size ?? -1)")
+        }
+        return parts.joined(separator: "|")
+    }
+
+    func headReadStamp(_ doc: DocumentID) -> String? {
+        guard let stamp = diskHeadStamp(doc) else { return nil }
+        // Cache eviction also invalidates pass-local heads: their clock-skew expiry is no longer retained here.
+        guard let cached = headReads[doc] else { return stamp + "|uncached" }
+        guard PackageCodec.ms(Date()) < cached.validUntil else { return nil }
+        return stamp + "|" + cached.token.uuidString
+    }
+
+    /// Library/index/thumbnail reads never perform recovery. Cache only the merged head, not WAL page payloads.
+    func peekHead(_ doc: DocumentID) throws -> DocumentContent {
+        let stamp = diskHeadStamp(doc)
+        if let stamp, let cached = headReads[doc], cached.stamp == stamp,
+           PackageCodec.ms(Date()) < cached.validUntil {
+            // Never lower an independently established gate using a cached snapshot.
+            if cached.format > NibFormat.version { applyFormatGate(doc, format: cached.format) }
+            retainReadCache(doc)
+            return cached.head
+        }
+        defer { retainReadCache(doc) }
+        let queued = readable.snapshot(doc)
+        let logged = wal.metadata(doc).heads
+        let pkg = try files.package(doc)
+        let sources = try files.headSources(pkg)
+        let read = files.read(sources, in: "", decode: { data in
+            self.headFileReads += 1
+            return try PackageCodec.decodeHead(data)
+        }, isFuture: { _ in false })
+        var candidates = read.values + logged
+        if let head = queued?.head { candidates.append(head) }
+        if let head = pending[doc]?.head { candidates.append(head) }
+        let format = candidates.map { $0.meta.format }.max() ?? NibFormat.version
+        guard var head = PackageCodec.mergeHeads(candidates) else { throw NibError.notFound("document \(doc.raw)") }
+        applyFormatGate(doc, format: format)
+        head.meta.id = doc
+        let now = PackageCodec.ms(Date())
+        var revisions: [Rev] = []
+        for h in candidates {
+            revisions.append(h.meta.rev)
+            revisions.append(contentsOf: h.pages.map(\.rev))
+            revisions.append(contentsOf: h.outline.map(\.rev))
+            revisions.append(contentsOf: h.blocks.map(\.rev))
+            revisions.append(contentsOf: h.cards.map(\.rev))
+            revisions.append(contentsOf: h.audio.map(\.rev))
+        }
+        let validUntil = Self.validUntil(revisions, now: now)
+        if let stamp, diskHeadStamp(doc) == stamp {
+            headReads[doc] = HeadRead(stamp: stamp, head: head, format: format, validUntil: validUntil)
+        }
+        return head
+    }
+
+    private static func validUntil(_ revisions: [Rev], now: UInt64) -> UInt64 {
+        revisions.filter { PackageCodec.isFuture($0, now: now) }
+            .map { $0.wallMs - PackageCodec.futureSkewMs }.min() ?? UInt64.max
+    }
+
+    private func applyFormatGate(_ doc: DocumentID, format: Int) {
+        let readOnly = format > NibFormat.version
+        let wasReadOnly = gate.contains(doc)
+        gate.set(doc, readOnly: readOnly)
+        if readOnly, !wasReadOnly {
+            log.error("\(doc.raw, privacy: .public) has format \(format) > \(NibFormat.version): read-only")
+            emit(doc, StoreStatus.newerFormat)
+        }
+    }
+
     private func readHead(_ doc: DocumentID, remembering: Bool) throws -> DocumentContent {
         let pkg = try files.package(doc)
         let now = PackageCodec.ms(Date())
@@ -225,11 +335,7 @@ final class PackagePersistence: DocumentPersistence {
         // being rewritten by this build).
         let format = candidates.map { $0.meta.format }.max() ?? NibFormat.version
         let readOnly = format > NibFormat.version
-        gate.set(doc, readOnly: readOnly)
-        if readOnly {
-            log.error("\(doc.raw, privacy: .public) has format \(format) > \(NibFormat.version): read-only")
-            emit(doc, StoreStatus.newerFormat)
-        }
+        applyFormatGate(doc, format: format)
         // Replay: pages logged but not written before the app died, merged over what the device files hold.
         var recovered: [PageID: [Item]] = [:]
         for entry in logged {
@@ -284,6 +390,7 @@ final class PackagePersistence: DocumentPersistence {
     /// Unreadable and clock-skewed files are reported.
     private func mergedPage(_ doc: DocumentID, _ pkg: URL, _ page: PageID,
                             now: UInt64) throws -> (items: [Item], read: PackageFiles.ReadResult<[Item]>) {
+        itemPageReads += 1
         let queued = readable.snapshot(doc)
         let logged = wal.read(doc)
         let read = files.read(try files.pageSources(pkg, page: page), in: PackageCodec.pageDirectory(page),
@@ -455,6 +562,8 @@ final class PackagePersistence: DocumentPersistence {
         known[doc] = nil
         seen[doc] = nil
         fileRevisions[doc] = nil
+        headReads[doc] = nil
+        failedMetadata[doc] = nil
         readCacheOrder.removeAll { $0 == doc }
     }
 
@@ -479,26 +588,68 @@ final class PackagePersistence: DocumentPersistence {
     /// until one of them changes (stamps), so a library of thumbnails costs one folder listing per page. nil when the
     /// document has no package.
     func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
+        contentMetadata(doc, page: page)?.rev
+    }
+
+    func contentFingerprint(_ doc: DocumentID, page: PageID) -> String? {
+        contentMetadata(doc, page: page, includingFingerprint: true)?.fingerprint
+    }
+
+    private func contentMetadata(_ doc: DocumentID, page: PageID,
+                                 includingFingerprint: Bool = false) -> (rev: Rev, fingerprint: String?)? {
         guard NibID.isValid(page.raw), let pkg = try? files.package(doc),
               FileManager.default.fileExists(atPath: pkg.path) else { return nil }
         defer { retainReadCache(doc) }
-        // Same read ordering as `mergedPage`, without waiting on file coordination.
+        // Validate all inputs before reading payload-free metadata. Completed writes retire their readable
+        // snapshot only after replacing files and truncating the WAL; a racing read is never cached.
+        let input = writeStamp(doc)
         let queued = readable.snapshot(doc)
-        let logged = wal.read(doc)
-        var unwritten = logged.compactMap { $0.pages[page.raw] }
-        if let kept = queued?.pages[page] { unwritten.append(kept) }
-        if let items = pending[doc]?.pages[page] { unwritten.append(items) }
-
         guard let sources = try? files.pageSources(pkg, page: page) else { return nil }
         let stamps = Dictionary(sources.map { ($0.name, $0.stamp) }, uniquingKeysWith: { first, _ in first })
-        if unwritten.isEmpty, let cached = fileRevisions[doc]?[page], cached.stamps == stamps { return cached.rev }
         let now = PackageCodec.ms(Date())
-        var revs = files.revisions(sources, now: now)
-        fileRevisions[doc, default: [:]][page] = FileRevision(stamps: stamps, rev: revs.values.max() ?? .zero)
-        for items in unwritten {
-            PackageCodec.merge(items.map { ($0.id, $0.rev) }, into: &revs, now: now)
+        if let cached = fileRevisions[doc]?[page], cached.stamps == stamps,
+           cached.input == input, now < cached.validUntil,
+           !includingFingerprint || cached.fingerprint != nil {
+            return (cached.rev, cached.fingerprint)
         }
-        return revs.values.max() ?? .zero
+        var unwritten = wal.metadata(doc, page: page).items
+        if let kept = queued?.pages[page] { unwritten.append(kept.map(PackageCodec.ItemMetadata.init)) }
+        if let items = pending[doc]?.pages[page] { unwritten.append(items.map(PackageCodec.ItemMetadata.init)) }
+        var records: [PackageCodec.ItemMetadata] = []
+        var validUntil = UInt64.max
+        // No item lists survive this call. Rare WAL/pending changes re-scan the files for their LWW merge.
+        for source in sources {
+            let key = PackageFiles.key(PackageCodec.pageDirectory(page), source.name)
+            if failedMetadata[doc]?[key] == source.stamp { continue }
+            do {
+                metadataFileReads += 1
+                let values = try PackageCodec.itemMetadata(Data(contentsOf: source.url), didScan: { scanned in
+                    if scanned { self.metadataScans += 1 } else { self.metadataFallbacks += 1 }
+                })
+                failedMetadata[doc]?[key] = nil
+                validUntil = min(validUntil, Self.validUntil(values.map(\.rev), now: now))
+                records = LWW.merge(records, values)
+            } catch {
+                // Read-only probes neither emit sync warnings nor make a partially synced foreign file fatal.
+                log.debug("metadata unavailable for \(key, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                failedMetadata[doc, default: [:]][key] = source.stamp
+            }
+        }
+        for values in unwritten {
+            validUntil = min(validUntil, Self.validUntil(values.map(\.rev), now: now))
+            records = LWW.merge(records, values)
+        }
+        // Revision-only clients (class navigator, backup, meeting/math watchers) do not pay for sorting/hashing
+        // every item. A later thumbnail may re-scan once, then both answers share the compact stamp cache.
+        let fingerprint = includingFingerprint ? LWW.fingerprint(records) : nil
+        let result = FileRevision(stamps: stamps, input: input, rev: records.map { $0.rev }.max() ?? .zero,
+                                  fingerprint: fingerprint, validUntil: validUntil)
+        if writeStamp(doc) == input,
+           let after = try? files.pageSources(pkg, page: page),
+           Dictionary(after.map { ($0.name, $0.stamp) }, uniquingKeysWith: { first, _ in first }) == stamps {
+            fileRevisions[doc, default: [:]][page] = result
+        }
+        return (result.rev, result.fingerprint)
     }
 
     // MARK: Package files, remote changes

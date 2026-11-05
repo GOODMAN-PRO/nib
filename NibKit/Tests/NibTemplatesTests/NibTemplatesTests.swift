@@ -334,17 +334,27 @@ final class NibTemplatesTests: XCTestCase {
     }
 
     func testPlannerLabelsAreAlignedAndWeighted() {
-        let ops = PlannerTemplates.monthly.render(["month": 2, "year": 2024], .a4, 2).display.ops.filter { $0.op == .text }
+        let locale = Locale(identifier: "en_US")
+        let ops = PlannerTemplates.makeMonthly(locale: locale).render(["month": 2, "year": 2024], .a4, 2).display.ops.filter { $0.op == .text }
         XCTAssertEqual(ops.first { $0.text?.hasSuffix("2024") == true }?.weight, .semibold)
         let days = ops.filter { Int($0.text ?? "") != nil }
         XCTAssertEqual(days.count, 29)
         XCTAssertTrue(days.allSatisfy { $0.align == .right })
-        let weekdays = Set(PlannerCalendar.weekdays(.short, startMonday: true))
+        let weekdays = Set(PlannerCalendar.weekdays(.short, startMonday: true, locale: locale))
         let names = ops.filter { weekdays.contains($0.text ?? "") }
         XCTAssertEqual(names.count, 7)
         XCTAssertTrue(names.allSatisfy { $0.align == .center && $0.weight == .medium })
         let weekly = PlannerTemplates.weekly.render([:], .a4, 2).display.ops.filter { $0.op == .text && $0.weight == .semibold }
         XCTAssertEqual(weekly.count, 8)   // seven days and Notes
+    }
+
+    func testMonthlyPlannerHeadingUsesLocaleDateOrder() throws {
+        let japanese = PlannerTemplates.makeMonthly(locale: Locale(identifier: "ja_JP"))
+        let ops = japanese.render(["month": 11, "year": 2026], .a4, 2).display.ops
+        let heading = try XCTUnwrap(ops.first { $0.op == .text && $0.weight == .semibold }?.text)
+        XCTAssertEqual(heading, "2026年11月")
+        XCTAssertEqual(PlannerCalendar.monthYear(month: 11, year: 2026, locale: Locale(identifier: "en_US")), "November 2026")
+        XCTAssertEqual(PlannerCalendar.monthYear(month: 0, year: 2026), "")
     }
 
     func testMonthlyPlannerLaysOutTheMonth() {
