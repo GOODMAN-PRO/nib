@@ -210,7 +210,8 @@ struct EraserSettingsView: View {
             NibButton(String(localized: "Clear Page"), symbol: .trash, kind: .destructivePlain, expands: true) {
                 confirmingClear = true
             }
-            .disabled(session.document == nil || session.page == nil || session.readOnly)
+            .disabled(session.document == nil || session.page == nil || session.readOnly
+                || session.document.map { app.isReadOnly($0) } == true)
         }
         .background(ClearPageConfirmation(isPresented: $confirmingClear, clear: clearPage))
         .onDisappear { confirmingClear = false; model.flushSizeWrite() }

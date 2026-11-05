@@ -12,6 +12,14 @@ struct EraseCounts: Codable, Equatable {
 /// Shared by the eraser commands.
 @MainActor
 enum EraseSupport {
+    static func checkWritable(_ doc: DocumentID, _ ctx: CommandContext) throws {
+        // Loading the head establishes persistence's newer-format gate for API callers too.
+        _ = try ctx.workspace.content(doc)
+        guard !ctx.isReadOnly(doc) else {
+            throw NibError(.permissionDenied, String(localized: "This document is read-only."))
+        }
+    }
+
     static func pageRef(_ ref: String, path: String = "$.page") throws -> (DocumentID, PageID) {
         guard case let .page(doc, page)? = NodeRef(ref) else {
             throw NibError(.invalidParams, "expected a page ref such as page:D/P", path: path,
@@ -132,6 +140,7 @@ struct InkErase: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
         let (doc, page) = try EraseSupport.pageRef(p.page)
+        try EraseSupport.checkWritable(doc, ctx)
         try EraseSupport.checkLength(p.path, "$.path")
         guard !p.path.isEmpty, p.path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else {
             throw NibError.invalid("path needs at least one finite [x, y] point", path: "$.path")
@@ -170,6 +179,7 @@ struct InkScribbleErase: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
         let (doc, page) = try EraseSupport.pageRef(p.page)
+        try EraseSupport.checkWritable(doc, ctx)
         try EraseSupport.checkLength(p.points, "$.points")
         guard p.points.count >= 2, p.points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else {
             throw NibError.invalid("points needs at least two finite [x, y] points", path: "$.points")
@@ -207,6 +217,7 @@ struct PageClear: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
         let (doc, page) = try EraseSupport.pageRef(p.page)
+        try EraseSupport.checkWritable(doc, ctx)
         let items = try EraseSupport.liveItems(ctx.workspace, doc, page)
         guard !items.isEmpty else { return .zero }
         return try ctx.mutate { tx in
@@ -302,6 +313,14 @@ struct PageDeleteItems: NibCommand {
     }
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
+        // Check the requested document even when there are no matching items or live pages.
+        if p.scope == "document", let ref = p.doc {
+            try EraseSupport.checkWritable(NodeRef.documentID(from: ref), ctx)
+        } else if let ref = p.page {
+            try EraseSupport.checkWritable(EraseSupport.pageRef(ref).0, ctx)
+        } else if let ref = p.doc {
+            try EraseSupport.checkWritable(NodeRef.documentID(from: ref), ctx)
+        }
         let work = try resolve(p, workspace: ctx.workspace, session: ctx.activeSession)
         guard !work.isEmpty else { return .zero }
         return try ctx.mutate { tx in

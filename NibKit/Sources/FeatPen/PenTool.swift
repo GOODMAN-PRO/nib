@@ -71,17 +71,33 @@ final class PenTool: CanvasTool {
         let app = host.app, session = host.session, doc = host.documentID
         if settings.get(PenSettings.scribbleErase), ScribbleDetector.isScribble(outline, scale: host.zoomScale) {
             host.cancelWetStroke()
-            Task { @MainActor [weak host] in
+            Task { @MainActor in
+                var erased = false
                 do {
                     let result = try await app.bus.execute(CommandIDs.inkScribbleErase,
                         ["page": .string(NodeRef.page(doc, page).description), "points": try JSONValue.from(outline)], session: session)
                     guard let removed = result["removed"]?.doubleValue else {
                         throw NibError.invalid("scribble erase must return a removed count")
                     }
-                    if removed == 0 { host?.commitStroke(stroke, page: page) }
+                    erased = removed > 0
                 } catch {
                     Self.report(error, command: CommandIDs.inkScribbleErase, app: app)
-                    host?.commitStroke(stroke, page: page)
+                }
+                if !erased {
+                    // An erase can finish after a new stroke has begun. Give this fallback
+                    // its own layer without borrowing the active stroke's preview.
+                    let activePreview = self.preview
+                    self.preview = nil
+                    self.drawStroke(stroke, page: page, host: host)
+                    let layer = self.preview; self.preview = activePreview
+                    host.commitStroke(stroke, page: page) { result in
+                        switch result {
+                        case .success:
+                            host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
+                        case .failure(let error):
+                            Self.report(error, command: CommandIDs.inkAddStrokes, app: app)
+                        }
+                    }
                 }
             }
             return
@@ -107,7 +123,6 @@ final class PenTool: CanvasTool {
                     return true
                 } catch {
                     Self.report(error, command: CommandIDs.inkAddStrokes, app: app)
-                    layer?.removeFromSuperlayer()
                     return false
                 }
             }

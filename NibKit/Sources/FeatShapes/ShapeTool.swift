@@ -353,7 +353,12 @@ final class ShapeTool: CanvasTool {
             if let hit { return ["item": .string(NodeRef.item(doc, page, hit.id).description)] }
             return ["point": [.number(p.x), .number(p.y)]]
         }
-        return (ShapeLibraryEntry.connectorCommand, ["page": .string(pageRef), "from": end(a), "to": end(b)])
+        let from = end(a)
+        var to = end(b)
+        if let item = from["item"]?.stringValue, to["item"]?.stringValue == item {
+            to = ["point": [.number(b.x), .number(b.y)]]
+        }
+        return (ShapeLibraryEntry.connectorCommand, ["page": .string(pageRef), "from": from, "to": to])
     }
 
     /// Creates the shape through `shape.create` (a connector through `connector.create`), then selects it. The preview

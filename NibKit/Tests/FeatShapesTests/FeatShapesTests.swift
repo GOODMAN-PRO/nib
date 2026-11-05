@@ -999,6 +999,19 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertFalse(model.showsDrawAndHoldHint, "no hint once Draw and Hold is off")
     }
 
+    func testConnectorDraggedInsideOneShapeKeepsAFreeEndpoint() throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let stroke = ShapeItem(shape: .line, frame: Frame(x: 150, y: 230, w: 70, h: 30),
+                               points: [Point(150, 230), Point(220, 260)])
+        let call = ShapeTool.createCall(stroke, entry: .connector, doc: Fixtures.docID,
+                                        page: Fixtures.page1, items: items)
+        XCTAssertEqual(call.command, ShapeLibraryEntry.connectorCommand)
+        XCTAssertEqual(call.params["from"]?["item"]?.stringValue, shapeRef)
+        XCTAssertNil(call.params["to"]?["item"])
+        XCTAssertEqual(call.params["to"]?["point"], [220, 260])
+    }
+
     func testLibraryFollowsTheDesignGridAndConnectsShapes() async throws {
         let h = Harness(features: [FeatShapesFeature.self])
         XCTAssertEqual(Array(ShapeLibraryEntry.allCases.prefix(8)),

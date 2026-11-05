@@ -471,6 +471,32 @@ final class FeatCanvasTests: XCTestCase {
 
     // MARK: view.goToPage
 
+    func testRemovingTheViewedMiddlePageShowsItsNeighbourOnCommitAndReload() async throws {
+        for reopen in [false, true] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            h.app.commands.register(CommandDescriptor(id: "test.removePage", title: "Remove Page",
+                summary: "Test page removal.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    guard var page = try tx.content(Fixtures.docID).page(Fixtures.page2) else {
+                        throw NibError.notFound("page")
+                    }
+                    page.deleted = true
+                    _ = try tx.put(page, doc: Fixtures.docID)
+                }
+                return .null
+            }
+            let vc = try makeCanvas(h, page: Fixtures.page2)
+            XCTAssertEqual(h.session.page, Fixtures.page2)
+            if reopen { vc.closeCanvas() }
+            _ = try await h.run("test.removePage")
+            if reopen { vc.viewWillAppear(false) }
+            XCTAssertEqual(h.session.page, Fixtures.pdfPage)
+            let neighbour = try XCTUnwrap(vc.host.pageFrame(Fixtures.pdfPage))
+            XCTAssertTrue(neighbour.intersects(unobscured(vc)))
+            vc.closeCanvas()
+        }
+    }
+
     func testGoToPageScrollsThePageToTheTop() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)
@@ -858,6 +884,28 @@ final class FeatCanvasTests: XCTestCase {
         vc.updatePinch(state: .ended, scale: 1.5, centroid: moved)
         XCTAssertTrue(vc.scrollView.panGestureRecognizer.isEnabled)
         XCTAssertEqual(vc.host.viewPoint(hit.point, page: hit.page).y - vc.scrollView.bounds.minY, moved.y, accuracy: 1)
+    }
+
+    func testClosingDuringPinchRestoresPanAcrossReopening() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let focal = CGPoint(x: 400, y: 350)
+        for enabled in [true, false] {
+            vc.scrollView.panGestureRecognizer.isEnabled = enabled
+            vc.updatePinch(state: .began, scale: 1, centroid: focal)
+            vc.updatePinch(state: .changed, scale: 1.2, centroid: focal)
+            vc.closeCanvas()
+            vc.updatePinch(state: .cancelled, scale: 1.2, centroid: focal)
+            XCTAssertEqual(vc.scrollView.panGestureRecognizer.isEnabled, enabled)
+            XCTAssertFalse(vc.scrollView.isZoomingNow)
+            XCTAssertFalse(vc.hud.isPinching)
+            vc.viewWillAppear(false)
+            XCTAssertFalse(vc.isClosed)
+            vc.updatePinch(state: .began, scale: 1, centroid: focal)
+            vc.updatePinch(state: .ended, scale: 1, centroid: focal)
+            XCTAssertEqual(vc.scrollView.panGestureRecognizer.isEnabled, enabled)
+        }
     }
 
     func testDocumentOwnedPinchKeepsItsFocalPointAndClampsWithoutEditing() throws {
@@ -2242,6 +2290,142 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(vc.failedPages.isEmpty)
     }
 
+    func testSuccessfulRerenderClearsFailureWithoutTryAgain() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = FailingRenderer()
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        defer { vc.closeCanvas() }
+        await waitUntil("render failure") { vc.failedPages.contains(Fixtures.boardID) }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+        await waitUntil("failed renders to settle") { page.isSettled }
+        XCTAssertFalse(vc.errorView.isHidden, "Settling alone is not recovery")
+        XCTAssertEqual(vc.errorView.reason, String(localized: "The page renderer could not finish drawing this page."))
+        h.app.services.renderer = RecordingRenderer()
+        page.invalidate(nil)
+        await waitUntil("successful rerender") { page.isSettled && !vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertTrue(vc.errorView.isHidden)
+        XCTAssertTrue(page.hasShownContent)
+        // A subsequent recovery must also notify after the first-content fade has already run.
+        vc.pageDidFail(Fixtures.boardID)
+        page.invalidate(nil)
+        await waitUntil("second recovery") { !vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testOneFailedTileStaysReportedWhenPreviewAndSiblingTilesLand() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let renderer = OneTileFailureRenderer()
+        h.app.services.renderer = renderer
+        let vc = try makeCanvas(h)
+        defer { renderer.releaseSuccessfulRenders(); vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("one tile to fail") { vc.failedPages.contains(Fixtures.page1) }
+        XCTAssertFalse(vc.errorView.isHidden)
+        XCTAssertGreaterThan(page.tileKeys.count, 1)
+        XCTAssertGreaterThan(page.pendingRenders, 0, "Preview and siblings are held until after the failure")
+        renderer.releaseSuccessfulRenders()
+        await waitUntil("preview and siblings to land") { page.isSettled }
+        XCTAssertTrue(page.hasShownContent)
+        XCTAssertTrue(vc.failedPages.contains(Fixtures.page1))
+        XCTAssertFalse(vc.errorView.isHidden)
+        XCTAssertEqual(vc.errorView.actionTitles, ["Try Again"])
+
+        let failed = try XCTUnwrap(renderer.failedRegion)
+        let sibling = try XCTUnwrap(page.tileKeys.first { CanvasTileGrid.rect($0) != failed })
+        page.invalidate(CanvasTileGrid.rect(sibling).insetBy(1))
+        await waitUntil("unrelated rerender") { page.isSettled }
+        XCTAssertTrue(vc.failedPages.contains(Fixtures.page1), "Unrelated work cannot recover the failed slot")
+        page.invalidate(failed.insetBy(1))
+        await waitUntil("failed slot to recover") { page.isSettled && !vc.failedPages.contains(Fixtures.page1) }
+        XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testZoomLevelChangeClearsRetiredTileFailureAfterNewTilesLand() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = RecordingRenderer()
+        let renderer = OneTileFailureRenderer()
+        let vc = try makeCanvas(h)
+        defer { renderer.releaseSuccessfulRenders(); vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("initial healthy render") { page.isSettled }
+        h.app.services.renderer = renderer
+        let key = try XCTUnwrap(page.tileKeys.first)
+        page.invalidate(CanvasTileGrid.rect(key).insetBy(1))
+        await waitUntil("one tile to fail") { vc.failedPages.contains(Fixtures.page1) }
+        let oldKeys = page.tileKeys
+        let newLevel = page.level + 1
+        let region = try XCTUnwrap(renderer.failedRegion)
+        page.updateCoverage(visible: region, level: newLevel, bake: true)
+        XCTAssertFalse(page.tileKeys.isEmpty)
+        XCTAssertTrue(page.tileKeys.allSatisfy { $0.level == newLevel })
+        XCTAssertTrue(page.tileKeys.isDisjoint(with: oldKeys))
+        XCTAssertTrue(vc.failedPages.contains(Fixtures.page1), "New tiles must land before recovery")
+        XCTAssertFalse(vc.errorView.isHidden)
+        renderer.releaseSuccessfulRenders()
+        await waitUntil("new zoom tiles to recover the page") { page.isSettled && vc.failedPages.isEmpty }
+        XCTAssertTrue(page.hasShownContent)
+        XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testDroppingFailedTileOnScrollOrTrimClearsFailure() async throws {
+        for trim in [false, true] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            h.app.services.renderer = RecordingRenderer()
+            let vc = try makeCanvas(h)
+            let renderer = OneTileFailureRenderer()
+            defer { renderer.releaseSuccessfulRenders(); vc.closeCanvas() }
+            let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+            await waitUntil("initial renders") { page.isSettled }
+            // Control coverage independently of the viewport to exercise both eviction paths.
+            page.reset()
+            h.app.services.renderer = renderer
+            let level = 3
+            let side = CanvasTileGrid.side(level: level)
+            page.updateCoverage(visible: Rect(x: 1, y: 1, width: side - 2, height: side - 2),
+                                level: level, bake: true)
+            await waitUntil("first tile failure") { vc.failedPages.contains(Fixtures.page1) }
+            let failedKey = try XCTUnwrap(page.tileKeys.first)
+            XCTAssertEqual(page.tileKeys.count, 1)
+            renderer.releaseSuccessfulRenders()
+            await waitUntil("failed coverage to settle") { page.isSettled }
+            XCTAssertTrue(vc.failedPages.contains(Fixtures.page1))
+
+            // The adjacent tile leaves the failed tile in the keep band; the distant one evicts it.
+            let x = (trim ? side : 3 * side) + 1
+            page.updateCoverage(visible: Rect(x: x, y: 1, width: side - 2, height: side - 2),
+                                level: level, bake: true)
+            await waitUntil("healthy coverage to settle") { page.isSettled }
+            if trim {
+                XCTAssertTrue(page.tileKeys.contains(failedKey))
+                XCTAssertTrue(vc.failedPages.contains(Fixtures.page1))
+                page.trim() // No render is pending: trimming must report recovery itself.
+            }
+            XCTAssertFalse(page.tileKeys.contains(failedKey))
+            XCTAssertTrue(vc.failedPages.isEmpty)
+            XCTAssertTrue(vc.errorView.isHidden)
+        }
+    }
+
+    func testOffscreenFailedPageDoesNotCoverHealthyPages() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        // Freeze page selection while the viewport moves, as during a pending page transition.
+        vc.scrollView.delegate = nil
+        let next = try XCTUnwrap(vc.host.pageFrame(Fixtures.page2))
+        vc.scrollView.contentOffset.y = next.minY
+        vc.pageDidFail(Fixtures.page1)
+        XCTAssertTrue(vc.errorView.isHidden)
+        XCTAssertEqual(vc.errorView.frame, .zero)
+        let paper = try XCTUnwrap(vc.host.pageFrame(Fixtures.page1))
+        vc.scrollView.contentOffset.y = paper.maxY - NibSpacing.l / 2
+        vc.pageDidFail(Fixtures.page1)
+        let visible = vc.scrollView.convert(paper, to: vc.fixedOverlay).intersection(vc.fixedOverlay.bounds)
+        XCTAssertFalse(visible.isEmpty)
+        XCTAssertEqual(vc.errorView.frame, visible)
+        XCTAssertTrue(vc.errorView.clipsToBounds)
+    }
+
     func testABoardWhoseTilesFailToRenderSaysSoAndTriesAgain() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let renderer = FailingRenderer()
@@ -2440,6 +2624,57 @@ private final class RecordingRenderer: PageRenderer {
         lock.unlock()
     }
 
+    func purgeCaches() {}
+}
+
+/// Fails one screen tile once and holds successful tiles/previews until the test observes the banner.
+private final class OneTileFailureRenderer: PageRenderer {
+    private let lock = NSLock()
+    private var failed: Rect?
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private let image = FakeRenderer.blank(CGSize(width: 4, height: 4))
+
+    var failedRegion: Rect? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
+    }
+
+    private func shouldFail(_ request: RenderRequest) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard request.page == Fixtures.page1, let region = request.region, failed == nil else { return false }
+        failed = region
+        return true
+    }
+
+    func releaseSuccessfulRenders() {
+        lock.lock()
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        if shouldFail(request) { throw NibError(.internalError, "one screen tile failed") }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if released {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+        return RenderResult(image: image, region: request.region ?? Rect(x: 0, y: 0, width: 1, height: 1), scale: request.scale)
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
 }
 

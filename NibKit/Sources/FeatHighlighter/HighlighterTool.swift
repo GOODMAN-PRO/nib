@@ -50,7 +50,7 @@ final class HighlighterTool: CanvasTool {
 
     private struct Hold {
         let generation: Int
-        let stroke: Stroke
+        var stroke: Stroke
         let page: PageID
         /// Where the pen rested: the reference for live scale and rotation.
         let holdPoint: Point
@@ -63,6 +63,7 @@ final class HighlighterTool: CanvasTool {
         var mergeWith: [String] = []
         var recognitionDone = false
         var touchEnded = false
+        var lastTimestamp: TimeInterval?
     }
 
     private var hold: Hold?
@@ -104,9 +105,22 @@ final class HighlighterTool: CanvasTool {
         guard var h = hold, let sample = samples.last(where: { !$0.isPredicted }) ?? samples.last else { return }
         // The pen may wander onto the next page: follow it in the held stroke's page coordinates.
         h.current = host.convert(sample.location, from: sample.page, to: h.page) ?? h.current
-        if let r = h.recognised { h.shape = HeldShape.adjusted(r, from: h.holdPoint, to: h.current) }
+        if let r = h.recognised {
+            h.shape = HeldShape.adjusted(r, from: h.holdPoint, to: h.current)
+        }
+        // Keep the real ink even after snapping, in case shape.create fails or the hold is cancelled.
+        for sample in samples where !sample.isPredicted {
+            guard let point = host.convert(sample.location, from: sample.page, to: h.page) else { continue }
+            let elapsed = max(0, sample.timestamp - (h.lastTimestamp ?? sample.timestamp))
+            var segment = [StrokePoint(x: Float(point.x), y: Float(point.y),
+                t: (h.stroke.points.last?.t ?? 0) + Float(elapsed), force: Float(sample.force),
+                azimuth: Float(sample.azimuth), altitude: Float(sample.altitude), roll: Float(sample.roll))]
+            InkModel.fillSizes(&segment, style: h.stroke.style)
+            h.stroke.points.append(contentsOf: segment)
+            h.lastTimestamp = sample.timestamp
+        }
         hold = h
-        if h.recognised != nil { refreshPreview(host) }
+        refreshPreview(host)
     }
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
@@ -195,6 +209,9 @@ final class HighlighterTool: CanvasTool {
         host.commitStroke(stroke, page: page) { result in
             if case .failure(let error) = result {
                 HighlighterTool.log.error("keeping the stroke failed: \(String(describing: error), privacy: .public)")
+                NotificationCenter.default.post(name: .nibCommandFailed, object: host.app,
+                    userInfo: ["command": CommandIDs.inkAddStrokes, "error": error])
+                return
             }
             host.afterNextRender(page: page) { preview.removeFromSuperlayer() }
         }
@@ -460,6 +477,10 @@ enum PresetEdit: Equatable {
     /// What a thickness of `points` means: a slot's own width selects that slot, anything else resizes the selected
     /// slot (to 0.1 pt). nil when nothing changes.
     static func width(_ points: Double, in p: ToolPresets) -> PresetEdit? {
+        // An unchanged stored width (including hundredths) must never become a write on appearance/reload.
+        if let i = p.widths.firstIndex(where: { abs($0 - points) < 1e-9 }) {
+            return i == p.selectedWidth ? nil : .selectWidth(i)
+        }
         let w = (points * 10).rounded() / 10
         if let i = p.widths.firstIndex(where: { abs($0 - w) < 0.01 }) {
             return i == p.selectedWidth ? nil : .selectWidth(i)
@@ -491,6 +512,12 @@ extension RGBA {
 // MARK: - Settings popover
 
 enum HighlighterColourSelection {
+    static func customBinding(presets: ToolPresets, edit: @escaping (PresetEdit) -> Void) -> Binding<Color> {
+        Binding(get: { Color(uiColor: presets.color.uiColor) }, set: { colour in
+            edit(.setColour(index: presets.selectedSwatch, color: RGBA(UIColor(colour)).asHighlighter))
+        })
+    }
+
     static func id(for colour: RGBA) -> String? {
         NibHighlighter.allCases.first { $0.rgba.r == colour.r && $0.rgba.g == colour.g && $0.rgba.b == colour.b }?.rawValue
     }
@@ -567,9 +594,7 @@ struct HighlighterSettingsView: View {
     }
 
     private var customColour: Binding<Color> {
-        Binding(get: { Color(uiColor: presets.color.uiColor) }, set: { colour in
-            edit(.setColour(index: presets.selectedSwatch, color: RGBA(UIColor(colour)).asHighlighter))
-        })
+        HighlighterColourSelection.customBinding(presets: presets, edit: edit)
     }
 
     private var widthRange: ClosedRange<Double> {
@@ -625,54 +650,6 @@ struct HighlighterSettingsView: View {
             drawAndHold = s.get(HighlighterSettings.drawAndHold)
         default:
             break
-        }
-    }
-}
-
-/// The system colour picker (grid, spectrum, sliders, hex, eyedropper) for a custom highlighter colour.
-struct SystemColourPicker: UIViewControllerRepresentable {
-    let initial: UIColor
-    let onPick: (UIColor) -> Void
-    let onDone: () -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-
-    func makeUIViewController(context: Context) -> UIColorPickerViewController {
-        let picker = UIColorPickerViewController()
-        picker.selectedColor = initial
-        picker.supportsAlpha = false                           // highlighters keep the preset translucency
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ picker: UIColorPickerViewController, context: Context) {
-        context.coordinator.parent = self
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, UIColorPickerViewControllerDelegate {
-        var parent: SystemColourPicker
-        private var last: UIColor?
-
-        init(_ parent: SystemColourPicker) {
-            self.parent = parent
-        }
-
-        func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor,
-                                       continuously: Bool) {
-            guard !continuously else { return }                // one command per choice, not per drag frame
-            pick(color)
-        }
-
-        func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
-            pick(viewController.selectedColor)
-            parent.onDone()
-        }
-
-        private func pick(_ color: UIColor) {
-            guard last != color else { return }
-            last = color
-            parent.onPick(color)
         }
     }
 }

@@ -375,6 +375,11 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
         controller?.pageDidSettle(page)
     }
 
+    func pageTileViewDidRender(_ view: PageTileView) {
+        guard let page = view.pageID else { return }
+        controller?.pageDidRender(page)
+    }
+
     func pageTileView(_ view: PageTileView, didFailWith error: Error) {
         // No renderer installed (a stripped-down build): the pages show their paper, which is not a failure.
         guard let page = view.pageID, NibError.wrap(error).code != .unavailable else { return }

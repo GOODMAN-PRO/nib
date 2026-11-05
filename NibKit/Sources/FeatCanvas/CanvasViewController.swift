@@ -81,6 +81,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private var notificationObservers: [NSObjectProtocol] = []
     private var paperCache: [String: UIColor] = [:]
     private(set) var failedPages: Set<PageID> = []
+    private var failureReasons: [PageID: String] = [:]
     private var loadingTask: Task<Void, Never>?
     private var sessionFlushScheduled = false
     private var hudLingerTask: Task<Void, Never>?
@@ -231,6 +232,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// when the editor leaves its container or the document closes; showing it again re-opens it.
     func closeCanvas() {
         guard !isClosed else { return }
+        if pinchStartZoom != nil {
+            pinchStartZoom = nil
+            pinchAnchor = nil
+            scrollView.panGestureRecognizer.isEnabled = pinchPanWasEnabled
+            scrollViewDidEndZooming(scrollView, with: scrollView.contentView, atScale: scrollView.zoomScale)
+        }
         isClosed = true
         host.inputController?.canvasWillClose(host)
         host.inputController = nil
@@ -249,6 +256,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         notificationObservers.removeAll()
         loadingTask?.cancel()
         hudLingerTask?.cancel()
+        hud.setPinching(false)
         scrollView.recycleAll()
         if session.editor === self { session.editor = nil }
         app.ui.setNeedsChromeUpdate(session)
@@ -769,15 +777,19 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func reloadAll() {
+        let oldPages = livePages
+        let anchor = didInitialLayout ? centreAnchor() : nil
         loadModel()
+        selectNeighbourIfNeeded(oldPages: oldPages)
         boardContentStale = true
         boardBoundsPage = nil
         paperCache.removeAll()
         failedPages.removeAll()
+        failureReasons.removeAll()
         guard isViewLoaded, didInitialLayout else { return }
-        let anchor = centreAnchor()
         scrollView.recycleAll()
-        relayout(anchor: anchor, initial: false)
+        let survivingAnchor = anchor.flatMap { a in livePages.contains { $0.id == a.page } ? a : nil }
+        relayout(anchor: survivingAnchor, initial: survivingAnchor == nil)
     }
 
     /// Pans by page points (or fractions of the window). A paged window turns the page for a window-sized step.
@@ -907,6 +919,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // MARK: Commits
 
+    private func selectNeighbourIfNeeded(oldPages: [PageRecord]) {
+        guard let page = session.page, !livePages.contains(where: { $0.id == page }), !livePages.isEmpty else { return }
+        let old = oldPages.firstIndex { $0.id == page } ?? 0
+        setSessionPage(livePages[min(old, livePages.count - 1)].id)
+    }
+
     private func committed(_ cs: Changeset) {
         guard !isClosed, cs.documents.contains(documentID) else { return }
         updateBoardBounds(cs)
@@ -918,14 +936,11 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             let geometry = livePages.map { $0.id } != oldPages.map { $0.id } || livePages.map { $0.size } != oldPages.map { $0.size }
                 || direction != oldDirection
             if geometry || !livePages.contains(where: { $0.id == session.page }) {
-                if let p = session.page, !livePages.contains(where: { $0.id == p }), !livePages.isEmpty {
-                    // The current page went away: show its neighbour.
-                    let old = oldPages.firstIndex { $0.id == p } ?? 0
-                    setSessionPage(livePages[min(old, livePages.count - 1)].id)
-                }
+                selectNeighbourIfNeeded(oldPages: oldPages)
                 if isViewLoaded && didInitialLayout {
                     let switched = mode(for: currentPage) != mode
-                    relayout(anchor: switched ? nil : anchor, initial: switched)
+                    let survivingAnchor = anchor.flatMap { a in livePages.contains { $0.id == a.page } ? a : nil }
+                    relayout(anchor: switched ? nil : survivingAnchor, initial: switched || survivingAnchor == nil)
                 }
             } else {
                 var redrawn: [PageID] = []
@@ -1368,14 +1383,22 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         refreshForReplayIfIdle()
     }
 
-    func pageDidFail(_ page: PageID) {
+    func pageDidRender(_ page: PageID) {
+        guard failedPages.remove(page) != nil else { return }
+        failureReasons.removeValue(forKey: page)
+        layoutFixedViews()
+    }
+
+    func pageDidFail(_ page: PageID, reason: String = String(localized: "The page renderer could not finish drawing this page.")) {
         failedPages.insert(page)
+        failureReasons[page] = reason
         layoutFixedViews()
     }
 
     private func retryFailedPages() {
         let pages = failedPages
         failedPages.removeAll()
+        failureReasons.removeAll()
         for p in pages { scrollView.pageViews[p]?.retry() }
         layoutFixedViews()
     }
@@ -1559,10 +1582,11 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         }
         if let page = displayedPage, failedPages.contains(page), let f = host.pageFrame(page) {
             errorView.showsRestore = canRestoreFromBackup
+            errorView.reason = failureReasons[page] ?? String(localized: "The page renderer could not finish drawing this page.")
             let visible = scrollView.convert(f, to: fixedOverlay).intersection(b)
             // The failure state replaces the visible paper, including stale tiles and attachments beneath it.
-            errorView.frame = visible.isNull ? b : visible
-            errorView.isHidden = false
+            errorView.frame = visible.isNull ? .zero : visible
+            errorView.isHidden = visible.isNull || visible.isEmpty
             fixedOverlay.bringSubviewToFront(scrubber)
         } else {
             errorView.isHidden = true
@@ -1989,6 +2013,9 @@ final class AddPageIndicatorView: UIView {
 final class PageErrorView: UIView {
     var onRetry: (() -> Void)?
     var onRestore: (() -> Void)?
+    var reason = String(localized: "The page renderer could not finish drawing this page.") {
+        didSet { if reason != oldValue { update() } }
+    }
     /// Shows Restore from Backup (the canvas sets it when the Cloud & Backup panel is registered).
     var showsRestore = false {
         didSet { if showsRestore != oldValue { update() } }
@@ -2004,6 +2031,7 @@ final class PageErrorView: UIView {
         super.init(frame: frame)
         backgroundColor = NibUIColor.background
         isOpaque = true
+        clipsToBounds = true
         hosting.view.backgroundColor = .clear
         // Placed by the canvas, clear of the chrome already: no safe-area padding of its own.
         hosting.safeAreaRegions = []
@@ -2032,7 +2060,7 @@ final class PageErrorView: UIView {
             ? NibAction(String(localized: "Restore from Backup")) { [weak self] in self?.onRestore?() } : nil
         actions = [retry] + (restore.map { [$0] } ?? [])
         hosting.rootView = NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."),
-                                         primary: retry, secondary: restore)
+                                         message: reason, primary: retry, secondary: restore)
         setNeedsLayout()
     }
 

@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatHighlighter
@@ -140,6 +141,24 @@ final class FeatHighlighterTests: XCTestCase {
         XCTAssertEqual(RGBA(0x12, 0x34, 0x56).asHighlighter, RGBA(0x12, 0x34, 0x56, RGBA.highlighterAlpha))
     }
 
+    func testOpeningSettingsDoesNotRoundAStoredThickness() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        var presets = h.app.settings.get(HighlighterSettings.presets)
+        presets.widths = [9.87, 14, 20]
+        presets.selectedWidth = 0
+        h.app.settings.set(HighlighterSettings.presets, presets)
+        let roundTrip = HighlighterUnits.points(HighlighterUnits.millimetres(presets.width))
+        XCTAssertNil(PresetEdit.width(roundTrip, in: presets))
+        let controller = UIHostingController(rootView: HighlighterSettingsView(app: h.app, session: h.session))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        controller.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(h.app.settings.get(HighlighterSettings.presets), presets)
+    }
+
     func testDesignWidthsReachFinishedStrokesWithoutChangingTools() async throws {
         let h = Harness(features: [FeatHighlighterFeature.self])
         let host = FakeCanvasHost(h)
@@ -173,18 +192,13 @@ final class FeatHighlighterTests: XCTestCase {
         var presets = h.app.settings.get(HighlighterSettings.presets)
         let expected = RGBA(0x12, 0xA4, 0xC8, RGBA.highlighterAlpha)
         var picks = 0
-        var finished = false
-        let picker = SystemColourPicker(initial: presets.color.uiColor, onPick: { colour in
+        let binding = HighlighterColourSelection.customBinding(presets: presets) { edit in
             picks += 1
-            PresetEdit.setColour(index: presets.selectedSwatch, color: RGBA(colour).asHighlighter).apply(to: &presets)
-        }, onDone: { finished = true })
-        let coordinator = picker.makeCoordinator()
-        let controller = UIColorPickerViewController()
-        controller.selectedColor = RGBA(expected.r, expected.g, expected.b).uiColor
-        coordinator.colorPickerViewController(controller, didSelect: controller.selectedColor, continuously: false)
-        coordinator.colorPickerViewControllerDidFinish(controller)
-        XCTAssertEqual(picks, 1, "Closing the system picker must not duplicate its final selection")
-        XCTAssertTrue(finished)
+            edit.apply(to: &presets)
+        }
+        // This is the binding passed to the production NibCustomColourPicker.
+        binding.wrappedValue = Color(uiColor: RGBA(expected.r, expected.g, expected.b).uiColor)
+        XCTAssertEqual(picks, 1)
         XCTAssertEqual(presets.color, expected)
         try await h.run(CommandIDs.settingsSet, ["name": .string(HighlighterSettings.presets.name),
                                                 "value": try JSONValue.from(presets)])
@@ -445,12 +459,101 @@ final class FeatHighlighterTests: XCTestCase {
         }
         defer { subscription.cancel() }
         XCTAssertTrue(tool.strokeHeld(stroke, page: Fixtures.page1, host: host))
-        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(110, 100)), host: host)
+        tool.touchesMoved([
+            CanvasSample(page: Fixtures.page1, location: Point(120, 110), force: 0.2, timestamp: 1),
+            CanvasSample(page: Fixtures.page1, location: Point(130, 120), force: 0.7, timestamp: 1.1),
+            CanvasSample(page: Fixtures.page1, location: Point(140, 110), timestamp: 1.2),
+            CanvasSample(page: Fixtures.page1, location: Point(999, 999), isPredicted: true)
+        ], host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(150, 100), timestamp: 1.3), host: host)
         for _ in 0..<200 where host.committed.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
-        XCTAssertEqual(host.committed.first?.stroke, stroke)
+        let kept = try XCTUnwrap(host.committed.first?.stroke)
+        XCTAssertEqual(kept.style, stroke.style)
+        XCTAssertEqual(kept.t0, stroke.t0)
+        XCTAssertEqual(kept.tapeRevealed, stroke.tapeRevealed)
+        XCTAssertEqual(Array(kept.points.prefix(stroke.points.count)), stroke.points)
+        XCTAssertEqual(Array(kept.polyline.suffix(4)), [Point(120, 110), Point(130, 120), Point(140, 110), Point(150, 100)])
+        XCTAssertEqual(kept.points.count, stroke.points.count + 4)
+        XCTAssertEqual(kept.points[stroke.points.count].force, 0.2, accuracy: 0.001)
+        XCTAssertTrue(kept.points.suffix(4).allSatisfy { $0.width > 0 && $0.height > 0 })
+        XCTAssertEqual(try XCTUnwrap(kept.points.last).t, try XCTUnwrap(stroke.points.last).t + 0.3, accuracy: 0.001)
         XCTAssertEqual(host.committed.count, 1)
         XCTAssertEqual(host.renderWaits, [Fixtures.page1], "the preview stays until the kept stroke has rendered")
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+
+    func testFailedShapeCreationKeepsSamplesDrawnAfterRecognition() async throws {
+        final class Box { var snapped = false; var creates = 0 }
+        let box = Box()
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise",
+            summary: "Recognised line.", effect: .read)) { _, _ in
+            try JSONValue.parse(#"{"shape":"line","points":[[10,10],[110,10]]}"#)
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeCreate, title: "Shape",
+            summary: "Failing shape commit.", effect: .edit)) { _, _ in
+            box.creates += 1
+            throw NibError(.internalError, "Could not save shape")
+        }
+        let subscription = h.app.events.subscribe { event in
+            if event.decode(ShapeSnappedPayload.self) != nil { box.snapped = true }
+        }
+        defer { subscription.cancel() }
+        let host = FakeCanvasHost(h)
+        let tool = HighlighterTool()
+        let stroke = Stroke(style: .defaultHighlighter, points: points([(10, 10), (60, 13), (110, 10)]), t0: 0)
+        XCTAssertTrue(tool.strokeHeld(stroke, page: Fixtures.page1, host: host))
+        for _ in 0..<200 where !box.snapped { try await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertTrue(box.snapped, "Movement must happen after recognition")
+        tool.touchesMoved([
+            CanvasSample(page: Fixtures.page1, location: Point(120, 20), force: 0.2, timestamp: 1),
+            CanvasSample(page: Fixtures.page1, location: Point(130, 30), force: 0.7, timestamp: 1.1),
+            CanvasSample(page: Fixtures.page1, location: Point(999, 999), isPredicted: true)
+        ], host: host)
+        let end = Point(140, 40)
+        let convertedEnd = try XCTUnwrap(host.convert(end, from: Fixtures.page2, to: Fixtures.page1))
+        tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: end, timestamp: 1.2), host: host)
+        for _ in 0..<200 where host.committed.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+        let kept = try XCTUnwrap(host.committed.first?.stroke)
+        XCTAssertEqual(box.creates, 1)
+        XCTAssertEqual(host.committed.count, 1)
+        XCTAssertEqual(kept.style, stroke.style)
+        XCTAssertEqual(kept.t0, stroke.t0)
+        XCTAssertEqual(Array(kept.points.prefix(stroke.points.count)), stroke.points)
+        XCTAssertEqual(kept.points.count, stroke.points.count + 3, "Predicted samples are never saved")
+        XCTAssertEqual(Array(kept.polyline.suffix(3).prefix(2)), [Point(120, 20), Point(130, 30)])
+        let keptEnd = try XCTUnwrap(kept.polyline.last)
+        XCTAssertEqual(keptEnd.x, convertedEnd.x, accuracy: 0.001)
+        XCTAssertEqual(keptEnd.y, convertedEnd.y, accuracy: 0.001)
+        XCTAssertEqual(kept.points[stroke.points.count].force, 0.2, accuracy: 0.001)
+        XCTAssertTrue(kept.points.suffix(3).allSatisfy { $0.width > 0 && $0.height > 0 })
+        XCTAssertEqual(try XCTUnwrap(kept.points.last).t, try XCTUnwrap(stroke.points.last).t + 0.2, accuracy: 0.001)
+        XCTAssertEqual(host.renderWaits, [Fixtures.page1])
+        XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+
+    func testFailedHeldInkCommitKeepsPreviewAndReportsError() async throws {
+        let h = Harness(features: [FeatHighlighterFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise",
+            summary: "No match.", effect: .read)) { _, _ in .null }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeCreate, title: "Shape",
+            summary: "Shape stand-in.", effect: .edit)) { _, _ in .null }
+        let host = ControlledInkHost(h)
+        let tool = HighlighterTool()
+        let notice = expectation(description: "failed held ink")
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: .main) { note in
+            XCTAssertEqual(note.userInfo?["command"] as? String, CommandIDs.inkAddStrokes)
+            notice.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        XCTAssertTrue(tool.strokeHeld(Stroke(style: .defaultHighlighter, points: wobbly), page: Fixtures.page1, host: host))
+        tool.touchesCancelled(host: host)
+        XCTAssertNotNil(host.pending)
+        host.finish(.failure(NibError(.internalError, "Could not save ink")))
+        await fulfillment(of: [notice], timeout: 5)
+        XCTAssertEqual(host.base.committed.count, 1)
+        XCTAssertTrue(host.base.renderWaits.isEmpty)
+        XCTAssertEqual(host.overlayLayer.sublayers?.count, 1)
     }
 
     func testCancellingAHoldKeepsTheStrokeAsDrawn() {
@@ -466,5 +569,40 @@ final class FeatHighlighterTests: XCTestCase {
         tool.touchesCancelled(host: host)
         XCTAssertEqual(host.committed.map(\.stroke), [stroke])
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+}
+
+/// A delayed ink commit with an immediate render fence, exposing premature preview retirement.
+@MainActor
+private final class ControlledInkHost: CanvasHost {
+    let base: FakeCanvasHost
+    var pending: (@MainActor (Result<ElementID?, NibError>) -> Void)?
+    init(_ h: Harness) { base = FakeCanvasHost(h) }
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { base.canvasView }
+    var overlayLayer: CALayer { base.overlayLayer }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ p: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(p) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { commitStroke(stroke, page: page) { _ in } }
+    func commitStroke(_ stroke: Stroke, page: PageID,
+                      completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        base.commitStroke(stroke, page: page)
+        pending = completion
+    }
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        base.afterNextRender(page: page, body)
+    }
+    func finish(_ result: Result<ElementID?, NibError>) {
+        let completion = pending
+        pending = nil
+        completion?(result)
     }
 }
