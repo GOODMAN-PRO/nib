@@ -342,20 +342,17 @@ struct EraserFilterChips: View {
     @ObservedObject var model: EraserOptions
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
+        ScrollView(.horizontal) {
             HStack(spacing: NibSpacing.s) { chips(InkTool.allCases) }
-            VStack(alignment: .leading, spacing: NibSpacing.s) {
-                HStack(spacing: NibSpacing.s) { chips(Array(InkTool.allCases.prefix(2))) }
-                HStack(spacing: NibSpacing.s) { chips(Array(InkTool.allCases.dropFirst(2))) }
-            }
         }
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     private func chips(_ tools: [InkTool]) -> some View {
         ForEach(tools, id: \.self) { tool in
             let on = model.filter.contains(tool)
-            // A checkmark carries the on state too: never shade alone.
-            NibChip(tool.eraserFilterTitle, symbol: on ? NibSymbol.checkmark : nil, style: .filter(isSelected: on),
+            // The filter style supplies its own selected checkmark.
+            NibChip(tool.eraserFilterTitle, style: .filter(isSelected: on),
                     action: { model.toggle(tool) })
                 .accessibilityAddTraits(on ? .isSelected : [])
                 .accessibilityHint(String(localized: "Chooses whether the eraser erases this ink."))
