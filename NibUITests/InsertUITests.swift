@@ -789,8 +789,15 @@ final class InsertUITests: XCTestCase {
         try ui.tapCommand("edit.undo")
         XCTAssertEqual((try item("connector")["bends"] as? [JSON])?.count, 1)
     }
-    private func settingsButton(_ name: String) throws {
-        try ui.requireControl(name, type: .button, scroll: true, timeout: 8).tap()
+    private func settingsControl(_ name: String, scroll: Bool = true,
+                                 timeout: TimeInterval = 8) throws -> XCUIElement {
+        // Settings navigation can expose buttons, cells or their static text. Keep the cheap typed hit,
+        // but let the original untyped lookup perform reveal/polling immediately when that query misses.
+        let target: XCUIElement
+        if let button = ui.findControl(name, type: .button) { target = button }
+        else { target = try ui.requireControl(name, scroll: scroll, timeout: timeout) }
+        guard target.isEnabled else { throw NibUI.Failure.message("Insert Settings control is disabled: " + name) }
+        return target
     }
     private func configureProvider() throws {
         let started = Date()
@@ -798,7 +805,8 @@ final class InsertUITests: XCTestCase {
         let state = try ui.state()
         provider = try InsertProviderFixture(page: "page:\(try XCTUnwrap(state.document))/\(try XCTUnwrap(state.page))")
         try wait("External fixture endpoint must start") { self.provider?.port != nil }
-        try ui.chord(",", .command) { _ = try self.ui.requireControl("Editing", type: .button) }; try settingsButton("AI"); try settingsButton("Add provider")
+        try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false, timeout: 3) }
+        try settingsControl("AI").tap(); try settingsControl("Add provider").tap()
         let preset = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Preset,")).firstMatch
         ui.revealFormElement(preset)
         try wait("Provider preset button must be available") { preset.exists && preset.isHittable }
@@ -811,7 +819,7 @@ final class InsertUITests: XCTestCase {
         try ui.nativeKey("s", in: lastField)
         let saved = ui.app.staticTexts["Provider saved."].firstMatch
         try wait("Provider save must complete") { saved.exists }
-        try ui.dismissSheets()
+        try ui.dismissSheets(requireClosedPopover: true)
     }
     func testNativeDiagramActionCreatesEditableNodesAndGroupedUndo() throws {
         try configureProvider(); try beginText("Make a flow diagram"); try finish(); try selectAt(target: canvasText("Make a flow diagram"))
@@ -821,7 +829,7 @@ final class InsertUITests: XCTestCase {
         try ui.focusField(composer); composer.typeText("Insert an editable flow diagram with Motion and Force, one connecting edge, classic style.")
         try tap("Send to assistant")
         try counts(before + 3)
-        try ui.dismissSheets(); try all(); let content = try items()
+        try ui.dismissSheets(requireClosedPopover: true); try all(); let content = try items()
         XCTAssertEqual(content.filter { $0["kind"] as? String == "connector" }.count, 1)
         XCTAssertEqual(content.filter { $0["kind"] as? String == "shape" }.count, 3)
         try ui.tapCommand("edit.undo"); try counts(before)
@@ -1021,7 +1029,7 @@ final class InsertUITests: XCTestCase {
         try elements(); try tap("Collection Options"); try tap("Export Collection")
         XCTAssertTrue(ui.app.otherElements["ActivityListView"].waitForExistence(timeout: 10) || query("Save to Files").firstMatch.exists,
                       "Export must produce a share sheet for the collection")
-        try ui.dismissSheets(); try elements(); try tap("Collection Options"); try tap("Import Collection")
+        try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("Collection Options"); try tap("Import Collection")
         try ui.cancelRemotePicker(.files); try counts(4)
         XCTAssertTrue(query("Stickers").firstMatch.exists)
     }
@@ -1049,7 +1057,7 @@ final class InsertUITests: XCTestCase {
         try filesLocation()
         try tap("Save")
         if visible("Replace") { try tap("Replace") }
-        try ui.dismissSheets(); try elements(); try tap("Collection Options"); try tap("Import Collection")
+        try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("Collection Options"); try tap("Import Collection")
         try filesLocation()
         let file = ui.app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Stickers'")).firstMatch
         let exportedFileExists = file.waitForExistence(timeout: 10)
@@ -1080,7 +1088,7 @@ final class InsertUITests: XCTestCase {
         let errorAppeared = errors.firstMatch.waitForExistence(timeout: 10)
         ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test", includeHierarchy: false)
         if !errorAppeared {
-            do { try ui.dismissSheets() }
+            do { try ui.dismissSheets(requireClosedPopover: true) }
             catch { ui.logQA("Invalid GIF dismissal diagnostic", String(describing: error)) }
             ui.recordDiagnostics("Invalid GIF after dismissal", includeHierarchy: true)
         }
@@ -1090,7 +1098,7 @@ final class InsertUITests: XCTestCase {
     }
     func testGIPHYKeySaveRemoveAndSearchRetryRetainsQuery() throws {
         try elements(); try tap("GIFs"); try tap("Open Settings")
-        if visible("Remove Key") { try tap("Remove Key") }
+        if visible("Remove Key") { try settingsControl("Remove Key").tap() }
         let form = ui.nativeFormContainer()
         try ui.requireControl("Show text", type: .button, in: form).tap()
         let keyField = form.textFields.matching(NSPredicate(format:
@@ -1099,12 +1107,13 @@ final class InsertUITests: XCTestCase {
         try ui.replaceNativeText(in: keyField, with: "nib-ui-invalid-test-key", container: form)
         try tap("Save Key")
         XCTAssertTrue(query("Remove Key").firstMatch.waitForExistence(timeout: 8))
-        try ui.dismissSheets(); try elements(); try tap("GIFs")
+        try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("GIFs")
         let search = try ui.fillNativeForm([("Search GIPHY", "physics")])
         search.typeText("\n")
         try tap("Try Again", scroll: true)
         XCTAssertEqual(search.value as? String, "physics")
-        outside(); try ui.chord(",", .command) { _ = try self.ui.requireControl("Editing", type: .button) }; try settingsButton("Elements and GIFs"); try settingsButton("Remove Key")
+        outside(); try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false, timeout: 3) }
+        try settingsControl("Elements and GIFs").tap(); try settingsControl("Remove Key").tap()
         XCTAssertTrue(query("Paste your GIPHY API key").firstMatch.waitForExistence(timeout: 8))
     }
 
@@ -1535,7 +1544,7 @@ final class InsertUITests: XCTestCase {
         let duration = row.value as? String
         try ui.nativeContextMenu(row, path: ["Share Audio File"])
         XCTAssertTrue(query("Save to Files").firstMatch.waitForExistence(timeout: 10), "Share must expose a real audio file")
-        try ui.dismissSheets(); try control("Motion lecture").tap(); try tap("Pause")
+        try ui.dismissSheets(requireClosedPopover: true); try control("Motion lecture").tap(); try tap("Pause")
         try ui.nativeContextMenu(try control("Motion lecture"), path: ["Delete Recording"]); try ui.cancelConfirmation(action: "Delete Recording")
         XCTAssertTrue(query("Playback position").firstMatch.exists)
         XCTAssertEqual(try control("Motion lecture").value as? String, duration)
@@ -1559,7 +1568,7 @@ final class InsertUITests: XCTestCase {
         for mode in ["Spotlight", "Reveal", "Static"] {
             try documentMenu("Replay Options"); try tap(mode)
             XCTAssertTrue(try control(mode).isSelected, "Replay mode must reflect the applied setting")
-            try ui.dismissSheets()
+            try ui.dismissSheets(requireClosedPopover: true)
             try ui.waitForMenuClosed(ui.app.buttons["Replay in Full Screen"].firstMatch, named: "Replay Options " + mode)
             rendered[mode] = try canvasPixels()
         }
@@ -1578,7 +1587,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(zoomed.zoom, min(0.5, originalZoom)); XCTAssertLessThanOrEqual(zoomed.zoom, 8)
     }
     func testAudioTimestampLinkSavesChosenRecordingAndTime() throws {
-        try recordClip(); try ui.dismissSheets(); try linkText(); try tap("Audio")
+        try recordClip(); try ui.dismissSheets(requireClosedPopover: true); try linkText(); try tap("Audio")
         let row = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Recording'")).firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 8)); row.tap()
         try tap("One second later"); try tap("Add Link"); try finish()
@@ -1593,8 +1602,9 @@ final class InsertUITests: XCTestCase {
 
     private func transcript() throws {
         try configureProvider()
-        try ui.chord(",", .command) { _ = try self.control("Editing") }; try tap("Recording Settings", scroll: true); try toggle("Cloud transcription", to: true)
-        try ui.dismissSheets()
+        try ui.chord(",", .command) { _ = try self.settingsControl("Editing", scroll: false) }
+        try settingsControl("Recording Settings").tap(); try toggle("Cloud transcription", to: true)
+        try ui.dismissSheets(requireClosedPopover: true)
         try recordClip(); try documentMenu("Transcript")
         _ = try ui.waitForState(timeout: 8) { $0.openPanels.contains("transcription") }
     }

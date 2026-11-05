@@ -130,10 +130,14 @@ final class ChromeUITests: XCTestCase {
     }
     private func menu(_ id: String, _ action: String) throws {
         try openMenu(id)
-        let menus = ui.app.scrollViews.containing(.button, identifier: action).allElementsBoundByIndex
+        let menus = ui.app.scrollViews.containing(NSPredicate(
+            format: "identifier == %@ OR label == %@", action, action)).allElementsBoundByIndex
         let surface = try XCTUnwrap(menus.first { $0.identifier != "nib.canvas" && $0.isHittable },
                                     "The droplet menu must contain its action: " + action)
-        try tap(action)
+        let row = try ui.requireControl(action, type: .button, scroll: true, timeout: 8, in: surface)
+        guard row.isEnabled else { throw NibUI.Failure.message("Chrome menu row disabled: " + action) }
+        row.tap()
+        // ChromeMenuList invokes row.action; the descriptor wrapper clears openMenu before chrome.run.
         try ui.waitForMenuClosed(surface, named: id + " after " + action)
     }
     private func more(_ action: String) throws {
@@ -203,7 +207,7 @@ final class ChromeUITests: XCTestCase {
         try panel("chrome.editingSettings")
         try tap(page)
     }
-    private func closeEditing() throws { try ui.dismissSheets(); try panel("chrome.editingSettings", shown: false) }
+    private func closeEditing() throws { try ui.dismissSheets(requireClosedPopover: true); try panel("chrome.editingSettings", shown: false) }
 
     // window.showLibrary; chrome.title; chrome.menus; chrome.compact
     func testBackToLibraryRetainsDocumentAndNewInk() throws {
@@ -241,11 +245,11 @@ final class ChromeUITests: XCTestCase {
         let english = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'English'")).firstMatch
         XCTAssertTrue(english.waitForExistence(timeout: 10)); let label = english.label; english.tap()
         try wait("Recognition language must save its selection") { english.isSelected }
-        try ui.dismissSheets()
+        try ui.dismissSheets(requireClosedPopover: true)
         try menu("title", "Recognition Language")
         XCTAssertTrue(ui.app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch.isSelected,
                       "Recognition language must retain the chosen English language")
-        try ui.dismissSheets(); try sameContent(before, history: false)
+        try ui.dismissSheets(requireClosedPopover: true); try sameContent(before, history: false)
     }
 
     func testTitleCollaboratorsOpensSharePanelAndCloses() throws {
@@ -253,7 +257,7 @@ final class ChromeUITests: XCTestCase {
         try menu("title", "Collaborators")
         _ = try ui.waitForState { !$0.openPanels.isEmpty }
         _ = try require("Share Live")
-        try ui.dismissSheets()
+        try ui.dismissSheets(requireClosedPopover: true)
         _ = try ui.waitForState { $0.openPanels.isEmpty }
         try sameContent(before)
     }
@@ -281,7 +285,7 @@ final class ChromeUITests: XCTestCase {
         }
         XCTAssertEqual(try reachable("Format", type: .button).value as? String, "PDF")
         XCTAssertTrue(try reachable("All").isSelected, "Export all must select every page")
-        try ui.dismissSheets()
+        try ui.dismissSheets(requireClosedPopover: true)
         try wait("Export options must close") { self.ui.findControl("Share & Export") == nil }
         try sameContent(before)
     }
@@ -307,7 +311,7 @@ final class ChromeUITests: XCTestCase {
                 throw error
             }
             try selectMoreRow("Go to Page…")
-            try panel("pages.goToPage"); try ui.dismissSheets()
+            try panel("pages.goToPage"); try ui.dismissSheets(requireClosedPopover: true)
             try more("Hide Tools")
             try wait("More Hide Tools must retract palette") { !self.query("tool.pen").firstMatch.exists }
             try more("Show Tools"); _ = try reachable("tool.pen")
@@ -1488,7 +1492,7 @@ final class ChromeUITests: XCTestCase {
     // chrome.status: details must open from the actual title-adjacent status, including after rotation.
     func testBridgeStatusPillOpensDetailsAndTurnOffHasEffect() throws {
         try tap("App Menu"); try tap("Settings"); try tap("Bridge")
-        try toggle("MCP bridge", to: true); try ui.dismissSheets(); try open()
+        try toggle("MCP bridge", to: true); try ui.dismissSheets(requireClosedPopover: true); try open()
         let before = try ui.state()
         for orientation in [UIDeviceOrientation.portrait, .landscapeLeft] {
             XCUIDevice.shared.orientation = orientation
@@ -1525,7 +1529,7 @@ final class ChromeUITests: XCTestCase {
         try menu("title", "Collaborators"); try tap("Start Live Session")
         let join = ui.app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Join code:'")).firstMatch
         XCTAssertTrue(join.waitForExistence(timeout: 20), "Starting a live session must produce a join code")
-        try ui.dismissSheets()
+        try ui.dismissSheets(requireClosedPopover: true)
         let presence = ui.app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Collaborators' OR label BEGINSWITH 'Live session'" )).firstMatch
         // Presence beads represent other participants (DESIGN §14.14), not the lone host.
         XCTAssertFalse(presence.exists, "Hosting alone must not invent collaborator presence")

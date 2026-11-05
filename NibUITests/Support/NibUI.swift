@@ -441,7 +441,7 @@ final class NibUI {
             origin.withOffset(CGVector(dx: start.x - appFrame.minX, dy: start.y - appFrame.minY))
                 .press(forDuration: 0.01, thenDragTo: origin.withOffset(
                     CGVector(dx: end.x - appFrame.minX, dy: end.y - appFrame.minY)),
-                       withVelocity: hasSlider(snapshot) || !lazySearch ? .slow : (homing ? .fast : .default), thenHoldForDuration: 0)
+                       withVelocity: lazySearch && homing && !hasSlider(snapshot) ? .fast : .slow, thenHoldForDuration: 0)
             moves += 1
             if homing { homeMoves += 1 }
             logQA("Form move timing", "move=\(moves) homing=\(homing) seconds=\(Date().timeIntervalSince(moveStarted))")
@@ -547,8 +547,10 @@ final class NibUI {
             abs($0 - preferredY) < abs($1 - preferredY)
         }
         let endY = down ? viewport.maxY - 24 : viewport.minY + 24
+        // Short popovers retain the original safe-start choices; taller lists still page efficiently.
+        let minimumTravel: CGFloat = viewport.height < 300 ? 24 : viewport.height * 0.5
         // First pass ignores x: every interactive frame must be at least 32pt away vertically.
-        for y in ys where abs(endY - y) >= viewport.height * 0.5 {
+        for y in ys where abs(endY - y) >= minimumTravel {
             let clearance = blocked.map { max($0.1.minY - y, y - $0.1.maxY) }.min() ?? viewport.height
             if clearance >= 32 {
                 let point = CGPoint(x: viewport.midX, y: y)
@@ -558,7 +560,7 @@ final class NibUI {
         }
         // Second pass: any row that is 40pt away from every slider and 12pt away from the other holding
         // controls, which in practice is a row of plain buttons or captions.
-        for y in ys where abs(endY - y) >= viewport.height * 0.5 {
+        for y in ys where abs(endY - y) >= minimumTravel {
             let sliderMargin = verticalMargin(sliders, y)
             let holdingMargin = verticalMargin(holding, y)
             if sliderMargin >= 40, holdingMargin >= 12 {
@@ -2604,14 +2606,18 @@ final class NibUI {
         return true
     }
 
-    func dismissSheets() throws {
+    /// Only callers requiring a closed popover opt into the round-10 closure postconditions.
+    func dismissSheets(requireClosedPopover: Bool = false) throws {
         // Modal form sheets are plain containers in the accessibility tree (only confirmation dialogs are
         // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
         // close button counts only until something else was dismissed: after Audio's share sheet closes,
         // the loop must not go on to close the Audio panel behind it (D:controls-forms#9).
         var dismissedSurface = false
         for _ in 0..<8 {
-            if try dismissPresentedPopover() { dismissedSurface = true; continue }
+            if requireClosedPopover, try dismissPresentedPopover() {
+                dismissedSurface = true
+                continue
+            }
             var close: XCUIElement?
             for id in ["sheet.dismiss", "cmd.panel.close", "Cancel", "Done", "Close", "Close export options"] {
                 if dismissedSurface, id == "cmd.panel.close" { continue }
@@ -2624,6 +2630,26 @@ final class NibUI {
             }
             if let sheet = app.sheets.allElementsBoundByIndex.first(where: { hasVisibleFrame($0) && $0.isHittable }) {
                 sheet.swipeDown(); continue
+            }
+            if !requireClosedPopover {
+                // A settings bud is not a native popover. Preserve the historical return for shared
+                // callers without adding eight-second waits or making probe availability a requirement.
+                do {
+                    if let settings = try readState()?.toolSettingsOpen {
+                        logQA("Popover closure advisory", "dismissSheets returning with toolSettingsOpen=\(settings)")
+                    }
+                } catch { logQA("Popover closure advisory", "probe unavailable: " + String(describing: error)) }
+                if hasVisibleFrame(app.otherElements["PopoverDismissRegion"].firstMatch)
+                    || app.popovers.allElementsBoundByIndex.contains(where: { hasVisibleFrame($0) }) {
+                    logQA("Popover closure advisory", "dismissSheets returning with a native popover or dismissal region")
+                }
+                for title in ["More", "More tools"] {
+                    let menu = app.scrollViews[title].firstMatch
+                    if menuHasActiveContent(menu) {
+                        logQA("Popover closure advisory", "dismissSheets returning with active " + title)
+                    }
+                }
+                return
             }
             if let settings = try readState()?.toolSettingsOpen {
                 logQA("Popover closure pending", "toolSettingsOpen=\(settings)")

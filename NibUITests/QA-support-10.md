@@ -320,3 +320,51 @@ These corrections supersede round 1's fixed-point fallback for unavailable item 
 | Successful selection/re-edit | Insert settled item | Which current visible item frame and content offset produced the tap? |
 
 Source review covered Swift optional comparisons, CGRect arrays and coordinate conversion, closure captures, typed field queries, helper access/signatures, and all callers of the changed helpers. No test declarations, assertions, allowances, sleeps or skips changed. Required checks: `python Scripts/lint.py` **0 errors, 25 warnings**; `git diff --check` passes. No Swift compiler or simulator is available here; compilation, revealed-field AX typing, item-frame availability and the shared dismissal risks still require macOS CI. No measured runtime improvement is claimed. One new review commit with the requested attribution; no amendment or push.
+
+## Round 10c
+
+Base: f067280, work/ui-round-10, 2026-11-06. Read both job prompts, Round 9/10 notes, the four current reviewer findings and current app/helper sources. These corrections supersede the earlier decision to retain strict shared dismissal, the default-velocity lazy scan and the unconditional half-viewport start bound. Only NibUITests changes.
+
+### 1. Chrome menu identity and closure audit
+
+`ChromeMenuList.rowStack` in `NibKit/Sources/FeatDocChrome/NavBar.swift` builds a Button whose label is the title and whose identifier is `cmd.` plus the command (or row.id). `menu()` now finds the non-canvas, hittable ScrollView with an identifier-OR-label predicate, then resolves the enabled button in that surface. This removes the title-as-identifier miss and prevents an app-wide same-title tap. The existing strict closure wait remains.
+
+All **14 calls in 11 tests** below run descriptor rows. `DocumentContainerViewController.menuRows` maps each descriptor through `row(_:section:context:)`; its action sets **openMenu = nil before chrome.run(item)**. `ChromeWindow.run(_ item:)` resolves parameters and dispatches the command through tap. `ChromePopovers` binds presentation to openMenu and builds row content only while that menu is selected. More's overflow Add Page entries are flattened into sections through the same row wrapper, not a submenu navigation action. Therefore every listed row closes its original droplet even when its command opens a successor sheet. No current caller needs an exemption from the closing wait. Start Live Session is a later tap in Share Live, not an argument to menu().
+
+| Caller (test name without `test`) | menu arguments / count | What closes the droplet; subsequent command |
+| --- | --- | --- |
+| TitleRenameChangesLibraryTitleAndKeepsDocumentIdentity | title, Rename (1) | row wrapper clears openMenu; panel.open chrome.rename |
+| TitleMoveActuallyMovesNoteAndPreservesContent | title, Move to Folder (1) | same wrapper; panel.open chrome.move |
+| TitleRecognitionLanguageAppliesAndReopens | title, Recognition Language (2) | same wrapper; panel.open convert.language |
+| TitleCollaboratorsOpensSharePanelAndCloses | title, Collaborators (1) | same wrapper; panel.open collab.share |
+| AddPageMenuAddsExactlyOnePageAndUndoRedo | addPage, Current Template (1) | same wrapper in Add Page or More overflow; page.add with current-template parameters |
+| ShareExportOpensCorrectSheetAndCancelIsInert | share, Export all… (1) | same wrapper; export.present with scope all |
+| SheetDismissAndEscapeDoNotRenameDocument | title, Rename (2) | same wrapper; panel.open chrome.rename |
+| TitleCloseOtherTabsKeepsChosenDocumentWithoutDeletingOthers | title, Close Other Tabs (1) | same wrapper; tab.closeOthers |
+| ReadOnlyButtonBlocksInkAndTitleEditRestoresTools | title, Edit (1) | same wrapper; view.setReadOnly with on false |
+| PDFCopyPastesSelectedTextIntoRenameField | title, Rename (1) | same wrapper; panel.open chrome.rename |
+| PresenceDoesNotInventPeersAndTitleDetailsRetainLiveSession | title, Collaborators (2) | same wrapper; panel.open collab.share |
+
+Checked descriptors in FeatDocChromeFeature, FeatConvertTextFeature, FeatCollabFeature, AddPageMenu, FeatExportUIFeature and FeatReadOnlyFeature (the latter suppresses its duplicate Edit entry when Chrome supplies one). CI must reach the original rename/move/language/collaboration/page/export/tab/read-only/PDF/presence assertions and observe closure before subsequent input.
+
+### 2. Opt-in strict popover dismissal
+
+`dismissSheets(requireClosedPopover: false)` preserves the pre-round-10 close-button/sheet loop. The default path does not run the new native-popover dismissal transaction or the eight-second settings/More/More tools closure waits. At the old return point it logs surviving settings, native surfaces/dismissal regions and active bud rows with `Popover closure advisory`, then returns. A missing or undecodable probe is also log-only. The pre-existing eight-iteration failure for sheets that cannot dismiss remains. All eight Chrome and ten Insert call sites explicitly pass true, retaining H4/I8 native-popover geometry checks, strict closure waits and Audio panel ordering. Other classes acquire no new throw or closure timeout.
+
+Re-read every dismissal caller found by grep: Canvas pencil-only input; Capture document-tabs setup; Ink closePreferences; Library external Files-drop export; Selection comment creation, Layers, alignment/snapping and both AI setup/result dismissals. Their existing argument-free calls use the compatible default. Chrome closeEditing, language (twice), collaboration, export, rotated Go to Page, Bridge and presence opt in. Insert provider, AI result, both collection exports, invalid-GIF failure diagnostics, GIPHY, Audio export, Replay modes, timestamp-link setup and transcript opt in. No class outside Chrome/Insert opts in.
+
+### 3. Small viewport and scan gesture compatibility
+
+The row-gap and plain-row passes of formDragStart use the original **24pt** minimum when the clipped viewport height is below **300pt**, retaining the half-viewport minimum for taller lists. Slider/holding-control clearance and leading-inset rules are unchanged. Lazy scan gestures now use `.slow`; `.fast` is restricted to lazy edge homing without sliders. Existing targets and slider-bearing forms remain slow. No sleep or gesture hold was added; six homing moves and sixteen total moves remain the bounds.
+
+Re-read the sole formDragStart call inside revealFormElement, both reveal overloads and all direct class callers: Create Calendar summaries; Ink Squeeze heading/scoped row, switch reveal and Pencil preferences; Library's wrapper and its folder-name, favourite (twice), hex, emoji and About version uses; Pages button fallback; Insert/Selection provider presets. Also checked shared requireControl, setSwitch and focusField reveal paths, including the class-level wrappers in Canvas, Capture, Chrome, Ink, Insert and Selection, and Chrome's scoped menu/Time Keeper calls. Target re-querying, ancestor/window/keyboard clipping, value checks, transient-surface failure handling and ordinary-form fallback are unchanged. CI must show short popovers finding safe starts and one-way scans observing target rows without coasting past them, while retaining every caller's original outcomes.
+
+### 4. Settings typed lookup with fallback
+
+Replaced Insert's button-only settingsButton with one settingsControl helper. It first tries findControl with `.button`; a miss immediately uses the existing untyped requireControl, including lazy reveal and bounded readiness, rather than spending a typed-only timeout. Both paths require an enabled control. Every helper caller was reviewed: configureProvider (Editing chord check, AI, Add provider), GIPHY (both Remove Key actions, Editing chord check, Elements and GIFs) and transcript (Editing chord check, Recording Settings). The two existing three-second chord postconditions retain that budget; transcript retains its prior eight seconds. All row reveals retain eight seconds. Show text stays typed because the current secure-field implementation establishes that it is a button; exact revealed-key verification and all save/remove/search/retry assertions remain.
+
+### Validation and remaining runtime evidence
+
+`python Scripts/lint.py`: **0 errors, 25 warnings**. `git diff --check`: clean. Python comparison against f067280 confirms unchanged test declarations, XCTAssert lines, execution allowances and sleep/skip inventory in all three edited Swift files; only NibUITests paths changed. Re-read changed Swift blocks and all callers above for API signatures, throwing closures, predicate placeholder counts, optional state reads, CGFloat inference and gesture velocity types. No new XCTest API is introduced: containing(NSPredicate), scoped requireControl and the slow/fast gesture overload already exist in this target. Default argument and explicit opt-in labels match every call; native-state errors cannot escape the advisory path.
+
+No Swift toolchain, Objective-C compiler or simulator is available on Windows. Compilation and runtime accessibility/gesture timing remain for GitHub Actions: particularly label-based menu containment, successor-sheet transitions, short viewport safe starts, slow lazy scan coverage and Settings cells/static text fallback. No measured speedup is claimed; typed hits retain their query saving, while slow scans may cost more per move. All four review items are addressed; earlier app/CI-owned limitations remain as documented in Round 10b. One new commit with the requested two-line attribution, no amendment and no push.
