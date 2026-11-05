@@ -47,6 +47,32 @@ final class DocumentPickerLifecycleTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 2)
     }
 
+    func testTimedOutPresentationDismissesALateAttachmentWithOrWithoutCompletion() async {
+        for reportsCompletion in [false, true] {
+            let fixture = PickerWindow()
+            defer { fixture.close() }
+            let controller = LatePresentationController()
+            let rejected = expectation(description: "unattached controller times out")
+            let dismissed = expectation(description: "late attachment is dismissed")
+            controller.onDismiss = { dismissed.fulfill() }
+            var lateCompletion: (@MainActor () -> Void)?
+            let task = Task { @MainActor in
+                let shown = await ImportUI.present(controller, navigator: fixture.navigator,
+                    timeoutNanoseconds: 20_000_000) { _, _, completion in lateCompletion = completion }
+                XCTAssertFalse(shown)
+                rejected.fulfill()
+            }
+            defer { task.cancel() }
+            await fulfillment(of: [rejected], timeout: 2)
+            controller.presenter = fixture.root
+            if reportsCompletion { lateCompletion?() }
+            await fulfillment(of: [dismissed], timeout: 2)
+            lateCompletion?()
+            XCTAssertEqual(controller.dismissCalls, 1)
+            XCTAssertNil(controller.presentingViewController)
+        }
+    }
+
     func testClosingWindowBeforeOrAfterPresentationCompletionReleasesThePicker() async throws {
         for completePresentation in [false, true] {
             let fixture = PickerWindow()
@@ -209,6 +235,21 @@ private final class PickerWindow {
         root.presented = nil
         window.isHidden = true
         window.rootViewController = nil
+    }
+}
+
+@MainActor
+private final class LatePresentationController: UIViewController {
+    var presenter: UIViewController?
+    var onDismiss: (() -> Void)?
+    var dismissCalls = 0
+    override var presentingViewController: UIViewController? { presenter }
+    override func dismiss(animated: Bool, completion: (() -> Void)? = nil) {
+        XCTAssertFalse(animated)
+        dismissCalls += 1
+        presenter = nil
+        onDismiss?()
+        completion?()
     }
 }
 

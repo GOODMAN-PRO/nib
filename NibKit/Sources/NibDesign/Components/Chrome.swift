@@ -123,6 +123,13 @@ public struct NibBarGroup<Content: View>: View {
 public enum NibBarGeometry {
     public static let didChange = Notification.Name("NibBarGeometry.didChange")
 
+    /// Ignore other bars and windows before a consumer walks its view tree for the updated frame.
+    public static func isChange(_ note: Notification, for id: String, in root: UIView) -> Bool {
+        guard let marker = note.object as? NibBarGeometryView, marker.id == id,
+              let window = root.window, marker.window === window else { return false }
+        return marker.isDescendant(of: root)
+    }
+
     public static func frame(_ id: String, in root: UIView) -> CGRect? {
         if let marker = root as? NibBarGeometryView, marker.id == id { return marker.barFrame }
         for child in root.subviews {
@@ -147,7 +154,7 @@ private struct NibBarGeometryMarker: UIViewRepresentable {
     }
 }
 
-private final class NibBarGeometryView: UIView {
+final class NibBarGeometryView: UIView {
     var id = ""
     var barFrame: CGRect = .zero
 }

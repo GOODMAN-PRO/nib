@@ -859,6 +859,30 @@ final class FeatObjectMenuTests: XCTestCase {
         }
     }
 
+    func testObjectMenuStaysAboveAnAnnotationInsideAnUnselectedObject() throws {
+        let selection = CGRect(x: 300, y: 500, width: 180, height: 80)
+        let background = CGRect(x: 100, y: 200, width: 600, height: 700)
+        let bar = CGSize(width: 300, height: 44)
+        let placed = try XCTUnwrap(ObjectMenuPlacement.place(bar: bar, selection: selection,
+            in: CGRect(x: 0, y: 0, width: 834, height: 1194), top: 60, bottom: 16, obstacles: [background]))
+        XCTAssertTrue(placed.above)
+        XCTAssertEqual(placed.centre.y, selection.minY - ObjectMenuPlacement.gapAbove - bar.height / 2)
+        XCTAssertTrue(ObjectMenuPlacement.nearestObstacles([background], selection: selection).isEmpty)
+    }
+
+    func testObstacleCacheKeepsOnlyTheNearestNeighboursWithinItsLimit() {
+        let selection = CGRect(x: 300, y: 500, width: 180, height: 80)
+        let background = CGRect(x: 100, y: 200, width: 600, height: 700)
+        let overlapping = CGRect(x: 250, y: 450, width: 100, height: 100)
+        let neighbours = (0..<2_000).map { i in
+            CGRect(x: 300, y: 600 + CGFloat(i) * 10, width: 180, height: 5)
+        }
+        let kept = ObjectMenuPlacement.nearestObstacles([background, overlapping] + Array(neighbours.reversed()),
+                                                        selection: selection)
+        XCTAssertEqual(kept.count, ObjectMenuPlacement.obstacleLimit)
+        XCTAssertEqual(kept, Array(neighbours.prefix(ObjectMenuPlacement.obstacleLimit)))
+    }
+
     func testObjectMenuChoosesBelowWhenAboveCoversAnUnselectedObject() throws {
         let selection = CGRect(x: 300, y: 500, width: 180, height: 80)
         let rectangle = CGRect(x: 220, y: 350, width: 180, height: 120)

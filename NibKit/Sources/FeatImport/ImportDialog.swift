@@ -698,15 +698,46 @@ enum ImportUI {
         var continuation: CheckedContinuation<Bool, Never>?
         var timeout: Task<Void, Never>?
         var disconnectObserver: NSObjectProtocol?
+        private(set) var result: Bool?
+        private var latePresentation: Task<Void, Never>?
 
         func resolve(_ shown: Bool) {
             guard let continuation else { return }
             self.continuation = nil
+            result = shown
             timeout?.cancel()
             timeout = nil
             if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
             disconnectObserver = nil
             continuation.resume(returning: shown)
+        }
+
+        /// A timed-out request can still attach during UIKit's deferred transition. Do not leave a picker
+        /// on screen after its caller released the delegate. Completion also checks after this grace period.
+        func watchForLatePresentation(_ controller: UIViewController, presenter: UIViewController) {
+            latePresentation = Task { @MainActor [weak controller, weak presenter] in
+                for _ in 0..<30 {
+                    do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
+                    guard let controller, let presenter else { return }
+                    if Self.dismissIfAttached(controller, presenter: presenter) { return }
+                }
+            }
+        }
+
+        func complete(_ controller: UIViewController, presenter: UIViewController) {
+            if result == false {
+                // Keep the follow-up alive if even the completion precedes UIKit's relationship update.
+                if Self.dismissIfAttached(controller, presenter: presenter) { latePresentation?.cancel() }
+            } else {
+                resolve(true)
+            }
+        }
+
+        private static func dismissIfAttached(_ controller: UIViewController, presenter: UIViewController) -> Bool {
+            guard controller.presentingViewController != nil || presenter.presentedViewController === controller
+                    || controller.viewIfLoaded?.window != nil else { return false }
+            if !controller.isBeingDismissed { controller.dismiss(animated: false) }
+            return true
         }
     }
 
@@ -742,6 +773,7 @@ enum ImportUI {
                     let presenting = String(describing: controller.presentingViewController)
                     NSLog("%@", "[Nib QA import] presentation deadline presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
                     #endif
+                    if !shown { outcome.watchForLatePresentation(controller, presenter: top) }
                     outcome.resolve(shown)
                 }
                 let complete: @MainActor () -> Void = {
@@ -750,7 +782,7 @@ enum ImportUI {
                     let presenting = String(describing: controller.presentingViewController)
                     NSLog("%@", "[Nib QA import] presentation completed presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
                     #endif
-                    outcome.resolve(true)
+                    outcome.complete(controller, presenter: top)
                 }
                 if let presentation { presentation(top, controller, complete) }
                 else { top.present(controller, animated: true, completion: complete) }

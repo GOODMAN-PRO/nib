@@ -1455,6 +1455,21 @@ final class FeatWindowsTests: XCTestCase {
         }
     }
 
+    func testLongDocumentTitleKeepsOneCapsuleInANarrowSlot() {
+        for compact in [false, true] {
+            let widths = TabStripLayout.tabWidths(compact: compact)
+            for available in [widths.lowerBound, (widths.lowerBound + widths.upperBound) / 2] {
+                let width = available + 2 * TabStripLayout.inset
+                let plan = TabStripLayout.documentPlan(count: 4, active: 3, width: width,
+                                                       compact: compact, activeTitleWidth: 1200)
+                XCTAssertEqual(plan.shown, [3])
+                XCTAssertEqual(plan.hidden, [0, 1, 2])
+                XCTAssertEqual(plan.tabWidth, available)
+                XCTAssertEqual(plan.dropletWidth, width)
+            }
+        }
+    }
+
     func testDocumentTabsFitOnlyTheSpaceBetweenTheBars() {
         let safeBounds = CGRect(x: 24, y: 24, width: 1146, height: 780)
         let menu = CGRect(x: 308, y: 32, width: 44, height: 44)

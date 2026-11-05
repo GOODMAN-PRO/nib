@@ -70,7 +70,8 @@ enum TabStripLayout {
         // A long title truncates inside the largest capsule instead of hiding the entire strip.
         let minimum = min(widths.upperBound,
                           max(widths.lowerBound, activeTitleWidth > 0 ? activeTitleWidth + NibSpacing.m + NibMetrics.hitTarget : 0))
-        let slots = min(max(0, count), maxTabs, Int(available / minimum))
+        var slots = min(max(0, count), maxTabs, Int(available / minimum))
+        if slots == 0, count > 0, available >= widths.lowerBound { slots = 1 }
         var shown = Array(0..<slots)
         if let active, active >= slots, active < count, slots > 0 { shown[slots - 1] = active }
         let hidden = (0..<max(0, count)).filter { !shown.contains($0) }
@@ -449,8 +450,12 @@ final class TabStripDocumentPresentation: ObservableObject {
         self.controller = controller
         self.host = host
         geometryObserver = NotificationCenter.default.addObserver(forName: NibBarGeometry.didChange,
-                                                                  object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.refreshGeometry() }
+                                                                  object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in
+                guard let self, let view = self.controller?.viewIfLoaded,
+                      NibBarGeometry.isChange(note, for: "chrome.bar.trailing", in: view) else { return }
+                self.refreshGeometry()
+            }
         }
     }
 

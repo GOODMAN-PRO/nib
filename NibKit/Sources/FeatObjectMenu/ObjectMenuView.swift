@@ -164,6 +164,24 @@ enum ObjectMenuPlacement {
     /// Below it: past the bottom handles' hit areas.
     static let gapBelow = NibMetrics.hitTarget / 2 + NibSpacing.xs
 
+    /// Bound per-frame projection work, even on pages with thousands of strokes. Cache the nearest neighbours
+    /// in page space when content changes; uniform zoom and pan preserve their distance ordering.
+    static let obstacleLimit = 64
+
+    static func nearestObstacles<S: Sequence>(_ bounds: S, selection: CGRect) -> [CGRect] where S.Element == CGRect {
+        var nearest: [(bounds: CGRect, distance: CGFloat)] = []
+        for rect in bounds where !rect.isEmpty && !rect.isInfinite && !rect.intersects(selection) {
+            let dx = max(0, max(rect.minX - selection.midX, selection.midX - rect.maxX))
+            let dy = max(0, max(rect.minY - selection.maxY, selection.minY - rect.maxY))
+            let distance = dx + dy
+            if nearest.count == obstacleLimit, distance >= nearest[obstacleLimit - 1].distance { continue }
+            let index = nearest.firstIndex { $0.distance > distance } ?? nearest.count
+            nearest.insert((rect, distance), at: index)
+            if nearest.count > obstacleLimit { nearest.removeLast() }
+        }
+        return nearest.map { $0.bounds }
+    }
+
     /// Completed selections display their tight item bounds; the original drag path is not a resting anchor.
     static func exclusionBounds(items: Rect, outline: [Point]?) -> Rect {
         items
@@ -196,6 +214,8 @@ enum ObjectMenuPlacement {
             return nil
         }
         let visible = selection.intersection(bounds)
+        // Objects under an annotation belong to its background, not to the neighbouring content we avoid.
+        let obstacles = obstacles.filter { !$0.intersects(selection) }
         let halfW = bar.width / 2, halfH = bar.height / 2
         let minX = bounds.minX + NibMetrics.chromeInset + halfW
         let maxX = max(minX, bounds.maxX - NibMetrics.chromeInset - halfW)

@@ -236,7 +236,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     private var commits = 0
     private var builtFor: BuildKey?
     private var lastContainerRect: CGRect?
-    private var obstacleBounds: [Rect] = []
+    private var obstacleBounds: [CGRect] = []
     private var reshow: Task<Void, Never>?
     private var editMenuShownFor: Selection?
     private var pendingMenu: UIMenu?
@@ -376,9 +376,10 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         model.show(entries, context: context, facts: facts, header: PageMenus.header(facts, app: app))
         let selected = Set(facts.items.map(\.id))
         let pageItems = (try? app.workspace.items(facts.doc, page: facts.page)) ?? []
-        obstacleBounds = pageItems.filter {
+        let neighbours = pageItems.lazy.filter {
             !$0.deleted && !selected.contains($0.id) && !session.hiddenLayers.contains($0.layer)
-        }.map { app.content.hitBounds(for: $0) }
+        }.map { app.content.hitBounds(for: $0).cg }
+        obstacleBounds = ObjectMenuPlacement.nearestObstacles(neighbours, selection: facts.bounds.cg)
     }
 
     private func reposition(contentChanged: Bool) {
@@ -435,7 +436,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         if let transform = host.pageTransform(facts.page) {
             // Resolve the page transform once, rather than converting four corners per neighbouring item.
             model.setObstacles(obstacleBounds.compactMap { bounds -> CGRect? in
-                let projected = bounds.cg.applying(transform)
+                let projected = bounds.applying(transform)
                 guard projected.intersects(host.canvasView.bounds) else { return nil }
                 return target.containerRect(projected, from: host.canvasView)
             })
