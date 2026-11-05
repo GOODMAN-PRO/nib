@@ -298,6 +298,78 @@ struct CollabDigest: Codable, Equatable {
     }
 }
 
+/// Catch-up keeps revisions and file names, never every page's item payloads at once.
+/// Uncached pages bypass Workspace's cache, preserving a concurrent editor's working set.
+@MainActor
+struct CollabCatchUp {
+    let content: DocumentContent
+    var digest: CollabDigest
+    var names: Set<String>
+    private var fingerprints: [PageID: String]
+
+    static func items(_ doc: DocumentID, page: PageID, workspace: Workspace) throws -> [Item] {
+        if workspace.isPageCached(doc, page: page) { return try workspace.allItems(doc, page: page) }
+        return try workspace.persistence.loadItems(doc, page: page)
+    }
+
+    static func scan(_ doc: DocumentID, workspace: Workspace,
+                     isCurrent: () -> Bool) async throws -> CollabCatchUp {
+        let content = try workspace.content(doc)
+        var result = CollabCatchUp(content: content, digest: CollabDigest(content: content, items: [:]),
+                                   names: CollabAssets.names(content: content, items: [:]), fingerprints: [:])
+        for page in content.pages {
+            try check(isCurrent)
+            try result.include(page.id, doc: doc, workspace: workspace)
+            await Task.yield()
+        }
+        try await result.validate(doc, workspace: workspace, isCurrent: isCurrent)
+        return result
+    }
+
+    // The synchronous scope releases the page array before scan yields.
+    private mutating func include(_ page: PageID, doc: DocumentID, workspace: Workspace) throws {
+        let items = try Self.items(doc, page: page, workspace: workspace)
+        digest.items[page.raw] = Dictionary(items.map { ($0.id.raw, $0.rev) }, uniquingKeysWith: { max($0, $1) })
+        fingerprints[page] = LWW.fingerprint(items)
+        names.formUnion(CollabAssets.names(in: DocumentPatch(doc: doc, items: [page.raw: items])))
+    }
+
+    func validate(_ doc: DocumentID, workspace: Workspace, isCurrent: () -> Bool) async throws {
+        for page in content.pages {
+            try Self.check(isCurrent)
+            guard try workspace.contentFingerprint(doc, page: page.id) == fingerprints[page.id] else {
+                throw Self.changedError
+            }
+            await Task.yield()
+        }
+        try Self.check(isCurrent)
+        guard try workspace.content(doc) == content else { throw Self.changedError }
+    }
+
+    /// Unchanged pages need no delta payload read or encoded patch.
+    func needsPage(_ page: PageID, against other: CollabDigest) -> Bool {
+        (digest.items[page.raw] ?? [:]).contains { id, rev in
+            CollabDigest.isNewer(rev, than: other.items[page.raw]?[id])
+        }
+    }
+
+    func pageDelta(_ page: PageID, doc: DocumentID, workspace: Workspace,
+                   against other: CollabDigest) throws -> DocumentPatch {
+        let items = try Self.items(doc, page: page, workspace: workspace)
+        guard LWW.fingerprint(items) == fingerprints[page] else { throw Self.changedError }
+        let newer = items.filter { CollabDigest.isNewer($0.rev, than: other.items[page.raw]?[$0.id.raw]) }
+        return DocumentPatch(doc: doc, items: newer.isEmpty ? [:] : [page.raw: newer])
+    }
+
+    static var changedError: NibError {
+        NibError(.conflict, String(localized: "The shared document changed while catching up."))
+    }
+    static func check(_ isCurrent: () -> Bool) throws {
+        try Task.checkCancellation()
+        guard isCurrent() else { throw changedError }
+    }
+}
+
 // MARK: - Wire messages
 
 /// One message of the collaboration protocol. Every field but `kind` and `from` is optional so a newer Nib can add
@@ -1157,6 +1229,9 @@ final class CollabSession {
     private var outbox: [Route: Task<Void, Never>] = [:]
     /// Every link of each route's chain, so rehosting cancels a busy send as well as the patch waiting behind it.
     private var pendingOutbox: [UUID: Task<Void, Never>] = [:]
+    private var catchUps: [Route: Task<Void, Never>] = [:]
+    private var catchUpTokens: [Route: UUID] = [:]
+    private var documentGeneration: UInt64 = 0
     private var commitSubscription: EventSubscription?
     private var eventSubscription: EventSubscription?
     private var registryObserver: NSObjectProtocol?
@@ -1677,7 +1752,10 @@ final class CollabSession {
             case .syncReply:
                 if let digest = m.digest { knownAssets[.host] = Set(digest.assets) }
                 if let patch = m.patch { applyRemote(patch, author: m.from) }
-                if let digest = m.digest { sendDelta(against: digest) }
+                if let digest = m.digest {
+                    if myRole == .edit { sendDelta(against: digest) }
+                    else { resolveReady(nil) }
+                }
             case .snapshot:
                 guard phase == .receiving, let s = m.snapshot else { return }
                 receiveSnapshot(s, blob: nil, file: nil)
@@ -1733,10 +1811,7 @@ final class CollabSession {
         applyRoleLocally()
         service.didBecomeActive(self)
         changed()
-        resolveReady(nil)
-        if let digest = try? digest(of: doc) {
-            hasUnsentChanges = !post(CollabMessage(kind: .sync, session: id, from: me, digest: digest), to: .host)
-        }
+        startCatchUp(to: .host, against: nil, kind: .sync)
         reportPage()
     }
 
@@ -1976,16 +2051,11 @@ final class CollabSession {
     }
 
     private func answerSync(_ digest: CollabDigest, to pid: String) {
-        guard let doc = localDoc, ensureUnlocked(), let state = try? documentState(doc) else { return }
+        guard localDoc != nil, ensureUnlocked() else { return }
         let route = Route.participant(pid)
         knownAssets[route] = Set(digest.assets)
         sentFileSizes[route] = [:]
-        let names = CollabAssets.names(content: state.content, items: state.items)
-        let patch = CollabDigest.delta(content: state.content, items: state.items, against: digest, doc: doc)
-        let mine = CollabDigest(content: state.content, items: state.items, assets: heldFiles(names, doc: doc))
-        sendFiles(names, to: route)
-        _ = post(CollabMessage(kind: .syncReply, session: id, from: me, patch: patch.isEmpty ? nil : patch, digest: mine),
-                 to: route)
+        startCatchUp(to: route, against: digest, kind: .syncReply)
     }
 
     /// The zipped package when the library keeps one on disk (streamed as a blob), else the document's records.
@@ -2094,14 +2164,8 @@ final class CollabSession {
     }
 
     private func sendDelta(against digest: CollabDigest) {
-        guard side == .guest, myRole == .edit, let doc = localDoc, let remote = remoteDoc, ensureUnlocked(),
-              let state = try? documentState(doc) else { return }
-        let patch = CollabDigest.delta(content: state.content, items: state.items, against: digest, doc: doc)
-        hasUnsentChanges = false
-        sendFiles(CollabAssets.names(content: state.content, items: state.items), to: .host)
-        guard !patch.isEmpty else { return }
-        let m = CollabMessage(kind: .patch, session: id, from: me, patch: CollabSession.rewrite(patch, to: remote))
-        if !post(m, to: .host) { hasUnsentChanges = true }
+        guard side == .guest, myRole == .edit, localDoc != nil, remoteDoc != nil, ensureUnlocked() else { return }
+        startCatchUp(to: .host, against: digest, kind: .patch)
     }
 
     private func hostLost() {
@@ -2160,6 +2224,7 @@ final class CollabSession {
     /// disconnected.
     private func committed(_ cs: Changeset) {
         guard !isClosed, let doc = localDoc, let remote = remoteDoc, cs.documents.contains(doc) else { return }
+        documentGeneration &+= 1
         if case let .sync(origin) = cs.principal, origin.hasPrefix(CollabSession.originPrefix) { return }
         guard ensureUnlocked() else { return }
         guard side == .host || myRole == .edit else { return }
@@ -2230,14 +2295,103 @@ final class CollabSession {
         }
     }
 
-    private func digest(of doc: DocumentID) throws -> CollabDigest {
-        let state = try documentState(doc)
-        let held = heldFiles(CollabAssets.names(content: state.content, items: state.items), doc: doc)
-        return CollabDigest(content: state.content, items: state.items, assets: held)
+    /// One task per route bounds overlapping requests. A changed snapshot is retried; partial page delivery
+    /// is safe because every patch retains its original LWW revisions.
+    private func startCatchUp(to route: Route, against other: CollabDigest?, kind: CollabMessage.Kind) {
+        catchUps[route]?.cancel()
+        let token = UUID()
+        catchUpTokens[route] = token
+        catchUps[route] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.catchUpTokens[route] == token {
+                    self.catchUps[route] = nil
+                    self.catchUpTokens[route] = nil
+                }
+            }
+            for attempt in 0..<3 {
+                do {
+                    try await self.catchUp(to: route, against: other, kind: kind)
+                    return
+                } catch is CancellationError {
+                    return
+                } catch {
+                    if Task.isCancelled || self.isClosed { return }
+                    if (error as? NibError)?.code == .conflict, attempt < 2 { continue }
+                    self.hasUnsentChanges = true
+                    let message = NibError.wrap(error).message
+                    self.service.notice(String(localized: "Couldn't catch up shared changes. Reconnect to retry. \(message)"))
+                    if self.side == .guest { self.resolveReady(error) }
+                    return
+                }
+            }
+        }
     }
 
-    /// Every record of the document. Pages loaded only for this are evicted again, so a join or re-join doesn't
-    /// leave the whole notebook in memory.
+    private func catchUp(to route: Route, against other: CollabDigest?, kind: CollabMessage.Kind) async throws {
+        guard let doc = localDoc, let remote = remoteDoc, ensureUnlocked() else { return }
+        if kind == .patch, side == .guest, myRole != .edit { resolveReady(nil); return }
+        let generation = documentGeneration
+        guard let targets = peers(for: route)?.map(\.id) else {
+            throw NibError.unavailable(String(localized: "The connection dropped while catching up."))
+        }
+        let current = { [self] in
+            guard !isClosed, phase == .active, localDoc == doc, documentGeneration == generation,
+                  peers(for: route)?.map(\.id) == targets, ensureUnlocked() else { return false }
+            return kind != .patch || myRole == .edit
+        }
+        try CollabCatchUp.check(current)
+        var state = try await CollabCatchUp.scan(doc, workspace: app.workspace, isCurrent: current)
+        state.digest.assets = heldFiles(state.names, doc: doc)
+        // A later file/transport failure must survive completion; do not clear it after awaited sends.
+        if side == .guest, kind == .patch { hasUnsentChanges = false }
+        if let other {
+            sendFiles(state.names, to: route)
+            await outbox[route]?.value
+            try CollabCatchUp.check(current)
+            let head = CollabDigest.delta(content: state.content, items: [:], against: other, doc: doc)
+            if !head.isEmpty { try await sendCatchUpPatch(head, remote: remote, to: route, isCurrent: current) }
+            for page in state.content.pages {
+                try CollabCatchUp.check(current)
+                if state.needsPage(page.id, against: other) {
+                    let patch = try state.pageDelta(page.id, doc: doc, workspace: app.workspace, against: other)
+                    if !patch.isEmpty { try await sendCatchUpPatch(patch, remote: remote, to: route, isCurrent: current) }
+                }
+                await Task.yield()
+            }
+            try await state.validate(doc, workspace: app.workspace, isCurrent: current)
+        }
+        try CollabCatchUp.check(current)
+        if kind != .patch {
+            await outbox[route]?.value
+            try CollabCatchUp.check(current)
+            let message = CollabMessage(kind: kind, session: id, from: me, digest: state.digest)
+            guard await deliver(try CollabFrames.frames(for: message), to: route) else {
+                throw NibError.unavailable(String(localized: "The connection dropped while catching up."))
+            }
+        }
+        if side == .guest, kind == .patch {
+            guard !hasUnsentChanges else {
+                throw NibError.unavailable(String(localized: "Some shared changes could not be sent."))
+            }
+            resolveReady(nil)
+        }
+    }
+
+    private func sendCatchUpPatch(_ patch: DocumentPatch, remote: DocumentID, to route: Route,
+                                 isCurrent: () -> Bool) async throws {
+        await outbox[route]?.value
+        try CollabCatchUp.check(isCurrent)
+        let message = CollabMessage(kind: .patch, session: id, from: me,
+                                   patch: CollabSession.rewrite(patch, to: remote))
+        // Await each page's frames instead of retaining every page in queued send closures.
+        guard await deliver(try CollabFrames.frames(for: message), to: route) else {
+            throw NibError.unavailable(String(localized: "The connection dropped while catching up."))
+        }
+    }
+
+    /// Full content fallback for initial snapshots when no package exists. Reconnect catch-up uses
+    /// CollabCatchUp instead, so it never materialises this whole-notebook dictionary.
     private func documentState(_ doc: DocumentID) throws -> (content: DocumentContent, items: [PageID: [Item]]) {
         let content = try app.workspace.content(doc)
         let cached = app.workspace.cachedPages(doc)
@@ -2384,6 +2538,9 @@ final class CollabSession {
     }
 
     private func cancelOutbox() {
+        for task in catchUps.values { task.cancel() }
+        catchUps = [:]
+        catchUpTokens = [:]
         for task in pendingOutbox.values { task.cancel() }
         pendingOutbox = [:]
         outbox = [:]

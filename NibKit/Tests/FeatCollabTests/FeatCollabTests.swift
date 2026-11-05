@@ -988,6 +988,7 @@ final class FeatCollabTests: XCTestCase {
         await pair.hostService.resumeAfterSuspend()
         try await waitUntil {
             pair.guestService.session?.phase == .active
+                && pair.guestService.session?.joinInProgress == false
                 && pair.hostService.session?.participants[CollabPair.guestID]?.state == .active
         }
         XCTAssertTrue(pair.hostService.state.pending.isEmpty)
