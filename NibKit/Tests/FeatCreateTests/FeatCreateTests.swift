@@ -799,6 +799,27 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(TemplateChoice.size([0, 10]), nil)
     }
 
+    func testCancelledTemplateRenderCannotReplaceCurrentPreview() async {
+        let started = expectation(description: "old render started")
+        let release = expectation(description: "old render released")
+        let oldImage = UIImage(), currentImage = UIImage()
+        var preview: UIImage?
+        let old = Task {
+            await TemplatePreviewPublication.render {
+                started.fulfill()
+                await self.fulfillment(of: [release], timeout: 2)
+                return oldImage
+            } publish: { preview = $0 }
+        }
+        await fulfillment(of: [started], timeout: 2)
+        await TemplatePreviewPublication.render { currentImage } publish: { preview = $0 }
+        XCTAssertTrue(preview === currentImage)
+        old.cancel()
+        release.fulfill()
+        await old.value
+        XCTAssertTrue(preview === currentImage)
+    }
+
     func testTemplateThumbnailDrawsTheTemplateAndItsPaperColour() throws {
         let definition = Self.ruled()
         let tile = CGSize(width: 104, height: 135)                 // NibMetrics.paperTileSize
