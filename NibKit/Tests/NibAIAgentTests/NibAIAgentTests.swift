@@ -100,6 +100,102 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(records.count, 3)
     }
 
+    func testHistoryIndexDoesNotRetainBodiesAndSelectionUsesABoundedCache() async throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = store(dir, device: 0x0A)
+        let ids = (0..<20).map { "HISTORY\($0)" }
+        for chat in ids {
+            writer.ensureChat(chat, title: chat, doc: Fixtures.docID)
+            let records = (0..<12).map { _ in writer.makeMessage(role: "user", text: String(repeating: "x", count: 1_024)) }
+            writer.append(records, chat: chat)
+        }
+        XCTAssertNil(writer.flush())
+        let coldSelection = store(dir, device: 0x0C)
+        let coldState = await coldSelection.stateAsync(ids[0])
+        XCTAssertEqual(coldState?.messages.count, 12)
+        XCTAssertEqual(coldSelection.cachedChatIDs, Set([ids[0]]))
+        XCTAssertEqual(coldSelection.messageCount(ids[1]), 0, "A cold selection must not decode other chats")
+        let reader = store(dir, device: 0x0B)
+        let summaries = await reader.summariesAsync(doc: Fixtures.docID)
+        XCTAssertEqual(Set(summaries.map(\.id)), Set(ids))
+        XCTAssertTrue(reader.cachedChatIDs.isEmpty, "Listing must retain summary metadata only")
+        for chat in ids { XCTAssertEqual(reader.messageCount(chat), 12) }
+        let selected = await reader.stateAsync(ids[0])
+        XCTAssertEqual(selected?.messages.count, 12)
+        XCTAssertEqual(reader.cachedChatIDs, Set([ids[0]]), "Only the selected chat enters the body cache")
+        for chat in ids {
+            let state = await reader.stateAsync(chat)
+            XCTAssertEqual(state?.messages.count, 12)
+            XCTAssertTrue(reader.cachedChatIDs.contains(chat))
+            XCTAssertLessThanOrEqual(reader.cachedChatIDs.count, ChatStore.messageCacheLimit)
+        }
+        // Synchronous AIService clients use the same index/cache and still return complete data.
+        XCTAssertEqual(reader.summaries(doc: Fixtures.docID).count, ids.count)
+        XCTAssertEqual(reader.messages(ids[0]).count, 12)
+        XCTAssertLessThanOrEqual(reader.cachedChatIDs.count, ChatStore.messageCacheLimit)
+    }
+
+    func testHistoryEvictionKeepsFailedWritesAndMergesRemoteRatings() async throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let writer = store(dir, device: 0x0A)
+        let blocked = dir.appendingPathComponent(writer.ownFileName("UNSAVED"))
+        try FileManager.default.createDirectory(at: blocked, withIntermediateDirectories: true)
+        writer.append([writer.makeMessage(role: "user", text: "Keep until durable")], chat: "UNSAVED")
+        XCTAssertNotNil(writer.flush())
+        for i in 0..<10 {
+            writer.append([writer.makeMessage(role: "assistant", text: "Answer")], chat: "CACHE\(i)")
+        }
+        _ = await writer.summariesAsync(doc: nil)
+        XCTAssertTrue(writer.cachedChatIDs.contains("UNSAVED"))
+        XCTAssertEqual(writer.messages("UNSAVED").first?.text, "Keep until durable")
+        try FileManager.default.removeItem(at: blocked)
+        XCTAssertNil(writer.flush())
+        XCTAssertLessThanOrEqual(writer.cachedChatIDs.count, ChatStore.messageCacheLimit)
+        let remote = store(dir, device: 0x0B)
+        XCTAssertEqual(remote.messages("UNSAVED").first?.text, "Keep until durable")
+        try remote.rate("CACHE0", message: "last", rating: "up")
+        let reloaded = await writer.stateAsync("CACHE0")
+        XCTAssertEqual(reloaded?.messages.first?.rating, "up")
+        XCTAssertEqual(writer.messageCount("CACHE0"), 1)
+    }
+
+    func testHistoryIndexKeepsOwnerAndDeletionWhileMetadataFileIsUnavailable() async throws {
+        let dir = tempFolder()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = store(dir, device: 0x0A)
+        let b = store(dir, device: 0x0B)
+        let chat = "INDEXOWNER"
+        a.ensureChat(chat, title: "Private", doc: Fixtures.docID)
+        XCTAssertNil(a.flush())
+        b.append([b.makeMessage(role: "assistant", text: "Private answer")], chat: chat)
+        XCTAssertNil(b.flush())
+        let reader = store(dir, device: 0x0C)
+        let indexed = await reader.summariesAsync(doc: Fixtures.docID)
+        XCTAssertEqual(indexed.map(\.id), [chat])
+        XCTAssertTrue(reader.cachedChatIDs.isEmpty)
+
+        let file = dir.appendingPathComponent(a.ownFileName(chat))
+        let metadata = try Data(contentsOf: file)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        let selected = await reader.stateAsync(chat)
+        XCTAssertEqual(selected?.meta?.doc, Fixtures.docID.raw, "Eviction must not forget a known owner")
+        try FileManager.default.removeItem(at: file)
+        try metadata.write(to: file)
+        try a.delete(chat)
+
+        let deletedReader = store(dir, device: 0x0D)
+        let deleted = await deletedReader.summariesAsync(doc: nil, all: true)
+        XCTAssertTrue(deleted.isEmpty)
+        XCTAssertTrue(deletedReader.cachedChatIDs.isEmpty)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        let stillDeleted = await deletedReader.summariesAsync(doc: nil, all: true)
+        XCTAssertTrue(stillDeleted.isEmpty, "An unavailable tombstone must not resurrect another device's messages")
+    }
+
     func testChatFilesFromTwoDevicesMergeByMessageID() throws {
         let dir = tempFolder()
         let a = store(dir, device: 0x0A)

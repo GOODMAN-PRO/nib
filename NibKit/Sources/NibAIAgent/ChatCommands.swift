@@ -218,25 +218,28 @@ struct AIChatList: NibCommand {
         func visible(_ owner: DocumentID?) -> Bool {
             ctx.principal.isUser || owner.map { !ctx.bus.gateway.isLocked($0) } ?? true
         }
-        let summaries = (agent?.chatStore.summaries(doc: doc, all: p.all ?? false) ?? ai.chats(doc: doc))
-            .filter { visible($0.doc) }
+        let store = agent?.chatStore
+        let loaded: [AIChatSummary]
+        if let store = store { loaded = await store.summariesAsync(doc: doc, all: p.all ?? false) }
+        else { loaded = ai.chats(doc: doc) }
+        let summaries = loaded.filter { visible($0.doc) }
         let rows = summaries.map { s -> Row in
-            let count = agent?.chatStore.visibleMessages(s.id).count ?? ai.messages(chatID: s.id).count
+            let count = store?.messageCount(s.id) ?? ai.messages(chatID: s.id).count
             return Row(id: s.id, title: s.title, doc: s.doc.map { NodeRef.document($0).description }, updated: s.updated,
                        messages: count)
         }
         guard let chat = p.chat else { return Output(chats: rows) }
-        guard let agent = agent else {
+        guard let store = store else {
             let list = ai.messages(chatID: chat).enumerated().map {
                 Message(id: String($0.offset), role: $0.element.role, text: $0.element.text)
             }
             return Output(chats: rows, messages: list)
         }
-        guard let state = agent.chatStore.state(chat) else { throw ChatStore.unknownChat(chat) }
+        guard let state = await store.stateAsync(chat) else { throw ChatStore.unknownChat(chat) }
         guard visible(state.meta?.doc.map { DocumentID($0) }) else {
             throw NibError(.locked, "the conversation belongs to a locked document", hint: "ask the user to unlock it first")
         }
-        let list = agent.chatStore.visibleMessages(chat).map {
+        let list = state.messages.filter(\.isVisibleMessage).map {
             Message(id: $0.id.raw, role: $0.role ?? "user", text: $0.text ?? "", at: $0.at, rating: $0.rating,
                     group: $0.group, changes: $0.changes, cancelled: $0.cancelled)
         }
