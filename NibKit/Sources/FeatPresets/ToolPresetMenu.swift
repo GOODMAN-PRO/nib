@@ -36,12 +36,12 @@ enum PresetText {
         }
     }
 
-    static func millimetres(_ points: Double) -> String {
-        String(format: String(localized: "%.2f mm"), points * 25.4 / 72)
+    static func millimetres(_ points: Double, locale: Locale = .current) -> String {
+        String(format: String(localized: "%.2f mm"), locale: locale, points * 25.4 / 72)
     }
 
-    static func points(_ points: Double) -> String {
-        String(format: String(localized: "%.1f pt"), points)
+    static func points(_ points: Double, locale: Locale = .current) -> String {
+        String(format: String(localized: "%.1f pt"), locale: locale, points)
     }
 
     static func patternName(_ pattern: StrokePattern) -> String {
@@ -53,9 +53,9 @@ enum PresetText {
     }
 
     /// VoiceOver value of a thickness: "0.42 millimetres, 1.2 points, dashed".
-    static func widthValue(_ points: Double, pattern: StrokePattern) -> String {
-        let mm = String(format: String(localized: "%.2f millimetres"), points * 25.4 / 72)
-        let pt = String(format: String(localized: "%.1f points"), points)
+    static func widthValue(_ points: Double, pattern: StrokePattern, locale: Locale = .current) -> String {
+        let mm = String(format: String(localized: "%.2f millimetres"), locale: locale, points * 25.4 / 72)
+        let pt = String(format: String(localized: "%.1f points"), locale: locale, points)
         return pattern == .solid ? "\(mm), \(pt)" : "\(mm), \(pt), \(patternName(pattern))"
     }
 }

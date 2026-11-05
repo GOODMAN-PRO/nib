@@ -700,6 +700,15 @@ final class FeatPresetsTests: XCTestCase {
 
     // MARK: UI logic
 
+    func testMeasurementsUseTheRequestedDecimalSeparator() {
+        let fr = Locale(identifier: "fr_FR"), en = Locale(identifier: "en_GB")
+        XCTAssertTrue(PresetText.millimetres(1.2, locale: fr).contains("0,42"))
+        XCTAssertTrue(PresetText.millimetres(1.2, locale: en).contains("0.42"))
+        XCTAssertTrue(PresetText.points(1.2, locale: fr).contains("1,2"))
+        XCTAssertTrue(PresetText.widthValue(1.2, pattern: .dashed, locale: fr).contains("0,42"))
+        XCTAssertTrue(PresetText.widthValue(1.2, pattern: .solid, locale: en).contains("1.2"))
+    }
+
     func testWidthScaleRoundTripsAndStaysInRange() {
         for tool in NibSettings.presetTools {
             let range = PresetRules.widthRange(tool)

@@ -225,6 +225,11 @@ final class FeatPencilHardwareTests: XCTestCase {
         XCTAssertEqual(plan(.colours, "lasso", nil).presetTool, "pen")
     }
 
+    func testPaletteThicknessUsesTheRequestedDecimalSeparator() {
+        XCTAssertTrue(PaletteNames.thickness(1.2, locale: Locale(identifier: "fr_FR")).contains("0,4"))
+        XCTAssertTrue(PaletteNames.thickness(1.2, locale: Locale(identifier: "en_GB")).contains("0.4"))
+    }
+
     func testPaletteStaysInsideTheSafeArea() {
         let bounds = CGRect(x: 0, y: 0, width: 1000, height: 800)
         let insets = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)

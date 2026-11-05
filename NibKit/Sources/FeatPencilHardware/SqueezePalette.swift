@@ -136,8 +136,8 @@ enum PaletteNames {
     }
 
     /// Preset widths are page points; people read millimetres.
-    static func thickness(_ points: Double) -> String {
-        let mm = String(format: "%.1f", points * 25.4 / 72)
+    static func thickness(_ points: Double, locale: Locale = .current) -> String {
+        let mm = String(format: "%.1f", locale: locale, points * 25.4 / 72)
         return String(localized: "\(mm) millimetres")
     }
 
