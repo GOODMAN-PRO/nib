@@ -9,30 +9,53 @@ import NibTesting
 @MainActor
 final class PanelEscapeTests: XCTestCase {
     func testOptionsPopoverEscapeClosesOnlyThePopover() async throws {
+        let h = Harness(features: [FeatStudySessionFeature.self])
+        h.session.document = Fixtures.studySetID
+        let runtime = try XCTUnwrap(h.app.services.get(StudyRuntime.serviceKey, as: StudyRuntime.self))
+        runtime.now = { 1_700_000_000 }
+        let model = runtime.model(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        await model.begin("practice")
+        XCTAssertTrue(model.started)
+        let card = try XCTUnwrap(model.current?.id)
+        let queue = model.queue
         var closes = 0
-        weak var presented: UIViewController?
-        let content = StudyOptionsPanel(onClose: {
-            closes += 1
-            presented?.dismiss(animated: false)
-        }) { Text("Options") }
-        let host = UIHostingController(rootView: content)
-        let root = UIViewController()
+        var sessionCloses = 0
+        var order: [String] = []
+        // Both owners are rendered in one window. The top surface must consume
+        // the press before the session header is offered it.
+        let underlying = StudySessionView(model: model, smartLearn: false, close: {
+            order.append("session")
+            sessionCloses += 1
+        }).snapshotContent
+        let content = ZStack {
+            underlying
+            StudyOptionsPanel(onClose: {
+                order.append("options")
+                closes += 1
+            }) { Text("Options") }
+        }
+        let host = UIHostingController(rootView: AnyView(content))
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
-        window.rootViewController = root
+        window.rootViewController = host
         window.isHidden = false
-        defer { root.dismiss(animated: false); window.isHidden = true; window.rootViewController = nil }
-        host.modalPresentationStyle = .popover
-        host.popoverPresentationController?.sourceView = root.view
-        host.popoverPresentationController?.sourceRect = CGRect(x: 500, y: 40, width: 44, height: 44)
-        presented = host
-        root.present(host, animated: false)
+        defer { window.isHidden = true; window.rootViewController = nil }
         for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
-        XCTAssertTrue(root.presentedViewController === host)
         XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
-        for _ in 0..<100 where root.presentedViewController != nil { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(order, ["options"])
         XCTAssertEqual(closes, 1)
-        XCTAssertNil(root.presentedViewController)
-        XCTAssertTrue(window.rootViewController === root)
+        XCTAssertEqual(sessionCloses, 0)
+        XCTAssertTrue(model.started)
+        XCTAssertEqual(model.current?.id, card)
+        XCTAssertEqual(model.queue, queue)
+
+        // Model the shell removing the closed surface. The next press must reach
+        // the still-registered session owner, proving it was bypassed above.
+        host.rootView = AnyView(underlying)
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
+        XCTAssertEqual(order, ["options", "session"])
+        XCTAssertEqual(closes, 1)
+        XCTAssertEqual(sessionCloses, 1)
     }
 
     func testPracticeScratchSheetPassesModalContextAndEscapePreservesSession() async throws {
@@ -42,42 +65,50 @@ final class PanelEscapeTests: XCTestCase {
         runtime.now = { 1_700_000_000 }
         let model = runtime.model(app: h.app, doc: Fixtures.studySetID, session: h.session)
         var scratchPresentation: PanelPresentation?
+        var scratchCloses = 0
         // The actual scratch view is covered in FeatStudyEditorTests. This stand-in checks the cross-module
         // descriptor boundary without importing a feature or hiding a missing presentation behind a default.
         h.app.ui.panels.register(PanelDescriptor(id: "studyeditor.scratch", title: "Scratch", icon: NibSymbol.quickNote.name,
             placement: .floating, order: 600, owner: "test") { context in
             scratchPresentation = context.presentation
             return AnyView(NibPanelHeader(title: "Scratch", symbol: .quickNote,
-                handlesEscape: context.presentation == .sheet, onClose: context.dismiss))
+                handlesEscape: context.presentation == .sheet, onClose: {
+                    scratchCloses += 1
+                    context.dismiss()
+                }))
         })
         var sessionCloses = 0
-        let host = UIHostingController(rootView: PracticeView(model: model, close: { sessionCloses += 1 }))
+        model.onEnd = { sessionCloses += 1 }
+        await model.begin("practice")
+        XCTAssertTrue(model.started)
+        let card = try XCTUnwrap(model.current?.id)
+        let queue = model.queue
+        try await h.run(StudySessionAction.id, ["doc": .string(model.docRef), "action": "scratch"])
+        XCTAssertTrue(model.scratchPresented)
+        let session = StudySessionView(model: model, smartLearn: false, close: { sessionCloses += 1 })
+        // Mount the exact content used by Practice's sheet, with its real context
+        // and dismissal callback, without asking a sceneless window to present it.
+        let host = UIHostingController(rootView: session.scratchContent)
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
         window.rootViewController = host
         window.isHidden = false
-        defer { host.dismiss(animated: false); window.isHidden = true; window.rootViewController = nil }
-        for _ in 0..<100 where !model.started { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertTrue(model.started)
-        let card = model.current?.id
-        let queue = model.queue
-        try await h.run(StudySessionAction.id, ["doc": .string(model.docRef), "action": "scratch"])
-        for _ in 0..<100 where host.presentedViewController == nil { try await Task.sleep(for: .milliseconds(10)) }
-        let sheet = try XCTUnwrap(host.presentedViewController)
-        for _ in 0..<5 { sheet.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
         XCTAssertEqual(scratchPresentation, .sheet)
-        XCTAssertTrue(NibEscapeRouting.cancel(in: sheet.view))
-        for _ in 0..<100 where model.scratchPresented || host.presentedViewController != nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
+        // context.dismiss enqueues closeScratch through the command bus.
+        for _ in 0..<20 where model.busy { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.busy)
+        XCTAssertEqual(scratchCloses, 1)
         XCTAssertFalse(model.scratchPresented)
-        XCTAssertNil(host.presentedViewController)
         XCTAssertEqual(sessionCloses, 0)
         XCTAssertTrue(model.started)
         XCTAssertEqual(model.current?.id, card)
         XCTAssertEqual(model.queue, queue)
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 0)
     }
 
-    func testModalPanelEscapeClosesPresentedController() async throws {
+    func testModalPanelEscapeRunsCloseExactlyOnce() async throws {
         for id in [PanelIDs.studyPractice, PanelIDs.studySmartLearn] {
             for presentation in [PanelPresentation.sheet, .fullScreen] {
                 for compact in [true, false] {
@@ -107,10 +138,8 @@ final class PanelEscapeTests: XCTestCase {
         let runtime = try XCTUnwrap(h.app.services.get(StudyRuntime.serviceKey, as: StudyRuntime.self))
         runtime.now = { 1_700_000_000 }
         var closes = 0
-        weak var presented: UIViewController?
         let close: @MainActor () -> Void = {
             closes += 1
-            presented?.dismiss(animated: false)
         }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.panelClose, title: "Close Panel",
                                                   summary: "Test panel host", effect: .session)) { params, _ in
@@ -125,30 +154,19 @@ final class PanelEscapeTests: XCTestCase {
         let host = UIHostingController(rootView: content
             .environment(\.horizontalSizeClass, compact ? .compact : .regular)
             .environment(\.colorScheme, scheme))
-        let root = UIViewController()
         let size = compact ? CGSize(width: 390, height: 844) : CGSize(width: 1024, height: 768)
         let window = UIWindow(frame: CGRect(origin: .zero, size: size))
-        window.rootViewController = modal ? root : host
+        // Hostless package tests have no scene to render a UIKit modal.
+        // The panel owns its close action; the shell owns controller dismissal.
+        window.rootViewController = host
         window.isHidden = false
         defer {
-            root.dismiss(animated: false)
             window.isHidden = true
             window.rootViewController = nil
         }
-        if modal {
-            host.modalPresentationStyle = presentation == .fullScreen ? .fullScreen : .pageSheet
-            presented = host
-            root.present(host, animated: false)
-        }
         for _ in 0..<5 { host.view.layoutIfNeeded(); try await Task.sleep(for: .milliseconds(20)) }
-        if modal { XCTAssertTrue(root.presentedViewController === host) }
         // This is the view-tree press fallback used by the shell and NibDesign's EscapeRoutingTests.
         XCTAssertEqual(NibEscapeRouting.cancel(in: host.view), modal, "\(id): \(presentation)")
-        for _ in 0..<100 {
-            if !modal || (closes > 0 && root.presentedViewController == nil) { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
         XCTAssertEqual(closes, modal ? 1 : 0)
-        if modal { XCTAssertNil(root.presentedViewController) }
     }
 }
