@@ -82,6 +82,25 @@ final class CanvasUITests: XCTestCase {
         target.tap()
     }
 
+    private func openBoardMenu(_ row: XCUIElement) throws {
+        try ui.pressWithoutIdle(row, duration: 1)
+        let item = try ui.requireControl("cmd.page.duplicate", type: .button, timeout: 8)
+        guard item.isHittable else { throw NibUI.Failure.message("Board menu item is not hittable") }
+    }
+
+    private func boardMenuTap(_ label: String) throws {
+        // Rename can expose its SF Symbol name instead of its title on the native menu.
+        let name = label == "Rename" && !ui.app.buttons["Rename"].exists ? "pencil" : label
+        let target = try ui.requireControl(name, type: .button, timeout: 8)
+        try ui.tapWithoutIdle(target)
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
+            !target.exists && !ui.app.buttons["cmd.page.duplicate"].exists
+        }, object: nil)
+        guard XCTWaiter.wait(for: [gone], timeout: 10) == .completed else {
+            throw NibUI.Failure.message("Board context menu did not dismiss after \(label)")
+        }
+    }
+
     private func eventually(_ message: String, timeout: TimeInterval = 10, _ predicate: @escaping () -> Bool) {
         if predicate() { return }
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
@@ -655,8 +674,8 @@ final class CanvasUITests: XCTestCase {
         try open(whiteboard)
         try boards()
         let row = try boardRow(1, count: 1)
-        row.press(forDuration: 1)
-        try tap("Rename")
+        try openBoardMenu(row)
+        try boardMenuTap("Rename")
         let field = try require("Board name")
         try ui.replaceNativeText(in: field, with: "Canvas navigation board")
         field.typeText("\n")
@@ -1051,14 +1070,14 @@ final class CanvasUITests: XCTestCase {
         try open(whiteboard)
         let original = try ui.state()
         try boards()
-        try ui.timedAction("Board 1 context menu") { try self.boardRow(1, count: 1).press(forDuration: 1) }
-        try tap("Duplicate")
+        try openBoardMenu(boardRow(1, count: 1))
+        try boardMenuTap("Duplicate")
         _ = try ui.waitForState { $0.pageCount == 2 }
         // Duplicate preserves a board's title, so identify its position rather than inventing a new name.
         try boardRow(2, count: 2).tap()
         XCTAssertEqual(try ui.state().itemCountOnPage, original.itemCountOnPage)
-        try ui.timedAction("Board 2 context menu") { try self.boardRow(2, count: 2).press(forDuration: 1) }
-        try tap("Move to Trash")
+        try openBoardMenu(boardRow(2, count: 2))
+        try boardMenuTap("Move to Trash")
         _ = try ui.waitForState { $0.pageCount == 1 }
         XCTAssertEqual(try ui.state().page, original.page)
         XCTAssertEqual(try ui.state().itemCountOnPage, original.itemCountOnPage)
@@ -1111,8 +1130,8 @@ final class CanvasUITests: XCTestCase {
         try open(whiteboard)
         let before = try ui.state()
         try boards()
-        try boardRow(1, count: 1).press(forDuration: 1)
-        try tap("Open in New Window")
+        try openBoardMenu(boardRow(1, count: 1))
+        try boardMenuTap("Open in New Window")
         eventually("Open in New Window must create a second app window") { self.ui.app.windows.count > 1 }
         // Checking the original window alone would falsely pass when the new scene opens an empty library.
         // F018's SceneHooksImpl currently drops requested activities in NibUITestMode: a fixture-mode limitation.
