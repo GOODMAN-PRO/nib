@@ -741,11 +741,11 @@ final class Indexer {
     func indexPage(_ doc: DocumentID, _ page: PageID, head: DocumentContent, force: Bool = false) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, page.raw)
-        var head = head
-        // Someone else indexed this page meanwhile: read the head again so an older one can never win.
-        if await waitForUnit(key), let fresh = try? reader.head(doc) { head = fresh }
+        await waitForUnit(key)
+        // A sweep's head can predate a completed deletion even when this unit was never in flight.
+        guard let currentHead = try? reader.head(doc) else { return false }
         let ink = indexInk
-        guard let snapshot = (try? pageSnapshot(doc, page, head: head, includeInk: ink)) ?? nil else {
+        guard let snapshot = (try? pageSnapshot(doc, page, head: currentHead, includeInk: ink)) ?? nil else {
             try? db.removeUnit(doc: doc, key: page.raw)
             return false
         }
@@ -773,9 +773,9 @@ final class Indexer {
     func indexDocUnit(_ doc: DocumentID, head: DocumentContent, force: Bool = false) async -> Bool {
         guard let db = db else { return false }
         let key = unitKey(doc, IndexKeys.docUnit)
-        var head = head
-        if await waitForUnit(key), let fresh = try? reader.head(doc) { head = fresh }
-        let snapshot = docSnapshot(doc, head: head)
+        await waitForUnit(key)
+        guard let currentHead = try? reader.head(doc) else { return false }
+        let snapshot = docSnapshot(doc, head: currentHead)
         if !force, db.version(doc: doc, key: IndexKeys.docUnit) == snapshot.version { return false }
         let env = self.env(includeInk: indexInk)
         _ = await extract(key, priority: .utility) {
@@ -847,7 +847,7 @@ final class Indexer {
             // An unchanged page returns without suspending: yield so a long walk never holds the main actor.
             await Task.yield()
         }
-        updatePageIndexes(doc, head: head)
+        if let fresh = try? reader.head(doc) { updatePageIndexes(doc, head: fresh) }
         return pass
     }
 

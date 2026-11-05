@@ -969,6 +969,44 @@ final class NibIndexTests: XCTestCase {
         XCTAssertTrue(hits.isEmpty, "\(hits)")
     }
 
+    func testOlderSweepDoesNotRestoreALaterDeletedPage() async throws {
+        let (h, indexer) = harness()
+        let doc = Fixtures.docID
+        let head = try XCTUnwrap(h.persistence.heads[doc])
+        let text = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 10, w: 100, h: 30),
+                                             text: RichText(plain: "Vanishingquokka")))
+        h.persistence.pageItems[doc, default: [:]][Fixtures.page2] = [text]
+        await indexer.indexPage(doc, Fixtures.page2, head: head)
+        let entered = expectation(description: "Earlier page extraction entered")
+        let finished = expectation(description: "Sweep finished")
+        let recognizer = GatedIndexRecognizer(entered: entered)
+        h.app.services.recognizer = recognizer
+        let sweep = Task { @MainActor in
+            await indexer.indexDocument(doc)
+            finished.fulfill()
+        }
+        defer { recognizer.release.signal(); sweep.cancel() }
+        await fulfillment(of: [entered], timeout: 2)
+        var current = head
+        let position = try XCTUnwrap(current.pages.firstIndex { $0.id == Fixtures.page2 })
+        current.pages[position].deleted = true
+        current.pages[position].rev = Rev(wallMs: 10, counter: 0, device: 8)
+        let moved = try XCTUnwrap(current.pages.firstIndex { $0.id == Fixtures.page1 })
+        current.pages[moved].order = "z"
+        current.pages[moved].rev = Rev(wallMs: 11, counter: 0, device: 8)
+        h.persistence.heads[doc] = current
+        await indexer.indexPage(doc, Fixtures.page2, head: current)
+        XCTAssertNil(indexer.db?.version(doc: doc, key: Fixtures.page2.raw))
+        recognizer.release.signal()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertNil(indexer.db?.version(doc: doc, key: Fixtures.page2.raw))
+        let hits = results(try await h.run("search.text", ["query": "Vanishingquokka"]))
+        XCTAssertTrue(hits.isEmpty)
+        let remaining = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertEqual(remaining.first?["pageIndex"]?.intValue, 1, "The final position update uses the current head")
+        XCTAssertFalse(h.app.workspace.isLoaded(doc))
+    }
+
     func testRecognizeItemsKeepsReadingOrderPerPageAndPagesInRefOrder() async throws {
         let (h, _) = harness()
         let footer = Item.makeText(TextBoxItem(frame: Frame(x: 72, y: 700, w: 200, h: 30), text: RichText(plain: "Page two footer")))
@@ -1007,4 +1045,18 @@ final class NibIndexTests: XCTestCase {
         XCTAssertEqual(VisionRecognizer.resolve("pt_PT", supported: supported), "pt-BR")
         XCTAssertNil(VisionRecognizer.resolve("xx-YY", supported: supported))
     }
+}
+
+private final class GatedIndexRecognizer: TextRecognizer {
+    let entered: XCTestExpectation
+    let release = DispatchSemaphore(value: 0)
+    init(entered: XCTestExpectation) { self.entered = entered }
+    func recognize(strokes: [Item], language: String) async throws -> [TextRecognition] {
+        entered.fulfill()
+        guard release.wait(timeout: .now() + 3) == .success else {
+            throw NibError(.timeout, "Test recognition was not released")
+        }
+        return []
+    }
+    func recognize(image: CGImage, language: String) async throws -> [TextRecognition] { [] }
 }
