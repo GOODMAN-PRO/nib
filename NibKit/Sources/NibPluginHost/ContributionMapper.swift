@@ -1689,19 +1689,23 @@ struct SchemaFieldControl: View {
         case let .number(min, max, integer):
             if let lo = min, let hi = max, lo.isFinite, hi.isFinite, hi > lo,
                (hi - lo).isFinite, (hi - lo) / 100 > 0 {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(verbatim: field.title)
-                        Spacer()
-                        Text(verbatim: PluginNumberField.format(number, integer: integer)).monospacedDigit()
+                if compact {
+                    HStack(spacing: 8) {
+                        Text(verbatim: field.title).fixedSize()
+                        numberSlider(lo: lo, hi: hi, integer: integer).frame(width: 140)
+                        Text(verbatim: PluginNumberField.format(number, integer: integer))
+                            .monospacedDigit().fixedSize()
                     }
-                    Slider(value: $number, in: lo...hi, step: integer ? 1 : (hi - lo) / 100) { editing in
-                        if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(verbatim: field.title)
+                            Spacer()
+                            Text(verbatim: PluginNumberField.format(number, integer: integer)).monospacedDigit()
+                        }
+                        numberSlider(lo: lo, hi: hi, integer: integer)
                     }
-                    .accessibilityLabel(Text(verbatim: field.title))
-                    .accessibilityValue(Text(verbatim: PluginNumberField.format(number, integer: integer)))
                 }
-                .frame(minWidth: compact ? 180 : nil)
             } else {
                 textField(keyboard: .numbersAndPunctuation) {
                     PluginNumberField.parse(draft, min: min, max: max, integer: integer)
@@ -1725,6 +1729,14 @@ struct SchemaFieldControl: View {
         case .json:
             textField(keyboard: .default) { try? JSONValue.parse(draft) }
         }
+    }
+
+    private func numberSlider(lo: Double, hi: Double, integer: Bool) -> some View {
+        Slider(value: $number, in: lo...hi, step: integer ? 1 : (hi - lo) / 100) { editing in
+            if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
+        }
+        .accessibilityLabel(Text(verbatim: field.title))
+        .accessibilityValue(Text(verbatim: PluginNumberField.format(number, integer: integer)))
     }
 
     private func textField(keyboard: UIKeyboardType, parse: @escaping () -> JSONValue?) -> some View {
