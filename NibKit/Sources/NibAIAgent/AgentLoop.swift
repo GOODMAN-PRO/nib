@@ -14,6 +14,7 @@ struct TurnOutcome {
     var toolNames: [String] = []
     var cancelled = false
     var stepLimitReached = false
+    var stopReason: String?
     var error: NibError?
 }
 
@@ -91,6 +92,7 @@ final class AgentLoop {
         var callSeq = 0
 
         while true {
+            out.stopReason = nil
             let request = ChatRequest(model: s.config.model, system: system, messages: messages, tools: s.toolbox.tools,
                                       maxTokens: s.config.maxOutputTokens)
             var roundText = ""
@@ -113,8 +115,8 @@ final class AgentLoop {
                     case let .usage(input, output):
                         out.usage.input += input
                         out.usage.output += output
-                    case .stop:
-                        break
+                    case .stop(let reason):
+                        out.stopReason = reason
                     }
                 }
             } catch {
@@ -131,7 +133,23 @@ final class AgentLoop {
                 out.cancelled = true
                 return out
             }
-            guard !calls.isEmpty else { return out }
+            guard !calls.isEmpty else {
+                if out.stopReason == "max_tokens" {
+                    let message = String(localized: "The answer was cut off because the model reached its output limit.")
+                    if s.jsonOutput {
+                        out.error = NibError(.unavailable, message,
+                                            hint: String(localized: "Increase Max output tokens in Settings > AI and try again."))
+                    } else {
+                        let note = (out.text.isEmpty ? "" : "\n\n") + message
+                        out.text += note
+                        sink(.text(note))
+                    }
+                } else if out.stopReason == "refusal" {
+                    out.error = NibError(.unavailable, String(localized: "The model declined to answer this request."),
+                                        hint: String(localized: "Try rephrasing your request."))
+                }
+                return out
+            }
             guard out.steps < maxSteps else {
                 // The model ignored the step-limit note: stop without running more tools.
                 out.stepLimitReached = true

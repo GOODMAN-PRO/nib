@@ -244,6 +244,7 @@ final class AgentService: AIService {
         ]
         if outcome.cancelled { payload["cancelled"] = true }
         if outcome.stepLimitReached { payload["stepLimitReached"] = true }
+        if let reason = outcome.stopReason { payload["stop_reason"] = .string(reason) }
         if let e = outcome.error { payload["error"] = e.json["error"] ?? .null }
         app?.events.emit(NibEventType.aiTurnFinished, principal: principal, doc: doc, changes: outcome.changes,
                          payload: .object(payload))

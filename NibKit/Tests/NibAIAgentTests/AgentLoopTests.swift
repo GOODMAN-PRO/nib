@@ -181,6 +181,41 @@ enum AgentFixture {
 final class AgentLoopTests: XCTestCase {
     typealias P = ScriptedProvider
 
+    func testTruncatedAnswerStreamsNoticeAndReportsStopReason() async throws {
+        let (h, agent) = AgentFixture.make(P(events: [[.textDelta("Partial"), .stop(reason: "max_tokens")]]))
+        var finished: [NibEvent] = []
+        let sub = h.app.events.subscribe { if $0.type == NibEventType.aiTurnFinished { finished.append($0) } }
+        defer { sub.cancel() }
+        var text = ""
+        var response: AIResponse?
+        for try await event in agent.stream(AgentFixture.request("Answer", mode: .ask)) {
+            if case .text(let delta) = event { text += delta }
+            if case .finished(let value) = event { response = value }
+        }
+        XCTAssertTrue(text.hasPrefix("Partial\n\n"))
+        XCTAssertTrue(text.contains("output limit"))
+        XCTAssertEqual(response?.text, text)
+        XCTAssertEqual(finished.last?.payload?["stop_reason"]?.stringValue, "max_tokens")
+    }
+
+    func testTruncatedJSONAndRefusalsFailExplicitly() async throws {
+        for (reason, text, json) in [("max_tokens", "{\"answer\":", true),
+                                     ("refusal", "", false), ("refusal", "I cannot answer.", false)] {
+            let (h, agent) = AgentFixture.make(P(events: [[.textDelta(text), .stop(reason: reason)]]))
+            var request = AgentFixture.request("Answer", mode: .ask)
+            request.jsonOutput = json
+            do {
+                _ = try await agent.complete(request)
+                XCTFail("Incomplete or declined answers must not succeed")
+            } catch {
+                XCTAssertEqual(NibError.wrap(error).code, .unavailable)
+            }
+            XCTAssertEqual(agent.chatStore.messages("CHATTEST0001").last?.text, text)
+            XCTAssertNotNil(agent.chatStore.messages("CHATTEST0001").last?.error)
+            _ = h // Keep the app alive for the agent's weak reference.
+        }
+    }
+
     /// Acceptance: a scripted provider drives a 3-call turn against the Harness; the turn is ONE undo group, its
     /// items carry the chat's provenance, and it ends with `ai.turn.finished`.
     func testThreeCallTurnIsOneUndoGroupWithProvenance() async throws {
