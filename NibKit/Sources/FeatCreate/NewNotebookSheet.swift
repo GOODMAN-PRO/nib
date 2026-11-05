@@ -1075,6 +1075,7 @@ struct NewNotebookSheet: View {
                 } paper: {
                     VStack(alignment: .leading, spacing: NibSpacing.xl) {
                         paperSection
+                        coverColourSection
                         optionsSection
                     }
                     .disabled(model.isWorking)
@@ -1191,7 +1192,7 @@ struct NewNotebookSheet: View {
 
     private var coverSection: some View {
         NibInspectorSection(String(localized: "Cover"), value: draft.hasCover ? nil : String(localized: "None")) {
-            ScrollView(.horizontal, showsIndicators: false) {
+            ScrollView(.horizontal) {
                 HStack(alignment: .top, spacing: NibSpacing.l) {
                     NibPaperTile(name: String(localized: "No cover"), isSelected: !draft.hasCover,
                                  size: NibMetrics.coverStripSize, action: { model.selectCover(nil) }) {
@@ -1206,17 +1207,24 @@ struct NewNotebookSheet: View {
                         }
                     }
                 }
+                .scrollTargetLayout()
                 .padding(NibStroke.ring + NibStroke.ringOutset)
             }
-            if draft.hasCover && model.coverTakesColour {
-                NibInspectorSection(String(localized: "Cover colour")) {
-                    NibChip(String(localized: "Use cover's colour"), style: .filter(isSelected: draft.cloth == nil),
-                            action: { model.selectCloth(nil) })
-                    NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
-                                  selection: Binding(get: { model.draft.cloth?.rawValue },
-                                                     set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
-                                  columns: swatchColumns(count: NibCoverCloth.allCases.count))
-                }
+            .scrollTargetBehavior(.viewAligned)
+            .scrollIndicators(.visible)
+            .scrollIndicatorsFlash(onAppear: true)
+        }
+    }
+
+    @ViewBuilder private var coverColourSection: some View {
+        if draft.hasCover && model.coverTakesColour {
+            NibInspectorSection(String(localized: "Cover colour")) {
+                NibChip(String(localized: "Use cover's colour"), style: .filter(isSelected: draft.cloth == nil),
+                        action: { model.selectCloth(nil) })
+                NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
+                              selection: Binding(get: { model.draft.cloth?.rawValue },
+                                                 set: { model.selectCloth($0.flatMap(NibCoverCloth.init(rawValue:))) }),
+                              columns: swatchColumns(count: NibCoverCloth.allCases.count))
             }
         }
     }
