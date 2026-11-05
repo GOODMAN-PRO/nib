@@ -992,6 +992,8 @@ final class CalendarStore: ObservableObject {
     /// `begin()`'s first work (queued Take Notes, then a refresh); tests await it.
     private(set) var startTask: Task<Void, Never>?
 
+    private var activeReads: [UUID: DateInterval] = [:]
+    private var supersededReads = Set<UUID>()
     private var providerStorage: CalendarProvider?
     @Published private(set) var reminderError: String?
     private var notifierStorage: NotificationScheduling?
@@ -1029,6 +1031,7 @@ final class CalendarStore: ObservableObject {
             return p
         }
         set {
+            supersededReads.formUnion(activeReads.keys)
             providerStorage = newValue
             access = newValue.access
         }
@@ -1194,9 +1197,22 @@ final class CalendarStore: ObservableObject {
             throw NibError(.unavailable, "Nib does not have full access to Calendars",
                            hint: "turn on Full Access for Nib in Settings › Privacy & Security › Calendars")
         }
+        let request = UUID()
+        let interval = DateInterval(start: from, end: to)
+        for (id, range) in activeReads where range.start < to && range.end > from {
+            supersededReads.insert(id)
+        }
+        activeReads[request] = interval
         isSyncing = true
-        defer { isSyncing = false }
+        defer {
+            activeReads[request] = nil
+            supersededReads.remove(request)
+            isSyncing = !activeReads.isEmpty
+        }
         let source = provider
+        func isCurrent() -> Bool {
+            !Task.isCancelled && !supersededReads.contains(request) && source === provider && source.access == .granted
+        }
         let events: [CalendarEvent]
         let calendars: [CalendarInfo]
         do {
@@ -1204,10 +1220,12 @@ final class CalendarStore: ObservableObject {
                 (try source.events(from: from, to: to), source.calendars())
             }.value
         } catch {
+            guard isCurrent() else { throw CancellationError() }
             let e = NibError.wrap(error)
             lastError = e
             throw e
         }
+        guard isCurrent() else { throw CancellationError() }
         lastError = nil
         var names: [String] = []
         for c in calendars where !c.source.isEmpty && !names.contains(c.source) { names.append(c.source) }
@@ -1252,6 +1270,7 @@ final class CalendarStore: ObservableObject {
 
     /// Calendar access went away: forget every cached event (privacy) and redraw planner pages.
     private func forgetEvents() {
+        supersededReads.formUnion(activeReads.keys)
         guard cache.latestSync != nil || !upcoming.isEmpty else { return }
         cache.clear()
         upcoming = []

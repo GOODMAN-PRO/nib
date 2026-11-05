@@ -562,6 +562,33 @@ final class FeatCalendarTests: XCTestCase {
                                    calendar: cal).pages.count, PlannerPlan.maxDays)
     }
 
+    func testSharedCalendarCacheRejectsOlderOverlappingFetch() async throws {
+        let oldEvent = event("Old snapshot", Date().addingTimeInterval(3_600))
+        let newEvent = event("New snapshot", Date().addingTimeInterval(3_600))
+        let (h, store, _) = harness([])
+        defer { withExtendedLifetime(h) {} }
+        let started = expectation(description: "old read blocked")
+        let provider = BlockingCalendarRead(old: [oldEvent], latest: [newEvent], started: started)
+        store.provider = provider
+        let window = CalendarDates.upcomingWindow()
+        let old = Task { try await store.fetch(from: window.start, to: window.end, principal: .user) }
+        defer { provider.release() }
+        await fulfillment(of: [started], timeout: 2)
+        let latest = try await store.fetch(from: window.start, to: window.end, principal: .user)
+        let revision = store.revision
+        let sync = store.cache.latestSync
+        XCTAssertTrue(store.isSyncing, "the older read is still running")
+        provider.release()
+        do { _ = try await old.value; XCTFail("superseded read must be cancelled") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(latest.map(\.id), [newEvent.id])
+        XCTAssertEqual(store.upcoming.map(\.id), [newEvent.id])
+        XCTAssertEqual(store.cache.events(overlapping: window.start, window.end).map(\.id), [newEvent.id], "planner reads the same protected cache")
+        XCTAssertEqual(store.cache.latestSync, sync)
+        XCTAssertEqual(store.revision, revision)
+        XCTAssertFalse(store.isSyncing)
+    }
+
     func testOtherEventsIgnoresAnOlderSuccessAfterTheNewDayFinishes() async throws {
         let model = OtherEventsModel()
         model.date = date(2026, 9, 29)
@@ -922,4 +949,29 @@ private final class TestCalendarScheduler: NotificationScheduling {
     func replace(prefix: String, with reminders: [PlannedReminder]) async throws {
         try await scheduler.replace(prefix: prefix, with: reminders)
     }
+}
+
+private final class BlockingCalendarRead: CalendarProvider {
+    let access = CalendarAccess.granted
+    let old: [CalendarEvent]
+    let latest: [CalendarEvent]
+    let started: XCTestExpectation
+    private let lock = NSLock()
+    private var reads = 0
+    private let gate = DispatchSemaphore(value: 0)
+    init(old: [CalendarEvent], latest: [CalendarEvent], started: XCTestExpectation) {
+        self.old = old; self.latest = latest; self.started = started
+    }
+    func release() { gate.signal() }
+    func requestAccess() async -> CalendarAccess { access }
+    func events(from: Date, to: Date) throws -> [CalendarEvent] {
+        lock.lock(); reads += 1; let first = reads == 1; lock.unlock()
+        if first {
+            started.fulfill()
+            guard gate.wait(timeout: .now() + 3) == .success else { throw NibError.unavailable("calendar gate timed out") }
+        }
+        return first ? old : latest
+    }
+    func calendars() -> [CalendarInfo] { latest.map(\.calendar) }
+    func observeChanges(_ handler: @escaping () -> Void) -> AnyObject? { nil }
 }
