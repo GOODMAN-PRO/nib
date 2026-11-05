@@ -574,6 +574,11 @@ struct PackageFiles {
     func pageSources(_ pkg: URL, page: PageID) throws -> [Source] {
         let dir = pkg.appendingPathComponent(PackageCodec.pageDirectory(page), isDirectory: true)
         let names = try pageDirectoryContents(dir, package: pkg)
+        // Provider placeholders are filtered out by pageRole. An evicted own file is not an empty page:
+        // accepting that snapshot would let the next edit replace ink that has not downloaded yet.
+        guard !names.contains("." + PackageCodec.pageFileName(device) + ".icloud") else {
+            throw NibError(.unavailable, String(localized: "This page has not finished downloading. Try again when it is available."))
+        }
         return sources(names, in: dir, role: PackageCodec.pageRole)
     }
 

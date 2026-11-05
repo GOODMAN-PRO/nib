@@ -877,9 +877,10 @@ final class FolderLibrary: LibraryService {
             let gen = generation
             var job = scanner(previous: catalog.byPath)
             job.reuse = FileManager.default.fileExists(atPath: cacheURL.path)
+            let scan = job
             let (result, names, offMain) = try await Task.detached(priority: .utility) {
-                _ = try FileManager.default.contentsOfDirectory(at: job.root, includingPropertiesForKeys: nil)
-                return (job.scanAll(), prefs.reload(), !Thread.isMainThread)
+                _ = try FileManager.default.contentsOfDirectory(at: scan.root, includingPropertiesForKeys: nil)
+                return (scan.scanAll(), prefs.reload(), !Thread.isMainThread)
             }.value
             guard rootEpoch == epoch else {
                 throw NibError(.conflict, String(localized: "The library changed while refreshing. Try syncing again."))

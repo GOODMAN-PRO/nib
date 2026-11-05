@@ -404,22 +404,42 @@ final class PageThumbnailModel: ObservableObject {
     private var request: Request?
     private var generation = UUID()
     private var task: Task<Void, Never>?
+    private let debounceNanoseconds: UInt64
+    private var coverPage: PageID?
+    private var needsCoverResolution = true
 
-    init(app: NibApp) {
+    init(app: NibApp, debounceNanoseconds: UInt64 = 300_000_000) {
         self.app = app
+        self.debounceNanoseconds = debounceNanoseconds
         bag.items.append(app.bus.observeCommits { [weak self] changes in
             guard let self, let request = self.request, changes.documents.contains(request.doc) else { return }
+            if changes.headChanged(request.doc) { self.needsCoverResolution = true }
             self.reload()
         })
         bag.items.append(app.events.subscribe { [weak self] event in
             guard event.type == NibEventType.libraryChanged else { return }
-            Task { @MainActor in self?.reload() }
+            Task { @MainActor in
+                guard let self, let request = self.request else { return }
+                // Quiet modification notifications accompany ink commits, which already tell us whether
+                // the head changed. Only a relevant catalogue refresh/change can replace a closed cover.
+                let refs = event.payload?["refs"]?.arrayValue?.compactMap(\.stringValue)
+                // Catalogue payloads cap refs at 500; a full list cannot rule this document out.
+                let relevant = refs == nil || refs?.isEmpty == true || (refs?.count ?? 0) >= 500 ||
+                    refs?.contains("doc:" + request.doc.raw) == true
+                if event.payload?["root"]?.boolValue == true ||
+                    (relevant && event.payload?["modified"]?.boolValue != true) {
+                    self.needsCoverResolution = true
+                }
+                self.reload()
+            }
         })
     }
 
     func configure(_ request: Request) {
+        needsCoverResolution = true
+        coverPage = nil
         self.request = request
-        reload()
+        reload(immediately: true)
     }
 
     func stop() {
@@ -429,7 +449,7 @@ final class PageThumbnailModel: ObservableObject {
         request = nil
     }
 
-    private func reload() {
+    private func reload(immediately: Bool = false) {
         task?.cancel()
         let token = UUID()
         generation = token
@@ -437,13 +457,22 @@ final class PageThumbnailModel: ObservableObject {
             image = nil
             return
         }
-        // Resolve covers again on every edit/undo/refresh: the first page may have been replaced.
-        var target = request.page
-        if target == nil, let head = try? app.workspace.peekContent(request.doc) { target = head.livePages.first?.id }
-        guard let target, let renderer = app.services.renderer else { image = nil; return }
+        let delay = immediately ? 0 : debounceNanoseconds
         task = Task { @MainActor [weak self] in
-            let rendered = await renderer.thumbnail(doc: request.doc, page: target, maxPixelSize: request.pixels)
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
             guard !Task.isCancelled, let self, self.generation == token else { return }
+            guard self.app.services.lock?.isLocked(request.doc) != true else { self.image = nil; return }
+            if request.page == nil, self.needsCoverResolution {
+                guard let head = try? self.app.workspace.peekContent(request.doc) else { self.image = nil; return }
+                self.coverPage = head.livePages.first?.id
+                self.needsCoverResolution = false
+            }
+            guard let target = request.page ?? self.coverPage, let renderer = self.app.services.renderer else {
+                self.image = nil
+                return
+            }
+            let rendered = await renderer.thumbnail(doc: request.doc, page: target, maxPixelSize: request.pixels)
+            guard !Task.isCancelled, self.generation == token else { return }
             self.image = rendered
         }
     }

@@ -27,6 +27,24 @@ private final class CountingThumbnailRenderer: PageRenderer {
     func purgeCaches() {}
 }
 
+@MainActor
+private final class CountingHeadPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    private(set) var headReads = 0
+    init(_ base: InMemoryPersistence) { self.base = base }
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent {
+        headReads += 1
+        return try base.loadHead(doc)
+    }
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+    func flush(_ doc: DocumentID) {}
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
+}
+
 /// Stand-in for page.setBookmarked (F046): bookmarks one page through a real transaction, so the page index sees a
 /// commit and an undo like it would in the app.
 private struct BookmarkStandIn: NibCommand {
@@ -392,6 +410,48 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         h.app.events.emit(NibEventType.libraryChanged)
         await eventually { renderer.requests.count > count }
         XCTAssertGreaterThan(renderer.requests.count, count)
+    }
+
+    func testThumbnailCoalescesCommitsAndLibraryEventsWithoutRereadingClosedCover() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let persistence = CountingHeadPersistence(h.persistence)
+        h.app.workspace.persistence = persistence
+        let renderer = CountingThumbnailRenderer()
+        h.app.services.renderer = renderer
+        let model = PageThumbnailModel(app: h.app, debounceNanoseconds: 20_000_000)
+        defer { model.stop() }
+        model.configure(.init(doc: Fixtures.docID, page: nil, pixels: 80, locked: false))
+        await eventually { renderer.completions == 1 }
+        XCTAssertEqual(persistence.headReads, 1)
+        XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.docID))
+        for _ in 0..<10 {
+            h.app.events.emit(NibEventType.libraryChanged, payload: ["modified": true])
+            h.app.events.emit(NibEventType.libraryChanged, payload: ["refs": ["doc:UNRELATED"]])
+        }
+        await eventually { renderer.completions >= 2 }
+        XCTAssertEqual(renderer.requests.count, 2, "the burst renders once after the debounce")
+        XCTAssertEqual(persistence.headReads, 1, "unrelated and ink notifications do not reread a closed head")
+
+        // A relevant remote refresh may replace the first page while the document remains closed.
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        head.pages.removeAll { $0.id == Fixtures.page1 }
+        h.persistence.heads[Fixtures.docID] = head
+        h.app.events.emit(NibEventType.libraryChanged,
+                          payload: ["refresh": true, "refs": [.string("doc:" + Fixtures.docID.raw)]])
+        await eventually { renderer.completions >= 3 }
+        XCTAssertEqual(renderer.requests.last, Fixtures.page2)
+        XCTAssertEqual(persistence.headReads, 2)
+
+        try await h.insert([Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 1)]))],
+                           page: Fixtures.page2)
+        await eventually { renderer.completions >= 4 }
+        let count = renderer.requests.count
+        for _ in 0..<10 {
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        }
+        await eventually { renderer.completions > count }
+        XCTAssertEqual(renderer.requests.count, count + 1, "a synchronous burst of commits renders only once")
     }
 
     func testSupersededThumbnailCannotRevealImageAfterLocking() async {

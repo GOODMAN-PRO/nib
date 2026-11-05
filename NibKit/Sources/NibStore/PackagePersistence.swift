@@ -170,7 +170,7 @@ final class PackagePersistence: DocumentPersistence {
     private var known: [DocumentID: Known] = [:]
     /// Snapshot readers (indexing, library thumbnails) never open their documents. Retain only a small recent
     /// working set for them; all open documents stay pinned for remote-change detection. Write recovery is separate.
-    static let closedReadCacheLimit = 8
+    static let closedReadCacheLimit = 32
     private let isDocumentOpen: (DocumentID) -> Bool
     private var readCacheOrder: [DocumentID] = []
     var retainedReadDocuments: Set<DocumentID> { Set(known.keys).union(seen.keys).union(fileRevisions.keys) }
@@ -346,12 +346,21 @@ final class PackagePersistence: DocumentPersistence {
 
     /// Operations that copy package bytes must know that every pending edit reached those bytes.
     func checkpoint(_ doc: DocumentID) throws {
-        if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
+        func skipReadOnly() throws -> Bool {
+            guard gate.contains(doc) else { return false }
+            // A clean newer-format package can be copied unchanged. Only outstanding writes make
+            // a checkpoint unsafe; keep them intact if the format gate changed after an edit.
+            if pending[doc]?.isEmpty == false || readable.snapshot(doc) != nil {
+                throw ReadOnlyGate.refusal(doc)
+            }
+            return true
+        }
+        if try skipReadOnly() { return }
         // Finish queued log appends before inspecting recovery obligations. A newly launched store may have
         // no in-memory writes at all; replay its WAL into full snapshots before copying package bytes.
         waitForIO()
         if !wal.read(doc).isEmpty { _ = try readHead(doc, remembering: false) }
-        if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
+        if try skipReadOnly() { return }
         if let error = write(doc, synchronously: true) { throw error }
     }
 

@@ -257,7 +257,7 @@ final class WebDAVSettingsModel: ObservableObject {
     }
 
     func reconcileFields() {
-        guard WebDAVSettings.read(app.settings) != expected else { return }
+        guard working == nil, WebDAVSettings.read(app.settings) != expected else { return }
         if isDirty {
             errorMessage = WebDAVConfigureCommand.staleSettings.message
         } else {
@@ -319,6 +319,8 @@ final class WebDAVSettingsModel: ObservableObject {
     func disconnect() async {
         errorMessage = nil
         testResult = nil
+        working = .saving
+        defer { working = nil }
         do {
             let draft = WebDAVConfigureCommand.stage(settings: app.settings, expected: expected, password: "")
             defer { WebDAVConfigureCommand.discard(draft) }

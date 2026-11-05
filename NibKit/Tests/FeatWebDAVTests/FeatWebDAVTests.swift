@@ -739,6 +739,34 @@ final class FeatWebDAVTests: XCTestCase {
         WebDAVCredentials.setPassword(nil, url: second.baseURL, user: "alex")
     }
 
+    func testOwnConfigurationStatusDoesNotMarkSuccessfulSaveOrDisconnectStale() async throws {
+        let (h, _, server) = try makeHarness()
+        let model = WebDAVSettingsModel(app: h.app)
+        model.url = server.baseURL
+        model.user = "status-race"
+        var reconciledDuringWrite = 0
+        // configurationChanged emits synchronously after writing settings, before save/disconnect reload
+        // their baseline. Reconcile at precisely the point a suspended status refresh could resume.
+        let subscription = h.app.events.subscribe { event in
+            guard event.decode(SyncStatusPayload.self)?.source == "webdav", model.isWorking else { return }
+            reconciledDuringWrite += 1
+            model.reconcileFields()
+            XCTAssertNil(model.errorMessage)
+        }
+        defer { subscription.cancel() }
+        let saved = await model.save()
+        XCTAssertTrue(saved)
+        XCTAssertGreaterThan(reconciledDuringWrite, 0)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isDirty)
+        let beforeDisconnect = reconciledDuringWrite
+        await model.disconnect()
+        XCTAssertGreaterThan(reconciledDuringWrite, beforeDisconnect)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.savedConfigured)
+        XCTAssertFalse(model.isWorking)
+    }
+
     func testConfigureValidatesStoresAndReportsMissingCredentials() async throws {
         let (h, _, server) = try makeHarness()
         do {
