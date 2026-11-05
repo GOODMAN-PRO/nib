@@ -1238,6 +1238,12 @@ final class NibUI {
     func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
         try timedAction("Native key \(key), modifiers \(modifiers.rawValue)") {
             try focusField(field)
+            if key.lowercased() == "a", modifiers.contains(.command) {
+                guard isKeyboardFocused(field, allowingAttributeFallback: true)
+                        || (try? readState())?.keyResponderIsText == true else {
+                    throw Failure.message("Native Select All rejected: text does not have the keyboard")
+                }
+            }
             XCTContext.runActivity(named: "Native field key route") { activity in
                 let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(probe.value ?? "missing")")
                 attachment.lifetime = .keepAlways; activity.add(attachment)
@@ -1248,6 +1254,8 @@ final class NibUI {
 
     /// Clear is an observable prerequisite, so a failed Select All can never append replacement text.
     func clearNativeText(in field: XCUIElement) throws {
+        // focusField taps an unfocused editor and verifies focus before nativeKey can send Select All.
+        try focusField(field)
         try nativeKey("a", in: field)
         guard let value = field.value as? String else { throw Failure.message("Native editor has no readable value") }
         if value.isEmpty || value == field.placeholderValue { return }
