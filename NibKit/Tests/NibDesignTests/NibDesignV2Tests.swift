@@ -34,6 +34,19 @@ final class NibDesignV2Tests: XCTestCase {
         XCTAssertEqual(NibSymbol.lap.name, "flag")
     }
 
+    func testSettingsAndLessonTokensUseTheirOwnSemanticGlyphs() {
+        let tokens: [(NibSymbol, String)] = [(.accessibility, "accessibility"),
+                                            (.recordingSettings, "waveform"), (.lesson, "play.rectangle")]
+        for (token, name) in tokens {
+            XCTAssertEqual(token.name, name)
+            XCTAssertTrue(NibSymbol.all.contains(token), "Include new tokens in the OS symbol-resolution test")
+            XCTAssertNotNil(UIImage(nib: token))
+        }
+        XCTAssertNotEqual(NibSymbol.accessibility, .speak)
+        XCTAssertNotEqual(NibSymbol.recordingSettings, .transcript)
+        XCTAssertNotEqual(NibSymbol.lesson, .share)
+    }
+
     // MARK: Swatches
 
     func testLuminanceRingRuleReproducesTheInkTable() {
