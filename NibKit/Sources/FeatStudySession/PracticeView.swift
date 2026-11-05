@@ -64,6 +64,7 @@ final class StudySessionModel: ObservableObject {
     @Published private(set) var flipped = false
     @Published private(set) var mode = "practice"
     @Published private(set) var reviewed: [NibID] = []
+    private(set) var reviewedIDs = Set<NibID>()
     @Published private(set) var hardest: [NibID] = []
     @Published private(set) var language = "en-US"
     @Published private(set) var started = false
@@ -106,6 +107,10 @@ final class StudySessionModel: ObservableObject {
     }
     var paused: Bool { content.map { StudyPreferences.paused($0.meta) } ?? true }
     var readOnly: Bool { app.isReadOnly(doc) || session?.readOnly == true }
+    var canFlip: Bool { current != nil && !busy }
+    var canGoPrevious: Bool { canFlip && mode == "practice" && index > 0 }
+    var canGoNext: Bool { canFlip && mode == "practice" && index + 1 < queue.count }
+    var canGrade: Bool { canFlip && flipped && !readOnly }
     var nextReview: Double? { Scheduler.nextReview(liveCards, now: runtime.now()) }
 
     func accept(_ content: DocumentContent) {
@@ -135,7 +140,7 @@ final class StudySessionModel: ObservableObject {
             guard let content else { throw NibError.notFound("study set") }
             self.mode = mode ?? "practice"
             queue = (self.mode == "smartLearn" ? Scheduler.due(liveCards, now: runtime.now()) : liveCards).map(\.id)
-            index = 0; reviewed = []; hardest = []; instantFlip = true; flipped = false; started = true
+            index = 0; reviewed = []; reviewedIDs = []; hardest = []; instantFlip = true; flipped = false; started = true
             self.language = StudyVoiceLanguages.resolve(content.meta.language, installed: voiceLanguages) ?? content.meta.language
             speaker.stop()
         case "flip":
@@ -176,8 +181,8 @@ final class StudySessionModel: ObservableObject {
         guard started, queue.contains(id) else { return }
         if mode == "practice" {
             guard current?.id == id else { return }
-        } else if reviewed.contains(id) { return }
-        if !reviewed.contains(id) { reviewed.append(id) }
+        } else if reviewedIDs.contains(id) { return }
+        if reviewedIDs.insert(id).inserted { reviewed.append(id) }
         if (rating == .again || rating == .hard), !hardest.contains(id) { hardest.append(id) }
         instantFlip = true
         flipped = false; speaker.stop()
@@ -186,7 +191,7 @@ final class StudySessionModel: ObservableObject {
 
     private func moveToDueCard() {
         index = queue.firstIndex { id in
-            !reviewed.contains(id) && cardsByID[id].map { Scheduler.dueDate($0) <= runtime.now() } == true
+            !reviewedIDs.contains(id) && cardsByID[id].map { Scheduler.dueDate($0) <= runtime.now() } == true
         } ?? queue.count
     }
 
@@ -236,32 +241,45 @@ final class StudySessionModel: ObservableObject {
         formatter.maximumUnitCount = 2
         return formatter.string(from: s.interval * Scheduler.day) ?? ""
     }
-    func picture(_ face: CardFace, card: StudyCard, back: Bool) -> UIImage? {
-        let paperStyle: UIUserInterfaceStyle = cardIsDark ? .dark : .light
+    func pictureKey(card: StudyCard, back: Bool) -> String {
         let side = back ? "/back" : "/front"
-        let appearance = paperStyle == .dark ? "/dark" : "/light"
-        let key = (card.id.raw + card.rev.description + side + appearance) as NSString
+        let appearance = cardIsDark ? "/dark" : "/light"
+        return card.id.raw + card.rev.description + side + appearance
+    }
+
+    func cachedPicture(_ key: String) -> UIImage? { pictures.object(forKey: key as NSString) }
+
+    func picture(_ face: CardFace, card: StudyCard, back: Bool) async -> UIImage? {
+        let key = pictureKey(card: card, back: back) as NSString
         if let image = pictures.object(forKey: key) { return image }
-        var image: UIImage?
-        if face.kind == .image, let asset = face.asset, let data = try? app.services.assets?.data(asset, doc: doc) {
-            // Downsample large imports before decoding to protect memory on older iPads.
-            if let source = CGImageSourceCreateWithData(data as CFData, nil),
-               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                   kCGImageSourceThumbnailMaxPixelSize: NibMetrics.studyCardSize.width * 2,
-                   kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) { image = UIImage(cgImage: cg) }
-        } else if face.kind == .ink {
-            let size = face.size ?? PageSize(Double(NibMetrics.studyCardSize.width), Double(NibMetrics.studyCardSize.height))
-            let scale = min(2, NibMetrics.studyCardSize.width * 2 / CGFloat(max(size.width, size.height, 1)))
-            // The paper's theme, not the surrounding window, determines PencilKit's ink appearance.
-            UITraitCollection(userInterfaceStyle: paperStyle).performAsCurrent {
-                image = PKBridge.drawing(face.ink ?? []).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+        let paperStyle: UIUserInterfaceStyle = cardIsDark ? .dark : .light
+        let store = app.services.assets, doc = self.doc
+        let worker = Task.detached(priority: .userInitiated) { () -> UIImage? in
+            guard !Task.isCancelled else { return nil }
+            var image: UIImage?
+            if face.kind == .image, let asset = face.asset, let data = try? store?.data(asset, doc: doc) {
+                // Downsample before decoding; asset reads and stroke conversion stay off the main actor.
+                if let source = CGImageSourceCreateWithData(data as CFData, nil),
+                   let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                       kCGImageSourceThumbnailMaxPixelSize: NibMetrics.studyCardSize.width * 2,
+                       kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) { image = UIImage(cgImage: cg) }
+            } else if face.kind == .ink {
+                let size = face.size ?? PageSize(Double(NibMetrics.studyCardSize.width), Double(NibMetrics.studyCardSize.height))
+                let scale = min(2, NibMetrics.studyCardSize.width * 2 / CGFloat(max(size.width, size.height, 1)))
+                UITraitCollection(userInterfaceStyle: paperStyle).performAsCurrent {
+                    image = PKBridge.drawing(face.ink ?? []).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
+                }
             }
+            return image
         }
+        let image = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+        guard !Task.isCancelled else { return nil }
         if let image {
             pictures.setObject(image, forKey: key, cost: (image.cgImage?.bytesPerRow ?? 0) * (image.cgImage?.height ?? 0))
         }
         return image
     }
+
 }
 
 struct PracticeView: View {
@@ -279,12 +297,40 @@ enum StudyCardLayout {
     }
 }
 
+/// Shared by the gesture callbacks, including GestureState's reset when iOS interrupts a drag.
+struct StudyCardDragState {
+    private(set) var offset = CGSize.zero
+    private(set) var isDragging = false
+
+    mutating func changed(_ translation: CGSize, reduceMotion: Bool) {
+        isDragging = true
+        offset = reduceMotion ? .zero : translation
+    }
+
+    mutating func activityChanged(_ active: Bool) {
+        if !active { offset = .zero; isDragging = false }
+    }
+
+    mutating func ended(_ complete: () -> Void) {
+        guard isDragging else { return }
+        activityChanged(false)
+        complete()
+    }
+
+    static func rotation(for offset: CGSize, width: CGFloat, reduceMotion: Bool) -> Double {
+        reduceMotion ? 0 : min(6, max(-6, Double(offset.width / max(width, 1)) * 6))
+    }
+}
+
 struct StudySessionView: View {
     @ObservedObject var model: StudySessionModel
     let smartLearn: Bool
     let close: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var drag = CGSize.zero
+    @GestureState private var dragActive = false
+    @State private var dragState = StudyCardDragState()
+    @State private var swipeOffset = CGSize.zero
+    private var drag: CGSize { swiping ? swipeOffset : dragState.offset }
     @State private var swiping = false
     @State private var resetConfirmed = false
     @State private var optionsPresented = false
@@ -303,6 +349,7 @@ struct StudySessionView: View {
             }
         }
         .onDisappear {
+            dragState.activityChanged(false)
             model.onEnd = nil
             if !model.scratchPresented && !optionsPresented {
                 model.app.perform(StudySessionAction.id, ["doc": .string(model.docRef), "action": "end"], session: model.session)
@@ -321,11 +368,11 @@ struct StudySessionView: View {
                     NibIconButton(.back, label: String(localized: "Previous Card"), size: .panel,
                                   shortcut: KeyboardShortcut(.leftArrow, modifiers: [])) {
                         model.action("previous", instant: true)
-                    }.disabled(model.busy || model.index == 0)
+                    }.disabled(!model.canGoPrevious)
                     NibIconButton(.forward, label: String(localized: "Next Card"), size: .panel,
                                   shortcut: KeyboardShortcut(.rightArrow, modifiers: [])) {
                         model.action("next", instant: true)
-                    }.disabled(model.busy || model.index + 1 >= model.queue.count)
+                    }.disabled(!model.canGoNext)
                 }
                 NibIconButton(.more, label: String(localized: "Study options"), size: .panel) {
                     optionsPresented = true
@@ -409,51 +456,63 @@ struct StudySessionView: View {
         }
         .frame(width: size.width, height: size.height)
         .offset(drag)
-        .rotationEffect(.degrees(reduceMotion ? 0 : min(6, max(-6, Double(drag.width / max(size.width, 1)) * 6))))
+        .rotationEffect(.degrees(StudyCardDragState.rotation(for: drag, width: size.width, reduceMotion: reduceMotion)))
         .transaction { if model.instantFlip { $0.disablesAnimations = true } }
         .contentShape(RoundedRectangle(cornerRadius: NibRadius.studyCard))
         .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.studyCard))
         .hoverEffect(.highlight)
         .onTapGesture { model.action("flip") }
-        .gesture(DragGesture(minimumDistance: NibSpacing.l).onChanged { value in
+        .gesture(DragGesture(minimumDistance: NibSpacing.l).updating($dragActive) { _, state, _ in
+            state = true
+        }.onChanged { value in
             guard !model.busy, !swiping else { return }
-            if !reduceMotion { drag = value.translation }
+            dragState.changed(value.translation, reduceMotion: reduceMotion)
         }.onEnded { value in
-            guard !model.busy, !swiping else { drag = .zero; return }
-            let travel = value.predictedEndTranslation.width
-            if abs(travel) > size.width / 4 {
-                if model.flipped, !model.readOnly {
-                    if reduceMotion { model.grade(travel > 0 ? .good : .again); drag = .zero }
-                    else {
-                        swiping = true
-                        withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
-                            drag = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
-                        } completion: {
-                            if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
-                            swiping = false
-                            var transaction = Transaction(); transaction.disablesAnimations = true
-                            withTransaction(transaction) { drag = .zero }
-                        }
+            withAnimation(reduceMotion ? nil : NibMotion.slot.animation) {
+                dragState.ended {
+                    guard !model.busy, !swiping else { return }
+                    let travel = value.predictedEndTranslation.width
+                    if abs(travel) > size.width / 4 {
+                        if model.flipped, !model.readOnly {
+                            if reduceMotion { model.grade(travel > 0 ? .good : .again) }
+                            else {
+                                swipeOffset = value.translation
+                                swiping = true
+                                withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
+                                    swipeOffset = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
+                                } completion: {
+                                    if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
+                                    swiping = false
+                                    var transaction = Transaction(); transaction.disablesAnimations = true
+                                    withTransaction(transaction) { swipeOffset = .zero }
+                                }
+                            }
+                        } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
                     }
-                } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
-            }
-            if !(model.flipped && !model.readOnly && !reduceMotion && abs(travel) > size.width / 4) {
-                withAnimation(NibMotion.slot.animation) { drag = .zero }
+                }
             }
         })
+        .onChange(of: dragActive) { _, active in
+            withAnimation(reduceMotion ? nil : NibMotion.slot.animation) { dragState.activityChanged(active) }
+        }
+        .onChange(of: card.id) { _, _ in dragState.activityChanged(false) }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isButton)
         .accessibilityLabel(model.flipped ? String(localized: "Answer side") : String(localized: "Question side"))
-        .accessibilityAction(named: String(localized: "Flip Card")) { model.action("flip", instant: true) }
-        .accessibilityAction(named: String(localized: "Previous Card")) { if !smartLearn { model.action("previous", instant: true) } }
-        .accessibilityAction(named: String(localized: "Next Card")) { if !smartLearn { model.action("next", instant: true) } }
-        .accessibilityAction(named: String(localized: "Still Learning")) { model.grade(.again) }
-        .accessibilityAction(named: String(localized: "Knew It")) { model.grade(.good) }
+        .accessibilityActions {
+            if model.canFlip { Button(String(localized: "Flip Card")) { model.action("flip", instant: true) } }
+            if model.canGoPrevious { Button(String(localized: "Previous Card")) { model.action("previous", instant: true) } }
+            if model.canGoNext { Button(String(localized: "Next Card")) { model.action("next", instant: true) } }
+            if model.canGrade {
+                Button(String(localized: "Still Learning")) { model.grade(.again) }
+                Button(String(localized: "Knew It")) { model.grade(.good) }
+            }
+        }
     }
 
     private var flip: some View {
         NibButton(String(localized: "Flip Card"), kind: .plain,
-                  shortcut: KeyboardShortcut(.space, modifiers: [])) { model.action("flip", instant: true) }.disabled(model.busy)
+                  shortcut: KeyboardShortcut(.space, modifiers: [])) { model.action("flip", instant: true) }.disabled(!model.canFlip)
     }
 
     private var grading: some View {
@@ -481,7 +540,7 @@ struct StudySessionView: View {
         let key = String((StudyRating.allCases.firstIndex(of: rating) ?? 0) + 1)
         return StudyGradeButton(title: rating.title, detail: model.interval(rating),
             shortcut: KeyboardShortcut(KeyEquivalent(Character(key)), modifiers: [])) { model.grade(rating) }
-            .disabled(model.busy || !model.flipped || model.readOnly)
+            .disabled(!model.canGrade)
     }
 
     private var controls: some View {
@@ -609,6 +668,9 @@ struct StudyFaceView: View {
     let card: StudyCard
     let face: CardFace
     let back: Bool
+    @State private var image: UIImage?
+    @State private var renderedKey: String?
+    private var renderKey: String { model.pictureKey(card: card, back: back) }
     var body: some View {
         Group {
             if face.kind == .text {
@@ -616,14 +678,23 @@ struct StudyFaceView: View {
                     text.fixedSize(horizontal: false, vertical: true)
                     ScrollView { text }
                 }
-            } else if let image = model.picture(face, card: card, back: back) {
+            } else if let image = model.cachedPicture(renderKey) ?? (renderedKey == renderKey ? image : nil) {
                 Image(uiImage: image).resizable().scaledToFit().padding(NibSpacing.l)
                     .accessibilityLabel(face.kind == .ink ? String(localized: "Handwritten card side") : String(localized: "Image card side"))
+            } else if renderedKey != renderKey {
+                ProgressView().accessibilityLabel(String(localized: "Loading card artwork"))
             } else {
                 Text(String(localized: "This card side is empty or its image is unavailable."))
                     .font(NibFont.callout).foregroundStyle(model.cardIsDark ? NibInk.chalk.color : NibInk.carbon.color)
                     .padding(NibSpacing.xxl)
             }
+        }
+        .task(id: renderKey) {
+            let key = renderKey
+            let result = await model.picture(face, card: card, back: back)
+            guard !Task.isCancelled else { return }
+            image = result
+            renderedKey = key
         }
     }
     private var attributedText: AttributedString {
