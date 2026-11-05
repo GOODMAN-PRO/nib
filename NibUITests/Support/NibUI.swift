@@ -43,6 +43,7 @@ final class NibUI {
     let app = XCUIApplication()
     var probe: XCUIElement { app.otherElements["nib.qa.state"].firstMatch }
     private(set) var formRevealFailure: String?
+    var diagnoseKeyDelivery = false
     var canvas: XCUIElement { app.scrollViews["nib.canvas"].firstMatch }
 
     /// Explicit prerequisites; no test-name detection and no changes to the standard fixture.
@@ -933,6 +934,7 @@ final class NibUI {
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
             let deliveryBefore = chordProbeSnapshot()
             let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
+            logQA("Key before delivery", "route=hardware typeKey key=\(key) modifiers=\(modifiers.rawValue) keyboardExists=\(app.keyboards.firstMatch.exists) " + deliveryBefore.facts)
             try hardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
@@ -971,12 +973,13 @@ final class NibUI {
     }
 
     private func chordProbeSnapshot() -> (state: QAState?, facts: String) {
-        let raw = (try? probe.snapshot())?.value as? String
+        // Snapshot values may truncate the long JSON, losing responder/log decoding.
+        let raw = probe.exists ? probe.value as? String : nil
         let decoded = raw.flatMap { try? JSONDecoder().decode(QAState.self, from: Data($0.utf8)) }
-        // Current probe exposes responder/log but not key-window identity/frame. Preserve the raw
-        // probe for future optional fields and identify the AX frame as a separate observation.
+        // Preserve the current keyWindowState and distinguish it from the first observed AX window.
+        // The probe still has no authoritative scene identifier or keyboard-focus scene ownership.
         let object = raw.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: Any]
-        let keyWindowValue = object?["keyWindow"]
+        let keyWindowValue = object?["keyWindowState"] ?? object?["keyWindow"]
         let windowFrameValue = object?["windowFrame"]
         let keyWindow = keyWindowValue.map { String(describing: $0) } ?? "unavailable in probe"
         let probeFrame = windowFrameValue.map { String(describing: $0) } ?? "unavailable in probe"
@@ -1723,8 +1726,9 @@ final class NibUI {
     }
 
     /// Delivers modifiers while preserving native focus; callers verify the relevant text or formatting result.
-    func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement) throws {
-        try focusField(field)
+    func nativeKey(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags = .command, in field: XCUIElement,
+                   focusVerified: Bool = false) throws {
+        if !focusVerified { try focusField(field) }
         try deliverNativeKey(key, modifiers, in: field)
     }
 
@@ -1737,14 +1741,22 @@ final class NibUI {
                     throw Failure.message("Native Select All rejected: text does not have the keyboard")
                 }
             }
+            let rawProbe = probe.value
             XCTContext.runActivity(named: "Native field key route") { activity in
-                let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(probe.value ?? "missing")")
+                let attachment = XCTAttachment(string: "route=XCUIElement.typeKey field=\(field.label) key=\(key) modifiers=\(modifiers.rawValue) probe=\(rawProbe ?? "missing")")
                 attachment.lifetime = .keepAlways; activity.add(attachment)
             }
             if modifiers.isEmpty, let usage = hidUsage(forKey: key) {
                 // XCUIElement.typeKey cannot produce Escape or Delete either (see hidUsage(forKey:)).
                 try sendHIDKey(usage)
             } else {
+                if diagnoseKeyDelivery {
+                    let route = "route=XCUIElement.typeKey key=\(key) modifiers=\(modifiers.rawValue)"
+                    logQA("Key before delivery", route + " keyboardExists=\(app.keyboards.firstMatch.exists) probe=\(String(describing: rawProbe))")
+                }
+                defer {
+                    if diagnoseKeyDelivery { logQA("Key after delivery", "key=\(key) probe=\(String(describing: probe.value))") }
+                }
                 logQA("Stall boundary", "native typeKey key=\(key) modifiers=\(modifiers.rawValue)")
                 field.typeKey(key == XCUIKeyboardKey.return.rawValue ? "\n" : key, modifierFlags: modifiers)
             }
@@ -1803,7 +1815,7 @@ final class NibUI {
 
     /// Waits for native Cut and Copy availability, which requires a nonempty selection, without editing or undoing.
     /// The callers' rich-text/range assertions verify its extent; this probe preserves text, focus and selection.
-    func verifyNativeSelection(in field: XCUIElement, fullText: String) throws {
+    func verifyNativeSelection(in field: XCUIElement, fullText: String, focusVerified: Bool = false) throws {
         // iPad's input assistant exposes these even when a hardware shortcut does not present the edit menu.
         // Never accept cmd.clipboard.*: those controls describe Nib's object selection, not this native field.
         func available(_ title: String, assistant: String) -> Bool {
@@ -1817,7 +1829,7 @@ final class NibUI {
             return false
         }
         func hasSelection() -> Bool {
-            isKeyboardFocused(field, allowingAttributeFallback: true) && field.value as? String == fullText
+            (focusVerified || isKeyboardFocused(field, allowingAttributeFallback: true)) && field.value as? String == fullText
                 && available("Cut", assistant: "assistantCut") && available("Copy", assistant: "assistantCopy")
         }
         if !hasSelection() {

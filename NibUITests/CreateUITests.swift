@@ -141,6 +141,8 @@ final class CreateUITests: XCTestCase {
     }
 
     func testSuggestedTitleUseReachesCreatedDocument() throws {
+        ui.diagnoseKeyDelivery = true
+        defer { ui.diagnoseKeyDelivery = false }
         // DESIGN §14.6 makes AI suggestions conditional on a connected provider. The fixture has none.
         // Exercise F021's local recognised-text suggestion in the QuickNote title form instead.
         let id = try quickNote()

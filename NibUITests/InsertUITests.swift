@@ -22,6 +22,7 @@ final class InsertUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.diagnoseKeyDelivery = true
         ui.logIdleSelectors(for: String(describing: type(of: self)))
         // A timed-out denial test cannot run teardown. Reset TCC before every fresh fixture.
         ui.app.resetAuthorizationStatus(for: .microphone)
@@ -125,12 +126,13 @@ final class InsertUITests: XCTestCase {
     }
 
     /// Preserves focus for native editing only; global commands use NibUI.chord at their call sites.
-    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command) throws {
-        let field = try focusedField()
+    private func key(_ value: String, _ modifiers: XCUIElement.KeyModifierFlags = .command,
+                     in resolvedField: XCUIElement? = nil) throws {
+        let field = try resolvedField ?? focusedField()
         let fullText = field.value as? String ?? ""
-        try ui.nativeKey(value, modifiers, in: field)
+        try ui.nativeKey(value, modifiers, in: field, focusVerified: resolvedField != nil)
         if value == "a" && modifiers == .command && !fullText.isEmpty && fullText != field.placeholderValue {
-            try ui.verifyNativeSelection(in: field, fullText: fullText)
+            try ui.verifyNativeSelection(in: field, fullText: fullText, focusVerified: resolvedField != nil)
         }
     }
     /// Resolves the current native input immediately before key delivery, avoiding stale retained editors.
@@ -488,9 +490,10 @@ final class InsertUITests: XCTestCase {
     }
     func testTextStylePresetsApplyTypography() throws {
         try beginText("Preset")
+        let presetEditor = try control("Text box", .textView)
         var sizes = Set<String>()
         for title in ["Title", "Heading", "Body", "Caption"] {
-            try key("a"); try tap("Text Style"); try tap(title)
+            try key("a", in: presetEditor); try tap("Text Style"); try tap(title)
             sizes.insert(try control("Larger Text").value as? String ?? "missing")
         }
         XCTAssertEqual(sizes.count, 4, "Each preset must apply distinct typography")

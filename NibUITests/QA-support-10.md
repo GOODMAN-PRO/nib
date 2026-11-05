@@ -158,3 +158,13 @@ Confirmed insert-timeouts-state#2: sticky at y303-507 while the fixed tap was y6
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | StickySevenColours, StickyCollapseExpand, TextBoxStyleAndAutosize, URLLinkSaveRemove; diagram setup | Insert settled item | Which visible frame and stable scroll offset supplied the contact after keyboard avoidance? |
+
+### I3 - keys and field-scoped focus
+
+Confirmed insert-timeouts-state#5 correction: preset selection was repeated at 36/81/143/188 seconds, but an earlier run passed in 146 seconds. Resolve/focus the preset editor once and reuse it for all four native chords and selection checks. The expensive field-focus identity scan is bypassed only for this explicit session; fresh Command-A, text equality and Cut/Copy verification remain on **every** preset. This intentionally follows the verifier over interpreting “once per field” as permission to drop fresh-selection coverage. Round 9b already provides cheap post-tap focus; defaults preserve every other class.
+
+For insert-timeouts-state#3, insert-singles#3 and insert-pickers-audio#4, cause remains unproven. Before every global modified key and the Insert/SuggestedTitle native modified keys, runner log records route, keyboard presence and raw responder/key-window/key-log probe; opted-in native delivery also logs after. Native diagnostics reuse the attachment's existing raw read and default off in other classes; chord snapshots now read the full value attribute to avoid JSON truncation and report current keyWindowState. Global postcondition/no-event logging was already corrected in 9b. No Unicode substitution, flyout workaround, missing-event retry or changed paste expectation. Input-mode/layer ownership is not exposed by the current runner probe; authoritative app internals remain app-owned. CI must show all four fresh selections and original typography results within allowance; missing Command-A/V/comma must have attributable before/after key logs.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| NativeTextInputRetainsUnicode; ObjectCommentCopiesDeepLink; TranscriptSearch; all chord/native-key callers | Key before delivery / Key after delivery | Which route, responder, keyboard presence and raw key-window/log state bracketed delivery? |
