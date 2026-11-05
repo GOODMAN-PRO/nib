@@ -52,6 +52,7 @@ final class QAStateProbe: UIView {
             let state: JSONValue = [
                 "keyResponder": keyResponder,
                 "keyResponderIsText": keyResponderIsText,
+                "keyLog": .array(NibUITestKeyLog.recent.map(JSONValue.string)),
                 "screen": .string(UITestFixture.failure != nil ? "fixtureError" : !UITestFixture.isReady ? "loading" : doc == nil ? "library" : "document"),
                 "document": doc.map { .string($0.raw) } ?? .null,
                 "page": doc == nil ? .null : session.page.map { .string($0.raw) } ?? .null,
@@ -199,4 +200,18 @@ final class QAClipboardProbe: UIView {
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
+}
+
+/// Fixture mode only (SceneDelegate): notes each hardware key press UIKit delivers to this window, before any
+/// responder or key command sees it.
+final class QAKeyLogWindow: UIWindow {
+    override func sendEvent(_ event: UIEvent) {
+        if let presses = event as? UIPressesEvent {
+            for press in presses.allPresses where press.phase == .began {
+                guard let key = press.key else { continue }
+                NibUITestKeyLog.note("window press '\(key.charactersIgnoringModifiers)' code \(key.keyCode.rawValue) flags \(key.modifierFlags.rawValue) keyWindow \(isKeyWindow)")
+            }
+        }
+        super.sendEvent(event)
+    }
 }

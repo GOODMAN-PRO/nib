@@ -205,6 +205,7 @@ final class LibraryCreationKeyboardResponder: UIView {
     }
 
     @objc private func runCreationKey(_ command: UIKeyCommand) {
+        NibUITestKeyLog.note("creation run \(String(describing: command.propertyList))")
         guard let context, let descriptor = descriptors.first(where: { $0.id == command.propertyList as? String }) else { return }
         LibraryCreationShortcuts.perform(descriptor.id, in: context)
     }
@@ -400,6 +401,7 @@ final class CanvasChromeKeyboardResponder: UIView {
     }
 
     @objc private func runChromeKey(_ key: UIKeyCommand) {
+        NibUITestKeyLog.note("canvas run \(String(describing: key.propertyList))")
         guard let context, let descriptor = descriptors.first(where: { $0.id == key.propertyList as? String }) else { return }
         CanvasChromeShortcuts.perform(descriptor.id, in: context)
     }
@@ -407,8 +409,10 @@ final class CanvasChromeKeyboardResponder: UIView {
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var unhandled = presses
         for press in presses {
-            guard let key = press.key,
-                  performUnhandledPress(CanvasKeyPress.shortcut(key, event: event)) else { continue }
+            guard let key = press.key else { continue }
+            let handled = performUnhandledPress(CanvasKeyPress.shortcut(key, event: event))
+            NibUITestKeyLog.note("canvas unhandled '\(key.charactersIgnoringModifiers)' flags \(key.modifierFlags.rawValue) handled \(handled)")
+            guard handled else { continue }
             unhandled.remove(press)
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }

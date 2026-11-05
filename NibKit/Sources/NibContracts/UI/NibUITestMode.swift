@@ -74,3 +74,23 @@ public enum NibUITestScenario: String, CaseIterable {
         return DocumentContent(meta: DocumentMeta(kind: .whiteboard), pages: pages)
     }
 }
+
+/// Fixture mode only: the last hardware key events the app saw and what it did with them. `nib.qa.state` reports
+/// them as `keyLog`, so a failed UI-test chord shows whether the key arrived, where, and which command ran.
+public enum NibUITestKeyLog {
+    private static let lock = NSLock()
+    private static var entries: [String] = []
+
+    public static func note(_ entry: @autoclosure () -> String) {
+        guard NibUITestMode.isEnabled else { return }
+        let text = entry()
+        lock.lock(); defer { lock.unlock() }
+        entries.append(text)
+        if entries.count > 24 { entries.removeFirst(entries.count - 24) }
+    }
+
+    public static var recent: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return entries
+    }
+}

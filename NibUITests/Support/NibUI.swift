@@ -6,6 +6,8 @@ struct QAState: Decodable {
     struct Dock: Decodable { let edge: String; let along: Double }
     let keyResponder: String?
     let keyResponderIsText: Bool?
+    /// The app's last hardware key events (fixture mode): window presses, the responder that took each, the command run.
+    let keyLog: [String]?
     let screen: String
     let document: String?
     let page: String?
@@ -490,6 +492,12 @@ final class NibUI {
             request.lifetime = .keepAlways; activity.add(request)
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
             try hardwareKey(key, modifiers)
+            // The app's own account of the key (window press, responder, command run) goes into the test log
+            // for passing and failing chords alike.
+            defer {
+                XCTContext.runActivity(named: "App key log: "
+                    + ((try? state())?.keyLog?.joined(separator: " | ") ?? "unavailable")) { _ in }
+            }
             do { try postcondition() }
             catch {
                 recordDiagnostics("Chord postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")

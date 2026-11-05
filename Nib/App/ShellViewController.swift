@@ -281,6 +281,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             #if DEBUG
             NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0)")
             #endif
+            NibUITestKeyLog.note("shell unhandled \(input) flags \(flags.rawValue)")
             guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
                 descriptors: app.content.keyCommands.all, in: keyCommandContext),
                   let command = keyCommands?.first(where: { $0.propertyList as? String == descriptor.id }),
@@ -323,6 +324,7 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         #if DEBUG
         NSLog("%@", "[Library key diagnostic] command \(String(describing: sender.propertyList)) typing \(keyCommandContext.isEditingText)")
         #endif
+        NibUITestKeyLog.note("shell run \(String(describing: sender.propertyList)) live \(liveKeyCommand(sender) != nil)")
         guard let d = liveKeyCommand(sender) else { return }
         activateWindow()
         let params = d.resolvedParams(for: session)

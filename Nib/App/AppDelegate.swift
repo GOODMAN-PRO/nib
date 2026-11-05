@@ -85,7 +85,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         guard let windowScene = scene as? UIWindowScene, let app = NibApp.shared else { return }
         let shell = ShellViewController(app: app)
-        let window = UIWindow(windowScene: windowScene)
+        let window: UIWindow = NibUITestMode.isEnabled ? QAKeyLogWindow(windowScene: windowScene)
+            : UIWindow(windowScene: windowScene)
         window.rootViewController = shell
         self.window = window
         self.shell = shell
