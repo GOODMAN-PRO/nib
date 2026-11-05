@@ -260,6 +260,34 @@ final class FeatTransformTests: XCTestCase {
         }
     }
 
+    func testNudgeAndPageMoveRejectHiddenSelectedOrAttachedContent() async throws {
+        for hiddenTarget in [true, false] {
+            let h = Harness(features: [FeatTransformFeature.self])
+            edit(h, Fixtures.imageID) { image in
+                image.layer = 2
+                if !hiddenTarget { image.attachedTo = Fixtures.shapeID }
+            }
+            h.session.hiddenLayers = [2]
+            h.session.selection = Selection(doc: doc, page: page1,
+                                              items: [hiddenTarget ? Fixtures.imageID : Fixtures.shapeID])
+            let before = try h.snapshot()
+            let commands: [(String, JSONValue)] = [
+                ("item.transform", ["translate": [1, 0]]),
+                ("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+            ]
+            for (command, params) in commands {
+                do {
+                    try await h.run(command, params)
+                    XCTFail("hidden selected items and hidden attached children must be protected")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, .invalidParams)
+                }
+                XCTAssertEqual(try h.snapshot(), before)
+                XCTAssertEqual(h.undoDepth(doc), 0)
+            }
+        }
+    }
+
     func testRefsDefaultToTheSelectionAndNothingSelectedIsANoOp() async throws {
         let h = Harness(features: [FeatTransformFeature.self])
         let depth = h.undoDepth(doc)

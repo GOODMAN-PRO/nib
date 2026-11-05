@@ -289,6 +289,27 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testDeleteRejectsHiddenSelectedOrAttachedContentWithoutWriting() async throws {
+        for hiddenTarget in [true, false] {
+            let h = Harness(features: [FeatObjectMenuFeature.self])
+            edit(h, Fixtures.imageID) { image in
+                image.layer = 2
+                if !hiddenTarget { image.attachedTo = Fixtures.shapeID }
+            }
+            h.session.hiddenLayers = [2]
+            select(h, [hiddenTarget ? Fixtures.imageID : Fixtures.shapeID])
+            let before = try h.snapshot()
+            do {
+                try await h.run("item.delete")
+                XCTFail("hidden selected items and hidden attached children must be protected")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .invalidParams)
+            }
+            XCTAssertEqual(try h.snapshot(), before)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        }
+    }
+
     func testDeletingTheSelectionUsesAndClearsIt() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         select(h, [Fixtures.strokeID, Fixtures.textID])

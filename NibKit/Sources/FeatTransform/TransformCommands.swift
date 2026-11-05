@@ -218,13 +218,29 @@ enum TransformTargets {
             }
             return nil
         }
-        return try list.enumerated().map { i, s in
+        let targets = try list.enumerated().map { i, s in
             guard case let .item(doc, page, id)? = NodeRef(s) else {
                 throw NibError(.invalidParams, "'\(s)' is not an item ref", path: "$.refs[\(i)]",
                                hint: "item refs look like item:DOC/PAGE/ITEM (query.find lists them)")
             }
             return TargetRef(doc: doc, page: page, id: id, path: "$.refs[\(i)]")
         }
+        // A drag may outlive a layer visibility change. Include attached content and connector ends, too.
+        if ctx.principal.isUser, let session = ctx.activeSession, !session.hiddenLayers.isEmpty {
+            for group in byPage(targets) where session.document == group.doc {
+                let items = try ctx.workspace.items(group.doc, page: group.page)
+                let travelling = TransformGraph.closure(Set(group.refs.map(\.id)), in: items)
+                let hiddenChange = items.contains { item in
+                    session.hiddenLayers.contains(item.layer) &&
+                        (travelling.contains(item.id) || TransformGraph.anchors(item).contains { travelling.contains($0) })
+                }
+                if hiddenChange {
+                    throw NibError(.invalidParams, String(localized: "This transform would change content on a hidden layer."),
+                                   path: "$.refs", hint: String(localized: "Show the layer before moving this selection."))
+                }
+            }
+        }
+        return targets
     }
 
     /// Refs grouped by (document, page), in first-seen order.

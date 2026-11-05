@@ -312,9 +312,9 @@ enum SelectionEngine {
     typealias HitArea = (Item) -> Rect?
 
     /// Live items of `layer` in the included categories that touch the polygon, in z-order.
-    static func select(_ items: [Item], polygon: [Point], include: Set<LassoCategory>, layer: Int,
+    static func select(_ items: [Item], polygon: [Point], include: Set<LassoCategory>, layer: Int, hiddenLayers: Set<Int> = [],
                        excluding: Set<ElementID> = [], hitArea: HitArea = { _ in nil }) -> [Item] {
-        guard let poly = LassoPolygon(polygon) else { return [] }
+        guard !hiddenLayers.contains(layer), let poly = LassoPolygon(polygon) else { return [] }
         let excludes = !excluding.isEmpty
         return items.filter { item in
             guard !item.deleted, item.layer == layer, !(excludes && excluding.contains(item.id)),
@@ -325,8 +325,9 @@ enum SelectionEngine {
     }
 
     /// The topmost live item of `layer` under a tap that `accept` allows.
-    static func tapTarget(at p: Point, in items: [Item], layer: Int, tolerance: Double,
+    static func tapTarget(at p: Point, in items: [Item], layer: Int, tolerance: Double, hiddenLayers: Set<Int> = [],
                           hitArea: HitArea = { _ in nil }, accept: (Item) -> Bool) -> Item? {
+        guard !hiddenLayers.contains(layer) else { return nil }
         for item in items.reversed() where !item.deleted && item.layer == layer && accept(item) {
             let area = item.kind == .stroke ? nil : hitArea(item)
             if LassoGeometry.hit(item, at: p, tolerance: tolerance, hitArea: area) { return item }
@@ -393,8 +394,9 @@ enum SelectionSupport {
     @discardableResult
     static func apply(_ items: [Item], doc: DocumentID, page: PageID, outline: [Point]?,
                       session: EditorSession) -> SelectionOutput {
+        let items = items.filter { !session.hiddenLayers.contains($0.layer) }
         guard let bounds = LassoGeometry.union(items) else {
-            session.selection = Selection()
+            clear(session)
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
         session.selection = Selection(doc: doc, page: page, items: items.map { $0.id }, bounds: bounds,
@@ -455,7 +457,7 @@ struct SelectionSet: NibCommand {
             ids.append(id)
         }
         guard let t = target else {
-            session.selection = Selection()
+            SelectionSupport.clear(session)
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
         _ = try SelectionSupport.page(NodeRef.page(t.doc, t.page).description, ctx, path: "$.refs")
@@ -511,7 +513,7 @@ struct SelectionFromPolygon: NibCommand {
         }
         let include = try SelectionSupport.include(p.include, ctx)
         let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: p.polygon,
-                                           include: include, layer: session.activeLayer,
+                                           include: include, layer: session.activeLayer, hiddenLayers: session.hiddenLayers,
                                            hitArea: SelectionSupport.hitArea(ctx.content))
         return SelectionSupport.apply(items, doc: doc, page: page, outline: p.polygon, session: session)
     }
@@ -546,7 +548,7 @@ struct SelectionFromRect: NibCommand {
         let polygon = LassoGeometry.corners(rect)
         let include = try SelectionSupport.include(p.include, ctx)
         let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: polygon,
-                                           include: include, layer: session.activeLayer,
+                                           include: include, layer: session.activeLayer, hiddenLayers: session.hiddenLayers,
                                            hitArea: SelectionSupport.hitArea(ctx.content))
         return SelectionSupport.apply(items, doc: doc, page: page, outline: polygon, session: session)
     }
@@ -583,6 +585,10 @@ struct SelectionFromLoop: NibCommand {
             throw NibError(.invalidParams, "expected an item ref like item:D/P/I", path: "$.stroke")
         }
         let loop = try ctx.workspace.item(doc, page: page, id: strokeID)
+        guard !session.hiddenLayers.contains(loop.layer) else {
+            throw NibError(.invalidParams, String(localized: "The loop stroke is on a hidden layer."), path: "$.stroke",
+                           hint: String(localized: "Show the layer before selecting its content."))
+        }
         guard loop.kind == .stroke, let stroke = loop.stroke, stroke.points.count >= 3 else {
             throw NibError(.invalidParams, "item \(strokeID.raw) is not a loop stroke", path: "$.stroke",
                            hint: "pass the ref of a closed ink stroke")
@@ -590,7 +596,8 @@ struct SelectionFromLoop: NibCommand {
         let outline = stroke.polyline
         let include = LassoSettings.included(ctx.services.settings)
         let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: outline,
-                                           include: include, layer: session.activeLayer, excluding: [strokeID],
+                                           include: include, layer: session.activeLayer, hiddenLayers: session.hiddenLayers,
+                                           excluding: [strokeID],
                                            hitArea: SelectionSupport.hitArea(ctx.content))
         try ctx.mutate { tx in try tx.delete(item: strokeID, doc: doc, page: page) }
         let out = SelectionSupport.apply(items, doc: doc, page: page, outline: outline, session: session)
@@ -660,9 +667,11 @@ struct SelectionTapAt: NibCommand {
         if session.tool == SelectionSupport.lassoTool {
             let include = LassoSettings.included(ctx.services.settings)
             target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hiddenLayers: session.hiddenLayers,
                                                hitArea: hitArea) { include.contains(LassoCategory.of($0)) }
         } else if ctx.services.settings.get(NibSettings.objectTapSelection) {
             target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hiddenLayers: session.hiddenLayers,
                                                hitArea: hitArea) { $0.kind != .stroke }
         }
         if let target = target {

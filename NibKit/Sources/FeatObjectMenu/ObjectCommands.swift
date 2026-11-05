@@ -215,6 +215,14 @@ struct ItemDelete: NibCommand {
                 let items = try tx.items(g.doc, page: g.page)
                 _ = try ItemTargets.check(g.targets, items: items, allowLocked: false)
                 let plan = DeletePlan.make(targets: g.targets.map { $0.id }, items: items)
+                if ctx.principal.isUser, let session = ctx.activeSession, session.document == g.doc,
+                   !session.hiddenLayers.isEmpty {
+                    let changed = Set(plan.deleted + plan.updated.map(\.id))
+                    if items.contains(where: { changed.contains($0.id) && session.hiddenLayers.contains($0.layer) }) {
+                        throw NibError(.invalidParams, String(localized: "This deletion would change content on a hidden layer."),
+                                       path: "$.refs", hint: String(localized: "Show the layer before deleting this selection."))
+                    }
+                }
                 try tx.put(plan.updated, doc: g.doc, page: g.page)
                 try tx.delete(items: plan.deleted, doc: g.doc, page: g.page)
                 deleted.append((doc: g.doc, page: g.page, ids: plan.deleted))
