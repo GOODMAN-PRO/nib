@@ -136,6 +136,7 @@ final class ToolbarModel: ObservableObject {
     /// One popover at a time: opening it closes the options bar's own popover.
     @Published var settingsOpen = false {
         didSet {
+            publishQASettings()
             #if DEBUG
             NSLog("%@", "[Nib QA ink] toolbar settings=\(oldValue)->\(settingsOpen) tool=\(tool) more=\(moreOpen) options=\(optionsPopovers.filter { $0.value.wrappedValue }.map(\.key)) dock=\(String(describing: savedDock))")
             #endif
@@ -453,6 +454,13 @@ final class ToolbarModel: ObservableObject {
         }
     }
 
+    /// Fixture observation comes from the owner of the presentation binding, never
+    /// from retained SwiftUI popovers in the accessibility tree.
+    func publishQASettings(isPresented: Bool? = nil) {
+        guard NibUITestMode.isEnabled else { return }
+        session.toolOptions["nib.qa.toolSettingsOpen"] = (isPresented ?? settingsOpen) && isVisible && showsPalette ? .string(tool) : .null
+    }
+
     /// The options bar's chevron: the palette buds the selected tool's settings (one popover at a time).
     func openSettings() {
         expandOptions()
@@ -596,6 +604,8 @@ struct ToolbarRootView: View {
                                        onReselect: { model.toolReselected($0) }) { id in
                             ToolSettingsContent(model: model, toolID: id)
                         }
+                        .onAppear { model.publishQASettings() }
+                        .onDisappear { model.publishQASettings(isPresented: false) }
                     } else {
                         RevealToolsButton(dock: dock, onDock: { model.requestDock($0) }) { model.setVisible(true) }
                     }
