@@ -80,13 +80,21 @@ enum Handwriting {
     }
 
     /// Analyses off the main actor (a whole page of strokes can take longer than a frame).
-    static func layout(_ glyphs: [InkGlyph], hints: [InkHint]) async -> InkLayout {
-        await Task.detached(priority: .userInitiated) { InkLayout.analyze(glyphs, hints: hints) }.value
+    static func rightToLeft(_ doc: DocumentID, workspace: Workspace) -> Bool {
+        let language = (try? workspace.content(doc).meta.language) ?? "en-US"
+        return NSLocale.characterDirection(forLanguage: language) == .rightToLeft
+    }
+
+    static func layout(_ glyphs: [InkGlyph], hints: [InkHint], rightToLeft: Bool = false) async -> InkLayout {
+        await Task.detached(priority: .userInitiated) {
+            InkLayout.analyze(glyphs, hints: hints, rightToLeft: rightToLeft)
+        }.value
     }
 
     static func layout(_ target: Target, ctx: CommandContext) async -> InkLayout {
+        let rtl = rightToLeft(target.doc, workspace: ctx.workspace)
         let hints = await hints(for: target, ctx: ctx)
-        return await layout(target.glyphs, hints: hints)
+        return await layout(target.glyphs, hints: hints, rightToLeft: rtl)
     }
 
     /// Writes per-stroke transforms for every target (page) in one transaction, so a multi-page call changes all its
@@ -385,7 +393,8 @@ struct HandwritingStraighten: NibCommand {
         var lines = 0
         for target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
             // Line geometry only: recognised words would not change it, so no recognition runs.
-            let layout = await Handwriting.layout(target.glyphs, hints: [])
+            let layout = await Handwriting.layout(target.glyphs, hints: [],
+                                                  rightToLeft: Handwriting.rightToLeft(target.doc, workspace: ctx.workspace))
             let transforms = layout.straightening(minimumAngle: minimum * .pi / 180, pivot: pivot)
             straightened += layout.lines.filter { line in line.ids.contains { transforms[$0] != nil } }.count
             lines += layout.lines.count
@@ -428,7 +437,8 @@ struct HandwritingAlign: NibCommand {
         var plans: [(target: Handwriting.Target, transforms: [ElementID: Affine])] = []
         for target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
             // Line geometry only: no recognition.
-            let layout = await Handwriting.layout(target.glyphs, hints: [])
+            let layout = await Handwriting.layout(target.glyphs, hints: [],
+                                                  rightToLeft: Handwriting.rightToLeft(target.doc, workspace: ctx.workspace))
             plans.append((target: target, transforms: Handwriting.translations(layout.alignment(alignment))))
         }
         return Output(moved: try Handwriting.write(plans, ctx: ctx))

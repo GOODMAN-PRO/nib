@@ -181,6 +181,40 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testRTLPreviewAndCommandUseDocumentWritingDirection() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.language", title: "Language",
+                                                  summary: "Set the document language.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.language = "ar"
+                try tx.putMeta(meta)
+            }
+            return [:]
+        }
+        try await h.run("test.language")
+        var s = Synth.paragraph()
+        s.strokes = s.strokes.map { (id: $0.id, points: $0.points.map { Point(300 - $0.x, $0.y) }) }
+        let (model, tool, host) = try await editMode(h, s)
+        defer { tool.deactivate(host) }
+        XCTAssertTrue(model.layout.rightToLeft)
+        let before = try strokePoints(h)
+        model.previewReflow(left: model.columnLeft, width: 77)
+        let preview = try XCTUnwrap(model.preview)
+        await model.commitReflow()
+        let now = try strokePoints(h)
+        for id in s.ids {
+            let delta = preview.moves[id] ?? .zero
+            let expected = try XCTUnwrap(before[id]).map { $0 + delta }
+            let actual = try XCTUnwrap(now[id])
+            XCTAssertEqual(actual.count, expected.count)
+            for (a, b) in zip(actual, expected) { XCTAssertPoint(a, b, accuracy: 1e-3) }
+        }
+        let words = try await lines(h, s.ids.map { ref($0) }).flatMap { $0["words"]?.arrayValue ?? [] }
+        let order = words.map { Set(($0["refs"]?.arrayValue ?? []).compactMap { $0.stringValue }) }
+        XCTAssertEqual(order, s.words.map { Set($0.map { ref($0) }) })
+    }
+
     func testReflowRejectsMovedLockedOrDeletedSourcesDuringRecognition() async throws {
         for change in ["move", "lock", "delete"] {
             let h = Harness(features: [FeatSmartInkFeature.self])

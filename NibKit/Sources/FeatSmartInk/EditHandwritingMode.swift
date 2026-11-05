@@ -209,7 +209,8 @@ final class EditHandwritingModel: ObservableObject {
         var current: [ElementID: Item] = [:]
         for id in ids { current[id] = byID[id] }
         let glyphs = ids.compactMap { id -> InkGlyph? in current[id].flatMap { InkGlyph(item: $0) } }
-        let next = glyphs.isEmpty ? InkLayout.empty : await Handwriting.layout(glyphs, hints: hints)
+        let next = glyphs.isEmpty ? InkLayout.empty : await Handwriting.layout(glyphs, hints: hints,
+            rightToLeft: Handwriting.rightToLeft(t.doc, workspace: app.workspace))
         guard generation == self.generation, target == t, serial > appliedSerial else { return }
         appliedSerial = serial
         revision += 1
@@ -363,7 +364,8 @@ final class EditHandwritingModel: ObservableObject {
         picking = true
         let generation = self.generation
         Task { [weak self] in
-            let whole = await Handwriting.layout(glyphs, hints: [])
+            let whole = await Handwriting.layout(glyphs, hints: [],
+                                                 rightToLeft: Handwriting.rightToLeft(doc, workspace: app.workspace))
             guard let self else { return }
             self.picking = false
             let queued = self.queuedTap
