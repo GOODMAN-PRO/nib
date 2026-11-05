@@ -326,10 +326,10 @@ enum ClipboardCore {
     }
 
     /// Fragment (with asset bytes), PNG and typed text. Recognition must never gate a pasteboard write.
-    static func export(_ sel: ClipSelection, _ ctx: CommandContext) async -> ClipboardExport {
+    static func export(_ sel: ClipSelection, _ ctx: CommandContext) async throws -> ClipboardExport {
         let store = ctx.services.assets
         let doc = sel.doc
-        let fragment = NibFragment.make(items: sel.items) { ref in try? store?.data(ref, doc: doc) }
+        let fragment = try NibFragment.complete(items: sel.items, store: store, doc: doc)
         let png = await ClipboardRender.png(sel.items, doc: doc, page: sel.page, pageItems: sel.pageItems,
                                             renderer: ctx.services.renderer)
         let text = ClipboardText.join(sel.items.compactMap { item in
@@ -414,7 +414,7 @@ struct ClipboardCopy: NibCommand {
         let visible = ClipSelection(doc: sel.doc, page: sel.page,
                                     items: sel.items.filter { !hidden.contains($0.layer) }, pageItems: sel.pageItems)
         guard !visible.items.isEmpty else { return Output(count: 0, types: [], text: nil) }
-        let export = await ClipboardCore.export(visible, ctx)
+        let export = try await ClipboardCore.export(visible, ctx)
         let nowHidden = ClipboardCore.hiddenLayers(sel.doc, ctx)
         if visible.items.contains(where: { nowHidden.contains($0.layer) }) {
             throw NibError(.conflict, String(localized: "Layer visibility changed while copying. Copy the selection again."))
@@ -514,7 +514,7 @@ struct ClipboardCut: NibCommand {
             throw NibError(.invalidParams, "item \(locked.id.raw) is locked and cannot be cut", path: "$.refs",
                            hint: "unlock it with item.setLocked, or copy it with clipboard.copy")
         }
-        let export = await ClipboardCore.export(sel, ctx)
+        let export = try await ClipboardCore.export(sel, ctx)
         try ClipboardCore.ensureUnlocked(sel.doc, ctx)
         try ClipboardCore.ensureWritable(sel.doc, ctx, path: "$.refs")
         let current = try ctx.workspace.items(sel.doc, page: sel.page)

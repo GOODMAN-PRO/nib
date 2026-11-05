@@ -23,6 +23,25 @@ final class GraphBuilderTests: XCTestCase {
         return try XCTUnwrap(result["ref"]?.stringValue)
     }
 
+    func testNineExpressionsUsesExplicitFrenchLocalization() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let french = root.appendingPathComponent("fr.lproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: french, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let expected = "Ajoutez entre une et huit expressions."
+        let translations = ["Add between one and eight expressions.": expected]
+        let data = try PropertyListSerialization.data(fromPropertyList: translations, format: .xml, options: 0)
+        try data.write(to: french.appendingPathComponent("Localizable.strings"))
+        let bundle = try XCTUnwrap(Bundle(url: french))
+        XCTAssertThrowsError(try GraphBuilder.build(expressions: Array(repeating: "x", count: 9), frame: frame,
+                                                    viewport: GraphViewport(), bundle: bundle)) { error in
+            guard let error = error as? NibError else { return XCTFail("Unexpected error") }
+            XCTAssertEqual(error.code, .invalidParams)
+            XCTAssertEqual(error.path, "$.expressions")
+            XCTAssertEqual(error.message, expected)
+        }
+    }
+
     func testDisplayListAndStrokeExtentsStayInsideFrameAtExtremeViewports() throws {
         for viewport in [GraphViewport(), GraphViewport(x: 3.14, y: -2.7, scale: 14),
                          GraphViewport(x: 1e12, y: -1e12, scale: 0.000001),

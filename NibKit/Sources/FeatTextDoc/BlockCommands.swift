@@ -55,6 +55,14 @@ struct BlockInsert: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        try await insert(p, ctx) {
+            try await BlockMedia.resolve(kind: p.kind, asset: p.asset, url: p.url,
+                                         doc: NodeRef.documentID(from: p.doc), ctx: ctx)
+        }
+    }
+
+    static func insert(_ p: Params, _ ctx: CommandContext,
+                       resolveMedia: () async throws -> BlockMedia.Resolved) async throws -> Output {
         let doc = NodeRef.documentID(from: p.doc)
         let content = try ctx.workspace.content(doc)
         guard content.meta.kind == .textDocument else {
@@ -72,9 +80,13 @@ struct BlockInsert: NibCommand {
         try BlockRules.checkPayload(kind: p.kind, asset: p.asset, url: p.url, caption: p.caption, custom: p.custom,
                                     principal: ctx.principal)
         // Slow work (downloads, hashing) happens before the transaction.
-        let media = try await BlockMedia.resolve(kind: p.kind, asset: p.asset, url: p.url, doc: doc, ctx: ctx)
+        let media = try await resolveMedia()
         let block = try ctx.mutate { (tx: DocTransaction) -> TextBlock in
             let live = try tx.content(doc).liveBlocks
+            if let id = p.id, live.contains(where: { $0.id.raw == id }) {
+                throw NibError(.invalidParams, "a block with id \(id) already exists", path: "$.id",
+                               hint: "choose another id or leave it out")
+            }
             var b = BlockRules.newBlock(id: p.id.map { NibID($0) } ?? NibID.make(), kind: p.kind, text: p.text,
                                         caption: p.caption, custom: p.custom)
             b.asset = media.asset

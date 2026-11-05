@@ -678,28 +678,32 @@ enum DocumentMerger {
                 if let t = face.text { for a in AssetRemap.attachments(t) { assets.insert(a) } }
             }
         }
-        let knownClips = Set(dst.audio.map { $0.id })
+        let knownClips = Set(dst.liveAudio.map { $0.id })
         let clips = src.liveAudio.filter { !knownClips.contains($0.id) }
 
         // Copy asset and audio bytes off the main actor (a dry run copies nothing).
         var names: [String: AssetRef] = [:]
         if !ctx.dryRun {
-            if let store = ctx.services.assets, !assets.isEmpty {
+            if !assets.isEmpty {
+                let store = try ctx.services.require(ctx.services.assets, "the asset store")
                 let refs = Array(assets)
                 names = try await Task.detached(priority: .userInitiated) {
                     try AssetRemap.copy(refs, from: source, to: target, store: store)
                 }.value
             }
-            let files = audioFiles(clips, from: source, to: target, ctx)
+            let files = try audioFiles(clips, from: source, to: target, ctx)
             if !files.isEmpty {
-                await Task.detached(priority: .userInitiated) {
+                try await Task.detached(priority: .userInitiated) {
                     for f in files where !FileManager.default.fileExists(atPath: f.to.path) {
-                        try? FileManager.default.copyItem(at: f.from, to: f.to)
+                        try FileManager.default.copyItem(at: f.from, to: f.to)
                     }
                 }.value
             }
         }
 
+        // Capture compensation's baseline after the copy awaits, so it never removes content another window
+        // added while the files were transferring.
+        let beforeMerge = try ctx.workspace.content(target)
         var result = Result()
         let pageMap = Dictionary(uniqueKeysWithValues: moves.map { ($0.old.id, $0.newID) })
         try ctx.mutate(String(localized: "Merge Documents"), undoable: false) { tx in
@@ -764,7 +768,48 @@ enum DocumentMerger {
                 result.cards = cards.count
             }
         }
-        if !ctx.dryRun { try library.trash(source) }
+        if !ctx.dryRun {
+            do {
+                try library.trash(source)
+            } catch {
+                // There is no suspension between commit and trash. Compensate only records this merge added;
+                // existing destination content keeps its revisions, and a retry cannot append a second live copy.
+                try ctx.mutate(String(localized: "Cancel Merge Documents"), undoable: false) { tx in
+                    let after = try tx.content(target)
+                    let pages = Set(beforeMerge.pages.map(\.id))
+                    let outline = Set(beforeMerge.outline.map(\.id))
+                    let audio = Dictionary(uniqueKeysWithValues: beforeMerge.audio.map { ($0.id, $0) })
+                    let copiedAudio = Set(clips.map(\.id))
+                    let blocks = Set(beforeMerge.blocks.map(\.id))
+                    let cards = Set(beforeMerge.cards.map(\.id))
+                    for var record in after.pages where !pages.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.outline where !outline.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.audio where copiedAudio.contains(record.id) {
+                        if let previous = audio[record.id] {
+                            record = previous
+                        } else {
+                            record.deleted = true
+                        }
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.blocks where !blocks.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                    for var record in after.cards where !cards.contains(record.id) {
+                        record.deleted = true
+                        try tx.put(record, doc: target)
+                    }
+                }
+                throw error
+            }
+        }
         LibraryEvents.changed(ctx, library, [NodeRef.document(target).description, NodeRef.document(source).description])
         return result
     }
@@ -789,24 +834,26 @@ enum DocumentMerger {
 
     /// Audio files (and per-device transcript files) of `clips` to copy into the target package.
     private static func audioFiles(_ clips: [AudioClip], from source: DocumentID, to target: DocumentID,
-                                   _ ctx: CommandContext) -> [(from: URL, to: URL)] {
+                                   _ ctx: CommandContext) throws -> [(from: URL, to: URL)] {
         let persistence = ctx.workspace.persistence
         let fm = FileManager.default
         var out: [(from: URL, to: URL)] = []
         for clip in clips {
-            if let from = try? persistence.fileURL(source, relativePath: clip.file), fm.fileExists(atPath: from.path),
-               let to = try? persistence.fileURL(target, relativePath: clip.file) {
-                out.append((from, to))
+            let from = try persistence.fileURL(source, relativePath: clip.file)
+            guard fm.fileExists(atPath: from.path) else {
+                throw NibError(.notFound, String(localized: "A recording could not be read. Download it before combining notebooks."))
             }
-            guard let base = clip.transcriptFile, let fromBase = try? persistence.fileURL(source, relativePath: base) else { continue }
+            let to = try persistence.fileURL(target, relativePath: clip.file)
+            out.append((from, to))
+            guard let base = clip.transcriptFile else { continue }
+            let fromBase = try persistence.fileURL(source, relativePath: base)
             let dir = fromBase.deletingLastPathComponent()
             let stem = fromBase.lastPathComponent + "."
             let relativeDir = (base as NSString).deletingLastPathComponent
-            for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] where name.hasPrefix(stem) && name.hasSuffix(".json") {
+            for name in try fm.contentsOfDirectory(atPath: dir.path) where name.hasPrefix(stem) && name.hasSuffix(".json") {
                 let rel = relativeDir.isEmpty ? name : relativeDir + "/" + name
-                if let to = try? persistence.fileURL(target, relativePath: rel) {
-                    out.append((dir.appendingPathComponent(name), to))
-                }
+                let to = try persistence.fileURL(target, relativePath: rel)
+                out.append((dir.appendingPathComponent(name), to))
             }
         }
         return out
@@ -822,7 +869,7 @@ enum AssetRemap {
         var out: [String: AssetRef] = [:]
         for ref in refs {
             if store.url(ref, doc: target) != nil { continue }
-            guard let data = try? store.data(ref, doc: source) else { continue }
+            let data = try store.data(ref, doc: source)
             let stored = try store.put(data, ext: ref.ext.isEmpty ? "bin" : ref.ext, doc: target)
             if stored != ref { out[ref.name] = stored }
         }

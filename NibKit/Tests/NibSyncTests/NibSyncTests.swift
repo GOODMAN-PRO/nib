@@ -382,6 +382,58 @@ final class NibSyncTests: XCTestCase {
 
     /// Documents and folders added elsewhere rescan the library; what this device's own library commands did (already
     /// in the catalog) does not.
+    func testStructuralChangeAwaitsBackgroundRefreshServiceAndRetriesFailure() async throws {
+        let root = try temporaryFolder()
+        let pkg = root.appendingPathComponent("Shared.nibnote", isDirectory: true)
+        try seedNotebook(in: pkg)
+        let a = try device(7, root: root, pkg: pkg)
+        _ = await a.watcher.check()
+        let remote = root.appendingPathComponent("Remote.nibnote", isDirectory: true)
+        try FileManager.default.createDirectory(at: remote, withIntermediateDirectories: true)
+        try FolderTestPersistence.writeHead(DocumentContent(meta: DocumentMeta(id: "REMOTEDOC001", kind: .notebook)),
+                                            device: "00000008", into: remote)
+        let failing: FolderWatcher.CatalogRefresh = { throw NibError.unavailable("injected refresh failure") }
+        a.app.services.set(failing as AnyObject, for: FolderWatcher.catalogRefreshKey)
+        let placeholder = pkg.appendingPathComponent(".doc.00000008.json.icloud")
+        try Data().write(to: placeholder)
+        let failed = await a.watcher.check(full: true)
+        XCTAssertFalse(failed.refreshed)
+        XCTAssertFalse(failed.errors.isEmpty)
+        XCTAssertTrue(failed.downloading.contains("doc:" + Fixtures.docID.raw))
+        XCTAssertTrue(a.watcher.downloadsPending, "refresh failure must preserve the download poll")
+        XCTAssertEqual(a.library.refreshes, 0)
+        XCTAssertEqual(a.watcher.currentStatuses["lib"]?.reason, "refreshFailed")
+        XCTAssertEqual(a.watcher.lastReport?.errors.count, failed.errors.count)
+        let recoverySeq = a.app.events.lastSeq
+        var completed = false
+        let refresh: FolderWatcher.CatalogRefresh = {
+            await Task.yield()
+            a.library.scanDisk()
+            completed = true
+            return true
+        }
+        a.app.services.set(refresh as AnyObject, for: FolderWatcher.catalogRefreshKey)
+        try FileManager.default.removeItem(at: placeholder)
+        let report = await a.watcher.check(full: true)
+        XCTAssertTrue(completed)
+        XCTAssertTrue(report.refreshed)
+        XCTAssertTrue(report.errors.isEmpty)
+        XCTAssertFalse(a.watcher.downloadsPending)
+        XCTAssertEqual(a.watcher.currentStatuses["lib"]?.state, "idle")
+        XCTAssertNil(a.watcher.currentStatuses["lib"]?.reason)
+        XCTAssertTrue(a.app.events.events(since: recoverySeq).contains { event in
+            guard event.doc == nil, let status = event.decode(SyncStatusPayload.self) else { return false }
+            return status.source == FolderWatcher.source && status.state == "idle" && status.reason == nil
+        })
+        XCTAssertEqual(a.library.refreshes, 0, "sync must not repeat the service scan synchronously")
+        XCTAssertTrue(a.library.allNodes().contains { $0.path == "Remote.nibnote" })
+        a.watcher.setStatus(nil, state: "error", reason: "unrelated", message: "Keep this error")
+        try seedNotebook(in: root.appendingPathComponent("Another.nibnote"))
+        let next = await a.watcher.check(full: true)
+        XCTAssertTrue(next.refreshed)
+        XCTAssertEqual(a.watcher.currentStatuses["lib"]?.reason, "unrelated")
+    }
+
     func testStructuralChangesRefreshTheLibraryOnlyWhenTheCatalogMissesThem() async throws {
         let root = try temporaryFolder()
         let pkg = root.appendingPathComponent("Shared.nibnote", isDirectory: true)

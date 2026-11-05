@@ -15,6 +15,7 @@ final class FakePageSource: PresentationPageSource {
     private(set) var renders: [(page: PageID, region: Rect, scale: Double)] = []
     private(set) var snapshots = 0
     let mirrorImage = FakeRenderer.blank(CGSize(width: 4, height: 3))
+    var failsRenders = false
     var holdsRenders = false
     var isInking = false
     private var held: [CheckedContinuation<Void, Never>] = []
@@ -35,6 +36,7 @@ final class FakePageSource: PresentationPageSource {
         if holdsRenders {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in held.append(continuation) }
         }
+        if failsRenders { throw NibError(.unavailable, "test render failure") }
         return FakeRenderer.blank(CGSize(width: 2, height: 2))
     }
 
@@ -187,6 +189,49 @@ final class FeatPresentationTests: XCTestCase {
         XCTAssertTrue(controller.view === root, "modes switch inside the same scene and view controller")
         XCTAssertTrue(controller.model === model)
         model.stop()
+    }
+
+    func testRenderFailureReachesPresenterAndRetryCommandRecovers() async throws {
+        let h = Harness(features: [FeatPresentationFeature.self])
+        let controller = try XCTUnwrap(h.app.services.get(PresentationController.serviceKey, as: PresentationController.self))
+        let token = NSObject()
+        let source = FakePageSource(page: Self.page())
+        source.failsRenders = true
+        let viewController = controller.connect(id: ObjectIdentifier(token), name: "Test TV", source: source)
+        defer { controller.disconnect(ObjectIdentifier(token)) }
+        let model = viewController.model
+        let hud = PresenterHUDModel(app: h.app, session: h.session, controller: controller)
+        await model.update(detailDelay: 0)
+        hud.refresh()
+        XCTAssertEqual(model.renderFailure?.page, Fixtures.page1)
+        XCTAssertEqual(model.renderFailure?.version, 0)
+        XCTAssertTrue(hud.renderFailed)
+
+        source.failsRenders = false
+        _ = try await h.run("present.setMode", ["mode": "presenter", "retry": true])
+        hud.refresh()
+        XCTAssertNil(model.renderFailure)
+        XCTAssertFalse(hud.renderFailed)
+        guard case .page(let frame) = model.display else { return XCTFail("retry must show the page") }
+        XCTAssertEqual(frame.page, Fixtures.page1)
+
+        source.current?.version = 1
+        source.failsRenders = true
+        await model.update(detailDelay: 0)
+        hud.refresh()
+        XCTAssertEqual(model.renderFailure?.version, 1)
+        XCTAssertTrue(hud.renderFailed, "a stale same-page fallback must carry a warning")
+        guard case .page(let stale) = model.display else { return XCTFail("keep the fallback with the warning") }
+        XCTAssertEqual(stale.base.key.version, 0)
+
+        source.current = Self.page(Fixtures.page2, index: 1)
+        await model.update(detailDelay: 0)
+        XCTAssertEqual(model.renderFailure?.page, Fixtures.page2)
+        guard case .idle = model.display else { return XCTFail("never show another page as fallback") }
+        source.failsRenders = false
+        _ = try await h.run("present.setMode", ["mode": "presenter", "retry": true])
+        XCTAssertNil(model.renderFailure)
+        XCTAssertEqual(model.lastFrame?.page, Fixtures.page2)
     }
 
     func testNoPageShowsTheEmptyDesk() async {

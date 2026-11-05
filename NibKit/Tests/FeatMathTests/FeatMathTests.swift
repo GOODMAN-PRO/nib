@@ -316,6 +316,41 @@ final class FeatMathTests: XCTestCase {
         }
     }
 
+    func testSetLatexRejectsRevisionLoadedBeforeExternalEdit() async throws {
+        let h = Harness(features: [FeatMathFeature.self])
+        let loaded = try await h.run(CommandIDs.mathCopy, ["ref": .string(math), "as": "latex"])
+        let revision = try XCTUnwrap(loaded["rev"])
+        try await h.run(CommandIDs.mathSetLatex, ["ref": .string(math), "lines": ["y+2"]])
+        let before = try h.snapshot()
+        let depth = h.undoDepth(Fixtures.docID)
+        do {
+            try await h.run(CommandIDs.mathSetLatex, ["ref": .string(math), "lines": ["x+1"], "rev": revision])
+            XCTFail("A stale editor replaced the external formula")
+        } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        let fresh = try await h.run(CommandIDs.mathCopy, ["ref": .string(math), "as": "latex"])
+        try await h.run(CommandIDs.mathSetLatex, ["ref": .string(math), "lines": ["z"], "rev": try XCTUnwrap(fresh["rev"])])
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID).math?.latex, ["z"])
+    }
+
+    func testConvertedFormulaAndRepeatedAppliesReturnUsableRevisions() async throws {
+        let h = Harness(features: [FeatMathFeature.self])
+        let converted = try await h.run(CommandIDs.mathConvert, ["refs": [.string(ink)], "latex": ["x"]])
+        let ref = try XCTUnwrap(converted["ref"])
+        let initialRevision = try XCTUnwrap(converted["rev"])
+        let edited = try await h.run(CommandIDs.mathSetLatex, ["ref": ref, "lines": ["y"], "rev": initialRevision])
+        let editedRevision = try XCTUnwrap(edited["rev"])
+        XCTAssertNotEqual(initialRevision, editedRevision)
+        try await h.run(CommandIDs.mathSetLatex, ["ref": ref, "lines": ["z"], "rev": editedRevision])
+        let before = try h.snapshot()
+        do {
+            try await h.run(CommandIDs.mathSetLatex, ["ref": ref, "lines": ["x"], "rev": initialRevision])
+            XCTFail("Converted formula accepted its stale editor revision")
+        } catch let error as NibError { XCTAssertEqual(error.code, .conflict) }
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
     func testSetLatexFitsHeightAndUndoRestoresEntireFrame() async throws {
         let h = Harness(features: [FeatMathFeature.self])
         try await h.run(CommandIDs.mathSetLatex, ["ref": .string(math), "lines": ["x"]])

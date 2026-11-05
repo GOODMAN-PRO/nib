@@ -310,6 +310,24 @@ final class FeatInkSynthTests: XCTestCase {
         }
     }
 
+    func testReplaceWordRejectsConcurrentSourceEdit() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let old = try await seedWord(h, "hello", style: InkStyle())
+        let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
+        let depth = h.undoDepth(Fixtures.docID)
+        var edited: Item?
+        recogniser(h) { tx in
+            let moved = old[0].transformed(by: .translation(100, 40))
+            edited = try tx.put(moved, doc: Fixtures.docID, page: Fixtures.page2)
+        }
+        await assertError(h, CommandIDs.handwritingReplaceWord, ["refs": .array(oldRefs), "text": "help"], .conflict)
+        let now = try items(h)
+        XCTAssertEqual(Set(now.map { $0.id }), Set(old.map { $0.id }))
+        XCTAssertEqual(now.first { $0.id == old[0].id }, edited)
+        for original in old.dropFirst() { XCTAssertEqual(now.first { $0.id == original.id }, original) }
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "only the concurrent edit was committed")
+    }
+
     func testReplaceWordRechecksCallerIDsWhenItWrites() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
         let old = try await seedWord(h, "hello", style: InkStyle())

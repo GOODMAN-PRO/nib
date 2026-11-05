@@ -211,12 +211,28 @@ enum BackupWriter {
 /// Hashing runs away from the UI actor; the caller loads at most one page's records at a time.
 actor BackupStampBuilder {
     private var stamp: BackupContentStamp
-    init(previous: BackupContentStamp?, pages: Set<String>) {
-        stamp = BackupContentStamp()
-        stamp.records = (previous?.records ?? [:]).filter {
+    init(previous: BackupContentStamp?) {
+        stamp = previous ?? BackupContentStamp()
+        stamp.pageRevisions = [:]
+    }
+
+    /// Normalize and encode immutable head records on this actor, alongside page hashing.
+    func addHead(_ head: DocumentContent) throws {
+        let pages = Set(head.livePages.map { $0.id.raw })
+        stamp.records = stamp.records.filter {
             $0.key.hasPrefix("item:") && pages.contains(String($0.key.dropFirst(5).split(separator: "/").first ?? ""))
         }
-        stamp.pageRevisions = [:]
+        var meta = head.meta
+        meta.rev = .zero; meta.favorite = false; meta.sourceBookmark = nil; meta.trashedFrom = nil
+        var records: [(String, JSONValue)] = [("meta", try JSONValue.from(meta))]
+        for var page in head.livePages {
+            page.rev = .zero; page.bookmarked = false
+            records.append(("page:" + page.id.raw, try JSONValue.from(page)))
+        }
+        for var block in head.liveBlocks { block.rev = .zero; records.append(("block:" + block.id.raw, try JSONValue.from(block))) }
+        for var card in head.liveCards { card.rev = .zero; records.append(("card:" + card.id.raw, try JSONValue.from(card))) }
+        for var audio in head.liveAudio { audio.rev = .zero; records.append(("audio:" + audio.id.raw, try JSONValue.from(audio))) }
+        try add(records)
     }
     func revision(_ revision: Rev?, page: PageID) { stamp.pageRevisions?[page.raw] = revision }
     func add(_ records: [(String, JSONValue)]) throws {

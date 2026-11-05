@@ -157,6 +157,35 @@ final class LibrarySortingTests: XCTestCase {
         XCTAssertEqual(document.subtitle(content: content), "6 words")
         XCTAssertEqual(document.subtitle(content: DocumentContent(meta: content.meta)), "0 words")
     }
+    func testCancelledSelectionDragUsesANewAnchorAndBaseline() {
+        let order = ["A", "B", "C", "D", "E", "F"]
+        var drag = LibrarySelectionDrag()
+        drag.begin(selection: LibrarySelection(), anchor: 0)
+        drag.selection.extendRange(to: 1, order: order)
+        let retained = drag.selection
+        drag.marquee = CGRect(x: 0, y: 0, width: 10, height: 10)
+        drag.cancel() // GestureState reset, without onEnded.
+        XCTAssertFalse(drag.active)
+        XCTAssertNil(drag.marquee)
+        drag.begin(selection: retained, anchor: 4)
+        drag.selection.extendRange(to: 5, order: order)
+        XCTAssertEqual(drag.selection.refs, Set(["A", "B", "E", "F"]))
+    }
+
+    func testUntouchedRenameNeverRestoresAnExternalOldName() throws {
+        var draft = LibraryRenameDraft()
+        draft.reconcile("Original")
+        XCTAssertNil(try draft.titleForSubmission(current: "Renamed elsewhere"), "Safe even before onChange")
+        draft.reconcile("Renamed elsewhere")
+        XCTAssertEqual(draft.text, "Renamed elsewhere")
+        XCTAssertNil(try draft.titleForSubmission(current: "Renamed elsewhere"))
+        draft.text = "My edit"
+        XCTAssertEqual(try draft.titleForSubmission(current: "Renamed elsewhere"), "My edit")
+        draft.reconcile("Another external rename")
+        XCTAssertEqual(draft.text, "My edit", "Never discard the person's draft")
+        XCTAssertThrowsError(try draft.titleForSubmission(current: "Another external rename"))
+    }
+
     func testSelectionSwipeAndPointerMarqueeKeepBaseline() {
         var selection = LibrarySelection()
         selection.toggle("D")

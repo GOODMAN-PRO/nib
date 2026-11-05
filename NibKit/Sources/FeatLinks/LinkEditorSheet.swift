@@ -101,6 +101,7 @@ struct LinkEditTarget {
     var range: NSRange
     var excerpt: String
     var existing: TextLink?
+    var baseline: RichText
 }
 
 @MainActor
@@ -158,7 +159,7 @@ enum LinkEditorPresenter {
         }
         if r.length == 0 { r = LinkText.link(at: r.location, in: text)?.range ?? NSRange(location: 0, length: length) }
         let existing = LinkText.links(in: text).first { NSIntersectionRange($0.range, r).length > 0 }?.link
-        return LinkEditTarget(ref: ref, doc: textRef.doc, range: r, excerpt: LinkText.substring(text, r), existing: existing)
+        return LinkEditTarget(ref: ref, doc: textRef.doc, range: r, excerpt: LinkText.substring(text, r), existing: existing, baseline: text)
     }
 }
 
@@ -293,7 +294,7 @@ final class LinkEditorModel: ObservableObject {
         guard canSave, let link = linkTarget else { return }
         isSaving = true
         errorMessage = nil
-        let params = LinkSet.Params(ref: target.ref, range: rangeParam, link: link)
+        let params = LinkSet.Params(ref: target.ref, range: rangeParam, link: link, baseline: target.baseline)
         Task { @MainActor in
             do {
                 try await app.bus.run(LinkSet.self, params, session: session)
@@ -309,7 +310,7 @@ final class LinkEditorModel: ObservableObject {
         guard !isSaving else { return }
         isSaving = true
         errorMessage = nil
-        let params = LinkRemove.Params(ref: target.ref, range: rangeParam)
+        let params = LinkRemove.Params(ref: target.ref, range: rangeParam, baseline: target.baseline)
         Task { @MainActor in
             do {
                 try await app.bus.run(LinkRemove.self, params, session: session)

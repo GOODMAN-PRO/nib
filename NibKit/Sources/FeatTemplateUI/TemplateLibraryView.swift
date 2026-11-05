@@ -178,6 +178,7 @@ struct TemplateBrowserLayout {
 
 @MainActor
 struct TemplateBrowser: View {
+    @Environment(\.locale) private var locale
     @ObservedObject var model: TemplateBrowserModel
     var management = false
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -291,9 +292,7 @@ struct TemplateBrowser: View {
     }
     private func setCustomSize() {
         do {
-            guard let width = Double(widthText), let height = Double(heightText), let size = try TemplateSizing.parse([width, height]) else {
-                throw NibError.invalid("Enter a width and height in page points.")
-            }
+            let size = try TemplateSizing.parse(width: widthText, height: heightText, locale: locale)
             model.size = size; model.error = nil
         } catch { model.error = error.localizedDescription }
     }

@@ -408,6 +408,7 @@ struct LinkSet: NibCommand {
         var ref: String?
         var range: [Int]?
         var link: LinkTarget?
+        var baseline: RichText? = nil
     }
     struct Output: Codable {
         var range: [Int]?
@@ -416,7 +417,7 @@ struct LinkSet: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "link.set", title: "Add Link",
         summary: "Link a range of typed text (a text box, a sticky note or shape label with a published layout, or a text-document block) to a URL, a page of any document or an audio clip time.",
-        params: .obj(["ref": .ref, "range": LinkText.rangeSchema,
+        params: .obj(["ref": .ref, "range": LinkText.rangeSchema, "baseline": .anything("Text loaded by the link editor"),
                       "link": .obj(LinkTarget.properties, required: [], "exactly one of url, page, clip (+ t) or doc")],
                      required: ["ref", "range", "link"]),
         examples: [
@@ -444,6 +445,9 @@ struct LinkSet: NibCommand {
         let content = ctx.content
         return try ctx.mutate { tx in
             let text = try ref.text(in: tx, content: content)
+            if let baseline = p.baseline, text != baseline {
+                throw NibError(.conflict, String(localized: "This text changed while the link editor was open. Close it and select the text again."))
+            }
             let range = try LinkText.range(rangeValue, in: text, allowEmpty: false)
             let linked = LinkText.setLink(link, in: text, range: range)
             if linked != text { try ref.write(linked, in: tx) }
@@ -456,6 +460,7 @@ struct LinkRemove: NibCommand {
     struct Params: Codable {
         var ref: String
         var range: [Int]?
+        var baseline: RichText? = nil
     }
     struct Output: Codable {
         var removed: Int
@@ -463,7 +468,7 @@ struct LinkRemove: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "link.remove", title: "Remove Link",
         summary: "Remove the links in a range of typed text; an empty range removes the whole link around that position.",
-        params: .obj(["ref": .ref, "range": LinkText.rangeSchema], required: ["ref", "range"]),
+        params: .obj(["ref": .ref, "range": LinkText.rangeSchema, "baseline": .anything("Text loaded by the link editor")], required: ["ref", "range"]),
         examples: [try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "range": [0, 9]}"#)],
         effect: .edit)
 
@@ -472,6 +477,9 @@ struct LinkRemove: NibCommand {
         let content = ctx.content
         return try ctx.mutate { tx in
             let text = try ref.text(in: tx, content: content, requiresLayout: false)
+            if let baseline = p.baseline, text != baseline {
+                throw NibError(.conflict, String(localized: "This text changed while the link editor was open. Close it and select the text again."))
+            }
             var range = try p.range.map { try LinkText.range($0, in: text, allowEmpty: true) }
                 ?? NSRange(location: 0, length: LinkText.length(text))
             if range.length == 0 {

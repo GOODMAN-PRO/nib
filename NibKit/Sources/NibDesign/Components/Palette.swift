@@ -278,7 +278,13 @@ public struct NibToolPalette<Settings: View>: View {
     /// The palette's own release until the binding takes the dock it chose.
     @State private var released: OwnRelease?
     @State private var tapped: String?
-    @State private var mode: DragMode?
+    @State private var dragLifetime = DropletDragLifetime()
+    @GestureState private var dragLive = false
+    @Environment(\.scenePhase) private var scenePhase
+    private var mode: DropletDragLifetime.Mode? {
+        get { dragLifetime.mode }
+        nonmutating set { dragLifetime.mode = newValue }
+    }
     @State private var localSettingsOpen = false
     @State private var localMoreOpen = false
     // A supplied binding is the presentation state, not a delayed mirror of local state.
@@ -300,10 +306,6 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var landing: DockLanding?
     /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
     @State private var fade: Double = 1
-
-    enum DragMode {
-        case move, scrub
-    }
 
     struct Arrangement: Equatable {
         var natives: [NibTool]
@@ -564,7 +566,21 @@ public struct NibToolPalette<Settings: View>: View {
             .onChange(of: paletteFrame, initial: true) { _, frame in
                 field?.setWorldAnchor(NibPalettePresentation.anchorPrefix + id, frame)
             }
-            .onDisappear { field?.removeWorldAnchor(NibPalettePresentation.anchorPrefix + id) }
+            .onDisappear {
+                cancelDrag(selectedHead: map[selection])
+                field?.removeWorldAnchor(NibPalettePresentation.anchorPrefix + id)
+            }
+            .onChange(of: dragLive) { _, live in
+                guard !live else { return }
+                // Normal release commits its dock/tool first; only an unfinished lifetime is cancelled.
+                DispatchQueue.main.async {
+                    guard !dragLive else { return }
+                    cancelDrag(selectedHead: map[selection])
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { cancelDrag(selectedHead: map[selection]) }
+            }
             .onChange(of: AnchorKey(dock: d, slots: map), initial: true) { _, key in
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
@@ -826,10 +842,16 @@ public struct NibToolPalette<Settings: View>: View {
         .position(placement.centre(size: moreSize, beside: anchor, gap: gap, in: bounds))
     }
 
+    private func cancelDrag(selectedHead: CGFloat?) {
+        guard let field else { mode = nil; return }
+        dragLifetime.cancel(id: id, field: field, selectedHead: selectedHead)
+    }
+
     private func dragGesture(region r: CGRect, origin: CGPoint, arrangement a: Arrangement,
                              slots map: [String: CGFloat]) -> some Gesture {
         let scrubbable = (a.natives + a.plugins).compactMap { t in map[t.id].map { (t.id, $0) } }
         return DragGesture(minimumDistance: DropletPhysics.pickupSlop, coordinateSpace: NibLiquid.space)
+            .updating($dragLive) { _, live, _ in live = true }
             .onChanged { value in
                 guard let field else { return }
                 if mode == nil {

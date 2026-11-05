@@ -544,6 +544,8 @@ struct PackageFiles {
         var futureFiles: [String] = []
         /// Package-relative paths of files that exist but could not be decoded.
         var failures: [String] = []
+        /// An unreadable own-device file must never be replaced using a partial merged snapshot.
+        var ownFailures: [String] = []
         /// Stamps of every non-own file listed (decodable or not), keyed by package-relative path.
         var stamps: [String: Stamp] = [:]
     }
@@ -569,10 +571,29 @@ struct PackageFiles {
     }
 
     /// Item files of one page (none when the page has never been written).
-    func pageSources(_ pkg: URL, page: PageID) -> [Source] {
+    func pageSources(_ pkg: URL, page: PageID) throws -> [Source] {
         let dir = pkg.appendingPathComponent(PackageCodec.pageDirectory(page), isDirectory: true)
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let names = try pageDirectoryContents(dir, package: pkg)
+        // Provider placeholders are filtered out by pageRole. An evicted own file is not an empty page:
+        // accepting that snapshot would let the next edit replace ink that has not downloaded yet.
+        guard !names.contains("." + PackageCodec.pageFileName(device) + ".icloud") else {
+            throw NibError(.unavailable, String(localized: "This page has not finished downloading. Try again when it is available."))
+        }
         return sources(names, in: dir, role: PackageCodec.pageRole)
+    }
+
+    /// Missing page folders are normal. Confirm absence by listing the parent: an inaccessible folder (or
+    /// package) must never look like a new empty page, even if its provider reports it as missing.
+    private func pageDirectoryContents(_ dir: URL, package: URL) throws -> [String] {
+        do {
+            return try FileManager.default.contentsOfDirectory(atPath: dir.path)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            guard dir.standardizedFileURL != package.standardizedFileURL else { throw error }
+            let parent = try pageDirectoryContents(dir.deletingLastPathComponent(), package: package)
+            guard !parent.contains(dir.lastPathComponent),
+                  !parent.contains("." + dir.lastPathComponent + ".icloud") else { throw error }
+            return []
+        }
     }
 
     private func sources(_ names: [String], in dir: URL, role: (String) -> PackageCodec.Role?) -> [Source] {
@@ -599,10 +620,15 @@ struct PackageFiles {
                 if isFuture(value) { r.futureFiles.append(key) }
                 if case .conflictCopy = s.role { r.copies.append(s.url) }
             } catch let e as CocoaError where e.code == .fileReadNoSuchFile {
+                if s.isOwn {
+                    r.failures.append(key)
+                    r.ownFailures.append(key)
+                }
                 continue // removed between listing and reading (a merged conflict copy)
             } catch {
                 PackageFiles.log.error("cannot read \(key, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 r.failures.append(key)
+                if s.isOwn { r.ownFailures.append(key) }
             }
         }
         return r

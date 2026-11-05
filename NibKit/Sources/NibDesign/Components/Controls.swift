@@ -619,7 +619,7 @@ public struct NibChip: View {
             if let onRemove {
                 Button(action: onRemove) {
                     Image(nib: .xmark).font(.system(size: 10, weight: .bold))
-                        .frame(width: 28, height: NibMetrics.hitTarget)
+                        .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: Capsule(), rectangularHitTarget: true))

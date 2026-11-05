@@ -53,8 +53,9 @@ final class FeatSmartInkTests: XCTestCase {
         h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete",
                                                   summary: "Test stand-in.", effect: .edit)) { params, ctx in
             try ctx.mutate { tx in
-                for value in params["refs"]?.arrayValue ?? [] {
-                    guard let s = value.stringValue, case let .item(d, p, id)? = NodeRef(s) else { continue }
+                let refs = ctx.refsOrSelection(params["refs"]?.arrayValue?.compactMap { $0.stringValue })
+                for ref in refs {
+                    guard case let .item(d, p, id)? = NodeRef(ref) else { continue }
                     try tx.delete(item: id, doc: d, page: p)
                 }
             }
@@ -178,6 +179,73 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(doc), 1)
         h.app.bus.undo(doc)
         XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testRTLPreviewAndCommandUseDocumentWritingDirection() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.language", title: "Language",
+                                                  summary: "Set the document language.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.language = "ar"
+                try tx.putMeta(meta)
+            }
+            return [:]
+        }
+        try await h.run("test.language")
+        var s = Synth.paragraph()
+        s.strokes = s.strokes.map { (id: $0.id, points: $0.points.map { Point(300 - $0.x, $0.y) }) }
+        let (model, tool, host) = try await editMode(h, s)
+        defer { tool.deactivate(host) }
+        XCTAssertTrue(model.layout.rightToLeft)
+        let before = try strokePoints(h)
+        model.previewReflow(left: model.columnLeft, width: 77)
+        let preview = try XCTUnwrap(model.preview)
+        await model.commitReflow()
+        let now = try strokePoints(h)
+        for id in s.ids {
+            let delta = preview.moves[id] ?? .zero
+            let expected = try XCTUnwrap(before[id]).map { $0 + delta }
+            let actual = try XCTUnwrap(now[id])
+            XCTAssertEqual(actual.count, expected.count)
+            for (a, b) in zip(actual, expected) { XCTAssertPoint(a, b, accuracy: 1e-3) }
+        }
+        let words = try await lines(h, s.ids.map { ref($0) }).flatMap { $0["words"]?.arrayValue ?? [] }
+        let order = words.map { Set(($0["refs"]?.arrayValue ?? []).compactMap { $0.stringValue }) }
+        XCTAssertEqual(order, s.words.map { Set($0.map { ref($0) }) })
+    }
+
+    func testReflowRejectsMovedLockedOrDeletedSourcesDuringRecognition() async throws {
+        for change in ["move", "lock", "delete"] {
+            let h = Harness(features: [FeatSmartInkFeature.self])
+            let s = Synth.paragraph()
+            let refs = try await install(s, in: h)
+            // The first word would stay put: it must still be checked as an input to the plan.
+            let id = s.ids[0]
+            h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                      summary: "Change source ink during recognition.", effect: .edit)) { _, ctx in
+                try ctx.mutate { tx in
+                    let original = try tx.item(Fixtures.docID, page: Fixtures.page2, id: id)
+                    if change == "delete" {
+                        try tx.delete(item: id, doc: Fixtures.docID, page: Fixtures.page2)
+                    } else {
+                        var edited = original.transformed(by: change == "move" ? .translation(100, 40) : .identity)
+                        if change == "lock" { edited.locked = true }
+                        try tx.put(edited, doc: Fixtures.docID, page: Fixtures.page2)
+                    }
+                }
+                return [:]
+            }
+            let code = await errorCode {
+                try await h.run(CommandIDs.handwritingReflow, ["refs": self.json(refs), "width": 77])
+            }
+            XCTAssertEqual(code, .conflict, change)
+            XCTAssertEqual(h.undoDepth(doc), 1, "only the intervening edit commits")
+            let now = try strokePoints(h)
+            for glyph in s.glyphs where glyph.id != id {
+                XCTAssertEqual(now[glyph.id], glyph.points, "no part of a stale plan may commit")
+            }
+        }
     }
 
     func testStraightenLevelsASlantedLineAndUndoes() async throws {
@@ -518,6 +586,36 @@ final class FeatSmartInkTests: XCTestCase {
 
     /// Delete Word on the first word of a line: the column flows on at its width as if the word were gone (no false
     /// indent), then the word is deleted. One undo step that restores everything.
+    func testDeleteWordKeepsCapturedRefsWhenModeEndsDuringRecognition() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        installItemDelete(h)
+        let s = Synth.paragraph()
+        let (model, tool, host) = try await editMode(h, s)
+        let before = try h.snapshot()
+        let word = model.layout.lines[1].words[0]
+        model.tap(at: word.box.center, page: page, time: 100)
+        model.tap(at: word.box.center, page: page, time: 100.2)
+        var ended = false
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "End the mode while reflow awaits recognition.", effect: .read)) { _, ctx in
+            // Ignore the mode's independent background hint request; only reflow's nested call ends the mode.
+            if ctx.depth > 0, !ended {
+                ended = true
+                model.finish()
+                tool.deactivate(host)
+            }
+            return [:]
+        }
+        await model.deleteWord()
+        XCTAssertTrue(ended)
+        XCTAssertNil(model.target)
+        let remaining = try h.app.workspace.items(doc, page: page).map { $0.id }
+        XCTAssertEqual(Set(remaining), Set(s.ids).subtracting(word.ids))
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        h.app.bus.undo(doc)
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
     func testEditModeDeleteClosesTheHoleAndReflows() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         installItemDelete(h)

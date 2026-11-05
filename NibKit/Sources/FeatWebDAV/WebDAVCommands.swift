@@ -136,11 +136,33 @@ struct WebDAVSyncNowCommand: NibCommand {
 /// `webdav.configure {url, user, folder, allowUntrustedCertificates?}`: sets up (or, with an empty url,
 /// disconnects) WebDAV sync. The password is entered in Settings › WebDAV only.
 struct WebDAVConfigureCommand: NibCommand {
+    /// Passwords never enter serialised command arguments. The page owns a short-lived, private draft;
+    /// the command checks its baseline before performing any Keychain or settings writes, without suspending.
+    private struct Draft {
+        let settings: SettingsStore
+        let expected: WebDAVSettings.Values
+        let password: String
+    }
+    private static var drafts: [String: Draft] = [:]
+
+    static func stage(settings: SettingsStore, expected: WebDAVSettings.Values, password: String) -> String {
+        let id = UUID().uuidString
+        drafts[id] = Draft(settings: settings, expected: expected, password: password)
+        return id
+    }
+
+    static func discard(_ id: String) { drafts[id] = nil }
+
+    static var staleSettings: NibError {
+        NibError(.conflict, String(localized: "WebDAV settings changed in another window. Reopen this page before saving."))
+    }
+
     struct Params: Codable {
         var url: String
         var user: String
         var folder: String
         var allowUntrustedCertificates: Bool?
+        var draftID: String? = nil
     }
 
     struct Output: Codable, Equatable {
@@ -159,7 +181,8 @@ struct WebDAVConfigureCommand: NibCommand {
             "url": .str("server address, e.g. https://dav.example.com/remote.php/dav/files/alex/ ('' = disconnect)"),
             "user": .str("user name ('' = no authentication)"),
             "folder": .str("library folder on the server, e.g. Nib"),
-            "allowUntrustedCertificates": .bool("accept a self-signed certificate from this server (default false)")
+            "allowUntrustedCertificates": .bool("accept a self-signed certificate from this server (default false)"),
+            "draftID": .str("private Settings draft identifier; omit for direct configuration")
         ], required: ["url", "user", "folder"]),
         examples: [["url": "https://dav.example.com/remote.php/dav/files/alex/", "user": "alex", "folder": "Nib"]],
         effect: .session, sensitive: true)
@@ -168,6 +191,12 @@ struct WebDAVConfigureCommand: NibCommand {
         let engine = try WebDAVSyncEngine.resolve(ctx.services)
         let settings = ctx.services.settings
         let old = WebDAVSettings.read(settings)
+        var draft: Draft?
+        if let id = p.draftID {
+            guard ctx.principal.isUser, let staged = drafts[id], staged.settings === settings,
+                  staged.expected == old else { throw staleSettings }
+            draft = staged
+        }
         if p.url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let cleared = WebDAVSettings.Values(url: "", user: "", folder: WebDAVSettings.folder.defaultValue,
                                                 allowUntrustedCertificates: false)
@@ -185,6 +214,15 @@ struct WebDAVConfigureCommand: NibCommand {
         let values = WebDAVSettings.Values(url: server, user: user, folder: folder,
                                            allowUntrustedCertificates: p.allowUntrustedCertificates ?? false)
         if !ctx.dryRun {
+            if let draft {
+                let password = draft.password.isEmpty
+                    ? WebDAVCredentials.password(url: old.url, user: old.user) : draft.password
+                if !draft.password.isEmpty || WebDAVCredentials.password(url: server, user: user) == nil {
+                    if let password, !WebDAVCredentials.setPassword(password, url: server, user: user) {
+                        throw NibError(.unavailable, String(localized: "The WebDAV password could not be saved. Try again."))
+                    }
+                }
+            }
             // A password belongs to one server and user: a new server never inherits the old one's password.
             if !old.url.isEmpty, old.url != server || old.user != user {
                 WebDAVCredentials.setPassword(nil, url: old.url, user: old.user)
