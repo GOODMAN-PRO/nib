@@ -16,6 +16,8 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
     private var tabBar: UIView?
     private var qaProbe: QAStateProbe?
     private var failureObserver: NSObjectProtocol?
+    private var fallbackToastTask: Task<Void, Never>?
+    private weak var fallbackToastLabel: UILabel?
     /// What the window shows right now, for key commands (`KeyCommandContext`): a document of `shownKind`, or the
     /// library / onboarding. `activeDocument` stays the selected tab while the library shows.
     private var showsDocument = false
@@ -606,8 +608,16 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
         #if DEBUG
         NSLog("%@", String("[Nib QA toast] shell toast message=\(message)".prefix(890)))
         #endif
+        fallbackToastTask?.cancel()
+        fallbackToastLabel?.removeFromSuperview()
+        if let host = session.floatingHost {
+            host.postToast(message)
+            return
+        }
         let label = UILabel()
+        fallbackToastLabel = label
         label.accessibilityIdentifier = "nib.toast"
+        label.isAccessibilityElement = true
         label.text = message
         label.textColor = .white
         label.backgroundColor = UIColor.black.withAlphaComponent(0.8)
@@ -622,10 +632,20 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
                              y: view.bounds.height - view.safeAreaInsets.bottom - size.height - 48,
                              width: size.width + 24, height: size.height + 16)
         view.addSubview(label)
-        UIView.animate(withDuration: 0.3, delay: 2.5, options: []) {
-            label.alpha = 0
-        } completion: { _ in
-            label.removeFromSuperview()
+        UIAccessibility.post(notification: .announcement, argument: message)
+        fallbackToastTask = Task { [weak label] in
+            var remaining = 2.5
+            while remaining > 0 {
+                do { try await Task.sleep(for: .milliseconds(250)) }
+                catch { return }
+                if !UIAccessibility.isVoiceOverRunning { remaining -= 0.25 }
+            }
+            guard !Task.isCancelled, let label else { return }
+            UIView.animate(withDuration: 0.3) {
+                label.alpha = 0
+            } completion: { _ in
+                label.removeFromSuperview()
+            }
         }
     }
 }
