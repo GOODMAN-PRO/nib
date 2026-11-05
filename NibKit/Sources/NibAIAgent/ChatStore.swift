@@ -47,6 +47,10 @@ struct ChatRecord: LWWRecord {
     /// Tools the turn called, in order.
     var tools: [String]?
 
+    var isVisibleMessage: Bool {
+        !(role == "assistant" && (text ?? "").isEmpty && (group ?? "").isEmpty && (changes?.isEmpty ?? true))
+    }
+
     init(id: NibID, rev: Rev, type: String) {
         self.id = id
         self.rev = rev
@@ -226,7 +230,7 @@ final class ChatStore {
 
     /// The messages the conversation shows (`AIService.messages`): answers that failed before writing anything are left out.
     func visibleMessages(_ chat: String) -> [ChatRecord] {
-        messages(chat).filter { !($0.role == "assistant" && ($0.text ?? "").isEmpty) }
+        messages(chat).filter(\.isVisibleMessage)
     }
 
     // MARK: Writing

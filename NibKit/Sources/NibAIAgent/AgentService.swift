@@ -149,8 +149,9 @@ final class AgentService: AIService {
         if let c = request.chatID, !NibID.isValid(c) {
             return .failure(NibError(.invalidParams, "chat ids are 1–64 characters [A-Za-z0-9_-]", path: "$.chat"))
         }
-        let incoming = request.messages.filter { !$0.text.isEmpty || !($0.images ?? []).isEmpty }
-        guard !incoming.isEmpty else {
+        // Empty assistant records can carry edits in stored history. Keep their position for deduplication.
+        let incoming = request.messages.filter { $0.role == "assistant" || !$0.text.isEmpty || !($0.images ?? []).isEmpty }
+        guard incoming.contains(where: { !$0.text.isEmpty || !($0.images ?? []).isEmpty }) else {
             return .failure(NibError(.invalidParams, "the request has no message", path: "$.messages"))
         }
         let chatID = request.chatID ?? NibID.make().raw
@@ -258,7 +259,7 @@ final class AgentService: AIService {
     /// The request's messages that are not already stored: callers may send only the new message or the whole
     /// conversation again.
     static func newMessages(_ incoming: [AIMessage], after stored: [ChatRecord]) -> [AIMessage] {
-        let shown = stored.filter { !($0.role == "assistant" && ($0.text ?? "").isEmpty) }
+        let shown = stored.filter(\.isVisibleMessage)
         guard !shown.isEmpty, incoming.count > shown.count else { return incoming }
         let prefix = zip(shown, incoming).allSatisfy { s, m in
             (s.role ?? "user") == m.role && (s.text ?? "") == m.text

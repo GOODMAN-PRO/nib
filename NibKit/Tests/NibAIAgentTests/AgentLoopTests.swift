@@ -181,6 +181,27 @@ enum AgentFixture {
 final class AgentLoopTests: XCTestCase {
     typealias P = ScriptedProvider
 
+    func testSilentEditRemainsListedRateableAndDoesNotDuplicateResentHistory() async throws {
+        let provider = P(events: [
+            [P.call("write", "nib_run", ["command": "test.addNote", "params": AgentFixture.note("Note", id: "SILENTNOTE01")]),
+             .stop(reason: "tool_use")],
+            [.stop(reason: "end_turn")], P.answer("Next answer")
+        ])
+        let (h, agent) = AgentFixture.make(provider)
+        let response = try await agent.complete(AgentFixture.request("Add a note"))
+        let listed = try await h.run("ai.chat.list", ["chat": "CHATTEST0001"])
+        let answer = try XCTUnwrap(listed["messages"]?[1])
+        XCTAssertEqual(answer["text"]?.stringValue, "")
+        XCTAssertEqual(answer["group"]?.stringValue, response.group)
+        let answerID = try XCTUnwrap(answer["id"]?.stringValue)
+        try await h.run("ai.chat.feedback", ["chat": "CHATTEST0001", "message": .string(answerID), "rating": "up"])
+        XCTAssertEqual(agent.chatStore.messages("CHATTEST0001").last?.rating, "up")
+        var next = AgentFixture.request("Continue")
+        next.messages = agent.messages(chatID: "CHATTEST0001") + next.messages
+        _ = try await agent.complete(next)
+        XCTAssertEqual(agent.messages(chatID: "CHATTEST0001").map(\.text), ["Add a note", "", "Continue", "Next answer"])
+    }
+
     func testTruncatedAnswerStreamsNoticeAndReportsStopReason() async throws {
         let (h, agent) = AgentFixture.make(P(events: [[.textDelta("Partial"), .stop(reason: "max_tokens")]]))
         var finished: [NibEvent] = []
