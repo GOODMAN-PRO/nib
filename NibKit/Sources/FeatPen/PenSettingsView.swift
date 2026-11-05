@@ -223,7 +223,7 @@ struct PenSettingsView: View {
                     action: {
                         model.set(PenSettings.style, style.rawValue)
                         model.app.perform(CommandIDs.toolSelect, ["tool": "pen"], session: session)
-                    }) { NibOptionGlyph(.pen) }
+                    }) { NibOptionGlyph(style.optionSymbol) }
                     .accessibilityLabel(style.title)
             }
             NibOptionTile(String(localized: "Pencil"), isSelected: session.tool == "pencil", action: {
@@ -258,6 +258,14 @@ struct PenOptionsBar: View {
 }
 
 extension PenStyle {
+    var optionSymbol: NibSymbol {
+        switch self {
+        case .fountain: return .fountainPen
+        case .ball: return .pen
+        case .brush: return .brushPen
+        }
+    }
+
     var shortTitle: String {
         switch self {
         case .fountain: return String(localized: "Fountain")

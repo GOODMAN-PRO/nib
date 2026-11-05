@@ -261,6 +261,7 @@ public struct NibOptionGlyph: View {
     public var body: some View {
         Image(nib: symbol)
             .font(NibFont.glyph(.panel, size: 22))
+            .frame(width: NibSpacing.xxl, height: NibSpacing.xxl)
             .accessibilityHidden(true)
     }
 }
