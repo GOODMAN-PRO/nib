@@ -161,7 +161,7 @@ enum ChatCommands {
                     return try await handler(params, ctx)
                 }
                 catch {
-                    if !ctx.dryRun, !(error is CancellationError), let app = ctx.app {
+                    if ctx.principal.isUser, !ctx.dryRun, !(error is CancellationError), let app = ctx.app {
                         ChatRuntime.get(app).model(for: ctx.activeSession).error = NibError.wrap(error)
                     }
                     throw error
@@ -233,6 +233,7 @@ enum ChatCommands {
             examples: [[:], ["scope": "block", "refs": ["block:FIXTUREDOC02/FIXTUREBLK01"]]]) { p, ctx in
                 let model = try model(ctx)
                 if ctx.dryRun { return [:] }
+                model.refreshSessionScope()
                 if let scope = p["scope"]?.stringValue {
                     guard model.canConfigureContext else { throw NibError(.conflict, "stop this turn before changing its context") }
                     if ctx.principal.isUser { model.registerContextUndo() }
@@ -421,7 +422,7 @@ enum ChatCommands {
                 case "answer":
                     let id = try string(p, "message")
                     guard let entry = model.entries.first(where: { $0.id == id && $0.role == "assistant" }) else { throw NibError.notFound("answer") }
-                    model.draft = ChatDraft(text: entry.text, prompt: entry.text)
+                    model.draft = ChatDraft(text: entry.displayText, prompt: entry.displayText)
                 case "text":
                     guard model.draft != nil else { throw NibError.notFound("draft") }
                     model.draft?.text = try string(p, "text")

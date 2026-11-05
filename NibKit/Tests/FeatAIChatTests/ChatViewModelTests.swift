@@ -6,6 +6,142 @@ import NibTesting
 
 @MainActor
 final class ChatViewModelTests: XCTestCase {
+    func testCitationLabelsRefreshAfterPageReorderAndDocumentRename() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        let pageRef = "page:FIXTUREDOC01/FIXTUREPG001"
+        let docRef = "doc:FIXTUREDOC01"
+        model.entries = [ChatEntry(id: "CITATIONS", role: "assistant", text: "See \(pageRef) in \(docRef).")]
+        model.refreshCitations()
+        XCTAssertEqual(model.entries[0].citationLabels[pageRef], "Page 1")
+        h.app.commands.register(CommandDescriptor(id: "test.reorder", title: "Reorder", summary: "Swap fixture pages.", effect: .edit)) { _, ctx in
+            var pages = try ctx.workspace.content(Fixtures.docID).livePages
+            let firstOrder = pages[0].order
+            pages[0].order = pages[1].order
+            pages[1].order = firstOrder
+            try ctx.mutate { tx in
+                _ = try tx.put(pages[0], doc: Fixtures.docID)
+                _ = try tx.put(pages[1], doc: Fixtures.docID)
+            }
+            return [:]
+        }
+        _ = try await h.run("test.reorder")
+        try h.library.rename(Fixtures.docID, to: "Renamed notebook")
+        XCTAssertEqual(model.citationLabel(pageRef), "Page 2")
+        model.refreshCitations()
+        XCTAssertEqual(model.entries[0].citationLabels[pageRef], "Page 2")
+        XCTAssertEqual(model.entries[0].citationLabels[docRef], "Renamed notebook")
+        XCTAssertEqual(model.entries[0].displayText, "See Page 2 in Renamed notebook.")
+    }
+
+    func testEntryCitationFallbackIsReplacedWhenResolutionBecomesAvailable() {
+        var entry = ChatEntry(id: "LATECITE", role: "assistant", text: "See page:D/P.")
+        entry.resolveCitations { _ in "Page" }
+        entry.resolveCitations { _ in "Page 3" }
+        XCTAssertEqual(entry.displayText, "See Page 3.")
+    }
+
+    func testRecoverableToolErrorsStayWithAIWhileUserErrorsCanBeDismissed() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        model.chatID = "RETRYCHAT"
+        model.isStreaming = true
+        let params: JSONValue = ["changes": [["command": "test.missing", "params": [:]]]]
+        do {
+            _ = try await h.run(ChatCommand.propose, params, as: .ai("RETRYCHAT"))
+            XCTFail("Invalid proposal must report a tool error")
+        } catch { XCTAssertNil(model.error) }
+        do {
+            _ = try await h.run(ChatCommand.propose, params)
+            XCTFail("Invalid user proposal must fail")
+        } catch { XCTAssertNotNil(model.error) }
+        _ = try await h.run(ChatCommand.inspect, ["section": "error"])
+        XCTAssertNil(model.error)
+    }
+
+    func testAnswerDraftUsesReadableCitationLabelsAndUnresolvedFallback() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        var answer = ChatEntry(id: "CITEDANSWER", role: "assistant", text: "See page:FIXTUREDOC01/FIXTUREPG001.")
+        answer.resolveCitations(model.citationLabel)
+        model.entries = [answer]
+        _ = try await h.run("ai.chat.draft", ["action": "answer", "message": .string(answer.id)])
+        XCTAssertEqual(model.draft?.text, "See Page 1.")
+        XCTAssertEqual(model.draft?.prompt, "See Page 1.")
+        model.entries = [ChatEntry(id: "UNRESOLVED", role: "assistant", text: "See page:UNKNOWN/PAGE.")]
+        _ = try await h.run("ai.chat.draft", ["action": "answer", "message": "UNRESOLVED"])
+        XCTAssertEqual(model.draft?.text, "See Reference.")
+    }
+
+    func testArchiveInterleavesReceiptsWithoutReorderingListedMessages() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let messages = [("USER1", "user", 1.0), ("ANSWER1", "assistant", 2.0),
+                        ("USER2", "user", 4.0), ("ANSWER2", "assistant", 5.0)].map {
+            StoredChatEntry(ChatEntry(id: $0.0, role: $0.1, text: $0.0, at: Date(timeIntervalSince1970: $0.2)))
+        }
+        let receipts = [("APPLIED", 2.0), ("INSERTED", 3.0)].map {
+            StoredChatEntry(ChatEntry(id: $0.0, role: "assistant", text: $0.0, group: $0.0,
+                                      at: Date(timeIntervalSince1970: $0.1), isReceipt: true))
+        }
+        try await ChatArchive.save(chat: "RECEIPTS", device: h.app.deviceHex,
+            records: receipts.map { ChatArchive.Record(message: $0, rev: h.app.clock.tick()) },
+            metadata: h.library.metadataURL, assets: h.app.services.assets, doc: Fixtures.docID)
+        let restored = try await ChatArchive.restore(chat: "RECEIPTS", listed: messages, metadata: h.library.metadataURL)
+        XCTAssertEqual(restored.map(\.id), ["USER1", "ANSWER1", "APPLIED", "INSERTED", "USER2", "ANSWER2"])
+        XCTAssertEqual(restored.filter { $0.receipt == true }.map(\.group), ["APPLIED", "INSERTED"])
+    }
+
+    func testContextAndSendFollowWindowDocumentChanges() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read context.", effect: .read)) { _, _ in
+            ["document": ["kind": "textDocument"]]
+        }
+        let ai = FakeAIService(responses: [.init(text: "Current document")])
+        h.app.services.ai = ai
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try model.setScope(.selection, refs: ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"])
+        h.session.document = Fixtures.textDocID
+        h.session.page = nil
+        _ = try await h.run(ChatCommand.inspect, ["section": "context"])
+        XCTAssertEqual(model.scope.kind, .document)
+        XCTAssertEqual(model.scope.doc, Fixtures.textDocID)
+        XCTAssertTrue(model.scope.refs.isEmpty)
+        h.session.document = Fixtures.docID
+        h.session.page = Fixtures.page2
+        _ = try await model.send(prompt: "Read this", principal: .user, group: "FOLLOWDOC")
+        XCTAssertEqual(ai.requests.last?.scope?.doc, Fixtures.docID)
+    }
+
+    func testInitialLibraryScopeFollowsDocumentButExplicitLibraryStays() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.session.document = nil
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        h.session.document = Fixtures.docID
+        model.refreshSessionScope()
+        XCTAssertEqual(model.scope.doc, Fixtures.docID)
+        try model.setScope(.library)
+        h.session.document = Fixtures.textDocID
+        model.refreshSessionScope()
+        XCTAssertEqual(model.scope.kind, .library)
+        XCTAssertNil(model.scope.doc)
+    }
+
+    func testContextUndoRestoresExplicitLibraryChoiceAcrossDocumentSwitch() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        try model.setScope(.library)
+        model.localUndo.beginUndoGrouping()
+        model.registerContextUndo()
+        try model.setScope(.document)
+        model.localUndo.endUndoGrouping()
+        model.localUndo.undo()
+        h.session.document = Fixtures.textDocID
+        model.refreshSessionScope()
+        XCTAssertEqual(model.scope.kind, .library)
+        XCTAssertNil(model.scope.doc)
+    }
+
     func testPageLabelUsesOneBasedScopedPageEvenWhenCanvasMoves() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         h.app.commands.register(CommandDescriptor(id: CommandIDs.queryContext, title: "Context", summary: "Read the visible canvas context.", effect: .read)) { _, ctx in

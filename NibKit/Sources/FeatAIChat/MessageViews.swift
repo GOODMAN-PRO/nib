@@ -20,7 +20,7 @@ struct ChatMessageView: View {
             .font(NibFont.caption1Emphasis)
             .foregroundStyle(NibColor.labelSecondary)
             if entry.role == "assistant" {
-                paragraph.draggable(ChatAnswerTransfer(text: entry.text, chatID: model.chatID))
+                paragraph.draggable(ChatAnswerTransfer(text: entry.displayText, chatID: model.chatID))
                     .accessibilityHint(String(localized: "Drag this answer onto a page to insert it."))
             } else { paragraph }
             if !entry.images.isEmpty {

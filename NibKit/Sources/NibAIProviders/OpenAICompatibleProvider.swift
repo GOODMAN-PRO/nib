@@ -239,7 +239,11 @@ enum OpenAIWire {
                     case .text(let s): text += s
                     case .toolCall(let id, let name, let arguments):
                         let args: String
-                        if case .string(let raw) = arguments { args = raw } else { args = JSONWire.string(arguments) }
+                        if case .string(let raw) = arguments {
+                            args = JSONWire.parse(raw)?.objectValue != nil ? raw : "{}"
+                        } else {
+                            args = arguments.objectValue != nil ? JSONWire.string(arguments) : "{}"
+                        }
                         calls.append(["id": .string(id), "type": "function",
                                       "function": ["name": .string(name), "arguments": .string(args)]])
                     case .image, .toolResult:

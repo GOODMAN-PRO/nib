@@ -294,11 +294,13 @@ final class LiveSummarizer {
             automaticGroups.insert(group)
             defer { automaticGroups.remove(group) }
             do {
+                let value = try await app.bus.execute(CommandIDs.transcriptGet, ["clip": .string(ref)])
+                let transcript = try value.decode(MeetingTranscript.self)
+                observe(ref, transcript: transcript)
+                let count = try transcript.committedLines().count
+                // Silence at the start of a recording is not a failed summary.
+                guard count > 0 else { continue }
                 if state.state == "stopped", coveredCount[ref] != nil, failures[ref] == nil {
-                    let value = try await app.bus.execute(CommandIDs.transcriptGet, ["clip": .string(ref)])
-                    let transcript = try value.decode(MeetingTranscript.self)
-                    observe(ref, transcript: transcript)
-                    let count = try transcript.committedLines().count
                     if count <= (coveredCount[ref] ?? 0) { continue }
                 }
                 _ = try await app.bus.execute(Invocation(command: CommandIDs.meetingSummarize,
@@ -316,6 +318,10 @@ final class LiveSummarizer {
             observe(ref, transcript: try value.decode(MeetingTranscript.self))
         } catch { transcribing[ref] = nil }
     }
-    func covered(_ ref: String, count: Int) { coveredCount[ref] = count }
+    func covered(_ ref: String, count: Int) {
+        coveredCount[ref] = count
+        failures[ref] = nil
+        errors[ref] = nil
+    }
     func status(_ ref: String) { app?.events.emit(Self.changed, doc: NodeRef(ref)?.documentID, payload: ["clip": .string(ref)]) }
 }

@@ -82,13 +82,15 @@ struct ChatPanel: View {
             // this never configures a provider or contacts its endpoint.
             while !Task.isCancelled {
                 model.refreshProviderLabel()
+                model.refreshCitations()
                 do { try await Task.sleep(for: .seconds(2)) } catch { return }
             }
         }
         .task {
             model.windowUndoManager = context.navigator?.rootViewController?.undoManager
             model.perform(ChatCommand.inspect, ["section": "visibility", "visible": true, "lease": .string(visibilityLease)])
-            if let scope = context.params["scope"]?.stringValue {
+            if let scope = context.params["scope"]?.stringValue,
+               scope != model.scope.kind.rawValue || (context.params["refs"]?.arrayValue?.compactMap(\.stringValue) ?? []) != model.scope.refs {
                 model.perform(ChatCommand.configure, ["scope": .string(scope), "refs": context.params["refs"] ?? []])
             } else { model.perform(ChatCommand.inspect, ["section": "context"]) }
         }
@@ -199,6 +201,9 @@ struct ChatPanel: View {
                           action: model.retryPrompt != nil && model.canSend ? NibAction(String(localized: "Retry")) {
                     model.perform(ChatCommand.send, ["retry": true])
                 } : nil)
+                NibButton(String(localized: "Dismiss error"), kind: .plain, size: .compact) {
+                    model.perform(ChatCommand.inspect, ["section": "error"])
+                }
             }
             Color.clear.frame(height: NibSpacing.xxs).id("aichat.bottom")
         }

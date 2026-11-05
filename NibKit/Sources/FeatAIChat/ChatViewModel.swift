@@ -36,7 +36,7 @@ struct ChatEntry: Identifiable {
     }
 
     mutating func resolveCitations(_ label: (String) -> String) {
-        for ref in citationRefs where citationLabels[ref] == nil { citationLabels[ref] = label(ref) }
+        citationLabels = Dictionary(uniqueKeysWithValues: citationRefs.map { ($0, label($0)) })
         displayText = ChatCitations.replacingRefs(in: text, labels: citationLabels, refs: citationRefs)
     }
 }
@@ -171,11 +171,12 @@ final class ChatViewModel: ObservableObject {
     @Published var retryPrompt: String?
     private var generation: UUID?
     private var sessionObservation: AnyCancellable?
+    private var contextDocument: DocumentID?
+    private var explicitLibraryScope = false
     var turnToken: UUID? { generation }
     @Published private(set) var isLoadingChat = false
     private var loadToken: UUID?
     private var imageTask: Task<Data, Error>?
-    private var citationLabels: [String: String] = [:]
     private var retryImages: [AssetRef] = []
     private var retryEntry: String?
     private var confirmationContinuation: CheckedContinuation<ConfirmationDecision, Never>?
@@ -183,6 +184,7 @@ final class ChatViewModel: ObservableObject {
     init(app: NibApp, session: EditorSession?) {
         self.app = app
         self.session = session
+        contextDocument = session?.document
         if let d = session?.document {
             scope = AIScope(kind: .document, doc: d)
         }
@@ -305,10 +307,29 @@ final class ChatViewModel: ObservableObject {
 
     func loadContext(principal: Principal = .user) async throws {
         guard let app else { throw NibError.unavailable("assistant is closed") }
+        refreshSessionScope()
+        refreshCitations()
         let result = try await app.bus.execute(CommandIDs.queryContext, [:], principal: principal, session: session)
         let value = result
         docKind = value["document"]?["kind"]?.stringValue.flatMap(DocumentKind.init(rawValue:))
         refreshProviderLabel()
+        refreshContextLabel()
+    }
+
+    /// Keep a chosen page/selection pinned within its document, but never carry it into a different notebook.
+    func refreshSessionScope() {
+        guard canConfigureContext, contextDocument != session?.document else { return }
+        contextDocument = session?.document
+        guard scope.kind != .library || !explicitLibraryScope else { return }
+        if let doc = session?.document {
+            if scope.kind == .page, let page = session?.page {
+                scope = AIScope(kind: .page, doc: doc, page: page)
+            } else {
+                scope = AIScope(kind: .document, doc: doc)
+            }
+        } else {
+            scope = AIScope(kind: .library)
+        }
         refreshContextLabel()
     }
 
@@ -334,6 +355,8 @@ final class ChatViewModel: ObservableObject {
             scope = AIScope(kind: kind, doc: NodeRef(selected[0])?.documentID,
                             page: NodeRef(selected[0])?.pageID, refs: selected)
         }
+        contextDocument = session?.document
+        explicitLibraryScope = kind == .library
         refreshContextLabel()
     }
 
@@ -368,6 +391,8 @@ final class ChatViewModel: ObservableObject {
         if let owner = list.chats.first(where: { $0.id == id })?.doc, let ref = NodeRef(owner), let doc = ref.documentID {
             scope = AIScope(kind: .document, doc: doc)
         } else { scope = AIScope(kind: .library) }
+        contextDocument = session?.document
+        explicitLibraryScope = scope.kind == .library
         refreshContextLabel()
         showsConversations = false
         composer = ""
@@ -402,6 +427,8 @@ final class ChatViewModel: ObservableObject {
             throw NibError(.unavailable, "Connect a model to use the assistant.", hint: "open Settings › AI")
         }
         guard canStartGeneration else { throw NibError(.conflict, "a turn or conversation load is already running") }
+        refreshSessionScope()
+        refreshCitations()
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("enter a question or instruction", path: "$.prompt") }
         let images = retry ? retryImages : attachments
@@ -661,7 +688,13 @@ final class ChatViewModel: ObservableObject {
     private func resolveEntryCitations(_ index: Int) {
         var entry = entries[index]
         entry.resolveCitations(citationLabel)
-        entries[index] = entry
+        if entry.citationLabels != entries[index].citationLabels || entry.displayText != entries[index].displayText {
+            entries[index] = entry
+        }
+    }
+
+    func refreshCitations() {
+        for index in entries.indices { resolveEntryCitations(index) }
     }
 
     func confirmationTargetLabel(_ raw: String) -> String {
@@ -673,7 +706,6 @@ final class ChatViewModel: ObservableObject {
     }
 
     func citationLabel(_ raw: String) -> String {
-        if let cached = citationLabels[raw] { return cached }
         guard let ref = NodeRef(raw) else { return String(localized: "Reference") }
         let content = ref.documentID.flatMap { try? app?.workspace.content($0) }
         let label: String
@@ -692,7 +724,6 @@ final class ChatViewModel: ObservableObject {
         case .library: label = String(localized: "Library")
         case .folder: label = String(localized: "Folder")
         }
-        citationLabels[raw] = label
         return label
     }
 
@@ -823,8 +854,12 @@ actor ChatArchive {
             return result
         }
         let ids = Set(restored.map(\.id))
-        restored += presentation.values.map(\.message).filter { $0.receipt == true && !ids.contains($0.id) }
+        let receipts = presentation.values.map(\.message).filter { $0.receipt == true && !ids.contains($0.id) }
             .sorted { ($0.at ?? 0, $0.id) < ($1.at ?? 0, $1.id) }
+        for receipt in receipts {
+            let index = restored.lastIndex(where: { ($0.at ?? 0) <= (receipt.at ?? 0) }).map { $0 + 1 } ?? 0
+            restored.insert(receipt, at: index)
+        }
         return restored
     }
     private func write(chat: String, device: String, records incoming: [Record], metadata: URL, assets: AssetStore?, doc: DocumentID?) throws {
@@ -947,11 +982,13 @@ extension ChatViewModel {
 
     func registerContextUndo() {
         let previousScope = scope, previousMode = mode, previousLabel = contextLabel
+        let previousDocument = contextDocument, previousLibraryScope = explicitLibraryScope
         let manager = windowUndoManager ?? (session?.editor as? UIViewController)?.undoManager ?? localUndo
         manager.registerUndo(withTarget: self) { model in
             MainActor.assumeIsolated {
                 model.registerContextUndo()
                 model.scope = previousScope; model.mode = previousMode; model.contextLabel = previousLabel
+                model.contextDocument = previousDocument; model.explicitLibraryScope = previousLibraryScope
             }
         }
         manager.setActionName(String(localized: "Change assistant context"))
