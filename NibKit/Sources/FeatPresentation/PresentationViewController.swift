@@ -878,6 +878,9 @@ final class LivePageSource: PresentationPageSource {
         switch event.type {
         case NibEventType.laserMoved:
             onLaser?(LaserEvent(event: event))
+        case "lock.changed":
+            // FeatLock publishes both session unlocks and relocks through this event. Re-read LockService.
+            onChange?()
         case NibEventType.docClosed:
             // A document merges from disk when it opens again: its cached numbers may be stale.
             if let doc = event.doc {
