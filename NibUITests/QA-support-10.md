@@ -150,3 +150,11 @@ Confirmed insert-timeouts-state#0 against current raw press/action pairs and Ele
 | Test | Log prefix | Question it answers |
 | --- | --- | --- |
 | Insert native context-menu callers | Native menu opening / item / dismissed | Which target and action were delivered and did the menu close? |
+
+### I2 - selection after keyboard avoidance
+
+Confirmed insert-timeouts-state#2: sticky at y303-507 while the fixed tap was y671; current avoidance deliberately retains its scroll offset. The four diagnosed tests now resolve their exact committed text/sticky value, wait for keyboard absence plus two equal clipped item frames and content offsets, then touch that live frame. Both Styled box re-edit double taps use the same live geometry. The diagram setup also names its committed text. Existing explicit canvas-point callers retain their semantics. CI must reach the four original style/sticky/link assertions and log a point inside the moved object.
+
+| Test | Log prefix | Question it answers |
+| --- | --- | --- |
+| StickySevenColours, StickyCollapseExpand, TextBoxStyleAndAutosize, URLLinkSaveRemove; diagram setup | Insert settled item | Which visible frame and stable scroll offset supplied the contact after keyboard avoidance? |

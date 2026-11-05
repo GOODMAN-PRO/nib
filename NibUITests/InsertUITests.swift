@@ -220,14 +220,37 @@ final class InsertUITests: XCTestCase {
         try wait("Selected content must expose bounds") { q.allElementsBoundByIndex.contains { $0.frame.width > 0 } }
         return try XCTUnwrap(q.allElementsBoundByIndex.first { $0.frame.width > 0 }).frame
     }
-    private func selectAt(_ p: CGPoint? = nil) throws {
+    private func canvasText(_ value: String) -> XCUIElement {
+        ui.canvas.staticTexts.matching(NSPredicate(format: "value == %@", value)).firstMatch
+    }
+    private func settledCanvasPoint(_ target: XCUIElement) throws -> XCUICoordinate {
+        var previousFrame: CGRect?
+        var previousOffset: CGPoint?
+        var visibleFrame = CGRect.zero
+        try wait("Canvas item and scroll position must settle after keyboard dismissal") {
+            guard !self.ui.app.keyboards.firstMatch.exists, target.exists,
+                  let state = try? self.ui.state() else { return false }
+            let frame = target.frame.intersection(self.ui.canvas.frame).intersection(self.ui.app.windows.firstMatch.frame)
+            let offset = CGPoint(x: state.contentOffset.x, y: state.contentOffset.y)
+            defer { previousFrame = frame; previousOffset = offset }
+            guard !frame.isNull, frame.width > 0, frame.height > 0,
+                  previousFrame == frame, previousOffset == offset else { return false }
+            visibleFrame = frame
+            return true
+        }
+        ui.logQA("Insert settled item", "frame=\(visibleFrame) offset=\(String(describing: previousOffset))")
+        return ui.app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+            dx: visibleFrame.midX - ui.app.frame.minX, dy: visibleFrame.midY - ui.app.frame.minY))
+    }
+    private func selectAt(_ p: CGPoint? = nil, target: XCUIElement? = nil) throws {
         try ui.selectTool("lasso")
         // Tapping a selected text/sticky starts its editor; clear selection on blank paper first.
         if try ui.state().selectionCount > 0 {
             ui.coordinate(CGPoint(x: 0.36, y: 0.84)).tap()
             _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 0 }
         }
-        ui.coordinate(p ?? point).tap()
+        if let target { try settledCanvasPoint(target).tap() }
+        else { ui.coordinate(p ?? point).tap() }
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
     }
     private func all() throws {
@@ -432,12 +455,13 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((style["cornerRadius"] as? Double) ?? 0, 0)
         XCTAssertGreaterThan((style["borderWidth"] as? Double) ?? 0, 0)
         let originalHeight = try XCTUnwrap((box["frame"] as? JSON)?["h"] as? Double)
-        try selectAt(); ui.doubleTap(at: point)
+        try selectAt(target: canvasText("Styled box")); try settledCanvasPoint(canvasText("Styled box")).doubleTap()
         try replace(try control("Text box", .textView), with: (1...10).map { "Line \($0)" }.joined(separator: "\n"))
         try finish()
         XCTAssertEqual(try XCTUnwrap((snapshot("text")["frame"] as? JSON)?["h"] as? Double), originalHeight, accuracy: 0.1,
                        "Fixed-height text must clip rather than silently resize its frame")
-        try selectAt(); ui.doubleTap(at: point); try tap("More Formatting")
+        let expandedText = (1...10).map { "Line \($0)" }.joined(separator: "\n")
+        try selectAt(target: canvasText(expandedText)); try settledCanvasPoint(canvasText(expandedText)).doubleTap(); try tap("More Formatting")
         try toggle("Fit Height to Text", to: true); outside(); try finish()
         XCTAssertGreaterThan(try XCTUnwrap((snapshot("text")["frame"] as? JSON)?["h"] as? Double), originalHeight,
                              "Auto-size must grow the frame to fit retained text")
@@ -709,7 +733,7 @@ final class InsertUITests: XCTestCase {
         try ui.dismissSheets()
     }
     func testNativeDiagramActionCreatesEditableNodesAndGroupedUndo() throws {
-        try configureProvider(); try beginText("Make a flow diagram"); try finish(); try selectAt()
+        try configureProvider(); try beginText("Make a flow diagram"); try finish(); try selectAt(target: canvasText("Make a flow diagram"))
         let before = try ui.state().itemCountOnPage
         try menu("Ask AI"); try tap("Edit")
         let composer = try control("Question or instruction")
@@ -994,7 +1018,7 @@ final class InsertUITests: XCTestCase {
         outside(); ui.coordinate(point).tap()
         let editor = try control("Sticky note", .textView)
         editor.typeText(text); try finish(); try counts(5)
-        try selectAt()
+        try selectAt(target: canvasText(text))
     }
     func testStickySevenColoursAndSelectedOnlyRecolour() throws {
         try sticky(); let original = try item("sticky")
@@ -1138,7 +1162,7 @@ final class InsertUITests: XCTestCase {
         try tap("Add Link"); try finish()
         let linked = try snapshot("text")
         XCTAssertTrue(json(linked).contains("https://example.com/lab"))
-        try selectAt(); try menu("Edit Link"); try tap("Remove Link")
+        try selectAt(target: canvasText("Visit lab")); try menu("Edit Link"); try tap("Remove Link")
         let removed = try snapshot("text")
         XCTAssertFalse(json(removed).contains("https://example.com/lab"))
         XCTAssertEqual(try plain(removed), "Visit lab")
