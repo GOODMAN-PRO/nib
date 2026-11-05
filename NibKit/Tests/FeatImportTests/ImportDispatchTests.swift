@@ -696,30 +696,32 @@ final class ImportDispatchTests: XCTestCase {
         }
     }
 
-    func testMarkerFailureCompletesHandoffWithoutDuplicatingOrLosingProvenance() throws {
+    func testMarkerFailureCompletesHandoffWithoutDuplicatingOrLosingProvenance() async throws {
         let dir = try tempDir()
         let file = dir.appendingPathComponent("shared.pdf")
         let marker = ShareHandoff.recoveryMarker(file)
         // A directory at the sidecar path forces the atomic marker write to fail.
         try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: true)
-        let board = UIPasteboard.general
-        let previous = board.items
-        let previousTaken = ShareHandoff.lastTaken
-        let previousDenied = ShareHandoff.deniedChangeCount
+        let fixture = HandoffTestFixture()
+        let board = fixture.board
         defer {
-            board.items = previous
-            ShareHandoff.lastTaken = previousTaken
-            ShareHandoff.deniedChangeCount = previousDenied
+            fixture.restore()
             try? FileManager.default.removeItem(at: file)
             ShareHandoff.sweepRecoveryMarkers(in: dir)
         }
         let bytes = Data("%PDF shared original".utf8)
         board.items = [[ShareHandoff.nameType: "shared.pdf", ShareHandoff.dataType: bytes]]
-        XCTAssertEqual(try ShareHandoff.take(into: dir), [file])
+        let taken = try await importStep("marker failure completes handoff with fallback provenance") {
+            try await ShareHandoff.take(into: dir)
+        }
+        XCTAssertEqual(taken, [file])
         XCTAssertFalse(ShareHandoff.isWaiting)
         XCTAssertEqual(try Data(contentsOf: file), bytes)
         XCTAssertTrue(ShareHandoff.isRecoveryOriginal(file), "A failed import must retain the original even without its marker")
-        XCTAssertEqual(try ShareHandoff.take(into: dir), [])
+        let retried = try await importStep("a second handoff does not duplicate the saved original") {
+            try await ShareHandoff.take(into: dir)
+        }
+        XCTAssertEqual(retried, [])
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { !$0.hasPrefix(".") }, ["shared.pdf"])
     }
 

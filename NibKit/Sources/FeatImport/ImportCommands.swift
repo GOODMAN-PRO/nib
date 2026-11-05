@@ -657,7 +657,7 @@ enum ImportEngine {
         let staging = try ImportStaging()
         defer { staging.cleanUp() }
 
-        let expanded = try expandHandoff(sources, staging: staging, ctx: ctx)
+        let expanded = try await expandHandoff(sources, staging: staging, ctx: ctx)
         // One Open In copy can reach Nib twice (the shell's openURL and the inbox scan on activation): the first call
         // takes it, the other leaves it alone.
         let claimed = claim(expanded)
@@ -845,7 +845,7 @@ enum ImportEngine {
 
     /// Replaces the share-extension hand-off link (nib://import?from=pasteboard) by the files on the pasteboard.
     static func expandHandoff(_ sources: [ImportSource], staging: ImportStaging,
-                                      ctx: CommandContext) throws -> [ImportSource] {
+                                      ctx: CommandContext) async throws -> [ImportSource] {
         var out: [ImportSource] = []
         for s in sources {
             guard ShareHandoff.isHandoffLink(s.original) else {
@@ -860,7 +860,7 @@ enum ImportEngine {
             // import leaves these inbox files available; success and explicit decline consume them normally.
             let inbox = ImportLocations.openInInbox
             try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
-            let urls = try ShareHandoff.take(into: inbox)
+            let urls = try await ShareHandoff.take(into: inbox)
             out += urls.map { ImportSource(original: $0.absoluteString) }
         }
         return out

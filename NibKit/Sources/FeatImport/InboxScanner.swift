@@ -87,6 +87,69 @@ enum ImportLocations {
 
 // MARK: - Share extension hand-off
 
+/// Read representations asynchronously: `UIPasteboard.items` can block the main actor on a provider/paste prompt.
+@MainActor
+protocol ShareHandoffBoard: AnyObject {
+    var changeCount: Int { get }
+    func contains(_ type: String) -> Bool
+    func readProviders() -> [NSItemProvider]
+    func clear()
+}
+
+@MainActor
+private final class SystemShareHandoffBoard: ShareHandoffBoard {
+    var changeCount: Int { NibApp.isHostlessTest ? 0 : UIPasteboard.general.changeCount }
+    func contains(_ type: String) -> Bool {
+        !NibApp.isHostlessTest && UIPasteboard.general.contains(pasteboardTypes: [type])
+    }
+    func readProviders() -> [NSItemProvider] { NibApp.isHostlessTest ? [] : UIPasteboard.general.itemProviders }
+    func clear() { if !NibApp.isHostlessTest { UIPasteboard.general.items = [] } }
+}
+
+/// A provider is allowed to never call back, or to call back after cancellation. Both must release the caller.
+@MainActor
+private final class HandoffDataRequest {
+    private var pending: CheckedContinuation<Data, Error>?
+    private var deadline: Task<Void, Never>?
+    private var progress: Progress?
+
+    func load(_ provider: NSItemProvider, type: String, timeoutNanoseconds: UInt64) async throws -> Data {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                pending = continuation
+                deadline = Task { @MainActor in
+                    do { try await Task.sleep(nanoseconds: timeoutNanoseconds) } catch { return }
+                    self.finish(.failure(NibError(.unavailable,
+                        String(localized: "The shared file didn't arrive. Share it with Nib again."))))
+                }
+                progress = provider.loadDataRepresentation(forTypeIdentifier: type) { [weak self] data, error in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        if let data { self.finish(.success(data)) }
+                        else { self.finish(.failure(NibError(.userDenied,
+                            String(localized: "Couldn't read the shared file. Share it again and allow pasting."),
+                            hint: error?.localizedDescription))) }
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.finish(.failure(CancellationError())) }
+        }
+    }
+
+    private func finish(_ result: Result<Data, Error>) {
+        guard let continuation = pending else { return }
+        pending = nil
+        deadline?.cancel()
+        deadline = nil
+        let loading = progress
+        progress = nil
+        if case .failure = result { loading?.cancel() }
+        continuation.resume(with: result)
+    }
+}
+
 /// How NibShare (NibShare/ShareViewController.swift, which cannot import NibKit: keep both in step) hands items over.
 /// With an App Group it writes files into `<group>/Inbox/` (hidden while being written, then renamed). Without one
 /// it puts each item on the pasteboard as a name plus its bytes and opens `nib://import?from=pasteboard`, which F074
@@ -96,6 +159,9 @@ enum ShareHandoff {
     static let nameType = "app.nib.share.name"
     static let dataType = "app.nib.share.data"
     static let inboxFolder = "Inbox"
+
+    @MainActor static var board: ShareHandoffBoard = SystemShareHandoffBoard()
+    @MainActor private static var taking = false
 
     /// When the waiting items were last taken: the scan on activation and the deep link can both ask for them, and
     /// the second one then finds nothing to do rather than an error.
@@ -122,18 +188,43 @@ enum ShareHandoff {
 
     /// True while NibShare's items wait on the pasteboard (checking types never shows the paste prompt).
     @MainActor
-    static var isWaiting: Bool { UIPasteboard.general.contains(pasteboardTypes: [dataType]) }
+    static var isWaiting: Bool { board.contains(dataType) }
 
     /// Writes the waiting items into `dir` and clears them from the pasteboard. [] when they were just taken.
     @MainActor
-    static func take(into dir: URL) throws -> [URL] {
-        let board = UIPasteboard.general
-        guard board.contains(pasteboardTypes: [dataType]) else {
+    static func take(into dir: URL, timeoutNanoseconds: UInt64 = 5_000_000_000) async throws -> [URL] {
+        try Task.checkCancellation()
+        // Deep link and activation scan can arrive together while the providers are still loading.
+        guard !taking else { return [] }
+        taking = true
+        defer { taking = false }
+        let board = self.board
+        let revision = board.changeCount
+        guard board.contains(dataType) else {
             if let taken = lastTaken, Date().timeIntervalSince(taken) < 60 { return [] }
             throw NibError(.notFound, "nothing shared with Nib is waiting on the pasteboard",
                            hint: "share the item to Nib again")
         }
-        let urls = try write(board.items, into: dir)
+        var items: [[String: Any]] = []
+        do {
+            for provider in board.readProviders() where provider.hasItemConformingToTypeIdentifier(dataType) {
+                let data = try await HandoffDataRequest().load(provider, type: dataType, timeoutNanoseconds: timeoutNanoseconds)
+                var item: [String: Any] = [dataType: data]
+                if provider.hasItemConformingToTypeIdentifier(nameType) {
+                    item[nameType] = try await HandoffDataRequest().load(provider, type: nameType,
+                                                                        timeoutNanoseconds: timeoutNanoseconds)
+                }
+                items.append(item)
+            }
+        } catch {
+            if NibError.wrap(error).code == .userDenied, board.changeCount == revision { deniedChangeCount = revision }
+            throw error
+        }
+        try Task.checkCancellation()
+        guard self.board === board, board.changeCount == revision else {
+            throw NibError(.unavailable, String(localized: "The clipboard changed. Share the file with Nib again."))
+        }
+        let urls = try write(items, into: dir)
         guard !urls.isEmpty else {
             deniedChangeCount = board.changeCount
             throw NibError(.userDenied, "Nib couldn't read what was shared",
@@ -142,7 +233,7 @@ enum ShareHandoff {
         // Persist provenance before clearing the only upstream copy. A later inbox scan (even after
         // relaunch) must distinguish these originals from the disposable copies iOS makes for Open In.
         for url in urls { rememberRecoveryOriginal(url) }
-        board.items = []
+        board.clear()
         lastTaken = Date()
         deniedChangeCount = nil
         return urls
@@ -219,6 +310,11 @@ enum ShareHandoff {
     /// Writes every hand-off item (name + bytes) into `dir`; other pasteboard items are ignored.
     static func write(_ items: [[String: Any]], into dir: URL) throws -> [URL] {
         var out: [URL] = []
+        var committed = false
+        defer {
+            // A partial write leaves the upstream payload intact. Remove this attempt's copies before retrying.
+            if !committed { for url in out { try? FileManager.default.removeItem(at: url) } }
+        }
         for item in items {
             guard let data = item[dataType] as? Data else { continue }
             let name = (item[nameType] as? Data).map { String(decoding: $0, as: UTF8.self) }
@@ -227,6 +323,7 @@ enum ShareHandoff {
             try data.write(to: url, options: .atomic)
             out.append(url)
         }
+        committed = true
         return out
     }
 }
@@ -332,7 +429,7 @@ enum InboxScanner {
               let root = nav.rootViewController, root.view.window != nil, root.presentedViewController == nil else { return }
         busy = true
         defer { busy = false }
-        if ShareHandoff.shouldOffer(isWaiting: ShareHandoff.isWaiting, changeCount: UIPasteboard.general.changeCount) {
+        if ShareHandoff.shouldOffer(isWaiting: ShareHandoff.isWaiting, changeCount: ShareHandoff.board.changeCount) {
             await runImport([ShareHandoff.link], app: app, navigator: nav)
             return
         }
