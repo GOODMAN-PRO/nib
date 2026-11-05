@@ -968,6 +968,27 @@ final class BlockCommentTests: XCTestCase {
         await assertError(.locked) { _ = try await self.export(h, ExportRequest(documents: [doc])) }
     }
 
+    func testExportAndPrintingRejectUnreadableReferencedImages() async throws {
+        let h = harness()
+        _ = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "image",
+                                            "asset": .string(Fixtures.pngAsset.name)])
+        h.assets.install(Data("corrupt image".utf8), as: Fixtures.pngAsset, doc: doc)
+        do {
+            _ = try await export(h, ExportRequest(documents: [doc]))
+            XCTFail("An incomplete PDF must not be returned")
+        } catch {}
+        XCTAssertThrowsError(try TextDocPrinter.renderer(doc: doc, app: h.app, session: h.session))
+        let blocks = try h.app.workspace.content(doc).liveBlocks
+        let missing = TextDocPrintSnapshot.make(doc: doc, title: "Missing", blocks: blocks, assets: nil, options: [:])
+        XCTAssertThrowsError(try TextDocPDF.data(missing))
+        h.assets.install(Fixtures.pngData, as: Fixtures.pngAsset, doc: doc)
+        let valid = TextDocPrintSnapshot.make(doc: doc, title: "Valid header", blocks: blocks, assets: h.assets, options: [:])
+        XCTAssertNotNil(TextDocPrintImages.pixelSize(h.assets, asset: Fixtures.pngAsset, doc: doc))
+        XCTAssertThrowsError(try TextDocPrintImages.validate(valid, decode: { _, _, _, _ in nil }),
+                             "A valid header with failed pixel decoding must fail preflight")
+        XCTAssertNoThrow(try TextDocPDF.data(valid))
+    }
+
     func testEveryBlockKindPrintsAndLongDocumentsPaginate() async throws {
         let h = harness()
         var blocks: [TextBlock] = []
@@ -1030,7 +1051,7 @@ final class BlockCommentTests: XCTestCase {
             for (a, b) in zip(parts, parts.dropFirst()) { XCTAssertEqual(a.upperBound, b.lowerBound) }
         }
 
-        let data = TextDocPDF.data(snapshot, layout: layout)
+        let data = try TextDocPDF.data(snapshot, layout: layout)
         let pdf = try XCTUnwrap(PDFDocument(data: data))
         XCTAssertEqual(pdf.pageCount, layout.pages.count)
         let text = pdf.string ?? ""
