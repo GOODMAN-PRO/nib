@@ -383,6 +383,30 @@ final class FeatPageTextTests: XCTestCase {
 
     // MARK: Editor
 
+    func testParagraphFormattingExcludesUnselectedNextParagraph() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(FakeItemUpdate.self)
+        let host = FakeCanvasHost(h)
+        let editor = PageTextEditor()
+        editor.attach(to: host)
+        defer { editor.detach(from: host) }
+        _ = try await start(h, page2Ref)
+        let tv = try XCTUnwrap(textView(host))
+        XCTAssertTrue(typeText("a\nb", editor, tv))
+        tv.selectedRange = NSRange(location: 0, length: 2)
+        editor.perform(key: "style.title")
+        let text = RichTextBridge.richText(tv.attributedText)
+        XCTAssertEqual(text.paragraphs[0].style, PageTextStyle.title.rawValue)
+        XCTAssertNotEqual(text.paragraphs[1].style, PageTextStyle.title.rawValue)
+        XCTAssertEqual(tv.selectedRange, NSRange(location: 0, length: 2))
+        editor.perform(key: "list.bullet")
+        XCTAssertEqual(RichTextBridge.richText(tv.attributedText).paragraphs.map { $0.list }, [.bullet, .plain])
+        editor.perform(key: "list.bullet")
+        XCTAssertEqual(RichTextBridge.richText(tv.attributedText).paragraphs.map { $0.list }, [.plain, .plain])
+        editor.perform(key: "indent")
+        XCTAssertEqual(RichTextBridge.richText(tv.attributedText).paragraphs.map { $0.indent }, [1, 0])
+    }
+
     func testEditorOpensOverTheBoxAndCommitsOneUndoStep() async throws {
         let h = Harness(features: [FeatPageTextFeature.self])
         h.app.commands.register(FakeItemUpdate.self)
