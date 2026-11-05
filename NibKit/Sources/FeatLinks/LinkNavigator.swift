@@ -84,6 +84,7 @@ final class LinkNavigator: ObservableObject {
             return LinkFollowResult(kind: "url", target: url.absoluteString)
         }
         guard let doc = link.document else { throw NibError(.invalidParams, "the link has no target", path: "$") }
+        try LinkTarget.requireLiveDocument(doc, library: ctx.services.library)
         let content = try ctx.workspace.content(doc)
         if let clipID = link.audioClip {
             guard let clip = content.liveAudio.first(where: { $0.id == clipID }) else { throw NibError.notFound("audio clip \(clipID)") }
@@ -126,6 +127,7 @@ final class LinkNavigator: ObservableObject {
         var result: LinkStop?
         var landing: PageID?
         while let stop = stack.popLast() {
+            guard (try? LinkTarget.requireLiveDocument(stop.doc, library: app?.services.library)) != nil else { continue }
             guard stop != here, let content = try? workspace.content(stop.doc) else { continue }
             var page: PageID?
             if let p = stop.page, let record = content.page(p), !record.deleted { page = p }

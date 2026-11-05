@@ -49,7 +49,7 @@ struct LinkTarget: Codable, Equatable {
     /// Validates the target against the documents and returns the stored form.
     /// `path` prefixes parameter paths in errors ("$.link." for link.set, "$." for link.follow).
     @MainActor
-    func resolve(defaultDoc: DocumentID?, workspace: Workspace, principal: Principal, path: String) throws -> TextLink {
+    func resolve(defaultDoc: DocumentID?, workspace: Workspace, library: LibraryService?, principal: Principal, path: String) throws -> TextLink {
         if let raw = url?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
             guard let u = LinkTarget.normalizedURL(raw) else {
                 throw NibError(.invalidParams, "'\(raw)' is not a web address", path: path + "url",
@@ -59,7 +59,7 @@ struct LinkTarget: Codable, Equatable {
                 let internalLink = RichTextBridge.link(from: u)
                 if internalLink.document != nil {
                     return try LinkTarget(internalLink).resolve(defaultDoc: defaultDoc, workspace: workspace,
-                                                               principal: principal, path: path)
+                                                               library: library, principal: principal, path: path)
                 }
                 // Other nib:// links (plugin install, bridge pairing, import) run as the user when tapped, so only
                 // the user may put them behind text.
@@ -78,6 +78,7 @@ struct LinkTarget: Codable, Equatable {
                 if case let .audio(d, c) = ref { return (d, c) }
                 return nil
             }
+            try Self.requireLiveDocument(d, library: library)
             guard try workspace.content(d).liveAudio.contains(where: { $0.id == c }) else {
                 throw NibError(.notFound, "audio clip \(c) not found in document \(d)", path: path + "clip")
             }
@@ -88,6 +89,7 @@ struct LinkTarget: Codable, Equatable {
                 if case let .page(d, p) = ref { return (d, p) }
                 return nil
             }
+            try Self.requireLiveDocument(d, library: library)
             guard let record = try workspace.content(d).page(p), !record.deleted else {
                 throw NibError(.notFound, "page \(p) not found in document \(d)", path: path + "page")
             }
@@ -95,11 +97,21 @@ struct LinkTarget: Codable, Equatable {
         }
         if let doc = doc, !doc.isEmpty {
             let d = NodeRef.documentID(from: doc)
+            try Self.requireLiveDocument(d, library: library)
             _ = try workspace.content(d)
             return TextLink(document: d)
         }
         throw NibError(.invalidParams, "a link needs url, page, clip or doc", path: String(path.dropLast()),
                        hint: "e.g. {\"url\": \"https://example.com\"} or {\"page\": \"page:D/P\"}")
+    }
+
+    /// Reject catalogue tombstones even when the workspace still holds live-looking metadata.
+    @MainActor
+    static func requireLiveDocument(_ doc: DocumentID, library: LibraryService?) throws {
+        // The catalogue changes when a package is trashed; Workspace may still cache its old metadata.
+        if library?.node(doc)?.trashedAt != nil {
+            throw NibError(.notFound, String(localized: "This document is in the Trash. Restore it before opening the link."))
+        }
     }
 
     /// "audio:D/A" / "page:D/P", or a bare id inside `owner`.
@@ -427,7 +439,8 @@ struct LinkSet: NibCommand {
         guard let refString = p.ref else { throw NibError(.invalidParams, "missing required field 'ref'", path: "$.ref") }
         guard let rangeValue = p.range else { throw NibError(.invalidParams, "missing required field 'range'", path: "$.range") }
         let ref = try LinkedTextRef(refString)
-        let link = try target.resolve(defaultDoc: ref.doc, workspace: ctx.workspace, principal: ctx.principal, path: "$.link.")
+        let link = try target.resolve(defaultDoc: ref.doc, workspace: ctx.workspace, library: ctx.services.library,
+                                      principal: ctx.principal, path: "$.link.")
         let content = ctx.content
         return try ctx.mutate { tx in
             let text = try ref.text(in: tx, content: content)
@@ -518,7 +531,7 @@ struct LinkFollow: NibCommand {
         let navigator = try LinkNavigator.require(ctx.services)
         let session = ctx.activeSession
         let link = try target.resolve(defaultDoc: session?.document, workspace: ctx.workspace,
-                                      principal: ctx.principal, path: "$.")
+                                      library: ctx.services.library, principal: ctx.principal, path: "$.")
         return try await navigator.follow(link, from: navigator.currentStop(session), ctx: ctx)
     }
 }

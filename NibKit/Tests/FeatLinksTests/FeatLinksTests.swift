@@ -10,6 +10,31 @@ import NibTesting
 final class FeatLinksTests: XCTestCase {
     private let textRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
 
+    func testTrashCatalogueRejectsNewAndStoredLinksDespiteCachedMetadata() async throws {
+        let h = harness()
+        let calls = stubAudioPlay(h)
+        let nav = try navigator(h)
+        _ = try h.app.workspace.content(Fixtures.docID)
+        let library = try XCTUnwrap(h.app.services.library)
+        try library.trash(Fixtures.docID)
+        XCTAssertNil(try h.app.workspace.content(Fixtures.docID).meta.trashedFrom)
+        let targets: [JSONValue] = [["doc": "doc:FIXTUREDOC01"], ["page": "page:FIXTUREDOC01/FIXTUREPG001"],
+                                   ["clip": "audio:FIXTUREDOC01/FIXTUREAUD01"], ["url": "nib://open/FIXTUREDOC01/FIXTUREPG001"]]
+        for target in targets {
+            await assertThrows(.notFound) { _ = try await h.run("link.follow", target) }
+            await assertThrows(.notFound) {
+                _ = try await h.run("link.set", ["ref": "block:FIXTUREDOC02/FIXTUREBLK02", "link": target])
+            }
+        }
+        h.app.commands.register(CommandDescriptor(id: "test.followStored", title: "Follow", summary: "Follow stored link", effect: .session)) { _, ctx in
+            _ = try await nav.follow(TextLink(document: Fixtures.docID), from: nil, ctx: ctx)
+            return [:]
+        }
+        await assertThrows(.notFound) { _ = try await h.run("test.followStored") }
+        XCTAssertTrue(calls.params.isEmpty)
+        XCTAssertTrue(nav.history(h.session).isEmpty)
+    }
+
     func testAudioLinkFallsBackFromTrashedPage() async throws {
         let h = harness()
         let calls = stubAudioPlay(h)
