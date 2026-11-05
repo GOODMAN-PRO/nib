@@ -274,27 +274,56 @@ public struct NibWidthPresetButton: View {
 /// Segmented control: fill3 track (radius 9, 2 pt inset, 32 pt visual), knob on selectedSegment (radius 7). Each
 /// segment's hit area is the full 44 pt height (the track is drawn inside it).
 public struct NibSegmentedControl<Value: Hashable>: View {
+    public enum Sizing: Sendable {
+        /// Preserve full labels, stacking when their intrinsic widths do not fit.
+        case intrinsic
+        /// Share the proposed width equally, truncating labels without reducing their font size.
+        case fitting
+    }
+
     @Binding var selection: Value
     let options: [Value]
+    let sizing: Sizing
     let title: (Value) -> String
     @Namespace private var knob
 
-    public init(selection: Binding<Value>, options: [Value], title: @escaping (Value) -> String) {
+    public init(selection: Binding<Value>, options: [Value], sizing: Sizing = .intrinsic,
+                title: @escaping (Value) -> String) {
         self._selection = selection
         self.options = options
+        self.sizing = sizing
         self.title = title
     }
 
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.layoutDirection) private var layoutDirection
 
     public var body: some View {
         if typeSize.isAccessibilitySize {
             verticalOptions
+        } else if sizing == .fitting {
+            ViewThatFits(in: .horizontal) {
+                fittingOptions
+                verticalOptions
+            }
         } else {
             ViewThatFits(in: .horizontal) {
                 horizontalOptions.fixedSize(horizontal: true, vertical: true)
                 verticalOptions
             }
+        }
+    }
+
+    private var fittingOptions: some View {
+        NibEqualSegmentLayout(direction: layoutDirection) {
+            ForEach(options, id: \.self) { option in segment(option, vertical: false) }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 2)
+        .background {
+            RoundedRectangle(cornerRadius: NibRadius.segment, style: .continuous)
+                .fill(NibColor.fill3)
+                .padding(.vertical, 6)
         }
     }
 
@@ -351,7 +380,33 @@ public struct NibSegmentedControl<Value: Hashable>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: shape))
+        .accessibilityLabel(title(option))
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// Its ideal width is the minimum tappable row, so ViewThatFits only stacks when
+/// equal 44 pt targets cannot fit. A finite proposal is shared equally, including in RTL.
+private struct NibEqualSegmentLayout: Layout {
+    let direction: LayoutDirection
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard !subviews.isEmpty else { return .zero }
+        let minimum = CGFloat(subviews.count) * NibMetrics.hitTarget
+        let width = max(minimum, proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? minimum)
+        let segment = ProposedViewSize(width: width / CGFloat(subviews.count), height: nil)
+        let height = subviews.map { $0.sizeThatFits(segment).height }.max() ?? NibMetrics.hitTarget
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard !subviews.isEmpty else { return }
+        let width = bounds.width / CGFloat(subviews.count)
+        for (index, subview) in subviews.enumerated() {
+            let column = direction == .rightToLeft ? subviews.count - 1 - index : index
+            subview.place(at: CGPoint(x: bounds.minX + (CGFloat(column) + 0.5) * width, y: bounds.midY),
+                          anchor: .center, proposal: ProposedViewSize(width: width, height: bounds.height))
+        }
     }
 }
 
