@@ -291,10 +291,14 @@ final class InkUITests: XCTestCase {
         let close = surface.buttons.matching(NSPredicate(format: "label ==[c] 'close'")).firstMatch
         let done = surface.buttons.matching(NSPredicate(format: "label ==[c] 'done'")).firstMatch
         var dismissal: XCUIElement?
-        try wait("Native colour picker must expose close, Done or a popover dismissal surface") {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             if close.exists && close.isHittable { dismissal = close; return true }
             if done.exists && done.isHittable { dismissal = done; return true }
-            return isPopover
+            return false
+        }, object: nil)
+        let foundControl = XCTWaiter.wait(for: [ready], timeout: isPopover ? 2 : 8) == .completed
+        guard foundControl || isPopover else {
+            throw NibUI.Failure.message("Native colour picker must expose close, Done or a popover dismissal surface")
         }
         if let dismissal {
             ui.logQA("Colour picker dismissal", ui.elementFacts(dismissal))
@@ -302,14 +306,26 @@ final class InkUITests: XCTestCase {
         } else {
             let window = ui.app.windows.firstMatch.frame
             let panel = popover.frame
-            let points = [CGPoint(x: window.minX + 24, y: window.minY + 24),
-                          CGPoint(x: window.maxX - 24, y: window.minY + 24),
-                          CGPoint(x: window.minX + 24, y: window.maxY - 24),
-                          CGPoint(x: window.maxX - 24, y: window.maxY - 24)]
-            guard let point = points.first(where: { !panel.insetBy(dx: -8, dy: -8).contains($0) }) else {
+            let region = ui.app.otherElements["PopoverDismissRegion"].firstMatch
+            guard region.exists else {
+                throw NibUI.Failure.message("Colour popover has no dismissal region")
+            }
+            let regionFrame = region.frame.intersection(window)
+            guard !regionFrame.isNull, !regionFrame.isInfinite,
+                  regionFrame.width > 48, regionFrame.height > 48 else {
+                throw NibUI.Failure.message("Colour popover has no visible dismissal region")
+            }
+            let surfaces = ui.app.popovers.allElementsBoundByIndex.map(\.frame) + [panel]
+            let points = [CGPoint(x: regionFrame.minX + 24, y: regionFrame.minY + 24),
+                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.minY + 24),
+                          CGPoint(x: regionFrame.minX + 24, y: regionFrame.maxY - 24),
+                          CGPoint(x: regionFrame.maxX - 24, y: regionFrame.maxY - 24)]
+            guard let point = points.first(where: { point in
+                regionFrame.contains(point) && !surfaces.contains { $0.insetBy(dx: -8, dy: -8).contains(point) }
+            }) else {
                 throw NibUI.Failure.message("Colour popover has no outside dismissal point")
             }
-            ui.logQA("Colour picker dismissal", "outside=\(point) popover=\(panel)")
+            ui.logQA("Colour picker dismissal", "outside=\(point) popover=\(panel) dismissRegion=\(regionFrame)")
             ui.app.coordinate(withNormalizedOffset: .zero).withOffset(
                 CGVector(dx: point.x - ui.app.frame.minX, dy: point.y - ui.app.frame.minY)).tap()
         }

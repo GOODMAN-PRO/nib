@@ -144,8 +144,14 @@ final class NibUI {
         let expected = enabled ? "1" : "0"
         if element.value as? String != expected {
             let native = element.descendants(matching: .switch).firstMatch
-            let hasNative = native.exists
-            let target = hasNative ? native : element
+            var hasNative = native.exists
+            var target = hasNative ? native : element
+            if target.exists && !target.isHittable {
+                revealFormElement(element)
+                if let failure = formRevealFailure { throw Failure.message(failure) }
+                hasNative = native.exists
+                target = hasNative ? native : element
+            }
             let facts = "row: " + elementFacts(element) + "\nthumb: " + elementFacts(target, includeOverlaps: true)
             logQA("Switch before press", facts)
             guard target.isEnabled && target.isHittable else {
@@ -204,12 +210,23 @@ final class NibUI {
             if let form, form.exists, hasVisibleFrame(form) {
                 ancestorClip = nil
                 containerIsTransient = false
-                if let node = try? form.snapshot(), let root = try? app.snapshot(),
-                   let context = ancestry(node, in: root) {
-                    ancestorClip = context.clip
-                    containerIsTransient = context.transient
-                } else {
-                    logQA("Form reveal ancestry unavailable", "Using explicit container with window clip; caller retains its form")
+                // Ordinary explicit forms keep the cheap window clip. Only inspect ancestry
+                // within a presented transient surface; native UIKit menus use a Preview sibling.
+                let surfaces = app.popovers.allElementsBoundByIndex + app.menus.allElementsBoundByIndex
+                let hasNativeMenu = app.otherElements["Preview"].firstMatch.exists
+                if !surfaces.isEmpty || hasNativeMenu, let node = try? form.snapshot() {
+                    for surface in surfaces where hasVisibleFrame(surface) {
+                        if let root = try? surface.snapshot(), let context = ancestry(node, in: root) {
+                            ancestorClip = context.clip
+                            containerIsTransient = context.transient
+                            break
+                        }
+                    }
+                    if ancestorClip == nil, hasNativeMenu, let root = try? app.snapshot(),
+                       let context = ancestry(node, in: root), context.transient {
+                        ancestorClip = context.clip
+                        containerIsTransient = true
+                    }
                 }
                 return form
             }
@@ -355,8 +372,14 @@ final class NibUI {
         var endSignatures: [String] = []
         for _ in 0..<16 {
             let listFrame = snapshot.frame
-            guard let viewport = NibUITestScrollGeometry.viewport(
-                scroll: listFrame.intersection(ancestorClip ?? window), window: window, obstructions: obstructions) else { return }
+            var clippedViewport = NibUITestScrollGeometry.viewport(
+                scroll: listFrame.intersection(ancestorClip ?? window), window: window, obstructions: obstructions)
+            if clippedViewport == nil, let ancestorClip {
+                logQA("Form viewport fallback", "Unusable ancestor clip=\(ancestorClip); using container=\(listFrame) intersected with window=\(window)")
+                clippedViewport = NibUITestScrollGeometry.viewport(
+                    scroll: listFrame, window: window, obstructions: obstructions)
+            }
+            guard let viewport = clippedViewport else { return }
             let element: XCUIElement
             if let identity {
                 element = list.descendants(matching: identity.elementType).matching(NSPredicate(
@@ -395,20 +418,26 @@ final class NibUI {
                 nextSnapshot = try? replacement.snapshot()
             }
             guard let after = nextSnapshot else {
-                logQA("Form reveal unavailable", "Container snapshot unavailable after drag; before=\(listFrame); caller retains its wait/fallback")
+                if wasTransient {
+                    containerLost("container disappeared after drag: before=\(snapshot.elementType) \(listFrame)")
+                } else {
+                    logQA("Form reveal unavailable", "Container snapshot unavailable after drag; before=\(listFrame); caller retains its wait/fallback")
+                }
                 return
             }
-            let sameFrame = abs(after.frame.minX - listFrame.minX) <= 1
-                && abs(after.frame.minY - listFrame.minY) <= 1
-                && abs(after.frame.maxX - listFrame.maxX) <= 1
-                && abs(after.frame.maxY - listFrame.maxY) <= 1
+            let dx0: CGFloat = abs(after.frame.minX - listFrame.minX)
+            let dy0: CGFloat = abs(after.frame.minY - listFrame.minY)
+            let dx1: CGFloat = abs(after.frame.maxX - listFrame.maxX)
+            let dy1: CGFloat = abs(after.frame.maxY - listFrame.maxY)
+            let sameFrame = dx0 <= 1.0 && dy0 <= 1.0 && dx1 <= 1.0 && dy1 <= 1.0
             if wasTransient && (after.elementType != snapshot.elementType || !sameFrame) {
                 containerLost("before=\(snapshot.elementType) \(listFrame) after=\(after.elementType) \(after.frame)")
                 return
             }
             if after.elementType != snapshot.elementType || !sameFrame {
-                logQA("Form container changed", "Ordinary form rebuilt or resized; before=\(listFrame) after=\(after.frame); caller retains its wait/fallback")
-                return
+                logQA("Form container changed", "Ordinary form rebuilt or resized; before=\(listFrame) after=\(after.frame); continuing with new snapshot")
+                // A previous ordinary ancestor clip can be stale after a resize or lazy-query rebind.
+                ancestorClip = nil
             }
             logQA("Form drag after", "point=\(start) container=\(after.frame) rows=\(formVisibleRange(after, viewport: viewport))")
             snapshot = after // Reuse this post-drag snapshot as the next iteration's before state.
@@ -872,13 +901,6 @@ final class NibUI {
             let deliveryBefore = chordProbeSnapshot()
             let logBeforeDelivery = deliveryBefore.state?.keyLog ?? focused.keyLog ?? []
             try hardwareKey(key, modifiers)
-            let deliveryAfter = chordProbeSnapshot()
-            if let prior = deliveryBefore.state, let after = deliveryAfter.state,
-               let priorLog = prior.keyLog, let afterLog = after.keyLog,
-               priorLog == afterLog, prior.keyLogTotal == after.keyLogTotal {
-                logQA("Chord no new key event", "key=\(key) modifiers=\(modifiers.rawValue)\nbefore: "
-                    + deliveryBefore.facts + "\nafter: " + deliveryAfter.facts)
-            }
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
             defer {
@@ -887,6 +909,15 @@ final class NibUI {
             }
             do { try postcondition() }
             catch {
+                // Allow the caller's bounded postcondition to observe delivery before declaring
+                // the key log unchanged; an immediate snapshot can race a late app log entry.
+                let deliveryAfter = chordProbeSnapshot()
+                if let prior = deliveryBefore.state, let after = deliveryAfter.state,
+                   let priorLog = prior.keyLog, let afterLog = after.keyLog,
+                   priorLog == afterLog, prior.keyLogTotal == after.keyLogTotal {
+                    logQA("Chord no new key event", "key=\(key) modifiers=\(modifiers.rawValue)\nbefore delivery: "
+                        + deliveryBefore.facts + "\nafter failed postcondition: " + deliveryAfter.facts)
+                }
                 // Retry only a proven modifier loss on a fresh printable press outside text editing.
                 // In particular, missing events and control keys are not retry evidence.
                 if let current = try? state(), current.keyResponderIsText != true,
@@ -1728,7 +1759,7 @@ final class NibUI {
         guard let point = NibUITestScrollGeometry.tapPoint(control: document.frame, viewport: visible) else {
             throw Failure.message("Document has no visible tap area: \(title)")
         }
-        try pressWithoutIdle(at: point, duration: 0)
+        try pressWithoutIdle(at: point, duration: 0.05)
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 
@@ -1951,7 +1982,7 @@ final class NibUI {
     }
 
     func tapWithoutIdle(_ element: XCUIElement) throws {
-        try pressWithoutIdle(element, duration: 0)
+        try pressWithoutIdle(element, duration: 0.05)
     }
 
     private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
