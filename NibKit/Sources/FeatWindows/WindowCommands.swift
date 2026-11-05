@@ -284,14 +284,20 @@ final class WindowScenes {
 
     /// Remove invalid background tabs first so closing the current tab cannot select another trashed package.
     func reconcileTabs() {
-        guard app?.services.library != nil else { return }
+        guard let library = app?.services.library else { return }
         for navigator in all {
-            let invalid = navigator.openDocuments.filter { !canOpen($0) }
+            let invalid = navigator.openDocuments.filter { doc in
+                // A scan can temporarily omit a package. Missing catalog membership blocks reopening,
+                // but is not proof that an already open document was deleted.
+                guard let node = library.node(doc) else { return false }
+                return node.kind != .document || node.trashedAt != nil
+            }
             for doc in invalid where doc != navigator.activeDocument { navigator.closeDocument(doc) }
             if let active = navigator.activeDocument, invalid.contains(active) {
                 // Remove the invalid editor synchronously. Closing first can leave it visible
                 // while the replacement tab waits for an unlock that may be cancelled.
-                navigator.showLibrary(folder: nil)
+                // If Library is already showing, preserve its folder, search and presentation state.
+                if navigator.session.document == active { navigator.showLibrary(folder: nil) }
                 navigator.closeDocument(active)
             }
             for doc in invalid {

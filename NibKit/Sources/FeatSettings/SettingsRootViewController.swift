@@ -438,7 +438,8 @@ struct SettingsIndexList: View {
     }
 }
 
-/// iPad detail: a section's only page directly, or its pages as rows to push.
+/// iPad detail: section pages as rows. Even a single page uses the shared pushed destination;
+/// a page owned by this layout-specific root would lose its draft when the root switches to the compact index.
 @MainActor
 struct SettingsSectionDetail: View {
     let app: NibApp

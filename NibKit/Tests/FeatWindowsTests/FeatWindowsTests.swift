@@ -19,6 +19,7 @@ final class FakeNavigator: SceneNavigator {
     private(set) var editorsBuilt = 0
     /// The displayed editor container, tracked separately from the session like the shell's content.
     private(set) var displayedDocument: DocumentID?
+    private(set) var showLibraryCount = 0
     var rootViewController: UIViewController?
 
     init(app: NibApp) {
@@ -74,6 +75,7 @@ final class FakeNavigator: SceneNavigator {
     }
 
     func showLibrary(folder: FolderID?) {
+        showLibraryCount += 1
         session.document = nil
         displayedDocument = nil
     }
@@ -550,6 +552,64 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(right.openDocuments, [board])
         try h.library.deletePermanently(board)
         XCTAssertFalse(scenes.canOpen(board), "cached workspace content is not live library membership")
+    }
+
+    func testTrashingActiveTabBehindLibraryDoesNotShowLibraryAgain() async throws {
+        let (h, scenes, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        navigator.showLibrary(folder: nil)
+        XCTAssertEqual(navigator.activeDocument, notebook)
+        XCTAssertNil(navigator.session.document)
+        let shows = navigator.showLibraryCount
+        let built = navigator.editorsBuilt
+
+        try h.library.trash(notebook)
+        h.app.events.emit(NibEventType.libraryChanged)
+
+        XCTAssertEqual(navigator.openDocuments, [board])
+        XCTAssertNil(navigator.activeDocument)
+        XCTAssertNil(navigator.session.document)
+        XCTAssertNil(navigator.displayedDocument)
+        XCTAssertEqual(navigator.showLibraryCount, shows, "keep the existing library view and its state")
+        XCTAssertEqual(navigator.editorsBuilt, built)
+    }
+
+    func testCatalogAbsencePreservesOpenTabsButBlocksReopeningUntilTheyReturn() async throws {
+        let (h, scenes, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        let built = navigator.editorsBuilt
+        let shows = navigator.showLibraryCount
+        // An empty scan result: the catalog omits both packages while their workspace heads remain readable.
+        h.app.services.library = InMemoryLibrary(persistence: InMemoryPersistence())
+        defer { h.app.services.library = h.library }
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["refresh": true])
+
+        XCTAssertEqual(navigator.openDocuments, [board, notebook])
+        XCTAssertEqual(navigator.activeDocument, notebook)
+        XCTAssertEqual(navigator.session.document, notebook)
+        XCTAssertEqual(navigator.displayedDocument, notebook)
+        XCTAssertFalse(scenes.canOpen(board))
+        let error = await errorCode {
+            try await self.run(h, CommandIDs.tabSelect, ["index": 0], in: navigator)
+        }
+        XCTAssertEqual(error, .notFound)
+        XCTAssertEqual(navigator.openDocuments, [board, notebook])
+        XCTAssertEqual(navigator.session.document, notebook)
+        XCTAssertEqual(navigator.editorsBuilt, built)
+        XCTAssertEqual(navigator.showLibraryCount, shows)
+
+        h.app.services.library = h.library
+        h.app.events.emit(NibEventType.libraryChanged, payload: ["refresh": true])
+        try await run(h, CommandIDs.tabSelect, ["index": 0], in: navigator)
+        XCTAssertEqual(navigator.openDocuments, [board, notebook])
+        XCTAssertEqual(navigator.session.document, board)
+        XCTAssertEqual(navigator.displayedDocument, board)
     }
 
     func testTrashingActiveTabShowsLibraryWhenRemainingTabUnlockIsDenied() async throws {
