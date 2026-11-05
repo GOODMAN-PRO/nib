@@ -460,8 +460,13 @@ public final class NibReflow<ID: Hashable> {
     }
 
     /// Abandons the drag: the neighbours spring back and the carrier flows home.
-    public func cancel() {
+    public func cancel() { cancel(reason: "caller") }
+
+    func cancel(reason: String) {
         guard let m = model else { return }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] lift cancelled reason=\(reason) carried=\(String(describing: carried))")
+        #endif
         if m.insertion != m.from {
             model = NibReflowModel(ids: m.ids, slots: m.slots, dragged: m.dragged, combines: m.combines)
         }
@@ -657,7 +662,7 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             probe.window?.addGestureRecognizer(gesture)
         }
         func detach() {
-            if gesture.state == .began || gesture.state == .changed { target.reflow.cancel() }
+            if gesture.state == .began || gesture.state == .changed { target.reflow.cancel(reason: "touch target detached") }
             gesture.view?.removeGestureRecognizer(gesture)
         }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
@@ -688,7 +693,11 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             // Menus wait for a stationary hold; scrolling waits for an early
             // swipe. Otherwise a pan can scroll the grid at the same time as a
             // held card lifts, or a long press can steal the pickup gesture.
-            otherGestureRecognizer is UILongPressGestureRecognizer || otherGestureRecognizer is UIPanGestureRecognizer
+            // UIContextMenuInteraction also installs recognizers that are neither a pan nor a
+            // UILongPressGestureRecognizer. Gate them by their owning touch surface, not private class names.
+            if otherGestureRecognizer.view is any NibReflowTouchOwner,
+               !(otherGestureRecognizer is UITapGestureRecognizer) { return true }
+            return otherGestureRecognizer is UILongPressGestureRecognizer || otherGestureRecognizer is UIPanGestureRecognizer
         }
         @objc func handle() {
             let reflow = target.reflow
@@ -708,7 +717,7 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             case .ended:
                 reflow.move(to: point)
                 target.onDrop(reflow.end(velocity: gesture.velocity))
-            case .cancelled, .failed: reflow.cancel()
+            case .cancelled, .failed: reflow.cancel(reason: gesture.cancellationReason ?? "recognizer ended without drop")
             default: break
             }
         }
@@ -746,10 +755,16 @@ final class LiftRecognizer: UIGestureRecognizer {
     private var beganAt: TimeInterval = 0
     private var sampledAt: TimeInterval = 0
     private var holdTimeout: DispatchWorkItem?
+    private(set) var cancellationReason: String?
     private weak var touchOwner: (any NibReflowTouchOwner)?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        guard touches.count == 1, beganAt == 0, let touch = touches.first else { state = .failed; return }
+        guard touches.count == 1, beganAt == 0, let touch = touches.first else {
+            cancellationReason = "additional touch"
+            state = .failed
+            return
+        }
+        cancellationReason = nil
         var touched = touch.view
         while let view = touched {
             if let owner = view as? NibReflowTouchOwner { touchOwner = owner; break }
@@ -775,6 +790,7 @@ final class LiftRecognizer: UIGestureRecognizer {
             #if DEBUG
             NSLog("%@", "[Nib QA reflow] winner=menu eligible after stationary timeout recognizer=\(ObjectIdentifier(self))")
             #endif
+            self.cancellationReason = "stationary hold yielded to menu"
             self.state = .failed
         }
         holdTimeout = timeout
@@ -788,7 +804,14 @@ final class LiftRecognizer: UIGestureRecognizer {
             NSLog("%@", "[Nib QA reflow] moved recognizer=\(ObjectIdentifier(self)) elapsed=\(touch.timestamp - beganAt) distance=\(hypot(point.x - start.x, point.y - start.y)) deliveryLag=\(CACurrentMediaTime() - touch.timestamp)")
             #endif
             guard hypot(point.x - start.x, point.y - start.y) >= DropletPhysics.pickupSlop else { return }
-            guard touch.timestamp - beganAt >= NibReflowMetrics.liftDelay else { state = .failed; return }
+            guard touch.timestamp - beganAt >= NibReflowMetrics.liftDelay else {
+                cancellationReason = "early movement yielded to scroll"
+                state = .failed
+                return
+            }
+            #if DEBUG
+            NSLog("%@", "[Nib QA reflow] lift began recognizer=\(ObjectIdentifier(self)) elapsed=\(touch.timestamp - beganAt)")
+            #endif
             touchOwner?.reflowLiftBegan()
             state = .began
             #if DEBUG
@@ -805,7 +828,9 @@ final class LiftRecognizer: UIGestureRecognizer {
         let contenders = touches.flatMap { $0.gestureRecognizers ?? [] }
             .map { "\(type(of: $0)):\($0.state.rawValue)" }.joined(separator: ",")
         NSLog("%@", "[Nib QA reflow] touchesCancelled recognizer=\(ObjectIdentifier(self)) state=\(state.rawValue) contenders=\(contenders)")
+        NSLog("%@", "[Nib QA reflow] lift cancelled reason=UIKit cancelled touch delivery state=\(state.rawValue)")
         #endif
+        cancellationReason = "UIKit cancelled touch delivery"
         state = .cancelled
     }
     override func reset() {
@@ -849,23 +874,26 @@ final class LiftRecognizer: UIGestureRecognizer {
 public struct NibReflowRenderingWarmup<Content: View>: View {
     let size: CGSize
     let content: Content
+    let reflow: NibReflow<Int>
     public init(size: CGSize, @ViewBuilder content: () -> Content) {
         self.size = size
         self.content = content()
-    }
-    private var style: DropletStyle {
-        var style = DropletStyle.card.lifted
-        style.restsDry = false
-        return style
+        // Exercise the actual moving carrier, including CarrierDriver and the lifted foreground.
+        // A static .card.lifted droplet does not build the same rendering pipeline.
+        let reflow = NibReflow<Int>(layout: NibReflowLayout(columns: 1, cell: size), combines: false)
+        let centre = CGPoint(x: size.width / 2, y: size.height / 2)
+        reflow.begin(0, order: [0], at: centre)
+        reflow.move(to: CGPoint(x: centre.x + DropletPhysics.pickupSlop, y: centre.y))
+        self.reflow = reflow
     }
     public var body: some View {
         NibDropletContainer {
-            content.frame(width: size.width, height: size.height)
-                .droplet("reflow.warmup", style: style, managesDrag: false)
+            NibReflowCarrier(reflow, id: "reflow.warmup") { _ in content }
         }
         .environment(\.nibReflowCoverOnly, true)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+        .onDisappear { reflow.cancel(reason: "render warmup finished") }
     }
 }
 

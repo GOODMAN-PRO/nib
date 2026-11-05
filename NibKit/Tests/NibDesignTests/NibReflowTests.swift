@@ -216,6 +216,16 @@ final class NibReflowTests: XCTestCase {
         XCTAssertEqual(reflow.carrierFrame, layout.slot(1))
     }
 
+    func testRenderingWarmupExercisesTheMovingCarrierBeforeAnyUserLift() {
+        let warmup = NibReflowRenderingWarmup(size: CGSize(width: 140, height: 182)) { Color.clear }
+        XCTAssertTrue(warmup.reflow.isDragging)
+        XCTAssertEqual(warmup.reflow.carried, 0)
+        XCTAssertEqual(warmup.reflow.carrierFrame?.size, CGSize(width: 140, height: 182))
+        XCTAssertNotEqual(warmup.reflow.lift?.start, warmup.reflow.lift?.location,
+                          "A static lifted style does not exercise CarrierDriver's moving foreground")
+        warmup.reflow.cancel()
+    }
+
     func testRecognizedLiftKeepsMenuOwnershipEvenAfterMovementStops() {
         XCTAssertTrue(NibReflowArbitration.permitsContextMenu(liftRecognized: false))
         XCTAssertFalse(NibReflowArbitration.permitsContextMenu(liftRecognized: true))

@@ -407,10 +407,23 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
     var preview: (() -> UIViewController)?
     var activate: (() -> Void)?
     private(set) var liftRecognized = false
-    func reflowTouchBegan() { liftRecognized = false }
+    private var touchSequence = 0
+    func reflowTouchBegan() {
+        touchSequence += 1
+        liftRecognized = false
+    }
     func reflowLiftBegan() {
         liftRecognized = true
-        for interaction in interactions.compactMap({ $0 as? UIContextMenuInteraction }) { interaction.dismissMenu() }
+        for interaction in interactions.compactMap({ $0 as? UIContextMenuInteraction }) {
+            dismissMenuForLift(interaction, phase: "lift began")
+        }
+    }
+    private func dismissMenuForLift(_ interaction: UIContextMenuInteraction, phase: String) {
+        guard liftRecognized else { return }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] menu dismissal requested phase=\(phase) view=\(ObjectIdentifier(self)) sequence=\(touchSequence)")
+        #endif
+        interaction.dismissMenu()
     }
     override func accessibilityActivate() -> Bool { activate?(); return activate != nil }
     override init(frame: CGRect) {
@@ -432,7 +445,17 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willDisplayMenuFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
-        if !NibReflowArbitration.permitsContextMenu(liftRecognized: liftRecognized) { interaction.dismissMenu() }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] menu will present view=\(ObjectIdentifier(self)) lifted=\(liftRecognized) sequence=\(touchSequence)")
+        #endif
+        dismissMenuForLift(interaction, phase: "menu will present")
+        let sequence = touchSequence
+        // UIKit may already have queued presentation when the lift wins. Dismissing before
+        // that animation starts can be a no-op; retire it again at its completion boundary.
+        animator?.addCompletion { [weak self, weak interaction] in
+            guard let self, let interaction, self.touchSequence == sequence else { return }
+            self.dismissMenuForLift(interaction, phase: "menu presentation completed")
+        }
         #if DEBUG
         NibQAIdleDiagnostics.schedule(reason: "library-context-menu")
         #endif
@@ -443,8 +466,10 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibR
                                 willEndFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
         NSLog("%@", "[Nib QA reflow] native-menu willEnd view=\(ObjectIdentifier(self))")
+        if animator == nil { NSLog("%@", "[Nib QA reflow] menu dismissed lifted=\(liftRecognized) animated=false") }
         animator?.addCompletion { [weak self] in
             NSLog("%@", "[Nib QA reflow] native-menu ended view=\(String(describing: self.map { ObjectIdentifier($0) }))")
+            NSLog("%@", "[Nib QA reflow] menu dismissed lifted=\(self?.liftRecognized ?? false)")
         }
     }
     #endif

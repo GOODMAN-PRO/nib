@@ -57,6 +57,24 @@ final class FeatLibraryUITests: XCTestCase {
             compact: false, compactHeight: false), 0)
     }
 
+    func testNativeCardMenuRecognizersWaitForLiftRegardlessOfTheirUIKitSubclass() {
+        let target = NibReflowTouchTarget(id: "cover", reflow: NibReflow<String>(),
+                                         order: ["cover"], onDrop: { _ in })
+        let coordinator = target.makeCoordinator()
+        let card = LibraryItemTouchView()
+        // The native context menu's recognizer is not required to subclass UILongPressGestureRecognizer.
+        let nativeMenu = UIGestureRecognizer()
+        card.addGestureRecognizer(nativeMenu)
+        XCTAssertTrue(coordinator.gestureRecognizer(coordinator.gesture, shouldBeRequiredToFailBy: nativeMenu))
+        let tap = UITapGestureRecognizer()
+        card.addGestureRecognizer(tap)
+        XCTAssertFalse(coordinator.gestureRecognizer(coordinator.gesture, shouldBeRequiredToFailBy: tap))
+        let bridge = UIGestureRecognizer()
+        UIView().addGestureRecognizer(bridge)
+        XCTAssertFalse(coordinator.gestureRecognizer(coordinator.gesture, shouldBeRequiredToFailBy: bridge))
+        XCTAssertTrue(ReflowLiftIntent.yieldsToMenu(distance: 0), "A stationary hold still releases the menu dependency")
+    }
+
     func testRecognizedLiftRejectsNativeMenuUntilTheNextTouch() {
         let card = LibraryItemTouchView()
         let interaction = UIContextMenuInteraction(delegate: card)

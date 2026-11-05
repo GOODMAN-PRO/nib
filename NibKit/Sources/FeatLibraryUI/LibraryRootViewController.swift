@@ -546,10 +546,18 @@ final class LibraryRootViewController: UIViewController {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
     }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // The SwiftUI task may have populated rows before its host was attached to a window.
+        Task { [weak self] in await self?.warmLiftedCardRendering() }
+    }
     func warmLiftedCardRendering() async {
         guard !warmedLiftRendering, viewIfLoaded?.window != nil,
               let row = model.documentRows.first ?? model.folderRows.first else { return }
         warmedLiftRendering = true
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] lifted card warmup began windowAttached=\(view.window != nil)")
+        #endif
         let size = NibMetrics.coverSize
         let warmup = NibReflowRenderingWarmup(size: size) {
             LibraryStackedCarrier(ref: row.ref, model: model)
@@ -569,7 +577,13 @@ final class LibraryRootViewController: UIViewController {
             host.removeFromParent()
         }
         host.view.layoutIfNeeded()
-        await Task.yield()
+        // Give the carrier's geometry registration and drag driver separate rendering turns.
+        // One yield can resume before either the native glass or its lifted foreground exists.
+        for _ in 0..<3 {
+            do { try await Task.sleep(for: .milliseconds(32)) }
+            catch { warmedLiftRendering = false; return }
+            host.view.layoutIfNeeded()
+        }
         guard !Task.isCancelled, view.window != nil else { warmedLiftRendering = false; return }
         host.view.layoutIfNeeded()
         var rendered = false
