@@ -508,6 +508,42 @@ final class FeatWindowsTests: XCTestCase {
 
     // MARK: Tabs
 
+    func testSelectingTrashedBackgroundTabDoesNotReopenItsReadableContent() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        try h.library.trash(notebook)
+        // The package can still be read, as it can from the Trash locator in the real store.
+        XCTAssertNoThrow(try h.app.workspace.content(notebook))
+        let built = navigator.editorsBuilt
+        let error = await errorCode {
+            try await self.run(h, CommandIDs.tabSelect, ["index": 0], in: navigator)
+        }
+        XCTAssertEqual(error, .notFound)
+        XCTAssertEqual(navigator.editorsBuilt, built)
+        XCTAssertEqual(navigator.openDocuments, [board])
+        XCTAssertEqual(navigator.session.document, board)
+    }
+
+    func testLibraryChangeReconcilesTrashedTabsInEveryWindow() async throws {
+        let (h, scenes, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let left = window(h, scenes)
+        let right = window(h, scenes)
+        for navigator in [left, right] {
+            try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+            try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        }
+        try h.library.trash(notebook)
+        h.app.events.emit(NibEventType.libraryChanged)
+        try await waitUntil { left.openDocuments == [self.board] && right.openDocuments == [self.board] }
+        XCTAssertEqual(left.openDocuments, [board])
+        XCTAssertEqual(right.openDocuments, [board])
+        try h.library.deletePermanently(board)
+        XCTAssertFalse(scenes.canOpen(board), "cached workspace content is not live library membership")
+    }
+
     func testTabsSwitchCloseAndReopenAtTheirPage() async throws {
         let (h, scenes, _) = try windows()
         await FeatWindowsFeature.start(h.app)

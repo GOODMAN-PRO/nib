@@ -177,6 +177,14 @@ final class WindowScenes {
         guard subscription == nil else { return }
         subscription = events.subscribe { @Sendable [weak self] event in
             let type = event.type
+            if type == NibEventType.libraryChanged {
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { self?.reconcileTabs() }
+                } else {
+                    Task { @MainActor [weak self] in self?.reconcileTabs() }
+                }
+                return
+            }
             guard type == NibEventType.pageChanged || type == NibEventType.sessionDocument,
                   let raw = event.payload?["session"]?.stringValue else { return }
             if Thread.isMainThread {
@@ -267,8 +275,27 @@ final class WindowScenes {
     /// Whether `doc` can be opened now. At launch the library may still be loading, so callers retry.
     func canOpen(_ doc: DocumentID) -> Bool {
         guard let app else { return false }
-        if let node = app.services.library?.node(doc) { return node.kind == .document && node.trashedAt == nil }
+        if let library = app.services.library {
+            guard let node = library.node(doc) else { return false }
+            return node.kind == .document && node.trashedAt == nil
+        }
         return (try? app.workspace.content(doc)) != nil
+    }
+
+    /// Remove invalid background tabs first so closing the current tab cannot select another trashed package.
+    func reconcileTabs() {
+        guard app?.services.library != nil else { return }
+        for navigator in all {
+            let invalid = navigator.openDocuments.filter { !canOpen($0) }
+            for doc in invalid where doc != navigator.activeDocument { navigator.closeDocument(doc) }
+            if let active = navigator.activeDocument, invalid.contains(active) {
+                navigator.closeDocument(active)
+            }
+            for doc in invalid {
+                pagesBySession[navigator.session.id]?[doc] = nil
+                lastPages[doc] = nil
+            }
+        }
     }
 
     // MARK: Actions
@@ -547,6 +574,11 @@ struct TabSelect: NibCommand {
                            hint: tabs.isEmpty ? "open a document with doc.open" : "use 0…\(tabs.count - 1), or -1 for the last tab")
         }
         let doc = tabs[i]
+        guard scenes.canOpen(doc) else {
+            scenes.reconcileTabs()
+            throw NibError(.notFound, String(localized: "This document is no longer in the library."),
+                           hint: String(localized: "Restore it from Trash before opening it."))
+        }
         guard navigator.session.document != doc else { return NoResult() }
         scenes.dropPendingClose(in: navigator)
         navigator.openDocument(doc, page: scenes.page(of: doc, in: navigator.session), mode: .replace)
