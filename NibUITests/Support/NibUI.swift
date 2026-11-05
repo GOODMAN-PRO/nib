@@ -63,8 +63,16 @@ final class NibUI {
             name, name, name, name)
         let command = ["cmd.", "tool.", "menu.", "sheet."].contains { name.hasPrefix($0) }
         let kind: XCUIElement.ElementType = type == .any && command ? .button : type
-        // One exact query replaces eleven missing-type queries per root. Query only the supplied
-        // scope (or app); hittability rejects retained modal copies, without repeated root discovery.
+        // Remote picker trees can lose an indexed Any match between count and exists.
+        // Resolve concrete first matches before using that fallback, preserving disabled controls.
+        if kind == .any {
+            for candidateType in priority {
+                let candidate = (scope ?? app).descendants(matching: candidateType).matching(predicate).firstMatch
+                if candidate.exists, hasVisibleFrame(candidate), !candidate.isEnabled || candidate.isHittable {
+                    return candidate
+                }
+            }
+        }
         let matches = (scope ?? app).descendants(matching: kind).matching(predicate)
         let first = matches.firstMatch
         guard first.exists else { return nil }
