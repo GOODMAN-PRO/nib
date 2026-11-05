@@ -2026,14 +2026,15 @@ final class PageErrorView: UIView {
     var showsRestore = false {
         didSet { if showsRestore != oldValue { update() } }
     }
-    let hosting: UIHostingController<NibEmptyState>
+    let hosting: UIHostingController<PageErrorContent>
+    let viewport = UIScrollView()
     /// The actions the empty state shows, primary first (tests and host inspection).
     private(set) var actions: [NibAction] = []
     /// `NibEmptyState` is at most 420 pt wide inside its own padding.
     static let maxWidth: CGFloat = 420 + 2 * NibSpacing.xxl
 
     override init(frame: CGRect) {
-        hosting = UIHostingController(rootView: NibEmptyState(symbol: .warningTriangle, title: ""))
+        hosting = UIHostingController(rootView: PageErrorContent(reason: "", actions: []))
         super.init(frame: frame)
         backgroundColor = NibUIColor.background
         isOpaque = true
@@ -2041,7 +2042,8 @@ final class PageErrorView: UIView {
         hosting.view.backgroundColor = .clear
         // Placed by the canvas, clear of the chrome already: no safe-area padding of its own.
         hosting.safeAreaRegions = []
-        addSubview(hosting.view)
+        addSubview(viewport)
+        viewport.addSubview(hosting.view)
         update()
     }
 
@@ -2050,14 +2052,17 @@ final class PageErrorView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         let size = fittingSize(width: min(bounds.width, Self.maxWidth))
-        hosting.view.frame = CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+        viewport.frame = bounds
+        viewport.isScrollEnabled = size.height > bounds.height
+        viewport.contentSize = CGSize(width: bounds.width, height: max(bounds.height, size.height))
+        hosting.view.frame = CGRect(x: bounds.midX - size.width / 2, y: max(0, bounds.midY - size.height / 2),
                                     width: size.width, height: size.height)
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
         // The paper field replaces the pixels, but scrolling outside the actions still reaches the canvas.
-        return hit === self ? nil : hit
+        return hit === self || (hit === viewport && !viewport.isScrollEnabled) ? nil : hit
     }
 
     private func update() {
@@ -2065,8 +2070,7 @@ final class PageErrorView: UIView {
         let restore = showsRestore
             ? NibAction(String(localized: "Restore from Backup")) { [weak self] in self?.onRestore?() } : nil
         actions = [retry] + (restore.map { [$0] } ?? [])
-        hosting.rootView = NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."),
-                                         message: reason, primary: retry, secondary: restore)
+        hosting.rootView = PageErrorContent(reason: reason, actions: actions)
         setNeedsLayout()
     }
 
@@ -2078,6 +2082,24 @@ final class PageErrorView: UIView {
 
     /// The buttons' titles (tests and host inspection).
     var actionTitles: [String] { actions.map { $0.title } }
+}
+
+/// Keep the shared empty-state typography, with recovery actions that can wrap as a vertical group.
+struct PageErrorContent: View {
+    let reason: String
+    let actions: [NibAction]
+    var body: some View {
+        VStack(spacing: NibSpacing.s) {
+            NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."), message: reason)
+            VStack(spacing: NibSpacing.s) {
+                ForEach(Array(actions.enumerated()), id: \.offset) { index, action in
+                    NibButton(action.title, kind: index == 0 ? .primary : .secondary, action: action.handler)
+                }
+            }
+            .padding(.horizontal, NibSpacing.s)
+            .padding(.bottom, NibSpacing.l)
+        }
+    }
 }
 
 // MARK: - Item accessibility
