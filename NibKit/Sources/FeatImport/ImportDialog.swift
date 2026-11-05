@@ -765,7 +765,7 @@ enum ImportUI {
         guard !top.isBeingPresented, !top.isBeingDismissed, top.viewIfLoaded?.window != nil else { return false }
         controller.overrideUserInterfaceStyle = root.traitCollection.userInterfaceStyle
         let outcome = PresentationOutcome()
-        let shown = await withTaskCancellationHandler {
+        let shown: Bool = await withTaskCancellationHandler {
             guard !Task.isCancelled else { return false }
             return await withCheckedContinuation { continuation in
                 outcome.continuation = continuation
@@ -777,14 +777,14 @@ enum ImportUI {
                 }
                 outcome.timeout = Task { @MainActor in
                     do { try await Task.sleep(nanoseconds: timeoutNanoseconds) } catch { return }
-                    let shown = controller.presentingViewController != nil
+                    let attached = controller.presentingViewController != nil
                         || top.presentedViewController === controller || controller.viewIfLoaded?.window != nil
                     #if DEBUG
                     let presented = String(describing: top.presentedViewController)
                     let presenting = String(describing: controller.presentingViewController)
                     NSLog("%@", "[Nib QA import] presentation deadline presentedViewController=\(presented) isBeingDismissed=\(controller.isBeingDismissed) presentingViewController=\(presenting)")
                     #endif
-                    outcome.resolve(shown)
+                    outcome.resolve(attached)
                 }
                 let complete: @MainActor () -> Void = {
                     #if DEBUG
