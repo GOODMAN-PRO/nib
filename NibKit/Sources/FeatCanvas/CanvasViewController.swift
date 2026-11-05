@@ -642,7 +642,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         growBoardIfNeeded()
         flushSessionState()
         host.inputController?.canvasDidEndZooming(host)
-        refreshBoardAccessibility()
+        refreshBoardAccessibility(announce: true)
     }
 
     /// Centres the window on `point` of `page` (a board point).
@@ -1225,10 +1225,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     /// Board elements are culled to the viewport when built, so changing its extent or
     /// origin must discard that snapshot even when UIKit sends no scroll-end callback.
-    private func refreshBoardAccessibility() {
+    /// `announce` posts a layout change for assistive technologies; it is reserved for the end of a zoom,
+    /// because programmatic pans and relayouts call this repeatedly and a post per call would disturb VoiceOver.
+    private func refreshBoardAccessibility(announce: Bool = false) {
         guard mode.isWorld else { return }
         for view in scrollView.pageViews.values { view.invalidateAccessibility() }
-        UIAccessibility.post(notification: .layoutChanged, argument: nil)
+        if announce { UIAccessibility.post(notification: .layoutChanged, argument: nil) }
     }
 
     func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
