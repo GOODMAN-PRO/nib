@@ -1,6 +1,89 @@
 import SwiftUI
 import UIKit
 
+/// Shared by the shell and explicit cancellation owners. Never dismiss a UIKit
+/// controller directly: the owner's closure must update its presentation binding.
+public enum NibEscapePolicy {
+    public static func permitsCancellation(isSystemPrompt: Bool, dismissalDisabled: Bool,
+                                           delegateAllowsDismissal: Bool) -> Bool {
+        !isSystemPrompt && !dismissalDisabled && delegateAllowsDismissal
+    }
+}
+
+@MainActor
+public protocol NibEscapeHandling: AnyObject {
+    @discardableResult func handleEscape() -> Bool
+}
+
+@MainActor
+public enum NibEscapeRouting {
+    /// Reuse responder-owned cancellation actions for HID presses too. Do not
+    /// resend pressesBegan: an unhandled press would recurse back into the shell.
+    public static func offer(to firstResponder: UIResponder?, stoppingAt boundary: UIResponder) -> Bool {
+        var current = firstResponder
+        var chain: [UIResponder] = []
+        while let responder = current, responder !== boundary {
+            chain.append(responder)
+            current = responder.next
+        }
+        // Focus capture is process-wide. Never invoke another window's owner.
+        guard current === boundary else { return false }
+        for responder in chain {
+            if let owner = responder as? NibEscapeHandling, owner.handleEscape() { return true }
+            for command in responder.keyCommands ?? [] {
+                guard command.input == UIKeyCommand.inputEscape, command.modifierFlags.isEmpty,
+                      let action = command.action, responder.canPerformAction(action, withSender: command) else { continue }
+                if UIApplication.shared.sendAction(action, to: responder, from: command, for: nil) { return true }
+            }
+        }
+        return false
+    }
+
+    /// Only explicit owners participate in the view-tree fallback. It also works
+    /// when a sheet's text field has resigned and focus has returned to the shell.
+    public static func cancel(in view: UIView) -> Bool {
+        guard !view.isHidden, view.alpha > 0.01 else { return false }
+        for child in view.subviews.reversed() {
+            if cancel(in: child) { return true }
+        }
+        return (view as? NibEscapeHandling)?.handleEscape() ?? false
+    }
+}
+
+public extension View {
+    /// Register the very same closure as Cancel. Disabled owners consume Escape
+    /// without cancelling, so an underlying surface cannot handle it instead.
+    func nibEscapeCancellation(isEnabled: Bool = true, onCancel: @escaping () -> Void) -> some View {
+        background(NibEscapeCancellationBridge(onEscape: {
+            if isEnabled { onCancel() }
+            return true
+        }))
+    }
+
+    /// An owner with conditional state can decline Escape and allow the next
+    /// owner to handle it. This is also used by the library's transient chrome.
+    func nibEscapeHandler(_ onEscape: @escaping () -> Bool) -> some View {
+        background(NibEscapeCancellationBridge(onEscape: onEscape))
+    }
+}
+
+private struct NibEscapeCancellationBridge: UIViewRepresentable {
+    let onEscape: () -> Bool
+    func makeUIView(context: Context) -> NibEscapeCancellationView { NibEscapeCancellationView() }
+    func updateUIView(_ view: NibEscapeCancellationView, context: Context) {
+        view.onEscape = onEscape
+    }
+    static func dismantleUIView(_ view: NibEscapeCancellationView, coordinator: ()) { view.onEscape = nil }
+}
+
+final class NibEscapeCancellationView: UIView, NibEscapeHandling {
+    var onEscape: (() -> Bool)?
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+    func handleEscape() -> Bool {
+        onEscape?() ?? false
+    }
+}
+
 /// A top-bar droplet: a Clear capsule of icon buttons (44 pt, up to 52 pt at the Dynamic Type cap).
 public struct NibBarGroup<Content: View>: View {
     let id: String
@@ -184,6 +267,9 @@ public struct NibToolOptionsBar<Content: View>: View {
 public struct NibToast: View {
     let message: String
     let action: NibAction?
+    #if DEBUG
+    @GestureState private var qaTouchActive = false
+    #endif
 
     public init(_ message: String, action: NibAction? = nil) {
         self.message = message
@@ -198,17 +284,20 @@ public struct NibToast: View {
                 .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(2)
             if let action {
-                Button(action.title) {
+                Button {
                     #if DEBUG
                     NSLog("%@", String("[Nib QA toast] button action=\(action.title) message=\(message)".prefix(890)))
                     #endif
                     action.handler()
+                } label: {
+                    Text(action.title)
+                        .padding(.horizontal, NibSpacing.m)
+                        .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                        .contentShape(Rectangle())
                 }.nibCommand(action.command)
                     .font(NibFont.button)
                     .foregroundStyle(NibColor.accent)
                     .buttonStyle(.plain)
-                    .padding(.horizontal, NibSpacing.m)
-                    .frame(minHeight: NibMetrics.hitTarget)
             }
         }
         .padding(.leading, 18)
@@ -216,6 +305,18 @@ public struct NibToast: View {
         .frame(minHeight: 48)
         .frame(maxWidth: 480)
         .accessibilityElement(children: .contain)
+        #if DEBUG
+        .simultaneousGesture(DragGesture(minimumDistance: 0)
+            .updating($qaTouchActive) { value, active, _ in
+                if !active {
+                    NSLog("%@", String("[Nib QA toast] touch began location=\(value.startLocation) message=\(message)".prefix(890)))
+                }
+                active = true
+            }
+            .onEnded { value in
+                NSLog("%@", "[Nib QA toast] touch ended location=\(value.location)")
+            })
+        #endif
     }
 }
 

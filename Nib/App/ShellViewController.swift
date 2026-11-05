@@ -280,9 +280,20 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             if flags.contains(.alternate) { modifiers.insert(.option) }
             if flags.contains(.control) { modifiers.insert(.control) }
             #if DEBUG
-            NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0)")
+            let responderClass = ShellFocus.firstResponder().map { NSStringFromClass(type(of: $0)) } ?? "nil"
+            NSLog("%@", "[Key routing] unhandled \(input) key flags \(key.modifierFlags.rawValue) event flags \(event?.modifierFlags.rawValue ?? 0) responder=\(responderClass)")
             #endif
             NibUITestKeyLog.note("shell unhandled \(input) flags \(flags.rawValue)")
+            if input == "escape", modifiers.isEmpty, cancelPresentedSurface() {
+                unhandled.remove(press)
+                continue
+            }
+            if input == "escape", modifiers.isEmpty, !ShellChromePolicy.hasModal(self),
+               NibEscapeRouting.offer(to: ShellFocus.firstResponder(), stoppingAt: self)
+                || NibEscapeRouting.cancel(in: view) {
+                unhandled.remove(press)
+                continue
+            }
             guard let descriptor = KeyCommandRouting.unhandledPress(KeyShortcut(input, modifiers),
                 descriptors: app.content.keyCommands.all.filter {
                     ShellChromePolicy.permits($0, hasModal: ShellChromePolicy.hasModal(self))
@@ -293,6 +304,34 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
             unhandled.remove(press)
         }
         if !unhandled.isEmpty { super.pressesBegan(unhandled, with: event) }
+    }
+
+    private func cancelPresentedSurface() -> Bool {
+        guard let modal = topmostModal(in: self) else { return false }
+        let presentation = modal.presentationController
+        func dismissalDisabled(in controller: UIViewController) -> Bool {
+            controller.isModalInPresentation || controller.children.contains { dismissalDisabled(in: $0) }
+        }
+        let permitted = NibEscapePolicy.permitsCancellation(isSystemPrompt: modal is UIAlertController,
+            dismissalDisabled: dismissalDisabled(in: modal),
+            delegateAllowsDismissal: presentation.map { $0.delegate?.presentationControllerShouldDismiss?($0) ?? true } ?? true)
+        guard permitted else { return false }
+        let responder = ShellFocus.firstResponder()
+        let responderView = (responder as? UIView) ?? (responder as? UIViewController)?.viewIfLoaded
+        if responderView?.isDescendant(of: modal.view) == true,
+           NibEscapeRouting.offer(to: responder, stoppingAt: modal) { return true }
+        if NibEscapeRouting.offer(to: modal, stoppingAt: modal.next ?? self) { return true }
+        return NibEscapeRouting.cancel(in: modal.view)
+    }
+
+    private func topmostModal(in controller: UIViewController) -> UIViewController? {
+        if let presented = controller.presentedViewController {
+            return topmostModal(in: presented) ?? presented
+        }
+        for child in controller.children.reversed() {
+            if let modal = topmostModal(in: child) { return modal }
+        }
+        return nil
     }
 
     /// What decides which key commands are live in this window: the document kind it shows, whether text has the

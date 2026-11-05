@@ -656,7 +656,10 @@ struct NibReflowTouchTarget<ID: Hashable>: UIViewRepresentable {
             gesture.cancelsTouchesInView = true
             probe.window?.addGestureRecognizer(gesture)
         }
-        func detach() { gesture.view?.removeGestureRecognizer(gesture) }
+        func detach() {
+            if gesture.state == .began || gesture.state == .changed { target.reflow.cancel() }
+            gesture.view?.removeGestureRecognizer(gesture)
+        }
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             guard target.isEnabled, let probe, probe.window != nil, !probe.isHidden else { return false }
             // Window-level recognisers must not receive touches in a sheet or an
@@ -724,6 +727,18 @@ enum ReflowLiftIntent {
     }
 }
 
+public enum NibReflowArbitration {
+    public static func permitsContextMenu(liftRecognized: Bool) -> Bool { !liftRecognized }
+}
+
+/// The touched card can retire its native menu synchronously, before rendering
+/// the carrier. A SwiftUI onChange runs too late if that first render stalls.
+@MainActor
+public protocol NibReflowTouchOwner: AnyObject {
+    func reflowTouchBegan()
+    func reflowLiftBegan()
+}
+
 final class LiftRecognizer: UIGestureRecognizer {
     private(set) var start = CGPoint.zero
     private(set) var point = CGPoint.zero
@@ -731,9 +746,16 @@ final class LiftRecognizer: UIGestureRecognizer {
     private var beganAt: TimeInterval = 0
     private var sampledAt: TimeInterval = 0
     private var holdTimeout: DispatchWorkItem?
+    private weak var touchOwner: (any NibReflowTouchOwner)?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         guard touches.count == 1, beganAt == 0, let touch = touches.first else { state = .failed; return }
+        var touched = touch.view
+        while let view = touched {
+            if let owner = view as? NibReflowTouchOwner { touchOwner = owner; break }
+            touched = view.superview
+        }
+        touchOwner?.reflowTouchBegan()
         start = touch.location(in: view); point = start
         beganAt = touch.timestamp; sampledAt = beganAt
         let timeout = DispatchWorkItem { [weak self] in
@@ -767,6 +789,7 @@ final class LiftRecognizer: UIGestureRecognizer {
             #endif
             guard hypot(point.x - start.x, point.y - start.y) >= DropletPhysics.pickupSlop else { return }
             guard touch.timestamp - beganAt >= NibReflowMetrics.liftDelay else { state = .failed; return }
+            touchOwner?.reflowLiftBegan()
             state = .began
             #if DEBUG
             NSLog("%@", "[Nib QA reflow] winner=lift recognizer=\(ObjectIdentifier(self)) elapsed=\(touch.timestamp - beganAt)")
@@ -777,10 +800,17 @@ final class LiftRecognizer: UIGestureRecognizer {
         if let touch = touches.first { sample(touch) }
         state = state == .began || state == .changed ? .ended : .failed
     }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { state = .cancelled }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        #if DEBUG
+        let contenders = touches.flatMap { $0.gestureRecognizers ?? [] }
+            .map { "\(type(of: $0)):\($0.state.rawValue)" }.joined(separator: ",")
+        NSLog("%@", "[Nib QA reflow] touchesCancelled recognizer=\(ObjectIdentifier(self)) state=\(state.rawValue) contenders=\(contenders)")
+        #endif
+        state = .cancelled
+    }
     override func reset() {
         holdTimeout?.cancel(); holdTimeout = nil
-        super.reset(); velocity = .zero; beganAt = 0; sampledAt = 0
+        super.reset(); velocity = .zero; beganAt = 0; sampledAt = 0; touchOwner = nil
     }
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
         // SwiftUI's responder bridge recognises at touch-down, before there is
@@ -789,6 +819,7 @@ final class LiftRecognizer: UIGestureRecognizer {
         // movement fails in touchesMoved; a stationary hold fails at menuDelay.
         // Once failed, the native menu is free to recognise the same touch.
         if state == .possible { return false }
+        if !NibReflowArbitration.permitsContextMenu(liftRecognized: state == .began || state == .changed) { return false }
         // Once held, the scroll view must not win the first movement before this
         // recognizer receives it. A normal immediate swipe fails us above.
         if beganAt > 0,
@@ -812,6 +843,31 @@ final class LiftRecognizer: UIGestureRecognizer {
 }
 
 // MARK: - The carrier
+
+/// Rendered once by a library host before its first drag. Use the carrier's
+/// material, envelope and foreground, without changing any live reflow state.
+public struct NibReflowRenderingWarmup<Content: View>: View {
+    let size: CGSize
+    let content: Content
+    public init(size: CGSize, @ViewBuilder content: () -> Content) {
+        self.size = size
+        self.content = content()
+    }
+    private var style: DropletStyle {
+        var style = DropletStyle.card.lifted
+        style.restsDry = false
+        return style
+    }
+    public var body: some View {
+        NibDropletContainer {
+            content.frame(width: size.width, height: size.height)
+                .droplet("reflow.warmup", style: style, managesDrag: false)
+        }
+        .environment(\.nibReflowCoverOnly, true)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
 
 extension DropletStyle {
     /// The cover a combine is armed on, as water under its own content: a 3 pt envelope (radius 8) with the held rim

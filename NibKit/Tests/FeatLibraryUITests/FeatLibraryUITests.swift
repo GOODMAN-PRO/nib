@@ -9,6 +9,79 @@ import NibTesting
 
 @MainActor
 final class FeatLibraryUITests: XCTestCase {
+    func testLiveLibraryResizeKeepsGridAndSortAnchorInsideWindow() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.appear()
+        model.liquidMode = .off
+        var frames: [String: CGRect] = [:]
+        let host = UIHostingController(rootView: LibraryRootView(model: model, idiom: .pad)
+            .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 })
+        model.controller = host
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1376, height: 1032))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        for size in [CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376),
+                     CGSize(width: 1376, height: 1032), CGSize(width: 1032, height: 1376)] {
+            window.frame.size = size
+            host.view.frame = window.bounds
+            host.view.setNeedsLayout()
+            host.view.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(100))
+            host.view.layoutIfNeeded()
+            let grid = try XCTUnwrap(frames["content.grid"])
+            let sort = try XCTUnwrap(frames["anchor.library.sort"])
+            XCTAssertGreaterThanOrEqual(grid.minX, 0)
+            XCTAssertLessThanOrEqual(grid.maxX, size.width + 0.5)
+            XCTAssertGreaterThanOrEqual(sort.minX, 0)
+            XCTAssertLessThanOrEqual(sort.maxX, size.width + 0.5)
+            XCTAssertGreaterThanOrEqual(sort.width, NibMetrics.hitTarget)
+        }
+    }
+
+    func testGridWidthUsesCurrentViewportAcrossRotationAndSidebarTransitions() {
+        for (size, inline) in [(CGSize(width: 1376, height: 1032), true),
+                               (CGSize(width: 1032, height: 1376), false),
+                               (CGSize(width: 1376, height: 1032), true)] {
+            let width = LibraryPresentation.gridWidth(viewport: size.width, inlineSidebar: inline,
+                compact: false, compactHeight: false)
+            let expected = size.width - (inline ? NibMetrics.sidebarWidth : 0) - 2 * NibMetrics.libraryGutter
+            XCTAssertEqual(width, expected)
+            XCTAssertLessThanOrEqual(width, size.width)
+        }
+        XCTAssertEqual(LibraryPresentation.gridWidth(viewport: 390, inlineSidebar: false,
+            compact: true, compactHeight: false), 390 - 2 * NibSpacing.l)
+        XCTAssertEqual(LibraryPresentation.gridWidth(viewport: 844, inlineSidebar: false,
+            compact: true, compactHeight: true), 844 - 3 * NibSpacing.l - LibraryPresentation.actionPairWidth)
+        XCTAssertEqual(LibraryPresentation.gridWidth(viewport: 0, inlineSidebar: true,
+            compact: false, compactHeight: false), 0)
+    }
+
+    func testRecognizedLiftRejectsNativeMenuUntilTheNextTouch() {
+        let card = LibraryItemTouchView()
+        let interaction = UIContextMenuInteraction(delegate: card)
+        card.reflowTouchBegan()
+        XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        card.reflowLiftBegan()
+        XCTAssertTrue(card.liftRecognized)
+        XCTAssertNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+        card.reflowTouchBegan()
+        XCTAssertNotNil(card.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+    }
+
+    func testEscapeClosesOneTransientSurfaceAndLeavesRenameToItsOwner() {
+        XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: true, isRenaming: false,
+            hasSearch: true, isSelecting: true), .menu)
+        XCTAssertNil(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: true,
+            hasSearch: true, isSelecting: true))
+        XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: false,
+            hasSearch: true, isSelecting: true), .search)
+        XCTAssertEqual(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: false,
+            hasSearch: false, isSelecting: true), .selection)
+        XCTAssertNil(LibraryEscapeTarget.resolve(hasMenu: false, isRenaming: false,
+            hasSearch: false, isSelecting: false))
+    }
+
     private var controllers: [UIViewController] = []
     private func harness() -> Harness {
         let h = Harness(features: [FeatLibraryUIFeature.self])
@@ -1977,6 +2050,33 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertTrue(manager.canUndo)
         XCTAssertEqual(h.app.settings.json(LibraryOrder.key(nil)), after)
     }
+    func testNewNotebookEscapeUsesPanelCancelAndClearsPresentationState() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        var descriptor = PanelDescriptor(id: "create.newNotebook", title: "New Notebook",
+            icon: NibSymbol.notebook.name, placement: .sheet, order: 0, owner: "test") { _ in
+                AnyView(Text("Unsaved draft"))
+            }
+        descriptor.providesHeader = true
+        h.app.ui.panels.register(descriptor)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView,
+            ["panel": "create.newNotebook"], session: h.session)
+        let panel = try XCTUnwrap(model.modal)
+        let host = UIHostingController(rootView: LibraryPanelView(panel: panel, model: model))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        host.view.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(NibEscapeRouting.cancel(in: host.view))
+        for _ in 0..<30 {
+            if model.modal == nil { break }
+            await Task.yield()
+        }
+        XCTAssertNil(model.modal, "The binding driving the sheet must become nil")
+        XCTAssertFalse(h.session.openPanels.contains(panel.id))
+    }
+
     func testPanelsPreserveParamsSelectTabAndClose() async throws {
         let h = harness()
         h.app.ui.panels.register(PanelDescriptor(id: "test.sheet", title: "Sheet", icon: NibSymbol.folder.name, placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })

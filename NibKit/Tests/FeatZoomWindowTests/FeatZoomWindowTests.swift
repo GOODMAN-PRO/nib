@@ -4,6 +4,7 @@ import SwiftUI
 import PencilKit
 import Combine
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatZoomWindow
 
@@ -533,6 +534,23 @@ final class FeatZoomWindowTests: XCTestCase {
         options.setPresented(true)
         options.setPresented(false) // outside tap or choosing a preset
         XCTAssertTrue(canvas.isFirstResponder)
+    }
+
+    func testOptionsAwaitKeyWindowAndExposePlainPressCancellation() {
+        let root = UIViewController()
+        let options = ZoomOptionsKeyView()
+        root.view.addSubview(options)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        window.rootViewController = root
+        options.setPresented(true)
+        var dismissals = 0
+        options.onDismiss = { dismissals += 1 }
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
+        XCTAssertTrue(options.isFirstResponder, "Presentation before the window becomes key must not lose Escape")
+        XCTAssertTrue(NibEscapeRouting.offer(to: options, stoppingAt: root))
+        XCTAssertEqual(dismissals, 1)
+        XCTAssertFalse(options.handleEscape(), "A stale press must not cancel twice")
     }
 
     func testOptionsDismissalLeavesNewLineAvailableAndDoesNotEdit() async throws {

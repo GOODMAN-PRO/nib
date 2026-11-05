@@ -253,7 +253,16 @@ final class LibraryViewModel: ObservableObject {
         return result
     }
     func perform(_ id: String, _ params: JSONValue = [:]) { app.perform(id, params, session: session) }
-    func setView(_ params: JSONValue) { perform(CommandIDs.librarySetView, params) }
+    func setView(_ params: JSONValue) {
+        #if DEBUG
+        if let menu = params["menu"]?.stringValue {
+            let window = controller?.viewIfLoaded?.window
+            let anchor = menuAnchors["library." + menu]
+            NSLog("%@", "[Library menu diagnostic] action menu=\(menu) anchor=\(String(describing: anchor)) window=\(String(describing: window?.bounds)) key=\(window?.isKeyWindow ?? false)")
+        }
+        #endif
+        perform(CommandIDs.librarySetView, params)
+    }
     func restoreView() {
         let value = app.settings.json(LibraryOrder.viewKey(folder))
         layout = LibraryLayout(rawValue: value?["layout"]?.stringValue ?? "") ?? .grid
@@ -496,6 +505,7 @@ final class LibraryFloatingAdapter: FloatingHosting {
 @MainActor
 final class LibraryRootViewController: UIViewController {
     let model: LibraryViewModel
+    private var warmedLiftRendering = false
     init(app: NibApp, navigator: SceneNavigator) {
         model = LibraryModels.get(app).model(navigator.session)
         super.init(nibName: nil, bundle: nil)
@@ -536,6 +546,41 @@ final class LibraryRootViewController: UIViewController {
         super.viewWillAppear(animated)
         model.session.floatingHost = model.floatingAdapter
     }
+    func warmLiftedCardRendering() async {
+        guard !warmedLiftRendering, viewIfLoaded?.window != nil,
+              let row = model.documentRows.first ?? model.folderRows.first else { return }
+        warmedLiftRendering = true
+        let size = NibMetrics.coverSize
+        let warmup = NibReflowRenderingWarmup(size: size) {
+            LibraryStackedCarrier(ref: row.ref, model: model)
+        }.nibLiquidMode(model.liquidMode)
+        let host = UIHostingController(rootView: warmup)
+        addChild(host)
+        // Behind the opaque library, but attached to its real window so native
+        // glass participates in rendering. A hidden/zero-alpha host is culled.
+        host.view.frame = CGRect(origin: .zero, size: CGSize(width: size.width + 32, height: size.height + 32))
+        host.view.isUserInteractionEnabled = false
+        host.view.accessibilityElementsHidden = true
+        view.insertSubview(host.view, at: 0)
+        host.didMove(toParent: self)
+        defer {
+            host.willMove(toParent: nil)
+            host.view.removeFromSuperview()
+            host.removeFromParent()
+        }
+        host.view.layoutIfNeeded()
+        await Task.yield()
+        guard !Task.isCancelled, view.window != nil else { warmedLiftRendering = false; return }
+        host.view.layoutIfNeeded()
+        var rendered = false
+        _ = UIGraphicsImageRenderer(size: host.view.bounds.size).image { _ in
+            rendered = host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+        }
+        warmedLiftRendering = rendered
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] lifted card warmup snapshotRendered=\(rendered)")
+        #endif
+    }
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         model.isVisible = false
@@ -550,6 +595,11 @@ enum LibraryPresentation {
     static func contentWidth(viewport: CGFloat, inlineSidebar: Bool) -> CGFloat {
         max(0, viewport - (inlineSidebar ? NibMetrics.sidebarWidth : 0))
     }
+    static func gridWidth(viewport: CGFloat, inlineSidebar: Bool, compact: Bool, compactHeight: Bool) -> CGFloat {
+        let gutter = compact ? NibSpacing.l : NibMetrics.libraryGutter
+        let controlLane = compactHeight ? actionPairWidth + NibSpacing.l : 0
+        return max(0, contentWidth(viewport: viewport, inlineSidebar: inlineSidebar) - 2 * gutter - controlLane)
+    }
     static func usesInlineSidebar(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
         !isCompact(size: size, idiom: idiom) && size.width > size.height && size.width >= NibMetrics.librarySidebarBreakpoint
     }
@@ -562,6 +612,18 @@ enum LibraryPresentation {
     }
     static func isCompact(size: CGSize, idiom: UIUserInterfaceIdiom) -> Bool {
         idiom == .phone || size.width < NibMetrics.compactBreakpoint || size.height < NibMetrics.compactBreakpoint
+    }
+}
+
+enum LibraryEscapeTarget: Equatable {
+    case menu, search, selection
+
+    static func resolve(hasMenu: Bool, isRenaming: Bool, hasSearch: Bool, isSelecting: Bool) -> Self? {
+        if hasMenu { return .menu }
+        // The rename field owns its draft and its saving guard.
+        if isRenaming { return nil }
+        if hasSearch { return .search }
+        return isSelecting ? .selection : nil
     }
 }
 
@@ -626,6 +688,8 @@ struct LibraryRootView: View {
                     }
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+                .environment(\.libraryGridWidth, LibraryPresentation.gridWidth(viewport: geometry.size.width,
+                    inlineSidebar: inlineSidebar, compact: compact, compactHeight: short))
                 .background(NibColor.background)
                 if !inlineSidebar && !compact && model.sidebarVisible {
                     HStack { sidebar(compact: false).frame(width: NibMetrics.sidebarWidth); Spacer() }
@@ -705,6 +769,7 @@ struct LibraryRootView: View {
                 if model.searchContentBounds != contentBounds { model.searchContentBounds = contentBounds }
             }
             .nibLiquidMode(model.liquidMode)
+            .nibEscapeHandler(handleEscape)
             .nibSheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .fullScreenCover(item: fullScreenBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .confirmationDialog(model.confirmation?.title ?? "", isPresented: Binding(get: { model.confirmation != nil }, set: { if !$0 { model.confirmation = nil } }), titleVisibility: .visible) {
@@ -737,9 +802,27 @@ struct LibraryRootView: View {
                 catch { return }
                 model.setView(["search": .string(searchText)])
             }
-            .task { await model.appear() }
+            .task {
+                await model.appear()
+                await (model.controller as? LibraryRootViewController)?.warmLiftedCardRendering()
+            }
             .onDisappear { model.isVisible = false }
         }
+    }
+    private func handleEscape() -> Bool {
+        guard model.modal == nil, model.confirmation == nil, model.floating.presentedIDs.isEmpty,
+              let target = LibraryEscapeTarget.resolve(hasMenu: model.menu != nil,
+                isRenaming: model.renaming != nil, hasSearch: !searchText.isEmpty || !model.search.isEmpty,
+                isSelecting: model.selection.isSelecting) else { return false }
+        switch target {
+        case .menu: model.setView(["menu": "none"])
+        case .search:
+            searchText = ""
+            model.setView(["search": ""])
+            model.controller?.view.endEditing(true)
+        case .selection: model.setView(["selection": "clear"])
+        }
+        return true
     }
     private var sheetBinding: Binding<LibraryPanel?> {
         Binding(get: { model.modal?.presentation == .sheet ? model.modal : nil }, set: { if $0 == nil, let modal = model.modal { model.setView(["panel": .string(modal.id), "close": true]) } })
@@ -1186,6 +1269,13 @@ struct LibraryPanelView: View {
                 }
                 descriptor.makeView(model.panelContext(panel))
             }.background(NibColor.background)
+                .background {
+                    // The New Notebook panel's Cancel calls this exact context
+                    // dismissal. Other custom headers register their own handler.
+                    if !descriptor.providesHeader || panel.id == "create.newNotebook" {
+                        Color.clear.nibEscapeCancellation { model.panelContext(panel).dismiss() }
+                    }
+                }
         } else {
             NibEmptyState(symbol: .warningTriangle, title: String(localized: "Panel unavailable"),
                 primary: NibAction(String(localized: "Close"), command: "library.setView") { model.setView(["panel": .string(panel.id), "close": true]) })

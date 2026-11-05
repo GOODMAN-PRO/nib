@@ -51,7 +51,9 @@ struct LibraryGridView: View {
     @ObservedObject var model: LibraryViewModel
     var compactHeight = false
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @State private var contentWidth: CGFloat = 0
+    @State private var measuredContentWidth: CGFloat = 0
+    @Environment(\.libraryGridWidth) private var viewportWidth
+    private var contentWidth: CGFloat { viewportWidth ?? measuredContentWidth }
     @ScaledMetric(relativeTo: .footnote) private var labelAllowance = NibMetrics.libraryRowPitch - NibMetrics.coverSize.height
     @State private var frames: [String: CGRect] = [:]
     @State private var dragSelection = LibrarySelection()
@@ -114,8 +116,9 @@ struct LibraryGridView: View {
                 }
             }
         }
+        .frame(width: viewportWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { contentWidth = $0 }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredContentWidth = $0 }
     }
     var emptyImportAction: NibAction {
         NibAction(String(localized: "Import"), command: CommandIDs.importPick) {
@@ -237,6 +240,17 @@ struct LibraryGridView: View {
     }
 }
 
+private struct LibraryGridWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+extension EnvironmentValues {
+    var libraryGridWidth: CGFloat? {
+        get { self[LibraryGridWidthKey.self] }
+        set { self[LibraryGridWidthKey.self] = newValue }
+    }
+}
+
 /// Loads document counts only for cells the lazy grid/list actually presents.
 struct LibraryCell: View {
     let row: LibraryRow
@@ -355,6 +369,7 @@ struct LibraryItemTapTarget: UIViewRepresentable {
         view.menu = menu
         view.preview = preview
         let tap = LibraryItemTapRecognizer(target: nil, action: nil)
+        tap.touchBegan = { [weak view] in view?.reflowTouchBegan() }
         tap.action = action
         tap.pressed = pressed
         tap.addTarget(tap, action: #selector(LibraryItemTapRecognizer.activate))
@@ -382,10 +397,16 @@ struct LibraryItemTapTarget: UIViewRepresentable {
 
 /// One native touch surface owns both opening and the context menu. A SwiftUI
 /// contextMenu wrapper above a separate tap overlay can consume the opening tap.
-final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
+final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate, NibReflowTouchOwner {
     var menu: (() -> UIMenu)?
     var preview: (() -> UIViewController)?
     var activate: (() -> Void)?
+    private(set) var liftRecognized = false
+    func reflowTouchBegan() { liftRecognized = false }
+    func reflowLiftBegan() {
+        liftRecognized = true
+        for interaction in interactions.compactMap({ $0 as? UIContextMenuInteraction }) { interaction.dismissMenu() }
+    }
     override func accessibilityActivate() -> Bool { activate?(); return activate != nil }
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -396,19 +417,23 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
     required init?(coder: NSCoder) { nil }
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        guard NibReflowArbitration.permitsContextMenu(liftRecognized: liftRecognized) else { return nil }
         #if DEBUG
         NSLog("%@", "[Nib QA reflow] winner=native-menu view=\(ObjectIdentifier(self)) location=\(location)")
         #endif
         return UIContextMenuConfiguration(identifier: nil, previewProvider: { [weak self] in self?.preview?() },
                                    actionProvider: { [weak self] _ in self?.menu?() })
     }
-    #if DEBUG
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willDisplayMenuFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
+        if !NibReflowArbitration.permitsContextMenu(liftRecognized: liftRecognized) { interaction.dismissMenu() }
+        #if DEBUG
         NibQAIdleDiagnostics.schedule(reason: "library-context-menu")
+        #endif
     }
 
+    #if DEBUG
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
                                 willEndFor configuration: UIContextMenuConfiguration,
                                 animator: UIContextMenuInteractionAnimating?) {
@@ -422,10 +447,12 @@ final class LibraryItemTouchView: UIView, UIContextMenuInteractionDelegate {
 }
 
 final class LibraryItemTapRecognizer: UITapGestureRecognizer {
+    var touchBegan: (() -> Void)?
     var action: () -> Void = {}
     var pressed: (Bool) -> Void = { _ in }
     @objc func activate() { action() }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        touchBegan?()
         super.touchesBegan(touches, with: event)
         pressed(true)
     }
@@ -588,12 +615,16 @@ struct LibraryRenameField: View {
                     .accessibilityLabel(String(localized: "Rename \(row.name)"))
                 NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
                     .accessibilityIdentifier("cmd.library.rename")
-                NibIconButton(.xmark, label: String(localized: "Cancel Rename")) { model.setView(["rename": ""]) }
+                NibIconButton(.xmark, label: String(localized: "Cancel Rename"), shortcut: .cancelAction) { model.setView(["rename": ""]) }
                 .accessibilityIdentifier("cmd.library.setView")
             }.frame(minHeight: NibMetrics.hitTarget)
             .disabled(saving)
             if let error { Text(error).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
         }.onAppear { text = row.name; focused = true }
+            .nibEscapeCancellation(isEnabled: !saving) {
+                focused = false
+                model.setView(["rename": ""])
+            }
     }
     private func save() {
         guard !saving else { return }
