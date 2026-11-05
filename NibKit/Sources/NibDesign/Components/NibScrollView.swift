@@ -7,7 +7,8 @@ public struct NibScrollView<Content: View>: View {
     private let axis: Axis
     private let content: Content
     @Namespace private var scrollSpace
-    @State private var contentFrame = CGRect.zero
+    @State private var contentSize = CGSize.zero
+    @State private var hasMore = false
     @State private var viewport = CGSize.zero
     @State private var scrollSize = CGSize.zero
     @Environment(\.layoutDirection) private var direction
@@ -35,19 +36,18 @@ public struct NibScrollView<Content: View>: View {
     }
 
     private var overflows: Bool {
-        NibScrollOverflow.exceeds(content: axis == .vertical ? contentFrame.height : contentFrame.width,
+        NibScrollOverflow.exceeds(content: axis == .vertical ? contentSize.height : contentSize.width,
                                   viewport: axis == .vertical ? viewport.height : viewport.width)
-    }
-
-    private var hasMore: Bool {
-        if axis == .vertical { return contentFrame.maxY > scrollSize.height + 1 }
-        return direction == .rightToLeft ? contentFrame.minX < -1 : contentFrame.maxX > scrollSize.width + 1
     }
 
     private var scroller: some View {
         ScrollView(axis == .vertical ? .vertical : .horizontal) {
             content
-                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(scrollSpace)) } action: { contentFrame = $0 }
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { contentSize = $0 }
+                .onGeometryChange(for: Bool.self) { proxy in
+                    NibScrollOverflow.hasMore(contentFrame: proxy.frame(in: .named(scrollSpace)),
+                                              viewport: scrollSize, axis: axis, direction: direction)
+                } action: { hasMore = $0 }
         }
         .coordinateSpace(name: scrollSpace)
         .onGeometryChange(for: CGSize.self) { $0.size } action: { scrollSize = $0 }
@@ -74,6 +74,11 @@ public struct NibScrollView<Content: View>: View {
 }
 
 enum NibScrollOverflow {
+    static func hasMore(contentFrame: CGRect, viewport: CGSize, axis: Axis, direction: LayoutDirection) -> Bool {
+        if axis == .vertical { return contentFrame.maxY > viewport.height + 1 }
+        return direction == .rightToLeft ? contentFrame.minX < -1 : contentFrame.maxX > viewport.width + 1
+    }
+
     static func exceeds(content: CGFloat, viewport: CGFloat) -> Bool {
         content.isFinite && viewport.isFinite && viewport > 0 && content > viewport + 1
     }

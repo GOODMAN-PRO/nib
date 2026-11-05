@@ -202,6 +202,21 @@ final class ShippingPolishTests: XCTestCase {
         XCTAssertEqual(NibSegmentedControl<String>.Sizing.intrinsic.minimumLabelScale, 1)
     }
 
+    func testCompactFittingSegmentsPreserveTargetsAndAccessibleFallbackBesideMenu() {
+        let tabs = ["Pages", "Outline", "Bookmarks"]
+        let control = NibSegmentedControl(selection: .constant("Bookmarks"), options: tabs,
+                                          sizing: .compactFitting) { $0 }
+        let width = NibMetrics.navigatorWidth - NibMetrics.hitTarget - 2 * NibSpacing.xs
+        for direction in [LayoutDirection.leftToRight, .rightToLeft] {
+            let size = NibSnapshot.fittingSize(control.environment(\.layoutDirection, direction), width: width)
+            XCTAssertEqual(size.width, width, accuracy: 1)
+            XCTAssertEqual(size.height, NibMetrics.hitTarget, accuracy: 1)
+        }
+        let accessible = NibSnapshot.fittingSize(control, width: width, variant: .largeText)
+        XCTAssertLessThanOrEqual(accessible.width, width)
+        XCTAssertGreaterThanOrEqual(accessible.height, 3 * NibMetrics.hitTarget)
+    }
+
     func testPanelHeaderPreservesLongProviderAndKeyInformation() {
         let header = NibPanelHeader(title: "Assistant",
             subtitle: "OpenAI-compatible provider · Local language model · API key is not configured",

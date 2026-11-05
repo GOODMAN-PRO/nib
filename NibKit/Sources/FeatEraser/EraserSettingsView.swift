@@ -340,12 +340,18 @@ struct EraserSizePresets: View {
 /// Erase Filter chips (T-019). Labels stay on one line; overflow has a persistent trailing scroll cue.
 struct EraserFilterChips: View {
     @ObservedObject var model: EraserOptions
+    // Opt-in measurement for hosted regressions; no geometry readers in normal use.
+    var measuresChipFrames = false
 
     var body: some View {
         NibScrollView(.horizontal) {
-            HStack(spacing: NibSpacing.s) { chips(InkTool.allCases) }
+            chipRow
         }
         .scrollBounceBehavior(.basedOnSize)
+    }
+
+    var chipRow: some View {
+        HStack(spacing: NibSpacing.s) { chips(InkTool.allCases) }
     }
 
     private func chips(_ tools: [InkTool]) -> some View {
@@ -356,7 +362,23 @@ struct EraserFilterChips: View {
                     action: { model.toggle(tool) })
                 .accessibilityAddTraits(on ? .isSelected : [])
                 .accessibilityHint(String(localized: "Chooses whether the eraser erases this ink."))
+                .background {
+                    if measuresChipFrames {
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: EraserChipFrames.self,
+                                                   value: [tool: proxy.frame(in: .global)])
+                        }
+                        .allowsHitTesting(false)
+                    }
+                }
         }
+    }
+}
+
+struct EraserChipFrames: PreferenceKey {
+    static let defaultValue: [InkTool: CGRect] = [:]
+    static func reduce(value: inout [InkTool: CGRect], nextValue: () -> [InkTool: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

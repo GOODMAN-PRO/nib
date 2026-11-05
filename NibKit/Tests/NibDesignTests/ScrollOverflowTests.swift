@@ -5,6 +5,25 @@ import UIKit
 
 @MainActor
 final class ScrollOverflowTests: XCTestCase {
+    func testCueDirectionChangesOnlyAtTheEndOfEachScrollAxis() {
+        let viewport = CGSize(width: 280, height: 240)
+        for offset in [CGFloat(0), -40, -100, -319] {
+            let frame = CGRect(x: offset, y: 0, width: 600, height: 44)
+            XCTAssertEqual(NibScrollOverflow.hasMore(contentFrame: frame, viewport: viewport,
+                                                    axis: .horizontal, direction: .leftToRight), offset > -319)
+        }
+        for edge in [CGFloat(-100), -2, -1, 0] {
+            let frame = CGRect(x: edge, y: 0, width: 600, height: 44)
+            XCTAssertEqual(NibScrollOverflow.hasMore(contentFrame: frame, viewport: viewport,
+                                                    axis: .horizontal, direction: .rightToLeft), edge < -1)
+        }
+        for offset in [CGFloat(0), -100, -359, -360] {
+            let frame = CGRect(x: 0, y: offset, width: 280, height: 600)
+            XCTAssertEqual(NibScrollOverflow.hasMore(contentFrame: frame, viewport: viewport,
+                                                    axis: .vertical, direction: .leftToRight), offset > -359)
+        }
+    }
+
     func testCueRequiresActualOverflowAndIgnoresUnmeasuredViewport() {
         XCTAssertFalse(NibScrollOverflow.exceeds(content: 600, viewport: 0))
         XCTAssertFalse(NibScrollOverflow.exceeds(content: 200, viewport: 300))

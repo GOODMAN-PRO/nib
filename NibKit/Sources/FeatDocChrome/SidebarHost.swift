@@ -4,7 +4,7 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): a readable selected title, primary labelled navigation, one overflow
 /// for other panels and presentation controls, and Close. The caller supplies the Deep panel or compact sheet.
-/// Panels providing their own header own its actions too; never prepend a second, untitled More row.
+/// Self-headed panels keep host placement actions beside the tabs, without a second header.
 /// The assistant is a standalone panel without navigation tabs.
 struct SidebarPanelView: View {
     let chrome: ChromeWindow
@@ -19,11 +19,12 @@ struct SidebarPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             // §14.4: tabs lead every navigator, including panels that embed their own header.
-            // Self-headed panels keep their own overflow menu. Host placement actions
-            // remain available by holding the tabs, without taking a segment's width.
             if selected.id != PanelIDs.assistant, SidebarNavigation.primary(tabs).count > 1 {
-                tabStrip.frame(maxWidth: .infinity)
-                    .contextMenu { placementMenu.items }
+                HStack(spacing: 0) {
+                    tabStrip.frame(maxWidth: .infinity)
+                        .contextMenu { placementMenu.items }
+                    if !chrome.drawsHeader(selected) { placementMenu }
+                }
             }
             Rectangle()
                 .fill(NibColor.separatorSoft)
@@ -57,7 +58,8 @@ struct SidebarPanelView: View {
     private var tabStrip: some View {
         let primary = SidebarNavigation.primary(tabs)
         if primary.count > 1 {
-            NibSegmentedControl(selection: selection, options: primary.map { $0.id }, sizing: .fitting) { id in
+            NibSegmentedControl(selection: selection, options: primary.map { $0.id },
+                                sizing: chrome.drawsHeader(selected) ? .fitting : .compactFitting) { id in
                 primary.first(where: { $0.id == id })?.title ?? id
             }
             .padding(.horizontal, NibSpacing.xs)

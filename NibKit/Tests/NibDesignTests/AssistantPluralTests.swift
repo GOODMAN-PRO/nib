@@ -4,8 +4,16 @@ import XCTest
 final class AssistantPluralTests: XCTestCase {
     func testProposalReviewAndReceiptCountsUseEnglishAndGermanPlurals() throws {
         for language in ["en", "de"] {
-            let path = try XCTUnwrap(Bundle.module.path(forResource: language, ofType: "lproj"))
-            let bundle = try XCTUnwrap(Bundle(path: path))
+            // Some SwiftPM resource layouts keep the development language in the
+            // module bundle. German must still have its compiled translation.
+            let bundle: Bundle
+            if language == "en" {
+                bundle = Bundle.module.path(forResource: language, ofType: "lproj")
+                    .flatMap { Bundle(path: $0) } ?? .module
+            } else {
+                let path = try XCTUnwrap(Bundle.module.path(forResource: language, ofType: "lproj"))
+                bundle = try XCTUnwrap(Bundle(path: path))
+            }
             for count in [0, 1, 2] {
                 let locale = Locale(identifier: language)
                 let changes = String(localized: "\(count) changes", bundle: bundle, locale: locale)

@@ -279,9 +279,23 @@ public struct NibSegmentedControl<Value: Hashable>: View {
         case intrinsic
         /// Share the proposed width equally, reducing padding and scaling to 85% before truncating.
         case fitting
+        /// Leave room for an adjacent 44 pt menu in a narrow navigator, retaining full labels.
+        case compactFitting
 
-        var labelPadding: CGFloat { self == .fitting ? NibSpacing.xs : NibSpacing.m }
-        var minimumLabelScale: CGFloat { self == .fitting ? 0.85 : 1 }
+        var labelPadding: CGFloat {
+            switch self {
+            case .intrinsic: return NibSpacing.m
+            case .fitting: return NibSpacing.xs
+            case .compactFitting: return NibSpacing.xxs
+            }
+        }
+        var minimumLabelScale: CGFloat {
+            switch self {
+            case .intrinsic: return 1
+            case .fitting: return 0.85
+            case .compactFitting: return 0.8
+            }
+        }
     }
 
     @Binding var selection: Value
@@ -305,7 +319,7 @@ public struct NibSegmentedControl<Value: Hashable>: View {
     public var body: some View {
         if typeSize.isAccessibilitySize {
             verticalOptions
-        } else if sizing == .fitting {
+        } else if sizing != .intrinsic {
             ViewThatFits(in: .horizontal) {
                 fittingOptions
                 verticalOptions
