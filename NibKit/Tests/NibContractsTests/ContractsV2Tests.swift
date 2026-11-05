@@ -1,7 +1,7 @@
 import XCTest
 import UIKit
 import SwiftUI
-import NibContracts
+@testable import NibContracts
 import NibTesting
 
 /// contracts-v2: regression tests for the DocTransaction.revert fixes and coverage of the APIs added in the v2 pass
@@ -39,6 +39,35 @@ final class ContractsV2Tests: XCTestCase {
     private let mathRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"
 
     // MARK: Undo / revert regressions
+
+    func testNonUndoableLocalRestampsPreserveCreateUndoAndRedo() async throws {
+        for writes in [1, 2] {
+            let h = Harness()
+            let ctx = try await probeContext(h)
+            let id: ElementID = "LOCALCREATE1"
+            try ctx.mutate { tx in
+                var item = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                item.id = id
+                try tx.put(item, doc: self.doc, page: self.page1)
+            }
+            try ctx.mutate(undoable: false) { tx in
+                for layer in 1...writes {
+                    var item = try tx.item(self.doc, page: self.page1, id: id)
+                    item.layer = layer
+                    try tx.put(item, doc: self.doc, page: self.page1)
+                }
+            }
+            XCTAssertEqual(h.undoDepth(doc), 1)
+            XCTAssertTrue(h.app.bus.undo(doc))
+            XCTAssertThrowsError(try h.app.workspace.item(doc, page: page1, id: id))
+            let redo = try XCTUnwrap(h.app.bus.history.popRedo(doc))
+            XCTAssertFalse(redo.mutations.isEmpty)
+            XCTAssertNil(h.app.bus.history.popRedo(doc), "exactly one redo entry")
+            h.app.bus.history.pushRedo(redo, doc: doc)
+            XCTAssertTrue(h.app.bus.redo(doc))
+            XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).layer, writes)
+        }
+    }
 
     /// F031 (FeatShapesTests.testDroppingAnItemIntoAShapeAttachesItInTheSameUndoStep): a commit observer attaches the
     /// moved item with `item.update` in the move's own undo group; one undo must revert BOTH the attach and the move.

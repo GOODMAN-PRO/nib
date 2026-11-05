@@ -471,6 +471,18 @@ public final class CommandBus {
         seq += 1
         let cs = Changeset(seq: seq, principal: tx.principal, group: tx.group, label: label, command: command, mutations: tx.mutations)
         if record && !cs.principal.isSync { history.record(cs) }
+        if !record && !cs.principal.isSync {
+            // Local view state and grading follow the existing undo step. Remote writes
+            // must still conflict. Walk backwards to include repeated writes in one tx.
+            var rebase = RevRebase()
+            for mutation in cs.mutations.reversed() {
+                if let old = mutation.beforeRev {
+                    let key = mutation.recordKey
+                    rebase.record(key, old: old, new: rebase.current(key, mutation.afterRev))
+                }
+            }
+            history.rebase(rebase)
+        }
         finish(cs)
         return cs
     }
