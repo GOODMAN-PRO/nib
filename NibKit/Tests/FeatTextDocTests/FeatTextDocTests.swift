@@ -47,6 +47,28 @@ final class FeatTextDocTests: XCTestCase {
 
     private func harness() -> Harness { Harness(features: [FeatTextDocFeature.self]) }
 
+    func testImageInsertRechecksIDAfterMediaResolution() async throws {
+        let h = harness()
+        let descriptor = CommandDescriptor(id: "test.suspendedInsert", title: "Insert", summary: "Interleaved import",
+                                           params: .obj([:]), effect: .edit)
+        h.app.commands.register(descriptor) { _, ctx in
+            let p = BlockInsert.Params(doc: "doc:FIXTUREDOC02", kind: .image, id: "RACINGBLOCK")
+            _ = try await BlockInsert.insert(p, ctx) {
+                // Run another invocation while the first is awaiting its media resolver.
+                try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "paragraph",
+                                                "id": "RACINGBLOCK", "text": "New text"])
+                try await h.run("block.update", ["ref": "block:FIXTUREDOC02/RACINGBLOCK", "text": "Edited text"])
+                return BlockMedia.Resolved(asset: AssetRef("fixture-image.png"))
+            }
+            return [:]
+        }
+        await assertError(.invalidParams) { _ = try await h.run("test.suspendedInsert", [:]) }
+        let survivor = try block(h, "RACINGBLOCK")
+        XCTAssertEqual(survivor.kind, .paragraph)
+        XCTAssertEqual(survivor.text.plainText, "Edited text")
+        XCTAssertEqual(h.undoDepth(doc), 2)
+    }
+
     private func live(_ h: Harness) throws -> [TextBlock] { try h.app.workspace.content(doc).liveBlocks }
 
     private func ids(_ h: Harness) throws -> [String] { try live(h).map { $0.id.raw } }
