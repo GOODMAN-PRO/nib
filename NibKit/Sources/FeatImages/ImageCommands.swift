@@ -42,8 +42,32 @@ enum ImageRefs {
     }
 }
 
-@MainActor
+/// Serial background work for image reads, validation and content-addressed writes.
+enum ImageIOWork {
+    static let queue = DispatchQueue(label: "app.nib.images.io", qos: .userInitiated)
+
+    static func run<T>(_ body: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+            queue.async {
+                do { continuation.resume(returning: try body()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+}
+
 enum ImageAssets {
+    /// Only trusted, freshly stored bytes supply this metadata, scoped to the nested command invocation.
+    // These immutable value wrappers contain only strings, numbers and an identity token, never the store itself.
+    struct Prepared: @unchecked Sendable {
+        let doc: DocumentID
+        let asset: AssetRef
+        let info: ImageDecoder.Info
+        let storeID: ObjectIdentifier
+    }
+    @TaskLocal static var prepared: Prepared?
+
+    @MainActor
     static func store(_ ctx: CommandContext) throws -> AssetStore {
         try ctx.services.require(ctx.services.assets, "the asset store")
     }
@@ -71,28 +95,38 @@ enum ImageAssets {
 
     /// Exactly one of `asset` (already in the document), `base64` or `url` (resolved through `ctx.inputFile`: tmp: refs,
     /// https downloads, file:// for the user only).
+    @MainActor
     static func resolve(asset: String?, base64: String?, url: String?, doc: DocumentID,
                         ctx: CommandContext) async throws -> (AssetRef, ImageDecoder.Info) {
         let store = try ImageAssets.store(ctx)
         switch (asset, base64, url) {
         case (let name?, nil, nil):
-            guard let data = try? store.data(AssetRef(name), doc: doc) else {
-                throw NibError(.notFound, "asset '\(name)' not found in document \(doc.raw)", path: "$.asset",
-                               hint: "store bytes with asset.put first, or pass base64 or url")
+            if let hit = prepared, hit.doc == doc, hit.asset.name == name, hit.storeID == ObjectIdentifier(store) {
+                return (hit.asset, hit.info)
             }
-            guard let info = ImageDecoder.info(data) else {
-                throw NibError(.invalidParams, "asset '\(name)' is not an image", path: "$.asset")
+            return try await ImageIOWork.run {
+                guard let data = try? store.data(AssetRef(name), doc: doc) else {
+                    throw NibError(.notFound, "asset '\(name)' not found in document \(doc.raw)", path: "$.asset",
+                                   hint: "store bytes with asset.put first, or pass base64 or url")
+                }
+                guard let info = ImageDecoder.info(data) else {
+                    throw NibError(.invalidParams, "asset '\(name)' is not an image", path: "$.asset")
+                }
+                try check(info, path: "$.asset")
+                return (AssetRef(name), info)
             }
-            try check(info, path: "$.asset")
-            return (AssetRef(name), info)
         case (nil, let text?, nil):
-            return try put(try decodeBase64(text), doc: doc, in: store, path: "$.base64")
+            return try await ImageIOWork.run {
+                try put(try decodeBase64(text), doc: doc, in: store, path: "$.base64")
+            }
         case (nil, nil, let link?):
             let file = try await ctx.inputFile(link)
-            guard let data = try? Data(contentsOf: file) else {
-                throw NibError(.notFound, "could not read \(link)", path: "$.url")
+            return try await ImageIOWork.run {
+                guard let data = try? Data(contentsOf: file) else {
+                    throw NibError(.notFound, "could not read \(link)", path: "$.url")
+                }
+                return try put(data, doc: doc, in: store, path: "$.url")
             }
-            return try put(data, doc: doc, in: store, path: "$.url")
         default:
             throw NibError(.invalidParams, "pass exactly one of asset, base64 or url", path: "$.asset",
                            hint: "asset = a name from asset.put; url = a tmp: ref from asset.upload or an https URL")
@@ -216,6 +250,9 @@ struct ImageInsert: NibCommand {
         }
         let layer = ctx.activeSession?.activeLayer ?? 0
         let item = try ctx.mutate { tx -> Item in
+            if let id = p.id, (try? tx.item(doc, page: pageID, id: NibID(id))) != nil {
+                throw NibError(.conflict, String(localized: "An item with ID \(id) already exists on this page."), path: "$.id")
+            }
             // `animated` can only turn animation off: a still never gets a live view.
             let animated = (p.animated ?? true) && info.isAnimated
             var it = Item.makeImage(ImageItem(frame: frame, asset: asset, animated: animated), layer: layer)
@@ -545,9 +582,14 @@ struct ImagePick: NibCommand {
         var out: [String] = []
         switch target {
         case let .replace(doc, page, id):
-            let (asset, _) = try ImageAssets.put(picked[0], doc: doc, in: store, path: "$.source")
+            let (asset, info) = try await ImageIOWork.run {
+                try ImageAssets.put(picked[0], doc: doc, in: store, path: "$.source")
+            }
             let ref = NodeRef.item(doc, page, id).description
-            _ = try await ctx.execute(ImageReplace.self, ImageReplace.Params(ref: ref, asset: asset.name))
+            let prepared = ImageAssets.Prepared(doc: doc, asset: asset, info: info, storeID: ObjectIdentifier(store))
+            _ = try await ImageAssets.$prepared.withValue(prepared) {
+                try await ctx.execute(ImageReplace.self, ImageReplace.Params(ref: ref, asset: asset.name))
+            }
             out.append(ref)
         case let .insert(doc, pageID, point):
             guard let page = try ctx.workspace.content(doc).page(pageID) else {
@@ -555,19 +597,27 @@ struct ImagePick: NibCommand {
             }
             let base = point ?? ImagePlacement.centre(of: page, doc: doc, session: ctx.activeSession)
             for (i, data) in picked.enumerated() {
-                let (asset, info) = try ImageAssets.put(data, doc: doc, in: store, path: "$.source")
+                let (asset, info) = try await ImageIOWork.run {
+                    try ImageAssets.put(data, doc: doc, in: store, path: "$.source")
+                }
                 let offset = Double(i) * ImagePlacement.cascade
                 let frame = ImagePlacement.frame(size: ImagePlacement.size(pixels: info.pixelSize, page: page.size),
                                                  centre: Point(base.x + offset, base.y + offset), page: page.size)
                 let params = ImageInsert.Params(page: NodeRef.page(doc, pageID).description, asset: asset.name,
                                                 frame: frame.rect, id: i < ids.count ? ids[i] : nil)
-                out.append(try await ctx.execute(ImageInsert.self, params).ref)
+                let prepared = ImageAssets.Prepared(doc: doc, asset: asset, info: info, storeID: ObjectIdentifier(store))
+                let inserted = try await ImageAssets.$prepared.withValue(prepared) {
+                    try await ctx.execute(ImageInsert.self, params)
+                }
+                out.append(inserted.ref)
             }
         case let .pages(doc, first, firstAnchor):
             var position = first
             var anchor = firstAnchor
             for (i, data) in picked.enumerated() {
-                let (asset, _) = try ImageAssets.put(data, doc: doc, in: store, path: "$.source")
+                let (asset, _) = try await ImageIOWork.run {
+                    try ImageAssets.put(data, doc: doc, in: store, path: "$.source")
+                }
                 var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description),
                                                    "position": .string(position.rawValue),
                                                    "source": "image", "asset": .string(asset.name)]
