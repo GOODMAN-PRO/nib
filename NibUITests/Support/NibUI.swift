@@ -1598,8 +1598,7 @@ final class NibUI {
         guard let point = NibUITestScrollGeometry.tapPoint(control: document.frame, viewport: visible) else {
             throw Failure.message("Document has no visible tap area: \(title)")
         }
-        app.coordinate(withNormalizedOffset: .zero)
-            .withOffset(CGVector(dx: point.x - app.frame.minX, dy: point.y - app.frame.minY)).tap()
+        try pressWithoutIdle(at: point, duration: 0)
         _ = try waitForState { $0.screen == "document" && $0.document != nil }
     }
 
@@ -1807,8 +1806,35 @@ final class NibUI {
                         [CGPoint(x: from.x + spacing, y: from.y), CGPoint(x: to.x + spacing, y: to.y)]], duration: duration)
     }
 
+    /// Caller must follow delivery with a bounded UI/state postcondition; completion only proves delivery.
+    func pressWithoutIdle(_ element: XCUIElement, duration: TimeInterval) throws {
+        guard element.exists, element.isEnabled, element.isHittable else {
+            throw Failure.message("Non-idle press requires an enabled hittable element: " + elementFacts(element))
+        }
+        let frame = element.frame
+        guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0 else {
+            throw Failure.message("Non-idle press has invalid frame: \(frame)")
+        }
+        try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: duration)
+    }
+
+    func tapWithoutIdle(_ element: XCUIElement) throws {
+        try pressWithoutIdle(element, duration: 0)
+    }
+
+    private func pressWithoutIdle(at point: CGPoint, duration: TimeInterval) throws {
+        let frame = app.frame
+        let screen = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).screenPoint
+        try synthesize(screenPaths: [[screen]], duration: duration)
+    }
+
     private func synthesize(_ paths: [[CGPoint]], duration: TimeInterval) throws {
-        let points = paths.map { $0.map { NSValue(cgPoint: coordinate($0).screenPoint) } }
+        try synthesize(screenPaths: paths.map { $0.map { coordinate($0).screenPoint } }, duration: duration)
+    }
+
+    private func synthesize(screenPaths: [[CGPoint]], duration: TimeInterval) throws {
+        let points = screenPaths.map { $0.map { NSValue(cgPoint: $0) } }
         let done = XCTestExpectation(description: "Touch path completed")
         var failure: Error?
         logTouchPaths(points)
