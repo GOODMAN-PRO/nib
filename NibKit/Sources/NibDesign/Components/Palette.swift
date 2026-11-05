@@ -230,7 +230,8 @@ public struct NibToolButton: View {
 
 /// The floating tool palette: tools, More, quick colours, plugin tools after a second divider, the selection bead,
 /// docking to any edge (it re-forms between vertical and horizontal by gathering into a bead and spreading), the
-/// selected tool's settings popover (buds out of the tool on a second tap), the More grid, and the active tool's
+/// selected tool's settings popover (opened by its chevron, accessibility action, or reselection without options),
+/// the More grid, and the active tool's
 /// options bar. Place it as a full-size child of the `NibDropletContainer`.
 ///
 /// `tools` is the customised palette (native and plugin tools, in order); `moreTools` is what More holds by default.
@@ -259,6 +260,7 @@ public struct NibToolPalette<Settings: View>: View {
     let settingsPresented: Binding<Bool>?
     let morePresented: Binding<Bool>?
     let onReselect: ((String) -> Void)?
+    let optionsState: ((String) -> NibToolOptionsState)?
     let settings: (String) -> Settings
 
     @Environment(DropletField.self) private var field: DropletField?
@@ -332,6 +334,7 @@ public struct NibToolPalette<Settings: View>: View {
         self.settingsPresented = nil
         self.morePresented = nil
         self.onReselect = nil
+        self.optionsState = nil
         self.settings = settings
     }
 
@@ -343,12 +346,14 @@ public struct NibToolPalette<Settings: View>: View {
     ///   - settingsPresented: owns the selected tool's settings presentation (a chevron in the options bar
     ///     opens it; the chrome keeps one popover open at a time and guards touches while it is open).
     ///   - morePresented: owns the More grid's presentation state.
-    ///   - onReselect: called with the tool's id when the selected tool is tapped again (before its settings bud).
+    ///   - optionsState: strip capability and fold state, even while the bar is absent.
+    ///   - onReselect: handles the selected tool's tap, including strip and settings presentation.
     public init(id: String = "palette", tools: [NibTool], moreTools: [NibTool] = [], selection: Binding<String>,
                 swatches: [NibSwatch], swatch: Binding<Int>, dock: Binding<NibPaletteDock>,
                 allowedEdges: [NibDock] = NibDock.allCases, reservedTrailing: CGFloat = 0,
                 toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
-                morePresented: Binding<Bool>? = nil, onReselect: ((String) -> Void)? = nil,
+                morePresented: Binding<Bool>? = nil, optionsState: ((String) -> NibToolOptionsState)? = nil,
+                onReselect: ((String) -> Void)? = nil,
                 @ViewBuilder settings: @escaping (String) -> Settings) {
         self.id = id
         self.tools = tools
@@ -364,6 +369,7 @@ public struct NibToolPalette<Settings: View>: View {
         self.settingsPresented = settingsPresented
         self.morePresented = morePresented
         self.onReselect = onReselect
+        self.optionsState = optionsState
         self.settings = settings
     }
 
@@ -542,7 +548,8 @@ public struct NibToolPalette<Settings: View>: View {
                     // Placement adds chromeInset itself, so expand that region by the inset first.
                     let optionsBounds = CGRect(x: r.minX - NibMetrics.chromeInset, y: bounds.minY,
                                                width: r.width + 2 * NibMetrics.chromeInset, height: bounds.height)
-                    let available = placement(d).availableSize(beside: slotAt(along), gap: 0, in: optionsBounds)
+                    let available = placement(d).availableSize(beside: slotAt(along), gap: NibToolOptionsPlacement.gap,
+                                                               in: optionsBounds)
                     if showsOptions {
                         NibToolOptionsPlacement(containerSize: proxy.size, bounds: optionsBounds,
                                             anchor: slotAt(along), placement: placement(d)) {
@@ -750,11 +757,22 @@ public struct NibToolPalette<Settings: View>: View {
     }
 
     private func toolButton(_ tool: NibTool, _ d: NibPaletteDock, _ map: [String: CGFloat]) -> some View {
-        NibToolButton(tool: tool, isSelected: tool.id == selection, paletteID: id, along: map[tool.id] ?? 0,
+        let hint = tool.id == selection
+            ? (optionsState?(tool.id).hint(hasSettings: tool.hasSettings, settingsOpen: settingsOpen) ?? "") : ""
+        return NibToolButton(tool: tool, isSelected: tool.id == selection, paletteID: id, along: map[tool.id] ?? 0,
                       pitch: pitch) {
             tap(tool)
         }
         .frame(width: d.isVertical ? thick : pitch, height: d.isVertical ? pitch : thick)
+        .accessibilityHint(tool.id == selection ? hint : "")
+        .accessibilityActions {
+            if tool.id == selection && tool.hasSettings {
+                Button(String(localized: "Open settings", bundle: .module)) {
+                    moreOpen = false
+                    settingsOpen = true
+                }
+            }
+        }
     }
 
     private func divider(_ d: NibPaletteDock) -> some View {
@@ -769,8 +787,8 @@ public struct NibToolPalette<Settings: View>: View {
     private func tap(_ tool: NibTool) {
         moreOpen = false
         if tool.id == selection {
-            onReselect?(tool.id)
-            if tool.hasSettings { settingsOpen.toggle() }
+            if let onReselect { onReselect(tool.id) }
+            else if tool.hasSettings { settingsOpen.toggle() }
         } else {
             settingsOpen = false
             tapped = tool.id
@@ -924,6 +942,8 @@ public struct NibToolPalette<Settings: View>: View {
 /// Measure and position the bounded viewport in the same layout pass. A cached size from the previous
 /// tool/orientation can otherwise place the new, wider viewport beyond the inset for its first frame.
 struct NibToolOptionsPlacement: Layout {
+    /// Independent rounded glass bodies need clear space; a one-point frame overlap does not fuse their caps.
+    static let gap: CGFloat = NibSpacing.l
     let containerSize: CGSize
     let bounds: CGRect
     let anchor: CGRect
@@ -934,11 +954,11 @@ struct NibToolOptionsPlacement: Layout {
     }
 
     func placeSubviews(in rect: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let available = placement.availableSize(beside: anchor, gap: 0, in: bounds)
+        let available = placement.availableSize(beside: anchor, gap: Self.gap, in: bounds)
         let proposed = ProposedViewSize(width: available.width, height: NibMetrics.barHeight)
         for subview in subviews {
             let size = subview.sizeThatFits(proposed)
-            let centre = placement.centre(size: size, beside: anchor, gap: -1, in: bounds, alignment: .centre)
+            let centre = placement.centre(size: size, beside: anchor, gap: Self.gap, in: bounds, alignment: .centre)
             subview.place(at: CGPoint(x: rect.minX + centre.x, y: rect.minY + centre.y),
                           anchor: .center, proposal: proposed)
         }

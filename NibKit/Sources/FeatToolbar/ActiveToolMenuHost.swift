@@ -3,7 +3,7 @@ import NibContracts
 import NibDesign
 
 /// The active tool's contextual options and its settings. The options bar is a `NibToolOptionsBar` that
-/// `NibToolPalette(toolOptions:)` fuses to the palette's far side, level with the selected tool (DESIGN.md §13.3), so
+/// `NibToolPalette(toolOptions:)` places 16 pt from the palette's far side, level with the selected tool (DESIGN.md §13.3), so
 /// it floats with the palette and docks with it on any screen edge. Its content comes from `ui.toolMenus` (registered
 /// under the tool id) and otherwise from the toolbar item's own `activeToolMenu`; a `ui.toolMenus` entry may add a
 /// popover of its own, which the palette buds beside the bar.
@@ -28,8 +28,7 @@ enum ActiveToolMenuHost {
         }
     }
 
-    /// The options bar's content: the tool's options, then the chevron that buds its settings (T-001: "tap the
-    /// selected tool again, or its chevron"). A tool with neither has no options bar.
+    /// The options bar's content: the tool's options, then the chevron that buds its settings. A settings-only tool has a chevron-only strip; a tool with neither has no strip.
     static func optionsBar(for descriptor: ToolbarItemDescriptor, app: NibApp, session: EditorSession,
                            openSettings: @escaping () -> Void) -> AnyView? {
         let options = Self.menu(for: descriptor, app: app, session: session)
@@ -55,8 +54,8 @@ enum ActiveToolMenuHost {
 }
 
 /// Inside the options bar droplet: the tool's options and a chevron for its settings. The chevron is also the
-/// explicit settings button VoiceOver and Full Keyboard Access reach (tapping the selected tool again is not
-/// discoverable there).
+/// explicit settings button VoiceOver and Full Keyboard Access reach. The selected tool also exposes a settings
+/// accessibility action while this strip is folded.
 struct ActiveToolOptions: View {
     let menu: AnyView?
     let settingsTitle: String?
@@ -77,8 +76,8 @@ struct ActiveToolOptions: View {
     }
 }
 
-/// The body of a tool's settings popover, which the palette buds out of the tool (a second tap on it, or the options
-/// bar's chevron through `settingsPresented`): the toolbar item's `settings` view.
+/// The body of a tool's settings popover, which the palette buds out of the tool (the options bar's chevron or its
+/// accessibility action through `settingsPresented`): the toolbar item's `settings` view.
 struct ToolSettingsContent: View {
     let model: ToolbarModel
     let toolID: String

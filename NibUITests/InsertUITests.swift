@@ -290,7 +290,7 @@ final class InsertUITests: XCTestCase {
     }
     private func shape(_ title: String = "Rectangle") throws {
         let before = try ui.state().itemCountOnPage
-        try ui.selectTool("shape"); try tap("tool.shape"); try tap(title, scroll: true); outside()
+        try ui.openToolSettings("shape"); try tap(title, scroll: true); outside()
         try ui.drawStroke([point, end])
         try counts(before + 1)
         _ = try ui.waitForState(timeout: 8) { $0.selectionCount == 1 }
@@ -467,11 +467,11 @@ final class InsertUITests: XCTestCase {
         try finish(); XCTAssertEqual(try plain(snapshot("text")), "Preset")
     }
     func testTextPinRetainsToolAndUnpinReturnsPreviousTool() throws {
-        try ui.selectTool("pen"); try ui.selectTool("text"); try tap("tool.text")
+        try ui.selectTool("pen"); try ui.openToolSettings("text")
         try toggle("Keep Text Tool Selected", to: true); outside()
         try beginText("Pinned"); try finish()
         _ = try ui.waitForState(timeout: 8) { $0.tool == "text" }
-        try tap("tool.text"); try toggle("Keep Text Tool Selected", to: false); outside()
+        try ui.openToolSettings("text"); try toggle("Keep Text Tool Selected", to: false); outside()
         ui.coordinate(CGPoint(x: 0.58, y: 0.80)).tap()
         try control("Text box", .textView).typeText("Unpinned"); try finish()
         _ = try ui.waitForState(timeout: 8) { $0.tool != "text" }
@@ -819,8 +819,8 @@ final class InsertUITests: XCTestCase {
     private func elements() throws {
         try ui.selectTool("elements")
         // F035's popover may remain open after a native share/picker sheet returns.
-        // Tapping the selected tool again would close the surface we intend to use.
-        if !visible("Stickers") { try tap("tool.elements") }
+        // Keep an already presented settings surface; otherwise open it from the strip.
+        if !visible("Stickers") { try ui.openToolSettings("elements") }
     }
     private func collectionPrompt(_ text: String, fieldName: String = "Collection name", action: String) throws {
         // DESIGN §1.7 requires native alerts. Address their input and action through
@@ -978,7 +978,7 @@ final class InsertUITests: XCTestCase {
     // MARK: sticky, sticky.setCollapsed/resolve/setColor
 
     private func sticky(_ text: String = "Lab reminder") throws {
-        try ui.selectTool("sticky"); try tap("tool.sticky")
+        try ui.openToolSettings("sticky")
         // DESIGN.md keeps the native keyboard: taps at the canvas's lower coordinates
         // hit its keys until input is submitted, rather than dismissing the popover.
         let author = try control("Author name on new notes", .textField, scroll: true)
@@ -1062,7 +1062,7 @@ final class InsertUITests: XCTestCase {
         try counts(5, strokes: 2)
         try ui.tapCommand("edit.redo"); try counts(6, strokes: 3)
         ui.logStateStep("Tape visibility redo")
-        try tap("tool.tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
+        try ui.openToolSettings("tape"); try tap("Remove All Tape", scroll: true); try tap("Cancel")
         ui.logStateStep("Tape visibility cancel remove")
         try counts(6, strokes: 3)
         try tap("Remove All Tape", scroll: true); try tap("Remove All Tape")
@@ -1073,10 +1073,10 @@ final class InsertUITests: XCTestCase {
         completed = true
     }
     func testTapePatternWidthStraightnessOrientationAndClearHistory() throws {
-        try ui.selectTool("tape"); try tap("tool.tape")
+        try ui.openToolSettings("tape")
         try tap("Colour 2", scroll: true); try tap("9.2 mm", scroll: true)
         // Return to the pattern grid after choosing the width lower in the popover.
-        outside(); try tap("tool.tape"); try tap("Stripes")
+        outside(); try ui.openToolSettings("tape"); try tap("Stripes")
         try toggle("Straight tape", to: true); try tap("Horizontal", scroll: true); outside()
         let bentPath = [point, CGPoint(x: 0.53, y: 0.60), end]
         try drawTape(bentPath)
@@ -1095,7 +1095,7 @@ final class InsertUITests: XCTestCase {
             let cross = (points[index] - points[0]) * dy - (points[index + 1] - points[1]) * dx
             XCTAssertEqual(cross / max(hypot(dx, dy), 1), 0, accuracy: 0.1, "Straight tape must flatten the bent gesture")
         }
-        try ui.selectTool("tape"); try tap("tool.tape"); try tap("History"); try tap("Clear History")
+        try ui.openToolSettings("tape"); try tap("History"); try tap("Clear History")
         XCTAssertTrue(query("Tape you use appears here.").firstMatch.waitForExistence(timeout: 8))
         try tap("Patterns"); XCTAssertTrue(query("Stripes").firstMatch.exists)
         try tap("Follow stroke", scroll: true); try toggle("Straight tape", to: false); outside()
@@ -1105,7 +1105,7 @@ final class InsertUITests: XCTestCase {
         XCTAssertGreaterThan((bent["pts"] as? [Double])?.count ?? 0, 20, "Free tape must retain the gesture's bend")
     }
     func testTapeImportPatternFilesCancelRetainsBuiltIns() throws {
-        try ui.selectTool("tape"); try tap("tool.tape"); try tap("Add a pattern from an image", scroll: true)
+        try ui.openToolSettings("tape"); try tap("Add a pattern from an image", scroll: true)
         try tap("Files"); try tap("Cancel")
         XCTAssertTrue(query("Stripes").firstMatch.exists)
         XCTAssertFalse(query("Image 1").firstMatch.exists)
@@ -1113,12 +1113,12 @@ final class InsertUITests: XCTestCase {
     }
     func testTapeImportedPhotoPatternCanBeDrawnAndDeleted() throws {
         try image(); try menu("Save to Photos"); try allowSystemPermissionIfPresented(); outside()
-        try ui.selectTool("tape"); try tap("tool.tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
+        try ui.openToolSettings("tape"); try tap("Add a pattern from an image", scroll: true); try tap("Photos")
         let photo = try ui.photoAsset(diagnostics: true)
         XCTAssertTrue(photo.waitForExistence(timeout: 10)); try ui.tapPhotoAsset(photo)
         try tap("Image 1", scroll: true); outside(); try drawTape()
         XCTAssertNotNil((try snapshot("stroke")["style"] as? JSON)?["tapePattern"])
-        try ui.selectTool("tape"); try tap("tool.tape")
+        try ui.openToolSettings("tape")
         try control("Image 1", scroll: true).press(forDuration: 0.8); try tap("Delete Pattern")
         try wait("Deleting a custom pattern removes that tile") { !self.query("Image 1").firstMatch.exists }
         XCTAssertTrue(query("Stripes").firstMatch.exists); try counts(6)
