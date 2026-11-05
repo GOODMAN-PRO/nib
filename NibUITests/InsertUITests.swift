@@ -938,8 +938,15 @@ final class InsertUITests: XCTestCase {
         try replace(try control("https://", .textField), with: "not a URL")
         ui.recordDiagnostics("Invalid GIF before submit", facts: "Expected route: ElementsPopover.submit(.gifLink) -> report(imageInsert, invalid web address) -> nibCommandFailed -> ShellViewController.toastIfActive", includeHierarchy: false)
         try tap("Add GIF")
+        if let root = try? ui.app.snapshot() {
+            func texts(_ node: XCUIElementSnapshot) -> [String] {
+                let own = node.elementType == .staticText ? ["\(node.label) frame=\(node.frame)"] : []
+                return own + node.children.flatMap { texts($0) }
+            }
+            ui.recordDiagnostics("Invalid GIF immediately after Add", facts: texts(root).joined(separator: "\n"))
+        } else { ui.recordDiagnostics("Invalid GIF immediately after Add", facts: "snapshot unavailable") }
         let errors = ui.app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'URL' OR label CONTAINS[c] 'address' OR label CONTAINS[c] 'invalid'"))
-        // Observe the transient error before collecting the more expensive screen/tree attachments.
+        // Keep the original error oracle; the immediate diagnostic above investigates its missing presentation.
         let errorAppeared = errors.firstMatch.waitForExistence(timeout: 10)
         ui.recordDiagnostics("Invalid GIF submit result", facts: "error appeared=\(errorAppeared); inspect active prompt and visible toast accessibility representation; no error was synthesized by the test", includeHierarchy: false)
         XCTAssertTrue(errorAppeared, "Invalid GIF link must give an actionable error")

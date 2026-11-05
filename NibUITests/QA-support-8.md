@@ -240,3 +240,11 @@ S:singles-insert#2 verifier rejects the guessed selection occluder: exists versu
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Insert TextInsertCommitEditAndUndo | Committed Text wait failed | Is the Text absent/replaced or visible but non-hittable, and which AX frames overlap it? |
+
+## X2 - invalid GIF immediate hierarchy
+
+S:singles-insert#5 correction leaves toast timing, posting and exposure unresolved. Immediately after Add GIF, capture static texts/frames, full hierarchy and screenshot before the unchanged error predicate. No new toast oracle or behavior fix. Diagnostic overhead can consume transient-toast lifetime; the captured early snapshot is the decisive evidence, not a new pass criterion.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Insert GIFLocalInvalidLinkReportsErrorAndFilesCancelInsertsNothing | Invalid GIF immediately after Add | Was any error text exposed immediately after submission, and where? |
