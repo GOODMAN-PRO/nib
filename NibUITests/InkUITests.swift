@@ -58,36 +58,40 @@ final class InkUITests: XCTestCase {
 
     /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
     private func squeezePaletteBinding() throws -> XCUIElement {
-        let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
-        let pencilDetail = ui.app.collectionViews.containing(NSPredicate(
+        let started = Date()
+        let detail = ui.app.collectionViews.containing(NSPredicate(
             format: "elementType == %@ AND label == %@", NSNumber(value: XCUIElement.ElementType.button.rawValue),
             "Switch between current tool and eraser")).firstMatch
-        ui.revealFormElement(in: pencilDetail) { heading }
+        guard detail.exists else { throw NibUI.Failure.message("Apple Pencil settings list missing") }
+        ui.logQA("Pencil AX duration", "resolve detail seconds=\(Date().timeIntervalSince(started))")
+        let heading = detail.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
+        ui.revealFormElement(in: detail) { heading }
         try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
-        let detail = try XCTUnwrap(scrollPanels.filter {
-            $0.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).count > 0
-        }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
-        let section = detail.otherElements.containing(.staticText, identifier: heading.label)
-            .matching(NSPredicate(format: "label != 'Double-tap'")).allElementsBoundByIndex
-            .filter {
-                let rows = $0.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
-                return rows.count == 1 && rows.firstMatch.frame.minY > heading.frame.maxY
-            }
-            .min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
-        if let section {
-            let row = section.buttons.matching(NSPredicate(format: "label == 'Show tool palette'")).firstMatch
-            ui.revealFormElement(in: detail) { row }
-            if row.isHittable { return row }
-        }
-        // Native grouped lists can flatten Section containers. Bind by the visible header/footer range instead.
-        let footer = detail.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Squeeze Apple Pencil Pro'")).firstMatch
         let choices = detail.buttons.matching(NSPredicate(format: "label == 'Show tool palette'"))
-        /// Reacquires the row between current section boundaries; the enclosing form search waits for visibility.
+        // One immutable list snapshot per observation supplies section boundaries and all row frames.
+        // Resolve only the chosen live row; never index a snapshot's children into a live query.
         func scopedRow() -> XCUIElement {
-            guard heading.exists else { return choices.matching(NSPredicate(value: false)).firstMatch }
-            return choices.allElementsBoundByIndex.first {
-                $0.frame.minY > heading.frame.maxY && (!footer.exists || $0.frame.maxY < footer.frame.minY)
-            } ?? choices.matching(NSPredicate(value: false)).firstMatch
+            let started = Date()
+            defer { ui.logQA("Pencil AX duration", "section snapshot/bind seconds=\(Date().timeIntervalSince(started))") }
+            guard let snapshot = try? detail.snapshot() else {
+                return choices.matching(NSPredicate(value: false)).firstMatch
+            }
+            func nodes(_ node: XCUIElementSnapshot) -> [XCUIElementSnapshot] {
+                [node] + node.children.flatMap { nodes($0) }
+            }
+            let all = nodes(snapshot)
+            guard let heading = all.first(where: { $0.elementType == .staticText && $0.label.lowercased() == "squeeze" }) else {
+                return choices.matching(NSPredicate(value: false)).firstMatch
+            }
+            let footer = all.first { $0.elementType == .staticText && $0.label.hasPrefix("Squeeze Apple Pencil Pro") }
+            let footerY = footer?.frame.minY ?? CGFloat.greatestFiniteMagnitude
+            let row = all.first {
+                $0.elementType == .button && $0.label == "Show tool palette"
+                    && $0.frame.minY > heading.frame.maxY && $0.frame.maxY < footerY
+            }
+            guard let row else { return choices.matching(NSPredicate(value: false)).firstMatch }
+            for candidate in choices.allElementsBoundByIndex.prefix(8) where candidate.frame == row.frame { return candidate }
+            return choices.matching(NSPredicate(value: false)).firstMatch
         }
         ui.revealFormElement(in: detail, target: scopedRow)
         let row = scopedRow()

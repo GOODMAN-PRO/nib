@@ -33,3 +33,11 @@ D:capture#4 correction: no UIKit event arrived; cause and relation to the wide w
 | Test | Log prefix | Question |
 | --- | --- | --- |
 | Capture PluginManager; all chord callers | Chord no new key event | Which probe responder/log and observed AX window frame bracketed delivery without a new event? |
+
+## C2 - Pencil query mitigation
+
+D:idle-stalls#2 verdict rejects query shape as the proven root cause: unchanged flow passed in 107s on the previous host; AX round trips inflated 4-20x despite fewer faults. Current squeezePaletteBinding repeatedly enumerates panels/sections and live boundary frames. Resolve the Apple Pencil collection once within this flow, reuse it for both reveals, and decide Squeeze boundaries/row geometry from one list snapshot per observation. Bind only the same-labelled row whose live frame matches the chosen snapshot; no snapshot-child ordinal addressing. Preserve all selection/persistence assertions and heading/row readiness. Add runner timings for collection resolution and snapshot/binding. CI must complete the original test within its unchanged allowance and compare timings with app snapshot logs. Savings unquantified; this mitigates query count and does not resolve host/transport latency.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| Ink PencilDoubleTapAndSqueezeBindingChoicesPersist | Pencil AX duration | Does latency remain in collection resolution or snapshot/row binding despite fewer queries? |
