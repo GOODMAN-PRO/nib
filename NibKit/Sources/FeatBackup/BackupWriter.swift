@@ -153,9 +153,10 @@ enum BackupWriter {
                 let report = output.appendingPathExtension("report.txt")
                 defer { try? fm.removeItem(at: report) }
                 try Data(warning.utf8).write(to: report, options: .atomic)
-                var reportName = "Backup Report.txt", suffix = 2
+                // Import skips hidden library metadata, so the report does not become a document on restore.
+                var reportName = NibFormat.libraryDirectory + "/Backup Report.txt", suffix = 2
                 while archive[reportName] != nil {
-                    reportName = "Backup Report " + String(suffix) + ".txt"; suffix += 1
+                    reportName = NibFormat.libraryDirectory + "/Backup Report " + String(suffix) + ".txt"; suffix += 1
                 }
                 try archive.addEntry(with: reportName, fileURL: report, compressionMethod: .deflate, progress: Progress(totalUnitCount: 1))
             }

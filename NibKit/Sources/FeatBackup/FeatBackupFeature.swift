@@ -129,9 +129,12 @@ final class BackupEngine {
     @discardableResult
     func persist() -> Task<Void, Error> {
         let snapshot = queue, disk = store, previous = saving
-        let task = Task { if let previous { _ = try? await previous.value }; try await disk.save(snapshot) }
+        let task = Task { [weak self] in
+            if let previous { _ = try? await previous.value }
+            do { try await disk.save(snapshot) }
+            catch { self?.report(error); throw error }
+        }
         saving = task
-        Task { [weak self] in do { try await task.value } catch { self?.report(error) } }
         return task
     }
 
@@ -296,6 +299,7 @@ final class BackupEngine {
         let nodes = app.services.library?.allNodes() ?? []
         queue.clear()
         queue.exportReports.removeAll()
+        queue.manualOmissions.removeAll()
         if BackupSettings.read(app.settings).destination.kind != "none" {
             for id in eligible(nodes).sorted() { queue.enqueue(id, at: now().timeIntervalSince1970) }
         }
@@ -311,6 +315,7 @@ final class BackupEngine {
         // Explicit reset also recovers corrupt state. Already-running exports cannot acknowledge new queue versions.
         if !loaded { loading?.cancel(); loading = nil; queue = BackupQueue(); loaded = true }
         generation = UUID(); queue.clear(); error = nil
+        queue.manualOmissions.removeAll()
         try await persist().value
         state = running ? "syncing" : "idle"; emit(); schedule()
     }
@@ -476,7 +481,9 @@ final class BackupEngine {
     }
 
     func manual(_ ctx: CommandContext) async throws -> JSONValue {
-        try await ensureLoaded()
+        // Queue bookkeeping must not prevent a rescue archive or overwrite unreadable device state.
+        let queueReadable = (try? await ensureLoaded()) != nil
+        let queueLoadError = queueReadable ? nil : error
         guard !running else { throw NibError.unavailable("A backup is already running") }
         let library = try ctx.services.require(ctx.services.library, "Library")
         let navigator = ctx.navigator
@@ -501,7 +508,7 @@ final class BackupEngine {
         let lifecycle = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.interruptManualForBackground() }
         }
-        manualProgress = progress; manualArchiving = true; manualInterrupted = false; running = true; state = "syncing"; error = nil; emit()
+        manualProgress = progress; manualArchiving = true; manualInterrupted = false; running = true; state = "syncing"; error = queueLoadError; emit()
         let publisher = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 self?.emit()
@@ -539,11 +546,19 @@ final class BackupEngine {
                 }.value
                 result["asset"] = .string("tmp:" + ref.name)
             }
-            queue.manualOmissions = archived.notDownloaded
-            try await persist().value
-            state = skippedLocked == 0 && queue.omissionWarning == nil ? "ok" : "warning"
+            if queueReadable {
+                queue.manualOmissions = archived.notDownloaded
+                // The archive is already delivered. persist reports bookkeeping failures once.
+                _ = try? await persist().value
+            } else {
+                error = [error, BackupWriter.omissionWarning(archived.notDownloaded)].compactMap { $0 }.joined(separator: "\n")
+            }
+            state = skippedLocked == 0 && error == nil && queue.omissionWarning == nil ? "ok" : "warning"
             manualInterrupted = false
-            if skippedLocked > 0 { error = String(localized: "Locked documents were skipped. Unlock them and create another backup to include them.") }
+            if skippedLocked > 0 {
+                let lockedWarning = String(localized: "Locked documents were skipped. Unlock them and create another backup to include them.")
+                error = [error, lockedWarning].compactMap { $0 }.joined(separator: "\n")
+            }
             return .object(result)
         } catch {
             if progress.isCancelled || error is CancellationError {
