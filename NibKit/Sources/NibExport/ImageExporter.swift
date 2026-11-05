@@ -129,9 +129,9 @@ enum ImageWriter {
         cg.scaleBy(x: CGFloat(Double(width) / region.width), y: -CGFloat(Double(height) / region.height))
         cg.translateBy(x: CGFloat(-region.x), y: CGFloat(-region.y))
         UIGraphicsPushContext(cg)
-        ExportCompositor.draw(snap, region: region, env: job.environment, target: .raster(scale), omit: [],
+        defer { UIGraphicsPopContext() }
+        try ExportCompositor.draw(snap, region: region, env: job.environment, target: .raster(scale), omit: [],
                               backgrounds: backgrounds, cg: cg)
-        UIGraphicsPopContext()
         guard let image = cg.makeImage() else { throw NibError(.internalError, "could not finish the exported image") }
         return image
     }
@@ -198,12 +198,14 @@ final class BackgroundCache {
         cg.drawPDFPage(page)
     }
 
-    func drawImage(_ url: URL, record: PageRecord, cg: CGContext) {
+    func drawImage(_ url: URL, record: PageRecord, cg: CGContext) throws {
         let decoded: (image: CGImage, size: PageSize)
         if let r = raster, r.url == url {
             decoded = (r.image, r.size)
         } else {
-            guard let d = ExportImages.decode(url: url, maxPixel: 4096) else { return }
+            guard let d = ExportImages.decode(url: url, maxPixel: 4096) else {
+                throw ExportAssets.unavailable(record.background.asset?.name ?? url.lastPathComponent)
+            }
             raster = (url, d.image, d.size)
             decoded = d
         }

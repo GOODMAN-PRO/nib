@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import PDFKit
+import ImageIO
 import NibContracts
 import NibTesting
 @testable import NibExport
@@ -351,7 +352,8 @@ final class NibExportTests: XCTestCase {
 
     func testUnreadableImageBackgroundFailsInsteadOfExportingBlankPaper() async throws {
         let h = Harness(features: [NibExportFeature.self])
-        h.assets.install(Data("broken image".utf8), as: Fixtures.pngAsset, doc: Fixtures.docID)
+        // Preserve the PNG signature and IHDR, but truncate the encoded pixel data.
+        let truncated = Data(try h.assets.data(Fixtures.pngAsset, doc: Fixtures.docID).prefix(41))
         h.app.commands.register(CommandDescriptor(id: "test.imageBackground", title: "Background", summary: "Test image background.",
             effect: .edit, exposure: .ui)) { _, ctx in
             try ctx.mutate { tx in
@@ -362,11 +364,43 @@ final class NibExportTests: XCTestCase {
             return .null
         }
         try await h.run("test.imageBackground")
-        do {
-            _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
-                "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": "png"])
-            XCTFail("Undecodable image background must fail")
-        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        for data in [Data("broken image".utf8), truncated] {
+            h.assets.install(data, as: Fixtures.pngAsset, doc: Fixtures.docID)
+            for format in ["pdf", "png"] {
+                let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-export")
+                let before = Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+                do {
+                    _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                        "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": .string(format)])
+                    XCTFail("Undecodable image background must fail")
+                } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+                XCTAssertEqual(Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []), before)
+                _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"],
+                    "pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "format": .string(format), "options": ["background": false]])
+            }
+        }
+    }
+
+    func testBackgroundDrawingReportsTruncatedPixelsAfterReadingTheHeader() throws {
+        let h = Harness()
+        let complete = try h.assets.data(Fixtures.pngAsset, doc: Fixtures.docID)
+        let truncated = Data(complete.prefix(41))
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(truncated as CFData, nil))
+        XCTAssertGreaterThan(CGImageSourceGetCount(source), 0, "the container still identifies an image")
+        XCTAssertNotNil(CGImageSourceCopyPropertiesAtIndex(source, 0, nil), "the header is readable")
+        h.assets.install(truncated, as: Fixtures.pngAsset, doc: Fixtures.docID)
+        let url = try XCTUnwrap(h.assets.url(Fixtures.pngAsset, doc: Fixtures.docID))
+        var page = try XCTUnwrap(h.persistence.loadHead(Fixtures.docID).page(Fixtures.pdfPage))
+        page.background = .ofImage(Fixtures.pngAsset)
+        let cg = try XCTUnwrap(CGContext(data: nil, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let cache = BackgroundCache()
+        XCTAssertThrowsError(try cache.drawImage(url, record: page, cg: cg)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+        }
+        h.assets.install(complete, as: Fixtures.pngAsset, doc: Fixtures.docID)
+        _ = h.assets.url(Fixtures.pngAsset, doc: Fixtures.docID) // The harness materializes new bytes on URL access.
+        XCTAssertNoThrow(try cache.drawImage(url, record: page, cg: cg), "a failed decode must not poison the cache")
     }
 
     func testPackageWithoutAnAssetServiceReportsOmissionsAndKeepsTheDocument() async throws {
