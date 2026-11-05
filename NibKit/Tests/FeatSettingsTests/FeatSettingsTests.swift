@@ -907,10 +907,12 @@ private func settingsDraftSnapshot(field: UITextField?, model: SettingsDraftMode
 }
 
 /// Exercise UIKit's text-input path and SwiftUI's delegate callback. Assigning `text` and sending
-/// editingChanged alone leaves SecureField's binding untouched on iOS 26. No scene/focus is required.
+/// editingChanged alone may leave SecureField's binding untouched on iOS 26. Request focus when
+/// the host permits it; the binding assertions below diagnose a scene-less input failure separately.
 @MainActor
 private func enterSettingsDraft(_ text: String, field: UITextField, model: SettingsDraftModel) async throws {
     let before = settingsDraftSnapshot(field: field, model: model)
+    _ = field.becomeFirstResponder()
     field.selectedTextRange = field.textRange(from: field.beginningOfDocument, to: field.endOfDocument)
     field.insertText(text)
     field.sendActions(for: .editingChanged)

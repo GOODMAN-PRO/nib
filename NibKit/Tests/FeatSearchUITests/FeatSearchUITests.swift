@@ -1026,6 +1026,34 @@ final class FeatSearchUITests: XCTestCase {
         }
     }
 
+    func testLibrarySearchSizingDependsOnlyOnTheHostProposal() {
+        XCTAssertEqual(LibrarySearchViewportLayout.size(for: .unspecified), .zero)
+        XCTAssertEqual(LibrarySearchViewportLayout.size(for: .infinity), .zero)
+        for width in [CGFloat(390), 600] {
+            let proposal = ProposedViewSize(width: width, height: 834)
+            XCTAssertEqual(LibrarySearchViewportLayout.size(for: proposal), CGSize(width: width, height: 834))
+        }
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.scope = "lib"
+        state.isPresented = true
+        state.instant = true
+        let host = UIHostingController(rootView:
+            LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
+                .environment(\.horizontalSizeClass, .compact))
+        host.safeAreaRegions = []
+        // No explicit frame or floating-layer wrapper: probe the production view itself with
+        // different result content and repeated proposals. Its answer must not grow each pass.
+        for query in ["", String(repeating: "Long search text ", count: 100)] {
+            state.query = query
+            state.matches = query.isEmpty ? [] : [hit()]
+            for width in [CGFloat(390), 600, 390] {
+                let proposal = CGSize(width: width, height: 834)
+                XCTAssertEqual(host.sizeThatFits(in: proposal), proposal)
+            }
+        }
+    }
+
     func testCompactLibrarySearchUsesTheSameSixteenPointGutterAsTheGrid() async throws {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()
@@ -1044,9 +1072,9 @@ final class FeatSearchUITests: XCTestCase {
                 LibrarySearchFloatingContent(app: h.app, session: h.session, state: state)
                     .environment(\.horizontalSizeClass, .compact)
             }
-            // The fallback water layer includes blur padding in its ideal size. Without a fixed
-            // window proposal its measured width feeds the search width and then its own next frame.
-            // Host the production floating layer in an explicitly bounded viewport, as the shell does.
+            // Exercise the shell's bounded floating host. The earlier timeout has no captured
+            // layout stack proving a blur-padding loop; a deadline cannot interrupt synchronous
+            // SwiftUI layout. The separate production sizing regression checks proposal isolation.
             let view = NibDropletContainer { NibFloatingLayer(host: floating) }
                 .nibLiquidMode(.off)
                 .frame(width: width, height: 834)
