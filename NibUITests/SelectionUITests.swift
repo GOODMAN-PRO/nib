@@ -917,8 +917,8 @@ final class SelectionUITests: XCTestCase {
                           CGPoint(x: 0.413, y: 0.68), CGPoint(x: 0.41, y: 0.72)),
             roundedStroke(CGPoint(x: 0.487, y: 0.54), CGPoint(x: 0.477, y: 0.59),
                           CGPoint(x: 0.488, y: 0.68), CGPoint(x: 0.48, y: 0.72)),
-            roundedStroke(CGPoint(x: 0.41, y: 0.627), CGPoint(x: 0.43, y: 0.617),
-                          CGPoint(x: 0.46, y: 0.622), CGPoint(x: 0.484, y: 0.62)),
+            roundedStroke(CGPoint(x: 0.40, y: 0.627), CGPoint(x: 0.43, y: 0.617),
+                          CGPoint(x: 0.47, y: 0.622), CGPoint(x: 0.50, y: 0.62)),
             roundedStroke(CGPoint(x: 0.565, y: 0.54), CGPoint(x: 0.59, y: 0.535),
                           CGPoint(x: 0.565, y: 0.715), CGPoint(x: 0.59, y: 0.72))
         ]

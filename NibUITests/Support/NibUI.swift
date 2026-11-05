@@ -2121,7 +2121,7 @@ final class NibUI {
         try pressWithoutIdle(at: CGPoint(x: frame.midX, y: frame.midY), duration: 0.8)
         var activated: [(item: XCUIElement, frame: CGRect)] = []
         for name in path {
-            var item: XCUIElement?
+            var found: XCUIElement?
             let ready = XCTNSPredicateExpectation(predicate: NSPredicate { [self] _, _ in
                 let menus = Array(app.menus.allElementsBoundByIndex.prefix(8))
                 let preview = app.otherElements["Preview"].firstMatch
@@ -2133,13 +2133,13 @@ final class NibUI {
                         for candidate in matches.allElementsBoundByIndex.prefix(16) {
                             guard hasVisibleFrame(candidate), candidate.isEnabled, candidate.isHittable else { continue }
                             if scope === app, existingFrames[name, default: []].contains(candidate.frame) { continue }
-                            item = candidate; return true
+                            found = candidate; return true
                         }
                     }
                 }
                 return false
             }, object: nil)
-            guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed, let item else {
+            guard XCTWaiter.wait(for: [ready], timeout: 8) == .completed, let item = found else {
                 let facts = "path=\(path) missing=\(name) target=" + elementFacts(element)
                 let state = " probe=\(String(describing: probe.exists ? probe.value : nil))"
                 let message = "Native context menu item absent: " + facts + state
