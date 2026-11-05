@@ -385,7 +385,9 @@ final class NibUI {
         func hasSlider(_ node: XCUIElementSnapshot) -> Bool {
             node.elementType == .slider || node.children.contains { hasSlider($0) }
         }
-        for _ in 0..<16 {
+        // Homing may consume six moves; preserve sixteen downward scans for a lazy row.
+        let moveLimit = lazySearch ? 22 : 16
+        for _ in 0..<moveLimit {
             let listFrame = snapshot.frame
             var clippedViewport = NibUITestScrollGeometry.viewport(
                 scroll: listFrame.intersection(ancestorClip ?? window), window: window, obstructions: obstructions)
@@ -2581,7 +2583,8 @@ final class NibUI {
         let region = app.otherElements["PopoverDismissRegion"].firstMatch
         let native = app.popovers.allElementsBoundByIndex.filter { hasVisibleFrame($0) }
         guard hasVisibleFrame(region) || !native.isEmpty else { return false }
-        let replay = app.scrollViews.containing(.switch, identifier: "Replay handwriting")
+        let replay = app.scrollViews.containing(NSPredicate(
+            format: "identifier == %@ OR label == %@", "Replay handwriting", "Replay handwriting"))
             .allElementsBoundByIndex.filter { menuHasActiveContent($0) }
         let surfaces = native + replay
         guard !surfaces.isEmpty else {
@@ -2607,7 +2610,9 @@ final class NibUI {
     }
 
     /// Only callers requiring a closed popover opt into the round-10 closure postconditions.
-    func dismissSheets(requireClosedPopover: Bool = false) throws {
+    /// A child share sheet can retain its parent's settings bud. Opt in by tool ID to close
+    /// that identified bud through palette reselection after native surfaces have dismissed.
+    func dismissSheets(requireClosedPopover: Bool = false, closingToolSettings: String? = nil) throws {
         // Modal form sheets are plain containers in the accessibility tree (only confirmation dialogs are
         // typed Sheet, run 41961796255), so the close control is looked up app-wide as before. A panel's own
         // close button counts only until something else was dismissed: after Audio's share sheet closes,
@@ -2651,8 +2656,22 @@ final class NibUI {
                 }
                 return
             }
-            if let settings = try readState()?.toolSettingsOpen {
+            let settings = try readState()?.toolSettingsOpen
+            if let settings {
+                if let closingToolSettings, settings == closingToolSettings {
+                    // The selected tool's UI action closes settings with or without an options strip.
+                    // Do not use selectTool: it deliberately does nothing for the current tool.
+                    let current = try state()
+                    guard current.tool == settings else {
+                        throw Failure.message("Settings bud does not belong to the selected tool: " + settings)
+                    }
+                    let button = try requireControl("tool." + settings, type: .button, timeout: 8)
+                    logQA("Popover close retained settings", "tool=" + settings + " " + elementFacts(button))
+                    button.tap()
+                }
                 logQA("Popover closure pending", "toolSettingsOpen=\(settings)")
+            }
+            if settings != nil || closingToolSettings != nil {
                 _ = try waitForState(timeout: 8) { $0.toolSettingsOpen == nil }
             }
             // Buds have no native dismissal region. Report active rows without a speculative corner tap.

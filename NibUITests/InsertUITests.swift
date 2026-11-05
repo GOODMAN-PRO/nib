@@ -1029,7 +1029,11 @@ final class InsertUITests: XCTestCase {
         try elements(); try tap("Collection Options"); try tap("Export Collection")
         XCTAssertTrue(ui.app.otherElements["ActivityListView"].waitForExistence(timeout: 10) || query("Save to Files").firstMatch.exists,
                       "Export must produce a share sheet for the collection")
-        try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("Collection Options"); try tap("Import Collection")
+        try ui.dismissSheets(requireClosedPopover: true, closingToolSettings: "elements")
+        try wait("Collection share sheet must close before import") {
+            !self.ui.app.otherElements["ActivityListView"].exists
+        }
+        try elements(); try tap("Collection Options"); try tap("Import Collection")
         try ui.cancelRemotePicker(.files); try counts(4)
         XCTAssertTrue(query("Stickers").firstMatch.exists)
     }
@@ -1057,7 +1061,11 @@ final class InsertUITests: XCTestCase {
         try filesLocation()
         try tap("Save")
         if visible("Replace") { try tap("Replace") }
-        try ui.dismissSheets(requireClosedPopover: true); try elements(); try tap("Collection Options"); try tap("Import Collection")
+        try ui.dismissSheets(requireClosedPopover: true, closingToolSettings: "elements")
+        try wait("Collection share sheet must close before import") {
+            !self.ui.app.otherElements["ActivityListView"].exists
+        }
+        try elements(); try tap("Collection Options"); try tap("Import Collection")
         try filesLocation()
         let file = ui.app.collectionViews.cells.matching(NSPredicate(format: "label BEGINSWITH 'Stickers'")).firstMatch
         let exportedFileExists = file.waitForExistence(timeout: 10)
