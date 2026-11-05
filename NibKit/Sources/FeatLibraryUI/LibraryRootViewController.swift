@@ -21,6 +21,13 @@ final class LibraryModels {
         if let existing = app.services.get(serviceKey, as: LibraryModels.self) { return existing }
         let store = LibraryModels(app)
         app.services.set(store, for: serviceKey)
+        // F056 consumes window-local geometry through the service escape hatch;
+        // feature modules must not import each other's view models.
+        let contentBounds: @MainActor (EditorSession) -> AnyPublisher<CGRect?, Never> = { [weak store] session in
+            guard let model = store?.models[session.id] else { return Just<CGRect?>(nil).eraseToAnyPublisher() }
+            return model.$searchContentBounds.removeDuplicates().eraseToAnyPublisher()
+        }
+        app.services.set(contentBounds as AnyObject, for: "libraryui.searchContentBounds")
         return store
     }
     func model(_ session: EditorSession) -> LibraryViewModel {
@@ -55,6 +62,8 @@ final class LibraryViewModel: ObservableObject {
     let reflow = NibReflow<String>(combines: true)
     let folderReflow = NibReflow<String>(combines: false)
     let floatingAdapter: LibraryFloatingAdapter
+    /// Search replacement area in SwiftUI global coordinates, converted by the floating host.
+    @Published var searchContentBounds: CGRect?
     @Published var collection: LibraryCollection = .documents
     @Published private(set) var sidebarCounts: [String: Int] = [:]
     @Published var folder: FolderID?
@@ -166,6 +175,7 @@ final class LibraryViewModel: ObservableObject {
     }
 
     deinit { eventSubscription?.cancel() }
+    var selectedRows: [LibraryRow] { visibleRows.filter { selection.refs.contains($0.ref) } }
     var folderRef: JSONValue { .string(folder.map { NodeRef.folder($0).description } ?? "lib") }
     var title: String {
         if collection != .documents { return collection.title }
@@ -261,7 +271,7 @@ final class LibraryViewModel: ObservableObject {
         sortedRows = rows; sortInputs = inputs; sortPasses += 1
         visibleRows = LibrarySorting.rows(rows, sort: recentOrder ? .manual : sort, filter: filter, manual: manual, search: search)
         splitSections()
-        selection.retain(rows.map(\.ref))
+        selection.retain(visibleRefs)
     }
     func splitSections() {
         let sections = LibrarySorting.sections(visibleRows)
@@ -563,6 +573,7 @@ struct LibraryRootView: View {
     @State private var chromeFrames: [String: CGRect] = [:]
     @State private var searchText = ""
     @State private var contentHeaderHeight: CGFloat = 0
+    @State private var compactViewportHeight: CGFloat = 0
     var body: some View {
         GeometryReader { geometry in
             // Keyboard avoidance changes the available content height, not the window's
@@ -610,6 +621,7 @@ struct LibraryRootView: View {
                             content(compact: compact, compactHeight: short)
                                 .frame(width: LibraryPresentation.contentWidth(viewport: geometry.size.width,
                                     inlineSidebar: inlineSidebar), height: geometry.size.height)
+                                .libraryChromeFrame("content.column", space: .global)
                         }
                     }
                 }
@@ -684,6 +696,13 @@ struct LibraryRootView: View {
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
                 chromeFrames = frames
                 model.updateMenuAnchors(from: frames)
+                let chromeHeight = frames.filter { $0.key.hasPrefix("top.") }.values.map(\.height).max() ?? NibMetrics.barHeight
+                let clearance = chromeHeight + NibSpacing.l + NibMetrics.minimumRestingGap
+                let contentBounds = frames["content.column"].map { frame in
+                    CGRect(x: frame.minX, y: frame.minY + clearance, width: frame.width,
+                        height: max(0, frame.height - clearance))
+                }
+                if model.searchContentBounds != contentBounds { model.searchContentBounds = contentBounds }
             }
             .nibLiquidMode(model.liquidMode)
             .nibSheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
@@ -777,51 +796,70 @@ struct LibraryRootView: View {
     }
     @ViewBuilder private func content(compact: Bool, compactHeight: Bool) -> some View {
         if let tab = model.tab { LibraryPanelView(panel: tab, model: model) }
-        else {
+        else if compact {
+            // Keep the ScrollView directly in NavigationStack so UIKit can track
+            // its offset for the large title and navigation-bar scroll edge.
+            contentScroll(compact: true, compactHeight: compactHeight, viewport: nil)
+        } else {
             GeometryReader { viewport in
-                let topInset = compact ? (compactHeight ? NibSpacing.xs : NibSpacing.s) : topChromeClearance
-                let bottomInset = compact && (!compactHeight || model.selection.isSelecting)
-                    ? NibMetrics.barHeight + 2 * NibSpacing.l : 0
-                let spacing = compactHeight ? NibSpacing.xs : NibSpacing.s
-                ScrollView {
-                    VStack(alignment: .leading, spacing: spacing) {
-                        VStack(alignment: .leading, spacing: spacing) {
-                            if compact, model.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true {
-                                compactContainerWarning
-                            } else if let banner = model.libraryBanner(isCompact: compact) {
-                                banner.frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            if !compact {
-                                HStack(spacing: NibSpacing.s) {
-                                    parentNavigation
-                                    Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
-                                        .libraryChromeFrame("title")
-                                }
-                            }
-                            itemCount.libraryChromeFrame("metadata")
-                            if let error = model.error {
-                                NibBanner(error, action: NibAction(String(localized: "Try Again"), command: "library.setView") { model.setView(["folder": model.folderRef]) })
-                                    .libraryChromeFrame("banner")
-                            }
-                        }
-                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeaderHeight = $0 }
-                        LibraryGridView(model: model, compactHeight: compactHeight)
-                            .environment(\.horizontalSizeClass, compact ? .compact : .regular)
-                            .frame(minHeight: model.rows.isEmpty && !model.isLoading && model.error == nil
-                                ? LibraryPresentation.emptyContentHeight(viewport: viewport.size.height,
-                                    header: contentHeaderHeight, insets: topInset + bottomInset + spacing) : 0)
+                contentScroll(compact: false, compactHeight: compactHeight, viewport: viewport.size)
+            }
+        }
+    }
+    private func contentScroll(compact: Bool, compactHeight: Bool, viewport: CGSize?) -> some View {
+        let topInset = compact ? (compactHeight ? NibSpacing.xs : NibSpacing.s) : topChromeClearance
+        let bottomInset = compact && (!compactHeight || model.selection.isSelecting)
+            ? NibMetrics.barHeight + 2 * NibSpacing.l : 0
+        let spacing = compactHeight ? NibSpacing.xs : NibSpacing.s
+        return ScrollView {
+            VStack(alignment: .leading, spacing: spacing) {
+                VStack(alignment: .leading, spacing: spacing) {
+                    if compact, model.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true {
+                        compactContainerWarning
+                    } else if let banner = model.libraryBanner(isCompact: compact) {
+                        banner.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
-                    .padding(.top, topInset)
-                    // A short viewport uses a trailing control lane instead of a whole bottom row.
-                    .padding(.trailing, compactHeight ? LibraryPresentation.actionPairWidth + NibSpacing.l : 0)
-                    .frame(width: viewport.size.width)
+                    if !compact {
+                        HStack(spacing: NibSpacing.s) {
+                            parentNavigation
+                            Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
+                                .libraryChromeFrame("title")
+                        }
+                    }
+                    itemCount.libraryChromeFrame("metadata")
+                    if let error = model.error {
+                        NibBanner(error, action: NibAction(String(localized: "Try Again"), command: "library.setView") { model.setView(["folder": model.folderRef]) })
+                            .libraryChromeFrame("banner")
+                    }
                 }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    if bottomInset > 0 { Color.clear.frame(height: bottomInset) }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeaderHeight = $0 }
+                LibraryGridView(model: model, compactHeight: compactHeight)
+                    .environment(\.horizontalSizeClass, compact ? .compact : .regular)
+                    .frame(minHeight: model.rows.isEmpty && !model.isLoading && model.error == nil
+                        ? LibraryPresentation.emptyContentHeight(viewport: compact ? compactViewportHeight : viewport?.height ?? 0,
+                            header: contentHeaderHeight, insets: topInset + (compact ? 0 : bottomInset) + spacing) : 0)
+                    .libraryChromeFrame("content.grid")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
+            .padding(.top, topInset)
+            // A short viewport uses a trailing control lane instead of a whole bottom row.
+            .padding(.trailing, compactHeight ? LibraryPresentation.actionPairWidth + NibSpacing.l : 0)
+            .frame(width: viewport?.width)
+            .background {
+                if compact {
+                    // Read the nearest ScrollView from inside its content. Its container
+                    // length already excludes navigation and the bottom safeAreaInset.
+                    // A minimum (not fixed) grid height still lets large text scroll.
+                    Color.clear.containerRelativeFrame(.vertical)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { compactViewportHeight = $0 }
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
             }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if bottomInset > 0 { Color.clear.frame(height: bottomInset) }
         }
     }
     private var itemCount: some View {
@@ -869,7 +907,7 @@ struct LibraryRootView: View {
     private var selectionBar: some View {
         NibBarGroup(id: "library.selection") {
             Text(model.selection.statusText).font(NibFont.hud).foregroundStyle(NibColor.label)
-            LibraryMenuEntries(model: model, location: .librarySelection, rows: model.rows.filter { model.selection.refs.contains($0.ref) }, compact: true)
+            LibraryMenuEntries(model: model, location: .librarySelection, rows: model.selectedRows, compact: true)
             NibIconButton(.xmark, label: String(localized: "Finish Selecting")) { model.setView(["selection": "clear"]) }
             .accessibilityIdentifier("cmd.library.setView")
         }
@@ -947,10 +985,10 @@ struct LibraryChromeFrames: PreferenceKey {
 }
 
 extension View {
-    func libraryChromeFrame(_ id: String) -> some View {
+    func libraryChromeFrame(_ id: String, space: CoordinateSpace = .named("library.chrome")) -> some View {
         background {
             GeometryReader { geometry in
-                Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: .named("library.chrome"))])
+                Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: space)])
             }
         }
     }

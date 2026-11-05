@@ -69,6 +69,54 @@ final class ReservedFolderNameTests: XCTestCase {
         XCTAssertTrue(CatalogScanner.isDocumentPackage(try XCTUnwrap(lib.url(doc))))
     }
 
+    func testExistingUserInboxAndItsContentsRemainVisibleAndUntouched() async throws {
+        let lib = try TempLibrary()
+        defer { try? FileManager.default.removeItem(at: lib.root) }
+        await lib.library.waitForScans()
+        let folder = try lib.library.createFolder(title: "Old Inbox", in: nil, style: nil)
+        let created = try await lib.run("doc.create", ["kind": "notebook", "title": "Motion",
+            "folder": .string(NodeRef.folder(folder).description)])
+        let doc = NodeRef.documentID(from: created["ref"]?.stringValue ?? "")
+        let old = try XCTUnwrap(lib.url(folder))
+        let inbox = lib.root.appendingPathComponent("Inbox", isDirectory: true)
+        try FileManager.default.moveItem(at: old, to: inbox)
+        let loose = inbox.appendingPathComponent("keep.pdf")
+        let bytes = Data("user-owned file".utf8)
+        try bytes.write(to: loose)
+        let scanner = CatalogScanner(root: lib.root, device: lib.device, previous: [:], skipInbox: true)
+        let entries = scanner.scan()
+        XCTAssertFalse(CatalogScanner.isHandoffInbox(inbox))
+        XCTAssertTrue(entries.contains { $0.node.id == folder })
+        XCTAssertTrue(entries.contains { $0.node.id == doc })
+        XCTAssertEqual(try Data(contentsOf: loose), bytes)
+        // Even a corrupt folder record must never turn the directory into consumable staging.
+        for record in FolderRecords.files(in: inbox, device: lib.device) {
+            try Data("damaged record".utf8).write(to: record)
+        }
+        XCTAssertFalse(CatalogScanner.isHandoffInbox(inbox))
+        XCTAssertTrue(scanner.scan().contains { $0.node.path == "Inbox" })
+        XCTAssertEqual(try Data(contentsOf: loose), bytes)
+    }
+
+    func testSystemHandoffInboxIsSkippedWithoutConsumingIncomingFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try LocalDocumentStorage.prepare(documents: root)
+        let inbox = root.appendingPathComponent("Inbox", isDirectory: true)
+        let scanner = CatalogScanner(root: root, device: "12345678", previous: [:], skipInbox: true)
+        XCTAssertTrue(CatalogScanner.isHandoffInbox(inbox))
+        XCTAssertTrue(scanner.scan().isEmpty)
+        let incoming = inbox.appendingPathComponent("Shared.nibnote", isDirectory: true)
+        try FileManager.default.createDirectory(at: incoming, withIntermediateDirectories: true)
+        let payload = incoming.appendingPathComponent("doc.12345678.json")
+        let bytes = try JSONEncoder().encode(Fixtures.sampleContent().0)
+        try bytes.write(to: payload)
+        XCTAssertTrue(scanner.scan().isEmpty, "an incoming package alone is not evidence of a library folder")
+        XCTAssertEqual(try Data(contentsOf: payload), bytes)
+        let external = CatalogScanner(root: root, device: "12345678", previous: [:], skipInbox: false)
+        XCTAssertTrue(external.scan().contains { $0.node.path == "Inbox" })
+    }
+
     func testDefaultRootReservesInboxAcrossCreateRenameMoveAndRestore() async throws {
         // The saved root has no directory slash; rename derives a directory URL from its child.
         // Both URL forms must reserve Inbox at the same filesystem path.

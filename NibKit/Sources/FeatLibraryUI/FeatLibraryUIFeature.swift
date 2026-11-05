@@ -31,6 +31,21 @@ public enum FeatLibraryUIFeature: NibFeature {
                 return try await importer.handler(routed, context)
             }
         }
+        // Creation shortcuts have no library folder in EditorSession. Supply it at
+        // the shared command boundary, preserving explicit and document destinations.
+        for id in [CommandIDs.panelOpen, "doc.quickNote"] {
+            guard let creation = app.commands.entry(id) else { continue }
+            app.commands.register(creation.descriptor) { params, context in
+                var routed = params
+                if (id != CommandIDs.panelOpen || params["id"]?.stringValue == "create.newNotebook"),
+                   params["folder"] == nil,
+                   let app = context.app, let session = context.activeSession, session.document == nil,
+                   let model = LibraryModels.get(app).models[session.id], model.collection == .documents {
+                    routed = params.merging(["folder": model.folderRef])
+                }
+                return try await creation.handler(routed, context)
+            }
+        }
     }
     public static func register(_ app: NibApp) {
         app.commands.register(LibrarySetView.self)
@@ -218,7 +233,7 @@ struct LibraryReorder: NibCommand {
         let stored = savedOrder?.arrayValue?.compactMap(\.stringValue) ?? []
         let sessionModel = ctx.activeSession.map { LibraryModels.get(app).model($0) }
         let view = app.settings.json(LibraryOrder.viewKey(folder))
-        let sort = sessionModel.flatMap { $0.folder == folder ? $0.sort : nil } ?? LibrarySort(rawValue: view?["sort"]?.stringValue ?? "") ?? .modified
+        let sort = sessionModel.flatMap { $0.collection == .documents && $0.folder == folder ? $0.sort : nil } ?? LibrarySort(rawValue: view?["sort"]?.stringValue ?? "") ?? .modified
         let previous = LibrarySorting.rows(children, sort: sort, manual: stored).map(\.ref)
         let restoring = p.previousSort != nil
         let current = Set(previous)
@@ -231,7 +246,7 @@ struct LibraryReorder: NibCommand {
         guard !ctx.dryRun else { return ["previous": .array(previous.map(JSONValue.string)), "undo": undo] }
         app.settings.setJSON(LibraryOrder.key(folder), restoring && p.hadOrder == false ? nil : .array(next.map(JSONValue.string)))
         app.settings.setJSON(LibraryOrder.viewKey(folder), (view ?? [:]).merging(["sort": .string(nextSort.rawValue)]))
-        for model in LibraryModels.get(app).models.values where model.folder == folder {
+        for model in LibraryModels.get(app).models.values where model.collection == .documents && model.folder == folder {
             model.sort = nextSort
             model.applySort()
         }

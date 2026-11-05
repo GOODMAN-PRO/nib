@@ -1,6 +1,7 @@
 import XCTest
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 @testable import NibDesign
 import NibTesting
@@ -586,6 +587,60 @@ final class FeatLibraryUITests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.importFiles, ["urls": ["tmp:fixture.pdf"], "doc": "doc:FIXTUREDOC01"], session: h.session)
         XCTAssertNil(imported?["folder"])
         XCTAssertEqual(imported?["doc"], "doc:FIXTUREDOC01")
+    }
+
+    func testCreationCommandsUseInvokingLibraryFolderAndPreserveOtherContexts() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.windowShowLibrary, title: "Library",
+            summary: "Show library", effect: .session, target: .app)) { _, _ in [:] }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Panel",
+            summary: "Record panel parameters", effect: .session, target: .app)) { params, _ in params }
+        // Exercise the destination through a creation-service stand-in, without importing a feature.
+        h.app.commands.register(CommandDescriptor(id: "doc.quickNote", title: "QuickNote",
+            summary: "Create a test note", effect: .library, target: .library)) { params, context in
+            guard !context.dryRun else { return params }
+            var content = Fixtures.sampleContent().0
+            content.meta.id = NibID.make()
+            let folder = try LibraryModels.folder(params["folder"]?.stringValue)
+            let id = try h.library.createDocument(content, title: "QuickNote", in: folder)
+            return ["ref": .string(NodeRef.document(id).description)]
+        }
+        await FeatLibraryUIFeature.start(h.app)
+        await FeatLibraryUIFeature.start(h.app)
+        model.folder = Fixtures.folderID
+        let opened = try await h.app.bus.execute(CommandIDs.panelOpen, ["id": "create.newNotebook"], session: h.session)
+        XCTAssertEqual(opened["folder"], "folder:FIXTUREFLD01")
+        let result = try await h.app.bus.execute("doc.quickNote", [:], session: h.session)
+        let ref = try XCTUnwrap(result["ref"]?.stringValue)
+        guard case .document(let id)? = NodeRef(ref) else { return XCTFail("Expected a document") }
+        XCTAssertEqual(h.library.node(id)?.parent, Fixtures.folderID)
+        for command in [CommandIDs.panelOpen, "doc.quickNote"] {
+            let base: JSONValue = command == CommandIDs.panelOpen ? ["id": "create.newNotebook"] : [:]
+            let explicit = try await h.app.bus.execute(Invocation(command: command,
+                params: base.merging(["folder": "lib"]), session: h.session, dryRun: true))
+            XCTAssertEqual(explicit.value["folder"], "lib")
+            for collection in [LibraryCollection.recents, .studySets] {
+                model.collection = collection
+                let unchanged = try await h.app.bus.execute(Invocation(command: command, params: base,
+                    session: h.session, dryRun: true))
+                XCTAssertNil(unchanged.value["folder"])
+            }
+            model.collection = .documents
+            h.session.document = Fixtures.docID
+            let document = try await h.app.bus.execute(Invocation(command: command, params: base,
+                session: h.session, dryRun: true))
+            XCTAssertNil(document.value["folder"])
+            h.session.document = nil
+            let other = EditorSession()
+            h.app.services.sessions.add(other)
+            let otherModel = LibraryModels.get(h.app).model(other)
+            let root = try await h.app.bus.execute(Invocation(command: command, params: base,
+                session: other, dryRun: true))
+            XCTAssertEqual(root.value["folder"], "lib")
+            withExtendedLifetime(otherModel) {}
+        }
+        let unrelated = try await h.app.bus.execute(CommandIDs.panelOpen, ["id": "another.panel"], session: h.session)
+        XCTAssertNil(unrelated["folder"])
     }
 
     func testCommandConformance() async {
@@ -1512,6 +1567,58 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 200, header: 240, insets: 80), 0)
     }
 
+    func testCompactEmptyFoldersAndCollectionsFillTheScrollViewport() async throws {
+        for idiom in [UIUserInterfaceIdiom.phone, .pad] {
+            for collection in [LibraryCollection.documents, .recents, .studySets] {
+                let h = Harness(features: [FeatLibraryUIFeature.self])
+                h.session.document = nil
+                h.app.commands.register(CommandDescriptor(id: CommandIDs.libraryList, title: "List Library",
+                    summary: "List an empty test library.", effect: .read, target: .library)) { _, _ in
+                    ["nodes": [], "total": 0]
+                }
+                let model = LibraryModels.get(h.app).model(h.session)
+                model.collection = collection
+                model.folder = collection == .documents ? Fixtures.folderID : nil
+                model.sidebarVisible = false
+                model.liquidMode = .off
+                let size = CGSize(width: idiom == .phone ? 390 : 540, height: 844)
+                var frames: [String: CGRect] = [:]
+                _ = try await hostlessLayoutImage(LibraryRootView(model: model, idiom: idiom)
+                    .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 },
+                    size: size, variant: .light, settlePasses: 10)
+                XCTAssertTrue(model.rows.isEmpty)
+                XCTAssertFalse(model.isLoading)
+                XCTAssertNil(model.error)
+                let grid = try XCTUnwrap(frames["content.grid"])
+                XCTAssertGreaterThan(grid.height, size.height / 2,
+                    "The compact empty placeholder must expand below the header for \(collection)")
+                XCTAssertLessThanOrEqual(grid.maxX, size.width)
+            }
+        }
+    }
+
+    func testLibraryModelsPublishesSearchBoundsThroughTheServiceKey() throws {
+        let h = harness(), store = LibraryModels.get(h.app)
+        let model = store.model(h.session)
+        let other = EditorSession()
+        let otherModel = store.model(other)
+        let publisher = try XCTUnwrap(h.app.services.get("libraryui.searchContentBounds",
+            as: (@MainActor (EditorSession) -> AnyPublisher<CGRect?, Never>).self))
+        var values: [CGRect?] = []
+        let subscription = publisher(h.session).sink { values.append($0) }
+        defer { subscription.cancel() }
+        XCTAssertEqual(values.count, 1)
+        XCTAssertNil(values[0])
+        let bounds = CGRect(x: 350, y: 100, width: 800, height: 650)
+        model.searchContentBounds = bounds
+        model.searchContentBounds = bounds
+        otherModel.searchContentBounds = CGRect(x: 20, y: 40, width: 500, height: 600)
+        XCTAssertEqual(values, [nil, bounds], "Updates are deduplicated and local to the requested window")
+        model.searchContentBounds = nil
+        XCTAssertEqual(values, [nil, bounds, nil])
+        XCTAssertTrue(LibraryModels.get(h.app) === store)
+    }
+
     func testLibraryBannerAndTrailingChromeStayInsideViewport() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         model.sidebarVisible = false
@@ -1815,6 +1922,37 @@ final class FeatLibraryUITests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.libraryReorder, result["undo"] ?? [:], session: h.session)
         XCTAssertEqual(model.visibleRows.map(\.ref), previous)
     }
+    func testRootReorderAndUndoLeaveCollectionWindowsUnchanged() async throws {
+        let h = harness(), root = LibraryModels.get(h.app).model(h.session)
+        await root.reload()
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sort": "name"], session: h.session)
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        let collection = LibraryModels.get(h.app).model(other)
+        for place in [LibraryCollection.recents, .studySets] {
+            _ = try await h.app.bus.execute(CommandIDs.librarySetView,
+                ["collection": .string(place.rawValue)], session: other)
+            await collection.reload()
+            let rows = collection.visibleRefs
+            let result = try await h.app.bus.execute(CommandIDs.libraryReorder,
+                ["refs": ["doc:FIXTUREDOC01"]], session: h.session)
+            XCTAssertEqual(root.sort, .manual)
+            XCTAssertEqual(collection.sort, .modified)
+            XCTAssertEqual(collection.visibleRefs, rows)
+            // Undo after navigating, or from another window, must restore only the folder view.
+            _ = try await h.app.bus.execute(CommandIDs.libraryReorder, result["undo"] ?? [:], session: other)
+            XCTAssertEqual(root.sort, .name)
+            XCTAssertEqual(collection.sort, .modified)
+            XCTAssertEqual(collection.visibleRefs, rows)
+            // A command invoked in a collection takes the folder's saved sort for its undo payload.
+            let fromCollection = try await h.app.bus.execute(CommandIDs.libraryReorder,
+                ["refs": ["doc:FIXTUREDOC01"]], session: other)
+            XCTAssertEqual(fromCollection["previousSort"], "name")
+            _ = try await h.app.bus.execute(CommandIDs.libraryReorder, fromCollection["undo"] ?? [:], session: other)
+            XCTAssertEqual(collection.sort, .modified)
+        }
+    }
+
     func testReorderUndoManagerRegistersRedoSynchronously() async throws {
         let h = harness(), manager = UndoManager()
         manager.groupsByEvent = false
@@ -1940,6 +2078,35 @@ final class FeatLibraryUITests: XCTestCase {
         _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["folder": "lib"], session: h.session)
         XCTAssertNil(LibraryMenus.context(model, location: .libraryNew, rows: []).folder)
     }
+    func testSearchAndFilterPruneHiddenBulkSelection() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        await model.reload()
+        let documents = model.visibleRows.filter { !$0.isFolder }
+        XCTAssertGreaterThan(documents.count, 1)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "all"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["search": "no matching library row"], session: h.session)
+        XCTAssertTrue(model.visibleRows.isEmpty)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+        XCTAssertTrue(model.selectedRows.isEmpty)
+
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["search": "", "selection": "clear"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["selection": "all"], session: h.session)
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["filter": "folders"], session: h.session)
+        XCTAssertFalse(model.selectedRows.isEmpty)
+        XCTAssertTrue(model.selectedRows.allSatisfy(\.isFolder))
+        XCTAssertEqual(model.selection.refs, Set(model.visibleRefs))
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["filter": "documents"], session: h.session)
+        XCTAssertTrue(model.selection.refs.isEmpty)
+        XCTAssertTrue(model.selectedRows.isEmpty)
+
+        // A visible selected row survives sorting, while a stale injected ref cannot reach the menu.
+        let visible = try XCTUnwrap(model.visibleRefs.first)
+        model.selection.refs = [visible, "doc:hidden"]
+        XCTAssertEqual(model.selectedRows.map(\.ref), [visible])
+        _ = try await h.app.bus.execute(CommandIDs.librarySetView, ["sort": "name"], session: h.session)
+        XCTAssertEqual(model.selection.refs, [visible])
+    }
+
     func testSelectionThroughCommandAndFloatingToast() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)

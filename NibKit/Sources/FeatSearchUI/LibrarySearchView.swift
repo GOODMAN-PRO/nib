@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
@@ -126,19 +127,30 @@ struct LibrarySearchFloatingContent: View {
     let session: EditorSession
     @ObservedObject var state: SearchState
     @State private var viewport: SearchViewport?
+    @State private var libraryContentBounds: CGRect?
     var belowBars = false
+
+    private var contentBoundsPublisher: AnyPublisher<CGRect?, Never>? {
+        let bounds = app.services.get("libraryui.searchContentBounds",
+            as: (@MainActor (EditorSession) -> AnyPublisher<CGRect?, Never>).self)
+        return bounds?(session)
+    }
 
     var body: some View {
         GeometryReader { geometry in
-            let bounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
+            let hostBounds = SearchViewport.hostBounds(proposedSize: geometry.size, viewport: viewport)
+            let measuredColumn = belowBars ? nil : libraryContentBounds
+            let bounds = SearchViewport.libraryContentBounds(hostBounds: hostBounds, column: measuredColumn,
+                hostOrigin: geometry.frame(in: .global).origin)
             let width = SearchViewport.panelWidth(availableWidth: bounds.width - 2 * NibMetrics.chromeInset,
                 windowSize: viewport?.windowSize ?? geometry.size)
-            let top = belowBars ? 0 : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
+            let top = belowBars || measuredColumn != nil ? 0
+                : NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
             let height = SearchViewport.resultsHeight(availableHeight: min(bounds.height,
                 (viewport?.availableHeight ?? geometry.size.height) - bounds.minY) - top, reservesNavigation: false)
             ZStack(alignment: .top) {
-                // Search owns this surface while open. An invisible catcher left fragments
-                // of the banner and title around the field, especially in landscape.
+                // Cover the replaced content, including its banner/title, but leave the
+                // measured sidebar and toolbar outside both the paint and the tap catcher.
                 (belowBars ? Color.clear : NibColor.background)
                     .contentShape(Rectangle())
                     .onTapGesture { close() }
@@ -174,6 +186,9 @@ struct LibrarySearchFloatingContent: View {
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
+        }
+        .onReceive(contentBoundsPublisher ?? Just<CGRect?>(nil).eraseToAnyPublisher()) { bounds in
+            if libraryContentBounds != bounds { libraryContentBounds = bounds }
         }
     }
     private var presentationBinding: Binding<Bool> {
@@ -215,9 +230,7 @@ struct SearchResults: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
-    @Namespace private var scrollSpace
     @State private var overflows = false
-    @State private var viewportHeight: CGFloat = 0
     private var showsContinuation: Bool {
         overflows
     }
@@ -294,15 +307,20 @@ struct SearchResults: View {
                     }
                     .foregroundStyle(NibColor.label)
                     .padding(NibSpacing.l)
-                    .onGeometryChange(for: Bool.self) {
-                        SearchScrollContinuation.isVisible(
-                            contentBottom: $0.frame(in: .named(scrollSpace)).maxY, viewportHeight: viewportHeight)
-                    } action: {
-                        overflows = $0
-                    }
+                    .anchorPreference(key: SearchContentBounds.self, value: .bounds) { $0 }
                 }
-                .coordinateSpace(name: scrollSpace)
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { viewportHeight = $0 }
+                // Resolve both measurements in one layout pass. Only the decision reaches
+                // state, so scrolling does not invalidate all result rows every frame.
+                .overlayPreferenceValue(SearchContentBounds.self) { anchor in
+                    GeometryReader { geometry in
+                        Color.clear.preference(key: SearchContinuationVisible.self,
+                            value: SearchScrollContinuation.isVisible(contentBounds: anchor.map { geometry[$0] },
+                                viewportBounds: CGRect(origin: .zero, size: geometry.size)))
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
+                .onPreferenceChange(SearchContinuationVisible.self) { overflows = $0 }
                 .scrollBounceBehavior(.basedOnSize)
                 .scrollIndicators(.visible)
                 .nibFadeBottomEdge(showsContinuation ? NibSpacing.l : 0)
@@ -329,7 +347,22 @@ struct SearchResults: View {
     }
 }
 
+private struct SearchContentBounds: PreferenceKey {
+    static let defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = nextValue() ?? value }
+}
+
+private struct SearchContinuationVisible: PreferenceKey {
+    static let defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+}
+
 enum SearchScrollContinuation {
+    static func isVisible(contentBounds: CGRect?, viewportBounds: CGRect) -> Bool {
+        guard let contentBounds else { return false }
+        return isVisible(contentBottom: contentBounds.maxY - viewportBounds.minY, viewportHeight: viewportBounds.height)
+    }
+
     static func isVisible(contentBottom: CGFloat, viewportHeight: CGFloat) -> Bool {
         viewportHeight > 0 && contentBottom > viewportHeight + NibSpacing.xxs
     }
