@@ -33,7 +33,7 @@ final class FeatExportUITests: XCTestCase {
             let asset = try ctx.services.assets!.putTemporary(data, ext: "pdf")
             return ["files": .array((0..<probe.fileCount).map { index in
                 ["asset": .string("tmp:" + asset.name), "name": .string(probe.fileName ?? "Notes\(index).pdf"), "bytes": .number(Double(data.count))]
-            })]
+            }), "warning": probe.warning.map(JSONValue.string) ?? .null, "omissions": probe.omissions]
         }
         return (h, presenter, probe)
     }
@@ -67,6 +67,18 @@ final class FeatExportUITests: XCTestCase {
         XCTAssertEqual(probe.calls.last?["pages"], ["page:FIXTUREDOC04/FIXTUREBRD01"])
         XCTAssertEqual(h.undoDepths(), depths)
         XCTAssertEqual(presenter.destinations, ["files", "share", "files", "share"])
+        XCTAssertTrue(presenter.filesExistedDuringDelivery)
+    }
+
+    func testDeliveredPackageRetainsTheOmissionWarning() async throws {
+        let (h, presenter, probe) = harness()
+        probe.warning = "Export completed without 1 asset on Page 1."
+        probe.omissions = [["asset": "missing.png", "pages": ["Page 1"]]]
+        let result = try await h.run("export.present", ["docs": ["doc:FIXTUREDOC01"],
+            "format": "nibnote", "destination": "files"])
+        XCTAssertEqual(result["completed"], true)
+        XCTAssertEqual(result["warning"]?.stringValue, probe.warning)
+        XCTAssertEqual(result["omissions"], probe.omissions)
         XCTAssertTrue(presenter.filesExistedDuringDelivery)
     }
 
@@ -636,6 +648,8 @@ private final class AttachingExportHost: FloatingHosting {
 private final class ExportProbe {
     var calls: [JSONValue] = []
     var fileCount = 1
+    var warning: String?
+    var omissions: JSONValue = .array([])
     var fileName: String?
     var onExport: (() -> Void)?
 }

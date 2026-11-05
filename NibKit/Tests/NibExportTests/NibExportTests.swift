@@ -273,8 +273,8 @@ final class NibExportTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: package.appendingPathComponent("pages/FIXTUREPG002").path), "empty pages have no file")
     }
 
-    func testMissingAssetsFailPDFImageAndPackageExportsAndCleanOutput() async throws {
-        for format in ["pdf", "png", "nibnote"] {
+    func testMissingAssetsFailPDFAndImageExportsAndCleanOutput() async throws {
+        for format in ["pdf", "png"] {
             for page in [Fixtures.pdfPage, Fixtures.page1] {
                 let h = Harness(features: [NibExportFeature.self])
                 h.app.services.assets = InMemoryAssetStore(root: h.persistence.root)
@@ -332,18 +332,63 @@ final class NibExportTests: XCTestCase {
         } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
     }
 
-    func testExportWithoutAnAssetServiceFailsWhenAssetsAreReferenced() async throws {
+    func testPackageWithoutAnAssetServiceReportsOmissionsAndKeepsTheDocument() async throws {
         let h = Harness(features: [NibExportFeature.self])
         h.app.services.assets = nil
         h.app.commands.register(CommandDescriptor(id: "test.noAssets", title: "Export", summary: "Missing asset service.",
             effect: .read, exposure: .ui)) { _, ctx in
-            _ = try await PackageExporter.exportPackages(ExportRequest(documents: [Fixtures.docID]), ctx)
+            let urls = try await PackageExporter.exportPackages(ExportRequest(documents: [Fixtures.docID]), ctx)
+            defer { ExportDelivery.discard(urls) }
+            XCTAssertEqual(urls.count, 1)
+            let report = ExportOmission.read(urls)
+            XCTAssertTrue(report.contains { $0.asset == Fixtures.pdfAsset.name })
+            XCTAssertTrue(report.contains { $0.asset == Fixtures.pngAsset.name })
+            XCTAssertTrue(FileManager.default.fileExists(atPath: urls[0].path))
             return .null
         }
-        do {
-            try await h.run("test.noAssets")
-            XCTFail("A backup must not omit its assets")
-        } catch let error as NibError { XCTAssertEqual(error.code, .unavailable) }
+        try await h.run("test.noAssets")
+    }
+
+    func testPackageReportsMissingAndUnreadableLiveAssetsAndRetainsReadableAssets() async throws {
+        for unreadable in [false, true] {
+            let h = Harness(features: [NibExportFeature.self])
+            let assets = InMemoryAssetStore(root: h.persistence.root)
+            assets.install(try h.assets.data(Fixtures.pdfAsset, doc: Fixtures.docID), as: Fixtures.pdfAsset, doc: Fixtures.docID)
+            if unreadable { assets.install(Data(), as: Fixtures.pngAsset, doc: Fixtures.docID) }
+            h.app.services.assets = assets
+            let result = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"], "format": "nibnote", "inline": true])
+            let omissions = try XCTUnwrap(result["omissions"]?.arrayValue)
+            XCTAssertEqual(omissions.count, 1)
+            XCTAssertEqual(omissions[0]["asset"]?.stringValue, Fixtures.pngAsset.name)
+            XCTAssertTrue(omissions[0]["pages"]?.arrayValue?.contains { $0.stringValue?.contains(Fixtures.page1.raw) == true } == true)
+            XCTAssertNotNil(result["warning"]?.stringValue)
+            let file = try XCTUnwrap(result["files"]?.arrayValue?.first)
+            let data = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(file["base64"]?.stringValue)))
+            XCTAssertNotNil(data.range(of: Data("Export Report.txt".utf8)))
+            XCTAssertNotNil(data.range(of: Data("assets/fixture-page.pdf".utf8)))
+            XCTAssertNil(data.range(of: Data("assets/fixture-image.png".utf8)))
+        }
+    }
+
+    func testPackageSilentlySkipsAssetsReferencedOnlyByTrashedPages() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.trashBackground", title: "Trash", summary: "Trashed asset reference.",
+            effect: .edit, exposure: .ui)) { _, ctx in
+            try ctx.mutate { tx in
+                var page = try XCTUnwrap(tx.content(Fixtures.docID).page(Fixtures.pdfPage))
+                page.background = .ofImage(AssetRef("gone-forever.png"))
+                page.deleted = true
+                page.trashedAt = Date().timeIntervalSince1970
+                try tx.put(page, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        try await h.run("test.trashBackground")
+        let out = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01"], "format": "nibnote", "inline": true])
+        XCTAssertNil(out["omissions"])
+        XCTAssertNil(out["warning"])
+        let data = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(out["files"]?.arrayValue?.first?["base64"]?.stringValue)))
+        XCTAssertNil(data.range(of: Data("Export Report.txt".utf8)))
     }
 
     func testNibnoteExportIsAZippedPackage() async throws {
