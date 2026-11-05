@@ -2,7 +2,7 @@ import XCTest
 
 /// Unit tests in the UI runner because the capture policy belongs to that target, not the shipped app.
 /// No app launch, screenshot, simulator interaction or real-time wait is needed by these tests.
-final class CaptureReadinessTests: XCTestCase {
+final class CaptureReadinessUITests: XCTestCase {
     private let window = CGRect(x: 0, y: 0, width: 800, height: 1000)
     private let canvas = CGRect(x: 0, y: 100, width: 800, height: 800)
 
