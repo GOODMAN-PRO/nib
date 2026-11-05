@@ -15,6 +15,9 @@ final class PenOptions: ObservableObject {
     private var commits: EventSubscription?
     private var pendingWrites: [String: UUID] = [:]
     private var lastWrite: Task<Void, Never>?
+    @Published private var customDraft: RGBA?
+    private var customSwatch: Int?
+    private(set) var customSave: Task<Void, Never>?
 
     init(app: NibApp, session: EditorSession, pencil: Bool, observesWritingAids: Bool = false) {
         self.app = app; self.session = session; tool = pencil ? "pencil" : "pen"
@@ -94,6 +97,8 @@ final class PenOptions: ObservableObject {
     }
 
     func chooseColour(_ colour: RGBA) {
+        customSave?.cancel()
+        customDraft = nil
         changePreset {
             if let index = $0.swatches.firstIndex(where: { $0.color == colour }) { $0.selectedSwatch = index }
             else if $0.swatches.count < ToolPresets.maxSwatches {
@@ -111,7 +116,34 @@ final class PenOptions: ObservableObject {
     }
 
     var customColour: Binding<Color> {
-        Binding(get: { Color(uiColor: self.presets.color.uiColor) }, set: { self.chooseColour(RGBA(UIColor($0))) })
+        Binding(get: { Color(uiColor: (self.customDraft ?? self.presets.color).uiColor) }, set: { colour in
+            let rgba = RGBA(UIColor(colour))
+            self.customDraft = rgba
+            self.customSave?.cancel()
+            // Keep the final choice even if the popover closes before the drag settles.
+            self.customSave = Task { @MainActor [self] in
+                do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
+                changePreset { presets in
+                    if let index = customSwatch, presets.swatches.indices.contains(index) {
+                        presets.swatches[index] = PresetSwatch(color: rgba)
+                        presets.selectedSwatch = index
+                    } else if let index = presets.swatches.firstIndex(where: { $0.color == rgba }) {
+                        presets.selectedSwatch = index
+                    } else if presets.swatches.count < ToolPresets.maxSwatches {
+                        presets.swatches.append(PresetSwatch(color: rgba))
+                        presets.selectedSwatch = presets.swatches.count - 1
+                        customSwatch = presets.selectedSwatch
+                    } else {
+                        let index = max(0, min(presets.selectedSwatch, presets.swatches.count - 1))
+                        presets.swatches[index] = PresetSwatch(color: rgba)
+                        presets.selectedSwatch = index
+                        customSwatch = index
+                    }
+                }
+                customDraft = nil
+                await lastWrite?.value
+            }
+        })
     }
 
     var disconnectStylus: Binding<Bool> {
