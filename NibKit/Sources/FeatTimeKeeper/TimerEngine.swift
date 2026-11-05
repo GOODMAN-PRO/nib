@@ -308,6 +308,26 @@ struct TimerPreset: Codable, Equatable, Hashable, Identifiable {
     }
 }
 
+/// Duration entry and ownership of outstanding handwriting results.
+struct TimerDurationInput {
+    var text = ""
+    var writing = false
+    var generation = 0
+
+    mutating func select(_ seconds: Int) {
+        generation += 1
+        writing = false
+        text = TimerFormat.clock(Double(seconds))
+    }
+
+    /// A preset/mode or a switch to typing supersedes any outstanding handwriting result.
+    mutating func complete(_ recognised: String?, generation: Int) -> Bool {
+        guard writing, self.generation == generation else { return false }
+        if let recognised { text = recognised }
+        return true
+    }
+}
+
 /// Reads a duration a person typed or wrote: "25" (minutes), "25 min", "90s", "1h 15m", "1h15", "2.5 min",
 /// "1:30" (minutes:seconds), "1:05:00" (hours:minutes:seconds). Handwriting look-alikes next to digits are fixed
 /// ("I5" is 15, "O5:00" is 05:00). Returns whole seconds in 1 s…24 h, or nil. Total: any string, however long its

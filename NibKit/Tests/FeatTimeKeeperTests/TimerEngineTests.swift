@@ -137,6 +137,23 @@ final class TimerEngineTests: XCTestCase {
         }
     }
 
+    func testPresetAndSavedModeSupersedePendingRecognition() {
+        for seconds in [1500, 3000] {
+            var input = TimerDurationInput()
+            input.writing = true
+            input.generation += 1
+            let pending = input.generation
+            input.select(seconds)
+            XCTAssertFalse(input.complete("5 min", generation: pending))
+            XCTAssertEqual(DurationParser.seconds(from: input.text), seconds)
+            // Even returning to handwriting cannot revive the older request.
+            input.writing = true
+            XCTAssertFalse(input.complete("5 min", generation: pending))
+            XCTAssertTrue(input.complete("10 min", generation: input.generation))
+            XCTAssertEqual(DurationParser.seconds(from: input.text), 600)
+        }
+    }
+
     func testDurationParserNeverOverflows() {
         // Typed nines, or a long digit run misread from a scribble: nil, never a trap.
         let hostile = ["999999999999999999", "99999999999999999999 min", "999999999999999999:00",
