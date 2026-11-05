@@ -68,10 +68,12 @@ final class ImageNavigationTracker {
     private var navigated: Bool
     private var watches: [AnyCancellable] = []
 
-    init(session: EditorSession?, target: ImageMenuTarget?) {
-        document = target?.doc ?? session?.document
-        page = target?.page ?? session?.page
-        navigated = session?.document != document || session?.page != page
+    init(session: EditorSession?) {
+        // The tapped page can differ from the page at the viewport centre. Only changes to the
+        // captured session invalidate this import's ownership of selection and tool state.
+        document = session?.document
+        page = session?.page
+        navigated = false
         if let session {
             watches = [
                 session.$document.dropFirst().sink { [weak self] value in
@@ -87,7 +89,7 @@ final class ImageNavigationTracker {
     }
 
     func canUpdate(_ session: EditorSession) -> Bool {
-        !navigated && session.document == document && session.page == page
+        !navigated && session.document == document
     }
 }
 
@@ -98,7 +100,7 @@ enum ImageUI {
     static func run(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
                     target: ImageMenuTarget? = nil, navigation: ImageNavigationTracker? = nil) {
         guard !calls.isEmpty else { return }
-        let navigation = navigation ?? ImageNavigationTracker(session: session, target: target)
+        let navigation = navigation ?? ImageNavigationTracker(session: session)
         Task { @MainActor in await perform(app, calls, session: session, target: target, navigation: navigation) }
     }
 
@@ -106,7 +108,7 @@ enum ImageUI {
     @discardableResult
     static func perform(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
                         target: ImageMenuTarget? = nil, navigation: ImageNavigationTracker? = nil) async -> [String] {
-        let navigation = navigation ?? ImageNavigationTracker(session: session, target: target)
+        let navigation = navigation ?? ImageNavigationTracker(session: session)
         let group = NibID.make().raw
         var created: [String] = []
         for call in calls {
@@ -122,6 +124,10 @@ enum ImageUI {
         }
         guard !created.isEmpty, let session = session, navigation.canUpdate(session) else { return created }
         finishToolUse(session, target: target)
+        // T4:concurrency-canvas#6 follow-up for the NibContracts/FeatLasso owners: selection.set
+        // needs an invocation-local precondition capturing this tracker, checked after all async
+        // hooks/authorization immediately before applying selection. A pre-call check cannot close
+        // that race (including A -> B -> A); rejecting selection must preserve the completed insert.
         _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
                                        session: session)
         return created
@@ -276,7 +282,7 @@ struct ImageSourceMenu: View {
 
     private func choose(_ source: ImagePickSource) {
         guard let t = target() else { return }
-        let navigation = ImageNavigationTracker(session: session, target: t)
+        let navigation = ImageNavigationTracker(session: session)
         var params: [String: JSONValue] = ["source": .string(source.rawValue), "page": .string(t.pageRef)]
         if let p = t.point { params["point"] = .array([.number(p.x), .number(p.y)]) }
         let app = self.app, session = self.session
@@ -302,7 +308,7 @@ struct ImageSourceMenu: View {
     func insertImages(_ load: @escaping @MainActor () async throws -> [Data],
                       completion: @escaping @MainActor ([String]) -> Void = { _ in }) {
         guard let t = target() else { return }
-        let navigation = ImageNavigationTracker(session: session, target: t)
+        let navigation = ImageNavigationTracker(session: session)
         let app = self.app, session = self.session, close = self.close
         Task { @MainActor in
             do {
@@ -778,12 +784,17 @@ final class ScanSession: NSObject, VNDocumentCameraViewControllerDelegate {
 
     nonisolated func documentCameraViewController(_ controller: VNDocumentCameraViewController, didFailWithError error: Error) {
         MainActor.assumeIsolated {
-            finish(.failure(NibError(.unavailable, String(localized: "The document scan failed. Please try again."))),
-                   controller: controller)
+            fail(controller: controller)
         }
     }
 
-    private func finish(_ result: Result<[Data], Error>, controller: UIViewController) {
+    /// Shared failure/completion paths also work without constructing a hardware scanner in tests.
+    func fail(controller: UIViewController) {
+        finish(.failure(NibError(.unavailable, String(localized: "The document scan failed. Please try again."))),
+               controller: controller)
+    }
+
+    func finish(_ result: Result<[Data], Error>, controller: UIViewController) {
         completion.finish(result, dismissing: controller) { [self] result in
             receive?(result)
             receive = nil

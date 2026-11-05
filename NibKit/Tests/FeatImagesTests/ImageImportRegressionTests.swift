@@ -1,7 +1,6 @@
 import XCTest
 import UIKit
 import UniformTypeIdentifiers
-import VisionKit
 import NibContracts
 import NibTesting
 @testable import FeatImages
@@ -116,6 +115,43 @@ final class ImageImportRegressionTests: XCTestCase {
             let actual = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
             XCTAssertEqual(actual, try XCTUnwrap(intervening))
             XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "only the intervening edit is undoable")
+        }
+    }
+
+    func testInsertOnVisibleNonCentredPageFinishesToolAndSelectsImage() async throws {
+        let h = Harness(features: [FeatImagesFeature.self])
+        h.session.page = Fixtures.page1
+        h.session.tool = "lasso"
+        h.session.tool = "image"
+        let target = ImageMenuTarget(doc: Fixtures.docID, page: Fixtures.page2, point: nil)
+        XCTAssertNotEqual(target.page, h.session.page)
+        var selected: [String] = []
+        // FeatLasso owns selection.set; record the image UI's request without importing another feature.
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select", summary: "Test selection.",
+                                                  effect: .session)) { params, _ in
+            selected = params["refs"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+            return .null
+        }
+        let refs = await ImageUI.perform(h.app, [("image.insert", ["page": .string(target.pageRef),
+            "asset": "fixture-image.png", "id": "OFFCENTREIMAGE"])], session: h.session, target: target)
+        XCTAssertEqual(refs, ["item:FIXTUREDOC01/FIXTUREPG002/OFFCENTREIMAGE"])
+        XCTAssertNotNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "OFFCENTREIMAGE").image)
+        XCTAssertEqual(selected, refs)
+        XCTAssertEqual(h.session.tool, "lasso")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testTrackerRemembersPageNavigationEvenAfterReturningToOrigin() {
+        for returnToOrigin in [false, true] {
+            let h = Harness(features: [FeatImagesFeature.self])
+            h.session.page = Fixtures.page1
+            let navigation = ImageNavigationTracker(session: h.session)
+            XCTAssertTrue(navigation.canUpdate(h.session))
+            h.session.page = Fixtures.page1 // A repeated publication is not navigation.
+            XCTAssertTrue(navigation.canUpdate(h.session))
+            h.session.page = Fixtures.page2
+            if returnToOrigin { h.session.page = Fixtures.page1 }
+            XCTAssertFalse(navigation.canUpdate(h.session))
         }
     }
 
@@ -277,9 +313,9 @@ final class ImageImportRegressionTests: XCTestCase {
         let session = ScanSession()
         var results: [Result<[Data], Error>] = []
         session.receive = { results.append($0) }
-        let scanner = VNDocumentCameraViewController()
-        session.documentCameraViewController(scanner, didFailWithError: URLError(.unknown))
-        session.documentCameraViewControllerDidCancel(scanner)
+        let controller = UIViewController()
+        session.fail(controller: controller)
+        session.finish(.success([]), controller: controller)
         XCTAssertEqual(results.count, 1)
         XCTAssertThrowsError(try XCTUnwrap(results.first).get()) { error in
             XCTAssertEqual((error as? NibError)?.code, .unavailable)
