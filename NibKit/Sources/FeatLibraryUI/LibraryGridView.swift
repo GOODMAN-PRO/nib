@@ -604,17 +604,40 @@ struct LibraryListRow: View {
     }
 }
 
+/// A clean field follows external renames; an edited draft never silently replaces one.
+struct LibraryRenameDraft {
+    private(set) var original = ""
+    var text = ""
+
+    mutating func reconcile(_ current: String) {
+        guard text == original else { return }
+        original = current
+        text = current
+    }
+
+    func titleForSubmission(current: String) throws -> String? {
+        guard text != original else { return nil }
+        let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { throw NibError(.invalidParams, String(localized: "Enter a name.")) }
+        guard title != current else { return nil }
+        guard original == current else {
+            throw NibError(.conflict, String(localized: "This item was renamed elsewhere. Cancel and rename it again to use the latest name."))
+        }
+        return title
+    }
+}
+
 struct LibraryRenameField: View {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
-    @State private var text = ""
+    @State private var draft = LibraryRenameDraft()
     @State private var error: String?
     @State private var saving = false
     @FocusState private var focused: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
             HStack(spacing: NibSpacing.xs) {
-                TextField(String(localized: "Name"), text: $text).font(NibFont.body).focused($focused).onSubmit(save)
+                TextField(String(localized: "Name"), text: $draft.text).font(NibFont.body).focused($focused).onSubmit(save)
                     .accessibilityLabel(String(localized: "Rename \(row.name)"))
                 NibIconButton(.checkmark, label: String(localized: "Save Name"), action: save)
                     .accessibilityIdentifier("cmd.library.rename")
@@ -623,7 +646,8 @@ struct LibraryRenameField: View {
             }.frame(minHeight: NibMetrics.hitTarget)
             .disabled(saving)
             if let error { Text(error).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
-        }.onAppear { text = row.name; focused = true }
+        }.onAppear { draft.reconcile(row.name); focused = true }
+            .onChange(of: row.name) { _, name in draft.reconcile(name) }
             .nibEscapeCancellation(isEnabled: !saving) {
                 focused = false
                 model.setView(["rename": ""])
@@ -631,8 +655,14 @@ struct LibraryRenameField: View {
     }
     private func save() {
         guard !saving else { return }
-        let title = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { error = String(localized: "Enter a name."); return }
+        let title: String
+        do {
+            guard let submitted = try draft.titleForSubmission(current: row.name) else {
+                model.setView(["rename": ""])
+                return
+            }
+            title = submitted
+        } catch { self.error = NibError.wrap(error).message; return }
         saving = true
         Task { @MainActor in
             defer { saving = false }
