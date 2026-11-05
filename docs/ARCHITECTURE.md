@@ -554,6 +554,8 @@ All commands below exist at the end of the build. Each row gives the owning feat
 |---|---|---|---|---|
 | `canvas.decorate` | session | page, id, display, ttl? | F006 | Show a transient DisplayList overlay on a page for ttl seconds (plugins: nib.canvas.decorate). |
 | `canvas.clearDecorations` | session | id? | F006 | Remove canvas decorations (all, or one id). |
+| `canvas.retainFailedInk` | session | page, stroke, id?, processed? | F006 | Keep an ink stroke whose commit failed for this app session, so it stays on screen and can be retried or discarded. |
+| `canvas.recoverInk` | edit | doc, discard? | F006 | Retry the document's unsaved ink with stable ids, or discard it explicitly. |
 
 ### `card.*`
 
