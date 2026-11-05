@@ -340,6 +340,69 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertTrue(CollabPair.hasItem(pair.host, "AFTERRESUME1"))
     }
 
+    func testDetachedSessionWorkReceivesCancellation() async {
+        let stopped = expectation(description: "detached session work was cancelled")
+        let task = Task {
+            do {
+                _ = try await CollabWork.value(of: Task.detached { () async throws -> Int in
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    return 1
+                })
+                XCTFail("cancelled file work completed normally")
+            } catch is CancellationError {
+                stopped.fulfill()
+            } catch {
+                XCTFail("unexpected cancellation result: \(error)")
+            }
+        }
+        task.cancel()
+        await fulfillment(of: [stopped], timeout: 1)
+    }
+
+    func testPendingRejoinDoesNotKeepItsServiceOrAppAlive() async throws {
+        var pair: CollabPair? = CollabPair()
+        let code = try await pair!.share()
+        try await pair!.join(code)
+        pair!.guestService.timing.rejoinTimeout = 0.08
+        weak var app = pair!.guest.app
+        weak var service = pair!.guestService
+        weak var session = service?.session
+        let transport = pair!.guestTransport
+        pair!.hostTransport.leave()
+        try await waitUntil(timeout: 1) { session?.joinInProgress == true }
+        XCTAssertTrue(session?.joinInProgress == true)
+        pair = nil
+        try await waitUntil(timeout: 1) { app == nil && service == nil && session == nil }
+        XCTAssertNil(app)
+        XCTAssertNil(service, "the retry task must not own its service across the admission wait")
+        XCTAssertNil(session)
+        XCTAssertNil(transport.onMessage)
+        XCTAssertNil(transport.onPeersChanged)
+        // Cross the old timeout: a queued timer/failure must not touch the destroyed app.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(transport.peers.isEmpty)
+    }
+
+    func testLeavingDuringRejoinCancelsWaitAndRetryWithoutLosingTheCopy() async throws {
+        let pair = CollabPair()
+        defer { pair.guestService.leave(); pair.hostService.leave() }
+        let code = try await pair.share()
+        try await pair.join(code)
+        let session = try XCTUnwrap(pair.guestService.session)
+        pair.guestService.timing.rejoinTimeout = 0.08
+        pair.hostTransport.leave()
+        try await waitUntil(timeout: 1) { session.joinInProgress }
+        pair.guestService.leave()
+        try await waitUntil(timeout: 1) { !session.joinInProgress }
+        let sent = pair.guestTransport.sent.count
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(session.isClosed)
+        XCTAssertNil(pair.guestService.session)
+        XCTAssertEqual(pair.guestTransport.sent.count, sent, "a cancelled attempt must not retry")
+        XCTAssertNil(pair.guestService.state.message, "late failure must not replace the user's leave")
+        XCTAssertNotNil(pair.guest.library.node(Fixtures.docID))
+    }
+
     func testLostHostEndsInFolderSyncFallback() async throws {
         let pair = CollabPair()
         pair.guestService.timing.rejoinTimeout = 0.1

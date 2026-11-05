@@ -1141,6 +1141,18 @@ enum CollabGuard {
     }
 }
 
+/// Detached file work must receive cancellation from the session task waiting for it. Callers
+/// still dispose of any returned scratch file before ignoring a late result.
+enum CollabWork {
+    static func value<T: Sendable>(of task: Task<T, Error>) async throws -> T {
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+}
+
 // MARK: - Timing
 
 struct CollabTiming {
@@ -1196,8 +1208,8 @@ final class CollabSession {
     let myName: String
     let startedAt = Date().timeIntervalSince1970
     var defaultRole: CollabRole
-    private unowned let service: CollabService
-    private var app: NibApp { service.app }
+    private weak var service: CollabService?
+    private weak var app: NibApp?
 
     private(set) var id: String
     private(set) var joinInProgress = false
@@ -1246,6 +1258,8 @@ final class CollabSession {
     /// before their bytes, and the host relays a patch only once it holds the files the patch needs.
     private var holds = 0
     private var outbox: [Route: Task<Void, Never>] = [:]
+    /// Snapshot import and received-file verification stop publishing when this session ends.
+    private var backgroundWork: [UUID: Task<Void, Never>] = [:]
     /// Every link of each route's chain, so rehosting cancels a busy send as well as the patch waiting behind it.
     private var pendingOutbox: [UUID: Task<Void, Never>] = [:]
     private var catchUps: [Route: Task<Void, Never>] = [:]
@@ -1256,6 +1270,7 @@ final class CollabSession {
     private var lastPage: String??
     private var readOnlySessions: [NibID] = []
     private var guardPatterns: [String] = []
+    private var readyToken: UUID?
     private var readyWaiter: CheckedContinuation<Void, Error>?
     private var readyTimer: Task<Void, Never>?
     private var syncTimer: Task<Void, Never>?
@@ -1274,6 +1289,7 @@ final class CollabSession {
         self.transport = transport
         self.defaultRole = defaultRole
         self.service = service
+        self.app = service.app
         self.me = me
         myName = name
         id = NibID.make().raw
@@ -1301,6 +1317,7 @@ final class CollabSession {
         self.transport = transport
         defaultRole = .edit
         self.service = service
+        self.app = service.app
         self.me = me
         myName = name
         self.secret = secret
@@ -1319,7 +1336,7 @@ final class CollabSession {
     var sessionFormat: Int { CollabGate.effectiveFormat(roster) }
 
     /// The newest Nib in the session: only participants at this format edit (S-100).
-    var newestFormat: Int { CollabGate.newestFormat(host: service.formatVersion, participants: roster) }
+    var newestFormat: Int { CollabGate.newestFormat(host: service?.formatVersion ?? NibFormat.version, participants: roster) }
 
     var isConnectedToHost: Bool {
         guard let h = hostPeer else { return false }
@@ -1344,9 +1361,23 @@ final class CollabSession {
                        hint: "call collab.participants for participant ids")
     }
 
+    deinit {
+        readyTimer?.cancel()
+        syncTimer?.cancel()
+        for task in catchUps.values { task.cancel() }
+        for task in workProgress.values { task.cancel() }
+        for task in pendingOutbox.values { task.cancel() }
+        for task in backgroundWork.values { task.cancel() }
+        commitSubscription?.cancel()
+        eventSubscription?.cancel()
+        if let registryObserver { NotificationCenter.default.removeObserver(registryObserver) }
+        readyWaiter?.resume(throwing: CancellationError())
+    }
+
     // MARK: Lifecycle
 
     func install() {
+        guard let app else { return }
         transport.onMessage = { [weak self] peer, data in self?.receive(data, from: peer) }
         transport.onPeersChanged = { [weak self] peers in self?.peersChanged(peers) }
         commitSubscription = app.bus.observeCommits { [weak self] cs in self?.committed(cs) }
@@ -1359,7 +1390,7 @@ final class CollabSession {
                                                                   queue: nil) { [weak self] _ in
             CollabSession.onMain { self?.refreshViewGuard() }
         }
-        service.hooks.presenceSender = { [weak self] payload, to in self?.sendPresence(payload, to: to) ?? false }
+        service?.hooks.presenceSender = { [weak self] payload, to in self?.sendPresence(payload, to: to) ?? false }
     }
 
     /// Joins as a guest: connect, say hello, and wait until the host admits us and the document is here.
@@ -1369,12 +1400,13 @@ final class CollabSession {
         phase = .connecting
         changed()
         try await transport.join(code: code, displayName: myName)
-        guard !isClosed else { throw NibError(.userDenied, String(localized: "You stopped joining.")) }
+        guard !isClosed, service?.app != nil, !Task.isCancelled else { throw NibError(.userDenied, String(localized: "You stopped joining.")) }
         let hello = helloMessage()
-        try await waitUntilReady(timeout: service.timing.approvalTimeout) { _ = transmit(hello, to: nil) }
+        try await waitUntilReady(timeout: (service?.timing.approvalTimeout ?? 0)) { _ = transmit(hello, to: nil) }
     }
 
     private func beginJoin() throws {
+        guard service?.app != nil, !isClosed else { throw CancellationError() }
         guard !joinInProgress else {
             throw NibError(.conflict, String(localized: "Joining this live session is already in progress. Wait for it to finish."))
         }
@@ -1393,9 +1425,9 @@ final class CollabSession {
         hostPeer = nil
         changed()
         try await transport.join(code: code, displayName: myName)
-        guard !isClosed else { throw NibError(.userDenied, String(localized: "You left the live session.")) }
+        guard !isClosed, service?.app != nil, !Task.isCancelled else { throw NibError(.userDenied, String(localized: "You left the live session.")) }
         let hello = helloMessage()
-        try await waitUntilReady(timeout: service.timing.rejoinTimeout) { _ = transmit(hello, to: nil) }
+        try await waitUntilReady(timeout: (service?.timing.rejoinTimeout ?? 0)) { _ = transmit(hello, to: nil) }
     }
 
     /// The host advertises again after its connection dropped; admitted guests re-join with their secrets.
@@ -1407,6 +1439,7 @@ final class CollabSession {
         }
         cancelOutbox()
         try await transport.host(code: code, displayName: myName)
+        guard !isClosed, app != nil, !Task.isCancelled else { return }
         rosterChanged()
     }
 
@@ -1445,15 +1478,17 @@ final class CollabSession {
         registryObserver = nil
         removeViewGuard()
         restoreReadOnlyWindows()
-        service.hooks.presenceSender = nil
+        service?.hooks.presenceSender = nil
         cancelOutbox()
+        for task in backgroundWork.values { task.cancel() }
+        backgroundWork = [:]
         for (_, out) in deliveries {
             if case let .blob(_, url) = out { try? FileManager.default.removeItem(at: url) }
         }
         deliveries.removeAll()
         assembler.reset()
         resolveReady(error ?? NibError(.unavailable, reason ?? String(localized: "The live session ended.")))
-        service.sessionDidEnd(self, reason: reason)
+        service?.sessionDidEnd(self, reason: reason)
     }
 
     // MARK: Host actions (collab.approve / setRole / revoke)
@@ -1466,14 +1501,14 @@ final class CollabSession {
             throw NibError(.conflict, String(localized: "\(p.name) is already in the live session."),
                            hint: "call collab.participants")
         }
-        service.notifier.clear(participant: pid)
+        service?.notifier.clear(participant: pid)
         if allow {
             participants[pid]?.state = .active
             secrets[pid] = CollabSession.makeSecret()
             regate()
             sendWelcome(pid)
             rosterChanged()
-            service.notice(String(localized: "\(p.name) joined the live session."))
+            service?.notice(String(localized: "\(p.name) joined the live session."))
             return participants[pid]
         }
         if let peer = peerOf[pid] {
@@ -1520,7 +1555,7 @@ final class CollabSession {
         removed.insert(pid)
         drop(pid)
         rosterChanged()
-        service.notice(String(localized: "\(p.name) was removed from the live session."))
+        service?.notice(String(localized: "\(p.name) was removed from the live session."))
         return p
     }
 
@@ -1529,7 +1564,7 @@ final class CollabSession {
             throw NibError(.permissionDenied, String(localized: "Only the host of the live session can do that."),
                            hint: "call collab.participants to see who hosts")
         }
-        guard !isClosed else { throw NibError(.notFound, String(localized: "The live session has ended.")) }
+        guard !isClosed, service?.app != nil, !Task.isCancelled else { throw NibError(.notFound, String(localized: "The live session has ended.")) }
     }
 
     // MARK: Presence (F108)
@@ -1554,7 +1589,7 @@ final class CollabSession {
     // MARK: Receiving
 
     private func receive(_ data: Data, from peer: CollabPeer) {
-        guard !isClosed else { return }
+        guard !isClosed, service != nil, app != nil else { return }
         // The synchronization deadline measures peer silence only: EVERY frame from the host
         // resets it, including incomplete messages, blobs, unknown kinds and progress frames.
         // Local reads/sends never reset it. Expired attempts reject their eventual replies below.
@@ -1683,7 +1718,7 @@ final class CollabSession {
             rosterChanged()
         case .presence:
             guard p.state == .active, let payload = m.payload else { return }
-            if m.to == nil || m.to == me { service.hooks.publish(.presence(participant: pid, payload: payload)) }
+            if m.to == nil || m.to == me { service?.hooks.publish(.presence(participant: pid, payload: payload)) }
             if let target = m.to {
                 if target != me, participants[target]?.state == .active { _ = send(m, to: target) }
             } else {
@@ -1693,7 +1728,7 @@ final class CollabSession {
             secrets[pid] = nil
             drop(pid)
             rosterChanged()
-            service.notice(String(localized: "\(p.name) left the live session."))
+            service?.notice(String(localized: "\(p.name) left the live session."))
         default:
             return
         }
@@ -1742,7 +1777,7 @@ final class CollabSession {
             _ = send(CollabMessage(kind: .pending, session: id, from: me), to: pid)
             if asksAgain {
                 rosterChanged()
-                if let p = participants[pid] { service.joinRequested(p, title: title) }
+                if let p = participants[pid] { service?.joinRequested(p, title: title) }
             } else {
                 changed()
             }
@@ -1760,7 +1795,7 @@ final class CollabSession {
         regate()
         _ = send(CollabMessage(kind: .pending, session: id, from: me), to: pid)
         changed()
-        if let p = participants[pid] { service.joinRequested(p, title: title) }
+        if let p = participants[pid] { service?.joinRequested(p, title: title) }
     }
 
     private func guestHandle(_ m: CollabMessage, from peer: CollabPeer) {
@@ -1798,7 +1833,7 @@ final class CollabSession {
                 if let reason = m.reason {
                     catchUps[.host]?.cancel()
                     hasUnsentChanges = true
-                    service.notice(reason)
+                    service?.notice(reason)
                     resolveReady(NibError(.unavailable, reason))
                     return
                 }
@@ -1814,7 +1849,7 @@ final class CollabSession {
                 receiveSnapshot(s, blob: nil, file: nil)
             case .presence:
                 guard phase == .active, let payload = m.payload else { return }
-                service.hooks.publish(.presence(participant: m.from, payload: payload))
+                service?.hooks.publish(.presence(participant: m.from, payload: payload))
             case .revoked:
                 let reason = m.reason ?? String(localized: "The host removed you from the live session.")
                 end(reason: reason, notify: false, error: NibError(.userDenied, reason))
@@ -1844,9 +1879,9 @@ final class CollabSession {
         secret = w.secret
         documentFormat = w.documentFormat
         setRoster(roster)
-        if let local = localDoc ?? service.localDocument(for: w.doc) {
+        if let local = localDoc ?? service?.localDocument(for: w.doc) {
             // A locked copy is never sent, nor merged into: this device stays out of the session.
-            if service.isLocked(local) {
+            if service?.isLocked(local) != false {
                 let reason = String(localized: "Your copy of “\(w.title)” is locked. Remove the password lock to join the live session.")
                 end(reason: reason, notify: true, error: NibError(.locked, reason, hint: "remove the password lock first"))
                 return
@@ -1863,11 +1898,12 @@ final class CollabSession {
     /// Admitted and the document is here: enforce the role, then catch up both ways (the host answers our digest with
     /// what we lack plus its own digest; we then send what it lacks).
     private func becomeActive() {
+        guard let app else { return }
         guard let doc = localDoc, !isClosed, ensureUnlocked() else { return }
         _ = try? app.workspace.content(doc)
         phase = .active
         applyRoleLocally()
-        service.didBecomeActive(self)
+        service?.didBecomeActive(self)
         changed()
         startCatchUp(to: .host, against: nil, kind: .sync)
         reportPage()
@@ -1877,7 +1913,7 @@ final class CollabSession {
         let host = hostID ?? ""
         let exchange = synchronizationID
         holds += 1
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else {
                 if let file { try? FileManager.default.removeItem(at: file) }
                 return
@@ -1890,7 +1926,11 @@ final class CollabSession {
             }
             let progress = self.startWorkProgress(to: .host, syncID: exchange)
             defer { self.stopWorkProgress(progress, to: .host) }
-            let service = self.service
+            guard let service = self.service, service.app != nil else {
+                if let file { try? FileManager.default.removeItem(at: file) }
+                self.holds -= 1
+                return
+            }
             let result: Result<DocumentID, Error>
             do {
                 result = .success(try await service.importSnapshot(s, blob: blob, file: file, author: host))
@@ -1917,6 +1957,7 @@ final class CollabSession {
             }
             self.drain()
         }
+        track(task)
     }
 
     // MARK: Files
@@ -1924,8 +1965,9 @@ final class CollabSession {
     /// Stores a received file after checking it is exactly what was announced, and (host) passes it on to everyone
     /// else who lacks it.
     private func storeAsset(_ m: CollabMessage, file: URL, from peer: CollabPeer) {
+        guard let app else { try? FileManager.default.removeItem(at: file); return }
         let fm = FileManager.default
-        guard let doc = localDoc, let name = m.asset?.name, let blob = m.blob, !service.isLocked(doc),
+        guard let doc = localDoc, let name = m.asset?.name, let blob = m.blob, service?.isLocked(doc) == false,
               senderMaySendFiles(m, peer: peer) else {
             try? fm.removeItem(at: file)
             return
@@ -1947,19 +1989,23 @@ final class CollabSession {
         let author = m.from
         let target = destination
         holds += 1
-        Task { [weak self] in
-            let stored = await Task.detached(priority: .userInitiated) {
-                CollabSession.store(file: file, blob: blob, name: name, destination: target, assets: assets, doc: doc)
-            }.value
+        let task = Task { [weak self] in
+            defer { try? FileManager.default.removeItem(at: file) }
+            let stored = try? await CollabWork.value(of: Task.detached(priority: .userInitiated) { () throws -> Bool in
+                try Task.checkCancellation()
+                return CollabSession.store(file: file, blob: blob, name: name, destination: target, assets: assets, doc: doc)
+            })
             guard let self = self else { return }
             self.holds -= 1
-            if stored {
+            guard !Task.isCancelled, !self.isClosed, self.app != nil else { return }
+            if stored == true {
                 self.fileArrived(name, from: author)
             } else {
                 self.log.error("collab: refused a file that didn't match its name: \(name, privacy: .public)")
             }
             self.drain()
         }
+        track(task)
     }
 
     private func senderMaySendFiles(_ m: CollabMessage, peer: CollabPeer) -> Bool {
@@ -2047,6 +2093,7 @@ final class CollabSession {
 
     /// The file behind `name` when this device has it.
     private func localFile(_ name: String, doc: DocumentID) -> URL? {
+        guard let app else { return nil }
         let fm = FileManager.default
         if CollabAssets.isPackageFile(name) {
             guard let url = try? app.workspace.persistence.fileURL(doc, relativePath: name),
@@ -2092,7 +2139,7 @@ final class CollabSession {
         participants[pid] = nil
         chosenRoles[pid] = nil
         order.removeAll { $0 == pid }
-        service.notifier.clear(participant: pid)
+        service?.notifier.clear(participant: pid)
         regate()
     }
 
@@ -2135,6 +2182,7 @@ final class CollabSession {
 
     /// The zipped package when the library keeps one on disk (streamed as a blob), else the document's records.
     private func sendSnapshot(to pid: String, syncID: String?) {
+        guard let app else { return }
         guard let doc = localDoc else { return }
         let route = Route.participant(pid)
         reportSyncProgress(to: route, syncID: syncID)
@@ -2153,7 +2201,10 @@ final class CollabSession {
                     await previous?.value
                     guard !Task.isCancelled, !self.isClosed else { return }
                     do {
-                        let zipped = try await Task.detached(priority: .userInitiated) { try CollabPackageIO.zipFile(url) }.value
+                        let zipped = try await CollabWork.value(of: Task.detached(priority: .userInitiated) {
+                            try Task.checkCancellation()
+                            return try CollabPackageIO.zipFile(url)
+                        })
                         let scratch = zipped.deletingLastPathComponent()
                         guard !Task.isCancelled, !self.isClosed else {
                             try? FileManager.default.removeItem(at: scratch)
@@ -2209,7 +2260,7 @@ final class CollabSession {
 
     private func helloMessage() -> CollabMessage {
         CollabMessage(kind: .hello, session: id, from: me,
-                      hello: CollabMessage.Hello(name: myName, format: service.formatVersion,
+                      hello: CollabMessage.Hello(name: myName, format: service?.formatVersion ?? NibFormat.version,
                                                  protocolVersion: CollabMessage.protocolVersion, secret: secret))
     }
 
@@ -2228,11 +2279,11 @@ final class CollabSession {
             if wasActive {
                 applyRoleLocally()
                 if myRole == .edit {
-                    service.notice(String(localized: "You can now edit this document."))
+                    service?.notice(String(localized: "You can now edit this document."))
                 } else if mine.needsUpdate {
-                    service.notice(String(localized: "Someone joined with a newer Nib, so you can view this document until you update."))
+                    service?.notice(String(localized: "Someone joined with a newer Nib, so you can view this document until you update."))
                 } else {
-                    service.notice(String(localized: "You can now view this document, not edit it."))
+                    service?.notice(String(localized: "You can now view this document, not edit it."))
                 }
             }
         }
@@ -2253,7 +2304,7 @@ final class CollabSession {
         case .active:
             phase = .reconnecting
             changed()
-            service.scheduleRejoin()
+            service?.scheduleRejoin()
         case .waiting, .receiving, .connecting:
             let reason = String(localized: "Lost the connection to the host.")
             end(reason: reason, notify: false, error: NibError(.unavailable, reason))
@@ -2277,7 +2328,7 @@ final class CollabSession {
                     participants[pid] = nil
                     chosenRoles[pid] = nil
                     order.removeAll { $0 == pid }
-                    service.notifier.clear(participant: pid)
+                    service?.notifier.clear(participant: pid)
                 } else {
                     participants[pid]?.state = .away
                 }
@@ -2293,6 +2344,7 @@ final class CollabSession {
     /// Locked documents are never sent nor merged into: a lock on the shared copy (set now, or already there) ends
     /// the host's session, or takes a guest out of it. False when the session ended for that reason.
     private func ensureUnlocked() -> Bool {
+        guard let service, service.app != nil else { end(reason: nil, notify: false); return false }
         guard let doc = localDoc, service.isLocked(doc) else { return true }
         let reason = side == .host ? String(localized: "The document was locked, so the live session ended.")
                                    : String(localized: "Your copy is locked, so you left the live session.")
@@ -2340,6 +2392,7 @@ final class CollabSession {
     }
 
     private func applyRemote(_ patch: DocumentPatch, author: String) {
+        guard let app else { return }
         guard let doc = localDoc, ensureUnlocked() else { return }
         // A collaborator's patch must land even when no window shows the document.
         _ = try? app.workspace.content(doc)
@@ -2362,7 +2415,7 @@ final class CollabSession {
         }
         let summary = app.bus.applyRemote(local, origin: CollabSession.originPrefix + author)
         guard !summary.isEmpty else { return }
-        service.hooks.publish(.remoteChanges(participant: author, doc: doc, summary: summary, pages: pages))
+        service?.hooks.publish(.remoteChanges(participant: author, doc: doc, summary: summary, pages: pages))
     }
 
     /// The page this device looks at, reported to everyone ("Participants with names, pages and roles").
@@ -2373,6 +2426,7 @@ final class CollabSession {
     }
 
     private func reportPage() {
+        guard let app else { return }
         guard phase == .active, let doc = localDoc, let remote = remoteDoc else { return }
         let active = app.services.sessions.active
         let page = active?.document == doc ? active?.page.map { NodeRef.page(remote, $0).description } : nil
@@ -2421,7 +2475,7 @@ final class CollabSession {
                     let reason = String(localized: "Couldn't catch up shared changes. Reconnect to retry. \(message)")
                     if self.side == .guest {
                         self.hasUnsentChanges = true
-                        self.service.notice(reason)
+                        self.service?.notice(reason)
                         self.resolveReady(error)
                     } else {
                         self.log.error("collab: catch-up failed: \(message, privacy: .public)")
@@ -2438,6 +2492,7 @@ final class CollabSession {
 
     private func catchUp(to route: Route, against other: CollabDigest?, kind: CollabMessage.Kind,
                          syncID: String?, allowChanged: Bool) async throws {
+        guard let workspace = app?.workspace else { throw CancellationError() }
         guard let doc = localDoc, let remote = remoteDoc, ensureUnlocked() else { return }
         if kind == .patch, side == .guest, myRole != .edit { resolveReady(nil); return }
         let failures = sendFailures[route, default: 0]
@@ -2453,7 +2508,7 @@ final class CollabSession {
         try CollabCatchUp.check(current)
         let progress = startWorkProgress(to: route, syncID: syncID)
         defer { stopWorkProgress(progress, to: route) }
-        var state = try await CollabCatchUp.scan(doc, workspace: app.workspace, isCurrent: current,
+        var state = try await CollabCatchUp.scan(doc, workspace: workspace, isCurrent: current,
                                                progress: { self.reportSyncProgress(to: route, syncID: syncID) })
         state.digest.assets = heldFiles(state.names, doc: doc)
         var sent = Set<PageID>()
@@ -2468,7 +2523,7 @@ final class CollabSession {
             for page in state.content.pages {
                 try CollabCatchUp.check(current)
                 if state.needsPage(page.id, against: other) {
-                    let patch = try state.pageDelta(page.id, doc: doc, workspace: app.workspace,
+                    let patch = try state.pageDelta(page.id, doc: doc, workspace: workspace,
                                                     against: other, allowChanged: allowChanged)
                     if !patch.isEmpty {
                         try await sendCatchUpPatch(patch, remote: remote, to: route, syncID: syncID, isCurrent: current)
@@ -2481,7 +2536,7 @@ final class CollabSession {
         }
         // Sent pages were fingerprint-checked with their payload read. After two conflicts, finish
         // with LWW-safe current deltas/a possibly older digest; live commits travel independently.
-        try await state.validate(doc, workspace: app.workspace, isCurrent: current, excluding: sent,
+        try await state.validate(doc, workspace: workspace, isCurrent: current, excluding: sent,
                                  allowChanged: allowChanged,
                                  progress: { self.reportSyncProgress(to: route, syncID: syncID) })
         await outbox[route]?.value
@@ -2518,6 +2573,7 @@ final class CollabSession {
     /// Full content fallback for initial snapshots when no package exists. Reconnect catch-up uses
     /// CollabCatchUp instead, so it never materialises this whole-notebook dictionary.
     private func documentState(_ doc: DocumentID, progress: () -> Void) throws -> (content: DocumentContent, items: [PageID: [Item]]) {
+        guard let app else { throw CancellationError() }
         let content = try app.workspace.content(doc)
         let cached = app.workspace.cachedPages(doc)
         defer {
@@ -2532,7 +2588,7 @@ final class CollabSession {
     }
 
     private func changed() {
-        service.sessionChanged(self)
+        service?.sessionChanged(self)
     }
 
     // MARK: Sending
@@ -2590,6 +2646,7 @@ final class CollabSession {
     }
 
     private func peers(for route: Route) -> [CollabPeer]? {
+        guard service != nil, app != nil else { return nil }
         switch route {
         case .host: return hostPeer.map { [$0] }
         case .participant(let pid): return peerOf[pid].map { [$0] }
@@ -2671,6 +2728,15 @@ final class CollabSession {
         }
     }
 
+    private func track(_ task: Task<Void, Never>) {
+        let token = UUID()
+        backgroundWork[token] = task
+        Task { [weak self] in
+            await task.value
+            self?.backgroundWork[token] = nil
+        }
+    }
+
     private func cancelOutbox() {
         for task in workProgress.values { task.cancel() }
         workProgress = [:]
@@ -2723,7 +2789,10 @@ final class CollabSession {
         guard !isClosed, let first = peers(for: route) else { return false }
         let prepared: (url: URL, scratch: URL?, bytes: Int, sha256: String)
         do {
-            prepared = try await Task.detached(priority: .utility) { try CollabBlobIO.prepare(source, copy: copy) }.value
+            prepared = try await CollabWork.value(of: Task.detached(priority: .utility) {
+                try Task.checkCancellation()
+                return try CollabBlobIO.prepare(source, copy: copy)
+            })
         } catch {
             log.error("collab: couldn't read a file to send: \(NibError.wrap(error).message, privacy: .public)")
             return false
@@ -2748,9 +2817,10 @@ final class CollabSession {
             let bytes = prepared.bytes
             let frames: [Data]
             do {
-                frames = try await Task.detached(priority: .utility) {
-                    try CollabBlobIO.frames(file: file, id: blobID, parts: range, count: count, bytes: bytes)
-                }.value
+                frames = try await CollabWork.value(of: Task.detached(priority: .utility) {
+                    try Task.checkCancellation()
+                    return try CollabBlobIO.frames(file: file, id: blobID, parts: range, count: count, bytes: bytes)
+                })
             } catch {
                 log.error("collab: couldn't read a file to send: \(NibError.wrap(error).message, privacy: .public)")
                 return false
@@ -2768,7 +2838,7 @@ final class CollabSession {
         guard !isClosed, !Task.isCancelled, let targets = peers(for: route),
               targets.allSatisfy({ isConnected($0) }) else { return }
         let now = Date()
-        let interval = max(service.timing.syncProgressInterval, 0.001)
+        let interval = max((service?.timing.syncProgressInterval ?? 5), 0.001)
         if let last = progressSentAt[route], now.timeIntervalSince(last) < interval { return }
         progressSentAt[route] = now
         // Do not queue heartbeats behind a large transfer or accumulate them on a busy relay.
@@ -2784,7 +2854,7 @@ final class CollabSession {
     private func startWorkProgress(to route: Route, syncID: String?) -> Task<Void, Never> {
         workProgress[route]?.cancel()
         reportSyncProgress(to: route, syncID: syncID)
-        let interval = max(service.timing.syncProgressInterval, 0.001)
+        let interval = max((service?.timing.syncProgressInterval ?? 5), 0.001)
         let task = Task { [weak self] in
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000)) }
@@ -2805,7 +2875,7 @@ final class CollabSession {
     private func startSyncDeadline() {
         syncTimer?.cancel()
         syncProgressAt = Date()
-        let timeout = max(service.timing.syncIdleTimeout, 0.001)
+        let timeout = max((service?.timing.syncIdleTimeout ?? 60), 0.001)
         syncTimer = Task { [weak self] in
             var remaining = timeout
             while !Task.isCancelled {
@@ -2823,16 +2893,26 @@ final class CollabSession {
     }
 
     private func waitUntilReady(timeout: TimeInterval, after start: () -> Void) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            readyWaiter?.resume(throwing: NibError(.conflict, String(localized: "Joining started again.")))
-            readyWaiter = continuation
-            readyTimer?.cancel()
-            readyTimer = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                self?.timedOut()
+        let token = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                readyWaiter?.resume(throwing: NibError(.conflict, String(localized: "Joining started again.")))
+                readyWaiter = continuation
+                readyToken = token
+                readyTimer?.cancel()
+                readyTimer = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000)) }
+                    catch { return }
+                    self?.timedOut()
+                }
+                start()
             }
-            start()
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.readyToken == token else { return }
+                self.resolveReady(CancellationError())
+            }
         }
     }
 
@@ -2860,6 +2940,7 @@ final class CollabSession {
             if let peer = hostPeer { assembler.forget(peer: peer.id) }
         }
         readyWaiter = nil
+        readyToken = nil
         if let error = error {
             waiter.resume(throwing: error)
         } else {
@@ -2883,6 +2964,7 @@ final class CollabSession {
     /// A command hook over every namespace (refreshed when commands are registered) that vetoes document edits of the
     /// shared copy from any caller while this device may only view it.
     private func refreshViewGuard() {
+        guard let app else { return }
         guard !isClosed, side == .guest, myRole == .view, localDoc != nil else {
             removeViewGuard()
             return
@@ -2901,12 +2983,14 @@ final class CollabSession {
     }
 
     private func removeViewGuard() {
+        guard let app else { return }
         guard app.bus.hooks.get(CollabSession.viewGuardID) != nil else { return }
         app.bus.hooks.unregister(id: CollabSession.viewGuardID)
         guardPatterns = []
     }
 
     private func vetoIfViewOnly(command: String, params: JSONValue, ctx: CommandContext) throws {
+        guard let app else { return }
         guard !isClosed, side == .guest, myRole == .view, let doc = localDoc else { return }
         let window = ctx.activeSession
         if command == CommandIDs.viewSetReadOnly, window?.document == doc {
@@ -2924,6 +3008,7 @@ final class CollabSession {
 
     /// Windows showing the shared copy enter read-only mode (F042's `view.setReadOnly` when installed).
     private func setReadOnlyWindows() {
+        guard let app else { return }
         guard let doc = localDoc else { return }
         for s in app.services.sessions.sessions where s.document == doc && !s.readOnly && !readOnlySessions.contains(s.id) {
             readOnlySessions.append(s.id)
@@ -2932,6 +3017,7 @@ final class CollabSession {
     }
 
     private func restoreReadOnlyWindows() {
+        guard let app else { return }
         let ids = readOnlySessions
         readOnlySessions = []
         for id in ids {
@@ -2941,6 +3027,7 @@ final class CollabSession {
     }
 
     private func setReadOnly(_ s: EditorSession, _ on: Bool) {
+        guard let app else { return }
         guard app.commands.entry(CommandIDs.viewSetReadOnly) != nil else {
             s.readOnly = on
             return
@@ -3048,7 +3135,7 @@ final class CollabService: ObservableObject {
 
     static func of(_ app: NibApp) -> CollabService? { app.services.get(serviceKey, as: CollabService.self) }
 
-    unowned let app: NibApp
+    weak var app: NibApp?
     let hooks: CollabHooks
     var notifier: CollabNotifier
     var timing = CollabTiming()
@@ -3057,6 +3144,7 @@ final class CollabService: ObservableObject {
     @Published private(set) var state = CollabState()
     private(set) var session: CollabSession?
     private var rejoinTask: Task<Void, Never>?
+    private var toastTask: Task<Void, Never>?
     private var backgroundedAt: Date?
     private var lifecycle: [NSObjectProtocol] = []
     private let log = Logger(subsystem: "app.nib", category: "collab")
@@ -3067,17 +3155,26 @@ final class CollabService: ObservableObject {
         self.notifier = notifier
     }
 
+    deinit {
+        rejoinTask?.cancel()
+        toastTask?.cancel()
+        for observer in lifecycle { NotificationCenter.default.removeObserver(observer) }
+        // Deinit may run off the main actor. Keep only the session alive until its teardown runs.
+        let abandoned = session
+        Task { @MainActor in abandoned?.end(reason: nil, notify: false) }
+    }
+
     /// This device's participant id.
-    var myID: String { app.deviceHex }
+    var myID: String { app?.deviceHex ?? "" }
 
     /// The author name (Settings › Profile), else the device's name.
     var myName: String {
-        let name = app.settings.get(NibSettings.authorName).trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = app?.settings.get(NibSettings.authorName).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return CollabSession.cleanName(name.isEmpty ? UIDevice.current.name : name)
     }
 
     /// True when the internet relay (F092) is installed.
-    var relayAvailable: Bool { app.services.get(ServiceKeys.collabRelay, as: CollabTransport.self) != nil }
+    var relayAvailable: Bool { app?.services.get(ServiceKeys.collabRelay, as: CollabTransport.self) != nil }
 
     /// Most people a session over `key` takes, the host included (8 nearby, the relay's own cap).
     func capacity(_ key: String) -> Int {
@@ -3095,7 +3192,7 @@ final class CollabService: ObservableObject {
         default:
             throw NibError(.invalidParams, "unknown transport '\(name)'", path: "$.transport", hint: "use multipeer or relay")
         }
-        guard let transport = app.services.get(serviceKey, as: CollabTransport.self) else {
+        guard let transport = app?.services.get(serviceKey, as: CollabTransport.self) else {
             if serviceKey == ServiceKeys.collabRelay {
                 throw NibError(.unavailable, String(localized: "The internet relay isn't set up."),
                                hint: "set the relay URL with relay.configure and enter its token in Settings")
@@ -3108,13 +3205,14 @@ final class CollabService: ObservableObject {
     /// True when `doc` carries a password lock (or is locked in this app session): it is never hosted, sent or merged
     /// into live.
     func isLocked(_ doc: DocumentID) -> Bool {
-        if (try? app.workspace.peekContent(doc))?.meta.locked == true { return true }
-        return app.services.lock?.isLocked(doc) ?? false
+        if (try? app?.workspace.peekContent(doc))?.meta.locked == true { return true }
+        return app?.services.lock?.isLocked(doc) ?? false
     }
 
     // MARK: Host and join
 
     func host(doc: DocumentID, transportKey: String?, role: CollabRole) async throws -> CollabSession {
+        guard let app else { throw CancellationError() }
         if let s = session, !s.isClosed {
             if s.side == .host, s.localDoc == doc { return s }
             throw NibError(.conflict, String(localized: "Another live session is running. Leave it before starting a new one."),
@@ -3218,75 +3316,95 @@ final class CollabService: ObservableObject {
     /// Back in the foreground: a guest whose host is gone re-joins with the same code and catches up; a host whose
     /// connection dropped advertises again.
     func resumeAfterSuspend() async {
-        let away = backgroundedAt.map { Date().timeIntervalSince($0) } ?? 0
-        backgroundedAt = nil
-        guard let s = session, !s.isClosed else { return }
-        switch s.side {
-        case .guest:
-            guard !s.joinInProgress else { return }
-            guard s.phase == .reconnecting || s.synchronizationPending || !s.isConnectedToHost || away >= timing.suspendThreshold else { return }
-            rejoinTask?.cancel()
-            rejoinTask = nil
-            s.markReconnecting()
-            await runRejoin([0] + timing.retryDelays)
-        case .host:
-            guard away >= timing.suspendThreshold || (s.transport.peers.isEmpty && s.hasAdmittedGuests) else { return }
-            rejoinTask?.cancel()
-            let task = Task<Void, Never> { [weak self] in
-                await self?.runRehost(s, delays: [0] + (self?.timing.retryDelays ?? []))
-            }
-            rejoinTask = task
-            await task.value
-            if rejoinTask == task { rejoinTask = nil }
-        }
+        guard let task = startResumeAfterSuspend() else { return }
+        await task.value
+        if rejoinTask == task { rejoinTask = nil }
     }
 
-    private func runRehost(_ s: CollabSession, delays: [TimeInterval]) async {
-        var lastError: NibError?
-        for delay in delays {
-            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
-            guard !Task.isCancelled, session === s, !s.isClosed else { return }
-            do {
-                try await s.rehost()
-                return
-            } catch {
-                lastError = NibError.wrap(error)
-            }
+    @discardableResult
+    private func startResumeAfterSuspend() -> Task<Void, Never>? {
+        let away = backgroundedAt.map { Date().timeIntervalSince($0) } ?? 0
+        backgroundedAt = nil
+        guard app != nil, let s = session, !s.isClosed else { return nil }
+        let task: Task<Void, Never>
+        switch s.side {
+        case .guest:
+            guard !s.joinInProgress else { return nil }
+            guard s.phase == .reconnecting || s.synchronizationPending || !s.isConnectedToHost || away >= timing.suspendThreshold else { return nil }
+            rejoinTask?.cancel()
+            s.markReconnecting()
+            task = makeRejoinTask([0] + timing.retryDelays)
+        case .host:
+            guard away >= timing.suspendThreshold || (s.transport.peers.isEmpty && s.hasAdmittedGuests) else { return nil }
+            rejoinTask?.cancel()
+            task = makeRehostTask(s, delays: [0] + timing.retryDelays)
         }
-        guard !Task.isCancelled, session === s, !s.isClosed, let error = lastError else { return }
-        s.end(reason: String(localized: "The live session couldn't restart: \(error.message)"), notify: false)
+        rejoinTask = task
+        return task
+    }
+
+    private func makeRehostTask(_ s: CollabSession, delays: [TimeInterval]) -> Task<Void, Never> {
+        Task { [weak self] in
+            defer { if !Task.isCancelled { self?.rejoinTask = nil } }
+            var lastError: NibError?
+            for delay in delays {
+                if delay > 0 {
+                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                    catch { return }
+                }
+                guard !Task.isCancelled, self?.app != nil, self?.session === s, !s.isClosed else { return }
+                do {
+                    try await s.rehost()
+                    return
+                } catch {
+                    lastError = NibError.wrap(error)
+                }
+            }
+            guard !Task.isCancelled, self?.app != nil, self?.session === s, !s.isClosed, let error = lastError else { return }
+            s.end(reason: String(localized: "The live session couldn't restart: \(error.message)"), notify: false)
+        }
     }
 
     func scheduleRejoin() {
-        guard rejoinTask == nil, let s = session, s.side == .guest, !s.isClosed else { return }
-        let delays = timing.retryDelays
-        rejoinTask = Task { [weak self] in
-            await self?.runRejoin(delays)
-            self?.rejoinTask = nil
+        guard rejoinTask == nil, app != nil, let s = session, s.side == .guest, !s.isClosed else { return }
+        rejoinTask = makeRejoinTask(timing.retryDelays)
+    }
+
+    /// The retry loop owns the attempt, never its service/app across a sleep or a transport await.
+    private func makeRejoinTask(_ delays: [TimeInterval]) -> Task<Void, Never> {
+        Task { [weak self] in
+            defer { if !Task.isCancelled { self?.rejoinTask = nil } }
+            for delay in delays {
+                if delay > 0 {
+                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+                    catch { return }
+                }
+                guard !Task.isCancelled, self?.app != nil, let s = self?.session,
+                      s.side == .guest, !s.isClosed else { return }
+                if s.joinInProgress || (s.phase == .active && s.isConnectedToHost && !s.synchronizationPending) { return }
+                do {
+                    try await s.rejoin()
+                    return
+                } catch {
+                    guard !Task.isCancelled, let owner = self, owner.app != nil,
+                          owner.session === s, !s.isClosed else { return }
+                    let e = NibError.wrap(error)
+                    if e.code == .userDenied || e.code == .unsupported || e.code == .locked {
+                        s.end(reason: e.message, notify: false, error: e)
+                        return
+                    }
+                    owner.log.info("collab: re-join attempt failed: \(e.message, privacy: .public)")
+                }
+            }
+            guard !Task.isCancelled else { return }
+            await self?.rejoinExhausted()
         }
     }
 
-    /// Tries to re-join after each delay; when every attempt fails, the session ends (and folder sync takes over when
-    /// the copy is the same document).
-    private func runRejoin(_ delays: [TimeInterval]) async {
-        for delay in delays {
-            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
-            if Task.isCancelled { return }
-            guard let s = session, s.side == .guest, !s.isClosed else { return }
-            if s.joinInProgress || (s.phase == .active && s.isConnectedToHost && !s.synchronizationPending) { return }
-            do {
-                try await s.rejoin()
-                return
-            } catch let e as NibError where e.code == .userDenied || e.code == .unsupported || e.code == .locked {
-                if !s.isClosed { s.end(reason: e.message, notify: false, error: e) }
-                return
-            } catch {
-                log.info("collab: re-join attempt failed: \(NibError.wrap(error).message, privacy: .public)")
-            }
-        }
-        guard let s = session, s.side == .guest, !s.isClosed,
+    private func rejoinExhausted() async {
+        guard let app, let s = session, s.side == .guest, !s.isClosed,
               !(s.phase == .active && s.isConnectedToHost && !s.synchronizationPending) else { return }
-        // A folder-synced copy is the host's own document; a copy received into Shared is not synced with the host.
+        // A folder-synced copy is the host's own document; a received Shared copy is not folder-synced.
         let synced = s.localDoc != nil && s.localDoc == s.remoteDoc
         let reason = synced
             ? String(localized: "Couldn't reconnect to the live session. Your copy stays in the library, and changes arrive through folder sync.")
@@ -3307,8 +3425,7 @@ final class CollabService: ObservableObject {
         lifecycle.append(center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil,
                                             queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self = self else { return }
-                Task { await self.resumeAfterSuspend() }
+                self?.startResumeAfterSuspend()
             }
         })
     }
@@ -3333,18 +3450,20 @@ final class CollabService: ObservableObject {
     func joinRequested(_ p: CollabParticipant, title: String) {
         notifier.joinRequest(participant: p.id, name: p.name, title: title)
         // Document windows show the request HUD; a library window gets a toast with Approve.
-        if let navigator = app.ui.activeNavigator, navigator.activeDocument == nil {
+        if let navigator = app?.ui.activeNavigator, navigator.activeDocument == nil {
             let pid = p.id
             navigator.floatingHost?.postToast(String(localized: "\(p.name) wants to join “\(title)”."),
                                               actionTitle: String(localized: "Approve"),
                                               action: { [weak self] in self?.approveFromToast(pid) })
         }
-        app.events.emit(CollabSessionEventPayload(event: "request", participant: p.id, name: p.name), doc: session?.localDoc)
+        app?.events.emit(CollabSessionEventPayload(event: "request", participant: p.id, name: p.name), doc: session?.localDoc)
     }
 
     private func approveFromToast(_ participant: String) {
-        let app = self.app
-        Task { @MainActor [weak self] in
+        guard let app else { return }
+        toastTask?.cancel()
+        toastTask = Task { @MainActor [weak self, weak app] in
+            guard let app, !Task.isCancelled else { return }
             do {
                 _ = try await app.bus.execute(Invocation(command: CommandIDs.collabApprove,
                                                          params: ["participant": .string(participant), "allow": true],
@@ -3363,7 +3482,7 @@ final class CollabService: ObservableObject {
 
     /// A toast in the active window (P-090 in-app messages).
     func notice(_ message: String) {
-        app.ui.activeNavigator?.floatingHost?.postToast(message)
+        app?.ui.activeNavigator?.floatingHost?.postToast(message)
     }
 
     /// This library's copy of the host's document: a copy received earlier, or the same document (folder sync).
@@ -3373,14 +3492,15 @@ final class CollabService: ObservableObject {
     }
 
     private func exists(_ doc: DocumentID) -> Bool {
-        if let library = app.services.library {
+        if let library = app?.services.library {
             guard let node = library.node(doc) else { return false }
             return node.kind == .document && node.trashedAt == nil
         }
-        return (try? app.workspace.peekContent(doc)) != nil
+        return (try? app?.workspace.peekContent(doc)) != nil
     }
 
     func refresh() {
+        guard app != nil else { return }
         let info = session.map { $0.info }
         let roster = session?.roster ?? []
         let previous = state
@@ -3393,13 +3513,13 @@ final class CollabService: ObservableObject {
             let peopleChanged = previous.participants.map { "\($0.id):\($0.state.rawValue):\($0.role.rawValue)" }
                 != roster.map { "\($0.id):\($0.state.rawValue):\($0.role.rawValue)" }
             if phaseChanged || peopleChanged {
-                app.events.emit(CollabSessionEventPayload(event: "session",
+                app?.events.emit(CollabSessionEventPayload(event: "session",
                                                           phase: info?.phase.rawValue ?? CollabPhase.idle.rawValue,
                                                           participants: roster.count), doc: info?.doc)
             }
         }
         hooks.update(session: info, participants: roster)
-        app.ui.setNeedsChromeUpdate()
+        app?.ui.setNeedsChromeUpdate()
     }
 }
 
