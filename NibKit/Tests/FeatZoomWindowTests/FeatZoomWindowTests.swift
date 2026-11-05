@@ -1010,31 +1010,44 @@ final class FeatZoomWindowTests: XCTestCase {
         let root = UIViewController()
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
         window.rootViewController = root
+        window.makeKeyAndVisible()
+        root.view.layoutIfNeeded()
         root.view.addSubview(view)
         view.frame = root.view.bounds
-        window.makeKeyAndVisible()
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.layoutIfNeeded()
+        h.session.replay = ReplayState(time: 1, mode: .reveal)
         controller.paneAppeared()
         defer { controller.paneDisappeared(); overlay.detach(from: host); window.isHidden = true }
-        // Every tick is faster than the 40 ms render cadence. Check displayed images while
-        // publishing, not just renderer requests or a final frame after the publisher stops.
-        var previous: UIImage?
-        var displayedFrames = 0
-        for tick in 1...40 {
-            h.session.replay = ReplayState(time: Double(tick), mode: .reveal)
-            try await Task.sleep(nanoseconds: 10_000_000)
-            if let image = view.paper.image, image !== previous {
-                displayedFrames += 1
-                previous = image
+        func waitFor(_ message: String, _ condition: () -> Bool) async throws {
+            for _ in 0..<400 {
+                if condition() { return }
+                try await Task.sleep(nanoseconds: 5_000_000)
             }
-            if tick == 20 {
-                XCTAssertGreaterThan(displayedFrames, 0, "continuous replay must render before publishing stops")
+            XCTFail(message)
+        }
+
+        // Observe on the same run loop as the controller, after its subscription. A newer tick
+        // must be delivered while each render is held, before we let that render complete.
+        var deliveredTime: Double?
+        let delivery = h.session.$replay.receive(on: RunLoop.main).sink { deliveredTime = $0?.time }
+        defer { delivery.cancel() }
+        for index in 0..<3 {
+            try await waitFor("Replay render \(index) must start") { renderer.requests.count > index }
+            let frame = try XCTUnwrap(renderer.frame(at: index))
+            let nextTime = Double(index + 2)
+            h.session.replay = ReplayState(time: nextTime, mode: .reveal)
+            try await waitFor("Deliver the next replay tick during rendering") { deliveredTime == nextTime }
+            renderer.release(index)
+            try await waitFor("Display render \(index) even though a newer replay tick is pending") {
+                view.paper.image?.cgImage === frame
             }
         }
-        XCTAssertGreaterThan(displayedFrames, 1, "the pane must keep rendering throughout playback")
-        for _ in 0..<100 where renderer.requests.last?.replay?.time != 40 {
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        XCTAssertEqual(renderer.requests.last?.replay, h.session.replay, "the final dirty state must also render")
+        try await waitFor("The final dirty replay state must start rendering") { renderer.requests.count > 3 }
+        let finalFrame = try XCTUnwrap(renderer.frame(at: 3))
+        XCTAssertEqual(renderer.requests.last?.replay, h.session.replay)
+        renderer.release(3)
+        try await waitFor("The final dirty replay state must also be displayed") { view.paper.image?.cgImage === finalFrame }
     }
 
     func testHidingPaneFinishesCaptureBeforeClearingWetInk() async throws {
@@ -1391,22 +1404,35 @@ final class FeatZoomWindowTests: XCTestCase {
     }
 }
 
-/// A small delayed renderer makes replay ticks arrive during rendering as well as during its
-/// cadence delay. It records completed renders, and honours cancellation like a real renderer.
+/// Each render waits for an explicit test release, so replay arrives during rendering regardless
+/// of simulator speed. Unique images identify displayed frames, rather than sampling UIImage timing.
 private final class ReplayCadenceRenderer: PageRenderer {
     private let lock = NSLock()
-    private var completed: [RenderRequest] = []
-    private let image = FakeRenderer.blank(CGSize(width: 2, height: 2))
-    var requests: [RenderRequest] { lock.withLock { completed } }
+    private var started: [RenderRequest] = []
+    private var frames: [CGImage] = []
+    private var released: Set<Int> = []
+    var requests: [RenderRequest] { lock.withLock { started } }
+    func frame(at index: Int) -> CGImage? { lock.withLock { frames.indices.contains(index) ? frames[index] : nil } }
+    func release(_ index: Int) { _ = lock.withLock { released.insert(index) } }
 
     func render(_ request: RenderRequest) async throws -> RenderResult {
-        try await Task.sleep(nanoseconds: 15_000_000)
+        let image = FakeRenderer.blank(CGSize(width: 2, height: 2))
+        let index = lock.withLock {
+            let index = started.count
+            started.append(request)
+            frames.append(image)
+            return index
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while !lock.withLock({ released.contains(index) }) {
+            guard Date() < deadline else { throw NibError(.unavailable, "Replay test did not release render \(index)") }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
         try Task.checkCancellation()
-        lock.withLock { completed.append(request) }
         return RenderResult(image: image, region: request.region ?? .zero, scale: request.scale)
     }
 
-    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { nil }
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
 }
