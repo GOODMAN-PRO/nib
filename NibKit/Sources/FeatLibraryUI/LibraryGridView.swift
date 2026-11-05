@@ -583,18 +583,28 @@ struct LibraryListRow: View {
     var body: some View {
         HStack(spacing: NibSpacing.l) {
             if row.isFolder {
-                NibFolderGlyphView(glyph: row.folderGlyph, color: row.folderColor, size: NibMetrics.rowThumbnailWidth)
-                    .frame(width: NibMetrics.rowThumbnailWidth)
+                Group {
+                    switch row.folderGlyph {
+                    case .symbol(let symbol):
+                        Image(nib: symbol).resizable().scaledToFit()
+                            .foregroundStyle(row.folderColor)
+                    case .emoji(let emoji):
+                        NibFolderGlyphView(glyph: .emoji(emoji), color: row.folderColor,
+                                           size: NibMetrics.rowThumbnailWidth - NibSpacing.s)
+                    }
+                }
+                .frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
+                .accessibilityHidden(true)
             }
             else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
-                .nibElevation(.paper)
                 .libraryCoverFrame(row.ref) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label).lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
-                if !row.isFolder { Text(subtitle ?? row.subtitle()).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
-                    .lineLimit(nil).fixedSize(horizontal: false, vertical: true) }
+                Text(row.isFolder ? LibraryRow.itemCount(row.items ?? 0) : subtitle ?? row.subtitle())
+                    .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                    .lineLimit(nil).fixedSize(horizontal: false, vertical: true)
                 Text(Date(timeIntervalSince1970: row.modified ?? 0), style: .date).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             }
             Spacer()
