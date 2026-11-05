@@ -221,6 +221,56 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertEqual(ReorderPlan.apply(order, moving: ["B"], to: .before("C")), order, "dropped where it was lifted")
     }
 
+    func testDropProposalHonoursMovePermissionWithoutTurningReorderIntoCopy() {
+        let refused = PageDropKind.proposal(for: .reorder, canEdit: true, allowsMoveOperation: false)
+        XCTAssertEqual(refused.operation, .forbidden)
+        let move = PageDropKind.proposal(for: .reorder, canEdit: true, allowsMoveOperation: true)
+        XCTAssertEqual(move.operation, .move)
+        XCTAssertEqual(move.intent, .insertAtDestinationIndexPath)
+        for kind in [PageDropKind.pages, .files] {
+            let copy = PageDropKind.proposal(for: kind, canEdit: true, allowsMoveOperation: false)
+            XCTAssertEqual(copy.operation, .copy)
+            XCTAssertEqual(copy.intent, .insertAtDestinationIndexPath)
+        }
+        XCTAssertEqual(PageDropKind.proposal(for: nil, canEdit: true, allowsMoveOperation: true).operation, .forbidden)
+        XCTAssertEqual(PageDropKind.proposal(for: .reorder, canEdit: false, allowsMoveOperation: true).operation, .forbidden)
+    }
+
+    func testReorderPlanStackAtEndStartAndInsideItsOwnRange() {
+        let order: [PageID] = ["A", "B", "C", "D"]
+        // Touching the second selected page makes it the lead drag item. It must not reverse the block.
+        XCTAssertEqual(ReorderPlan.apply(order, moving: ["B", "A"], to: .end), ["C", "D", "A", "B"])
+        XCTAssertEqual(ReorderPlan.apply(order, moving: ["D", "C"], to: .before("A")), ["C", "D", "A", "B"])
+        for target in [PageDropTarget.before("B"), .after("B"), .before("C"), .after("C")] {
+            XCTAssertEqual(ReorderPlan.apply(order, moving: ["C", "B"], to: target), order)
+        }
+        XCTAssertEqual(ReorderPlan.stack(["D", "B", "D", "missing"], in: order), ["B", "D"],
+                       "Adding a second thumbnail keeps a unique live stack in document order")
+    }
+
+    func testStackDropRequestsOneCommandAtEitherEndAndNoneInsideItsRange() async throws {
+        for target in [PageDropTarget.end, .before(p1)] {
+            let h = harness()
+            let log = CallLog()
+            stub(h, [SidebarIDs.pageReorder], log)
+            let model = PagesPanelModel(app: h.app, session: h.session)
+            let pages = target == .end ? [p2, p1] : [p3, p2]
+            let request = try XCTUnwrap(model.beginReorder(pages, to: target))
+            XCTAssertEqual(request.stack, target == .end ? [p1, p2] : [p2, p3])
+            XCTAssertEqual(model.rows.map(\.id), target == .end ? [p3, p1, p2] : [p2, p3, p1])
+            await model.finishReorder(request)
+            XCTAssertEqual(log.calls.count, 1, "One page.reorder supplies one undo transaction for the entire block")
+            XCTAssertEqual(log.calls[0].params, request.target.reorderParams(request.stack, doc: doc))
+        }
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.pageReorder], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        XCTAssertNil(model.beginReorder([p2, p1], to: .before(p2)))
+        XCTAssertEqual(model.rows.map(\.id), [p1, p2, p3])
+        XCTAssertTrue(log.calls.isEmpty, "A drop inside the stack must not create an undo step")
+    }
+
     func testDropPlannerPicksTheGapNearestTheFinger() {
         func slot(_ id: PageID, x: CGFloat, y: CGFloat) -> PageDropPlanner.Slot {
             PageDropPlanner.Slot(page: id, frame: CGRect(x: x, y: y, width: 176, height: 250))

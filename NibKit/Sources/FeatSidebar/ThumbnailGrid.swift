@@ -326,6 +326,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var autoScroll: CADisplayLink?
     private var updateScheduled = false
     private var subscriptions = Set<AnyCancellable>()
+    #if DEBUG
+    private var lastDropDiagnostic: String?
+    #endif
 
     init(model: PagesPanelModel) {
         self.model = model
@@ -870,7 +873,19 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         true
     }
 
+    func collectionView(_ collectionView: UICollectionView, dragSessionWillBegin session: UIDragSession) {
+        #if DEBUG
+        lastDropDiagnostic = nil
+        let pages = session.items.compactMap { ($0.localObject as? PageDragItem)?.page.raw }
+        NSLog("%@", "[Nib QA pages] dragSessionWillBegin items=\(session.items.count) pages=\(pages)")
+        #endif
+    }
+
     func collectionView(_ collectionView: UICollectionView, dragSessionDidEnd session: UIDragSession) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] dragSessionDidEnd items=\(session.items.count)")
+        lastDropDiagnostic = nil
+        #endif
         highlightedPages.removeAll()
         flushDeferredUpdate()
     }
@@ -893,21 +908,35 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidUpdate session: UIDropSession,
                         withDestinationIndexPath destinationIndexPath: IndexPath?) -> UICollectionViewDropProposal {
+        let kind = dropKind(session)
+        let proposal = PageDropKind.proposal(for: kind, canEdit: model.canEdit,
+                                             allowsMoveOperation: session.allowsMoveOperation)
         #if DEBUG
-        NSLog("%@", "[Nib QA pages] proposal destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(session)))")
-        #endif
-        guard model.canEdit, let kind = dropKind(session) else {
-            return UICollectionViewDropProposal(operation: .forbidden)
+        // UIKit asks on every movement tick; record only a changed decision or session state.
+        let state = [
+            "destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit)",
+            "kind=\(String(describing: kind)) allowsMoveOperation=\(session.allowsMoveOperation)",
+            "hasActiveDrag=\(collectionView.hasActiveDrag) local=\(session.localDragSession != nil)",
+            "items=\(session.items.count) operation=\(proposal.operation.rawValue) intent=\(proposal.intent.rawValue)"
+        ].joined(separator: " ")
+        if lastDropDiagnostic != state {
+            lastDropDiagnostic = state
+            NSLog("%@", "[Nib QA pages] proposal destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(session)))")
+            NSLog("%@", "[Nib QA pages] drop state \(state)")
         }
-        return UICollectionViewDropProposal(operation: kind == .reorder ? .move : .copy,
-                                            intent: .insertAtDestinationIndexPath)
+        #endif
+        return proposal
     }
 
     func collectionView(_ collectionView: UICollectionView, performDropWith coordinator: UICollectionViewDropCoordinator) {
         #if DEBUG
         NSLog("%@", "[Nib QA pages] performDrop items=\(coordinator.items.count) destination=\(String(describing: coordinator.destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(coordinator.session)))")
+        let droppedPages = coordinator.items.compactMap { ($0.dragItem.localObject as? PageDragItem)?.page.raw }
+        let sessionPages = coordinator.session.items.compactMap { ($0.localObject as? PageDragItem)?.page.raw }
+        NSLog("%@", "[Nib QA pages] performDrop pageIDs=\(droppedPages) sessionPageIDs=\(sessionPages)")
         #endif
-        guard let doc = model.doc, model.canEdit, let kind = dropKind(coordinator.session) else { return }
+        guard let doc = model.doc, model.canEdit, let kind = dropKind(coordinator.session),
+              kind != .reorder || coordinator.session.allowsMoveOperation else { return }
         let location = coordinator.session.location(in: collectionView)
         let model = self.model
         switch kind {
@@ -943,6 +972,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     }
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidEnd session: UIDropSession) {
+        #if DEBUG
+        lastDropDiagnostic = nil
+        #endif
         flushDeferredUpdate()
     }
 
