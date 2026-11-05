@@ -143,10 +143,8 @@ final class HistoryViewModel: ObservableObject {
                                                   session: session)
             let entries = try value.decode(HistoryListOutput.self).entries
             guard doc == self.doc else { return }          // the document changed while listing
-            // ponytail: ids count from the oldest step, so they stay put as steps are added or undone; they shift
-            // only when the history is full and the oldest step drops out.
-            finish(rows: entries.enumerated().map { offset, entry in
-                HistoryRow(id: "\(entry.group)#\(entries.count - offset)", group: entry.group, label: entry.label,
+            finish(rows: entries.map { entry in
+                HistoryRow(id: entry.id, group: entry.group, label: entry.label,
                            principal: HistoryPrincipal(entry.principal), changes: entry.changes,
                            date: Date(timeIntervalSince1970: entry.at))
             }, failed: false)
@@ -170,7 +168,8 @@ final class HistoryViewModel: ObservableObject {
         reverting = row.group
         let outcome: HistoryReceipt
         do {
-            let value = try await app.bus.execute(CommandIDs.revertGroup, ["doc": Self.ref(doc), "group": .string(row.group)],
+            let value = try await app.bus.execute(CommandIDs.revertGroup, ["doc": Self.ref(doc), "group": .string(row.group),
+                                                                        "entryID": .string(row.id)],
                                                   session: session)
             outcome = .reverted(count: value["reverted"]?.intValue ?? 0, kept: value["skipped"]?.intValue ?? 0)
         } catch let error as NibError where error.code == .notFound {
@@ -202,6 +201,7 @@ final class HistoryViewModel: ObservableObject {
 /// `history.list`'s result.
 private struct HistoryListOutput: Decodable {
     struct Entry: Decodable {
+        var id: String
         var group: String
         var label: String
         var principal: String
