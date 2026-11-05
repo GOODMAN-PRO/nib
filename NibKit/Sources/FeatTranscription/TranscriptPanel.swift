@@ -254,6 +254,7 @@ struct TranscriptPanel: View {
             } label: {
                 Text(Self.timestamp(line.start)).font(NibFont.hud).foregroundStyle(NibColor.accent)
                     .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain).hoverEffect(.highlight)
             .accessibilityLabel(String(localized: "Play from \(Self.timestamp(line.start)) and show linked page"))
@@ -324,6 +325,7 @@ struct TranscriptPanel: View {
                                 model.run(TranscriptSeek.descriptor.id, ["clip": .string(model.selectedClip), "t": .number(t)])
                             } label: {
                                 Text(paragraph).font(NibFont.body).frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+                                    .contentShape(Rectangle())
                             }.buttonStyle(.plain).hoverEffect(.highlight)
                             .accessibilityHint(String(localized: "Play audio at the linked timestamp"))
                         } else {
