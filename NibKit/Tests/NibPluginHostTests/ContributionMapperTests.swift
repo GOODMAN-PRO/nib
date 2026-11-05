@@ -565,6 +565,44 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertEqual(PluginToolPreview.resolve("ink", input: .rect), .rect)
     }
 
+    func testLateToolCompletionPreservesTheNextGesture() async throws {
+        for sticky in [false, true] {
+            let kit = PluginTestKit()
+            var calls = 0
+            var release = false
+            var completed = false
+            kit.h.app.commands.register(CommandDescriptor(id: "test.delayedTool", title: "Delayed", summary: "Test tool.",
+                                                          effect: .edit, owner: "test")) { _, _ in
+                calls += 1
+                if calls == 1 {
+                    for _ in 0..<500 where !release { try await Task.sleep(nanoseconds: 1_000_000) }
+                    completed = true
+                }
+                return .null
+            }
+            let host = FakeCanvasHost(kit.h)
+            kit.h.session.selectTool("pen")
+            kit.h.session.selectTool("test.tool")
+            let tool = PluginCanvasTool(PluginToolSpec(id: "test.tool", pluginID: "test", command: "test.delayedTool",
+                                                       input: .stroke, preview: .ink, sticky: sticky))
+            let sample = CanvasSample(page: Fixtures.page1, location: Point(10, 10))
+            tool.touchesBegan(sample, host: host)
+            tool.touchesEnded(sample, host: host)
+            let started = await eventually { calls == 1 }
+            XCTAssertTrue(started)
+            tool.touchesBegan(sample, host: host)
+            let livePreview = host.overlayLayer.sublayers?.last
+            release = true
+            let cleaned = await eventually { completed && host.overlayLayer.sublayers?.count == 1 }
+            XCTAssertTrue(cleaned)
+            XCTAssertTrue(host.overlayLayer.sublayers?.last === livePreview)
+            XCTAssertEqual(kit.h.session.tool, "test.tool")
+            tool.touchesEnded(sample, host: host)
+            let submitted = await eventually { calls == 2 }
+            XCTAssertTrue(submitted, "The second stroke must reach its command")
+        }
+    }
+
     func testCanvasToolRunsItsCommandOnceWithAPreview() async throws {
         let kit = PluginTestKit()
         let calls = CallRecorder()
