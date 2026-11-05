@@ -946,6 +946,7 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
     let contentInset: CGFloat
     @ViewBuilder var form: Form
     @ViewBuilder var paper: Paper
+    @State private var hasMoreBelow = false
 
     var body: some View {
         ScrollView {
@@ -955,6 +956,28 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
             }
             .padding(.top, NibSpacing.xl)
             .padding(.bottom, NibSpacing.l)
+            .anchorPreference(key: NotebookFormBounds.self, value: .bounds) { $0 }
+        }
+        .overlayPreferenceValue(NotebookFormBounds.self) { anchor in
+            GeometryReader { geometry in
+                Color.clear.preference(key: NotebookFormContinuation.self,
+                    value: anchor.map { geometry[$0].maxY > geometry.size.height + 1 } ?? false)
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .onPreferenceChange(NotebookFormContinuation.self) { hasMoreBelow = $0 }
+        .scrollIndicators(.visible)
+        .scrollIndicatorsFlash(onAppear: true)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if hasMoreBelow {
+                Label(String(localized: "Scroll for more options"), systemImage: NibSymbol.chevronDown.name)
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.labelSecondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, NibSpacing.s)
+                    .background(NibColor.backgroundSecondary)
+            }
         }
         .contentMargins(.horizontal, contentInset, for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
@@ -962,6 +985,16 @@ struct NewNotebookFormViewport<Form: View, Paper: View>: View {
         // A drawing mask alone does not constrain SwiftUI's hit testing after scrolling.
         .contentShape(Rectangle())
     }
+}
+
+private struct NotebookFormBounds: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? { nil }
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = nextValue() ?? value }
+}
+
+private struct NotebookFormContinuation: PreferenceKey {
+    static var defaultValue: Bool { false }
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
 /// Paper layout follows the space inside the sheet, independently of the presenting window's size class.
@@ -1037,9 +1070,13 @@ struct NewNotebookSheet: View {
     }
     private var contentInset: CGFloat { compact ? NibSpacing.l : NibSpacing.xl }
     private var sheetSize: CGSize {
-        guard let windowSize else { return NibMetrics.newDocumentSheetSize }
+        // The continuous form needs room for a complete first paper row and its scroll cue.
+        let preferredHeight = NibMetrics.newDocumentSheetSize.height + NibMetrics.paperTileSize.height + NibSpacing.xl
+        guard let windowSize else {
+            return CGSize(width: NibMetrics.newDocumentSheetSize.width, height: preferredHeight)
+        }
         return CGSize(width: min(NibMetrics.newDocumentSheetSize.width, windowSize.width - NibSpacing.xl * 2),
-                      height: min(NibMetrics.newDocumentSheetSize.height, windowSize.height - NibSpacing.xl * 2))
+                      height: min(preferredHeight, windowSize.height - NibSpacing.xl * 2))
     }
     private var draft: NotebookDraft { model.draft }
 
