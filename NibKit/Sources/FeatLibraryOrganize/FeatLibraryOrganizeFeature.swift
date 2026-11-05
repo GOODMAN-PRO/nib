@@ -389,6 +389,66 @@ extension NibFolderGlyphView {
 
 /// The page render behind a thumbnail or a cover (paper-coloured placeholder while it loads; never a shimmer).
 /// A password-locked document shows a lock instead of its content.
+@MainActor
+final class PageThumbnailModel: ObservableObject {
+    struct Request: Hashable {
+        var doc: DocumentID
+        var page: PageID?
+        var pixels: Int
+        var locked: Bool
+    }
+
+    @Published private(set) var image: CGImage?
+    private let app: NibApp
+    private let bag = SubscriptionBag()
+    private var request: Request?
+    private var generation = UUID()
+    private var task: Task<Void, Never>?
+
+    init(app: NibApp) {
+        self.app = app
+        bag.items.append(app.bus.observeCommits { [weak self] changes in
+            guard let self, let request = self.request, changes.documents.contains(request.doc) else { return }
+            self.reload()
+        })
+        bag.items.append(app.events.subscribe { [weak self] event in
+            guard event.type == NibEventType.libraryChanged else { return }
+            Task { @MainActor in self?.reload() }
+        })
+    }
+
+    func configure(_ request: Request) {
+        self.request = request
+        reload()
+    }
+
+    func stop() {
+        generation = UUID()
+        task?.cancel()
+        task = nil
+        request = nil
+    }
+
+    private func reload() {
+        task?.cancel()
+        let token = UUID()
+        generation = token
+        guard let request, !request.locked, app.services.lock?.isLocked(request.doc) != true else {
+            image = nil
+            return
+        }
+        // Resolve covers again on every edit/undo/refresh: the first page may have been replaced.
+        var target = request.page
+        if target == nil, let head = try? app.workspace.peekContent(request.doc) { target = head.livePages.first?.id }
+        guard let target, let renderer = app.services.renderer else { image = nil; return }
+        task = Task { @MainActor [weak self] in
+            let rendered = await renderer.thumbnail(doc: request.doc, page: target, maxPixelSize: request.pixels)
+            guard !Task.isCancelled, let self, self.generation == token else { return }
+            self.image = rendered
+        }
+    }
+}
+
 struct PageThumbnailImage: View {
     let app: NibApp
     let doc: DocumentID
@@ -397,7 +457,20 @@ struct PageThumbnailImage: View {
     let pixelSize: CGFloat
     let isLocked: Bool
     @Environment(\.displayScale) private var displayScale
-    @State private var image: CGImage? = nil
+    @StateObject private var model: PageThumbnailModel
+
+    init(app: NibApp, doc: DocumentID, page: PageID?, pixelSize: CGFloat, isLocked: Bool) {
+        self.app = app
+        self.doc = doc
+        self.page = page
+        self.pixelSize = pixelSize
+        self.isLocked = isLocked
+        _model = StateObject(wrappedValue: PageThumbnailModel(app: app))
+    }
+
+    private var request: PageThumbnailModel.Request {
+        .init(doc: doc, page: page, pixels: Int(pixelSize * displayScale), locked: isLocked)
+    }
 
     var body: some View {
         ZStack {
@@ -406,21 +479,16 @@ struct PageThumbnailImage: View {
                 Image(nib: .lock)
                     .font(NibFont.glyph(.bar))
                     .foregroundStyle(NibColor.labelTertiary)
-            } else if let image {
+            } else if let image = model.image {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .scaledToFill()
                     .transition(.opacity)
             }
         }
-        .animation(NibMotion.fade, value: image != nil)
-        .task(id: "\(doc.raw)/\(page?.raw ?? "")/\(isLocked)") {
-            guard !isLocked else {
-                image = nil
-                return
-            }
-            image = await load()
-        }
+        .animation(NibMotion.fade, value: model.image != nil)
+        .task(id: request) { model.configure(request) }
+        .onDisappear { model.stop() }
         .accessibilityHidden(true)
     }
 
@@ -429,11 +497,4 @@ struct PageThumbnailImage: View {
         app.services.lock?.isLocked(doc) ?? catalogued
     }
 
-    private func load() async -> CGImage? {
-        guard let renderer = app.services.renderer else { return nil }
-        var target = page
-        if target == nil, let head = try? app.workspace.peekContent(doc) { target = head.livePages.first?.id }
-        guard let target else { return nil }
-        return await renderer.thumbnail(doc: doc, page: target, maxPixelSize: Int(pixelSize * displayScale))
-    }
 }

@@ -6,6 +6,27 @@ import NibDesign
 import NibTesting
 @testable import FeatLibraryOrganize
 
+private final class CountingThumbnailRenderer: PageRenderer {
+    private let lock = NSLock()
+    private let fake = FakeRenderer()
+    private var pages: [PageID] = []
+    private var finished = 0
+    let delay: UInt64
+    init(delay: UInt64 = 0) { self.delay = delay }
+    var requests: [PageID] { lock.withLock { pages } }
+    var completions: Int { lock.withLock { finished } }
+    func render(_ request: RenderRequest) async throws -> RenderResult { try await fake.render(request) }
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
+        lock.withLock { pages.append(page) }
+        if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+        let image = await fake.thumbnail(doc: doc, page: page, maxPixelSize: maxPixelSize)
+        lock.withLock { finished += 1 }
+        return image
+    }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
+}
+
 /// Stand-in for page.setBookmarked (F046): bookmarks one page through a real transaction, so the page index sees a
 /// commit and an undo like it would in the app.
 private struct BookmarkStandIn: NibCommand {
@@ -327,6 +348,67 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         let a4 = PageSize.a4
         XCTAssertEqual(pages.bookmarked[0].aspect ?? 0, a4.width / a4.height, accuracy: 1e-9)
         XCTAssertEqual(pages.bookmarked[1].aspect ?? 0, a4.height / a4.width, accuracy: 1e-9)
+    }
+
+    func testMountedThumbnailFollowsEditsUndoAndFirstPageReplacement() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let renderer = CountingThumbnailRenderer()
+        h.app.services.renderer = renderer
+        h.app.commands.register(CommandDescriptor(id: "test.thumbnailEdit", title: "Edit", summary: "Test", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                try tx.put(Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 1)])),
+                           doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return .null
+        }
+        h.app.commands.register(CommandDescriptor(id: "test.thumbnailFirstPage", title: "Replace", summary: "Test", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var page = try XCTUnwrap(tx.content(Fixtures.docID).page(Fixtures.page1))
+                page.deleted = true
+                try tx.put(page, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        let host = UIHostingController(rootView: PageThumbnailImage(app: h.app, doc: Fixtures.docID,
+                                                                    page: nil, pixelSize: 80, isLocked: false))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 200, height: 200))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        await eventually { renderer.requests.count >= 1 }
+        XCTAssertEqual(renderer.requests.last, Fixtures.page1)
+        var count = renderer.requests.count
+        try await h.run("test.thumbnailEdit")
+        await eventually { renderer.requests.count > count }
+        XCTAssertGreaterThan(renderer.requests.count, count)
+        count = renderer.requests.count
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        await eventually { renderer.requests.count > count }
+        XCTAssertGreaterThan(renderer.requests.count, count)
+        try await h.run("test.thumbnailFirstPage")
+        await eventually { renderer.requests.last == Fixtures.page2 }
+        XCTAssertEqual(renderer.requests.last, Fixtures.page2)
+        count = renderer.requests.count
+        h.app.events.emit(NibEventType.libraryChanged)
+        await eventually { renderer.requests.count > count }
+        XCTAssertGreaterThan(renderer.requests.count, count)
+    }
+
+    func testSupersededThumbnailCannotRevealImageAfterLocking() async {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let renderer = CountingThumbnailRenderer(delay: 50_000_000)
+        h.app.services.renderer = renderer
+        let model = PageThumbnailModel(app: h.app)
+        var request = PageThumbnailModel.Request(doc: Fixtures.docID, page: Fixtures.page1, pixels: 80, locked: false)
+        model.configure(request)
+        await eventually { !renderer.requests.isEmpty }
+        XCTAssertFalse(renderer.requests.isEmpty)
+        request.locked = true
+        model.configure(request)
+        await eventually { renderer.completions == 1 }
+        XCTAssertEqual(renderer.completions, 1)
+        XCTAssertNil(model.image)
+        model.stop()
     }
 
     func testPageIndexFollowsCommitsAndUndo() async throws {
