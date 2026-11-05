@@ -364,6 +364,9 @@ final class FeatCollabTests: XCTestCase {
 
     func testPendingRejoinDoesNotKeepItsServiceAlive() async throws {
         var pair: CollabPair? = CollabPair()
+        // Harness makes its app shared. Move that strong root away before starting delayed work.
+        _ = Harness(fixtures: false)
+        weak var app = pair!.guest.app
         let code = try await pair!.share()
         try await pair!.join(code)
         pair!.guestService.timing.rejoinTimeout = 0.08
@@ -374,7 +377,8 @@ final class FeatCollabTests: XCTestCase {
         try await waitUntil(timeout: 1) { session?.joinInProgress == true }
         XCTAssertTrue(session?.joinInProgress == true)
         pair = nil
-        try await waitUntil(timeout: 1) { service == nil && session == nil }
+        try await waitUntil(timeout: 1) { app == nil && service == nil && session == nil }
+        XCTAssertNil(app, "the shared app must not retain the guest fixture")
         XCTAssertNil(service, "the retry task must not own its service across the admission wait")
         XCTAssertNil(session)
         XCTAssertNil(transport.onMessage)
@@ -537,6 +541,38 @@ final class FeatCollabTests: XCTestCase {
             XCTAssertEqual(e.code, .userDenied)
         }
         XCTAssertEqual(pair.hostService.state.admitted.count, 1)
+    }
+
+    func testToastApprovalsDoNotCancelOtherParticipants() async throws {
+        let harness = Harness(features: [FeatCollabFeature.self])
+        let service = try XCTUnwrap(CollabService.of(harness.app))
+        var started: [String] = []
+        var completed: [String] = []
+        var releaseFirst = false
+        defer { releaseFirst = true }
+        // Hold the first command across an await, as admission I/O can, while another toast is tapped.
+        harness.app.commands.register(CollabApproveCommand.descriptor) { params, _ in
+            let participant = try XCTUnwrap(params["participant"]?.stringValue)
+            started.append(participant)
+            if participant == "first" {
+                for _ in 0..<200 {
+                    if releaseFirst { break }
+                    try await Task.sleep(nanoseconds: 5_000_000)
+                }
+                XCTAssertTrue(releaseFirst, "first approval was not released within its deadline")
+            }
+            try Task.checkCancellation()
+            completed.append(participant)
+            return [:]
+        }
+        service.approveFromToast("first")
+        try await waitUntil(timeout: 1) { started.contains("first") }
+        service.approveFromToast("second")
+        try await waitUntil(timeout: 1) { completed.contains("second") }
+        releaseFirst = true
+        try await waitUntil(timeout: 1) { completed.contains("first") }
+        XCTAssertEqual(Set(completed), Set(["first", "second"]), "both approval commands must finish")
+        XCTAssertEqual(started.count, 2)
     }
 
     func testDeclinedJoinerIsToldNo() async throws {

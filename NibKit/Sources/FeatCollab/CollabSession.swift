@@ -1929,6 +1929,7 @@ final class CollabSession {
             guard let service = self.service, service.app != nil else {
                 if let file { try? FileManager.default.removeItem(at: file) }
                 self.holds -= 1
+                self.drain()
                 return
             }
             let result: Result<DocumentID, Error>
@@ -3144,7 +3145,7 @@ final class CollabService: ObservableObject {
     @Published private(set) var state = CollabState()
     private(set) var session: CollabSession?
     private var rejoinTask: Task<Void, Never>?
-    private var toastTask: Task<Void, Never>?
+    private var approvalTasks: [String: Task<Void, Never>] = [:]
     private var backgroundedAt: Date?
     private var lifecycle: [NSObjectProtocol] = []
     private let log = Logger(subsystem: "app.nib", category: "collab")
@@ -3157,7 +3158,7 @@ final class CollabService: ObservableObject {
 
     deinit {
         rejoinTask?.cancel()
-        toastTask?.cancel()
+        for task in approvalTasks.values { task.cancel() }
         for observer in lifecycle { NotificationCenter.default.removeObserver(observer) }
         // Deinit may run off the main actor. Keep only the session alive until its teardown runs.
         let abandoned = session
@@ -3463,10 +3464,10 @@ final class CollabService: ObservableObject {
         app?.events.emit(CollabSessionEventPayload(event: "request", participant: p.id, name: p.name), doc: session?.localDoc)
     }
 
-    private func approveFromToast(_ participant: String) {
-        guard let app else { return }
-        toastTask?.cancel()
-        toastTask = Task { @MainActor [weak self, weak app] in
+    func approveFromToast(_ participant: String) {
+        guard let app, approvalTasks[participant] == nil else { return }
+        approvalTasks[participant] = Task { @MainActor [weak self, weak app] in
+            defer { self?.approvalTasks[participant] = nil }
             guard let app, !Task.isCancelled else { return }
             do {
                 _ = try await app.bus.execute(Invocation(command: CommandIDs.collabApprove,

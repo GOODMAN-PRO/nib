@@ -97,7 +97,12 @@ func presenceWait(_ what: String, file: StaticString = #filePath, line: UInt = #
 final class PresenceTests: XCTestCase {
     func testPresenceHelpersAndDelayedSummarySurviveOwnerTeardown() async throws {
         var harness: Harness? = Harness(features: PresencePair.features)
+        // Release NibApp.shared's ownership before scheduling the delayed summary.
+        _ = Harness(fixtures: false)
+        weak var app = harness!.app
+        weak var service = CollabService.of(harness!.app)
         var hub: PresenceHub? = PresenceHub.of(harness!.app)
+        weak var releasedHub = hub
         let follow = try XCTUnwrap(hub).follow
         let shared = try XCTUnwrap(hub).sharedModel
         let unseen = try XCTUnwrap(hub).unseen
@@ -105,6 +110,8 @@ final class PresenceTests: XCTestCase {
         hub?.didEnterBackground()
         hub?.didBecomeActive()
         harness = nil
+        XCTAssertNil(app, "the shared app must not retain the presence fixture")
+        XCTAssertNil(service)
         // A retained panel/hub can outlive its app; a delayed summary must find no app to update.
         try await Task.sleep(nanoseconds: 50_000_000)
         hub?.refreshState()
@@ -112,6 +119,7 @@ final class PresenceTests: XCTestCase {
         unseen.scan(Fixtures.docID)
         XCTAssertTrue(shared.entries.isEmpty)
         hub = nil
+        XCTAssertNil(releasedHub, "retained helpers must not own their hub")
         // Retained helper objects must also tolerate the hub disappearing.
         follow.follow("departed")
         XCTAssertFalse(follow.setLeading(true))
