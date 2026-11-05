@@ -682,6 +682,27 @@ final class FeatLassoTests: XCTestCase {
         XCTAssertNil(overlay.view.superview)
     }
 
+    func testLooseCompletedLassoUsesTightVisualBoundsWithoutChangingSelectionGeometry() {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        let overlay = SelectionOverlay()
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        let outline = [Point(100, 100), Point(400, 100), Point(400, 400), Point(100, 400)]
+        let selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID],
+                                  bounds: Rect(x: 180, y: 200, width: 160, height: 90), outline: outline)
+        h.session.selection = selection
+        for scale in [CGFloat(1), 2] {
+            host.zoomScale = Double(scale)
+            overlay.canvasDidChange(host)
+            let expected = CGRect(x: 180 * scale, y: 200 * scale, width: 160 * scale, height: 90 * scale)
+                .insetBy(dx: -SelectionStyle.boxPadding, dy: -SelectionStyle.boxPadding)
+            XCTAssertEqual(overlay.view.content?.outline.boundingBoxOfPath, expected)
+            XCTAssertEqual(overlay.view.content?.drawsBox, false)
+            XCTAssertEqual(h.session.selection, selection, "Display fitting must not mutate selected items or transform geometry")
+        }
+    }
+
     // MARK: Geometry
 
     func testLineTouchesAgreesWithGeoPolylineTouchesPolygon() {

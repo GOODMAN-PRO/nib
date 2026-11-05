@@ -708,6 +708,8 @@ Every press is scale 0.96 on `tap` (the Tinted primary, covers, buttons, icon bu
 
 ### 10.15 Where liquid is never used
 
+A completed lasso whose projected bounds surround the selected items with empty space on every side displays the tight item bounds with the standard 4 pt selection inset. Tight and intersecting outlines keep their gesture shape. This affects the overlay only; stored selection geometry and item transforms remain unchanged.
+
 - The page, ink, dry tiles, thumbnail contents, exports, print and PDFs.
 - Text-editing surfaces: text boxes, text documents, the composer text itself.
 - Lists, Settings (except the switch thumb), grouped forms, the template grid, the plugin list, study-card lists.
