@@ -491,6 +491,17 @@ public struct NibToolPalette<Settings: View>: View {
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
+                    #if DEBUG
+                    .background {
+                        GeometryReader { toolsProxy in
+                            Color.clear.allowsHitTesting(false).accessibilityHidden(true)
+                                .onChange(of: qaDockState(d, a, centre: c, proxy: proxy,
+                                                                 globalFrame: toolsProxy.frame(in: .global)), initial: true) { _, state in
+                                NSLog("%@", state)
+                            }
+                        }
+                    }
+                    #endif
                     .gesture(dragGesture(region: r, origin: origin, arrangement: a, slots: map))
                     .opacity(fade)
                     .position(c)
@@ -558,6 +569,21 @@ public struct NibToolPalette<Settings: View>: View {
         }
         .background(ReshapeWatcher(node: field?.node(id)) { phase in reshaped(phase) })
     }
+
+    #if DEBUG
+    @MainActor
+    private func qaDockState(_ d: NibPaletteDock, _ a: Arrangement, centre: CGPoint,
+                             proxy: GeometryProxy, globalFrame: CGRect) -> String {
+        let p = field?.node(id).presentation
+        let system = field?.usesSystemGlass ?? false
+        let native = p.map { DropletBodyModifier.drawsBody(style: .palette, presentation: $0) } ?? false
+        let branch: String
+        if #available(iOS 26.0, *), system && native { branch = "native" }
+        else { branch = field == nil ? "standalone" : "content" }
+        let line = "[Nib QA dock] edge=\(d.edge) along=\(d.along) size=\(size(d, a)) laidOut=\(String(describing: laidOut)) centre=\(centre) proxy=\(proxy.size) origin=\(proxy.frame(in: NibLiquid.space).origin) bodySize=\(String(describing: p?.bodySize)) restSize=\(String(describing: p?.restSize)) bodyOffset=\(String(describing: p?.bodyOffset)) usesSystemGlass=\(system) branch=\(branch) globalTools=\(globalFrame) reshape=\(String(describing: p?.reshape)) wanted=\(wanted)"
+        return String(line.prefix(890))
+    }
+    #endif
 
     // MARK: Moving between docks
 

@@ -475,6 +475,9 @@ final class ImportDialogSession {
     }
 
     func choose() async -> ImportDialogOutcome {
+        #if DEBUG
+        NSLog("%@", "[Nib QA import] choose entered navigator=\(navigator != nil)")
+        #endif
         guard let navigator = navigator, navigator.rootViewController?.view.window != nil else { return .notShown }
         await ImportUI.waitUntilPresentable(navigator)
         return await withCheckedContinuation { (continuation: CheckedContinuation<ImportDialogOutcome, Never>) in
@@ -528,6 +531,9 @@ final class ImportDialogSession {
     }
 
     private func resolve(_ outcome: ImportDialogOutcome) {
+        #if DEBUG
+        NSLog("%@", String("[Nib QA import] choose resolved \(outcome)".prefix(890)))
+        #endif
         guard let continuation = pending else { return }
         pending = nil
         stopWatchingScene()
@@ -602,11 +608,17 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA import] didPick count=\(urls.count)")
+        #endif
         importLog.info("Files picker delivered \(urls.count) URLs")
         finish(.success(urls))
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA import] picker cancelled")
+        #endif
         importLog.info("Files picker cancelled")
         finish(.success([]))
     }
@@ -656,6 +668,9 @@ enum ImportUI {
 
     /// Waits (up to 3 s) until nothing is being presented or dismissed, so the next sheet can appear.
     static func waitUntilPresentable(_ navigator: SceneNavigator) async {
+        #if DEBUG
+        defer { NSLog("%@", "[Nib QA import] waitUntilPresentable returned") }
+        #endif
         for _ in 0..<30 {
             guard let root = navigator.rootViewController else { return }
             var top = root

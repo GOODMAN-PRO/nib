@@ -431,6 +431,9 @@ struct BoardsList: View {
         Button { model.beginRename(board) } label: {
             Label { Text(String(localized: "Rename")) } icon: { Image(nib: .pencil) }
         }
+        #if DEBUG
+        .onAppear { NibQAIdleDiagnostics.schedule(reason: "board-context-menu") }
+        #endif
         let context = model.menuContext(for: board.id)
         let targets = context.nodes.isEmpty ? [board.id] : context.nodes
         if model.canRemove(targets) {

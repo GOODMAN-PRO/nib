@@ -525,12 +525,19 @@ final class ShellViewController: UIViewController, SceneNavigator, UIGestureReco
 
     /// Command failures are posted app-wide; only the window the user is working in shows them.
     private func toastIfActive(_ message: String) {
+        #if DEBUG
+        NSLog("%@", String("[Nib QA toast] toastIfActive guard=\(app.ui.activeNavigator === self || app.ui.activeNavigator == nil) message=\(message)".prefix(890)))
+        #endif
         guard app.ui.activeNavigator === self || app.ui.activeNavigator == nil else { return }
         toast(message)
     }
 
     private func toast(_ message: String) {
+        #if DEBUG
+        NSLog("%@", String("[Nib QA toast] shell toast message=\(message)".prefix(890)))
+        #endif
         let label = UILabel()
+        label.accessibilityIdentifier = "nib.toast"
         label.text = message
         label.textColor = .white
         label.backgroundColor = UIColor.black.withAlphaComponent(0.8)

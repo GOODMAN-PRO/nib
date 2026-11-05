@@ -59,6 +59,7 @@ final class QAStateProbe: UIView {
                 "page": doc == nil ? .null : session.page.map { .string($0.raw) } ?? .null,
                 "pageCount": .number(Double(content?.livePages.count ?? 0)),
                 "tool": .string(session.tool),
+                "toolSettingsOpen": canvas == nil ? .null : session.toolOptions["nib.qa.toolSettingsOpen"] ?? .null,
                 "zoom": .number(Double(canvas?.zoomScale ?? 1)),
                 "contentOffset": ["x": .number(Double(offset.x)), "y": .number(Double(offset.y))],
                 "itemCountOnPage": .number(Double(items.filter { !$0.deleted }.count)),

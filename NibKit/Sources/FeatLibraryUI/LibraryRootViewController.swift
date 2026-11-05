@@ -370,6 +370,9 @@ final class LibraryViewModel: ObservableObject {
                 let canUndo = !destination.hasPrefix("doc:") && !parents.isEmpty
                 var undoAction: (@MainActor () -> Void)?
                 if canUndo { undoAction = { [weak self] in
+                    #if DEBUG
+                    NSLog("%@", "[Nib QA toast] move undo entered modelAlive=\(self != nil)")
+                    #endif
                     guard let self else { return }
                     for (parent, rows) in parents {
                         #if DEBUG
@@ -392,12 +395,20 @@ final class LibraryViewModel: ObservableObject {
     func drop(_ drop: NibReflowDrop<String>) { self.drop(drop, from: nil) }
 
     func drop(_ drop: NibReflowDrop<String>, from source: NibReflow<String>?) {
+        #if DEBUG
+        defer {
+            NSLog("%@", String("[Nib QA reflow] library drop=\(drop) confirmationSet=\(confirmation != nil)".prefix(890)))
+        }
+        #endif
         // onChange coalesces finger updates. Resolve the final point synchronously
         // before the released carrier/monitor clears its hover state.
         if let lift = source?.lift {
             let match = LibraryDropDestination.match(lift.location, carried: lift.id, targets: dropTargets)
             dropTarget = match?.key; dropFrame = match?.value
         }
+        #if DEBUG
+        NSLog("%@", "[Nib QA reflow] library target=\(String(describing: dropTarget)) frame=\(String(describing: dropFrame))")
+        #endif
         if let destination = dropTarget, let carried = source?.carried ?? reflow.carried ?? folderReflow.carried {
             let refs = selection.refs.contains(carried) ? selection.refs.sorted() : [carried]
             if let frame = dropFrame, let source = reflow.carrierFrame {
@@ -464,6 +475,9 @@ final class LibraryFloatingAdapter: FloatingHosting {
     func removeAnchor(_ id: String) { host.removeAnchor(id) }
     func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { host.containerRect(rect, from: view) }
     func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {
+        #if DEBUG
+        NSLog("%@", String("[Nib QA toast] library post hasAction=\(action != nil) message=\(message)".prefix(890)))
+        #endif
         let button = actionTitle.flatMap { title in action.map { handler in NibAction(title) { handler() } } }
         host.post(NibToastItem(message, action: button))
     }

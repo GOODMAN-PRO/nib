@@ -985,14 +985,29 @@ struct ImportFiles: NibCommand {
     }()
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ImportResult {
-        let urls = p.urls.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard !urls.isEmpty else { throw NibError.invalid("'urls' must list at least one file", path: "$.urls") }
-        if let blank = urls.firstIndex(where: { $0.isEmpty }) {
-            throw NibError.invalid("empty url", path: "$.urls[\(blank)]")
+        #if DEBUG
+        NSLog("%@", "[Nib QA import] \(descriptor.id) started")
+        defer { NSLog("%@", "[Nib QA import] \(descriptor.id) ended (including cancel/dryRun)") }
+        #endif
+        do {
+            let urls = p.urls.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            guard !urls.isEmpty else { throw NibError.invalid("'urls' must list at least one file", path: "$.urls") }
+            if let blank = urls.firstIndex(where: { $0.isEmpty }) {
+                throw NibError.invalid("empty url", path: "$.urls[\(blank)]")
+            }
+            let destination = try ImportDestination.parse(folder: p.folder, doc: p.doc, position: p.position, anchor: p.anchor)
+            let result = try await ImportEngine.perform(urls.map { ImportSource(original: $0) }, destination: destination,
+                                                  ids: p.ids, ctx: ctx)
+            #if DEBUG
+            NSLog("%@", String("[Nib QA import] \(descriptor.id) result=\(result)".prefix(890)))
+            #endif
+            return result
+        } catch {
+            #if DEBUG
+            NSLog("%@", String("[Nib QA import] \(descriptor.id) error=\(error.localizedDescription)".prefix(890)))
+            #endif
+            throw error
         }
-        let destination = try ImportDestination.parse(folder: p.folder, doc: p.doc, position: p.position, anchor: p.anchor)
-        return try await ImportEngine.perform(urls.map { ImportSource(original: $0) }, destination: destination,
-                                              ids: p.ids, ctx: ctx)
     }
 }
 
@@ -1025,43 +1040,74 @@ struct ImportPick: NibCommand {
     }
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ImportResult {
-        let preset = try parseTarget(p.target)
-        if ctx.dryRun { return ImportResult(refs: []) }                           // nothing is shown or written
-        guard !NibApp.isHostlessTest, let nav = await ImportUI.navigator(ctx) else {
-            throw NibError(.unavailable, "the Files picker needs a window", hint: "call import.files with urls instead")
-        }
-        // Pages go into a notebook, so a notebook target offers only formats that become pages.
-        let types = ImportUI.pickerTypes(ctx.content, pagesOnly: preset?.doc != nil)
-        let picked = try await DocumentPicker.pick(types: types, navigator: nav)
-        guard !picked.isEmpty else { return .cancelledResult }
-        // Picked files stay readable while the import runs (the engine opens them again from their paths).
-        let access = picked.map { ($0, $0.startAccessingSecurityScopedResource()) }
-        importLog.info("Import picked files: \(picked.count), security scopes granted: \(access.filter { $0.1 }.count)")
-        defer { for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() } }
-        var sources = picked.map { ImportSource(original: $0.absoluteString) }
-        var destination = preset
-        var dialog: ImportDialogSession?
-        let asksWhere = preset == nil && sources.contains { ImportFormats.needsDestination($0.name) }
-        if asksWhere || (preset?.doc != nil && picked.count > 1) {
-            let ask = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
-                                          session: nav.session, sources: sources, preset: preset)
-            switch await ask.choose() {
-            case .chosen(let choice):
-                destination = choice.destination
-                sources = choice.order.map { sources[$0] }
-                dialog = ask
-            case .cancelled:
-                return .cancelledResult
-            case .notShown:
-                throw NibError(.unavailable, "Nib couldn't show the import dialog", hint: "choose Import Files again")
+        #if DEBUG
+        NSLog("%@", "[Nib QA import] \(descriptor.id) started")
+        defer { NSLog("%@", "[Nib QA import] \(descriptor.id) ended (including cancel/dryRun)") }
+        #endif
+        do {
+            let preset = try parseTarget(p.target)
+            if ctx.dryRun {
+                #if DEBUG
+                NSLog("%@", "[Nib QA import] import.pick result=empty dryRun=true")
+                #endif
+                return ImportResult(refs: [])
             }
-        } else if ImportUI.isLong(picked) {
-            // Nothing to ask, but the import takes a moment: the sheet shows its progress where it was started.
-            let progress = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
-                                               session: nav.session, sources: sources, preset: destination)
-            if await progress.showProgress() { dialog = progress }
+            guard !NibApp.isHostlessTest, let nav = await ImportUI.navigator(ctx) else {
+                throw NibError(.unavailable, "the Files picker needs a window", hint: "call import.files with urls instead")
+            }
+            // Pages go into a notebook, so a notebook target offers only formats that become pages.
+            let types = ImportUI.pickerTypes(ctx.content, pagesOnly: preset?.doc != nil)
+            let picked = try await DocumentPicker.pick(types: types, navigator: nav)
+            guard !picked.isEmpty else {
+                #if DEBUG
+                NSLog("%@", "[Nib QA import] import.pick result=cancelled pickerReturnedNoURLs")
+                #endif
+                return .cancelledResult
+            }
+            // Picked files stay readable while the import runs (the engine opens them again from their paths).
+            let access = picked.map { ($0, $0.startAccessingSecurityScopedResource()) }
+            #if DEBUG
+            NSLog("%@", "[Nib QA import] picked=\(picked.count) securityScopesGranted=\(access.filter { $0.1 }.count)")
+            #endif
+            importLog.info("Import picked files: \(picked.count), security scopes granted: \(access.filter { $0.1 }.count)")
+            defer { for (url, granted) in access where granted { url.stopAccessingSecurityScopedResource() } }
+            var sources = picked.map { ImportSource(original: $0.absoluteString) }
+            var destination = preset
+            var dialog: ImportDialogSession?
+            let asksWhere = preset == nil && sources.contains { ImportFormats.needsDestination($0.name) }
+            if asksWhere || (preset?.doc != nil && picked.count > 1) {
+                let ask = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
+                                              session: nav.session, sources: sources, preset: preset)
+                switch await ask.choose() {
+                case .chosen(let choice):
+                    destination = choice.destination
+                    sources = choice.order.map { sources[$0] }
+                    dialog = ask
+                case .cancelled:
+                    #if DEBUG
+                    NSLog("%@", "[Nib QA import] import.pick result=cancelled dialog")
+                    #endif
+                    return .cancelledResult
+                case .notShown:
+                    throw NibError(.unavailable, "Nib couldn't show the import dialog", hint: "choose Import Files again")
+                }
+            } else if ImportUI.isLong(picked) {
+                // Nothing to ask, but the import takes a moment: the sheet shows its progress where it was started.
+                let progress = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
+                                                   session: nav.session, sources: sources, preset: destination)
+                if await progress.showProgress() { dialog = progress }
+            }
+            let result = try await ImportEngine.perform(sources, destination: destination ?? .libraryRoot, ids: nil, ctx: ctx,
+                                                  dialog: dialog, reveal: true)
+            #if DEBUG
+            NSLog("%@", String("[Nib QA import] \(descriptor.id) result=\(result)".prefix(890)))
+            #endif
+            return result
+        } catch {
+            #if DEBUG
+            NSLog("%@", String("[Nib QA import] \(descriptor.id) error=\(error.localizedDescription)".prefix(890)))
+            #endif
+            throw error
         }
-        return try await ImportEngine.perform(sources, destination: destination ?? .libraryRoot, ids: nil, ctx: ctx,
-                                              dialog: dialog, reveal: true)
     }
 }

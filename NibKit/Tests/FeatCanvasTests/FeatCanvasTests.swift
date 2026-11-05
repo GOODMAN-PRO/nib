@@ -1672,6 +1672,25 @@ final class FeatCanvasTests: XCTestCase {
         }
     }
 
+    func testBoardAccessibilityRebuildsAfterFitPinchAndProgrammaticPan() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        defer { vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+        var summary = try XCTUnwrap(page.accessibilityElements?.first as? UIAccessibilityElement)
+        _ = try await h.run("view.zoom", ["fit": true])
+        var next = try XCTUnwrap(page.accessibilityElements?.first as? UIAccessibilityElement)
+        XCTAssertFalse(summary === next, "Fit must rebuild the viewport-cropped board summary")
+        summary = next
+        vc.scrollViewDidEndZooming(vc.scrollView, with: vc.scrollView.contentView, atScale: vc.scrollView.zoomScale)
+        next = try XCTUnwrap(page.accessibilityElements?.first as? UIAccessibilityElement)
+        XCTAssertFalse(summary === next, "Native zoom completion must discard the old viewport")
+        summary = next
+        vc.scrollBy(dx: 40, dy: 40, windowFractions: false, animated: false)
+        next = try XCTUnwrap(page.accessibilityElements?.first as? UIAccessibilityElement)
+        XCTAssertFalse(summary === next, "Nonanimated offsets have no UIKit scroll-end callback")
+    }
+
     func testWhiteboardIsOneInfiniteWorldWithBoardZoomLimits() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)

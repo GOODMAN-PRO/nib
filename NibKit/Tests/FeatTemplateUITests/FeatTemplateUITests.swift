@@ -73,7 +73,7 @@ final class FeatTemplateUITests: XCTestCase {
             params: [TemplateParam(name: TemplateParamNames.paper, title: "Paper", kind: "color")], render: { _, _, _ in TemplateRender(paper: .white) }))
     }
     // Stand-ins expose only the contracts needed by F045, keeping feature tests independent of F005/F022.
-    private func registerPages(_ h: Harness) {
+    private func registerPages(_ h: Harness, assetResult: JSONValue? = nil) {
         registerPaper(h)
         h.app.commands.register(CommandDescriptor(id: CommandIDs.pageSetBackground, title: "Set Background", summary: "Test page-background stand-in.", effect: .edit)) { p, ctx in
             let background = try XCTUnwrap(p["background"]).decode(Background.self)
@@ -104,8 +104,11 @@ final class FeatTemplateUITests: XCTestCase {
         h.app.commands.register(CommandDescriptor(id: CommandIDs.assetPut, title: "Store Asset", summary: "Test asset stand-in.", effect: .edit, undoable: false)) { p, ctx in
             let doc = try XCTUnwrap(NodeRef(p["doc"]?.stringValue ?? "")?.documentID)
             let url = try await ctx.inputFile(XCTUnwrap(p["url"]?.stringValue))
-            let ref = try h.assets.put(Data(contentsOf: url), ext: p["ext"]?.stringValue ?? "png", doc: doc)
-            return try JSONValue.from(ref)
+            let data = try Data(contentsOf: url)
+            let ref = try h.assets.put(data, ext: p["ext"]?.stringValue ?? "png", doc: doc)
+            // Match AssetPut.Output, not AssetRef's single-string encoding.
+            return assetResult ?? ["asset": .string(ref.name), "doc": .string(NodeRef.document(doc).description),
+                    "bytes": .number(Double(data.count))]
         }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.nodeSet, title: "Set Node", summary: "Test node stand-in.", effect: .edit)) { p, ctx in
             let node = try XCTUnwrap(NodeRef(p["ref"]?.stringValue ?? ""))
@@ -311,6 +314,37 @@ final class FeatTemplateUITests: XCTestCase {
         XCTAssertEqual(exported?["pages"], ["page:FIXTUREDOC01/FIXTUREPG002"])
         let lecture = try await store(h).locate("lecture").1
         XCTAssertEqual(lecture.title, "Lecture")
+    }
+
+    func testCustomTemplateApplyReadsAssetPutObject() async throws {
+        for kind in ["cover", "paper"] {
+            let h = harness(); registerPages(h)
+            _ = try await h.run("template.import", ["url": .string(try image(h)), "kind": .string(kind), "id": "custom01"])
+            _ = try await apply(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "custom01", "custom": true])
+            let content = try h.app.workspace.content(Fixtures.docID)
+            let background = try XCTUnwrap(content.page(Fixtures.page1)?.background)
+            XCTAssertEqual(background.kind, .image)
+            let asset = try XCTUnwrap(background.asset)
+            XCTAssertFalse(asset.name.isEmpty)
+            XCTAssertFalse(asset.name.hasPrefix("tmp:"))
+            XCTAssertEqual(content.meta.coverEnabled, kind == "cover")
+        }
+    }
+
+    func testCustomTemplateMissingAssetNameDoesNotChangePages() async throws {
+        let results: [JSONValue] = [[:], ["asset": ""], ["asset": .null]]
+        for result in results {
+            let h = harness(); registerPages(h, assetResult: result)
+            _ = try await h.run("template.import", ["url": .string(try image(h)), "kind": "cover", "id": "custom01"])
+            let before = try h.snapshot()
+            do {
+                _ = try await apply(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "custom01", "custom": true])
+                XCTFail("Expected a missing asset error")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .internalError)
+            }
+            XCTAssertEqual(try h.snapshot(), before)
+        }
     }
 
     func testApplyCustomCoverThenPaperAndUndoRedo() async throws {

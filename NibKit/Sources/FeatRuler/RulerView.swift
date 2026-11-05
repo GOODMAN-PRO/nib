@@ -580,6 +580,12 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
         }
     }
 
+    #if DEBUG
+    private func qaRotation(_ state: String) {
+        NSLog("%@", "[Nib QA ruler] state=\(state) touches=\(manipulation?.fingers.count ?? 0) locations=\(String(describing: manipulation?.fingers)) rotating=\(manipulation?.isRotating ?? false) pose=\(String(describing: manipulation?.pose))")
+    }
+    #endif
+
     // MARK: Touches (routed by the canvas after `hitTest` claimed them)
 
     func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
@@ -589,6 +595,9 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
+        #if DEBUG
+        defer { qaRotation("began") }
+        #endif
         guard !sample.isPencil else { return }               // fingers move the ruler; the Pencil writes
         let p = viewPoint(sample, host)
         if manipulation == nil {
@@ -601,6 +610,9 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     }
 
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
+        #if DEBUG
+        defer { qaRotation("moved") }
+        #endif
         guard var g = manipulation else { return }
         let moves = samples.filter { !$0.isPencil && !$0.isPredicted }.map { (id: $0.touchID, point: viewPoint($0, host)) }
         guard !moves.isEmpty else { return }
@@ -614,6 +626,9 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     }
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
+        #if DEBUG
+        defer { qaRotation("ended") }
+        #endif
         guard !sample.isPencil, var g = manipulation else { return }
         let done = g.remove(sample.touchID)
         manipulation = g
@@ -630,6 +645,9 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     }
 
     func touchesCancelled(host: CanvasHost) {
+        #if DEBUG
+        defer { qaRotation("cancelled") }
+        #endif
         manipulation = nil
         live = nil
         scheduleHUDHide()

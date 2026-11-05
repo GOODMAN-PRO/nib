@@ -200,27 +200,29 @@ final class DropletField {
     @ObservationIgnored private var idleDiagnostic: DispatchWorkItem?
 
     /// Text input can leave a native animation running even when our field has parked.
-    /// Report both outcomes, once two seconds have passed since the last input.
+    /// Keep the existing two-second debounce; keyboard/menu triggers additionally use 1s/5s.
     @MainActor func noteQAInput(in window: UIWindow?) {
         idleDiagnostic?.cancel()
-        let work = DispatchWorkItem { [weak self, weak window] in
-            guard let self else { return }
-            let states = self.order.compactMap { id -> String? in
-                guard let e = self.entries[id] else { return nil }
-                return "\(id): drawn=\(self.isDrawn(e)) reshape=\(e.reshape) offset=\(e.dyn.offset.isResting) size=\(e.dyn.size.isResting) corner=\(e.dyn.corner.isResting) stretch=\(e.dyn.stretch.isResting) lift=\(e.dyn.lift.isResting) anchor=\(e.dyn.anchor.isResting) bud=\(String(describing: e.bud))"
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                NibQAIdleDiagnostics.dump(reason: "text+2s", fieldState: self.qaIdleState())
             }
-            NSLog("%@", "[Nib QA idle] field=\(ObjectIdentifier(self)) active=\(self.isActive) driver=\(self.driver?.isRunning ?? false) inking=\(self.isInking) beads=\(self.beads) bonds=\(self.bonds.count) meniscuses=\(self.meniscuses.count) satellites=\(self.satellites.count) entries=\(states)")
-            func inspect(_ layer: CALayer) {
-                for key in layer.animationKeys() ?? [] {
-                    guard let animation = layer.animation(forKey: key) else { continue }
-                    NSLog("%@", "[Nib QA idle] layer=\(type(of: layer)) delegate=\(String(describing: layer.delegate.map { type(of: $0) })) key=\(key) duration=\(animation.duration) repeats=\(animation.repeatCount) repeatDuration=\(animation.repeatDuration) speed=\(animation.speed) hidden=\(layer.isHidden)")
-                }
-                for child in layer.sublayers ?? [] { inspect(child) }
-            }
-            if let window { inspect(window.layer) }
         }
         idleDiagnostic = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+    }
+
+    @MainActor func noteQAKeyboard(_ name: String) {
+        NibQAIdleDiagnostics.schedule(reason: name) { [weak self] in self?.qaIdleState() }
+    }
+
+    @MainActor private func qaIdleState() -> String {
+        let states = order.compactMap { id -> String? in
+            guard let e = entries[id] else { return nil }
+            return "\(id): drawn=\(isDrawn(e)) reshape=\(e.reshape) offset=\(e.dyn.offset.isResting) size=\(e.dyn.size.isResting) corner=\(e.dyn.corner.isResting) stretch=\(e.dyn.stretch.isResting) lift=\(e.dyn.lift.isResting) anchor=\(e.dyn.anchor.isResting) bud=\(String(describing: e.bud))"
+        }
+        return "field=\(ObjectIdentifier(self)) active=\(isActive) driver=\(driver?.isRunning ?? false) inking=\(isInking) beads=\(beads) bonds=\(bonds.count) meniscuses=\(meniscuses.count) satellites=\(satellites.count) entries=\(states)"
     }
     #endif
     @ObservationIgnored private var isActive = true
@@ -1196,3 +1198,54 @@ final class DisplayLinkDriver: NSObject {
         if !onTick(dt) { stop() }
     }
 }
+
+#if DEBUG
+/// Shared DEBUG-only observation for NibDesign's input lifecycle, F019 library
+/// menus and F044 board menus. Uses public window/layer APIs; never changes animations.
+@MainActor
+public enum NibQAIdleDiagnostics {
+    public static func schedule(reason: String, fieldState: (@MainActor () -> String?)? = nil) {
+        for delay in [1, 5] {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(delay))
+                dump(reason: "\(reason)+\(delay)s", fieldState: fieldState?())
+            }
+        }
+    }
+
+    /// At most 4000 layers and 12 lines per dump, including the field and totals.
+    /// Pack multiple animations per line and report omissions when the output cap wins.
+    public static func dump(reason: String, fieldState: String? = nil) {
+        let prefix = "[Nib QA idle] "
+        var lines: [String] = []
+        if let fieldState { lines.append(String(fieldState.prefix(850))) }
+        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
+        var pending = windows.map { (window: NSStringFromClass(type(of: $0)), layer: $0.layer) }
+        var visited = 0
+        var animations = 0
+        var omitted = 0
+        var packed = ""
+        // Breadth first across window roots so a large document does not consume
+        // the budget before text-effects and keyboard windows are inspected.
+        while visited < pending.count && visited < 4000 {
+            let entry = pending[visited]
+            visited += 1
+            for key in entry.layer.animationKeys() ?? [] {
+                guard let animation = entry.layer.animation(forKey: key) else { continue }
+                animations += 1
+                let record = "window=\(entry.window) layer=\(type(of: entry.layer)) key=\(String(key.prefix(160))) duration=\(animation.duration) repeatCount=\(animation.repeatCount)"
+                if !packed.isEmpty && packed.count + record.count + 3 > 850 {
+                    if lines.count < 11 { lines.append(packed) } else { omitted += 1 }
+                    packed = ""
+                }
+                if lines.count < 11 { packed += (packed.isEmpty ? "" : " | ") + record }
+                else { omitted += 1 }
+            }
+            pending.append(contentsOf: (entry.layer.sublayers ?? []).map { (window: entry.window, layer: $0) })
+        }
+        if !packed.isEmpty && lines.count < 11 { lines.append(packed) }
+        lines.append("reason=\(reason) windows=\(windows.count) layers=\(visited) layerLimitReached=\(visited >= 4000) animations=\(animations) omittedRecords=\(omitted)")
+        for line in lines { NSLog("%@", prefix + String(line.prefix(850))) }
+    }
+}
+#endif

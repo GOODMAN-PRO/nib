@@ -51,6 +51,11 @@ public struct NibDropletContainer<Content: View>: View {
             ].map { NotificationCenter.default.publisher(for: $0) })) { notification in
                 field.noteQAInput(in: (notification.object as? UIView)?.window)
             }
+            .onReceive(Publishers.MergeMany([
+                UIResponder.keyboardDidShowNotification, UIResponder.keyboardDidHideNotification
+            ].map { NotificationCenter.default.publisher(for: $0) })) { notification in
+                field.noteQAKeyboard(notification.name.rawValue)
+            }
             #endif
     }
 

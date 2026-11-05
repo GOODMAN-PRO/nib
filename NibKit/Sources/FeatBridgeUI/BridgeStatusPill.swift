@@ -304,6 +304,9 @@ struct BridgeDetailsPopover: View {
             try await BridgeCalls.setEnabled(app, enabled: false)
             state.detailsPresented = false
             await monitor.refresh()
+            #if DEBUG
+            NSLog("%@", "[Nib QA bridge] pill turnOff awaited enabled=\(String(describing: monitor.snapshot?.enabled)) state=\(String(describing: monitor.snapshot?.state))")
+            #endif
         } catch {
             state.error = NibError.wrap(error).message
         }

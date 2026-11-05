@@ -814,6 +814,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, itemsForBeginning session: UIDragSession,
                         at indexPath: IndexPath) -> [UIDragItem] {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] itemsForBeginning index=\(indexPath) selection=\(model.selection.count)")
+        #endif
         guard let doc = model.doc, let page = pageID(at: indexPath), model.app.services.lock?.isLocked(doc) != true else {
             return []
         }
@@ -823,7 +826,11 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
             pages += model.orderedSelection.filter { $0 != page }
         }
         session.localContext = PageDragSession(doc: doc)
-        return pages.compactMap { dragItem($0, doc: doc) }
+        let items = pages.compactMap { dragItem($0, doc: doc) }
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] itemsForBeginning offered=\(items.count) pages=\(pages.count)")
+        #endif
+        return items
     }
 
     /// Tapping other thumbnails while holding a drag adds them to the stack (D-058).
@@ -886,6 +893,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     func collectionView(_ collectionView: UICollectionView, dropSessionDidUpdate session: UIDropSession,
                         withDestinationIndexPath destinationIndexPath: IndexPath?) -> UICollectionViewDropProposal {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] proposal destination=\(String(describing: destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(session)))")
+        #endif
         guard model.canEdit, let kind = dropKind(session) else {
             return UICollectionViewDropProposal(operation: .forbidden)
         }
@@ -894,6 +904,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     }
 
     func collectionView(_ collectionView: UICollectionView, performDropWith coordinator: UICollectionViewDropCoordinator) {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] performDrop items=\(coordinator.items.count) destination=\(String(describing: coordinator.destinationIndexPath)) canEdit=\(model.canEdit) kind=\(String(describing: dropKind(coordinator.session)))")
+        #endif
         guard let doc = model.doc, model.canEdit, let kind = dropKind(coordinator.session) else { return }
         let location = coordinator.session.location(in: collectionView)
         let model = self.model
@@ -901,6 +914,9 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         case .reorder:
             let pages = coordinator.items.compactMap { ($0.dragItem.localObject as? PageDragItem)?.page }
             let target = dropTarget(at: location, destination: coordinator.destinationIndexPath, moving: Set(pages))
+            #if DEBUG
+            NSLog("%@", "[Nib QA pages] reorder pages=\(pages.count) target=\(target)")
+            #endif
             guard let request = model.beginReorder(pages, to: target) else { return }
             update(force: true)
             for item in coordinator.items {
@@ -1047,19 +1063,49 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         return [selectAll, copy, trash, done]
     }
 
-    @objc private func selectAllPages() { model.selectAll() }
+    @objc private func selectAllPages() {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] key action=selectAll selecting=\(model.isSelecting) selection=\(model.selection.count)")
+        #endif
+        model.selectAll()
+    }
 
-    @objc private func copyPages() { runSelectionAction("copy") }
+    @objc private func copyPages() {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] key action=copy selecting=\(model.isSelecting) selection=\(model.selection.count)")
+        #endif
+        runSelectionAction("copy")
+    }
 
-    @objc private func trashPages() { runSelectionAction("trash") }
+    @objc private func trashPages() {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] key action=trash selecting=\(model.isSelecting) selection=\(model.selection.count)")
+        #endif
+        runSelectionAction("trash")
+    }
 
-    @objc private func endSelecting() { model.setSelecting(false) }
+    @objc private func endSelecting() {
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] key action=endSelecting selecting=\(model.isSelecting) selection=\(model.selection.count)")
+        #endif
+        model.setSelecting(false)
+    }
 
     /// The keyboard runs the same `sidebarSelection` entry the bottom row shows (when it is available); a multi-page
     /// Trash asks first, as it does there.
     private func runSelectionAction(_ key: String) {
         let context = model.selectionMenuContext()
-        guard let item = model.app.ui.menus.get(SidebarMenus.selectionMenuID(key)), item.isVisible(context) else { return }
+        guard let item = model.app.ui.menus.get(SidebarMenus.selectionMenuID(key)) else {
+            #if DEBUG
+            NSLog("%@", "[Nib QA pages] action=\(key) selection=\(model.selection.count) returnedEarly=missing-menu-item")
+            #endif
+            return
+        }
+        let visible = item.isVisible(context)
+        #if DEBUG
+        NSLog("%@", "[Nib QA pages] action=\(key) selection=\(model.selection.count) visible=\(visible) returnedEarly=\(!visible)")
+        #endif
+        guard visible else { return }
         model.perform(item, context)
     }
 }

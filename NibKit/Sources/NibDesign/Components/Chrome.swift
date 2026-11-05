@@ -193,11 +193,17 @@ public struct NibToast: View {
     public var body: some View {
         HStack(spacing: NibSpacing.m) {
             Text(message)
+                .accessibilityIdentifier("nib.toast")
                 .font(NibFont.callout)
                 .foregroundStyle(NibChromeColor(NibColor.label))
                 .lineLimit(2)
             if let action {
-                Button(action.title, action: action.handler).nibCommand(action.command)
+                Button(action.title) {
+                    #if DEBUG
+                    NSLog("%@", String("[Nib QA toast] button action=\(action.title) message=\(message)".prefix(890)))
+                    #endif
+                    action.handler()
+                }.nibCommand(action.command)
                     .font(NibFont.button)
                     .foregroundStyle(NibColor.accent)
                     .buttonStyle(.plain)

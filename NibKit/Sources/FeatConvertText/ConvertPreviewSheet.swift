@@ -89,6 +89,10 @@ final class ConvertPreviewModel {
                 ["refs": .array(refs.map(JSONValue.string))], session: session)
             try Task.checkCancellation()
             guard let recognized = result["text"]?.stringValue else { throw NibError.unavailable(String(localized: "Handwriting recognition")) }
+            #if DEBUG
+            // A cached result may not run Vision again; correlate this with its bitmap log.
+            NSLog("%@", String("[Nib QA recognize] convert preview refs=\(refs.count) stale=\(stale) text=\(recognized)".prefix(890)))
+            #endif
             guard !stale else { return }
             text = recognized
             loaded = true

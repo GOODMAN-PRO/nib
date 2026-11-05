@@ -20,6 +20,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         }
         do { try NibUITestMode.prepareStorage() }
         catch { UITestFixture.failure = "Could not prepare fixture storage: \(error)" }
+        // The unsigned UI-test host cannot write Keychain items. Install before feature registration.
+        if NibUITestMode.isEnabled { Keychain.store = UITestSecretStore() }
         let app = NibApp(defaults: UITestFixture.defaults())
         app.gateway.presenter = AppDelegate.confirmer
         let disabled = NibUITestMode.isEnabled ? Set<String>() : SafeMode.disabledFeatures
@@ -196,5 +198,25 @@ final class ExternalDisplaySceneDelegate: UIResponder, UIWindowSceneDelegate {
         window.rootViewController = root
         window.isHidden = false
         self.window = window
+    }
+}
+
+/// Disposable secrets for the explicit fixture launch only. Current UI tests reopen
+/// panels but do not expect credentials to survive a process relaunch.
+private final class UITestSecretStore: SecretStore {
+    private let lock = NSLock()
+    private var values: [String: [String: Data]] = [:]
+
+    func set(_ data: Data?, service: String, account: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        values[service, default: [:]][account] = data
+        return true
+    }
+
+    func get(service: String, account: String) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[service]?[account]
     }
 }
