@@ -1693,7 +1693,7 @@ struct SchemaFieldControl: View {
                     HStack(spacing: 8) {
                         Text(verbatim: field.title).fixedSize()
                         numberSlider(lo: lo, hi: hi, integer: integer).frame(width: 140)
-                        Text(verbatim: PluginNumberField.format(number, integer: integer))
+                        Text(verbatim: PluginNumberField.display(number, integer: integer))
                             .monospacedDigit().fixedSize()
                     }
                 } else {
@@ -1701,7 +1701,7 @@ struct SchemaFieldControl: View {
                         HStack {
                             Text(verbatim: field.title)
                             Spacer()
-                            Text(verbatim: PluginNumberField.format(number, integer: integer)).monospacedDigit()
+                            Text(verbatim: PluginNumberField.display(number, integer: integer)).monospacedDigit()
                         }
                         numberSlider(lo: lo, hi: hi, integer: integer)
                     }
@@ -1736,7 +1736,7 @@ struct SchemaFieldControl: View {
             if !editing { commit(field.key, .number(integer ? number.rounded() : number)) }
         }
         .accessibilityLabel(Text(verbatim: field.title))
-        .accessibilityValue(Text(verbatim: PluginNumberField.format(number, integer: integer)))
+        .accessibilityValue(Text(verbatim: PluginNumberField.display(number, integer: integer)))
     }
 
     private func textField(keyboard: UIKeyboardType, parse: @escaping () -> JSONValue?) -> some View {
@@ -1785,6 +1785,20 @@ struct SchemaFieldControl: View {
 
 /// Keep legacy large values readable without converting an untrusted Double with a trapping initializer.
 enum PluginNumberField {
+    /// Compact slider labels and VoiceOver values must not expose binary floating-point noise.
+    /// Editing keeps the separate round-trip formatter below so drafts never round stored values.
+    static func display(_ n: Double, integer: Bool, locale: Locale = .current) -> String {
+        guard n.isFinite else { return String(n) }
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
+        formatter.usesSignificantDigits = false
+        formatter.maximumIntegerDigits = 309
+        formatter.maximumFractionDigits = integer ? 0 : 2
+        return formatter.string(from: NSNumber(value: integer ? n.rounded() : n)) ?? String(n)
+    }
+
     static func format(_ n: Double, integer: Bool, locale: Locale = .current) -> String {
         guard n.isFinite else { return String(n) }
         let formatter = NumberFormatter()

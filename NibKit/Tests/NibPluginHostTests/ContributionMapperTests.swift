@@ -315,6 +315,20 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertThrowsError(try PluginPaths.resolve("/etc/hosts", in: empty, path: "$"))
     }
 
+    func testSliderDisplayHidesFloatingPointNoiseWithoutRoundingDrafts() {
+        let us = Locale(identifier: "en_US")
+        let de = Locale(identifier: "de_DE")
+        XCTAssertEqual(PluginNumberField.display(0.5700000000000001, integer: false, locale: us), "0.57")
+        XCTAssertEqual(PluginNumberField.display(0.30000000000000004, integer: false, locale: us), "0.3")
+        XCTAssertEqual(PluginNumberField.display(0.5700000000000001, integer: false, locale: de), "0,57")
+        XCTAssertEqual(PluginNumberField.display(42.6, integer: true, locale: us), "43")
+        for locale in [us, de] {
+            let n = 0.5700000000000001
+            let draft = PluginNumberField.format(n, integer: false, locale: locale)
+            XCTAssertEqual(PluginNumberField.parse(draft, min: nil, max: nil, integer: false, locale: locale), .number(n))
+        }
+    }
+
     func testNumberFieldsParseFullLocalizedNumbers() {
         let us = Locale(identifier: "en_US")
         let de = Locale(identifier: "de_DE")
