@@ -231,6 +231,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// when the editor leaves its container or the document closes; showing it again re-opens it.
     func closeCanvas() {
         guard !isClosed else { return }
+        if pinchStartZoom != nil {
+            pinchStartZoom = nil
+            pinchAnchor = nil
+            scrollView.panGestureRecognizer.isEnabled = pinchPanWasEnabled
+            scrollViewDidEndZooming(scrollView, with: scrollView.contentView, atScale: scrollView.zoomScale)
+        }
         isClosed = true
         host.inputController?.canvasWillClose(host)
         host.inputController = nil
@@ -249,6 +255,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         notificationObservers.removeAll()
         loadingTask?.cancel()
         hudLingerTask?.cancel()
+        hud.setPinching(false)
         scrollView.recycleAll()
         if session.editor === self { session.editor = nil }
         app.ui.setNeedsChromeUpdate(session)

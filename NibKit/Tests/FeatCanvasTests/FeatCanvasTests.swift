@@ -860,6 +860,28 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(vc.host.viewPoint(hit.point, page: hit.page).y - vc.scrollView.bounds.minY, moved.y, accuracy: 1)
     }
 
+    func testClosingDuringPinchRestoresPanAcrossReopening() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let focal = CGPoint(x: 400, y: 350)
+        for enabled in [true, false] {
+            vc.scrollView.panGestureRecognizer.isEnabled = enabled
+            vc.updatePinch(state: .began, scale: 1, centroid: focal)
+            vc.updatePinch(state: .changed, scale: 1.2, centroid: focal)
+            vc.closeCanvas()
+            vc.updatePinch(state: .cancelled, scale: 1.2, centroid: focal)
+            XCTAssertEqual(vc.scrollView.panGestureRecognizer.isEnabled, enabled)
+            XCTAssertFalse(vc.scrollView.isZoomingNow)
+            XCTAssertFalse(vc.hud.isPinching)
+            vc.viewWillAppear(false)
+            XCTAssertFalse(vc.isClosed)
+            vc.updatePinch(state: .began, scale: 1, centroid: focal)
+            vc.updatePinch(state: .ended, scale: 1, centroid: focal)
+            XCTAssertEqual(vc.scrollView.panGestureRecognizer.isEnabled, enabled)
+        }
+    }
+
     func testDocumentOwnedPinchKeepsItsFocalPointAndClampsWithoutEditing() throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h)
