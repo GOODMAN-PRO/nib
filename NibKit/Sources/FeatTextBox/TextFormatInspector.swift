@@ -982,7 +982,7 @@ private struct TextParagraphSection: View {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 NibSegmentedControl(selection: Binding(get: { model.state.align == .natural ? .left : model.state.align },
                                                        set: { model.setAlign($0) }),
-                                    options: TextFormatOptions.alignments,
+                                    options: TextFormatOptions.alignments, sizing: .fitting,
                                     title: { TextFormatOptions.alignmentTitle($0) })
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(String(localized: "Alignment"))
@@ -991,7 +991,7 @@ private struct TextParagraphSection: View {
                     .foregroundStyle(NibColor.labelSecondary)
                     .accessibilityHidden(true)
                 NibSegmentedControl(selection: Binding(get: { model.state.lineSpacingOption }, set: { model.setLineSpacing($0) }),
-                                    options: LineSpacingOption.allCases,
+                                    options: LineSpacingOption.allCases, sizing: .fitting,
                                     title: { $0.title })
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel(String(localized: "Line Spacing"))
