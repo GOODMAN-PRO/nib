@@ -166,7 +166,7 @@ struct WritingPosture: Hashable, Identifiable {
 /// Two rows of four drawings (right hand, then left hand). The selected one sits on `fill3` with a check.
 struct PosturePicker: View {
     /// This screen's own layout, not a system measure (DESIGN_SYSTEM.md "NibDesign v2 additions" keeps it local).
-    static let cellHeight: CGFloat = 56
+    static let cellHeight: CGFloat = 72
 
     @Binding var selection: Int
 
@@ -174,15 +174,17 @@ struct PosturePicker: View {
     private var cellShape: RoundedRectangle { RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NibSpacing.s) {
+        VStack(alignment: .leading, spacing: NibSpacing.l) {
             ForEach(WritingPosture.Hand.allCases, id: \.self) { hand in
-                Text(hand.title)
-                    .font(NibFont.footnote)
-                    .foregroundStyle(NibColor.labelSecondary)
-                    .accessibilityHidden(true)
-                HStack(spacing: NibSpacing.xs) {
-                    ForEach(WritingPosture.Wrist.allCases, id: \.self) { wrist in
-                        cell(WritingPosture(hand: hand, wrist: wrist))
+                VStack(alignment: .leading, spacing: NibSpacing.s) {
+                    Text(hand.title)
+                        .font(NibFont.footnote)
+                        .foregroundStyle(NibColor.labelSecondary)
+                        .accessibilityHidden(true)
+                    HStack(spacing: NibSpacing.s) {
+                        ForEach(WritingPosture.Wrist.allCases, id: \.self) { wrist in
+                            cell(WritingPosture(hand: hand, wrist: wrist))
+                        }
                     }
                 }
             }
@@ -204,7 +206,7 @@ struct PosturePicker: View {
         } label: {
             PostureIllustration(posture: posture, isSelected: isSelected)
                 .frame(maxWidth: .infinity, minHeight: Self.cellHeight, maxHeight: Self.cellHeight)
-                .background(isSelected ? NibColor.fill3 : Color.clear, in: cellShape)
+                .background(isSelected ? NibColor.fill3 : NibColor.fill4, in: cellShape)
                 .overlay(alignment: .topTrailing) {
                     if isSelected {
                         Image(nib: .checkCircleFill)
@@ -222,6 +224,14 @@ struct PosturePicker: View {
     }
 }
 
+/// The palm centre is one reach from the tip and its ellipse extends another 0.55 reach.
+/// Reserve an inset and the widest stroke before fitting that full radius into the tile.
+enum PostureIllustrationGeometry {
+    static func reach(in size: CGSize) -> CGFloat {
+        max(0, min(size.width, size.height) / 2 - NibSpacing.s - NibStroke.thick / 2) / 1.55
+    }
+}
+
 /// A writing line, the pen on it and the resting palm, drawn from the posture's angles.
 struct PostureIllustration: View {
     let posture: WritingPosture
@@ -230,7 +240,7 @@ struct PostureIllustration: View {
     var body: some View {
         Canvas { context, size in
             let tip = CGPoint(x: size.width / 2, y: size.height / 2)
-            let reach = min(size.width, size.height) * 0.36
+            let reach = PostureIllustrationGeometry.reach(in: size)
 
             var line = Path()
             line.move(to: CGPoint(x: NibSpacing.s, y: tip.y))
