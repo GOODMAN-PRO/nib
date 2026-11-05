@@ -30,6 +30,7 @@ final class CaptureUITests: XCTestCase {
     private func variants(scenario: NibUI.FixtureScenario = .standard,
                           _ body: () throws -> Void) {
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         do {
             ui.app.launchArguments = ["-NibUITestFixture", "-NibUITestScenario", scenario.rawValue,
                                       "-NibUITestAppearance", appearance,

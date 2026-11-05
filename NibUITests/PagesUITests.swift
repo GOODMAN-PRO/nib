@@ -19,6 +19,7 @@ final class PagesUITests: XCTestCase {
         // The shared runner permits 300 seconds; cold fixture startup is part of each test.
         executionTimeAllowance = 300
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         try ui.launchFixture()
         let fm = FileManager.default
         let containers = URL(fileURLWithPath: NSHomeDirectory()).deletingLastPathComponent()

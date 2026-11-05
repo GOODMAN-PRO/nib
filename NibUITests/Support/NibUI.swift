@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import ObjectiveC
 
 struct QAState: Decodable {
     struct Offset: Decodable { let x: Double; let y: Double }
@@ -414,6 +415,30 @@ final class NibUI {
         for start in stride(from: 0, to: characters.count, by: 1200) {
             let chunk = String(characters[start..<min(start + 1200, characters.count)])
             NSLog("[Nib QA] %@ [%ld] %@", prefix, start / 1200, chunk)
+        }
+    }
+
+    private static var idleSelectorClasses: Set<String> = []
+
+    /// Discovery only: do not invoke, replace or swizzle any private XCTest waiting selector.
+    func logIdleSelectors(for testClass: String) {
+        guard Self.idleSelectorClasses.insert(testClass).inserted else { return }
+        for name in ["XCUIApplicationProcess", "XCUIApplicationImpl"] {
+            guard let cls = NSClassFromString(name) else {
+                logQA("XCTest idle selectors", "testClass=\(testClass) class=\(name) unavailable")
+                continue
+            }
+            var count: UInt32 = 0
+            guard let methods = class_copyMethodList(cls, &count) else {
+                logQA("XCTest idle selectors", "testClass=\(testClass) class=\(name) no instance methods")
+                continue
+            }
+            defer { free(methods) }
+            let names = (0..<Int(count)).map { NSStringFromSelector(method_getName(methods[$0])) }.filter {
+                let lower = $0.lowercased()
+                return lower.contains("uiescen") || lower.contains("idle") || lower.contains("nimation")
+            }.sorted()
+            logQA("XCTest idle selectors", "testClass=\(testClass) class=\(name) selectors=\(names)")
         }
     }
 

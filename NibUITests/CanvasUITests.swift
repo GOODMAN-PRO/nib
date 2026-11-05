@@ -17,6 +17,7 @@ final class CanvasUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         ui = NibUI()
+        ui.logIdleSelectors(for: String(describing: type(of: self)))
         let scenario: NibUI.FixtureScenario
         if name.contains("testFailedPage") { scenario = .failedRender }
         else if name.contains("testLargeDocumentMemoryRecovery") { scenario = .largeDocument }
