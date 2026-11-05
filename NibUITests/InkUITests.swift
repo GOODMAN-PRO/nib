@@ -58,7 +58,8 @@ final class InkUITests: XCTestCase {
     /// Waits for the Squeeze section and its palette row; repeated labels in Double-tap are outside this scope.
     private func squeezePaletteBinding() throws -> XCUIElement {
         let heading = ui.app.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).firstMatch
-        ui.revealFormElement(heading)
+        let pencilDetail = ui.app.collectionViews.containing(.button, identifier: "Switch between current tool and eraser").firstMatch
+        ui.revealFormElement(in: pencilDetail) { heading }
         try wait("Squeeze section heading must be visible") { heading.exists && heading.isHittable }
         let detail = try XCTUnwrap(scrollPanels.filter {
             $0.staticTexts.matching(NSPredicate(format: "label ==[c] 'Squeeze'")).count > 0

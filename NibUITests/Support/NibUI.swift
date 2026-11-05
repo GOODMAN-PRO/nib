@@ -122,36 +122,61 @@ final class NibUI {
     func revealFormElement(in form: XCUIElement? = nil, target: () -> XCUIElement) {
         let initial = target()
         let identity = initial.exists ? (try? initial.snapshot()) : nil
-        // Rebuild queries on every iteration: library grids and native forms replace their containers on scroll.
         func liveList() -> XCUIElement? {
-            if let form, form.exists, hasVisibleFrame(form), form.isHittable { return form }
-            var candidates: [(XCUIElement, CGRect, Bool, String)] = []
-            for kind in [XCUIElement.ElementType.collectionView, .table, .scrollView] {
-                let query = app.descendants(matching: kind)
-                for index in 0..<min(query.count, 24) {
-                    let list = query.element(boundBy: index)
-                    guard list.exists, list.identifier != "nib.canvas" else { continue }
-                    let frame = list.frame
-                    guard frame.height > 100, frame.width > 200,
-                          frame.intersects(app.windows.firstMatch.frame), list.exists, list.isHittable else { continue }
-                    let contains = identity.map { node in
-                        list.descendants(matching: node.elementType).matching(NSPredicate(
-                            format: "identifier == %@ AND label == %@", node.identifier, node.label)).firstMatch.exists
-                    } ?? false
-                    candidates.append((list, frame, contains, list.label))
+            if let form, form.exists, hasVisibleFrame(form) { return form }
+            guard let root = try? app.snapshot() else { return nil }
+            let window = app.windows.firstMatch.frame
+            var candidates: [(element: XCUIElement, node: XCUIElementSnapshot, surface: Int, contains: Bool, overflow: Bool)] = []
+            var surfaceOrder = 0
+            func containsTarget(_ node: XCUIElementSnapshot) -> Bool {
+                guard let identity else { return false }
+                if node.elementType == identity.elementType && node.identifier == identity.identifier
+                    && node.label == identity.label { return true }
+                return node.children.contains { containsTarget($0) }
+            }
+            func overflows(_ node: XCUIElementSnapshot, frame: CGRect) -> Bool {
+                if node.label.hasPrefix("Vertical scroll bar,") {
+                    let words = node.label.split(separator: " ")
+                    if words.count > 3, let pages = Int(words[3]), pages > 1 { return true }
+                }
+                if node.frame.height > frame.height + 2 && node.frame.width <= frame.width + 2 { return true }
+                return node.children.contains { overflows($0, frame: frame) }
+            }
+            func visit(_ node: XCUIElementSnapshot, element: XCUIElement, surface: Int) {
+                var scope = surface
+                if [.sheet, .popover, .alert].contains(node.elementType), node.frame.intersects(window) {
+                    surfaceOrder += 1; scope = surfaceOrder
+                }
+                let frame = node.frame
+                if [.collectionView, .table, .scrollView].contains(node.elementType), node.identifier != "nib.canvas",
+                   frame.width > 200, frame.height > 100, frame.intersects(window) {
+                    candidates.append((element, node, scope, containsTarget(node), overflows(node, frame: frame)))
+                }
+                for (index, child) in node.children.enumerated() {
+                    visit(child, element: element.children(matching: .any).element(boundBy: index), surface: scope)
                 }
             }
-            // Prefer the full-size copy of the SAME named popover, then the tightest containing
-            // viewport. Time Keeper has a taller inner ScrollView clipped by its outer panel.
-            let live = candidates.filter { candidate in
-                candidate.3.isEmpty || !candidates.contains {
-                    $0.3 == candidate.3 && $0.1.width * $0.1.height > candidate.1.width * candidate.1.height
+            visit(root, element: app, surface: 0)
+            let foremost = surfaceOrder
+            let presented = candidates.filter { $0.surface == foremost }
+            let live = presented.filter { candidate in
+                candidate.node.label.isEmpty || !presented.contains {
+                    $0.node.label == candidate.node.label
+                        && $0.node.frame.width * $0.node.frame.height > candidate.node.frame.width * candidate.node.frame.height
                 }
             }
-            let containing = live.filter { $0.2 }
-            return (containing.isEmpty ? live : containing).min {
-                $0.1.width * $0.1.height < $1.1.width * $1.1.height
-            }?.0
+            let containing = live.filter { $0.contains }
+            if !containing.isEmpty {
+                return containing.min { $0.node.frame.width * $0.node.frame.height < $1.node.frame.width * $1.node.frame.height }?.element
+            }
+            // Lazy rows are absent: overflow wins, then the native detail pane, then area (never narrowest).
+            return live.sorted {
+                if $0.overflow != $1.overflow { return $0.overflow }
+                let firstNative = [.collectionView, .table].contains($0.node.elementType)
+                let secondNative = [.collectionView, .table].contains($1.node.elementType)
+                if firstNative != secondNative { return firstNative }
+                return $0.node.frame.width * $0.node.frame.height > $1.node.frame.width * $1.node.frame.height
+            }.first?.element
         }
         var visited = Set<String>()
         for _ in 0..<16 {
