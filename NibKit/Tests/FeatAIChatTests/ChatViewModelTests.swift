@@ -193,6 +193,41 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertTrue(model.entries.last?.reverted == true)
     }
 
+    func testWhollySkippedUndoShowsReasonAndCanBeRetriedAfterLaterEditIsUndone() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.editForRevert", title: "Edit", summary: "Edit fixture", effect: .edit)) { p, ctx in
+            try ctx.mutate { tx in
+                var item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+                if p["later"]?.boolValue == true { item.layer = 3 }
+                else { item.locked = true }
+                try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+            }
+            return [:]
+        }
+        h.app.services.ai = FakeAIService(responses: [.init(text: "Updated", toolCalls: [("test.editForRevert", [:])])], bus: h.app.bus)
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        model.mode = .edit
+        _ = try await model.send(prompt: "Update", principal: .user, group: "SKIPPEDCHAT")
+        let receipt = try XCTUnwrap(model.entries.last)
+        try await h.run("test.editForRevert", ["later": true])
+        let groups = h.app.bus.history.entries(Fixtures.docID).map(\.group)
+        let result = try await h.run(ChatCommand.undo, ["message": .string(receipt.id)])
+        XCTAssertEqual(result["reverted"]?.intValue, 0)
+        XCTAssertEqual(result["skipped"]?.intValue, 1)
+        XCTAssertFalse(try XCTUnwrap(model.entries.last).reverted)
+        let reason = "These records changed after this step. The history entry was kept; undo the later changes and try again."
+        XCTAssertTrue(model.entries.last?.revertNote?.contains(reason) == true)
+        XCTAssertTrue(model.error?.message.contains(reason) == true)
+        XCTAssertEqual(h.app.bus.history.entries(Fixtures.docID).map(\.group), groups)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        let retried = try await h.run(ChatCommand.undo, ["message": .string(receipt.id)])
+        XCTAssertEqual(retried["reverted"]?.intValue, 1)
+        XCTAssertEqual(retried["skipped"]?.intValue, 0)
+        XCTAssertTrue(try XCTUnwrap(model.entries.last).reverted)
+        XCTAssertNil(model.error)
+        XCTAssertFalse(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).locked)
+    }
+
     func testToolTraceUsageFailureAndRetryPreserveThread() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let service = ScriptedChatService()

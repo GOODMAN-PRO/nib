@@ -547,6 +547,7 @@ final class ChatViewModel: ObservableObject {
         var skipped = 0
         var notes: [String] = []
         var failed = 0
+        var retryable = false
         for doc in docs.sorted(by: { $0.raw < $1.raw }) {
             let label = citationLabel(NodeRef.document(doc).description)
             do {
@@ -556,18 +557,20 @@ final class ChatViewModel: ObservableObject {
                 let kept = result["skipped"]?.intValue ?? 0
                 reverted += count
                 skipped += kept
+                if count == 0 && kept > 0 { retryable = true }
                 notes.append(String(localized: "\(label): \(count) changes reverted · \(kept) later edits kept"))
+                if let reason = result["reason"]?.stringValue, !reason.isEmpty { notes.append(reason) }
             } catch {
                 failed += 1
                 notes.append(String(localized: "\(label): Undo failed. \(NibError.wrap(error).message)"))
             }
         }
         if let current = entries.firstIndex(where: { $0.id == entryID }) {
-            entries[current].reverted = failed == 0
+            entries[current].reverted = failed == 0 && !retryable
             entries[current].revertNote = notes.joined(separator: "\n")
         }
-        if failed > 0 { error = NibError(.conflict, notes.joined(separator: "\n")) }
-        else if skipped > 0 { error = NibError(.conflict, "\(skipped) later edits were kept. \(reverted) changes reverted.") }
+        if failed > 0 || skipped > 0 { error = NibError(.conflict, notes.joined(separator: "\n")) }
+        else { error = nil }
         try await persistConversation()
         return ["reverted": .number(Double(reverted)), "skipped": .number(Double(skipped))]
     }
