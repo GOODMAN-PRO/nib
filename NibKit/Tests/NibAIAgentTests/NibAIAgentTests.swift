@@ -77,6 +77,29 @@ final class NibAIAgentTests: XCTestCase {
     // MARK: Conversations
 
     /// Acceptance: chat files written by two devices merge by message id.
+    func testFailedTurnWriteReportsErrorAndFlushRecoversWithoutDuplicates() async throws {
+        let (h, agent) = AgentFixture.make(P(events: [P.answer("Saved on retry")]))
+        let chat = "CHATTEST0001"
+        let destination = h.library.metadataURL.appendingPathComponent("ai")
+            .appendingPathComponent(agent.chatStore.ownFileName(chat))
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        do {
+            _ = try await agent.complete(AgentFixture.request("Keep my question"))
+            XCTFail("A completed turn must report its persistence failure")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .unavailable)
+            XCTAssertNotNil(error.hint)
+        }
+        XCTAssertNotNil(agent.chatStore.flush())
+        try FileManager.default.removeItem(at: destination)
+        XCTAssertNil(agent.chatStore.flush())
+        XCTAssertNil(agent.chatStore.flush())
+        let reopened = store(destination.deletingLastPathComponent(), device: 0x0B)
+        XCTAssertEqual(reopened.messages(chat).map(\.text), ["Keep my question", "Saved on retry"])
+        let records = ChatStore.decodeLines(try Data(contentsOf: destination)).records
+        XCTAssertEqual(records.count, 3)
+    }
+
     func testChatFilesFromTwoDevicesMergeByMessageID() throws {
         let dir = tempFolder()
         let a = store(dir, device: 0x0A)

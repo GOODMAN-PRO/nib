@@ -154,6 +154,33 @@ struct ChatState {
     }
 }
 
+/// Serial durable writes. Failed jobs remain ordered ahead of later writes, including compaction.
+/// Retrying an atomic replacement cannot append a partial record twice.
+private final class ChatWrites {
+    let queue = DispatchQueue(label: "app.nib.aiagent.chats", qos: .utility)
+    private var pending: [() throws -> Void] = []
+
+    func enqueue(_ write: @escaping () throws -> Void) {
+        queue.async {
+            self.pending.append(write)
+            _ = self.retry()
+        }
+    }
+
+    func retry() -> NibError? {
+        while let write = pending.first {
+            do {
+                try write()
+                pending.removeFirst()
+            } catch {
+                return NibError(.unavailable, String(localized: "The conversation could not be saved."),
+                                hint: String(localized: "Free some storage and try again. Unsaved messages are kept for retry while Nib is open."))
+            }
+        }
+        return nil
+    }
+}
+
 /// Conversations stored per device in the library's AI folder: `<chat>.<dev>.jsonl`, one `ChatRecord` per line.
 /// Each device appends only to its own files (§4.3); readers merge every device's file of a chat (and provider
 /// conflict copies, which are folded into this device's file and then removed) by record id and revision. Writes run
@@ -171,7 +198,8 @@ final class ChatStore {
     private let directoryProvider: Directory
     private let clock: HLCClock
     private let accessURL: URL?
-    private let io = DispatchQueue(label: "app.nib.aiagent.chats", qos: .utility)
+    private let writes = ChatWrites()
+    private var io: DispatchQueue { writes.queue }
     private var directory: URL?
     private var resolvedOnce = false
     private var chats: [String: ChatState] = [:]
@@ -273,7 +301,7 @@ final class ChatStore {
         let data = ChatStore.encodeLines(records)
         ownLines[chat, default: 0] += records.count
         ownTombstoned.remove(chat)
-        io.async { ChatStore.appendData(data, to: url, directory: dir) }
+        writes.enqueue { try ChatStore.appendData(data, to: url, directory: dir) }
         compactIfNeeded(chat)
     }
 
@@ -287,6 +315,7 @@ final class ChatStore {
         meta.title = String(clean.prefix(200))
         meta.rev = clock.tick()
         append([meta], chat: chat)
+        if let error = flush() { throw error }
     }
 
     /// Deletes a conversation everywhere: a tombstone replaces this device's file; other devices' files lose to it
@@ -302,6 +331,7 @@ final class ChatStore {
         s.absorb(meta, now: now)
         chats[chat] = s
         rewriteOwnFile(chat, records: [meta])
+        if let error = flush() { throw error }
     }
 
     /// Rates an assistant message ("up" / "down"; nil clears the rating). `message` is a message id, "last" (the
@@ -324,12 +354,21 @@ final class ChatStore {
         r.rating = rating
         r.rev = clock.tick()
         append([r], chat: chat)
+        if let error = flush() { throw error }
         return r
     }
 
-    /// Waits until every queued write reached the disk.
-    func flush() {
-        io.sync {}
+    /// Retries pending writes; a failure is retained for the next flush.
+    @discardableResult
+    func flush() -> NibError? {
+        io.sync { writes.retry() }
+    }
+
+    func flushAsync() async -> NibError? {
+        let writes = self.writes
+        return await withCheckedContinuation { continuation in
+            writes.queue.async { continuation.resume(returning: writes.retry()) }
+        }
     }
 
     // MARK: Folder scan and merge
@@ -426,13 +465,11 @@ final class ChatStore {
         } else {
             ownTombstoned.remove(chat)
         }
-        io.async {
-            do {
-                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                try data.write(to: url, options: .atomic)
-                for conflict in conflicts { try FileManager.default.removeItem(at: conflict) }
-            } catch {
-                agentLog.error("chat file not written: \(error.localizedDescription, privacy: .public)")
+        writes.enqueue {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            for conflict in conflicts where FileManager.default.fileExists(atPath: conflict.path) {
+                try FileManager.default.removeItem(at: conflict)
             }
         }
     }
@@ -488,27 +525,13 @@ final class ChatStore {
         return (records, lines)
     }
 
-    nonisolated static func appendData(_ data: Data, to url: URL, directory: URL) {
+    nonisolated static func appendData(_ data: Data, to url: URL, directory: URL) throws {
         let fm = FileManager.default
-        do {
-            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-            if !fm.fileExists(atPath: url.path) {
-                try data.write(to: url, options: .atomic)
-                return
-            }
-            let handle = try FileHandle(forUpdating: url)
-            defer { try? handle.close() }
-            let end = try handle.seekToEnd()
-            if end > 0 {
-                try handle.seek(toOffset: end - 1)
-                let last = try handle.read(upToCount: 1)
-                try handle.seekToEnd()
-                if last?.first != 0x0A { try handle.write(contentsOf: Data([0x0A])) }
-            }
-            try handle.write(contentsOf: data)
-        } catch {
-            agentLog.error("chat file not appended: \(error.localizedDescription, privacy: .public)")
-        }
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        var contents = fm.fileExists(atPath: url.path) ? try Data(contentsOf: url) : Data()
+        if !contents.isEmpty && contents.last != 0x0A { contents.append(0x0A) }
+        contents.append(data)
+        try contents.write(to: url, options: .atomic)
     }
 
     // MARK: Helpers
