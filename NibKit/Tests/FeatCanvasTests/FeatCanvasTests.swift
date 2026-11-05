@@ -2299,7 +2299,7 @@ final class FeatCanvasTests: XCTestCase {
         let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
         await waitUntil("failed renders to settle") { page.isSettled }
         XCTAssertFalse(vc.errorView.isHidden, "Settling alone is not recovery")
-        XCTAssertEqual(vc.errorView.reason, String(localized: "The page renderer could not finish drawing this page."))
+        XCTAssertEqual(vc.errorView.reason, "the tile could not be drawn")
         h.app.services.renderer = RecordingRenderer()
         page.invalidate(nil)
         await waitUntil("successful rerender") { page.isSettled && !vc.failedPages.contains(Fixtures.boardID) }
@@ -2310,6 +2310,29 @@ final class FeatCanvasTests: XCTestCase {
         page.invalidate(nil)
         await waitUntil("second recovery") { !vc.failedPages.contains(Fixtures.boardID) }
         XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testPreviewOnlyFailureClearsWhenSharpTilesLand() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.services.renderer = PreviewFailureRenderer()
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        await waitUntil("sharp tiles after failed preview") { page.isSettled }
+        XCTAssertFalse(page.tileKeys.isEmpty)
+        XCTAssertTrue(page.hasShownContent)
+        XCTAssertTrue(vc.failedPages.isEmpty)
+        XCTAssertTrue(vc.errorView.isHidden)
+    }
+
+    func testRenderFailureReasonReachesTheBanner() throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        defer { vc.closeCanvas() }
+        let page = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        vc.host.pageTileView(page, didFailWith: NibError(.notFound, "Missing page image"))
+        XCTAssertEqual(vc.errorView.reason, "Missing page image")
+        XCTAssertFalse(vc.errorView.isHidden)
     }
 
     func testOneFailedTileStaysReportedWhenPreviewAndSiblingTilesLand() async throws {
@@ -2704,6 +2727,18 @@ private final class FailingRenderer: PageRenderer {
         return RenderResult(image: image, region: Rect(x: 0, y: 0, width: 1, height: 1), scale: request.scale)
     }
 
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
+}
+
+/// The optional low-resolution fallback fails, while every sharp tile succeeds.
+private final class PreviewFailureRenderer: PageRenderer {
+    private let image = FakeRenderer.blank(CGSize(width: 4, height: 4))
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        guard let region = request.region else { throw NibError(.internalError, "preview failed") }
+        return RenderResult(image: image, region: region, scale: request.scale)
+    }
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
