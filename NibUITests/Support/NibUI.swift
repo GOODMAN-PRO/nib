@@ -126,9 +126,12 @@ final class NibUI {
         let identity = initialSnapshot.flatMap { $0.identifier.isEmpty && $0.label.isEmpty ? nil : $0 }
         func liveList() -> XCUIElement? {
             if let form, form.exists, hasVisibleFrame(form) { return form }
-            guard let root = try? app.snapshot() else { return nil }
+            guard let root = try? app.snapshot() else {
+                logQA("Form reveal unavailable", "snapshotCandidates=0; app snapshot unavailable; candidates not collected")
+                return nil
+            }
             let window = app.windows.firstMatch.frame
-            var candidates: [(element: XCUIElement, node: XCUIElementSnapshot, surface: Int, contains: Bool, overflow: Bool)] = []
+            var candidates: [(node: XCUIElementSnapshot, surface: Int, contains: Bool, overflow: Bool)] = []
             var surfaceOrder = 0
             func containsTarget(_ node: XCUIElementSnapshot) -> Bool {
                 guard let identity else { return false }
@@ -144,7 +147,7 @@ final class NibUI {
                 if node.frame.height > frame.height + 2 && node.frame.width <= frame.width + 2 { return true }
                 return node.children.contains { overflows($0, frame: frame) }
             }
-            func visit(_ node: XCUIElementSnapshot, element: XCUIElement, surface: Int) {
+            func visit(_ node: XCUIElementSnapshot, surface: Int) {
                 var scope = surface
                 if [.sheet, .popover, .alert].contains(node.elementType), node.frame.intersects(window) {
                     surfaceOrder += 1; scope = surfaceOrder
@@ -152,13 +155,13 @@ final class NibUI {
                 let frame = node.frame
                 if [.collectionView, .table, .scrollView].contains(node.elementType), node.identifier != "nib.canvas",
                    frame.width > 200, frame.height > 100, frame.intersects(window) {
-                    candidates.append((element, node, scope, containsTarget(node), overflows(node, frame: frame)))
+                    candidates.append((node, scope, containsTarget(node), overflows(node, frame: frame)))
                 }
-                for (index, child) in node.children.enumerated() {
-                    visit(child, element: element.children(matching: .any).element(boundBy: index), surface: scope)
+                for child in node.children {
+                    visit(child, surface: scope)
                 }
             }
-            visit(root, element: app, surface: 0)
+            visit(root, surface: 0)
             let foremost = surfaceOrder
             // Surface traversal is a preference, not z-order. Rank from the snapshot, then probe
             // only successive winners; retained modal copies must not hide the live form.
@@ -186,7 +189,63 @@ final class NibUI {
                 if firstNative != secondNative { return firstNative }
                 return firstArea > secondArea
             }
-            return ranked.first { $0.element.exists && $0.element.isHittable }?.element
+            var diagnostics: [String] = []
+            var fallback: (element: XCUIElement, rank: Int, frame: CGRect)?
+            func chosen(_ element: XCUIElement, rank: Int, frame: CGRect, hittable: Bool) -> XCUIElement {
+                let node = ranked[rank].node
+                logQA("Form reveal container", "type=\(node.elementType) label=\(node.label) frame=\(frame) rank=\(rank + 1)/\(ranked.count) hittable=\(hittable)")
+                return element
+            }
+            for (rank, candidate) in ranked.enumerated() {
+                let node = candidate.node
+                // Snapshot child ordinals are not live query ordinals. Bind by native type and
+                // available identity, then verify all four edges against the ranked snapshot.
+                var query = app.descendants(matching: node.elementType)
+                if !node.identifier.isEmpty {
+                    query = query.matching(NSPredicate(format: "identifier == %@", node.identifier))
+                }
+                if !node.label.isEmpty {
+                    query = query.matching(NSPredicate(format: "label == %@", node.label))
+                }
+                var walked = 0, existing = 0
+                var resolved: (element: XCUIElement, frame: CGRect, hittable: Bool)?
+                for index in 0..<min(query.count, 24) {
+                    walked += 1
+                    let element = query.element(boundBy: index)
+                    guard element.exists else { continue }
+                    existing += 1
+                    let frame = element.frame
+                    guard abs(frame.minX - node.frame.minX) <= 1,
+                          abs(frame.minY - node.frame.minY) <= 1,
+                          abs(frame.maxX - node.frame.maxX) <= 1,
+                          abs(frame.maxY - node.frame.maxY) <= 1 else { continue }
+                    resolved = (element, frame, element.isHittable)
+                    break
+                }
+                if rank < 8 {
+                    diagnostics.append("rank=\(rank + 1) type=\(node.elementType) label=\(node.label) frame=\(node.frame)"
+                        + " surface=\(candidate.surface) contains=\(candidate.contains) overflow=\(candidate.overflow)"
+                        + " walked=\(walked) existing=\(existing) frameMatched=\(resolved != nil)"
+                        + " exists=\(resolved == nil ? "n/a" : "true") isHittable=\(resolved.map { String($0.hittable) } ?? "n/a")")
+                }
+                guard let resolved else { continue }
+                if resolved.hittable {
+                    return chosen(resolved.element, rank: rank, frame: resolved.frame, hittable: true)
+                }
+                let visible = resolved.frame.intersection(window)
+                if fallback == nil, !visible.isNull, visible.width > 1, visible.height > 1 {
+                    fallback = (resolved.element, rank, resolved.frame)
+                }
+            }
+            // Some native forms report a non-hittable container while their rows accept input.
+            // Drags use app coordinates; this element supplies only snapshots and scoped queries.
+            // Verified frame identity/window overlap replaces the retained off-screen-copy filter.
+            if let fallback {
+                return chosen(fallback.element, rank: fallback.rank, frame: fallback.frame, hittable: false)
+            }
+            logQA("Form reveal unavailable", "snapshotCandidates=\(ranked.count); no resolved hittable or in-window container\n"
+                + diagnostics.joined(separator: "\n"))
+            return nil
         }
         guard var list = liveList(), let firstSnapshot = try? list.snapshot() else {
             logQA("Form reveal unavailable", "No live container snapshot; caller retains its wait/fallback")
