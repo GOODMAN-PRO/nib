@@ -1495,6 +1495,12 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(LibraryPresentation.contentWidth(viewport: 0, inlineSidebar: true), 0)
     }
 
+    func testEmptyStateUsesSpaceBelowHeaderAndAboveControls() {
+        XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 1000, header: 140, insets: 84), 776)
+        XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 400, header: 200, insets: 80), 120)
+        XCTAssertEqual(LibraryPresentation.emptyContentHeight(viewport: 200, header: 240, insets: 80), 0)
+    }
+
     func testLibraryBannerAndTrailingChromeStayInsideViewport() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
         model.sidebarVisible = false

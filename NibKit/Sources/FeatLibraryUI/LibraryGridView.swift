@@ -66,11 +66,13 @@ struct LibraryGridView: View {
                     title: model.collection == .recents ? String(localized: "No recent documents") : String(localized: "No study sets yet"),
                     message: model.collection == .recents ? String(localized: "Documents you open appear here.") : String(localized: "Create a study set from the New menu."),
                     primary: NibAction(String(localized: "Show Documents"), command: "library.setView") { model.setView(["collection": "documents"]) })
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             else if model.rows.isEmpty && model.error == nil {
                 NibEmptyState(symbol: .notebook, title: model.folder == nil ? String(localized: "No notebooks yet") : String(localized: "Nothing in \(model.title) yet"), message: model.folder == nil ? String(localized: "Write something, or bring in a PDF.") : String(localized: "Drag notebooks here."),
                     primary: NibAction(String(localized: "New Notebook"), command: CommandIDs.panelOpen) { model.perform(CommandIDs.panelOpen, ["id": "create.newNotebook", "folder": model.folderRef]) },
                     secondary: emptyImportAction)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: compactHeight ? NibSpacing.s : NibMetrics.libraryGutter) {
