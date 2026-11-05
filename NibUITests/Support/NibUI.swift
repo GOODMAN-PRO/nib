@@ -560,6 +560,7 @@ final class NibUI {
             app.terminate()
             app.launch()
             _ = try waitForState(timeout: 30) { $0.screen == "library" }
+            prepareLaunchKeyRoute()
             if waitForPlacement(3) || expandWindow() { return }
         }
         throw Failure.message("Full-screen recovery failed: display \(screen), window \(app.windows.firstMatch.frame)\n\(system.debugDescription)\n\(app.debugDescription)")
@@ -689,6 +690,7 @@ final class NibUI {
         try establishFullScreen(allowFixtureRelaunch: true)
         _ = try waitForState { $0.screen == "library" }
         try handleAuthorizationAlerts()
+        prepareLaunchKeyRoute()
     }
 
     /// Activates this scene, waits for non-text focus without editing/navigating, and verifies the chord's action.
@@ -715,6 +717,7 @@ final class NibUI {
             let request = XCTAttachment(string: "key=\(key) modifiers=\(modifiers.rawValue) route=runner hardware event responder=\(recipient) window=\(window.frame)\n\(probe.value ?? "missing")")
             request.lifetime = .keepAlways; activity.add(request)
             // Deliver at device level after verifying UIKit focus; non-text responders have no AX recipient.
+            let logBeforeDelivery = (try? state())?.keyLog ?? []
             try hardwareKey(key, modifiers)
             // The app's own account of the key (window press, responder, command run) goes into the test log
             // for passing and failing chords alike.
@@ -724,10 +727,51 @@ final class NibUI {
             }
             do { try postcondition() }
             catch {
+                // Retry only a proven modifier loss on a fresh printable press outside text editing.
+                // In particular, missing events and control keys are not retry evidence.
+                if let current = try? state(), current.keyResponderIsText != true,
+                   let observed = missingChordModifiers(key, modifiers, before: logBeforeDelivery,
+                                                        after: current.keyLog ?? []) {
+                    logQA("Chord modifier loss retry", "key=\(key) requested=\(modifiers.rawValue) observed=\(observed)")
+                    try sendHardwareKey(key, modifiers)
+                    do { try postcondition(); return }
+                    catch {
+                        recordDiagnostics("Chord retry postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
+                        throw error
+                    }
+                }
                 recordDiagnostics("Chord postcondition failed", facts: "key=\(key) modifiers=\(modifiers.rawValue)")
                 throw error
             }
         }
+    }
+
+    private func missingChordModifiers(_ key: String, _ modifiers: XCUIElement.KeyModifierFlags,
+                                       before: [String], after: [String]) -> String? {
+        guard key.unicodeScalars.count == 1, let scalar = key.unicodeScalars.first,
+              scalar.value >= 32, scalar.value < 127 else { return nil }
+        var expected = 0
+        if modifiers.contains(.shift) { expected |= 1 << 17 }
+        if modifiers.contains(.control) { expected |= 1 << 18 }
+        if modifiers.contains(.alternate) { expected |= 1 << 19 }
+        if modifiers.contains(.command) { expected |= 1 << 20 }
+        let supported: XCUIElement.KeyModifierFlags = [.shift, .control, .alternate, .command]
+        guard expected != 0, modifiers.subtracting(supported).isEmpty else { return nil }
+        // keyLog is bounded: match the retained tail, never mistake an older bare press for this chord.
+        var overlap = min(before.count, after.count)
+        while overlap > 0 && Array(before.suffix(overlap)) != Array(after.prefix(overlap)) { overlap -= 1 }
+        guard before.isEmpty || overlap > 0 else { return nil }
+        let prefix = "window press '\(key)' code "
+        guard let press = after.dropFirst(overlap).last(where: { $0.hasPrefix(prefix) }),
+              let flagsText = press.components(separatedBy: " flags ").last?.split(separator: " ").first,
+              let flags = Int(flagsText), flags & expected != expected else { return nil }
+        return press
+    }
+
+    /// Best effort at process launch, before a native editor can receive its first modified key.
+    func prepareLaunchKeyRoute() {
+        do { try openHardwareKeyRoute() }
+        catch { logQA("Hardware key route unobserved", "launch: \(error)") }
     }
 
     /// Global responders deliberately have no AX keyboard focus. The fixture probe observes UIKit's responder.

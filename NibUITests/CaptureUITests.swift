@@ -47,6 +47,7 @@ final class CaptureUITests: XCTestCase {
                 return self.orientation == "portrait" ? frame.height > frame.width : frame.width > frame.height
             }
             try ui.establishFullScreen()
+            ui.prepareLaunchKeyRoute()
             try body()
         } catch {
             let reason = "\(name) / \(appearance) / \(orientation): \(error)"

@@ -64,3 +64,12 @@ Final validation: `python Scripts/lint.py` reports **0 errors, 25 warnings**; `g
 ## H2 - typed control lookup
 
 Confirmed D:controls-menus#3 and D:controls-forms#5 (verifier correction): indexed Any element 1 fails exists while the typed Cancel Button is hittable. findControl now tries concrete firstMatch queries in its existing editor-first priority order before the Any indexed fallback. Visible disabled controls still return for enabled assertions; scope and fallback contracts remain. Expected: six Files/Photos Cancel/Save flows, including Chrome More Image and Insert collection export/import and Tape import. Next CI must tap the visible picker button and retain each cancel/content/save assertion. No runtime proof on Windows.
+
+## H1 - launch key route and evidence-gated retry
+
+Confirmed S:singles-insert#1 correction (a/c) and D:keyboard-and-state#1: first native Cmd-V is consistent with lost initialization; Quick Note n arrived flags 0 after the opener. launchFixture, full-screen fixture recovery and Capture variants now call the best-effort opener before text focus; other launches are Safari/Calendar, not Nib. Existing lazy hardwareKey guard stays. Launch synthesis/observation failure logs rather than throws. chord retries once only after its existing bounded postcondition throws, a fresh printable-key press lacks requested UIKit modifier bits, and the current probe is non-text. A retained-log suffix proves freshness; absent/ambiguous logs never retry. Escape/Delete/Return routes and encodings are unchanged. Expected: three Insert native paste tests, first partial-range key initialization, Create Quick Note. Partial selection's cause remains unproven; sticky/shape Escape is expressly not claimed fixed. Next CI must show launch route evidence before native input and correct modifier flags/result; retries must name the fresh bare press.
+
+| Test | Log prefix | Question |
+| --- | --- | --- |
+| All Nib launch paths | Hardware key route opened / unobserved | Was the first keyed press observed before text focus? |
+| Global modified chords, especially Create Quick Note | Chord modifier loss retry | Did a fresh requested printable key arrive without its modifiers before the single resend? |
