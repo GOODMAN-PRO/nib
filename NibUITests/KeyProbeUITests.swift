@@ -64,10 +64,10 @@ final class KeyProbeUITests: XCTestCase {
                     guard hasBudget(until: canvasDeadline, context: "canvas", reserve: 6) else { break canvasMatrix }
                     guard waitForState({ $0.keyResponderIsText == false && $0.openPanels.isEmpty }, timeout: 1) else {
                         let current = try? state()
-                        log("skipped", "context=canvas key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) "
-                            + "reason=focus responder=\(quoted(current?.keyResponder ?? "nil")) "
-                            + "isText=\(String(describing: current?.keyResponderIsText)) "
-                            + "openPanels=\(quoted(current?.openPanels))")
+                        log("skipped", ["context=canvas key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) ",
+                            "reason=focus responder=\(quoted(current?.keyResponder ?? "nil")) ",
+                            "isText=\(String(describing: current?.keyResponderIsText)) ",
+                            "openPanels=\(quoted(current?.openPanels))"].joined())
                         continue
                     }
                     let before = try state()
@@ -75,9 +75,9 @@ final class KeyProbeUITests: XCTestCase {
                     _ = waitForState({ $0.keyLogTotal > before.keyLogTotal }, timeout: 1)
                     let after = try state()
                     let delivered = after.keyLogTotal > before.keyLogTotal
-                    log("result", "context=canvas key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) "
-                        + "error=\(quoted(error ?? "nil")) delivered=\(delivered) \(delta(before, after)) "
-                        + "textBefore=\(String(describing: before.keyResponderIsText)) responder=\(quoted(before.keyResponder ?? "nil"))")
+                    log("result", ["context=canvas key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) ",
+                        "error=\(quoted(error ?? "nil")) delivered=\(delivered) \(delta(before, after)) ",
+                        "textBefore=\(String(describing: before.keyResponderIsText)) responder=\(quoted(before.keyResponder ?? "nil"))"].joined())
                     if name == "a", before.keyResponderIsText == false, delivered { controlDelivered = true }
                     if name == "Escape", delivered, firstEscape == nil { firstEscape = (key, route) }
                 }
@@ -91,10 +91,11 @@ final class KeyProbeUITests: XCTestCase {
             let (escapeKey, escapeRoute): (String, Route) = firstEscape ?? (XCUIKeyboardKey.escape.rawValue, Route.one)
             let escapeError = send(escapeKey, route: escapeRoute)
             let cleared = waitForState { $0.selectionCount == 0 }
-            log("effect", "context=canvas key=Escape scalars=\(scalars(escapeKey)) route=\(escapeRoute.rawValue) "
-                + "selected=\(selected) selectionBefore=\(beforeEscape.selectionCount) cleared=\(cleared) "
-                + "meaningful=\(selected && beforeEscape.selectionCount > 0) selectError=\(quoted(selectError ?? "nil")) "
-                + "error=\(quoted(escapeError ?? "nil")) \(delta(beforeEscape, try state()))")
+            let afterEscape = try state()
+            log("effect", ["context=canvas key=Escape scalars=\(scalars(escapeKey)) route=\(escapeRoute.rawValue) ",
+                "selected=\(selected) selectionBefore=\(beforeEscape.selectionCount) cleared=\(cleared) ",
+                "meaningful=\(selected && beforeEscape.selectionCount > 0) selectError=\(quoted(selectError ?? "nil")) ",
+                "error=\(quoted(escapeError ?? "nil")) \(delta(beforeEscape, afterEscape))"].joined())
         }
 
         // Canonical encodings once per route in native input. Return needs a valid page: "12" is out of range
@@ -135,11 +136,11 @@ final class KeyProbeUITests: XCTestCase {
                 let after = try state()
                 let closed = !after.openPanels.contains(panelID)
                 let afterValue = closed ? "<panel closed>" : fieldValue(field)
-                log("result", "context=text key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) "
-                    + "error=\(quoted(error ?? "nil")) delivered=\(after.keyLogTotal > before.keyLogTotal) "
-                    + "\(delta(before, after)) before=\(quoted(beforeValue)) after=\(quoted(afterValue)) "
-                    + "prepared=\(prepared) textBefore=\(String(describing: before.keyResponderIsText)) "
-                    + "responder=\(quoted(before.keyResponder ?? "nil")) panelClosed=\(closed) effect=\(effect)")
+                log("result", ["context=text key=\(name) scalars=\(scalars(key)) route=\(route.rawValue) ",
+                    "error=\(quoted(error ?? "nil")) delivered=\(after.keyLogTotal > before.keyLogTotal) ",
+                    "\(delta(before, after)) before=\(quoted(beforeValue)) after=\(quoted(afterValue)) ",
+                    "prepared=\(prepared) textBefore=\(String(describing: before.keyResponderIsText)) ",
+                    "responder=\(quoted(before.keyResponder ?? "nil")) panelClosed=\(closed) effect=\(effect)"].joined())
             }
         }
         XCTAssertTrue(controlDelivered, "No canvas route delivered control key a; inspect Key probe logs")
