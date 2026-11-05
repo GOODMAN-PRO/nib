@@ -135,6 +135,7 @@ final class ElementsModel: ObservableObject {
     @Published var showsSheet = false
 
     private var lists: [String: [ElementInfo]] = [:]
+    private var collectionLoadToken = UUID()
     private var subscription: EventSubscription?
     private var cancellables = Set<AnyCancellable>()
     /// The GIF search whose results may still be shown: an older one that finishes later is dropped.
@@ -215,13 +216,19 @@ final class ElementsModel: ObservableObject {
     }
 
     private func loadCurrent() async {
-        guard !current.isEmpty else {
+        let collection = current
+        let token = UUID()
+        collectionLoadToken = token
+        guard !collection.isEmpty else {
             elements = []
+            loading = false
             return
         }
         loading = true
-        defer { loading = false }
-        elements = await elementsOf(current) ?? []
+        let loaded = await elementsOf(collection) ?? []
+        guard collection == current, collectionLoadToken == token else { return }
+        elements = loaded
+        loading = false
     }
 
     private func elementsOf(_ collection: String) async -> [ElementInfo]? {

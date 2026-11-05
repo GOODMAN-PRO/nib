@@ -638,6 +638,51 @@ final class FeatElementsTests: XCTestCase {
     /// Non-sticky: after one successful insert the palette goes back to the tool used before Elements (contracts-v2
     /// `finishToolUse`, which announces `tool.finished`); a failed insert leaves Elements active; a temporary switch into
     /// Elements returns where it came from.
+    func testCollectionLoadsCannotOverwriteANewerSelectionOrItsLoadingState() async throws {
+        for newestFinishesFirst in [false, true] {
+            let h = harness()
+            let aStarted = expectation(description: "A suspended")
+            let bStarted = expectation(description: "B suspended")
+            var finishA: CheckedContinuation<Void, Never>?
+            var finishB: CheckedContinuation<Void, Never>?
+            h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "test.elements", owner: "test",
+                                                                   commands: ["element.list"]) { _, _, _ in nil })
+            h.app.commands.register(ElementListCommand.descriptor) { params, _ in
+                let collection = params["collection"]?.stringValue ?? ""
+                await withCheckedContinuation { continuation in
+                    if collection == "a" { finishA = continuation; aStarted.fulfill() }
+                    else { finishB = continuation; bStarted.fulfill() }
+                }
+                let info = ElementInfo(id: collection, collection: collection, title: collection,
+                                       kinds: [], itemCount: 1, size: [10, 10])
+                return ["collection": .string(collection), "title": .string(collection), "readOnly": false,
+                        "elements": .array([try JSONValue.from(info)]), "truncated": false]
+            }
+            let model = ElementsModel(app: h.app, session: h.session)
+            model.select("a")
+            await fulfillment(of: [aStarted], timeout: 2)
+            model.select("b")
+            await fulfillment(of: [bStarted], timeout: 2)
+            if newestFinishesFirst {
+                finishB?.resume()
+                for _ in 0..<200 where model.loading { try await Task.sleep(nanoseconds: 10_000_000) }
+                XCTAssertEqual(model.elements.map { $0.id }, ["b"])
+                finishA?.resume()
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } else {
+                finishA?.resume()
+                try await Task.sleep(nanoseconds: 50_000_000)
+                XCTAssertEqual(model.current, "b")
+                XCTAssertTrue(model.elements.isEmpty)
+                XCTAssertTrue(model.loading, "A finishing must not clear B's loading state")
+                finishB?.resume()
+                for _ in 0..<200 where model.loading { try await Task.sleep(nanoseconds: 10_000_000) }
+            }
+            XCTAssertEqual(model.elements.map { $0.id }, ["b"])
+            XCTAssertFalse(model.loading)
+        }
+    }
+
     func testInsertHandsBackToThePreviousTool() async throws {
         let h = harness()
         var finished: [JSONValue?] = []
