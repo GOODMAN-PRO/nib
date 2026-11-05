@@ -270,6 +270,25 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(Set(try liveCards(h, other).map { $0.id }).count, 3)
     }
 
+    func testMoveRejectsAnImageAddedDuringAssetCopyWithoutRemovingSource() async throws {
+        let h = harness()
+        let other = DocumentID("SECONDSET001")
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: other, kind: .studySet)), title: "Second", in: nil)
+        let replacement = try h.assets.put(Data("replacement".utf8), ext: "png", doc: Fixtures.studySetID)
+        let started = expectation(description: "copy started")
+        let gate = BlockingCardMoveAssets(base: h.assets, destination: other, started: started)
+        h.app.services.assets = gate
+        let moving = Task { try await h.run("card.moveTo", ["refs": ["card:FIXTUREDOC03/FIXTURECRD02"], "doc": "doc:SECONDSET001"]) }
+        defer { gate.release() }
+        await fulfillment(of: [started], timeout: 2)
+        try await h.run("card.update", ["ref": "card:FIXTUREDOC03/FIXTURECRD02", "back": ["asset": .string(replacement.name)]])
+        gate.release()
+        await expectError(.conflict) { _ = try await moving.value }
+        XCTAssertEqual(try liveCards(h).first { $0.id == Fixtures.card2 }?.back.asset, replacement)
+        XCTAssertTrue(try liveCards(h, other).isEmpty)
+        XCTAssertEqual(h.undoDepth(other), 0)
+    }
+
     func testMovingManyCardsKeepsTheirOrderWithShortKeys() async throws {
         let h = harness()
         let source = DocumentID("BIGSET000001")
@@ -852,4 +871,26 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(MenuEntry.display(KeyShortcut("return", [.command, .option, .control])), "⌃⌥⌘↩")
         XCTAssertNotNil(NibSnapshot.image(MenuEntry(item: item, context: context) {}, size: CGSize(width: 240, height: 44)))
     }
+}
+
+private final class BlockingCardMoveAssets: AssetStore {
+    let base: AssetStore
+    let destination: DocumentID
+    let started: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+    init(base: AssetStore, destination: DocumentID, started: XCTestExpectation) {
+        self.base = base; self.destination = destination; self.started = started
+    }
+    func release() { gate.signal() }
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        if doc == destination {
+            started.fulfill()
+            guard gate.wait(timeout: .now() + 3) == .success else { throw NibError.unavailable("copy gate timed out") }
+        }
+        return try base.put(data, ext: ext, doc: doc)
+    }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
 }
